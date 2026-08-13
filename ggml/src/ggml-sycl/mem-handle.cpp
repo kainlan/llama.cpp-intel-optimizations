@@ -674,8 +674,8 @@ mem_handle mem_handle::from_owned_alloc(alloc_owner && owner, ggml_layout_mode l
 }
 
 mem_handle detail::from_legacy_owned_alloc(alloc_handle && handle, ggml_layout_mode layout) {
-    alloc_owner owner = promote_legacy_alloc_owner(std::move(handle));
-    return owner ? mem_handle::from_owned_alloc(std::move(owner), layout) : mem_handle{};
+    allocation_result promotion = promote_legacy_alloc_owner(std::move(handle));
+    return promotion ? mem_handle::from_owned_alloc(std::move(promotion.owner), layout) : mem_handle{};
 }
 
 mem_handle mem_handle::slice(size_t byte_offset, size_t byte_size) const {

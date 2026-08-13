@@ -1037,6 +1037,9 @@ struct runtime_alloc_record {
     // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
     // erase must match this as well as the complete allocation key.
     uint64_t                   release_generation = 0;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    bool                       test_no_physical_release = false;
+#endif
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
@@ -10423,21 +10426,19 @@ bool unified_cache::get_dma_staging_buffers(size_t slice_bytes, size_t count, dm
         req.intent.category                = runtime_category::STAGING;
         req.intent.constraints.must_device = true;
 
-        alloc_handle handle{};
-        if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
+        allocation_result allocation = unified_allocate_owner(req);
+        if (!allocation) {
             break;
         }
-        const size_t   owner_size     = handle.size;
-        const int      owner_device   = handle.device;
-        const uint64_t owner_alloc_id = handle.alloc_id;
-        mem_handle     owner_handle   = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
-        void *         owner_ptr      = owner_handle.resolve().ptr;
-        if (!owner_ptr) {
-            owner_handle = {};
+        const alloc_metadata owner_metadata = allocation.owner.metadata();
+        mem_handle owner_handle = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        auto owner_resolved = owner_handle.resolve(req.device);
+        if (!owner_resolved.ptr || !owner_resolved.on_device) {
             break;
         }
-        dma_staging_allocs_[i]  = { owner_ptr, owner_size, owner_device, owner_alloc_id, std::move(owner_handle) };
-        dma_staging_buffers_[i] = owner_ptr;
+        dma_staging_allocs_[i]  = { owner_resolved.ptr, owner_metadata.size, owner_metadata.device,
+                                    owner_metadata.alloc_id, std::move(owner_handle) };
+        dma_staging_buffers_[i] = dma_staging_allocs_[i].owner.resolve(req.device).ptr;
         allocated++;
     }
 
@@ -12369,28 +12370,94 @@ bool allocation_coordinator_test_try_register(
 }
 #endif
 
-alloc_owner detail::promote_legacy_alloc_owner(alloc_handle && handle) noexcept {
-    if (!handle.ptr || handle.device < 0 || handle.device >= GGML_SYCL_MAX_DEVICES) return {};
+static allocation_result promote_legacy_alloc_owner_with_coordinator(
+    alloc_handle && handle,
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
+    allocation_result result;
+    // Snapshot before consuming the compatibility token. Cleanup and the
+    // registry claim must use the same complete key even after std::move.
+    const alloc_metadata exact = handle.metadata();
+    if (!exact.ptr || exact.device < 0 || exact.device >= GGML_SYCL_MAX_DEVICES) {
+        result.error = allocation_error::INVALID_REQUEST;
+        return result;
+    }
+
     alloc_owner_control * control = nullptr;
+    auto cleanup_legacy = [&](allocation_error primary) noexcept {
+        const registered_release_status released = release_registered_allocation_exact(
+            exact, registered_release_mode::LEGACY);
+        if (released == registered_release_status::OWNERSHIP_MISMATCH) {
+            result.error = allocation_error::LEGACY_OWNERSHIP_MISMATCH;
+            return;
+        }
+        if (released == registered_release_status::LEASE_REFUSED) {
+            // The row was restored to LIVE by exact release. Transfer the
+            // consumed token to the cache retry coordinator when available;
+            // otherwise the exact LEGACY registry row durably retains it.
+            alloc_handle retry = std::move(handle);
+            (void) unified_defer_free(&retry);
+            result.error = allocation_error::LEGACY_RELEASE_RETAINED;
+            return;
+        }
+        result.error = primary;
+    };
+
     try {
-        auto coordinator = unified_allocation_release_coordinator(handle.device);
         control = allocation_owner_internal_access::create(coordinator);
-        if (!control) return {};
+        if (!control) {
+            cleanup_legacy(allocation_error::CONTROL_ALLOCATION_FAILED);
+            return result;
+        }
+
+        allocation_error claim_error = allocation_error::NONE;
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-            auto it = g_runtime_alloc_registry.find(handle.ptr);
+            auto it = g_runtime_alloc_registry.find(exact.ptr);
             if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
-                it->second.ownership != runtime_alloc_ownership::LEGACY || it->second.handle != handle.metadata() ||
-                !allocation_owner_internal_access::publish(control, it->second.handle)) {
-                allocation_owner_internal_access::abandon(control);
-                return {};
+                it->second.ownership != runtime_alloc_ownership::LEGACY || it->second.handle != exact) {
+                claim_error = allocation_error::LEGACY_OWNERSHIP_MISMATCH;
+            } else if (!allocation_owner_internal_access::publish(control, it->second.handle)) {
+                claim_error = allocation_error::METADATA_PUBLICATION_FAILED;
+            } else {
+                it->second.ownership = runtime_alloc_ownership::INTRUSIVE;
             }
-            it->second.ownership = runtime_alloc_ownership::INTRUSIVE;
         }
-        return allocation_owner_internal_access::adopt(control);
+        if (claim_error != allocation_error::NONE) {
+            allocation_owner_internal_access::abandon(control);
+            control = nullptr;
+            if (claim_error == allocation_error::LEGACY_OWNERSHIP_MISMATCH) {
+                // A copied legacy token that loses the atomic claim has no
+                // release authority and must not disturb the winner's row.
+                result.error = claim_error;
+            } else {
+                cleanup_legacy(claim_error);
+            }
+            return result;
+        }
+
+        result.owner = allocation_owner_internal_access::adopt(control);
+        control = nullptr;
+        result.error = allocation_error::NONE;
+        return result;
     } catch (...) {
         if (control) allocation_owner_internal_access::abandon(control);
-        return {};
+        cleanup_legacy(allocation_error::CONTROL_ALLOCATION_FAILED);
+        return result;
+    }
+}
+
+allocation_result detail::promote_legacy_alloc_owner(alloc_handle && handle) noexcept {
+    const alloc_metadata exact = handle.metadata();
+    if (!exact.ptr || exact.device < 0 || exact.device >= GGML_SYCL_MAX_DEVICES) {
+        allocation_result result;
+        result.error = allocation_error::INVALID_REQUEST;
+        return result;
+    }
+    try {
+        return promote_legacy_alloc_owner_with_coordinator(
+            std::move(handle), unified_allocation_release_coordinator(exact.device));
+    } catch (...) {
+        return promote_legacy_alloc_owner_with_coordinator(std::move(handle), {});
     }
 }
 
@@ -12696,13 +12763,21 @@ static registered_release_status release_registered_allocation_owned(
         detached.vram_zone = it->second.vram_zone;
         detached.cohort_id = it->second.cohort_id;
         detached.release_generation = ++it->second.release_generation;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        detached.test_no_physical_release = it->second.test_no_physical_release;
+#endif
         it->second.state = runtime_alloc_state::RELEASING;
         // Release-only adjuncts have a single claimant and are never copied to
         // lookup output or another concurrent releaser.
         detached.owned_segments = std::move(it->second.owned_segments);
     }
 
-    if (!unified_free_record(detached)) {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    const bool physically_released = detached.test_no_physical_release || unified_free_record(detached);
+#else
+    const bool physically_released = unified_free_record(detached);
+#endif
+    if (!physically_released) {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         auto it = g_runtime_alloc_registry.find(requested.ptr);
         if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
@@ -12747,11 +12822,25 @@ bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intr
         runtime_alloc_record rec;
         rec.handle = metadata;
         rec.ownership = intrusive ? runtime_alloc_ownership::INTRUSIVE : runtime_alloc_ownership::LEGACY;
+        rec.test_no_physical_release = true;
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         return g_runtime_alloc_registry.emplace(metadata.ptr, std::move(rec)).second;
     } catch (...) {
         return false;
     }
+}
+
+allocation_result allocation_registry_test_promote(
+    const alloc_metadata & metadata,
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
+    alloc_handle handle;
+    allocation_owner_internal_access::mint(handle, metadata);
+    return promote_legacy_alloc_owner_with_coordinator(std::move(handle), coordinator);
+}
+
+bool allocation_registry_test_contains(void * ptr) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
 }
 
 registered_release_status allocation_registry_test_claim(

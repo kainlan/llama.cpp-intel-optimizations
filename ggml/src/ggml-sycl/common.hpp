@@ -2581,7 +2581,7 @@ struct staging_buffer_pool {
             // separate runtime pinned allocation path.
             void *                  ptr       = nullptr;
             bool                    from_pool = false;
-            ggml_sycl::alloc_handle unified_handle{};
+            ggml_sycl::mem_handle   unified_handle{};
             {
                 auto * ucache = ggml_sycl::get_unified_cache_for_device(queue_device);
                 if (ucache) {
@@ -2597,8 +2597,15 @@ struct staging_buffer_pool {
                         _stg_req.intent.constraints.must_host_pinned        = true;
                         _stg_req.intent.constraints.use_pinned_pool         = true;
                         _stg_req.intent.constraints.forbid_host_zone_growth = true;
-                        if (ggml_sycl::unified_alloc(_stg_req, &unified_handle) && unified_handle.ptr) {
-                            ptr = unified_handle.ptr;
+                        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(_stg_req);
+                        if (allocation) {
+                            ggml_sycl::mem_handle candidate = ggml_sycl::mem_handle::from_owned_alloc(
+                                std::move(allocation.owner), GGML_LAYOUT_AOS);
+                            auto resolved = candidate.resolve(queue_device);
+                            if (resolved.ptr && !resolved.on_device) {
+                                unified_handle = std::move(candidate);
+                                ptr = unified_handle.resolve(queue_device).ptr;
+                            }
                         }
                         if (!ptr) {
                             GGML_SYCL_DEBUG("[STAGING] zone allocation miss for %zu bytes; will try pending slots\n",
@@ -2624,7 +2631,7 @@ struct staging_buffer_pool {
             new_slot.context          = queue_context;
             new_slot.in_use           = true;
             new_slot.from_pinned_pool = from_pool;
-            new_slot.unified_handle   = ggml_sycl::detail::from_legacy_owned_alloc(std::move(unified_handle));
+            new_slot.unified_handle   = std::move(unified_handle);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 slots_.push_back(std::move(new_slot));
@@ -5425,13 +5432,13 @@ struct ggml_backend_sycl_context {
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
 
-        ggml_sycl::alloc_handle graph_input_owner{};
-        if (!ggml_sycl::unified_alloc(req, &graph_input_owner) || graph_input_owner.ptr == nullptr) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             return nullptr;
         }
 
         ggml_sycl::mem_handle handle =
-            ggml_sycl::detail::from_legacy_owned_alloc(std::move(graph_input_owner), GGML_LAYOUT_AOS);
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
         auto resolved = handle.resolve(dev_id);
         if (!resolved.ptr || !resolved.on_device) {
             return nullptr;
@@ -5442,7 +5449,7 @@ struct ggml_backend_sycl_context {
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
         graph_input_staging[name] = { std::move(handle), nbytes };
-        return resolved.ptr;
+        return graph_input_staging[name].handle.resolve(dev_id).ptr;
     }
 
     bool graph_input_refresh(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {

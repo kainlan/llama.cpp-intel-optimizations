@@ -80,18 +80,22 @@ void * vram_pool::allocate(size_t size, uint64_t tensor_id, size_t alignment) {
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = vram_zone_id::WEIGHT;
 
-    alloc_handle handle{};
-    if (!unified_alloc(req, &handle) || !handle.ptr) {
-        GGML_LOG_ERROR("[SYCL] unified VRAM allocation returned nullptr for size %zu\n", size);
+    allocation_result allocation = unified_allocate_owner(req);
+    if (!allocation) {
+        GGML_LOG_ERROR("[SYCL] unified VRAM allocation failed for size %zu (error=%d)\n", size,
+                       static_cast<int>(allocation.error));
         return nullptr;
     }
 
-    void *     ptr          = handle.ptr;
-    mem_handle owner        = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+    mem_handle owner = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    auto resolved = owner.resolve(device_id_);
+    if (!resolved.ptr || !resolved.on_device) {
+        return nullptr;
+    }
     allocations_[tensor_id] = { std::move(owner), size };
     used_ += size;
 
-    return ptr;
+    return allocations_[tensor_id].handle.resolve(device_id_).ptr;
 }
 
 void vram_pool::deallocate(uint64_t tensor_id) {

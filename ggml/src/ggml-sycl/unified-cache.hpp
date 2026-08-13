@@ -4236,6 +4236,8 @@ enum class allocation_error : uint8_t {
     CONTROL_ALLOCATION_FAILED,
     PHYSICAL_ALLOCATION_FAILED,
     METADATA_PUBLICATION_FAILED,
+    LEGACY_OWNERSHIP_MISMATCH,
+    LEGACY_RELEASE_RETAINED,
 };
 
 struct allocation_result {
@@ -4271,6 +4273,10 @@ size_t allocation_coordinator_test_count() noexcept;
 bool allocation_coordinator_test_try_register(
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intrusive) noexcept;
+allocation_result allocation_registry_test_promote(
+    const alloc_metadata & metadata,
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
+bool allocation_registry_test_contains(void * ptr) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
@@ -4284,7 +4290,10 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
 namespace detail {
 // Narrow compatibility bridge for allocation sites still returning alloc_handle.
 // Atomically promotes the exact legacy registry row to intrusive ownership.
-alloc_owner promote_legacy_alloc_owner(alloc_handle && handle) noexcept;
+// Failure is typed and consumes the legacy authority: the exact LEGACY row is
+// released, durably queued after lease refusal, or left untouched when another
+// token already claimed it.
+allocation_result promote_legacy_alloc_owner(alloc_handle && handle) noexcept;
 }
 std::shared_ptr<allocation_release_coordinator> unified_allocation_release_coordinator(int device);
 bool unified_allocation_release_coordinator_detach(int device) noexcept;

@@ -284,6 +284,72 @@ void concurrent_registry_claim_reports_busy() {
     std::cout << "PASS concurrent-exact-registry-claim-busy\n";
 }
 
+void concurrent_legacy_promotion_has_one_owner() {
+    fake_release_backend backend;
+    const alloc_metadata exact = metadata(83);
+    check(allocation_registry_test_publish(exact, false), "legacy promotion row publication failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
+
+    allocation_result first;
+    allocation_result second;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto promote = [&](allocation_result & out) {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        out = allocation_registry_test_promote(exact, coordinator);
+    };
+    std::thread a(promote, std::ref(first));
+    std::thread b(promote, std::ref(second));
+    while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    a.join();
+    b.join();
+
+    allocation_result * winner = first ? &first : &second;
+    allocation_result * loser  = first ? &second : &first;
+    check(static_cast<bool>(*winner), "neither copied legacy token won promotion");
+    check(loser->error == allocation_error::LEGACY_OWNERSHIP_MISMATCH,
+          "losing copied legacy token did not report ownership mismatch");
+    check(allocation_registry_test_claim(exact, false) == registered_release_status::OWNERSHIP_MISMATCH,
+          "losing promotion released or reclaimed the intrusive row");
+    check(winner->owner.reset().released(), "promoted owner did not release through coordinator");
+    check(backend.releases == 1 && coordinator->live_controls() == 0,
+          "concurrent promotion did not retain exactly one release authority");
+    allocation_registry_test_erase(exact.ptr);
+    std::cout << "PASS concurrent-legacy-promotion-single-winner\n"
+                 "PASS copied-legacy-token-ownership-mismatch\n";
+}
+
+void legacy_promotion_failures_clean_exact_row() {
+    fake_release_backend backend;
+
+    const alloc_metadata admission_exact = metadata(84);
+    check(allocation_registry_test_publish(admission_exact, false), "admission-failure row publication failed");
+    auto closed = std::make_shared<allocation_release_coordinator>(
+        admission_exact.device, release_fake, &backend);
+    allocation_coordinator_test_close(closed);
+    allocation_result admission = allocation_registry_test_promote(admission_exact, closed);
+    check(admission.error == allocation_error::CONTROL_ALLOCATION_FAILED,
+          "closed coordinator promotion returned wrong typed error");
+    check(!allocation_registry_test_contains(admission_exact.ptr),
+          "closed coordinator promotion left a legacy row");
+
+    const alloc_metadata control_exact = metadata(85);
+    check(allocation_registry_test_publish(control_exact, false), "control-failure row publication failed");
+    auto open = std::make_shared<allocation_release_coordinator>(control_exact.device, release_fake, &backend);
+    fail_allocations.store(true, std::memory_order_release);
+    allocation_result control = allocation_registry_test_promote(control_exact, open);
+    fail_allocations.store(false, std::memory_order_release);
+    check(control.error == allocation_error::CONTROL_ALLOCATION_FAILED,
+          "control allocation failure returned wrong typed error");
+    check(!allocation_registry_test_contains(control_exact.ptr),
+          "control allocation failure left a legacy row");
+    check(open->live_controls() == 0, "control allocation failure changed coordinator census");
+    std::cout << "PASS legacy-promotion-admission-failure-cleans-row\n"
+                 "PASS legacy-promotion-control-failure-cleans-row\n";
+}
+
 void invalid_request_has_zero_coordinator_census() {
     const size_t before = allocation_coordinator_test_count();
     alloc_request invalid{};
@@ -339,6 +405,8 @@ static_assert(std::is_copy_constructible_v<alloc_metadata>);
 static_assert(std::is_trivially_destructible_v<alloc_metadata>);
 static_assert(!std::is_constructible_v<alloc_owner, alloc_metadata>);
 static_assert(!std::is_constructible_v<shared_alloc_owner, alloc_metadata>);
+static_assert(!std::is_invocable_v<decltype(&detail::promote_legacy_alloc_owner), alloc_handle &>,
+              "legacy promotion must reject lvalues; callers snapshot metadata then explicitly move ownership");
 
 int main() {
     unique_to_shared_preserves_identity();
@@ -351,6 +419,8 @@ int main() {
     intrusive_registry_row_rejects_legacy_claim();
     exact_registry_key_rejects_every_field_mismatch();
     concurrent_registry_claim_reports_busy();
+    concurrent_legacy_promotion_has_one_owner();
+    legacy_promotion_failures_clean_exact_row();
     invalid_request_has_zero_coordinator_census();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;

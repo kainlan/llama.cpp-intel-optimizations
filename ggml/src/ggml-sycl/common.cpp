@@ -371,18 +371,22 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         req.intent.cohort_id                    = "runtime_staging_cache";
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.use_pinned_pool  = true;
-        ggml_sycl::alloc_handle owner{};
-        if (ggml_sycl::unified_alloc(req, &owner) && owner.ptr) {
-            void *                staged     = owner.ptr;
-            ggml_sycl::mem_handle dst_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner));
-            ggml_sycl::mem_handle src_handle =
-                ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS,
-                                                   /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
-            ggml_sycl::mem_copy(dst_handle, src_handle, size, q);
-            g_runtime_staging_cache[key] = { staged, size, std::move(dst_handle) };
-            return staged;
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
+            return nullptr;
         }
-        return nullptr;
+        ggml_sycl::mem_handle dst_handle =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        auto staged = dst_handle.resolve(device);
+        if (!staged.ptr || staged.on_device) {
+            return nullptr;
+        }
+        ggml_sycl::mem_handle src_handle =
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS,
+                                               /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
+        ggml_sycl::mem_copy(dst_handle, src_handle, size, q);
+        g_runtime_staging_cache[key] = { staged.ptr, size, std::move(dst_handle) };
+        return g_runtime_staging_cache[key].ptr;
     }
     // Multi-process mode: No cross-device staging needed (each process has its own data)
     if (g_sycl_tp_config.is_multiprocess) {
@@ -1327,15 +1331,21 @@ static bool tp_alloc_device_buffer(ggml_sycl::alloc_request & req,
                                    size_t                     size,
                                    ggml_sycl::mem_handle &    handle,
                                    T *&                       ptr) {
-    ggml_sycl::alloc_handle owner{};
     req.size = size;
     handle   = {};
     ptr      = nullptr;
-    if (!ggml_sycl::unified_alloc(req, &owner) || owner.ptr == nullptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         return false;
     }
-    ptr    = static_cast<T *>(owner.ptr);
-    handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+    ggml_sycl::mem_handle candidate =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    auto resolved = candidate.resolve(req.device);
+    if (!resolved.ptr || !resolved.on_device) {
+        return false;
+    }
+    handle = std::move(candidate);
+    ptr    = static_cast<T *>(handle.resolve(req.device).ptr);
     return ptr != nullptr;
 }
 
@@ -1722,14 +1732,15 @@ float * ggml_sycl_tp_ensure_host_staging(size_t size, queue_ptr stream) {
     req.intent.category                     = ggml_sycl::runtime_category::HOST_COMPUTE;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
-    ggml_sycl::alloc_handle host_staging_owner{};
-    if (ggml_sycl::unified_alloc(req, &host_staging_owner) && host_staging_owner.ptr) {
-        g_tp_host_staging.handle =
-            ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_staging_owner), GGML_LAYOUT_AOS);
-        auto resolved         = g_tp_host_staging.handle.resolve(req.device);
-        g_tp_host_staging.buf = resolved ? static_cast<float *>(resolved.ptr) : nullptr;
-    } else {
-        g_tp_host_staging.buf = nullptr;
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (allocation) {
+        ggml_sycl::mem_handle candidate =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        auto resolved = candidate.resolve(req.device);
+        if (resolved.ptr && !resolved.on_device) {
+            g_tp_host_staging.handle = std::move(candidate);
+            g_tp_host_staging.buf = static_cast<float *>(g_tp_host_staging.handle.resolve(req.device).ptr);
+        }
     }
     g_tp_host_staging.capacity = new_capacity;
     g_tp_host_staging.size     = size;
