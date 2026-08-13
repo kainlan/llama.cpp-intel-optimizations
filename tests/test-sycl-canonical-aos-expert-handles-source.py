@@ -291,6 +291,58 @@ def test_mandatory_ranges_reach_pointer_table_and_dpas_rollback() -> None:
     assert "/*logical_offset=*/0" in rollback
 
 
+def test_logical_consumers_and_publishers_fail_closed() -> None:
+    source = SOURCE.read_text()
+    common = COMMON.read_text()
+
+    payload = function(common, "bool build_moe_ptr_payload_from_handles")
+    assert "size_t                expected_expert_bytes = 0" in payload
+    assert "layout_record->logical_bytes" not in payload
+    assert "expected_expert_bytes != 0" in payload
+    assert "resolve_moe_storage_record" in payload
+
+    for signature in (
+        "static void moe_layer_executor_abi_add_full_role_storage",
+        "static bool persistent_tg_collect_full_role_descriptor",
+        "static const void * const * moe_fusion_ensure_full_local_ptr_table(",
+    ):
+        consumer = function(source, signature)
+        assert "resolve_moe_storage_record" in consumer, signature
+        assert "find_moe_storage_handle" not in consumer, signature
+
+    materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
+    assert "resolve_moe_storage_record" in materialize
+    assert "logical.ptr" in materialize
+    assert "materialize-publish-rejected" in materialize
+
+
+def test_dpas_mid_loop_failure_is_transactional_failpoint_contract() -> None:
+    source = SOURCE.read_text()
+    start = source.index("// Transaction rollback state machine:")
+    end = source.index("dpas_down_tensors++", start)
+    rollback = source[start:end]
+    ordered = (
+        "dpas-rollback-drain-target",
+        "forget_moe_storage_handle_on_device",
+        "dpas-promotion-rollback",
+        "stage-dpas-rollback",
+        "dpas-rollback-drain-base",
+        "resolve_moe_storage_record",
+        "GGML_ABORT",
+    )
+    positions = [rollback.index(token) for token in ordered]
+    assert positions == sorted(positions)
+    assert "local_experts" in rollback
+    assert "target_keys" in rollback
+    assert "SIZE_MAX / expert_dpas_bytes" in source
+    assert "SIZE_MAX - expert_dpas_bytes" in source
+
+    # Source-level failpoint: deleting target withdrawal must be witnessed.
+    mutated = rollback.replace("extra->forget_moe_storage_handle_on_device", "/* failpoint: retained target */", 1)
+    assert "forget_moe_storage_handle_on_device" not in mutated
+    assert "forget_moe_storage_handle_on_device" in rollback
+
+
 def test_mutations_are_witnessed() -> None:
     source = SOURCE.read_text()
     mutations = [

@@ -3295,7 +3295,8 @@ struct ggml_tensor_extra_gpu {
                                             bool                  require_all    = false,
                                             bool                  require_device = false,
                                             bool                  require_layout = false,
-                                            ggml_layout_mode      layout         = GGML_LAYOUT_AOS) const {
+                                            ggml_layout_mode      layout         = GGML_LAYOUT_AOS,
+                                            size_t                expected_expert_bytes = 0) const {
         payload.clear();
         if (!ggml_sycl_valid_device_index(dev)) {
             return false;
@@ -3309,10 +3310,9 @@ struct ggml_tensor_extra_gpu {
             ggml_sycl::mem_handle handle = handles[i];
             void *                logical_ptr = nullptr;
             if (require_layout) {
-                const auto * layout_record = find_moe_storage_handle_on_device(static_cast<int>(i), layout, dev);
                 resolved_moe_expert_storage_record logical{};
-                if (layout_record && resolve_moe_storage_record(static_cast<int>(i), layout, dev,
-                                                                 layout_record->logical_bytes, &logical)) {
+                if (expected_expert_bytes != 0 &&
+                    resolve_moe_storage_record(static_cast<int>(i), layout, dev, expected_expert_bytes, &logical)) {
                     handle      = logical.logical_handle;
                     logical_ptr = logical.ptr;
                 } else if (require_all) {
