@@ -5286,7 +5286,8 @@ static bool ggml_sycl_materialize_planned_expert_layout(const ggml_tensor * src0
     }
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (remember_storage_handle && extra) {
-        extra->remember_moe_storage_handle(expert_id, layout, std::move(storage_handle), &staged.event);
+        extra->remember_moe_storage_handle(expert_id, layout, std::move(storage_handle), &staged.event,
+                                                   /*logical_offset=*/0, dst_bytes);
     }
     if (ggml_sycl_moe_route_log_enabled()) {
         static std::atomic<int> logged_ok{ 0 };
@@ -5360,56 +5361,46 @@ static bool ggml_sycl_try_moe_storage_handle_route(const ggml_tensor *     tenso
             continue;
         }
 
-        ggml_sycl::mem_handle handle = stored->handle;
         const size_t expected_size = layout == GGML_LAYOUT_AOS ? static_cast<size_t>(tensor->nb[2]) :
             ggml_sycl_layout_bytes_for_dims(tensor->type, tensor->ne[0], tensor->ne[1], layout,
                                             owner == mem_handle::HOST_DEVICE ? current_device : owner);
-        auto resolved = handle.resolve(owner == mem_handle::HOST_DEVICE ? mem_handle::HOST_DEVICE : owner);
-        const size_t allocation_bytes = handle.size();
-        const bool logical_range_valid = stored->logical_bytes == expected_size &&
-                                         stored->logical_offset <= allocation_bytes &&
-                                         stored->logical_bytes <= allocation_bytes - stored->logical_offset;
-        const uintptr_t allocation_begin = reinterpret_cast<uintptr_t>(resolved.ptr);
-        const bool pointer_range_valid = resolved.ptr &&
-                                         stored->logical_offset <= UINTPTR_MAX - allocation_begin;
-        if (!handle.has_stable_owner_identity() || expected_size == 0 || !logical_range_valid ||
-            !pointer_range_valid || resolved.layout != layout) {
-            route.reason = resolved.ptr && resolved.layout != layout ? expert_resolve_reason::LAYOUT_MISMATCH :
-                                                                       expert_resolve_reason::NOT_FOUND;
+        ggml_tensor_extra_gpu::resolved_moe_expert_storage_record logical{};
+        if (!extra->resolve_moe_storage_record(expert_id, layout, owner, expected_size, &logical)) {
+            route.reason = expert_resolve_reason::NOT_FOUND;
             continue;
         }
-        void * const logical_ptr = reinterpret_cast<void *>(allocation_begin + stored->logical_offset);
-
-        const int owning_device = resolved.on_device ? handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+        ggml_sycl::mem_handle handle = logical.logical_handle;
+        const bool            on_device = logical.on_device;
+        const int owning_device = on_device ? handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
         if (device_planned) {
             const bool allowed_planned_device =
-                resolved.on_device && owning_device == route.planned_device && owner == route.planned_device;
-            const bool allowed_current_alternate = current_device_planned_alternate && resolved.on_device &&
+                on_device && owning_device == route.planned_device && owner == route.planned_device;
+            const bool allowed_current_alternate = current_device_planned_alternate && on_device &&
                                                    owning_device == current_device && owner == current_device;
             if (!allowed_planned_device && !allowed_current_alternate) {
-                route.reason = resolved.on_device ? expert_resolve_reason::DEVICE_MISMATCH :
-                                                    expert_resolve_reason::HOST_DISALLOWED;
+                route.reason = on_device ? expert_resolve_reason::DEVICE_MISMATCH :
+                                           expert_resolve_reason::HOST_DISALLOWED;
                 continue;
             }
         }
-        if (host_only && resolved.on_device) {
+        if (host_only && on_device) {
             route.reason = expert_resolve_reason::DEVICE_MISMATCH;
             continue;
         }
 
-        route.ptr           = logical_ptr;
+        route.ptr           = logical.ptr;
         route.owning_device = owning_device;
         route.planned_alternate_admitted = current_device_planned_alternate && owning_device == current_device &&
                                            owning_device != route.planned_device;
-        route.actual_layout = resolved.layout;
-        route.tier          = resolved.on_device ? expert_resolve_tier::DEVICE_VRAM : expert_resolve_tier::HOST_PINNED;
+        route.actual_layout = layout;
+        route.tier          = on_device ? expert_resolve_tier::DEVICE_VRAM : expert_resolve_tier::HOST_PINNED;
         route.reason        = expert_resolve_reason::FOUND;
         route.lease         = std::move(handle);
-        route.has_ready_event = stored->has_ready_event;
-        if (stored->has_ready_event) {
-            route.ready_event = stored->ready_event;
+        route.has_ready_event = logical.has_ready_event;
+        if (logical.has_ready_event) {
+            route.ready_event = logical.ready_event;
         }
-        if (resolved.on_device) {
+        if (on_device) {
             route.kind = owning_device == current_device ? moe_expert_route_kind::LOCAL_DEVICE :
                                                            moe_expert_route_kind::SECONDARY_DEVICE;
         } else {
@@ -8777,7 +8768,8 @@ bool test_moe_storage_handle_first_route_and_negatives() {
 
     // Positive: the stable allocation-time AoS owner is authoritative without
     // inventing a canonical GGUF key.
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable, nullptr,
+                                      /*logical_offset=*/0, expert_size);
     moe_expert_route positive = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
     if (positive.ptr != resolved.ptr || positive.kind != moe_expert_route_kind::LOCAL_DEVICE ||
         !positive.lease.stable_identity_equal(stable)) {
@@ -8788,7 +8780,8 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     clear_records();
     extra.remember_moe_storage_handle(
         expert_id, GGML_LAYOUT_AOS,
-        mem_handle::from_direct(resolved.ptr, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0));
+        mem_handle::from_direct(resolved.ptr, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0), nullptr,
+        /*logical_offset=*/0, expert_size);
     if (!route_closed()) {
         return false;
     }
@@ -8821,15 +8814,17 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner, nullptr,
                                       prefix_padding, expert_size);
     moe_expert_route padded = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+    const auto padded_lease = padded.lease.resolve(0);
     if (padded.ptr != static_cast<uint8_t *>(range_base.ptr) + prefix_padding ||
-        !padded.lease.stable_identity_equal(range_owner)) {
+        padded_lease.ptr != padded.ptr || padded.lease.size() != expert_size) {
         return false;
     }
 
     // Allocation size alone is not authority: absent an exact producer range,
     // the same padded handle must fail closed.
     clear_records();
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner, nullptr,
+                                      /*logical_offset=*/0, range_owner.size());
     if (!route_closed()) {
         return false;
     }
@@ -8865,7 +8860,8 @@ bool test_moe_storage_handle_first_route_and_negatives() {
         return false;
     }
     mem_handle host_owner = mem_handle::from_owned_alloc(std::move(host_allocation), GGML_LAYOUT_AOS);
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, host_owner);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, host_owner, nullptr,
+                                      /*logical_offset=*/0, expert_size);
     if (!route_closed()) {
         return false;
     }
@@ -8873,7 +8869,8 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     // Finally prove placement-plan authority wins over the otherwise valid
     // device handle: this expert is explicitly host-planned.
     clear_records();
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable, nullptr,
+                                      /*logical_offset=*/0, expert_size);
     ggml_set_name(&tensor, "blk.31.ffn_gate_exps.weight");
     placement_plan plan{};
     plan.entries.push_back({ "blk.31.ffn_gate_exps.weight", expert_size, expert_size, 0,
@@ -15488,7 +15485,8 @@ static bool test_stage_soa_expert_handle(unified_cache *            cache,
         return false;
     }
 
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(storage_handle), &stage.event);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(storage_handle), &stage.event,
+                                      /*logical_offset=*/0, size);
     if (out_ptr) {
         *out_ptr = stage.ptr;
     }
@@ -15564,6 +15562,31 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
         sycl::event::wait(stage_events);
         return false;
     }
+
+    // Replace one exact-sized producer with a padded allocation whose logical
+    // SOA record starts at a nonzero offset. The real pointer-table upload below
+    // must publish this logical pointer, never the allocation base.
+    constexpr size_t logical_offset = 64;
+    alloc_request    padded_req{};
+    padded_req.queue                          = &q;
+    padded_req.device                         = 0;
+    padded_req.size                           = logical_offset + data.size() + 32;
+    padded_req.intent.role                    = alloc_role::WEIGHT;
+    padded_req.intent.constraints.must_device = true;
+    alloc_handle padded_allocation{};
+    if (!unified_alloc(padded_req, &padded_allocation)) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+    mem_handle padded_owner = mem_handle::from_owned_alloc(std::move(padded_allocation), GGML_LAYOUT_SOA);
+    auto       padded_base  = padded_owner.resolve(0);
+    if (!padded_base.ptr ||
+        !extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(padded_owner), nullptr,
+                                           logical_offset, data.size())) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+    expected_ptr = static_cast<uint8_t *>(padded_base.ptr) + logical_offset;
 
     ggml_backend_sycl_context ctx(0);
     const int32_t             routed[] = { expert_id };
@@ -22053,8 +22076,11 @@ static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffe
                                                                             ctx->device, &previous[expert]);
         }
         for (size_t expert = 0; expert < expert_count; ++expert) {
-            extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS,
-                                               std::move(replacement[expert]));
+            if (!extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS,
+                                                     std::move(replacement[expert]), nullptr,
+                                                     /*logical_offset=*/0, expert_size)) {
+                throw std::runtime_error("SYCL AoS expert handle publication rejected logical range");
+            }
         }
     } catch (...) {
         for (size_t expert = 0; expert < expert_count; ++expert) {
@@ -28658,7 +28684,10 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
                     !handle.resolve().ptr) {
                     throw std::runtime_error("SYCL host expert registration failed during preload");
                 }
-                extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle));
+                if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS, std::move(handle),
+                                                        nullptr, /*logical_offset=*/0, expert_size)) {
+                    throw std::runtime_error("SYCL host expert logical range publication failed during preload");
+                }
                 host_registered++;
                 continue;
             }
@@ -29371,8 +29400,11 @@ static void ggml_sycl_preload_model_weights() {
                                 throw std::runtime_error("SYCL host expert registration failed during preload");
                             }
                             if (!remembered_handle) {
-                                extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
-                                                                   std::move(handle));
+                                if (!extra->remember_moe_storage_handle(static_cast<int>(e), GGML_LAYOUT_AOS,
+                                                                       std::move(handle), nullptr,
+                                                                       /*logical_offset=*/0, expert_size)) {
+                                    throw std::runtime_error("SYCL host expert logical range publication failed");
+                                }
                                 remembered_handle = true;
                             }
                         }
@@ -29524,8 +29556,11 @@ static void ggml_sycl_preload_model_weights() {
                         for (int64_t e = 0; e < n_experts; ++e) {
                             ggml_sycl::mem_handle & handle = bulk_handles[static_cast<size_t>(e)];
                             if (handle.resolve().ptr) {
-                                extra->remember_moe_storage_handle(static_cast<int>(e), bulk_layout, std::move(handle),
-                                                                   &bulk_result.event);
+                                if (!extra->remember_moe_storage_handle(static_cast<int>(e), bulk_layout,
+                                                                       std::move(handle), &bulk_result.event,
+                                                                       /*logical_offset=*/0, bulk_expert_bytes)) {
+                                    return false;
+                                }
                             }
                         }
 
@@ -29747,8 +29782,11 @@ static void ggml_sycl_preload_model_weights() {
                                 }
                                 if (alt_result.ok && alt_result.ptr) {
                                     if (alt_handle.resolve().ptr) {
-                                        extra->remember_moe_storage_handle(static_cast<int>(e), alt_preload_layout,
-                                                                           std::move(alt_handle), &alt_result.event);
+                                        if (!extra->remember_moe_storage_handle(static_cast<int>(e), alt_preload_layout,
+                                                                               std::move(alt_handle), &alt_result.event,
+                                                                               /*logical_offset=*/0, alt_preload_bytes)) {
+                                            throw std::runtime_error("SYCL alternate expert logical range publication failed");
+                                        }
                                     }
                                     total_bytes += alt_preload_bytes;
                                     weight_device_bytes[device] += alt_preload_bytes;
@@ -30230,8 +30268,12 @@ static void ggml_sycl_preload_model_weights() {
                             break;
                         }
                         if (handle.resolve().ptr) {
-                            extra->remember_moe_storage_handle(e, GGML_LAYOUT_MXFP4_DPAS, std::move(handle),
-                                                               &result.event);
+                            if (!extra->remember_moe_storage_handle(e, GGML_LAYOUT_MXFP4_DPAS, std::move(handle),
+                                                                   &result.event, /*logical_offset=*/0,
+                                                                   expert_dpas_bytes)) {
+                                all_staged = false;
+                                break;
+                            }
                         }
                         staged_experts.push_back(e);
                         s1_push_event(
@@ -30262,8 +30304,15 @@ static void ggml_sycl_preload_model_weights() {
                                 ggml_sycl_fill_reordered_host, &rollback_ctx, s1_preload_q, &rollback_handle);
                             if (rollback.ok && rollback.ptr) {
                                 if (rollback_handle.resolve().ptr) {
-                                    extra->remember_moe_storage_handle(e, base_layout, std::move(rollback_handle),
-                                                                       &rollback.event);
+                                    const size_t rollback_logical_bytes = base_layout == GGML_LAYOUT_AOS ?
+                                                                              static_cast<size_t>(tensor->nb[2]) :
+                                                                              expert_base_bytes;
+                                    if (!extra->remember_moe_storage_handle(e, base_layout,
+                                                                           std::move(rollback_handle), &rollback.event,
+                                                                           /*logical_offset=*/0,
+                                                                           rollback_logical_bytes)) {
+                                        continue;
+                                    }
                                 }
                                 s1_push_event(
                                     rollback.event,
@@ -52371,8 +52420,12 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
                     rollback_to_soa("bulk-xmx-invalid-handle");
                     return false;
                 }
-                extra->remember_moe_storage_handle(static_cast<int>(e), target_layout, std::move(handle),
-                                                   &bulk_result.event);
+                if (!extra->remember_moe_storage_handle(static_cast<int>(e), target_layout, std::move(handle),
+                                                        &bulk_result.event, /*logical_offset=*/0,
+                                                        dst_expert_bytes)) {
+                    rollback_to_soa("bulk-xmx-logical-range-rejected");
+                    return false;
+                }
             }
             ready_events.push_back(bulk_result.event);
             materialized = expert_count;
@@ -52504,8 +52557,12 @@ static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * sr
                             rollback_to_soa("bulk-down-i8-invalid-chunk-handle");
                             return false;
                         }
-                        extra->remember_moe_storage_handle(static_cast<int>(chunk_start + i), target_layout,
-                                                           std::move(handle), &chunk_result.event);
+                        if (!extra->remember_moe_storage_handle(static_cast<int>(chunk_start + i), target_layout,
+                                                               std::move(handle), &chunk_result.event,
+                                                               /*logical_offset=*/0, dst_expert_bytes)) {
+                            rollback_to_soa("bulk-down-i8-logical-range-rejected");
+                            return false;
+                        }
                     }
                     ready_events.push_back(chunk_result.event);
                     materialized += chunk_count;

@@ -5,6 +5,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
 PREFETCH_HEADER = ROOT / "ggml/src/ggml-sycl/expert-prefetch.hpp"
 PREFETCH_SOURCE = ROOT / "ggml/src/ggml-sycl/expert-prefetch.cpp"
 LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
@@ -64,6 +65,8 @@ def violations(source: str) -> list[str]:
     clearer = function(source, "static void ggml_backend_sycl_buffer_clear")
     route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route")
     storage_route = function(source, "static bool ggml_sycl_try_moe_storage_handle_route")
+    common = COMMON.read_text()
+    logical_resolver = function(common, "bool resolve_moe_storage_record")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
 
@@ -76,8 +79,10 @@ def violations(source: str) -> list[str]:
         "per-expert retained slice": "ctx->managed_handle.slice(slice_offset, expert_size)" in publish,
         "exact device": "expert_handle.device() != ctx->device" in publish,
         "exact canonical range": "expert_handle.size() != expert_size" in publish,
-        "producer logical range": "stored->logical_bytes == expected_size" in storage_route and "stored->logical_offset" in storage_route,
-        "padded allocation bounded": "stored->logical_bytes <= allocation_bytes - stored->logical_offset" in storage_route,
+        "producer logical range": "record->logical_bytes != expected_bytes" in logical_resolver,
+        "padded allocation bounded": "record->logical_bytes > record->handle.size() - record->logical_offset" in logical_resolver,
+        "central logical resolver": "resolve_moe_storage_record" in storage_route and "logical.ptr" in storage_route,
+        "bounded logical lease": "record->handle.slice(record->logical_offset, record->logical_bytes)" in logical_resolver,
         "stable identity": "!expert_handle.has_stable_owner_identity()" in publish,
         "canonical registration": "remember_moe_storage_handle" in publish,
         "transaction prebuild": "replacement.reserve(expert_count)" in publish,
@@ -96,8 +101,8 @@ def violations(source: str) -> list[str]:
         "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
         "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
         "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("cache->resolve_expert"),
-        "resolver retains canonical lease": "route.lease" in route and "std::move(handle)" in source,
-        "resolver propagates ready event": "route.has_ready_event = stored->has_ready_event" in source,
+        "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
+        "resolver propagates ready event": "route.has_ready_event = logical.has_ready_event" in storage_route,
         "Q1/NVFP4 executor gate remains disabled": "q1_nvfp4_direct_b70_validated = false" in source,
         "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
@@ -259,6 +264,33 @@ def test_real_sycl_owned_slice_lifecycle_is_registered() -> None:
     assert retained_reset.end() < final_reclamation
 
 
+def test_mandatory_ranges_reach_pointer_table_and_dpas_rollback() -> None:
+    source = SOURCE.read_text()
+    common = COMMON.read_text()
+    registration = function(common, "bool remember_moe_storage_handle")
+    signature = registration[:registration.index("{")]
+    assert "logical_offset =" not in signature
+    assert "logical_bytes =" not in signature
+    assert signature.startswith("bool remember_moe_storage_handle")
+
+    pointer_test = function(source, "bool test_moe_ptr_table_does_not_persist_pointer_cache")
+    for witness in (
+        "constexpr size_t logical_offset = 64",
+        "logical_offset, data.size()",
+        "expected_ptr = static_cast<uint8_t *>(padded_base.ptr) + logical_offset",
+        "uploaded_ptr == expected_ptr",
+    ):
+        assert witness in pointer_test, witness
+
+    rollback_start = source.index("action=stage-dpas-down")
+    rollback_end = source.index("dpas_down_tensors++", rollback_start)
+    rollback = source[rollback_start:rollback_end]
+    assert "base_layout == GGML_LAYOUT_AOS" in rollback
+    assert "static_cast<size_t>(tensor->nb[2])" in rollback
+    assert "expert_base_bytes" in rollback
+    assert "/*logical_offset=*/0" in rollback
+
+
 def test_mutations_are_witnessed() -> None:
     source = SOURCE.read_text()
     mutations = [
@@ -266,8 +298,8 @@ def test_mutations_are_witnessed() -> None:
                        "ggml_sycl::mem_handle::from_direct(reinterpret_cast<void *>(tensor_begin + expert * expert_size), GGML_LAYOUT_AOS, true, ctx->device)", 1),
         source.replace("expert_handle.device() != ctx->device ||", "false ||", 1),
         source.replace("expert_handle.size() != expert_size ||", "false ||", 1),
-        source.replace("stored->logical_bytes == expected_size", "true", 1),
-        source.replace("stored->logical_bytes <= allocation_bytes - stored->logical_offset", "true", 1),
+        source.replace("resolve_moe_storage_record(expert_id, layout, owner, expected_size, &logical)",
+                       "false", 1),
         source.replace("if (!src0->name || src0->name[0] == '\\0')", "if (false)", 1),
         source.replace("!expert_handle.has_stable_owner_identity()", "false", 1),
         source.replace("is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)",

@@ -3307,9 +3307,18 @@ struct ggml_tensor_extra_gpu {
         payload.assign(count, nullptr);
         for (size_t i = 0; i < count; ++i) {
             ggml_sycl::mem_handle handle = handles[i];
+            void *                logical_ptr = nullptr;
             if (require_layout) {
-                if (const auto * layout_record = find_moe_storage_handle_on_device(static_cast<int>(i), layout, dev)) {
-                    handle = layout_record->handle;
+                const auto * layout_record = find_moe_storage_handle_on_device(static_cast<int>(i), layout, dev);
+                resolved_moe_expert_storage_record logical{};
+                if (layout_record && resolve_moe_storage_record(static_cast<int>(i), layout, dev,
+                                                                 layout_record->logical_bytes, &logical)) {
+                    handle      = logical.logical_handle;
+                    logical_ptr = logical.ptr;
+                } else if (require_all) {
+                    return false;
+                } else {
+                    continue;
                 }
             }
             if (!ggml_sycl_mem_handle_has_identity(handle)) {
@@ -3334,7 +3343,7 @@ struct ggml_tensor_extra_gpu {
                 }
                 continue;
             }
-            payload[i] = resolved.ptr;
+            payload[i] = logical_ptr ? logical_ptr : resolved.ptr;
         }
         return true;
     }
@@ -3407,19 +3416,16 @@ struct ggml_tensor_extra_gpu {
         sycl::event           ready_event;
     };
 
-    void remember_moe_storage_handle(int                   expert_id,
+    bool remember_moe_storage_handle(int                   expert_id,
                                      ggml_layout_mode      layout,
                                      ggml_sycl::mem_handle h,
-                                     const sycl::event *   ready_event   = nullptr,
-                                     size_t                logical_offset = 0,
-                                     size_t                logical_bytes  = SIZE_MAX) {
+                                     const sycl::event *   ready_event,
+                                     size_t                logical_offset,
+                                     size_t                logical_bytes) {
         auto resolved = h.resolve();
-        if (logical_bytes == SIZE_MAX) {
-            logical_bytes = h.size();
-        }
         if (expert_id < 0 || !resolved.ptr || resolved.layout != layout || logical_bytes == 0 ||
             logical_offset > h.size() || logical_bytes > h.size() - logical_offset) {
-            return;
+            return false;
         }
         moe_expert_storage_record record;
         record.handle         = std::move(h);
@@ -3430,16 +3436,75 @@ struct ggml_tensor_extra_gpu {
             record.ready_event     = *ready_event;
         }
         auto &    records   = moe_expert_storage_handles[moe_storage_handle_key(expert_id, layout)];
-        const int new_owner = record.handle.device();
+        const int new_owner = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
         for (moe_expert_storage_record & existing : records) {
-            if (existing.handle.device() == new_owner) {
+            const auto existing_resolved = existing.handle.resolve();
+            const int  existing_owner = existing_resolved.on_device ? existing.handle.device() :
+                                                                    ggml_sycl::mem_handle::HOST_DEVICE;
+            if (existing_owner == new_owner) {
                 existing = std::move(record);
                 ++moe_expert_storage_generation;
-                return;
+                return true;
             }
         }
         records.push_back(std::move(record));
         ++moe_expert_storage_generation;
+        return true;
+    }
+
+    struct resolved_moe_expert_storage_record {
+        ggml_sycl::mem_handle logical_handle;
+        void *                ptr           = nullptr;
+        size_t                logical_bytes = 0;
+        bool                  on_device     = false;
+        bool                  has_ready_event = false;
+        sycl::event           ready_event;
+
+        explicit operator bool() const { return ptr != nullptr && logical_bytes != 0; }
+    };
+
+    // The only resolver for published logical expert records. It validates the
+    // allocation generation via resolve(), exact owner/layout, and the producer-
+    // minted logical range before returning a bounded slice. Consumers must use
+    // ptr/logical_handle from this result rather than resolving the record base.
+    bool resolve_moe_storage_record(int                                  expert_id,
+                                    ggml_layout_mode                     layout,
+                                    int                                  owner_device,
+                                    size_t                               expected_bytes,
+                                    resolved_moe_expert_storage_record * out) const {
+        if (!out) {
+            return false;
+        }
+        *out = {};
+        const moe_expert_storage_record * record =
+            find_moe_storage_handle_on_device(expert_id, layout, owner_device);
+        if (!record || expected_bytes == 0 || record->logical_bytes != expected_bytes ||
+            !record->handle.has_stable_owner_identity() ||
+            record->logical_offset > record->handle.size() ||
+            record->logical_bytes > record->handle.size() - record->logical_offset) {
+            return false;
+        }
+        const auto base = record->handle.resolve(owner_device);
+        if (!base.ptr || base.layout != layout ||
+            (owner_device == ggml_sycl::mem_handle::HOST_DEVICE ? base.on_device :
+             (!base.on_device || record->handle.device() != owner_device))) {
+            return false;
+        }
+        ggml_sycl::mem_handle logical = record->handle.slice(record->logical_offset, record->logical_bytes);
+        const auto            resolved = logical.resolve(owner_device);
+        if (!resolved.ptr || resolved.layout != layout || resolved.on_device != base.on_device ||
+            resolved.ptr != static_cast<uint8_t *>(base.ptr) + record->logical_offset) {
+            return false;
+        }
+        out->logical_handle = std::move(logical);
+        out->ptr            = resolved.ptr;
+        out->logical_bytes  = record->logical_bytes;
+        out->on_device      = resolved.on_device;
+        out->has_ready_event = record->has_ready_event;
+        if (record->has_ready_event) {
+            out->ready_event = record->ready_event;
+        }
+        return true;
     }
 
     const moe_expert_storage_record * find_moe_storage_handle(int expert_id, ggml_layout_mode layout) const {
@@ -3464,7 +3529,9 @@ struct ggml_tensor_extra_gpu {
             return nullptr;
         }
         for (const moe_expert_storage_record & record : it->second) {
-            if (record.handle.device() == owner_device) {
+            const auto resolved = record.handle.resolve();
+            const int  owner = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+            if (owner == owner_device) {
                 return &record;
             }
         }
@@ -3483,7 +3550,10 @@ struct ggml_tensor_extra_gpu {
             const size_t before  = records.size();
             records.erase(std::remove_if(records.begin(), records.end(),
                                          [&](const moe_expert_storage_record & record) {
-                                             return record.handle.device() == owner_device;
+                                             const auto resolved = record.handle.resolve();
+                                             const int owner = resolved.on_device ? record.handle.device() :
+                                                                                   ggml_sycl::mem_handle::HOST_DEVICE;
+                                             return owner == owner_device;
                                          }),
                           records.end());
             erased = records.size() != before;
@@ -3532,7 +3602,9 @@ struct ggml_tensor_extra_gpu {
 
         auto & records = it->second;
         auto   rec_it  = std::find_if(records.begin(), records.end(), [&](const moe_expert_storage_record & record) {
-            return record.handle.device() == owner_device;
+            const auto resolved = record.handle.resolve();
+            const int owner = resolved.on_device ? record.handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
+            return owner == owner_device;
         });
         if (rec_it == records.end()) {
             return false;
@@ -3578,7 +3650,10 @@ struct ggml_tensor_extra_gpu {
             const size_t before  = records.size();
             records.erase(std::remove_if(records.begin(), records.end(),
                                          [&](const moe_expert_storage_record & record) {
-                                             return record.handle.device() == owner_device;
+                                             const auto resolved = record.handle.resolve();
+                                             const int owner = resolved.on_device ? record.handle.device() :
+                                                                                   ggml_sycl::mem_handle::HOST_DEVICE;
+                                             return owner == owner_device;
                                          }),
                           records.end());
             if (records.size() != before) {
