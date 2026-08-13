@@ -39,9 +39,15 @@ alloc_metadata metadata(uint64_t id) {
     value.size = 256;
     value.device = 0;
     value.id = id;
-    value.alloc_id = id;
+    value.generation = 7;
+    value.offset = 64;
+    value.extent = 512;
     value.epoch_id = 1;
-    value.tier = alloc_tier::HOST_PINNED;
+    value.kind = alloc_tier::HOST_PINNED;
+    value.role = alloc_role::STAGING;
+    value.category = runtime_category::STAGING;
+    value.zone = vram_zone_id::RUNTIME;
+    value.host_zone = host_zone_id::STAGING;
     return value;
 }
 
@@ -231,6 +237,53 @@ void intrusive_registry_row_rejects_legacy_claim() {
                  "PASS intrusive-exact-row-claim\n";
 }
 
+void exact_registry_key_rejects_every_field_mismatch() {
+    const alloc_metadata exact = metadata(81);
+    check(allocation_registry_test_publish(exact, true), "exact-key test row publication failed");
+
+    std::vector<alloc_metadata> wrong;
+    wrong.reserve(11);
+    wrong.push_back(exact); wrong.back().device++;
+    wrong.push_back(exact); wrong.back().kind = alloc_tier::DEVICE_VRAM;
+    wrong.push_back(exact); wrong.back().role = alloc_role::COMPUTE;
+    wrong.push_back(exact); wrong.back().category = runtime_category::COMPUTE;
+    wrong.push_back(exact); wrong.back().id++;
+    wrong.push_back(exact); wrong.back().generation++;
+    wrong.push_back(exact); wrong.back().zone = vram_zone_id::SCRATCH;
+    wrong.push_back(exact); wrong.back().offset++;
+    wrong.push_back(exact); wrong.back().extent++;
+    wrong.push_back(exact); wrong.back().size++;
+    wrong.push_back(exact); wrong.back().host_zone = host_zone_id::SCRATCH;
+
+    for (const alloc_metadata & mismatch : wrong) {
+        check(allocation_registry_test_claim(mismatch, true) == registered_release_status::KEY_MISMATCH,
+              "incomplete exact key accepted a mismatched field");
+    }
+    check(allocation_registry_test_claim(exact, true) == registered_release_status::RELEASED,
+          "mismatch damaged or removed the live registry row");
+    allocation_registry_test_erase(exact.ptr);
+    std::cout << "PASS exact-key-all-fields-mismatch-rejected\n"
+                 "PASS exact-key-mismatch-row-remains-live\n";
+}
+
+void concurrent_registry_claim_reports_busy() {
+    const alloc_metadata exact = metadata(82);
+    check(allocation_registry_test_publish(exact, true), "concurrent test row publication failed");
+    allocation_registry_test_pause_claim(true);
+    registered_release_status first = registered_release_status::NOT_FOUND;
+    std::thread releaser([&] { first = allocation_registry_test_claim(exact, true); });
+    while (!allocation_registry_test_claim_reached()) std::this_thread::yield();
+    check(allocation_registry_test_claim(exact, true) == registered_release_status::BUSY,
+          "second exact claimant did not observe BUSY during physical release");
+    allocation_registry_test_pause_claim(false);
+    releaser.join();
+    check(first == registered_release_status::RELEASED, "paused exact claimant did not complete");
+    check(allocation_registry_test_claim(exact, true) == registered_release_status::RELEASED,
+          "completed claim did not restore deterministic test row");
+    allocation_registry_test_erase(exact.ptr);
+    std::cout << "PASS concurrent-exact-registry-claim-busy\n";
+}
+
 void invalid_request_has_zero_coordinator_census() {
     const size_t before = allocation_coordinator_test_count();
     alloc_request invalid{};
@@ -296,6 +349,8 @@ int main() {
     failure_accounting_and_metadata_nonownership();
     coordinator_close_linearizes_with_registration();
     intrusive_registry_row_rejects_legacy_claim();
+    exact_registry_key_rejects_every_field_mismatch();
+    concurrent_registry_claim_reports_busy();
     invalid_request_has_zero_coordinator_census();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;

@@ -3996,9 +3996,33 @@ struct alloc_metadata {
     bool         zone_managed = false;
     host_zone_id host_zone    = host_zone_id::COUNT;
 
-    // Stable exact-allocation key. Routing/diagnostic fields are intentionally
-    // excluded: they do not change allocation identity or geometry.
-    auto key() const { return std::make_tuple(ptr, size, device, kind, id, generation, zone, offset, extent); }
+    struct exact_key {
+        void *           ptr;
+        int              device;
+        alloc_tier       kind;
+        alloc_role       role;
+        runtime_category category;
+        uint64_t         id;
+        uint64_t         generation;
+        vram_zone_id     zone;
+        size_t           offset;
+        size_t           extent;
+        size_t           size;
+        host_zone_id     host_zone;
+
+        friend bool operator==(const exact_key & lhs, const exact_key & rhs) noexcept {
+            return std::tie(lhs.ptr, lhs.device, lhs.kind, lhs.role, lhs.category, lhs.id, lhs.generation, lhs.zone,
+                            lhs.offset, lhs.extent, lhs.size, lhs.host_zone) ==
+                   std::tie(rhs.ptr, rhs.device, rhs.kind, rhs.role, rhs.category, rhs.id, rhs.generation, rhs.zone,
+                            rhs.offset, rhs.extent, rhs.size, rhs.host_zone);
+        }
+    };
+
+    // Canonical exact allocation identity and geometry. epoch_id and
+    // zone_managed are lifecycle/routing annotations, not release-key fields.
+    exact_key key() const noexcept {
+        return { ptr, device, kind, role, category, id, generation, zone, offset, extent, size, host_zone };
+    }
 
     friend bool operator==(const alloc_metadata & lhs, const alloc_metadata & rhs) { return lhs.key() == rhs.key(); }
     friend bool operator!=(const alloc_metadata & lhs, const alloc_metadata & rhs) { return !(lhs == rhs); }
@@ -4201,6 +4225,11 @@ enum class registered_release_status : uint8_t {
     LEASE_REFUSED,
 };
 
+enum class registered_release_mode : uint8_t {
+    LEGACY = 0,
+    INTRUSIVE,
+};
+
 enum class allocation_error : uint8_t {
     NONE = 0,
     INVALID_REQUEST,
@@ -4243,6 +4272,8 @@ bool allocation_coordinator_test_try_register(
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intrusive) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
+void allocation_registry_test_pause_claim(bool pause) noexcept;
+bool allocation_registry_test_claim_reached() noexcept;
 void allocation_registry_test_erase(void * ptr) noexcept;
 #endif
 
@@ -4263,9 +4294,17 @@ bool       unified_alloc(const alloc_request & req, alloc_handle * out);
 mem_handle unified_allocate(const alloc_request & req);
 bool       unified_free(const alloc_handle & handle);
 bool       unified_free_ptr(void * ptr, int expected_device = -1);
-// Claims the exact LIVE registry row before physical release. The row is
-// RELEASING while detached release adjuncts are in use; refusal restores LIVE.
+// Full-handle release: every canonical alloc_metadata::key() field must match.
+// The row is RELEASING while detached release adjuncts are in use; refusal
+// restores LIVE only when the exact row and claim generation still match.
+registered_release_status release_registered_allocation_exact(
+    const alloc_metadata & exact_key, registered_release_mode mode);
+// Compatibility spelling is exact legacy release; it never infers wildcards
+// from zero-valued metadata fields.
 registered_release_status release_registered_allocation(const alloc_metadata & exact_key);
+// Explicit raw-deallocator facade. Only ptr and an optional device are checked;
+// metadata-bearing callers must use release_registered_allocation_exact().
+registered_release_status release_registered_pointer(void * ptr, int expected_device = -1);
 // Transfer a refused owning handle to its device cache's durable retry queue.
 // Returns false without taking ownership when no live cache can accept it.
 bool       unified_defer_free(alloc_handle * handle);

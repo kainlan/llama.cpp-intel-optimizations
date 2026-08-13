@@ -736,7 +736,7 @@ static std::unordered_map<int, std::shared_ptr<allocation_release_coordinator>> 
 thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
 
 static registered_release_status release_registered_allocation_owned(
-    const alloc_metadata & exact_key, bool intrusive_claim);
+    const alloc_metadata & exact_key, registered_release_mode mode, bool require_exact_key);
 
 struct allocation_owner_internal_access {
     static alloc_owner_control * create(const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
@@ -859,7 +859,8 @@ release_attempt allocation_release_coordinator::release_physical(alloc_owner_con
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (test_backend_) return test_backend_(control->metadata(), test_backend_context_);
 #endif
-    const registered_release_status status = release_registered_allocation_owned(control->metadata(), true);
+    const registered_release_status status = release_registered_allocation_owned(
+        control->metadata(), registered_release_mode::INTRUSIVE, true);
     return status == registered_release_status::RELEASED ?
         release_attempt{ release_attempt_status::RELEASED } :
         release_attempt{ release_attempt_status::RETRY_SCHEDULED };
@@ -1033,9 +1034,16 @@ struct runtime_alloc_record {
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
     vram_zone_id               vram_zone        = vram_zone_id::COUNT;  // Non-COUNT: zone_free on unified_free
     std::string                cohort_id;
+    // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
+    // erase must match this as well as the complete allocation key.
+    uint64_t                   release_generation = 0;
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+static std::atomic<bool> g_test_pause_registry_claim{ false };
+static std::atomic<bool> g_test_registry_claim_reached{ false };
+#endif
 static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 
 struct arena_runtime_publication_context {
@@ -3604,12 +3612,8 @@ bool unified_cache::shutdown_resources() {
             if (dma_staging_allocs_[i].owner.valid()) {
                 dma_staging_allocs_[i].owner = {};
             } else {
-                alloc_metadata exact{};
-                exact.ptr      = dma_staging_allocs_[i].ptr;
-                exact.size     = dma_staging_allocs_[i].size;
-                exact.device   = dma_staging_allocs_[i].device;
-                exact.alloc_id = dma_staging_allocs_[i].alloc_id;
-                if (release_registered_allocation(exact) != registered_release_status::RELEASED) {
+                if (release_registered_pointer(dma_staging_allocs_[i].ptr, dma_staging_allocs_[i].device) !=
+                    registered_release_status::RELEASED) {
                     GGML_LOG_ERROR("[UNIFIED-CACHE] destructor failed to release DMA staging ptr=%p\n",
                                    dma_staging_allocs_[i].ptr);
                     GGML_ASSERT(false && "DMA staging release failed");
@@ -3658,12 +3662,8 @@ bool unified_cache::shutdown_resources() {
                 if (entry.handle.owner.valid()) {
                     entry.handle.owner = {};
                 } else {
-                    alloc_metadata exact{};
-                    exact.ptr      = entry.handle.ptr;
-                    exact.size     = entry.handle.size;
-                    exact.device   = entry.handle.device;
-                    exact.alloc_id = entry.handle.alloc_id;
-                    if (release_registered_allocation(exact) != registered_release_status::RELEASED) {
+                    if (release_registered_pointer(entry.handle.ptr, entry.handle.device) !=
+                        registered_release_status::RELEASED) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] destructor failed to release deferred managed ptr=%p\n",
                                        entry.ptr);
                         GGML_ASSERT(false && "deferred managed release failed");
@@ -9334,12 +9334,8 @@ void unified_cache::process_deferred_frees_locked() {
                 if (it->handle.owner.valid()) {
                     it->handle.owner = {};
                 } else {
-                    alloc_metadata exact{};
-                    exact.ptr      = it->handle.ptr;
-                    exact.size     = it->handle.size;
-                    exact.device   = it->handle.device;
-                    exact.alloc_id = it->handle.alloc_id;
-                    if (release_registered_allocation(exact) != registered_release_status::RELEASED) {
+                    if (release_registered_pointer(it->handle.ptr, it->handle.device) !=
+                        registered_release_status::RELEASED) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] deferred managed free failed ptr=%p size=%zu\n", it->ptr,
                                        it->size);
                         GGML_ASSERT(false && "deferred managed release failed");
@@ -9397,12 +9393,8 @@ void unified_cache::process_deferred_frees_locked() {
                 if (host_it->handle.owner.valid()) {
                     host_it->handle.owner = {};
                 } else {
-                    alloc_metadata exact{};
-                    exact.ptr      = host_it->handle.ptr;
-                    exact.size     = host_it->handle.size;
-                    exact.device   = host_it->handle.device;
-                    exact.alloc_id = host_it->handle.alloc_id;
-                    if (release_registered_allocation(exact) != registered_release_status::RELEASED) {
+                    if (release_registered_pointer(host_it->handle.ptr, host_it->handle.device) !=
+                        registered_release_status::RELEASED) {
                         GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host tracked free failed ptr=%p size=%zu\n",
                                        host_it->ptr, host_it->size);
                         GGML_ASSERT(false && "deferred host tracked free failed");
@@ -12676,29 +12668,26 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
 }
 
 static registered_release_status release_registered_allocation_owned(
-    const alloc_metadata & exact_key, bool intrusive_claim) {
-    if (!exact_key.ptr) return registered_release_status::NOT_FOUND;
+    const alloc_metadata & requested, registered_release_mode mode, bool require_exact_key) {
+    if (!requested.ptr) return registered_release_status::NOT_FOUND;
 
     runtime_alloc_record detached;
     {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        auto it = g_runtime_alloc_registry.find(exact_key.ptr);
+        auto it = g_runtime_alloc_registry.find(requested.ptr);
         if (it == g_runtime_alloc_registry.end()) return registered_release_status::NOT_FOUND;
         if (it->second.state == runtime_alloc_state::RELEASING) return registered_release_status::BUSY;
-        const runtime_alloc_ownership expected = intrusive_claim ? runtime_alloc_ownership::INTRUSIVE :
-                                                                   runtime_alloc_ownership::LEGACY;
+        const runtime_alloc_ownership expected = mode == registered_release_mode::INTRUSIVE ?
+                                                     runtime_alloc_ownership::INTRUSIVE :
+                                                     runtime_alloc_ownership::LEGACY;
         if (it->second.ownership != expected) return registered_release_status::OWNERSHIP_MISMATCH;
-        // A partially populated key is accepted only for the legacy raw-pointer
-        // facade. Any populated identity/geometry component must match exactly.
         const alloc_metadata & live = it->second.handle;
-        if ((exact_key.id && exact_key.id != live.id) ||
-            (exact_key.size && exact_key.size != live.size) ||
-            (exact_key.device >= 0 && exact_key.device != live.device) ||
-            (exact_key.generation && exact_key.generation != live.generation) ||
-            (exact_key.extent && exact_key.extent != live.extent)) {
+        if (require_exact_key ? !(requested.key() == live.key()) :
+                                (requested.device >= 0 && requested.device != live.device)) {
             return registered_release_status::KEY_MISMATCH;
         }
-        detached.handle = it->second.handle;
+        if (it->second.release_generation == UINT64_MAX) return registered_release_status::BUSY;
+        detached.handle = live;
         detached.queue = it->second.queue;
         detached.queue_keepalive = it->second.queue_keepalive;
         detached.uses_pinned_pool = it->second.uses_pinned_pool;
@@ -12706,6 +12695,7 @@ static registered_release_status release_registered_allocation_owned(
         detached.from_arena = it->second.from_arena;
         detached.vram_zone = it->second.vram_zone;
         detached.cohort_id = it->second.cohort_id;
+        detached.release_generation = ++it->second.release_generation;
         it->second.state = runtime_alloc_state::RELEASING;
         // Release-only adjuncts have a single claimant and are never copied to
         // lookup output or another concurrent releaser.
@@ -12714,8 +12704,9 @@ static registered_release_status release_registered_allocation_owned(
 
     if (!unified_free_record(detached)) {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        auto it = g_runtime_alloc_registry.find(exact_key.ptr);
-        if (it != g_runtime_alloc_registry.end() && it->second.handle.id == detached.handle.id &&
+        auto it = g_runtime_alloc_registry.find(requested.ptr);
+        if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
+            it->second.release_generation == detached.release_generation &&
             it->second.state == runtime_alloc_state::RELEASING) {
             it->second.owned_segments = std::move(detached.owned_segments);
             it->second.state = runtime_alloc_state::LIVE;
@@ -12724,16 +12715,29 @@ static registered_release_status release_registered_allocation_owned(
     }
 
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    auto it = g_runtime_alloc_registry.find(exact_key.ptr);
-    if (it != g_runtime_alloc_registry.end() && it->second.handle.id == detached.handle.id &&
+    auto it = g_runtime_alloc_registry.find(requested.ptr);
+    if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == detached.handle.key() &&
+        it->second.release_generation == detached.release_generation &&
         it->second.state == runtime_alloc_state::RELEASING) {
         g_runtime_alloc_registry.erase(it);
     }
     return registered_release_status::RELEASED;
 }
 
+registered_release_status release_registered_allocation_exact(
+    const alloc_metadata & exact_key, registered_release_mode mode) {
+    return release_registered_allocation_owned(exact_key, mode, true);
+}
+
 registered_release_status release_registered_allocation(const alloc_metadata & exact_key) {
-    return release_registered_allocation_owned(exact_key, false);
+    return release_registered_allocation_exact(exact_key, registered_release_mode::LEGACY);
+}
+
+registered_release_status release_registered_pointer(void * ptr, int expected_device) {
+    alloc_metadata pointer_key{};
+    pointer_key.ptr = ptr;
+    pointer_key.device = expected_device;
+    return release_registered_allocation_owned(pointer_key, registered_release_mode::LEGACY, false);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -12753,19 +12757,42 @@ bool allocation_registry_test_publish(const alloc_metadata & metadata, bool intr
 registered_release_status allocation_registry_test_claim(
     const alloc_metadata & exact_key, bool intrusive) noexcept {
     if (!exact_key.ptr) return registered_release_status::NOT_FOUND;
-    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    auto it = g_runtime_alloc_registry.find(exact_key.ptr);
-    if (it == g_runtime_alloc_registry.end()) return registered_release_status::NOT_FOUND;
-    if (it->second.state != runtime_alloc_state::LIVE) return registered_release_status::BUSY;
-    const runtime_alloc_ownership expected = intrusive ? runtime_alloc_ownership::INTRUSIVE :
-                                                         runtime_alloc_ownership::LEGACY;
-    if (it->second.ownership != expected) return registered_release_status::OWNERSHIP_MISMATCH;
-    if (it->second.handle != exact_key) return registered_release_status::KEY_MISMATCH;
-    // Exercise the same atomic LIVE -> RELEASING ownership claim without
-    // touching fake physical memory, then restore the row for test cleanup.
-    it->second.state = runtime_alloc_state::RELEASING;
-    it->second.state = runtime_alloc_state::LIVE;
+    uint64_t claim_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        auto it = g_runtime_alloc_registry.find(exact_key.ptr);
+        if (it == g_runtime_alloc_registry.end()) return registered_release_status::NOT_FOUND;
+        if (it->second.state != runtime_alloc_state::LIVE) return registered_release_status::BUSY;
+        const runtime_alloc_ownership expected = intrusive ? runtime_alloc_ownership::INTRUSIVE :
+                                                             runtime_alloc_ownership::LEGACY;
+        if (it->second.ownership != expected) return registered_release_status::OWNERSHIP_MISMATCH;
+        if (!(it->second.handle.key() == exact_key.key())) return registered_release_status::KEY_MISMATCH;
+        if (it->second.release_generation == UINT64_MAX) return registered_release_status::BUSY;
+        claim_generation = ++it->second.release_generation;
+        it->second.state = runtime_alloc_state::RELEASING;
+    }
+    // Deterministic physical-release window: the row remains atomically claimed
+    // while another thread attempts the same exact release.
+    g_test_registry_claim_reached.store(true, std::memory_order_release);
+    while (g_test_pause_registry_claim.load(std::memory_order_acquire)) std::this_thread::yield();
+    {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        auto it = g_runtime_alloc_registry.find(exact_key.ptr);
+        if (it != g_runtime_alloc_registry.end() && it->second.handle.key() == exact_key.key() &&
+            it->second.release_generation == claim_generation && it->second.state == runtime_alloc_state::RELEASING) {
+            it->second.state = runtime_alloc_state::LIVE;
+        }
+    }
     return registered_release_status::RELEASED;
+}
+
+void allocation_registry_test_pause_claim(bool pause) noexcept {
+    if (pause) g_test_registry_claim_reached.store(false, std::memory_order_release);
+    g_test_pause_registry_claim.store(pause, std::memory_order_release);
+}
+
+bool allocation_registry_test_claim_reached() noexcept {
+    return g_test_registry_claim_reached.load(std::memory_order_acquire);
 }
 
 void allocation_registry_test_erase(void * ptr) noexcept {
@@ -12776,11 +12803,7 @@ void allocation_registry_test_erase(void * ptr) noexcept {
 
 bool unified_free_ptr(void * ptr, int expected_device) {
     if (!ptr) return true;
-    alloc_metadata exact{};
-    exact.ptr = ptr;
-    exact.device = expected_device;
-    const registered_release_status status = release_registered_allocation(exact);
-    return status == registered_release_status::RELEASED;
+    return release_registered_pointer(ptr, expected_device) == registered_release_status::RELEASED;
 }
 
 bool unified_defer_free(alloc_handle * handle) {
