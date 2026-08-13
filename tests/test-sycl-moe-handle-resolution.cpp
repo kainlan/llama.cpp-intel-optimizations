@@ -18,6 +18,10 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+namespace ggml_sycl {
+bool test_moe_storage_handle_first_route_and_negatives();
+}
+
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
@@ -531,6 +535,13 @@ static bool test_exact_wrapper_owner_resolution() {
     return true;
 }
 
+static bool test_moe_storage_handle_first_route_and_negatives() {
+    printf("\n=== Test: storage-handle-first AoS route and fail-closed variants ===\n");
+    TEST_ASSERT(ggml_sycl::test_moe_storage_handle_first_route_and_negatives(),
+                "stable AoS owner route or unstable/stale/device/layout/range/plan negative failed");
+    return true;
+}
+
 static bool test_moe_route_preserves_ready_event_for_chaining() {
     printf("\n=== Test: MoE route ready-event chaining contract ===\n");
     TEST_ASSERT(ggml_sycl::test_moe_route_preserves_ready_event_for_chaining(),
@@ -660,6 +671,8 @@ int main() {
             ok &= test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing();
             lifecycle.reset_candidate_plan(/*stage_empty_plan=*/true);
             ok &= test_moe_route_preserves_ready_event_for_chaining();
+            lifecycle.reset_candidate_plan(/*stage_empty_plan=*/true);
+            ok &= test_moe_storage_handle_first_route_and_negatives();
         }
     }
     ok &= test_direct_host_and_miss_resolution(*q);

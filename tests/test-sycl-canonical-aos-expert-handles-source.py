@@ -89,7 +89,9 @@ def violations(source: str) -> list[str]:
         "clear invalidates": "ggml_sycl_invalidate_backend_buffer_weights(ctx)" in clearer,
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
         "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
-        "resolver checks registered handles first": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("cache->resolve_expert"),
+        "resolver checks plan before registered handles": route.index("lookup_expert_placement") < route.index("ggml_sycl_try_moe_storage_handle_route"),
+        "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
+        "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("cache->resolve_expert"),
         "resolver retains canonical lease": "route.lease" in route and "std::move(handle)" in source,
         "resolver propagates ready event": "route.has_ready_event = stored->has_ready_event" in source,
         "Q1/NVFP4 executor gate remains disabled": "q1_nvfp4_direct_b70_validated = false" in source,
@@ -240,10 +242,17 @@ def test_real_sycl_owned_slice_lifecycle_is_registered() -> None:
         "owner.slice(expert_bytes, expert_bytes)",
         "expert.resolve(1)",
         "unified_lookup(base, &lookup)",
-        "retained = {}",
         "replacement_slice.stable_identity_hash() != old_identity",
     ):
         assert witness in test, witness
+
+    # Pin the named lease reset, not one alignment-sensitive spelling of it or
+    # an unrelated `handle = {}` elsewhere in the fixture. Reclamation must be
+    # checked only after that final retained owner is released.
+    retained_reset = re.search(r"\bretained\s*=\s*\{\s*\}\s*;", test)
+    assert retained_reset, "retained lease reset"
+    final_reclamation = test.index("TEST_ASSERT(!ggml_sycl::unified_lookup(base, &lookup)")
+    assert retained_reset.end() < final_reclamation
 
 
 def test_mutations_are_witnessed() -> None:

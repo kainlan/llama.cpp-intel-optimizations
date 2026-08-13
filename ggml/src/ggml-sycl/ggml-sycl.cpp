@@ -5323,7 +5323,8 @@ static std::vector<ggml_layout_mode> ggml_sycl_moe_resolve_layouts(ggml_layout_m
     return layouts;
 }
 
-static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra,
+static bool ggml_sycl_try_moe_storage_handle_route(const ggml_tensor *     tensor,
+                                                   ggml_tensor_extra_gpu * extra,
                                                    int                     current_device,
                                                    int                     expert_id,
                                                    ggml_layout_mode        layout,
@@ -5359,10 +5360,15 @@ static bool ggml_sycl_try_moe_storage_handle_route(ggml_tensor_extra_gpu * extra
             continue;
         }
 
-        ggml_sycl::mem_handle handle   = stored->handle;
-        auto                  resolved = handle.resolve();
-        if (!resolved.ptr || resolved.layout != layout) {
-            route.reason = expert_resolve_reason::LAYOUT_MISMATCH;
+        ggml_sycl::mem_handle handle = stored->handle;
+        const size_t expected_size = layout == GGML_LAYOUT_AOS ? static_cast<size_t>(tensor->nb[2]) :
+            ggml_sycl_layout_bytes_for_dims(tensor->type, tensor->ne[0], tensor->ne[1], layout,
+                                            owner == mem_handle::HOST_DEVICE ? current_device : owner);
+        auto resolved = handle.resolve(owner == mem_handle::HOST_DEVICE ? mem_handle::HOST_DEVICE : owner);
+        if (!handle.has_stable_owner_identity() || expected_size == 0 || handle.size() != expected_size ||
+            !resolved.ptr || resolved.layout != layout) {
+            route.reason = resolved.ptr && resolved.layout != layout ? expert_resolve_reason::LAYOUT_MISMATCH :
+                                                                       expert_resolve_reason::NOT_FOUND;
             continue;
         }
 
@@ -5437,13 +5443,10 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
         return route;
     }
 
-    const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
-    if (!base_key.valid) {
-        route.reason = expert_resolve_reason::INVALID_REQUEST;
-        return route;
-    }
-    std::vector<ggml_sycl_cache_id> canonical_keys = ggml_sycl_get_canonical_moe_expert_keys(src0, expert_id);
-    unified_cache *                 plan_cache     = get_unified_cache_for_device(current_device);
+    // Placement-plan authority is evaluated before either ownership route. A
+    // missing/mismatched plan must not be bypassed by a registered handle or a
+    // cache key.
+    unified_cache * plan_cache = get_unified_cache_for_device(current_device);
     bool                            current_device_planned_alternate = false;
     if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\0') {
         const auto placement =
@@ -5498,8 +5501,8 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
     expert_resolve_reason last_reason = expert_resolve_reason::NOT_FOUND;
 
     for (ggml_layout_mode layout : layouts) {
-        if (ggml_sycl_try_moe_storage_handle_route(extra, current_device, expert_id, layout, device_planned, host_only,
-                                                   current_device_planned_alternate, route)) {
+        if (ggml_sycl_try_moe_storage_handle_route(src0, extra, current_device, expert_id, layout, device_planned,
+                                                   host_only, current_device_planned_alternate, route)) {
             ggml_sycl_log_moe_layout_route(src0, current_device, expert_id, route);
             return route;
         }
@@ -5507,6 +5510,15 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
             last_reason = route.reason;
         }
     }
+
+    // Registered allocation-time handles do not depend on GGUF key recovery.
+    // A canonical base key is authority only for the unified-cache fallback.
+    const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
+    if (!base_key.valid) {
+        route.reason = expert_resolve_reason::INVALID_REQUEST;
+        return route;
+    }
+    std::vector<ggml_sycl_cache_id> canonical_keys = ggml_sycl_get_canonical_moe_expert_keys(src0, expert_id);
 
     for (int d : devices) {
         unified_cache * cache = get_unified_cache_for_device(d);
@@ -8695,6 +8707,151 @@ bool test_exact_wrapper_owner_matches(uint64_t wrapper_model_id, uint64_t expect
     return owner.model.value != 0 && owner.model.value == expected_model_id;
 }
 
+static void test_init_q8_moe_tensor(ggml_tensor & tensor, const char * name) {
+    tensor       = {};
+    tensor.type  = GGML_TYPE_Q8_0;
+    tensor.ne[0] = QK8_0;
+    tensor.ne[1] = 4;
+    tensor.ne[2] = 16;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = sizeof(block_q8_0);
+    tensor.nb[1] = sizeof(block_q8_0);
+    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
+    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
+    ggml_set_name(&tensor, name);
+    GGML_ASSERT(tensor.nb[0] == sizeof(block_q8_0));
+    GGML_ASSERT(ggml_nbytes(&tensor) >= static_cast<size_t>(tensor.ne[2]) * tensor.nb[2]);
+}
+
+bool test_moe_storage_handle_first_route_and_negatives() {
+    constexpr int expert_id = 3;
+    ggml_tensor   tensor{};
+    test_init_q8_moe_tensor(tensor, "");
+    ggml_tensor_extra_gpu extra{};
+    tensor.extra = &extra;
+
+    sycl::queue & q = ggml_sycl_get_device(0).default_queue();
+    const size_t expert_size = static_cast<size_t>(tensor.nb[2]);
+    alloc_request req{};
+    req.queue                          = &q;
+    req.device                         = 0;
+    req.size                           = expert_size;
+    req.intent.role                    = alloc_role::WEIGHT;
+    req.intent.constraints.must_device = true;
+    alloc_handle allocation{};
+    if (!unified_alloc(req, &allocation)) {
+        return false;
+    }
+    mem_handle stable = mem_handle::from_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS);
+    auto       resolved = stable.resolve(0);
+    if (!resolved.ptr || !stable.has_stable_owner_identity() || stable.size() != expert_size) {
+        return false;
+    }
+
+    const ggml_sycl_cache_id invalid_key = ggml_sycl_get_moe_expert_cache_key(&tensor, &extra, expert_id);
+    if (invalid_key.valid) {
+        return false;
+    }
+    auto clear_records = [&]() {
+        extra.moe_expert_storage_handles.clear();
+        ++extra.moe_expert_storage_generation;
+    };
+    auto route_closed = [&]() {
+        moe_expert_route route = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+        return !route.ptr && route.kind == moe_expert_route_kind::UNAVAILABLE;
+    };
+
+    // Positive: the stable allocation-time AoS owner is authoritative without
+    // inventing a canonical GGUF key.
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable);
+    moe_expert_route positive = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+    if (positive.ptr != resolved.ptr || positive.kind != moe_expert_route_kind::LOCAL_DEVICE ||
+        !positive.lease.stable_identity_equal(stable)) {
+        return false;
+    }
+
+    // Unstable DIRECT pointers are ABI values, not ownership authority.
+    clear_records();
+    extra.remember_moe_storage_handle(
+        expert_id, GGML_LAYOUT_AOS,
+        mem_handle::from_direct(resolved.ptr, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0));
+    if (!route_closed()) {
+        return false;
+    }
+
+    // A stale arena generation retains an identity-shaped handle but cannot
+    // resolve against the current arena generation.
+    clear_records();
+    ggml_tensor_extra_gpu::moe_expert_storage_record stale_record{};
+    stale_record.handle = mem_handle::from_arena_zone(static_cast<int>(vram_zone_id::RUNTIME), 0, expert_size, 0,
+                                                      UINT64_MAX, UINT64_MAX, expert_size);
+    extra.moe_expert_storage_handles[ggml_tensor_extra_gpu::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS)]
+        .push_back(std::move(stale_record));
+    if (!route_closed()) {
+        return false;
+    }
+
+    // Exact retained range is part of the registered route contract.
+    clear_records();
+    alloc_request range_req = req;
+    range_req.size          = expert_size + 1;
+    alloc_handle range_allocation{};
+    if (!unified_alloc(range_req, &range_allocation)) {
+        return false;
+    }
+    mem_handle range_owner = mem_handle::from_owned_alloc(std::move(range_allocation), GGML_LAYOUT_AOS);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner.slice(0, expert_size - 1));
+    if (!route_closed()) {
+        return false;
+    }
+
+    // A record indexed as AoS cannot smuggle a differently laid out owner.
+    clear_records();
+    alloc_handle layout_allocation{};
+    if (!unified_alloc(req, &layout_allocation)) {
+        return false;
+    }
+    mem_handle wrong_layout = mem_handle::from_owned_alloc(std::move(layout_allocation), GGML_LAYOUT_SOA);
+    ggml_tensor_extra_gpu::moe_expert_storage_record wrong_layout_record{};
+    wrong_layout_record.handle = wrong_layout;
+    extra.moe_expert_storage_handles[ggml_tensor_extra_gpu::moe_storage_handle_key(expert_id, GGML_LAYOUT_AOS)]
+        .push_back(std::move(wrong_layout_record));
+    if (!route_closed()) {
+        return false;
+    }
+
+    // Host ownership is a wrong-device route when no host placement admits it.
+    clear_records();
+    alloc_request host_req = req;
+    host_req.intent.constraints.must_device      = false;
+    host_req.intent.constraints.must_host_pinned = true;
+    alloc_handle host_allocation{};
+    if (!unified_alloc(host_req, &host_allocation)) {
+        return false;
+    }
+    mem_handle host_owner = mem_handle::from_owned_alloc(std::move(host_allocation), GGML_LAYOUT_AOS);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, host_owner);
+    if (!route_closed()) {
+        return false;
+    }
+
+    // Finally prove placement-plan authority wins over the otherwise valid
+    // device handle: this expert is explicitly host-planned.
+    clear_records();
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, stable);
+    ggml_set_name(&tensor, "blk.31.ffn_gate_exps.weight");
+    placement_plan plan{};
+    plan.entries.push_back({ "blk.31.ffn_gate_exps.weight", expert_size, expert_size, 0,
+                             placement_priority::MOE_GATE_PROJ, 31, expert_id, expert_tensor_role::GATE,
+                             false, -1 });
+    plan.expert_device[31][expert_id] = -1;
+    plan.build_index();
+    ggml_sycl_publish_test_plan(std::move(plan));
+    moe_expert_route mismatch = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+    return mismatch.plan_found && !mismatch.planned_device_residency && !mismatch.ptr &&
+           mismatch.kind == moe_expert_route_kind::UNAVAILABLE;
+}
+
 bool test_moe_route_preserves_ready_event_for_chaining() {
     unified_cache * cache = get_unified_cache_for_device(0);
     if (!cache) {
@@ -8704,16 +8861,7 @@ bool test_moe_route_preserves_ready_event_for_chaining() {
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
     ggml_tensor tensor{};
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-    ggml_set_name(&tensor, "blk.7.ffn_gate_exps.weight");
+    test_init_q8_moe_tensor(tensor, "blk.7.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
     if (!test_register_moe_builder_identity(tensor, extra)) {
@@ -8751,16 +8899,7 @@ bool test_moe_ptr_table_retains_route_lease_until_event() {
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
     ggml_tensor tensor{};
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-    ggml_set_name(&tensor, "blk.7.ffn_gate_exps.weight");
+    test_init_q8_moe_tensor(tensor, "blk.7.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
     if (!test_register_moe_builder_identity(tensor, extra)) {
@@ -8846,16 +8985,7 @@ bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
     ggml_tensor tensor{};
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-    ggml_set_name(&tensor, "blk.11.ffn_gate_exps.weight");
+    test_init_q8_moe_tensor(tensor, "blk.11.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
     if (!test_register_moe_builder_identity(tensor, extra)) {
@@ -8975,17 +9105,7 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
 
     auto init_tensor = [](ggml_tensor & tensor, ggml_tensor_extra_gpu & extra, const char * name, uint64_t model_id,
                           std::vector<uint8_t> & data) {
-        tensor       = {};
-        tensor.type  = GGML_TYPE_Q8_0;
-        tensor.ne[0] = QK8_0;
-        tensor.ne[1] = 4;
-        tensor.ne[2] = 16;
-        tensor.ne[3] = 1;
-        tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-        tensor.nb[1] = sizeof(block_q8_0);
-        tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-        tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-        ggml_set_name(&tensor, name);
+        test_init_q8_moe_tensor(tensor, name);
         extra.model_id = model_id;
         tensor.extra   = &extra;
         tensor.data    = data.data();
@@ -15356,17 +15476,8 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     ggml_tensor           tensor{};
     ggml_tensor_extra_gpu extra{};
     std::vector<uint8_t>  data(256, 0x42);
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
+    test_init_q8_moe_tensor(tensor, "blk.13.ffn_gate_exps.weight");
     data.resize(static_cast<size_t>(tensor.nb[2]), 0x42);
-    ggml_set_name(&tensor, "blk.13.ffn_gate_exps.weight");
     tensor.data = data.data();
     if (!test_register_moe_builder_identity(tensor, extra)) {
         return false;
@@ -15442,16 +15553,7 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
     ggml_tensor tensor{};
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-    ggml_set_name(&tensor, "blk.17.ffn_gate_exps.weight");
+    test_init_q8_moe_tensor(tensor, "blk.17.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
     std::vector<uint8_t>  data(static_cast<size_t>(tensor.nb[2]), 0x63);
@@ -15566,16 +15668,7 @@ bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
     sycl::queue & q = ggml_sycl_get_device(0).default_queue();
 
     ggml_tensor tensor{};
-    tensor.type  = GGML_TYPE_Q8_0;
-    tensor.ne[0] = QK8_0;
-    tensor.ne[1] = 4;
-    tensor.ne[2] = 16;
-    tensor.ne[3] = 1;
-    tensor.nb[0] = sizeof(block_q8_0) / QK8_0;
-    tensor.nb[1] = sizeof(block_q8_0);
-    tensor.nb[2] = tensor.nb[1] * tensor.ne[1];
-    tensor.nb[3] = tensor.nb[2] * tensor.ne[2];
-    ggml_set_name(&tensor, "blk.23.ffn_gate_exps.weight");
+    test_init_q8_moe_tensor(tensor, "blk.23.ffn_gate_exps.weight");
 
     ggml_tensor_extra_gpu extra{};
     std::vector<uint8_t>  data(static_cast<size_t>(tensor.nb[2]), 0x67);
