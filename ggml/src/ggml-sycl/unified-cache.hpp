@@ -4007,8 +4007,125 @@ struct alloc_metadata {
 static_assert(std::is_copy_constructible<alloc_metadata>::value, "allocation metadata must be copyable");
 static_assert(std::is_copy_assignable<alloc_metadata>::value, "allocation metadata must be copy assignable");
 
-// Temporary copyable owner token. Only values retained by code responsible for
-// calling unified_free() are owners; observation and indexing must use metadata().
+enum class release_attempt_status : uint8_t {
+    RELEASED = 0,
+    RETAINED,
+    RETRY_SCHEDULED,
+    INVALID,
+};
+
+struct release_attempt {
+    release_attempt_status status = release_attempt_status::INVALID;
+
+    bool released() const noexcept { return status == release_attempt_status::RELEASED; }
+    bool retry_scheduled() const noexcept { return status == release_attempt_status::RETRY_SCHEDULED; }
+};
+
+class allocation_release_coordinator;
+class shared_alloc_owner;
+
+// Preallocated, intrusive allocation ownership state. The control is created
+// before physical allocation, then becomes the sole source of published
+// metadata. Its retry link is embedded so a refused final release can be
+// queued without allocating memory.
+class alloc_owner_control final {
+  public:
+    const alloc_metadata & metadata() const noexcept { return metadata_; }
+    uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
+
+  private:
+    friend class alloc_owner;
+    friend class shared_alloc_owner;
+    friend class allocation_release_coordinator;
+    friend struct allocation_owner_internal_access;
+
+    explicit alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator) noexcept;
+    ~alloc_owner_control() = default;
+
+    void retain() noexcept;
+    release_attempt release_ref() noexcept;
+    bool publish(const alloc_metadata & metadata) noexcept;
+    void abandon() noexcept;
+
+    std::atomic<uint32_t> refs_{ 1 };
+    alloc_metadata metadata_{};
+    std::shared_ptr<allocation_release_coordinator> coordinator_;
+    alloc_owner_control * retry_next_ = nullptr;
+    bool published_ = false;
+};
+
+class alloc_owner {
+  public:
+    alloc_owner() = default;
+    ~alloc_owner();
+    alloc_owner(const alloc_owner &) = delete;
+    alloc_owner & operator=(const alloc_owner &) = delete;
+    alloc_owner(alloc_owner && other) noexcept;
+    alloc_owner & operator=(alloc_owner && other) noexcept;
+
+    explicit operator bool() const noexcept { return control_ != nullptr; }
+    const alloc_metadata & metadata() const noexcept;
+    release_attempt reset() noexcept;
+    shared_alloc_owner into_shared() && noexcept;
+
+  private:
+    friend struct allocation_owner_internal_access;
+    explicit alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
+    alloc_owner_control * control_ = nullptr;
+};
+
+class shared_alloc_owner {
+  public:
+    shared_alloc_owner() = default;
+    ~shared_alloc_owner();
+    shared_alloc_owner(const shared_alloc_owner & other) noexcept;
+    shared_alloc_owner & operator=(const shared_alloc_owner & other) noexcept;
+    shared_alloc_owner(shared_alloc_owner && other) noexcept;
+    shared_alloc_owner & operator=(shared_alloc_owner && other) noexcept;
+
+    explicit operator bool() const noexcept { return control_ != nullptr; }
+    const alloc_metadata & metadata() const noexcept;
+    uint32_t use_count() const noexcept { return control_ ? control_->use_count() : 0; }
+    release_attempt reset() noexcept;
+
+  private:
+    friend class alloc_owner;
+    explicit shared_alloc_owner(alloc_owner_control * control) noexcept : control_(control) {}
+    alloc_owner_control * control_ = nullptr;
+};
+
+class allocation_release_coordinator : public std::enable_shared_from_this<allocation_release_coordinator> {
+  public:
+    explicit allocation_release_coordinator(int device) noexcept : device_(device) {}
+
+    int device() const noexcept { return device_; }
+    size_t live_controls() const noexcept { return live_controls_.load(std::memory_order_acquire); }
+    size_t retry_count() const noexcept { return retry_count_.load(std::memory_order_acquire); }
+    bool can_detach() const noexcept { return live_controls() == 0 && retry_count() == 0; }
+    size_t process_retries() noexcept;
+
+  private:
+    friend class alloc_owner_control;
+    friend struct allocation_owner_internal_access;
+    release_attempt retire(alloc_owner_control * control) noexcept;
+    void register_control() noexcept { live_controls_.fetch_add(1, std::memory_order_acq_rel); }
+    void abandon_control(alloc_owner_control * control) noexcept;
+
+    int device_ = -1;
+    mutable std::mutex retry_mutex_;
+    alloc_owner_control * retry_head_ = nullptr;
+    std::atomic<size_t> live_controls_{ 0 };
+    std::atomic<size_t> retry_count_{ 0 };
+};
+
+static_assert(!std::is_copy_constructible<alloc_owner>::value, "alloc_owner must be move-only");
+static_assert(!std::is_copy_assignable<alloc_owner>::value, "alloc_owner must be move-only");
+static_assert(std::is_nothrow_move_constructible<alloc_owner>::value, "alloc_owner moves must not throw");
+static_assert(std::is_copy_constructible<shared_alloc_owner>::value, "shared_alloc_owner must be copyable");
+
+// Temporary copyable legacy owner token. Only allocator-internal adapters and
+// unmigrated callers responsible for unified_free() may use it. It cannot mint
+// metadata; observation and indexing use alloc_metadata.
 struct alloc_handle : alloc_metadata {
     alloc_handle() = default;
     explicit alloc_handle(const alloc_metadata & value) : alloc_metadata(value) {}
@@ -4039,9 +4156,30 @@ struct offload_buffer_lease {
     bool         valid    = false;
 };
 
+enum class allocation_error : uint8_t {
+    NONE = 0,
+    INVALID_REQUEST,
+    CONTROL_ALLOCATION_FAILED,
+    PHYSICAL_ALLOCATION_FAILED,
+    METADATA_PUBLICATION_FAILED,
+};
+
+struct allocation_result {
+    alloc_owner      owner{};
+    allocation_error error = allocation_error::INVALID_REQUEST;
+
+    explicit operator bool() const noexcept { return error == allocation_error::NONE && static_cast<bool>(owner); }
+};
+
+// Foundation owner path. The intrusive control is allocated before any physical
+// allocation. The legacy alloc_handle adapter remains inside the allocator;
+// broad caller migration is intentionally deferred.
+allocation_result unified_allocate_owner(const alloc_request & req) noexcept;
+std::shared_ptr<allocation_release_coordinator> unified_allocation_release_coordinator(int device);
+bool unified_allocation_release_coordinator_detach(int device) noexcept;
+
 bool       unified_alloc(const alloc_request & req, alloc_handle * out);
-// New: returns mem_handle (auto-validating smart pointer). Existing callers
-// continue to use unified_alloc(); callers migrate incrementally in T4/T5.
+// Compatibility smart-handle path. Existing callers migrate incrementally.
 mem_handle unified_allocate(const alloc_request & req);
 bool       unified_free(const alloc_handle & handle);
 bool       unified_free_ptr(void * ptr, int expected_device = -1);

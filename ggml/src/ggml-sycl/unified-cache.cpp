@@ -731,6 +731,177 @@ static bool fail_expert_phase(expert_fault_phase phase) noexcept;
 #endif
 
 static std::mutex            g_runtime_alloc_mutex;
+static std::mutex            g_allocation_coordinator_mutex;
+static std::unordered_map<int, std::shared_ptr<allocation_release_coordinator>> g_allocation_coordinators;
+thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
+
+struct allocation_owner_internal_access {
+    static alloc_owner_control * create(const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
+        return new (std::nothrow) alloc_owner_control(coordinator);
+    }
+    static alloc_owner adopt(alloc_owner_control * control) noexcept { return alloc_owner(control); }
+    static bool publish(alloc_owner_control * control, const alloc_metadata & metadata) noexcept {
+        return control == nullptr || control->publish(metadata);
+    }
+    static void abandon(alloc_owner_control * control) noexcept { if (control) control->abandon(); }
+};
+
+alloc_owner_control::alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator) noexcept :
+    coordinator_(std::move(coordinator)) {
+    if (coordinator_) coordinator_->register_control();
+}
+
+void alloc_owner_control::retain() noexcept {
+    const uint32_t previous = refs_.fetch_add(1, std::memory_order_acq_rel);
+    GGML_ASSERT(previous != 0 && previous != UINT32_MAX);
+}
+
+bool alloc_owner_control::publish(const alloc_metadata & metadata) noexcept {
+    if (published_ || metadata.ptr == nullptr || metadata.size == 0 || metadata.id == 0 ||
+        !coordinator_ || metadata.device != coordinator_->device()) return false;
+    metadata_ = metadata;
+    published_ = true;
+    return true;
+}
+
+void alloc_owner_control::abandon() noexcept {
+    GGML_ASSERT(refs_.load(std::memory_order_acquire) == 1);
+    if (coordinator_) coordinator_->abandon_control(this);
+    else delete this;
+}
+
+release_attempt alloc_owner_control::release_ref() noexcept {
+    const uint32_t previous = refs_.fetch_sub(1, std::memory_order_acq_rel);
+    GGML_ASSERT(previous != 0);
+    if (previous != 1) return { release_attempt_status::RETAINED };
+    return coordinator_ ? coordinator_->retire(this) : release_attempt{ release_attempt_status::INVALID };
+}
+
+alloc_owner::~alloc_owner() { (void) reset(); }
+alloc_owner::alloc_owner(alloc_owner && other) noexcept : control_(std::exchange(other.control_, nullptr)) {}
+alloc_owner & alloc_owner::operator=(alloc_owner && other) noexcept {
+    if (this != &other) { (void) reset(); control_ = std::exchange(other.control_, nullptr); }
+    return *this;
+}
+const alloc_metadata & alloc_owner::metadata() const noexcept {
+    static const alloc_metadata empty{};
+    return control_ ? control_->metadata() : empty;
+}
+release_attempt alloc_owner::reset() noexcept {
+    alloc_owner_control * control = std::exchange(control_, nullptr);
+    return control ? control->release_ref() : release_attempt{};
+}
+shared_alloc_owner alloc_owner::into_shared() && noexcept {
+    return shared_alloc_owner(std::exchange(control_, nullptr));
+}
+
+shared_alloc_owner::~shared_alloc_owner() { (void) reset(); }
+shared_alloc_owner::shared_alloc_owner(const shared_alloc_owner & other) noexcept : control_(other.control_) {
+    if (control_) control_->retain();
+}
+shared_alloc_owner & shared_alloc_owner::operator=(const shared_alloc_owner & other) noexcept {
+    if (this == &other) return *this;
+    alloc_owner_control * incoming = other.control_;
+    if (incoming) incoming->retain();
+    (void) reset();
+    control_ = incoming;
+    return *this;
+}
+shared_alloc_owner::shared_alloc_owner(shared_alloc_owner && other) noexcept :
+    control_(std::exchange(other.control_, nullptr)) {}
+shared_alloc_owner & shared_alloc_owner::operator=(shared_alloc_owner && other) noexcept {
+    if (this != &other) { (void) reset(); control_ = std::exchange(other.control_, nullptr); }
+    return *this;
+}
+const alloc_metadata & shared_alloc_owner::metadata() const noexcept {
+    static const alloc_metadata empty{};
+    return control_ ? control_->metadata() : empty;
+}
+release_attempt shared_alloc_owner::reset() noexcept {
+    alloc_owner_control * control = std::exchange(control_, nullptr);
+    return control ? control->release_ref() : release_attempt{};
+}
+
+namespace {
+release_attempt release_control_physical(alloc_owner_control * control) noexcept {
+    if (!control || !control->metadata().ptr) return { release_attempt_status::INVALID };
+    return unified_free(alloc_handle(control->metadata())) ?
+        release_attempt{ release_attempt_status::RELEASED } :
+        release_attempt{ release_attempt_status::RETRY_SCHEDULED };
+}
+}
+
+release_attempt allocation_release_coordinator::retire(alloc_owner_control * control) noexcept {
+    // Physical retirement can acquire registry/cache locks and must run before
+    // taking the intrusive retry leaf lock.
+    release_attempt attempt = release_control_physical(control);
+    if (attempt.released() || attempt.status == release_attempt_status::INVALID) {
+        live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+        delete control;
+        return attempt;
+    }
+    {
+        std::lock_guard<std::mutex> lock(retry_mutex_);
+        control->retry_next_ = retry_head_;
+        retry_head_ = control;
+        retry_count_.fetch_add(1, std::memory_order_release);
+    }
+    return { release_attempt_status::RETRY_SCHEDULED };
+}
+
+void allocation_release_coordinator::abandon_control(alloc_owner_control * control) noexcept {
+    live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+    delete control;
+}
+
+size_t allocation_release_coordinator::process_retries() noexcept {
+    size_t released = 0;
+    for (;;) {
+        alloc_owner_control * control = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(retry_mutex_);
+            if (!retry_head_) break;
+            control = retry_head_;
+            retry_head_ = control->retry_next_;
+            control->retry_next_ = nullptr;
+            retry_count_.fetch_sub(1, std::memory_order_release);
+        }
+        const release_attempt attempt = release_control_physical(control);
+        if (attempt.released() || attempt.status == release_attempt_status::INVALID) {
+            live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+            delete control;
+            ++released;
+            continue;
+        }
+        // Still refused: reinsert the same embedded node without allocating.
+        std::lock_guard<std::mutex> lock(retry_mutex_);
+        control->retry_next_ = retry_head_;
+        retry_head_ = control;
+        retry_count_.fetch_add(1, std::memory_order_release);
+        break;
+    }
+    return released;
+}
+
+std::shared_ptr<allocation_release_coordinator> unified_allocation_release_coordinator(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) return {};
+    std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
+    auto & coordinator = g_allocation_coordinators[device];
+    if (!coordinator) coordinator = std::make_shared<allocation_release_coordinator>(device);
+    return coordinator;
+}
+
+bool unified_allocation_release_coordinator_detach(int device) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
+        const auto it = g_allocation_coordinators.find(device);
+        if (it == g_allocation_coordinators.end()) return true;
+        if (!it->second->can_detach()) return false;
+        g_allocation_coordinators.erase(it);
+        return true;
+    } catch (...) { return false; }
+}
+
 // One identity namespace for every backing that can enter retained caches.
 // UINT64_MAX is the permanent exhausted sentinel; CAS prevents wrap/reuse.
 static std::atomic<uint64_t> g_retention_identity_counter{ 1 };
@@ -827,6 +998,7 @@ static std::unordered_map<std::string, alloc_tier>      g_runtime_cohort_tier;
 
 struct arena_runtime_publication_context {
     runtime_alloc_record * record    = nullptr;
+    alloc_owner_control *  control   = nullptr;
     bool                   attempted = false;
     bool                   published = false;
 };
@@ -855,6 +1027,8 @@ static bool arena_runtime_registry_commit(void * ptr, const arena_authority::all
         rec.handle.arena_generation      = exact.generation;
         rec.handle.arena_offset          = exact.offset;
         rec.handle.arena_extent          = exact.extent;
+        if (!allocation_owner_internal_access::publish(context.control, rec.handle)) return false;
+        if (context.control) rec.handle = context.control->metadata();
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         // A live pointer row is authority. Never replace it with an allocation
         // from a recycled TLSF address; failure rolls this allocation back.
@@ -11330,6 +11504,10 @@ static size_t unified_alloc_total_vram(int device, sycl::queue & queue) {
 }
 
 bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
+    // Non-null only for the narrow allocator-internal owner adapter. Broad
+    // legacy callers continue to receive alloc_handle without gaining a way to
+    // mint or mutate an intrusive control.
+    alloc_owner_control * const owner_control = g_allocating_owner_control;
     if (out == nullptr) {
         return false;
     }
@@ -11436,7 +11614,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     void *                             ptr              = nullptr;
     arena_authority::allocation_record exact_arena{};
     runtime_alloc_record               rec;
-    arena_runtime_publication_context  arena_publication{ &rec };
+    arena_runtime_publication_context  arena_publication{ &rec, owner_control };
     auto prepare_arena_publication = [&](vram_zone_id zid) -> bool {
         try {
             rec = {};
@@ -11800,6 +11978,14 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
     }
 
     if (!arena_publication.published) {
+        // The registry row is copied from the already-published control, never
+        // the reverse. This makes metadata authority independent of the legacy
+        // alloc_handle returned by the compatibility API.
+        if (!allocation_owner_internal_access::publish(owner_control, rec.handle)) {
+            (void) unified_free_record(rec);
+            return false;
+        }
+        if (owner_control) rec.handle = owner_control->metadata();
         bool registered = false;
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
@@ -12076,6 +12262,65 @@ static size_t offload_buffer_pool_trim_host_zone(host_zone_id zone) {
         (void) unified_free(h);
     }
     return free_list.size();
+}
+
+allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
+    allocation_result result;
+    alloc_owner_control * control = nullptr;
+    if (req.size == 0 || req.device < -1 ||
+        (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0)) {
+        result.error = allocation_error::INVALID_REQUEST;
+        return result;
+    }
+    try {
+        int device = req.device;
+        if (device < 0 && req.queue) device = get_device_id_from_queue(*req.queue);
+        auto coordinator = unified_allocation_release_coordinator(device);
+        if (!coordinator) {
+            result.error = allocation_error::INVALID_REQUEST;
+            return result;
+        }
+        control = allocation_owner_internal_access::create(coordinator);
+        if (!control) {
+            result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
+            return result;
+        }
+
+        struct adapter_scope {
+            alloc_owner_control * previous;
+            explicit adapter_scope(alloc_owner_control * current) : previous(g_allocating_owner_control) {
+                g_allocating_owner_control = current;
+            }
+            ~adapter_scope() { g_allocating_owner_control = previous; }
+        } scope(control);
+
+        alloc_handle legacy;
+        if (!unified_alloc(req, &legacy) || !legacy.ptr) {
+            const bool was_published = control->metadata().ptr != nullptr;
+            allocation_owner_internal_access::abandon(control);
+            control = nullptr;
+            result.error = was_published ? allocation_error::METADATA_PUBLICATION_FAILED :
+                                           allocation_error::PHYSICAL_ALLOCATION_FAILED;
+            return result;
+        }
+        // No ownership is copied from the legacy token. It is merely the
+        // bounded adapter output used to verify publication identity.
+        if (legacy.metadata() != control->metadata()) {
+            (void) unified_free(legacy);
+            allocation_owner_internal_access::abandon(control);
+            control = nullptr;
+            result.error = allocation_error::METADATA_PUBLICATION_FAILED;
+            return result;
+        }
+        result.owner = allocation_owner_internal_access::adopt(control);
+        control = nullptr;
+        result.error = allocation_error::NONE;
+        return result;
+    } catch (...) {
+        if (control) allocation_owner_internal_access::abandon(control);
+        result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
+        return result;
+    }
 }
 
 mem_handle unified_allocate(const alloc_request & req) {
@@ -15098,6 +15343,26 @@ bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexc
 }
 
 bool shutdown_unified_cache() {
+    // Intrusive controls and their embedded retry nodes keep the per-device
+    // release backend attached. Retry outside coordinator leaf locks, then
+    // refuse teardown while any external owner remains live.
+    std::vector<std::shared_ptr<allocation_release_coordinator>> release_coordinators;
+    {
+        std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
+        release_coordinators.reserve(g_allocation_coordinators.size());
+        for (const auto & item : g_allocation_coordinators) release_coordinators.push_back(item.second);
+    }
+    for (const auto & coordinator : release_coordinators) {
+        if (coordinator) (void) coordinator->process_retries();
+    }
+    for (const auto & coordinator : release_coordinators) {
+        if (coordinator && !coordinator->can_detach()) {
+            GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown refused: device=%d live allocation controls=%zu retries=%zu\n",
+                           coordinator->device(), coordinator->live_controls(), coordinator->retry_count());
+            return false;
+        }
+    }
+
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
     // mem_handle release callbacks cannot deadlock on cache lookup.
@@ -15147,6 +15412,13 @@ bool shutdown_unified_cache() {
     // Any later static destructors must not re-enter SYCL after explicit DSO
     // shutdown. A freshly loaded module gets a fresh false-initialized flag.
     g_sycl_shutting_down.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
+        for (auto it = g_allocation_coordinators.begin(); it != g_allocation_coordinators.end();) {
+            if (it->second->can_detach()) it = g_allocation_coordinators.erase(it);
+            else ++it;
+        }
+    }
 
     GGML_SYCL_DEBUG("[UNIFIED-CACHE] Explicit shutdown drained and destroyed all device caches\n");
     return clean;
