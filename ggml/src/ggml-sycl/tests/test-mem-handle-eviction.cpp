@@ -7,8 +7,8 @@
 //   (1) DIRECT handles are stable — resolve() returns the original pointer
 //       regardless of cache_generation() bumps.
 //   (2) Explicit eviction via cache.evict() bumps the global cache generation
-//       AND removes the entry from lookup.  get_weight_ptr must not return a
-//       stale device pointer for an evicted key.
+//       when it actually removes an entry, and removes that entry from lookup.
+//       get_weight_ptr must not return a stale device pointer for an evicted key.
 //   (3) Re-insertion after eviction produces a fresh lookup result.
 //
 // Companion to llama.cpp-goegc.1 ("stale pointer after eviction"): this test
@@ -300,10 +300,15 @@ static bool test_explicit_evict_bumps_gen_and_removes_entry(sycl::queue & q) {
     TEST_ASSERT(cache.is_cached(key_a, GGML_LAYOUT_AOS), "is_cached(A, AOS) must agree with get()");
     TEST_ASSERT(cache.is_cached_any(key_a), "is_cached_any(A) must agree with get()");
 
-    // Sanity: A is resolvable before eviction.
-    auto result_a_before = cache.get_weight_ptr(key_a);
-    TEST_ASSERT(static_cast<bool>(result_a_before), "A should be resolvable before eviction");
-    TEST_ASSERT(result_a_before.ptr == ptr_a, "pre-eviction ptr matches ensure_cached return");
+    // Sanity: A is resolvable before eviction.  get_weight_ptr() returns a
+    // retained handle by contract, so confine the precondition result to this
+    // scope.  Keeping it alive across evict() correctly makes A ineligible;
+    // an eviction request alone neither removes A nor bumps the generation.
+    {
+        auto result_a_before = cache.get_weight_ptr(key_a);
+        TEST_ASSERT(static_cast<bool>(result_a_before), "A should be resolvable before eviction");
+        TEST_ASSERT(result_a_before.ptr == ptr_a, "pre-eviction ptr matches ensure_cached return");
+    }
 
     const uint64_t gen_before_evict = ggml_sycl::cache_generation();
 
@@ -609,9 +614,11 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
 
     constexpr size_t bytes = 4096;
     ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
-    void * src = sycl::malloc_host(bytes * 2, q);
-    TEST_ASSERT(src != nullptr, "malloc_host for fault phases failed");
-    std::memset(src, 0x61, bytes * 2);
+    // direct_stage_expert() is given the exact source capacity.  Use ordinary
+    // owned host storage so its raw-pointer bridge mints a bounded DIRECT view;
+    // an external sycl::malloc_host pointer is classified as HOST_PINNED and
+    // the compatibility chunk bridge cannot infer that allocation's extent.
+    std::vector<uint8_t> src(bytes * 2, 0x61);
 
     const ggml_sycl::expert_fault_phase single_phases[] = {
         ggml_sycl::expert_fault_phase::SINGLE_AFTER_ALLOC,
@@ -621,10 +628,10 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
         const auto key = make_test_cache_id(710 + i, 20 + i, bytes);
         ggml_sycl::unified_cache_fail_next_expert_phase_for_test(single_phases[i]);
         const auto failed = cache.direct_stage_expert(
-            key, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+            key, src.data(), bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
         TEST_ASSERT(!failed.ok, "faulted single publication committed");
         TEST_ASSERT(cache.lookup_expert(key) == nullptr, "faulted single publication leaked a mirror");
-        TEST_ASSERT(cache.register_host_expert(key, src, bytes, GGML_LAYOUT_AOS),
+        TEST_ASSERT(cache.register_host_expert(key, src.data(), bytes, GGML_LAYOUT_AOS),
                     "single publication did not recover after fault");
     }
 
@@ -639,7 +646,7 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
         };
         ggml_sycl::unified_cache_fail_next_expert_phase_for_test(bulk_phases[i]);
         const auto failed = cache.direct_stage_expert_tensor(
-            keys, src, bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+            keys, src.data(), bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
         TEST_ASSERT(!failed.ok, "faulted bulk publication committed");
         TEST_ASSERT(cache.lookup_expert(keys[0]) == nullptr && cache.lookup_expert(keys[1]) == nullptr,
                     "faulted bulk publication leaked a mirror");
@@ -648,14 +655,13 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     const auto duplicate = make_test_cache_id(730, 40, bytes);
     std::vector<ggml_sycl_cache_id> duplicates{ duplicate, duplicate };
     TEST_ASSERT(!cache.direct_stage_expert_tensor(
-                     duplicates, src, bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr).ok,
+                     duplicates, src.data(), bytes * 2, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr).ok,
                 "bulk publication accepted duplicate keys");
     TEST_ASSERT(cache.lookup_expert(duplicate) == nullptr, "duplicate bulk request partially published");
 
     q.wait_and_throw();
     cache.process_deferred_frees_public();
     TEST_ASSERT(cache.validate(), "device fault phases left inconsistent bookkeeping");
-    sycl::free(src, q);
     TEST_PASS();
     return true;
 }
