@@ -667,7 +667,36 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
 }
 
 // =============================================================================
-// Test 9: a ready-event status query exception is unknown and therefore keeps
+// Test 9: abort cleanup failure is observable and a caller can fail closed;
+// retry performs the allocation-free withdrawal.
+// =============================================================================
+static bool test_abort_cleanup_status_is_observable(sycl::queue & q) {
+    TEST_BEGIN("abort_cleanup_status_is_observable");
+
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    std::vector<uint8_t> bytes(4096, 0x52);
+    const auto key = make_test_cache_id(735, 45, bytes.size());
+    constexpr uint64_t load_txn = 0xB70;
+    TEST_ASSERT(cache.register_host_expert(key, bytes.data(), bytes.size(), GGML_LAYOUT_AOS),
+                "abort fixture publication failed");
+    TEST_ASSERT(cache.test_mark_entry_touched_by_load(key, GGML_LAYOUT_AOS, load_txn),
+                "abort fixture was not tagged");
+
+    ggml_sycl::unified_cache_fail_next_expert_phase_for_test(
+        ggml_sycl::expert_fault_phase::ABORT_BEFORE_RETIRE);
+    TEST_ASSERT(!cache.note_model_load_abort(load_txn), "faulted abort reported false success");
+    TEST_ASSERT(cache.lookup_expert(key) != nullptr, "faulted abort partially withdrew publication");
+
+    TEST_ASSERT(cache.note_model_load_abort(load_txn), "allocation-free abort retry failed");
+    TEST_ASSERT(cache.lookup_expert(key) == nullptr, "successful abort left direct publication visible");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "successful abort left reclaimable retirement pending");
+
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 10: a ready-event status query exception is unknown and therefore keeps
 // retired backing deferred until a later successful query proves completion.
 // =============================================================================
 static bool test_retired_status_query_failure_is_deferred(sycl::queue & q) {
@@ -828,6 +857,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_expert_publication_retirement_linearization(q);
     all_passed &= test_host_publication_fault_is_transactional(q);
     all_passed &= test_device_publication_fault_phases(q);
+    all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
     all_passed &= test_retained_publication_failure_is_transactional(q);
 

@@ -11573,7 +11573,7 @@ static bool ggml_sycl_abort_owner_effects_noexcept(ggml_sycl::lifecycle::ModelTo
         clean = false;
     }
     try {
-        ggml_sycl::unified_cache_note_model_load_abort(owner.load.value);
+        clean = ggml_sycl::unified_cache_note_model_load_abort(owner.load.value) && clean;
     } catch (...) {
         clean = false;
     }
