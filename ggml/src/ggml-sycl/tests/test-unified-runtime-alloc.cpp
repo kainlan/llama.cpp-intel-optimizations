@@ -23,6 +23,15 @@
 #include <vector>
 #include <sycl/sycl.hpp>
 
+// This direct-source fixture does not compile ggml-sycl.cpp, where the private
+// sycl-info override normally lives. The linked backend references the query
+// when private testing is enabled; this fixture never installs an override.
+namespace ggml_sycl {
+bool test_sycl_info_override_active() {
+    return false;
+}
+}  // namespace ggml_sycl
+
 static int g_tests_run    = 0;
 static int g_tests_passed = 0;
 
@@ -759,6 +768,15 @@ static bool arena_destroy_timeout_preserves_authority_for_retry(sycl::queue & q)
     TEST_ASSERT(cache.reserve_scratch_pool(1ull * mib), "scratch owner reserve failed");
     mem_handle retained = cache.test_scratch_pool_owner();
     TEST_ASSERT(retained.resolve(), "copied arena owner did not acquire its authority lease");
+    const mem_handle_debug_info owner = retained.debug_info();
+    TEST_ASSERT(retained.is_arena(), "scratch fixture returned a non-arena direct owner");
+    TEST_ASSERT(owner.canonical_allocation_id != 0, "scratch fixture lost its exact allocation id");
+    TEST_ASSERT(owner.generation != 0 && owner.canonical_generation == owner.generation,
+                "scratch fixture lost its exact arena generation");
+    TEST_ASSERT(owner.zone_id == static_cast<int>(vram_zone_id::WEIGHT),
+                "scratch fixture returned the wrong arena zone");
+    TEST_ASSERT(owner.canonical_extent == 2ull * mib && owner.size == owner.canonical_extent,
+                "scratch fixture returned the wrong exact allocation extent");
 
     unified_cache_test_set_arena_drain_timeout_ms(10);
     TEST_ASSERT(!cache.shutdown_resources(), "destroy unexpectedly freed an arena with a retained lease");

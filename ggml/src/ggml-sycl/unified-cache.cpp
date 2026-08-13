@@ -3198,23 +3198,31 @@ bool unified_cache::shutdown_resources() {
     compute_arena_off_.store(0, std::memory_order_relaxed);
 
     // Free scratch pool BEFORE destroying the VRAM arena (which would invalidate owns check).
-    if (scratch_pool_ptr_) {
-        if (scratch_pool_owner_.valid()) {
-            scratch_pool_owner_ = {};
-            if (!(had_arena && vram_owns(scratch_pool_ptr_))) saturating_sub_used(scratch_pool_size_);
-        } else if (had_arena && vram_owns(scratch_pool_ptr_)) {
-            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
-        } else {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] direct scratch pool missing alloc_handle owner ptr=%p\n",
-                           scratch_pool_ptr_);
-            GGML_ASSERT(false && "direct scratch pool missing alloc_handle owner");
+    {
+        std::lock_guard<std::mutex> owner_lock(scratch_pool_mutex_);
+        if (scratch_pool_ptr_) {
+            const bool arena_owned = had_arena && vram_owns(scratch_pool_ptr_);
+            if (scratch_pool_owner_.valid()) {
+                // Release this cache's exact lease first. A copied owner can
+                // then force arena_destroy() to time out without losing chunks.
+                scratch_pool_owner_ = {};
+                if (arena_owned) {
+                    zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
+                } else {
+                    saturating_sub_used(scratch_pool_size_);
+                }
+            } else {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] scratch pool missing canonical owner ptr=%p arena=%d\n",
+                               scratch_pool_ptr_, arena_owned ? 1 : 0);
+                GGML_ASSERT(false && "scratch pool missing canonical owner");
+            }
         }
+        scratch_pool_ptr_          = nullptr;
+        scratch_pool_size_         = 0;
+        scratch_pool_owner_        = {};
+        scratch_pool_region_bytes_ = 0;
+        scratch_pool_reset_regions();
     }
-    scratch_pool_ptr_          = nullptr;
-    scratch_pool_size_         = 0;
-    scratch_pool_owner_        = {};
-    scratch_pool_region_bytes_ = 0;
-    scratch_pool_reset_regions();
 
     // Free oneDNN scratch buffers BEFORE arena destroy (vram_owns() needs live arena).
     if (onednn_weights_scratch_) {
@@ -16100,6 +16108,8 @@ size_t unified_cache::compute_arena_used() const {
 // --- Inference Scratch Pool ---
 
 bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
+    std::lock_guard<std::mutex> owner_lock(scratch_pool_mutex_);
+
     // `pool_bytes` is, and has always been, the sizing contract callers plan
     // against -- unified_cache_reserve_moe_q8_1_scratch() specs and unit-tests
     // it as full one-epoch capacity. So each region gets pool_bytes (not
@@ -16147,8 +16157,11 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
         }
 
         if (arena_active() && vram_owns(scratch_pool_ptr_)) {
-            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
+            // Drop the cache's exact authority lease before unregistering and
+            // returning the allocation to TLSF. External copies remain valid
+            // leases and will make arena teardown retry rather than free early.
             scratch_pool_owner_ = {};
+            zone_free(vram_zone_id::WEIGHT, scratch_pool_ptr_);
         } else {
             if (scratch_pool_owner_.valid()) {
                 scratch_pool_owner_ = {};
@@ -16169,11 +16182,25 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
     // see the sizing-contract comment above.
     const size_t total_bytes = pool_bytes * static_cast<size_t>(kScratchPoolRegionCount);
 
-    // VRAM arena path: sub-allocate from the weight zone (persistent allocation).
+    // VRAM arena path: mint and retain the exact allocation-time capability.
+    // A raw zone_alloc() with allocation_id=0 is intentionally rejected by the
+    // arena authority and must never be reconstructed later from its pointer.
     if (arena_active()) {
-        void * ptr = zone_alloc(vram_zone_id::WEIGHT, total_bytes);
+        const uint64_t allocation_id = unified_cache_mint_retention_identity();
+        arena_authority::allocation_record exact{};
+        void * ptr = allocation_id != 0 ?
+                         zone_alloc(vram_zone_id::WEIGHT, total_bytes, 64, allocation_id, &exact) :
+                         nullptr;
         if (ptr) {
-            scratch_pool_owner_        = {};
+            mem_handle exact_owner = mem_handle::from_arena_zone(
+                exact.zone_id, exact.offset, exact.extent, get_device_id_from_queue(queue_), exact.generation,
+                exact.allocation_id, exact.extent, arena_authority_snapshot(vram_zone_id::WEIGHT));
+            if (!exact_owner.valid()) {
+                zone_free(vram_zone_id::WEIGHT, ptr);
+                GGML_LOG_ERROR("[UNIFIED-CACHE] Scratch pool exact arena owner admission failed\n");
+                return false;
+            }
+            scratch_pool_owner_        = std::move(exact_owner);
             scratch_pool_ptr_          = ptr;
             scratch_pool_size_         = total_bytes;
             scratch_pool_region_bytes_ = pool_bytes;
@@ -16228,6 +16255,13 @@ bool unified_cache::reserve_scratch_pool(size_t pool_bytes) {
                   scratch_pool_region_bytes_ / (1024.0 * 1024.0));
     return true;
 }
+
+#ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
+mem_handle unified_cache::test_scratch_pool_owner() const {
+    std::lock_guard<std::mutex> owner_lock(scratch_pool_mutex_);
+    return scratch_pool_owner_;
+}
+#endif
 
 void unified_cache::scratch_pool_reset_regions() {
     for (auto & region : scratch_pool_regions_) {

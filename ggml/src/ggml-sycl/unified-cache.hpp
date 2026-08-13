@@ -2623,8 +2623,8 @@ class unified_cache {
     // Destroy arena (free all chunks).
     bool arena_destroy();
 #ifdef GGML_SYCL_ALLOCATOR_TRANSACTION_TESTING
-    void test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
-    mem_handle test_scratch_pool_owner() const { return scratch_pool_owner_; }
+    void       test_zone_boundary_check(vram_zone_id zone) { zone_boundary_check(zone); }
+    mem_handle test_scratch_pool_owner() const;
 #endif
     bool resources_shutdown_ = false;
     bool drain_all_queues_noexcept() noexcept;
@@ -3486,7 +3486,11 @@ class unified_cache {
 
     void *     scratch_pool_ptr_  = nullptr;           // Base pointer (device VRAM), spans all regions
     size_t     scratch_pool_size_ = 0;                 // Total pool bytes across all regions
-    mem_handle scratch_pool_owner_;                    // Non-arena direct allocation owner
+    // Canonical owner for either allocation path. Arena reservations retain
+    // the exact allocation-time id/generation/zone/offset/extent capability;
+    // direct reservations retain the owning unified_alloc handle.
+    mem_handle         scratch_pool_owner_;
+    mutable std::mutex scratch_pool_mutex_;
 
     std::array<scratch_pool_region, kScratchPoolRegionCount> scratch_pool_regions_;
     // Per-region (one-epoch) capacity, i.e. the reserve_scratch_pool(pool_bytes)
