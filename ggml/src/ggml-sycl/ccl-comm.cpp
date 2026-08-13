@@ -28,9 +28,9 @@ static bool ccl_debug_enabled() {
     return g_ccl_debug == 1;
 }
 
-static ggml_sycl::mem_handle ccl_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, /*on_device=*/false,
-                                              ggml_sycl::mem_handle::HOST_DEVICE);
+static ggml_sycl::mem_handle ccl_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 void ggml_sycl_ccl_init(int world_size, queue_ptr * queues) {
@@ -377,7 +377,7 @@ void ggml_sycl_ccl_allreduce_sum_f32(const float * send_buf, float * recv_buf, s
                     float  dbg_vals[4] = {};
                     size_t dbg_bytes   = ((count < 4) ? count : 4) * sizeof(float);
                     if (dbg_bytes > 0) {
-                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals), staging_handle, dbg_bytes, q);
+                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals, dbg_bytes), staging_handle, dbg_bytes, q);
                     }
                     fprintf(stderr, "SYCL CCL: rank=%d BEFORE allreduce: [%.4f,%.4f,%.4f,%.4f]\n", g_ccl_ctx.rank,
                             dbg_vals[0], dbg_vals[1], dbg_vals[2], dbg_vals[3]);
@@ -394,7 +394,7 @@ void ggml_sycl_ccl_allreduce_sum_f32(const float * send_buf, float * recv_buf, s
                     float  dbg_vals[4] = {};
                     size_t dbg_bytes   = ((count < 4) ? count : 4) * sizeof(float);
                     if (dbg_bytes > 0) {
-                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals), staging_handle, dbg_bytes, q);
+                        ggml_sycl::mem_copy(ccl_host_handle(dbg_vals, dbg_bytes), staging_handle, dbg_bytes, q);
                     }
                     fprintf(stderr, "SYCL CCL: rank=%d AFTER allreduce: [%.4f,%.4f,%.4f,%.4f]\n", g_ccl_ctx.rank,
                             dbg_vals[0], dbg_vals[1], dbg_vals[2], dbg_vals[3]);

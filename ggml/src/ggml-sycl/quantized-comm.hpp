@@ -30,9 +30,9 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-static inline ggml_sycl::mem_handle quant_comm_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, /*on_device=*/false,
-                                              ggml_sycl::mem_handle::HOST_DEVICE);
+static inline ggml_sycl::mem_handle quant_comm_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 // Quantization parameters computed per-tensor
@@ -166,7 +166,7 @@ inline sycl::event quantize_and_copy_to_host(queue_ptr                     strea
     // Debug: Read original FP32 values
     if (debug && g_quant_debug_count < 3) {
         float src_sample[4];
-        auto  src_sample_handle = quant_comm_host_handle(src_sample);
+        auto  src_sample_handle = quant_comm_host_handle(src_sample, sizeof(src_sample));
         ggml_sycl::mem_copy(src_sample_handle, src_handle, 4 * sizeof(float), *stream);
         fprintf(stderr, "QUANT_DEBUG: src_fp32[0..3]=[%.6f, %.6f, %.6f, %.6f] n=%zu\n", src_sample[0], src_sample[1],
                 src_sample[2], src_sample[3], n);
@@ -174,7 +174,7 @@ inline sycl::event quantize_and_copy_to_host(queue_ptr                     strea
 
     // Initialize minmax
     float init_minmax[2]     = { FLT_MAX, -FLT_MAX };
-    auto  init_minmax_handle = quant_comm_host_handle(init_minmax);
+    auto  init_minmax_handle = quant_comm_host_handle(init_minmax, sizeof(init_minmax));
     ggml_sycl::mem_copy(dev_minmax_handle, init_minmax_handle, 2 * sizeof(float), *stream);
 
     // Kernel 1: Find min/max
@@ -192,7 +192,7 @@ inline sycl::event quantize_and_copy_to_host(queue_ptr                     strea
 
     // Read min/max to compute params
     float minmax[2];
-    auto  minmax_handle = quant_comm_host_handle(minmax);
+    auto  minmax_handle = quant_comm_host_handle(minmax, sizeof(minmax));
     ggml_sycl::mem_copy(minmax_handle, dev_minmax_handle, 2 * sizeof(float), *stream);
 
     if (debug && g_quant_debug_count < 3) {
@@ -329,8 +329,8 @@ inline void quantized_allreduce(int       main_device,
 
         // Compare with simple FP32 sum (read src values for comparison)
         float orig0[4], orig1[4];
-        auto  orig0_handle = quant_comm_host_handle(orig0);
-        auto  orig1_handle = quant_comm_host_handle(orig1);
+        auto  orig0_handle = quant_comm_host_handle(orig0, sizeof(orig0));
+        auto  orig1_handle = quant_comm_host_handle(orig1, sizeof(orig1));
         auto  dst_dev0_handle =
             ggml_sycl::mem_handle::from_chunk_ptr(dst_dev0, main_device, GGML_LAYOUT_AOS, /*on_device=*/true);
         auto src_dev1_handle =

@@ -1013,7 +1013,7 @@ static void set_rows_validate_indices(sycl::queue &                  queue,
     std::vector<unsigned char> host(bytes);
 
     ggml_sycl::mem_handle host_h = ggml_sycl::mem_handle::from_direct(host.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
-                                                                      ggml_sycl::mem_handle::HOST_DEVICE);
+                                                                      ggml_sycl::mem_handle::HOST_DEVICE, bytes);
     ggml_sycl::mem_handle index_h = ggml_sycl_memcpy_handle_for_raw_ptr(index_ptr, device, GGML_LAYOUT_AOS,
                                                                         /*fallback_on_device=*/true,
                                                                         /*fallback_unknown=*/true);

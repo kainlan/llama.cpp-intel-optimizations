@@ -2834,7 +2834,7 @@ static void dequantize_mul_mat_vec_q8_0_sycl(const void *    vx,
         aos_kernel_debug_count++;
         std::vector<float>    h(256);
         ggml_sycl::mem_handle host_handle =
-            ggml_sycl::mem_handle::from_direct(h.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            ggml_sycl::mem_handle::from_direct(h.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, 256 * sizeof(float));
         ggml_sycl::mem_copy(host_handle, debug_owner, 256 * sizeof(float), *stream);
         debug_owner = {};
 
@@ -3461,8 +3461,7 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
                                     size_t                           src_size,
                                     const void *                     ctx_void,
                                     const std::vector<sycl::event> & deps) {
-    GGML_UNUSED(src_size);
-    auto copy_handle_for_raw_ptr = [](void * ptr, int fallback_device, bool default_device,
+    auto copy_handle_for_raw_ptr = [](void * ptr, int fallback_device, bool default_device, size_t extent,
                                       ggml_layout_mode layout = GGML_LAYOUT_AOS) {
         ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
         if (loc.on_device()) {
@@ -3472,14 +3471,14 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
         if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
             return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
         }
-        return ggml_sycl::mem_handle::from_direct(ptr, layout, default_device, fallback_device);
+        return ggml_sycl::mem_handle::from_direct(ptr, layout, default_device, fallback_device, extent);
     };
     const int    queue_device = ggml_sycl_get_device_id_from_queue(queue);
     const auto * ctx          = static_cast<const dmmv_stream_ctx *>(ctx_void);
     if (!ctx || ctx->segment_count == 0 || ctx->row_total_bytes == 0) {
-        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true);
+        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true, slice_bytes);
         auto src_handle = copy_handle_for_raw_ptr(const_cast<char *>(static_cast<const char *>(src_ptr) + offset_bytes),
-                                                  queue_device, false);
+                                                  queue_device, false, src_size - offset_bytes);
         return ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
     }
     GGML_ASSERT(offset_bytes % ctx->row_total_bytes == 0);
@@ -3525,8 +3524,9 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
             dst_offset += bytes;
         }
         GGML_ASSERT(dst_offset == slice_bytes);
-        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true);
-        auto src_handle = use_persistent ? copy_handle_for_raw_ptr(host_slice, queue_device, false) : host_stage_handle;
+        auto dst_handle = copy_handle_for_raw_ptr(device_slice, queue_device, true, slice_bytes);
+        auto src_handle =
+            use_persistent ? copy_handle_for_raw_ptr(host_slice, queue_device, false, slice_bytes) : host_stage_handle;
         sycl::event evt = ggml_sycl::mem_copy_async(dst_handle, src_handle, slice_bytes, queue, deps);
         if (use_persistent) {
             ctx->prev_staging_evt     = evt;
@@ -3547,8 +3547,8 @@ static sycl::event dmmv_stream_copy(sycl::queue &                    queue,
         }
         const uint8_t * src        = ctx->src_base + seg.src_base + src_row * seg.bytes_per_row;
         void *          dst        = static_cast<uint8_t *>(device_slice) + dst_offset;
-        auto            dst_handle = copy_handle_for_raw_ptr(dst, queue_device, true);
-        auto            src_handle = copy_handle_for_raw_ptr(const_cast<uint8_t *>(src), queue_device, true);
+        auto            dst_handle = copy_handle_for_raw_ptr(dst, queue_device, true, bytes);
+        auto            src_handle = copy_handle_for_raw_ptr(const_cast<uint8_t *>(src), queue_device, true, bytes);
         last_evt                   = ggml_sycl::mem_copy_async(dst_handle, src_handle, bytes, queue, cur_deps);
         cur_deps.assign(1, last_evt);
         dst_offset += bytes;

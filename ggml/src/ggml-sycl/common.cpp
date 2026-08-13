@@ -377,7 +377,7 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
             ggml_sycl::mem_handle dst_handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(owner));
             ggml_sycl::mem_handle src_handle =
                 ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS,
-                                                   /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+                                                   /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
             ggml_sycl::mem_copy(dst_handle, src_handle, size, q);
             g_runtime_staging_cache[key] = { staged, size, std::move(dst_handle) };
             return staged;
@@ -486,7 +486,7 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
 
             // Copy mmap'd -> host-pinned -> device through mem_handle helpers.
             ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-                const_cast<void *>(src), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+                const_cast<void *>(src), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
             ggml_sycl::mem_copy(host_handle, src_handle, size, *tp_queue);
             GGML_SYCL_DEBUG("[STAGING] host copy done, submitting mem_handle copy to device...\n");
 

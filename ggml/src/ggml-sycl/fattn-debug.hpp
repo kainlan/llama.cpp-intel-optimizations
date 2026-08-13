@@ -27,8 +27,9 @@
 // Environment variable to enable FA debug dumping
 // Set GGML_SYCL_FA_DEBUG=1 to enable
 // Set GGML_SYCL_FA_DEBUG=2 for verbose mode (dumps all heads)
-inline ggml_sycl::mem_handle fattn_debug_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+inline ggml_sycl::mem_handle fattn_debug_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 inline void fattn_debug_copy_to_host(dpct::queue_ptr stream, void * host_dst, const void * src, size_t bytes) {
@@ -41,11 +42,11 @@ inline void fattn_debug_copy_to_host(dpct::queue_ptr stream, void * host_dst, co
     const bool                       src_on_device = loc.on_device();
     const int                        src_device =
         src_on_device && loc.device >= 0 ? loc.device : (src_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE);
-    ggml_sycl::mem_handle dst_handle = fattn_debug_host_handle(host_dst);
+    ggml_sycl::mem_handle dst_handle = fattn_debug_host_handle(host_dst, bytes);
     ggml_sycl::mem_handle src_handle =
         src_on_device ?
             ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src), src_device, GGML_LAYOUT_AOS, true) :
-            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device);
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device, bytes);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *stream);
 }
 

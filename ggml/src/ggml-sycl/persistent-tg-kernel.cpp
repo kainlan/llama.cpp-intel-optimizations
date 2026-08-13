@@ -334,7 +334,7 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
 
     LayerWeights * dev_weights = static_cast<LayerWeights *>(weights_ptr.ptr);
     mem_handle     resolved_weights_host =
-        mem_handle::from_direct(resolved_weights.data(), GGML_LAYOUT_AOS, /*on_device=*/false, mem_handle::HOST_DEVICE);
+        mem_handle::from_direct(resolved_weights.data(), GGML_LAYOUT_AOS, /*on_device=*/false, mem_handle::HOST_DEVICE, weights_bytes);
     mem_copy(weights_owner, resolved_weights_host, weights_bytes, q);
 
     PersistentTGArgs resolved_args = args;

@@ -5349,7 +5349,7 @@ struct ggml_backend_sycl_context {
                 // Reuse existing buffer through the smart copy helper so host
                 // staging and pointer ownership stay centralized.
                 ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-                    const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+                    const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
                 ggml_sycl::mem_copy(it->second.handle, src_handle, nbytes, q);
                 return resolved.ptr;
             }
@@ -5382,7 +5382,7 @@ struct ggml_backend_sycl_context {
 
         // Sync copy to ensure data is ready before recording.
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-            const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
         graph_input_staging[name] = { std::move(handle), nbytes };
         return resolved.ptr;
@@ -5402,7 +5402,7 @@ struct ggml_backend_sycl_context {
         }
 
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
-            const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         (void) ggml_sycl::mem_copy_async(dst_handle, src_handle, nbytes, q);
         return true;
     }

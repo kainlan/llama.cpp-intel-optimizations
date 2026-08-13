@@ -24,7 +24,7 @@ static void ggml_sycl_norm_debug_read_f32(sycl::queue & queue,
                                           const float * src,
                                           size_t        count) {
     ggml_sycl::mem_handle dst_handle =
-        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + count * sizeof(float));
     ggml_sycl::mem_handle src_handle = ggml_sycl_memcpy_handle_for_raw_ptr(src, device);
     ggml_sycl::mem_copy(dst_handle, 0, src_handle, 0, count * sizeof(float), queue);
 }

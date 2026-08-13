@@ -13,11 +13,12 @@
 
 #include <sycl/sycl.hpp>
 
-static inline ggml_sycl::mem_handle ggml_sycl_moe_sort_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+static inline ggml_sycl::mem_handle ggml_sycl_moe_sort_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
-static inline ggml_sycl::mem_handle ggml_sycl_moe_sort_direct_handle(void * ptr, sycl::queue & queue) {
+static inline ggml_sycl::mem_handle ggml_sycl_moe_sort_direct_handle(void * ptr, sycl::queue & queue, size_t extent) {
     int queue_device = -1;
     try {
         queue_device = ggml_sycl_get_device_id_from_queue(queue);
@@ -27,7 +28,7 @@ static inline ggml_sycl::mem_handle ggml_sycl_moe_sort_direct_handle(void * ptr,
     const bool                       on_device = loc.on_device();
     const int                        device =
         on_device && loc.device >= 0 ? loc.device : (on_device ? queue_device : ggml_sycl::mem_handle::HOST_DEVICE);
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device, device);
+    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, on_device, device, extent);
 }
 
 // Stores original position for scatter-back after GEMM
@@ -92,7 +93,7 @@ void moe_count_tokens_per_expert(const char *  ids_base,       // Raw ids base p
                                  int64_t       n_ids,
                                  sycl::queue & queue) {
     // Zero counts
-    ggml_sycl::mem_fill(ggml_sycl_moe_sort_direct_handle(expert_counts, queue), 0, MAX_EXPERTS * sizeof(int32_t),
+    ggml_sycl::mem_fill(ggml_sycl_moe_sort_direct_handle(expert_counts, queue, MAX_EXPERTS * sizeof(int32_t)), 0, MAX_EXPERTS * sizeof(int32_t),
                         queue);
 
     // Parallel histogram
@@ -132,7 +133,7 @@ inline void moe_compute_expert_offsets(
         ggml_sycl::mem_handle::from_chunk_ptr(const_cast<int32_t *>(expert_counts), queue_device, GGML_LAYOUT_AOS,
                                               /*on_device=*/true);
     GGML_ASSERT(counts_handle.valid());
-    ggml_sycl::mem_copy(ggml_sycl_moe_sort_host_handle(counts.data()), 0, counts_handle, 0, n_experts * sizeof(int32_t),
+    ggml_sycl::mem_copy(ggml_sycl_moe_sort_host_handle(counts.data(), 0 + n_experts * sizeof(int32_t)), 0, counts_handle, 0, n_experts * sizeof(int32_t),
                         queue);
 
     int32_t sum = 0;
@@ -145,7 +146,7 @@ inline void moe_compute_expert_offsets(
     auto offsets_handle = ggml_sycl::mem_handle::from_chunk_ptr(expert_offsets, queue_device, GGML_LAYOUT_AOS,
                                                                 /*on_device=*/true);
     GGML_ASSERT(offsets_handle.valid());
-    ggml_sycl::mem_copy(offsets_handle, 0, ggml_sycl_moe_sort_host_handle(offsets.data()), 0,
+    ggml_sycl::mem_copy(offsets_handle, 0, ggml_sycl_moe_sort_host_handle(offsets.data(), 0 + (n_experts + 1) * sizeof(int32_t)), 0,
                         (n_experts + 1) * sizeof(int32_t), queue);  // Copy all n_experts + 1 elements
 }
 
@@ -306,7 +307,7 @@ sycl::event moe_count_tokens_per_expert_async(const char *  ids_base,
     if (ggml_sycl_should_add_dependency(dep_event)) {
         deps.push_back(dep_event);
     }
-    sycl::event memset_event = ggml_sycl::mem_fill_async(ggml_sycl_moe_sort_direct_handle(expert_counts, queue), 0,
+    sycl::event memset_event = ggml_sycl::mem_fill_async(ggml_sycl_moe_sort_direct_handle(expert_counts, queue, MAX_EXPERTS * sizeof(int32_t)), 0,
                                                          MAX_EXPERTS * sizeof(int32_t), queue, deps);
 
     // Parallel histogram

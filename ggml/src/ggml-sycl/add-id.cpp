@@ -66,12 +66,12 @@ static void add_id_validate_inputs(
 
     const int             queue_device = ggml_sycl_get_device_id_from_queue(q);
     ggml_sycl::mem_handle src1_dst     = ggml_sycl::mem_handle::from_direct(
-        src1_host.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+        src1_host.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, src1_bytes);
     ggml_sycl::mem_handle src1_src = ggml_sycl_memcpy_handle_for_raw_ptr(src1_d, queue_device, GGML_LAYOUT_AOS,
                                                                          /*fallback_on_device=*/true,
                                                                          /*fallback_unknown=*/true);
     ggml_sycl::mem_handle src2_dst = ggml_sycl::mem_handle::from_direct(
-        src2_host.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+        src2_host.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, src2_bytes);
     ggml_sycl::mem_handle src2_src = ggml_sycl_memcpy_handle_for_raw_ptr(src2_d, queue_device, GGML_LAYOUT_AOS,
                                                                          /*fallback_on_device=*/true,
                                                                          /*fallback_unknown=*/true);

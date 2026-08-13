@@ -18,8 +18,9 @@
 #include <atomic>
 #include <vector>
 
-static inline ggml_sycl::mem_handle ggml_sycl_cont_batch_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+static inline ggml_sycl::mem_handle ggml_sycl_cont_batch_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 template <typename T>
@@ -548,17 +549,17 @@ inline int ggml_sycl_multi_seq_add(ggml_sycl_multi_seq_sampler & sampler,
     // Update device state
     int active = 1;
     ggml_sycl::mem_copy(sampler.temperatures_handle, slot * sizeof(float),
-                        ggml_sycl_cont_batch_host_handle(&temperature), 0, sizeof(float), q);
-    ggml_sycl::mem_copy(sampler.rng_states_handle, slot * sizeof(uint32_t), ggml_sycl_cont_batch_host_handle(&seed), 0,
+                        ggml_sycl_cont_batch_host_handle(&temperature, 0 + sizeof(float)), 0, sizeof(float), q);
+    ggml_sycl::mem_copy(sampler.rng_states_handle, slot * sizeof(uint32_t), ggml_sycl_cont_batch_host_handle(&seed, 0 + sizeof(uint32_t)), 0,
                         sizeof(uint32_t), q);
-    ggml_sycl::mem_copy(sampler.seq_active_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&active), 0,
+    ggml_sycl::mem_copy(sampler.seq_active_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&active, 0 + sizeof(int)), 0,
                         sizeof(int), q);
 
     // Reset token buffer for this sequence
     int zero = 0;
-    ggml_sycl::mem_copy(sampler.write_indices_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&zero), 0,
+    ggml_sycl::mem_copy(sampler.write_indices_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&zero, 0 + sizeof(int)), 0,
                         sizeof(int), q);
-    ggml_sycl::mem_copy(sampler.token_counts_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&zero), 0,
+    ggml_sycl::mem_copy(sampler.token_counts_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&zero, 0 + sizeof(int)), 0,
                         sizeof(int), q);
 
     return slot;
@@ -585,7 +586,7 @@ inline void ggml_sycl_multi_seq_remove(ggml_sycl_multi_seq_sampler & sampler, sy
 
     // Update device state
     int inactive = 0;
-    ggml_sycl::mem_copy(sampler.seq_active_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&inactive), 0,
+    ggml_sycl::mem_copy(sampler.seq_active_handle, slot * sizeof(int), ggml_sycl_cont_batch_host_handle(&inactive, 0 + sizeof(int)), 0,
                         sizeof(int), q);
 }
 
@@ -750,7 +751,7 @@ inline int ggml_sycl_multi_seq_get_tokens(ggml_sycl_multi_seq_sampler & sampler,
 
     // Get token count
     int count;
-    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&count), 0, sampler.token_counts_handle, slot * sizeof(int),
+    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&count, 0 + sizeof(int)), 0, sampler.token_counts_handle, slot * sizeof(int),
                         sizeof(int), q);
 
     int n_to_copy = std::min(count, max_tokens);
@@ -762,7 +763,7 @@ inline int ggml_sycl_multi_seq_get_tokens(ggml_sycl_multi_seq_sampler & sampler,
 
     // Get write index to calculate start position
     int write_idx;
-    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&write_idx), 0, sampler.write_indices_handle,
+    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&write_idx, 0 + sizeof(int)), 0, sampler.write_indices_handle,
                         slot * sizeof(int), sizeof(int), q);
 
     int start_idx = 0;
@@ -774,16 +775,16 @@ inline int ggml_sycl_multi_seq_get_tokens(ggml_sycl_multi_seq_sampler & sampler,
     int32_t * src = sampler.token_buffers + slot * CONT_BATCH_TOKENS_PER_SEQ;
 
     if (start_idx + n_to_copy <= CONT_BATCH_TOKENS_PER_SEQ) {
-        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens), 0, sampler.token_buffers_handle,
+        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens, 0 + n_to_copy * sizeof(int32_t)), 0, sampler.token_buffers_handle,
                             (slot * CONT_BATCH_TOKENS_PER_SEQ + start_idx) * sizeof(int32_t),
                             n_to_copy * sizeof(int32_t), q);
     } else {
         int first_part  = CONT_BATCH_TOKENS_PER_SEQ - start_idx;
         int second_part = n_to_copy - first_part;
-        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens), 0, sampler.token_buffers_handle,
+        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens, 0 + first_part * sizeof(int32_t)), 0, sampler.token_buffers_handle,
                             (slot * CONT_BATCH_TOKENS_PER_SEQ + start_idx) * sizeof(int32_t),
                             first_part * sizeof(int32_t), q);
-        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens + first_part), 0, sampler.token_buffers_handle,
+        ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(host_tokens + first_part, 0 + second_part * sizeof(int32_t)), 0, sampler.token_buffers_handle,
                             slot * CONT_BATCH_TOKENS_PER_SEQ * sizeof(int32_t), second_part * sizeof(int32_t), q);
     }
 
@@ -828,7 +829,7 @@ inline bool ggml_sycl_multi_seq_check_eos(ggml_sycl_multi_seq_sampler & sampler,
 
     int32_t      token;
     const size_t token_offset = static_cast<size_t>(token_ptr - sampler.sampled_tokens) * sizeof(int32_t);
-    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&token), 0, sampler.sampled_tokens_handle, token_offset,
+    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(&token, 0 + sizeof(int32_t)), 0, sampler.sampled_tokens_handle, token_offset,
                         sizeof(int32_t), q);
 
     return token == eos_token;
@@ -1131,7 +1132,7 @@ inline void ggml_sycl_multi_seq_sample_indexed(
     // Check if all sequences use greedy sampling (temp=0)
     // We need to copy temperatures to host to check
     std::vector<float> h_temps(sampler.max_seqs);
-    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(h_temps.data()), 0, sampler.temperatures_handle, 0,
+    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(h_temps.data(), 0 + sampler.max_seqs * sizeof(float)), 0, sampler.temperatures_handle, 0,
                         sampler.max_seqs * sizeof(float), q);
 
     // Check if all active sequences have temp=0 (greedy)
@@ -1139,7 +1140,7 @@ inline void ggml_sycl_multi_seq_sample_indexed(
     auto             seq_ids_handle = ggml_sycl::mem_handle::from_chunk_ptr(
         const_cast<int *>(d_seq_ids), ggml_sycl_get_device_id_from_queue(q), GGML_LAYOUT_AOS, /*on_device=*/true);
     GGML_ASSERT(seq_ids_handle.valid());
-    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(h_seq_ids.data()), 0, seq_ids_handle, 0, n_seqs * sizeof(int),
+    ggml_sycl::mem_copy(ggml_sycl_cont_batch_host_handle(h_seq_ids.data(), 0 + n_seqs * sizeof(int)), 0, seq_ids_handle, 0, n_seqs * sizeof(int),
                         q);
 
     bool all_greedy = true;

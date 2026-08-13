@@ -60,7 +60,7 @@ void ggml_sycl_count_equal(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                                                          dst_loc.device :
                                                          (dst_on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
     const ggml_sycl::mem_handle      dst_handle =
-        ggml_sycl::mem_handle::from_direct(dst_d, GGML_LAYOUT_AOS, dst_on_device, dst_device);
+        ggml_sycl::mem_handle::from_direct(dst_d, GGML_LAYOUT_AOS, dst_on_device, dst_device, dst.nbytes());
     ggml_sycl::mem_fill(dst_handle, 0, dst.nbytes(), *stream);
 
     const dpct::dim3 block_dims(WARP_SIZE, 1, 1);

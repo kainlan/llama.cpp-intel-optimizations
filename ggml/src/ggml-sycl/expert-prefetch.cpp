@@ -982,7 +982,7 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
 
         // D2H copy of scores (tiny: M floats, e.g. 512 bytes for 128 experts)
         ggml_sycl::mem_handle scores_host_handle = ggml_sycl::mem_handle::from_direct(
-            scores_host.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            scores_host.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, M * sizeof(float));
         ggml_sycl::mem_copy(scores_host_handle, scores_handle_, M * sizeof(float), compute_q, { ev });
 
     } catch (const sycl::exception & e) {

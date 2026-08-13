@@ -3927,7 +3927,8 @@ static std::shared_ptr<mem_handle> make_direct_entry_handle(const unified_cache_
                                                             const char *              site);
 static bool                        moe_direct_trace_enabled();
 
-static mem_handle make_copy_handle_for_raw_ptr(void * ptr, ggml_layout_mode layout, int fallback_device) {
+static mem_handle make_copy_handle_for_raw_ptr(
+    void * ptr, ggml_layout_mode layout, int fallback_device, size_t extent) {
     memory_location loc = query_location(ptr, fallback_device);
     if (loc.on_device()) {
         const int owner = loc.device >= 0 ? loc.device : fallback_device;
@@ -3936,7 +3937,7 @@ static mem_handle make_copy_handle_for_raw_ptr(void * ptr, ggml_layout_mode layo
     if (loc.tier == alloc_tier::HOST_PINNED && fallback_device >= 0) {
         return mem_handle::from_chunk_ptr(ptr, fallback_device, layout, false);
     }
-    return mem_handle::from_direct(ptr, layout, false, mem_handle::HOST_DEVICE);
+    return mem_handle::from_direct(ptr, layout, false, mem_handle::HOST_DEVICE, extent);
 }
 
 static unified_cache_key make_direct_stage_key(cache_entry_type           type,
@@ -4155,7 +4156,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // through the unified-cache copy helper so the transfer is backed by a
     // refcounted pinned staging handle instead of a raw host pointer.
     mem_handle dst_handle =
-        direct_alloc_owner.valid() ? direct_alloc_owner : make_copy_handle_for_raw_ptr(ptr, layout, cache_device);
+        direct_alloc_owner.valid() ? direct_alloc_owner : make_copy_handle_for_raw_ptr(ptr, layout, cache_device, dst_size);
     sycl::event fill_event;
     try {
         if (fill_fn) {
@@ -4163,7 +4164,7 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         } else {
             const size_t copy_size = std::min(src_size, dst_size);
             mem_handle   src_handle =
-                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device);
+                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
             fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, copy_size, *queue, {});
         }
     } catch (const sycl::exception & e) {
@@ -4433,9 +4434,9 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         } else {
             host_ptr = host_zone_alloc(host_zone_id::WEIGHT, src_size, 256);
             if (host_ptr) {
-                mem_handle dst_handle = make_copy_handle_for_raw_ptr(host_ptr, GGML_LAYOUT_AOS, cache_device);
+                mem_handle dst_handle = make_copy_handle_for_raw_ptr(host_ptr, GGML_LAYOUT_AOS, cache_device, src_size);
                 mem_handle src_handle =
-                    make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device);
+                    make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
                 mem_copy(dst_handle, src_handle, src_size, *queue, {});
                 loc = cache_location::HOST_PINNED;
             } else {
@@ -4533,14 +4534,14 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // 2. Fill: reorder or plain memcpy. Source readiness is part of the
     // submission rather than a host-side wait, preserving DMA overlap.
     mem_handle dst_handle =
-        direct_alloc_owner.valid() ? direct_alloc_owner : make_copy_handle_for_raw_ptr(ptr, layout, cache_device);
+        direct_alloc_owner.valid() ? direct_alloc_owner : make_copy_handle_for_raw_ptr(ptr, layout, cache_device, dst_size);
     sycl::event fill_event;
     try {
         if (fill_fn) {
             fill_event = fill_fn(*queue, ptr, dst_size, src_ptr, src_size, fill_ctx, deps);
         } else {
             mem_handle src_handle =
-                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device);
+                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
             fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, src_size, *queue, deps);
         }
     } catch (const sycl::exception & e) {
@@ -4767,9 +4768,9 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
         if (fill_fn) {
             fill_event = fill_fn(*queue, ptr, total_dst_size, src_ptr, src_size, fill_ctx, {});
         } else {
-            mem_handle dst_handle = make_copy_handle_for_raw_ptr(ptr, layout, cache_device);
+            mem_handle dst_handle = make_copy_handle_for_raw_ptr(ptr, layout, cache_device, total_dst_size);
             mem_handle src_handle =
-                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device);
+                make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
             fill_event = mem_copy_async(dst_handle, 0, src_handle, 0, src_size, *queue, {});
         }
     } catch (const sycl::exception & e) {
@@ -6588,9 +6589,9 @@ bool unified_cache::stage_expert_group(int                          block_id,
                 // sides into smart handles so mem-ops owns queue selection,
                 // staging, and async lifetime retention.
                 const size_t copy_size  = std::min(s.data->dst_size, s.data->src_size);
-                auto         dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device);
+                auto         dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
                 auto         src_handle =
-                    make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device);
+                    make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
                 std::vector<sycl::event> copy_deps;
                 if (has_last_event) {
                     copy_deps.push_back(last_event);
@@ -6689,9 +6690,9 @@ bool unified_cache::stage_expert_group(int                          block_id,
 
         try {
             size_t copy_size  = std::min(s.data->src_size, s.data->dst_size);
-            auto   dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device);
+            auto   dst_handle = make_copy_handle_for_raw_ptr(s.ptr, layout, cache_device, s.data->dst_size);
             auto   src_handle =
-                make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device);
+                make_copy_handle_for_raw_ptr(const_cast<void *>(s.data->src_ptr), GGML_LAYOUT_AOS, cache_device, s.data->src_size);
             last_event = mem_copy_async(dst_handle, src_handle, copy_size, bcs);
         } catch (...) {
             GGML_LOG_WARN(
@@ -8041,8 +8042,8 @@ size_t unified_cache::evict_one(size_t /* new_size */) {
                     sycl::queue & dq = get_dma_queue();
                     sycl::event   evt;
                     try {
-                        auto dst_handle = make_copy_handle_for_raw_ptr(host_dst, it->second.layout, cache_device);
-                        auto src_handle = make_copy_handle_for_raw_ptr(ptr, it->second.layout, cache_device);
+                        auto dst_handle = make_copy_handle_for_raw_ptr(host_dst, it->second.layout, cache_device, entry_size);
+                        auto src_handle = make_copy_handle_for_raw_ptr(ptr, it->second.layout, cache_device, entry_size);
                         evt             = mem_copy_async(dst_handle, src_handle, entry_size, dq);
                     } catch (...) {
                         if (host_zones_configured()) {
@@ -8291,8 +8292,8 @@ sycl::event unified_cache::copy_to_device_async(void *                          
     // staging lifetimes stay centralized in mem-ops.
     sycl::queue & q          = override_q ? *override_q : queue_;
     const int     device_id  = get_device_id_from_queue(q);
-    mem_handle    dst_handle = make_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, device_id);
-    mem_handle    src_handle = make_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, device_id);
+    mem_handle    dst_handle = make_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, device_id, size);
+    mem_handle    src_handle = make_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, device_id, size);
 
     if (copy_to_device_sync_enabled()) {
         sycl::event event = mem_copy_async(dst_handle, src_handle, size, q, deps);
@@ -13939,7 +13940,8 @@ void * unified_cache::load_partial_rows(const char *               tensor_name,
     // Complete the AOS upload before the synchronous reorder publication API;
     // queue_ may be out-of-order.
     mem_handle partial_src =
-        mem_handle::from_direct(const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
+        mem_handle::from_direct(
+        const_cast<void *>(src_host), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, partial_bytes);
     mem_copy(partial_handle, partial_src, partial_bytes, queue_, {});
 
     // Apply the synchronous in-place SOA reorder only after upload submission.
@@ -15999,7 +16001,8 @@ bool unified_cache_fill_with_host_copy(int           device_id,
     const sycl::usm::alloc dst_type = ggml_sycl_get_alloc_type(dst);
     if (dst_type == sycl::usm::alloc::host || dst_type == sycl::usm::alloc::shared ||
         dst_type == sycl::usm::alloc::unknown) {
-        mem_handle dst_handle = mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
+        mem_handle dst_handle =
+            mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, size);
         mem_fill(dst_handle, value, size, queue);
         return true;
     }
@@ -16034,7 +16037,7 @@ bool unified_cache_fill_with_host_copy(int           device_id,
         while (offset < size) {
             const size_t this_chunk = std::min(chunk_bytes, size - offset);
             auto *       dst_chunk  = static_cast<uint8_t *>(dst) + offset;
-            mem_handle   dst_handle = make_copy_handle_for_raw_ptr(dst_chunk, GGML_LAYOUT_AOS, device_id);
+            mem_handle   dst_handle = make_copy_handle_for_raw_ptr(dst_chunk, GGML_LAYOUT_AOS, device_id, this_chunk);
             mem_copy(dst_handle, src_handle, this_chunk, queue);
             offset += this_chunk;
         }
@@ -16076,9 +16079,10 @@ bool unified_cache_copy_from_host_async(int                              device_
     const sycl::usm::alloc dst_type = ggml_sycl_get_alloc_type(dst);
     if (dst_type == sycl::usm::alloc::host || dst_type == sycl::usm::alloc::shared ||
         dst_type == sycl::usm::alloc::unknown) {
-        mem_handle src_handle =
-            mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
-        mem_handle dst_handle = mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
+        mem_handle src_handle = mem_handle::from_direct(
+            const_cast<void *>(src), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, size);
+        mem_handle dst_handle =
+            mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, size);
         mem_copy(dst_handle, src_handle, size, queue, deps);
         if (out_event) {
             *out_event = queue.ext_oneapi_submit_barrier();
@@ -16087,9 +16091,9 @@ bool unified_cache_copy_from_host_async(int                              device_
     }
 
     try {
-        mem_handle src_handle =
-            mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE);
-        mem_handle  dst_handle = make_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, device_id);
+        mem_handle src_handle = mem_handle::from_direct(
+            const_cast<void *>(src), GGML_LAYOUT_AOS, false, mem_handle::HOST_DEVICE, size);
+        mem_handle  dst_handle = make_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, device_id, size);
         sycl::event event      = mem_copy_async(dst_handle, src_handle, size, queue, deps);
         if (out_event) {
             *out_event = event;

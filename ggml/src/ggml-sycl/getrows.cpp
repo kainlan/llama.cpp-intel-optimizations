@@ -99,8 +99,9 @@ static int64_t get_view_row_offset(const ggml_tensor * t) {
     return offset;
 }
 
-static inline ggml_sycl::mem_handle ggml_sycl_get_rows_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+static inline ggml_sycl::mem_handle ggml_sycl_get_rows_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 static void ggml_sycl_get_rows_debug_copy_to_host(ggml_backend_sycl_context & ctx,
@@ -116,9 +117,9 @@ static void ggml_sycl_get_rows_debug_copy_to_host(ggml_backend_sycl_context & ct
     const int                        src_device    = src_on_device && loc.device >= 0 ?
                                                          loc.device :
                                                          (src_on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
-    ggml_sycl::mem_handle            dst_handle    = ggml_sycl_get_rows_host_handle(host_dst);
+    ggml_sycl::mem_handle            dst_handle    = ggml_sycl_get_rows_host_handle(host_dst, bytes);
     ggml_sycl::mem_handle            src_handle =
-        ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, src_on_device, src_device);
+        ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, src_on_device, src_device, bytes);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *ctx.stream());
 }
 
@@ -342,8 +343,8 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
         return resolved.ptr;
     };
 
-    auto host_stage_handle = [](void * ptr, ggml_sycl::mem_handle & owner) -> ggml_sycl::mem_handle {
-        return owner.valid() ? owner : ggml_sycl_get_rows_host_handle(ptr);
+    auto host_stage_handle = [](void * ptr, ggml_sycl::mem_handle & owner, size_t extent) -> ggml_sycl::mem_handle {
+        return owner.valid() ? owner : ggml_sycl_get_rows_host_handle(ptr, extent);
     };
 
     const int queue_device = ggml_sycl_get_device_id_from_queue(*stream);
@@ -362,7 +363,7 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
             auto src0_device_handle =
                 ggml_sycl::mem_handle::from_chunk_ptr(src0_orig, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
             GGML_ASSERT(src0_device_handle.valid());
-            ggml_sycl::mem_copy(host_stage_handle(src0_host_ptr, src0_host_owner), 0, src0_device_handle, 0, src0_bytes,
+            ggml_sycl::mem_copy(host_stage_handle(src0_host_ptr, src0_host_owner, src0_bytes), 0, src0_device_handle, 0, src0_bytes,
                                 *stream);
             ggml_sycl_set_host_data(src0, src0_host_ptr);
         }
@@ -377,7 +378,7 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
             auto src1_device_handle =
                 ggml_sycl::mem_handle::from_chunk_ptr(src1_orig, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
             GGML_ASSERT(src1_device_handle.valid());
-            ggml_sycl::mem_copy(host_stage_handle(src1_host_ptr, src1_host_owner), 0, src1_device_handle, 0, src1_bytes,
+            ggml_sycl::mem_copy(host_stage_handle(src1_host_ptr, src1_host_owner, src1_bytes), 0, src1_device_handle, 0, src1_bytes,
                                 *stream);
             ggml_sycl_set_host_data(src1, src1_host_ptr);
         }
@@ -407,7 +408,7 @@ static bool ggml_sycl_cpu_get_rows_direct(ggml_backend_sycl_context & ctx,
             auto dst_device_handle =
                 ggml_sycl::mem_handle::from_chunk_ptr(dst_orig, queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
             GGML_ASSERT(dst_device_handle.valid());
-            ggml_sycl::mem_copy(dst_device_handle, 0, host_stage_handle(ggml_sycl_host_data(dst), dst_host_owner), 0,
+            ggml_sycl::mem_copy(dst_device_handle, 0, host_stage_handle(ggml_sycl_host_data(dst), dst_host_owner, dst_bytes), 0,
                                 dst_bytes, *stream);
         }
         ok = true;
@@ -639,9 +640,9 @@ static void ggml_sycl_trace_q8_0_aos_get_rows_access(ggml_backend_sycl_context &
                                                              loc.device :
                                                              (src_on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
         ggml_sycl::mem_handle            dst_handle =
-            ggml_sycl::mem_handle::from_direct(host_dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+            ggml_sycl::mem_handle::from_direct(host_dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, bytes);
         ggml_sycl::mem_handle src_handle =
-            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, src_on_device, src_device);
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, src_on_device, src_device, bytes);
         ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *ctx.stream());
     };
 
@@ -682,7 +683,7 @@ static void ggml_sycl_trace_q8_0_aos_get_rows_access(ggml_backend_sycl_context &
                                                              dst_loc.device :
                                                              (dst_on_device ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE);
         ggml_sycl::mem_handle            dst_handle =
-            ggml_sycl::mem_handle::from_direct(dst_d, GGML_LAYOUT_AOS, dst_on_device, dst_device);
+            ggml_sycl::mem_handle::from_direct(dst_d, GGML_LAYOUT_AOS, dst_on_device, dst_device, dst_probe);
         ggml_sycl::mem_fill(dst_handle, 0, dst_probe, *ctx.stream());
     } catch (const sycl::exception & e) {
         GGML_LOG_ERROR("[GET_ROWS-DIAG] dst memset failed tensor=%s dst=%p bytes=%zu dst_alloc=%d: %s\n",

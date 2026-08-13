@@ -6889,7 +6889,7 @@ static sycl::event mmq_stream_copy(sycl::queue &                    queue,
 
         std::vector<sycl::event> verify_deps = cur_deps;
         auto actual_handle     = ggml_sycl::mem_handle::from_direct(actual.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
-                                                                    ggml_sycl::mem_handle::HOST_DEVICE);
+                                                                    ggml_sycl::mem_handle::HOST_DEVICE, probe_bytes);
         sycl::event verify_evt = ggml_sycl::mem_copy_async(actual_handle, dst_handle, probe_bytes, queue, verify_deps);
         if (!g_ggml_sycl_graph_recording) {
             verify_evt.wait();

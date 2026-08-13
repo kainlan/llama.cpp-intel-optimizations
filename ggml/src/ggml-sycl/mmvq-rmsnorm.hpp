@@ -292,7 +292,7 @@ static void mul_mat_vec_q4_0_f32_rmsnorm_sycl(
         dst_loc.device :
         (dst_on_device ? queue_device : ggml_sycl::mem_handle::HOST_DEVICE);
     const ggml_sycl::mem_handle dst_handle =
-        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, dst_on_device, dst_device);
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, dst_on_device, dst_device, nrows * batch_size * sizeof(float));
     ggml_sycl::mem_fill(dst_handle, 0, nrows * batch_size * sizeof(float), *stream);
 }
 
@@ -389,7 +389,7 @@ static void ggml_sycl_mul_mat_vec_rmsnorm(
 
     std::vector<float> ones(batch_size, 1.0f);
     ggml_sycl::mem_handle ones_handle =
-        ggml_sycl::mem_handle::from_direct(ones.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(ones.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, batch_size * sizeof(float));
     ggml_sycl::mem_copy(scales_owner, ones_handle, batch_size * sizeof(float), *stream);
 
     // SKIP: compute_rms_scales_sycl

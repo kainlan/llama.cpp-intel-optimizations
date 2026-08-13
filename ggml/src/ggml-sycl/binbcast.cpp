@@ -29,7 +29,8 @@ enum class ggml_sycl_binbcast_event_mode {
     REUSE,
 };
 
-static ggml_sycl::mem_handle ggml_sycl_binbcast_copy_handle_for_raw_ptr(void * ptr, int fallback_device) {
+static ggml_sycl::mem_handle ggml_sycl_binbcast_copy_handle_for_raw_ptr(
+    void * ptr, int fallback_device, size_t extent) {
     ggml_sycl::memory_location loc = ggml_sycl::query_location(ptr, fallback_device);
     if (loc.on_device()) {
         const int owner = loc.device >= 0 ? loc.device : fallback_device;
@@ -38,7 +39,8 @@ static ggml_sycl::mem_handle ggml_sycl_binbcast_copy_handle_for_raw_ptr(void * p
     if (loc.tier == ggml_sycl::alloc_tier::HOST_PINNED && fallback_device >= 0) {
         return ggml_sycl::mem_handle::from_chunk_ptr(ptr, fallback_device, GGML_LAYOUT_AOS, false);
     }
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 static void ggml_sycl_binbcast_debug_read_f32(sycl::queue & queue,
@@ -47,8 +49,8 @@ static void ggml_sycl_binbcast_debug_read_f32(sycl::queue & queue,
                                               const void *  src,
                                               size_t        count) {
     ggml_sycl::mem_handle dst_handle =
-        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
-    ggml_sycl::mem_handle src_handle = ggml_sycl_binbcast_copy_handle_for_raw_ptr(const_cast<void *>(src), device);
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + count * sizeof(float));
+    ggml_sycl::mem_handle src_handle = ggml_sycl_binbcast_copy_handle_for_raw_ptr(const_cast<void *>(src), device, count * sizeof(float));
     ggml_sycl::mem_copy(dst_handle, 0, src_handle, 0, count * sizeof(float), queue);
 }
 

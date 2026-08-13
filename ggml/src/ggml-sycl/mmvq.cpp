@@ -1291,8 +1291,9 @@ static bool ggml_sycl_mmvq_alloc_host_stage(size_t                  bytes,
     return true;
 }
 
-static ggml_sycl::mem_handle mmvq_host_direct_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+static ggml_sycl::mem_handle mmvq_host_direct_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 static void mmvq_debug_copy_to_host(sycl::queue & queue, int device, void * host_dst, const void * src, size_t bytes) {
@@ -1304,11 +1305,11 @@ static void mmvq_debug_copy_to_host(sycl::queue & queue, int device, void * host
     const bool                       src_on_device = loc.on_device();
     const int                        src_device =
         src_on_device && loc.device >= 0 ? loc.device : (src_on_device ? device : ggml_sycl::mem_handle::HOST_DEVICE);
-    ggml_sycl::mem_handle dst_handle = mmvq_host_direct_handle(host_dst);
+    ggml_sycl::mem_handle dst_handle = mmvq_host_direct_handle(host_dst, bytes);
     ggml_sycl::mem_handle src_handle =
         src_on_device ?
             ggml_sycl::mem_handle::from_chunk_ptr(const_cast<void *>(src), src_device, GGML_LAYOUT_AOS, true) :
-            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device);
+            ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS, false, src_device, bytes);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue);
 }
 
@@ -12455,7 +12456,7 @@ static int mxfp4_copy_active_chunks_to_host(sycl::queue &                    que
     int32_t   active_chunks_host = -1;
     const int queue_device       = ggml_sycl_get_device_id_from_queue(queue);
     auto      host_handle        = ggml_sycl::mem_handle::from_direct(&active_chunks_host, GGML_LAYOUT_AOS,
-                                                                      /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+                                                                      /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, sizeof(active_chunks_host));
     auto      device_handle      = ggml_sycl::mem_handle::from_chunk_ptr(const_cast<int32_t *>(active_chunks_device),
                                                                          queue_device, GGML_LAYOUT_AOS, /*on_device=*/true);
     ggml_sycl::mem_copy(host_handle, device_handle, sizeof(active_chunks_host), queue, deps);
@@ -20492,7 +20493,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                     return false;
                 }
                 ggml_sycl::mem_handle table_src = ggml_sycl::mem_handle::from_direct(
-                    expert_ptr_payload.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+                    expert_ptr_payload.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, expert_ptr_payload.size() * sizeof(void *));
                 table_event     = ggml_sycl::mem_copy_async(src0_extra->moe_expert_ptrs_handle[ctx.device], table_src,
                                                             expert_ptr_payload.size() * sizeof(void *), *stream);
                 has_table_event = true;
@@ -20732,7 +20733,7 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 int  missing_host = 0;
                 auto missing_host_handle =
                     ggml_sycl::mem_handle::from_direct(&missing_host, GGML_LAYOUT_AOS,
-                                                       /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE);
+                                                       /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, sizeof(missing_host));
                 ggml_sycl::mem_handle missing_device_handle = extra_mut->moe_expert_ptrs_missing_handle[ctx.device];
                 if (!missing_device_handle.valid()) {
                     const bool missing_on_device = ggml_sycl_get_alloc_type(missing_device) == sycl::usm::alloc::device;

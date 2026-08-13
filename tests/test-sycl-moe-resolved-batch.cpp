@@ -51,7 +51,7 @@ mem_handle test_make_stable_weight_lease(const ggml_sycl_cache_id & key_id,
     h.device_               = device;
     h.key_                  = { cache_entry_type::DENSE_WEIGHT, key_id, -1, -1 };
     h.gen_                  = cache_generation();
-    h.cached_                  = { ptr, extent, layout, on_device, false, sycl::event{} };
+    h.cached_                  = { ptr, sizeof(int), layout, on_device, false, sycl::event{} };
 #ifdef GGML_SYCL_RETENTION_IDENTITY_TESTING
     h.set_canonical_identity_for_test(key_id.aux_id, h.gen_, 4096, 64, 256);
 #endif

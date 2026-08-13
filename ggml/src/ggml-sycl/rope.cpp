@@ -15,7 +15,7 @@ struct mrope_sections {
 
 static void ggml_sycl_rope_debug_read(sycl::queue & queue, int device, void * dst, const void * src, size_t bytes) {
     ggml_sycl::mem_handle dst_handle =
-        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + bytes);
     ggml_sycl::mem_handle src_handle = ggml_sycl_memcpy_handle_for_raw_ptr(src, device);
     ggml_sycl::mem_copy(dst_handle, 0, src_handle, 0, bytes, queue);
 }

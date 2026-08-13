@@ -4193,9 +4193,9 @@ void xmx_test_kernel(sycl::queue & q) {
     std::vector<int8_t>   h_A(M * K, 1);
     std::vector<int8_t>   h_B(K * N, 2);
     ggml_sycl::mem_handle h_A_handle =
-        ggml_sycl::mem_handle::from_direct(h_A.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(h_A.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, M * K * sizeof(int8_t));
     ggml_sycl::mem_handle h_B_handle =
-        ggml_sycl::mem_handle::from_direct(h_B.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(h_B.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, K * N * sizeof(int8_t));
     ggml_sycl::mem_copy(d_A_owner, h_A_handle, M * K * sizeof(int8_t), q);
     ggml_sycl::mem_copy(d_B_owner, h_B_handle, K * N * sizeof(int8_t), q);
 
@@ -4228,7 +4228,7 @@ void xmx_test_kernel(sycl::queue & q) {
 
     std::vector<int32_t>  h_C(M * N);
     ggml_sycl::mem_handle h_C_handle =
-        ggml_sycl::mem_handle::from_direct(h_C.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+        ggml_sycl::mem_handle::from_direct(h_C.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, M * N * sizeof(int32_t));
     ggml_sycl::mem_copy(h_C_handle, d_C_owner, M * N * sizeof(int32_t), q);
 
     bool pass     = true;

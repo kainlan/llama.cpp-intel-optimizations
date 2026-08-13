@@ -17,8 +17,9 @@
 #include <random>
 #include <vector>
 
-static inline ggml_sycl::mem_handle ggml_sycl_gpu_sampler_host_handle(void * ptr) {
-    return ggml_sycl::mem_handle::from_direct(ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE);
+static inline ggml_sycl::mem_handle ggml_sycl_gpu_sampler_host_handle(void * ptr, size_t extent) {
+    return ggml_sycl::mem_handle::from_direct(
+        ptr, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, extent);
 }
 
 template <typename T>
@@ -538,7 +539,7 @@ inline float gpu_topk_find_threshold(ggml_backend_sycl_context & ctx,
         auto    total_count_handle = ggml_sycl::mem_handle::from_chunk_ptr(
             total_count_buf, ggml_sycl_get_device_id_from_queue(q), GGML_LAYOUT_AOS, /*on_device=*/true);
         GGML_ASSERT(total_count_handle.valid());
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&count), 0, total_count_handle, 0, sizeof(int32_t), q);
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&count, 0 + sizeof(int32_t)), 0, total_count_handle, 0, sizeof(int32_t), q);
 
         if (count >= k) {
             lo        = mid;
@@ -752,7 +753,7 @@ inline int32_t ggml_sycl_sample_token(ggml_backend_sycl_context &      ctx,
         // Get global max from block results
         float              global_max = -INFINITY;
         std::vector<float> h_block_max(n_blocks);
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(h_block_max.data()), 0, state.block_max_owner, 0,
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(h_block_max.data(), 0 + n_blocks * sizeof(float)), 0, state.block_max_owner, 0,
                             n_blocks * sizeof(float), q);
         for (int i = 0; i < n_blocks; i++) {
             if (h_block_max[i] > global_max) {
@@ -796,9 +797,9 @@ inline int32_t ggml_sycl_sample_token(ggml_backend_sycl_context &      ctx,
 
         // Compute global max and sum on host (simpler for one-time use)
         std::vector<float> h_block_max(n_blocks), h_block_sum(n_blocks);
-        sycl::event block_max_copy = ggml_sycl::mem_copy_async(ggml_sycl_gpu_sampler_host_handle(h_block_max.data()), 0,
+        sycl::event block_max_copy = ggml_sycl::mem_copy_async(ggml_sycl_gpu_sampler_host_handle(h_block_max.data(), 0 + n_blocks * sizeof(float)), 0,
                                                                state.block_max_owner, 0, n_blocks * sizeof(float), q);
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(h_block_sum.data()), 0, state.block_sum_owner, 0,
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(h_block_sum.data(), 0 + n_blocks * sizeof(float)), 0, state.block_sum_owner, 0,
                             n_blocks * sizeof(float), q, { block_max_copy });
 
         float global_max = -INFINITY;
@@ -862,7 +863,7 @@ inline int32_t ggml_sycl_sample_token(ggml_backend_sycl_context &      ctx,
 
         // Read result (single sync point)
         int32_t result;
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result), 0, state.selected_owner, 0, sizeof(int32_t), q);
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result, 0 + sizeof(int32_t)), 0, state.selected_owner, 0, sizeof(int32_t), q);
         return result;
     }
 
@@ -898,7 +899,7 @@ inline int32_t ggml_sycl_sample_token(ggml_backend_sycl_context &      ctx,
 
     // Read result (single sync point)
     int32_t result;
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result), 0, state.selected_owner, 0, sizeof(int32_t), q);
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result, 0 + sizeof(int32_t)), 0, state.selected_owner, 0, sizeof(int32_t), q);
     return result;
 }
 
@@ -1048,7 +1049,7 @@ inline void ggml_sycl_sample_token_async(ggml_backend_sycl_context &      ctx,
 inline int32_t ggml_sycl_sample_token_wait(ggml_backend_sycl_context & ctx, ggml_sycl_sampler_state & state) {
     sycl::queue & q = *ctx.stream();
     int32_t       result;
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result), 0, state.selected_owner, 0, sizeof(int32_t), q);
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&result, 0 + sizeof(int32_t)), 0, state.selected_owner, 0, sizeof(int32_t), q);
     return result;
 }
 
@@ -1208,16 +1209,16 @@ inline int ggml_sycl_sampler_get_tokens(ggml_backend_sycl_context & ctx,
     // Handle wrap-around in ring buffer
     if (start_idx + n_to_copy <= GPU_SAMPLER_TOKEN_BUFFER_SIZE) {
         // No wrap - single copy
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens), 0, state.token_buffer_owner,
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens, 0 + n_to_copy * sizeof(int32_t)), 0, state.token_buffer_owner,
                             static_cast<size_t>(start_idx) * sizeof(int32_t), n_to_copy * sizeof(int32_t), q);
     } else {
         // Wrap - two copies
         int         first_part  = GPU_SAMPLER_TOKEN_BUFFER_SIZE - start_idx;
         int         second_part = n_to_copy - first_part;
         sycl::event first_copy  = ggml_sycl::mem_copy_async(
-            ggml_sycl_gpu_sampler_host_handle(host_tokens), 0, state.token_buffer_owner,
+            ggml_sycl_gpu_sampler_host_handle(host_tokens, 0 + first_part * sizeof(int32_t)), 0, state.token_buffer_owner,
             static_cast<size_t>(start_idx) * sizeof(int32_t), first_part * sizeof(int32_t), q);
-        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens + first_part), 0, state.token_buffer_owner, 0,
+        ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens + first_part, 0 + second_part * sizeof(int32_t)), 0, state.token_buffer_owner, 0,
                             second_part * sizeof(int32_t), q, { first_copy });
     }
 
@@ -1427,7 +1428,7 @@ inline int ggml_sycl_verify_speculative(ggml_backend_sycl_context & ctx,
     // Copy result back (single sync point)
     int32_t                       n_accepted;
     const ggml_sycl::mem_handle & n_accepted_handle = allocated_n_accepted ? n_accepted_owner : state.selected_owner;
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&n_accepted), 0, n_accepted_handle, 0, sizeof(int32_t), q);
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(&n_accepted, 0 + sizeof(int32_t)), 0, n_accepted_handle, 0, sizeof(int32_t), q);
 
     // Local owners release temporary allocations after the queue copy above has completed.
     GGML_UNUSED(allocated_matches);
@@ -1450,7 +1451,7 @@ inline int ggml_sycl_verify_speculative_host(ggml_backend_sycl_context & ctx,
     ggml_sycl::mem_handle draft_tokens_owner;
     int32_t *             draft_tokens_dev = ggml_sycl_gpu_sampler_alloc<int32_t>(n_draft, q, draft_tokens_owner);
     ggml_sycl::mem_copy(draft_tokens_owner, 0,
-                        ggml_sycl_gpu_sampler_host_handle(const_cast<int32_t *>(draft_tokens_host)), 0,
+                        ggml_sycl_gpu_sampler_host_handle(const_cast<int32_t *>(draft_tokens_host), 0 + n_draft * sizeof(int32_t)), 0,
                         n_draft * sizeof(int32_t), q);
 
     // Call main function
@@ -1889,19 +1890,19 @@ inline void ggml_sycl_multi_seq_sampler_alloc(ggml_sycl_multi_seq_sampler_state 
     std::vector<sycl::event> init_copy_events;
     init_copy_events.reserve(5);
     init_copy_events.push_back(ggml_sycl::mem_copy_async(state.temperatures_owner, 0,
-                                                         ggml_sycl_gpu_sampler_host_handle(h_temps.data()), 0,
+                                                         ggml_sycl_gpu_sampler_host_handle(h_temps.data(), 0 + max_seqs * sizeof(float)), 0,
                                                          max_seqs * sizeof(float), q));
     init_copy_events.push_back(ggml_sycl::mem_copy_async(state.top_k_values_owner, 0,
-                                                         ggml_sycl_gpu_sampler_host_handle(h_top_k.data()), 0,
+                                                         ggml_sycl_gpu_sampler_host_handle(h_top_k.data(), 0 + max_seqs * sizeof(int32_t)), 0,
                                                          max_seqs * sizeof(int32_t), q));
     init_copy_events.push_back(ggml_sycl::mem_copy_async(state.top_p_values_owner, 0,
-                                                         ggml_sycl_gpu_sampler_host_handle(h_top_p.data()), 0,
+                                                         ggml_sycl_gpu_sampler_host_handle(h_top_p.data(), 0 + max_seqs * sizeof(float)), 0,
                                                          max_seqs * sizeof(float), q));
     init_copy_events.push_back(ggml_sycl::mem_copy_async(state.min_p_values_owner, 0,
-                                                         ggml_sycl_gpu_sampler_host_handle(h_min_p.data()), 0,
+                                                         ggml_sycl_gpu_sampler_host_handle(h_min_p.data(), 0 + max_seqs * sizeof(float)), 0,
                                                          max_seqs * sizeof(float), q));
     init_copy_events.push_back(ggml_sycl::mem_copy_async(state.greedy_flags_owner, 0,
-                                                         ggml_sycl_gpu_sampler_host_handle(h_greedy.data()), 0,
+                                                         ggml_sycl_gpu_sampler_host_handle(h_greedy.data(), 0 + max_seqs * sizeof(uint8_t)), 0,
                                                          max_seqs * sizeof(uint8_t), q));
     q.wait();
 
@@ -1966,21 +1967,21 @@ inline void ggml_sycl_multi_seq_sampler_set_params(ggml_sycl_multi_seq_sampler_s
     std::vector<sycl::event> param_copy_events;
     param_copy_events.reserve(6);
     param_copy_events.push_back(ggml_sycl::mem_copy_async(
-        state.temperatures_owner, slot * sizeof(float), ggml_sycl_gpu_sampler_host_handle(&temp), 0, sizeof(float), q));
+        state.temperatures_owner, slot * sizeof(float), ggml_sycl_gpu_sampler_host_handle(&temp, 0 + sizeof(float)), 0, sizeof(float), q));
     param_copy_events.push_back(ggml_sycl::mem_copy_async(state.top_k_values_owner, slot * sizeof(int32_t),
-                                                          ggml_sycl_gpu_sampler_host_handle(&top_k), 0, sizeof(int32_t),
+                                                          ggml_sycl_gpu_sampler_host_handle(&top_k, 0 + sizeof(int32_t)), 0, sizeof(int32_t),
                                                           q));
     param_copy_events.push_back(ggml_sycl::mem_copy_async(state.top_p_values_owner, slot * sizeof(float),
-                                                          ggml_sycl_gpu_sampler_host_handle(&top_p), 0, sizeof(float),
+                                                          ggml_sycl_gpu_sampler_host_handle(&top_p, 0 + sizeof(float)), 0, sizeof(float),
                                                           q));
     param_copy_events.push_back(ggml_sycl::mem_copy_async(state.min_p_values_owner, slot * sizeof(float),
-                                                          ggml_sycl_gpu_sampler_host_handle(&min_p), 0, sizeof(float),
+                                                          ggml_sycl_gpu_sampler_host_handle(&min_p, 0 + sizeof(float)), 0, sizeof(float),
                                                           q));
     param_copy_events.push_back(ggml_sycl::mem_copy_async(state.greedy_flags_owner, slot * sizeof(uint8_t),
-                                                          ggml_sycl_gpu_sampler_host_handle(&is_greedy), 0,
+                                                          ggml_sycl_gpu_sampler_host_handle(&is_greedy, 0 + sizeof(uint8_t)), 0,
                                                           sizeof(uint8_t), q));
     param_copy_events.push_back(ggml_sycl::mem_copy_async(state.rng_states_owner, slot * sizeof(uint32_t),
-                                                          ggml_sycl_gpu_sampler_host_handle(&seed), 0, sizeof(uint32_t),
+                                                          ggml_sycl_gpu_sampler_host_handle(&seed, 0 + sizeof(uint32_t)), 0, sizeof(uint32_t),
                                                           q));
     q.wait();
 }
@@ -2080,7 +2081,7 @@ inline void ggml_sycl_multi_seq_sampler_get_tokens(ggml_sycl_multi_seq_sampler_s
     }
 
     int n_copy = std::min(n_tokens, state.n_seqs);
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens), 0, state.sampled_tokens_owner, 0,
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(host_tokens, 0 + n_copy * sizeof(int32_t)), 0, state.sampled_tokens_owner, 0,
                         n_copy * sizeof(int32_t), q);
 }
 
@@ -2114,7 +2115,7 @@ inline int ggml_sycl_verify_speculative_with_tokens(
 
     // Copy draft tokens to device
     ggml_sycl::mem_copy(draft_tokens_owner, 0,
-                        ggml_sycl_gpu_sampler_host_handle(const_cast<int32_t *>(draft_tokens_host)), 0,
+                        ggml_sycl_gpu_sampler_host_handle(const_cast<int32_t *>(draft_tokens_host), 0 + n_draft * sizeof(int32_t)), 0,
                         n_draft * sizeof(int32_t), q);
 
     // Debug: Print draft tokens
@@ -2129,7 +2130,7 @@ inline int ggml_sycl_verify_speculative_with_tokens(
     auto  all_logits_handle = ggml_sycl::mem_handle::from_chunk_ptr(
         const_cast<float *>(all_logits), ggml_sycl_get_device_id_from_queue(q), GGML_LAYOUT_AOS, /*on_device=*/true);
     GGML_ASSERT(all_logits_handle.valid());
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(debug_logits), 0, all_logits_handle, 0, 5 * sizeof(float), q);
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(debug_logits, 0 + 5 * sizeof(float)), 0, all_logits_handle, 0, 5 * sizeof(float), q);
     GGML_LOG_DEBUG("GPU verify logits sample: [%.3f, %.3f, %.3f, %.3f, %.3f]\n", debug_logits[0], debug_logits[1],
                    debug_logits[2], debug_logits[3], debug_logits[4]);
 
@@ -2157,9 +2158,9 @@ inline int ggml_sycl_verify_speculative_with_tokens(
 
     // Copy results back (single sync point)
     int32_t     n_accepted;
-    sycl::event n_accepted_copy = ggml_sycl::mem_copy_async(ggml_sycl_gpu_sampler_host_handle(&n_accepted), 0,
+    sycl::event n_accepted_copy = ggml_sycl::mem_copy_async(ggml_sycl_gpu_sampler_host_handle(&n_accepted, 0 + sizeof(int32_t)), 0,
                                                             n_accepted_owner, 0, sizeof(int32_t), q);
-    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(sampled_tokens_out), 0, sampled_tokens_owner, 0,
+    ggml_sycl::mem_copy(ggml_sycl_gpu_sampler_host_handle(sampled_tokens_out, 0 + n_draft * sizeof(int32_t)), 0, sampled_tokens_owner, 0,
                         n_draft * sizeof(int32_t), q, { n_accepted_copy });
 
     // Debug: Print sampled tokens for analysis
