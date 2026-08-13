@@ -55,6 +55,7 @@
 
 #include "../unified-cache.hpp"
 #include "../mem-handle.hpp"
+#include "../common.hpp"
 
 #include "sycl-test-skip.hpp"
 
@@ -785,11 +786,30 @@ int main(int argc, char ** argv) {
     if (!dev_opt) {
         return SYCL_TEST_SKIP;
     }
-    sycl::device & dev = *dev_opt;
-    fprintf(stderr, "Device: %s\n", dev.get_info<sycl::info::device::name>().c_str());
-    fprintf(stderr, "-------------------------------------------\n");
+    // Initialize the backend's logical-to-physical device map before choosing
+    // the fixture queue.  A raw gpu_selector queue is not authoritative when
+    // GGML_SYCL_DEVICE remaps logical device 0 (for example, raw B50 device 1
+    // becomes backend owner 0).  Publishing handles from a cache built on that
+    // raw queue then labels them with a different owner than the active queue.
+    // Keep production's exact wrong-device checks intact: make the fixture use
+    // the backend owner's device and context instead.
+    const auto & sycl_info = ggml_sycl_info();
+    if (sycl_info.total_gpu_count <= 0) {
+        sycl_test_print_skip("mem_handle / eviction lifecycle backend owner selection");
+        return SYCL_TEST_SKIP;
+    }
+    auto &        owner       = ggml_sycl_get_gpu_device(0);
+    sycl::queue & owner_queue = owner.default_queue();
+    sycl::queue   q(owner_queue.get_context(), owner_queue.get_device(), sycl::property::queue::in_order{});
+    const int     queue_device = ggml_sycl_get_device_id_from_queue(q);
 
-    sycl::queue q(dev, sycl::property::queue::in_order{});
+    fprintf(stderr, "Device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+    fprintf(stderr, "Backend owner: logical GPU 0, queue device %d\n", queue_device);
+    fprintf(stderr, "-------------------------------------------\n");
+    if (queue_device != 0) {
+        fprintf(stderr, "FAILED: backend owner queue did not round-trip to logical GPU 0\n");
+        return 1;
+    }
 
     bool all_passed = true;
     all_passed &= test_direct_handle_stable_across_bumps();
