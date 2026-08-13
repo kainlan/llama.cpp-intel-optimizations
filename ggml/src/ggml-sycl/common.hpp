@@ -3398,6 +3398,11 @@ struct ggml_tensor_extra_gpu {
 
     struct moe_expert_storage_record {
         ggml_sycl::mem_handle handle;
+        // Producer-minted logical payload within handle's retained allocation
+        // view. This is explicit because quantized AoS allocations may include
+        // alignment padding that is not part of the expert tensor.
+        size_t                logical_offset  = 0;
+        size_t                logical_bytes   = 0;
         bool                  has_ready_event = false;
         sycl::event           ready_event;
     };
@@ -3405,13 +3410,21 @@ struct ggml_tensor_extra_gpu {
     void remember_moe_storage_handle(int                   expert_id,
                                      ggml_layout_mode      layout,
                                      ggml_sycl::mem_handle h,
-                                     const sycl::event *   ready_event = nullptr) {
+                                     const sycl::event *   ready_event   = nullptr,
+                                     size_t                logical_offset = 0,
+                                     size_t                logical_bytes  = SIZE_MAX) {
         auto resolved = h.resolve();
-        if (expert_id < 0 || !resolved.ptr || resolved.layout != layout) {
+        if (logical_bytes == SIZE_MAX) {
+            logical_bytes = h.size();
+        }
+        if (expert_id < 0 || !resolved.ptr || resolved.layout != layout || logical_bytes == 0 ||
+            logical_offset > h.size() || logical_bytes > h.size() - logical_offset) {
             return;
         }
         moe_expert_storage_record record;
-        record.handle = std::move(h);
+        record.handle         = std::move(h);
+        record.logical_offset = logical_offset;
+        record.logical_bytes  = logical_bytes;
         if (ready_event) {
             record.has_ready_event = true;
             record.ready_event     = *ready_event;

@@ -5365,12 +5365,20 @@ static bool ggml_sycl_try_moe_storage_handle_route(const ggml_tensor *     tenso
             ggml_sycl_layout_bytes_for_dims(tensor->type, tensor->ne[0], tensor->ne[1], layout,
                                             owner == mem_handle::HOST_DEVICE ? current_device : owner);
         auto resolved = handle.resolve(owner == mem_handle::HOST_DEVICE ? mem_handle::HOST_DEVICE : owner);
-        if (!handle.has_stable_owner_identity() || expected_size == 0 || handle.size() != expected_size ||
-            !resolved.ptr || resolved.layout != layout) {
+        const size_t allocation_bytes = handle.size();
+        const bool logical_range_valid = stored->logical_bytes == expected_size &&
+                                         stored->logical_offset <= allocation_bytes &&
+                                         stored->logical_bytes <= allocation_bytes - stored->logical_offset;
+        const uintptr_t allocation_begin = reinterpret_cast<uintptr_t>(resolved.ptr);
+        const bool pointer_range_valid = resolved.ptr &&
+                                         stored->logical_offset <= UINTPTR_MAX - allocation_begin;
+        if (!handle.has_stable_owner_identity() || expected_size == 0 || !logical_range_valid ||
+            !pointer_range_valid || resolved.layout != layout) {
             route.reason = resolved.ptr && resolved.layout != layout ? expert_resolve_reason::LAYOUT_MISMATCH :
                                                                        expert_resolve_reason::NOT_FOUND;
             continue;
         }
+        void * const logical_ptr = reinterpret_cast<void *>(allocation_begin + stored->logical_offset);
 
         const int owning_device = resolved.on_device ? handle.device() : ggml_sycl::mem_handle::HOST_DEVICE;
         if (device_planned) {
@@ -5389,7 +5397,7 @@ static bool ggml_sycl_try_moe_storage_handle_route(const ggml_tensor *     tenso
             continue;
         }
 
-        route.ptr           = resolved.ptr;
+        route.ptr           = logical_ptr;
         route.owning_device = owning_device;
         route.planned_alternate_admitted = current_device_planned_alternate && owning_device == current_device &&
                                            owning_device != route.planned_device;
@@ -5448,7 +5456,13 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
     // cache key.
     unified_cache * plan_cache = get_unified_cache_for_device(current_device);
     bool                            current_device_planned_alternate = false;
-    if (plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty() && src0->name && src0->name[0] != '\0') {
+    const bool active_plan = plan_cache && !ggml_sycl_cache_plan_owner(plan_cache)->entries.empty();
+    if (active_plan) {
+        if (!src0->name || src0->name[0] == '\0') {
+            route.plan_missing = true;
+            route.reason       = expert_resolve_reason::NOT_FOUND;
+            return route;
+        }
         const auto placement =
             (*ggml_sycl_cache_plan_owner(plan_cache)).lookup_expert_placement(std::string(src0->name), expert_id);
         if (placement.found()) {
@@ -8791,16 +8805,37 @@ bool test_moe_storage_handle_first_route_and_negatives() {
         return false;
     }
 
-    // Exact retained range is part of the registered route contract.
+    // A production-like padded Q8 AoS allocation is valid only when its
+    // producer records the exact logical expert subrange.
     clear_records();
+    constexpr size_t prefix_padding = 32;
+    constexpr size_t suffix_padding = 64;
     alloc_request range_req = req;
-    range_req.size          = expert_size + 1;
+    range_req.size          = prefix_padding + expert_size + suffix_padding;
     alloc_handle range_allocation{};
     if (!unified_alloc(range_req, &range_allocation)) {
         return false;
     }
     mem_handle range_owner = mem_handle::from_owned_alloc(std::move(range_allocation), GGML_LAYOUT_AOS);
-    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner.slice(0, expert_size - 1));
+    auto       range_base  = range_owner.resolve(0);
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner, nullptr,
+                                      prefix_padding, expert_size);
+    moe_expert_route padded = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+    if (padded.ptr != static_cast<uint8_t *>(range_base.ptr) + prefix_padding ||
+        !padded.lease.stable_identity_equal(range_owner)) {
+        return false;
+    }
+
+    // Allocation size alone is not authority: absent an exact producer range,
+    // the same padded handle must fail closed.
+    clear_records();
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner);
+    if (!route_closed()) {
+        return false;
+    }
+    clear_records();
+    extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, range_owner, nullptr,
+                                      prefix_padding, expert_size - 1);
     if (!route_closed()) {
         return false;
     }
@@ -8848,8 +8883,17 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
     moe_expert_route mismatch = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
-    return mismatch.plan_found && !mismatch.planned_device_residency && !mismatch.ptr &&
-           mismatch.kind == moe_expert_route_kind::UNAVAILABLE;
+    if (!mismatch.plan_found || mismatch.planned_device_residency || mismatch.ptr ||
+        mismatch.kind != moe_expert_route_kind::UNAVAILABLE) {
+        return false;
+    }
+
+    // An active plan applies independently of tensor naming. An unnamed tensor
+    // cannot bypass lookup and route through an otherwise valid handle.
+    ggml_set_name(&tensor, "");
+    moe_expert_route unnamed = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
+    return unnamed.plan_missing && !unnamed.plan_found && !unnamed.ptr &&
+           unnamed.kind == moe_expert_route_kind::UNAVAILABLE;
 }
 
 bool test_moe_route_preserves_ready_event_for_chaining() {
@@ -22018,7 +22062,8 @@ static bool ggml_sycl_publish_backend_aos_expert_handles(ggml_backend_sycl_buffe
             if (had_previous[expert]) {
                 const sycl::event * ready = previous[expert].has_ready_event ? &previous[expert].ready_event : nullptr;
                 extra->remember_moe_storage_handle(static_cast<int>(expert), GGML_LAYOUT_AOS,
-                                                   std::move(previous[expert].handle), ready);
+                                                   std::move(previous[expert].handle), ready,
+                                                   previous[expert].logical_offset, previous[expert].logical_bytes);
             }
         }
         return false;
@@ -28641,7 +28686,9 @@ static bool ggml_sycl_preload_moe_experts(const ggml_tensor * src0, int device, 
 
         if (result.ok && result.ptr) {
             if (handle.resolve().ptr) {
-                extra->remember_moe_storage_handle(static_cast<int>(e), layout, std::move(handle), &result.event);
+                const size_t logical_bytes = layout == GGML_LAYOUT_AOS ? expert_size : expert_layout_bytes;
+                extra->remember_moe_storage_handle(static_cast<int>(e), layout, std::move(handle), &result.event,
+                                                   /*logical_offset=*/0, logical_bytes);
             }
             cached++;
         } else {
@@ -29643,8 +29690,11 @@ static void ggml_sycl_preload_model_weights() {
                         }
                         if (result.ok && result.ptr) {
                             if (handle.resolve().ptr) {
+                                const size_t logical_bytes = expert_preload_layout == GGML_LAYOUT_AOS ?
+                                                                 expert_size : expert_preload_bytes;
                                 extra->remember_moe_storage_handle(static_cast<int>(e), expert_preload_layout,
-                                                                   std::move(handle), &result.event);
+                                                                   std::move(handle), &result.event,
+                                                                   /*logical_offset=*/0, logical_bytes);
                             }
                             any_cached = true;
                             total_bytes += expert_preload_bytes;

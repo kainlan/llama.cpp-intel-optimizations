@@ -63,6 +63,7 @@ def violations(source: str) -> list[str]:
     copier = function(source, "static bool ggml_backend_sycl_buffer_cpy_tensor")
     clearer = function(source, "static void ggml_backend_sycl_buffer_clear")
     route = function(source, "static moe_expert_route ggml_sycl_resolve_moe_expert_route")
+    storage_route = function(source, "static bool ggml_sycl_try_moe_storage_handle_route")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
 
@@ -74,7 +75,9 @@ def violations(source: str) -> list[str]:
         "checked allocation range": "tensor_span > ctx->managed_meta.size - tensor_offset" in publish,
         "per-expert retained slice": "ctx->managed_handle.slice(slice_offset, expert_size)" in publish,
         "exact device": "expert_handle.device() != ctx->device" in publish,
-        "exact range": "expert_handle.size() != expert_size" in publish,
+        "exact canonical range": "expert_handle.size() != expert_size" in publish,
+        "producer logical range": "stored->logical_bytes == expected_size" in storage_route and "stored->logical_offset" in storage_route,
+        "padded allocation bounded": "stored->logical_bytes <= allocation_bytes - stored->logical_offset" in storage_route,
         "stable identity": "!expert_handle.has_stable_owner_identity()" in publish,
         "canonical registration": "remember_moe_storage_handle" in publish,
         "transaction prebuild": "replacement.reserve(expert_count)" in publish,
@@ -90,6 +93,7 @@ def violations(source: str) -> list[str]:
         "complete upload readiness": "is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)" in setter,
         "withdraw before publish": setter.find("ggml_sycl_invalidate_backend_weight_mutation") < setter.find("ggml_sycl_publish_backend_aos_expert_handles"),
         "resolver checks plan before registered handles": route.index("lookup_expert_placement") < route.index("ggml_sycl_try_moe_storage_handle_route"),
+        "active plan rejects unnamed tensors": "if (!src0->name || src0->name[0] == '\\0')" in route and "route.plan_missing = true" in route,
         "resolver checks registered handles before requiring key": route.index("ggml_sycl_try_moe_storage_handle_route") < route.index("if (!base_key.valid)"),
         "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("cache->resolve_expert"),
         "resolver retains canonical lease": "route.lease" in route and "std::move(handle)" in source,
@@ -262,6 +266,9 @@ def test_mutations_are_witnessed() -> None:
                        "ggml_sycl::mem_handle::from_direct(reinterpret_cast<void *>(tensor_begin + expert * expert_size), GGML_LAYOUT_AOS, true, ctx->device)", 1),
         source.replace("expert_handle.device() != ctx->device ||", "false ||", 1),
         source.replace("expert_handle.size() != expert_size ||", "false ||", 1),
+        source.replace("stored->logical_bytes == expected_size", "true", 1),
+        source.replace("stored->logical_bytes <= allocation_bytes - stored->logical_offset", "true", 1),
+        source.replace("if (!src0->name || src0->name[0] == '\\0')", "if (false)", 1),
         source.replace("!expert_handle.has_stable_owner_identity()", "false", 1),
         source.replace("is_moe_expert && offset == 0 && size == ggml_nbytes(tensor)",
                        "is_moe_expert && size > 0", 1),
