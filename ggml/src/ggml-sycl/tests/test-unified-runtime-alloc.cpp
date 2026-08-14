@@ -722,30 +722,37 @@ static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
         return true;
     }
 
-    void * const ptr         = allocation.ptr;
-    const size_t used_before = cache->zone_used(allocation.vram_zone);
-    mem_handle owner         = detail::from_legacy_owned_alloc(allocation);
+    // Snapshot the copyable identity before consuming the legacy ownership
+    // token. Promotion deliberately rejects lvalues so there cannot be two
+    // apparent owners of the same registry row.
+    const alloc_metadata exact = allocation.metadata();
+    void * const ptr           = exact.ptr;
+    const size_t used_before   = cache->zone_used(exact.zone);
+    mem_handle owner           = detail::from_legacy_owned_alloc(std::move(allocation));
     TEST_ASSERT(owner.valid(), "owning arena handle construction failed");
     mem_handle independent = mem_handle::from_arena_zone(
-        static_cast<int>(allocation.vram_zone), allocation.arena_offset, allocation.size, allocation.device,
-        allocation.arena_generation, allocation.alloc_id, allocation.arena_extent,
-        cache->arena_authority_snapshot(allocation.vram_zone));
+        static_cast<int>(exact.zone), exact.offset, exact.size, exact.device,
+        exact.generation, exact.alloc_id, exact.extent,
+        cache->arena_authority_snapshot(exact.zone));
     TEST_ASSERT(independent.valid() && independent.resolve().ptr == ptr,
                 "independent exact token admission failed");
 
+    auto coordinator = unified_allocation_release_coordinator(exact.device);
+    TEST_ASSERT(coordinator != nullptr, "owning arena handle omitted its release coordinator");
     owner = {};
     alloc_metadata looked{};
     TEST_ASSERT(unified_lookup(ptr, &looked), "refused owner release erased the runtime record");
-    TEST_ASSERT(cache->has_pending_deferred_frees(), "refused owner release lost durable retry ownership");
-    TEST_ASSERT(cache->zone_used(allocation.vram_zone) == used_before,
+    TEST_ASSERT(coordinator->retry_count() == 1, "refused owner release lost durable retry ownership");
+    TEST_ASSERT(cache->zone_used(exact.zone) == used_before,
                 "refused owner release returned the TLSF block");
 
-    cache->process_deferred_frees_public();
-    TEST_ASSERT(unified_lookup(ptr, &looked), "retry freed allocation while independent token remained live");
+    TEST_ASSERT(coordinator->process_retries() == 0,
+                "retry freed allocation while independent token remained live");
+    TEST_ASSERT(unified_lookup(ptr, &looked), "retry erased the record while independent token remained live");
     independent = {};
-    cache->process_deferred_frees_public();
+    TEST_ASSERT(coordinator->process_retries() == 1, "final-token retry did not release the allocation");
     TEST_ASSERT(!unified_lookup(ptr, &looked), "final-token sync did not erase the runtime record");
-    TEST_ASSERT(cache->zone_used(allocation.vram_zone) < used_before,
+    TEST_ASSERT(cache->zone_used(exact.zone) < used_before,
                 "final-token sync did not reclaim the TLSF block");
     TEST_PASS();
     return true;

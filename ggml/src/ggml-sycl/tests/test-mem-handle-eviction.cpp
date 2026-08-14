@@ -713,6 +713,67 @@ static bool test_device_publication_fault_phases(sycl::queue & q) {
     return true;
 }
 
+static sycl::event count_unexpected_stage_fill(sycl::queue & queue,
+                                               void *, size_t, const void *, size_t,
+                                               const void * ctx,
+                                               const std::vector<sycl::event> &) {
+    static_cast<std::atomic<int> *>(const_cast<void *>(ctx))->fetch_add(1, std::memory_order_relaxed);
+    return queue.ext_oneapi_submit_barrier();
+}
+
+// Owner-control failure must happen before any allocation pointer can be copied,
+// submitted to a fill callback, or published through the output handle.
+static bool test_owner_failure_prevents_raw_stage_use(sycl::queue & q) {
+    TEST_BEGIN("owner_failure_prevents_raw_stage_use");
+
+    constexpr size_t bytes = 4096;
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    std::vector<uint8_t> src(bytes * 2, 0x73);
+    std::atomic<int> fill_calls{ 0 };
+    int sentinel = 0x274;
+    ggml_sycl::mem_handle sentinel_handle =
+        ggml_sycl::mem_handle::from_direct(&sentinel, GGML_LAYOUT_AOS, false,
+                                           ggml_sycl::mem_handle::HOST_DEVICE, sizeof(sentinel));
+
+    const auto dense_key = make_test_cache_id(2740, 2740, bytes);
+    ggml_sycl::allocation_owner_test_fail_next_control_allocations(2);
+    const auto dense = cache.direct_stage_weight(
+        dense_key, src.data(), bytes, bytes, GGML_LAYOUT_AOS, count_unexpected_stage_fill,
+        &fill_calls, &q, &sentinel_handle);
+    TEST_ASSERT(!dense.ok && dense.ptr == nullptr, "owner-failed dense stage exposed a raw pointer");
+    TEST_ASSERT(fill_calls.load(std::memory_order_relaxed) == 0,
+                "owner-failed dense stage submitted a fill");
+    TEST_ASSERT(sentinel_handle.resolve().ptr == &sentinel,
+                "owner-failed dense stage changed the output sentinel");
+
+    const auto expert_key = make_test_cache_id(2741, 2741, bytes);
+    ggml_sycl::allocation_owner_test_fail_next_control_allocations(2);
+    const auto single = cache.direct_stage_expert(
+        expert_key, src.data(), bytes, bytes, GGML_LAYOUT_AOS, count_unexpected_stage_fill,
+        &fill_calls, &q, &sentinel_handle);
+    TEST_ASSERT(!single.ok && single.ptr == nullptr, "owner-failed expert stage exposed a raw pointer");
+    TEST_ASSERT(fill_calls.load(std::memory_order_relaxed) == 0,
+                "owner-failed expert stage submitted a fill");
+    TEST_ASSERT(sentinel_handle.resolve().ptr == &sentinel,
+                "owner-failed expert stage changed the output sentinel");
+
+    std::vector<ggml_sycl_cache_id> bulk_keys{
+        make_test_cache_id(2742, 2742, bytes), make_test_cache_id(2743, 2743, bytes) };
+    std::vector<ggml_sycl::mem_handle> bulk_sentinel{ sentinel_handle };
+    ggml_sycl::allocation_owner_test_fail_next_control_allocations(1);
+    const auto bulk = cache.direct_stage_expert_tensor(
+        bulk_keys, src.data(), bytes * 2, bytes, GGML_LAYOUT_AOS, count_unexpected_stage_fill,
+        &fill_calls, &q, &bulk_sentinel);
+    TEST_ASSERT(!bulk.ok && bulk.ptr == nullptr, "owner-failed bulk stage exposed a raw pointer");
+    TEST_ASSERT(fill_calls.load(std::memory_order_relaxed) == 0,
+                "owner-failed bulk stage submitted a fill");
+    TEST_ASSERT(bulk_sentinel.size() == 1 && bulk_sentinel.front().resolve().ptr == &sentinel,
+                "owner-failed bulk stage changed the output sentinel");
+
+    TEST_PASS();
+    return true;
+}
+
 // =============================================================================
 // Test 9: abort cleanup failure is observable and a caller can fail closed;
 // retry performs the allocation-free withdrawal.
@@ -1013,6 +1074,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_expert_publication_retirement_linearization(q);
     all_passed &= test_host_publication_fault_is_transactional(q);
     all_passed &= test_device_publication_fault_phases(q);
+    all_passed &= test_owner_failure_prevents_raw_stage_use(q);
     all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
     all_passed &= test_terminal_retention_ticket_state_machine(q);

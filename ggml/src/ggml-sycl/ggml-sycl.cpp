@@ -37752,19 +37752,20 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
                 req.suppress_failure_log                = true;
 
-                ggml_sycl::alloc_handle h{};
-                if (!ggml_sycl::unified_alloc(req, &h) || !h.ptr) {
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+                if (!allocation) return nullptr;
+                ggml_sycl::mem_handle owner =
+                    ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                const auto resolved = owner.resolve(device);
+                if (!resolved.ptr || !resolved.on_device || ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
                     return nullptr;
                 }
-
-                void * const          ptr   = h.ptr;
-                ggml_sycl::mem_handle owner = ggml_sycl::detail::from_legacy_owned_alloc(std::move(h));
                 {
                     std::lock_guard<std::mutex> lock(arena_handles_mutex);
-                    arena_handles[ptr] = std::move(owner);
+                    arena_handles[resolved.ptr] = std::move(owner);
                 }
                 *actual_size = rounded_size;
-                return ptr;
+                return resolved.ptr;
             };
 
             void * ptr = try_alloc();
@@ -37785,24 +37786,22 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 req.intent.constraints.must_device      = false;
                 req.intent.constraints.use_pinned_pool  = true;
 
-                ggml_sycl::alloc_handle h{};
-                if (!ggml_sycl::unified_alloc(req, &h) || !h.ptr) {
-                    return nullptr;
-                }
-                void * const          fallback_ptr  = h.ptr;
-                const size_t          fallback_size = h.size;
-                ggml_sycl::mem_handle owner    = ggml_sycl::detail::from_legacy_owned_alloc(std::move(h), GGML_LAYOUT_AOS);
-                auto                  resolved = owner.resolve(device);
-                if (!owner.valid() || !resolved || ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+                if (!allocation) return nullptr;
+                const size_t fallback_size = allocation.owner.metadata().size;
+                ggml_sycl::mem_handle owner =
+                    ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                const auto resolved = owner.resolve();
+                if (!resolved.ptr || resolved.on_device || ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
                     return nullptr;
                 }
 
                 {
                     std::lock_guard<std::mutex> lock(arena_handles_mutex);
-                    arena_handles[fallback_ptr] = std::move(owner);
+                    arena_handles[resolved.ptr] = std::move(owner);
                 }
                 *actual_size = fallback_size;
-                return fallback_ptr;
+                return resolved.ptr;
             };
 
             ptr = try_host_fallback();
@@ -37897,12 +37896,17 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             req.intent.cohort_id     = "sycl-device-pool-legacy";
             req.suppress_failure_log = true;
 
-            ggml_sycl::alloc_handle pool_owner{};
-            if (ggml_sycl::unified_alloc(req, &pool_owner) && pool_owner.ptr) {
-                ptr                 = pool_owner.ptr;
-                *actual_size        = pool_owner.size;
-                active_handles[ptr] = { pool_owner.size, ggml_sycl::detail::from_legacy_owned_alloc(std::move(pool_owner),
-                                                                                                 GGML_LAYOUT_AOS) };
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (allocation) {
+                const size_t allocation_size = allocation.owner.metadata().size;
+                ggml_sycl::mem_handle owner =
+                    ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                const auto resolved = owner.resolve();
+                if (resolved.ptr && !ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
+                    ptr                 = resolved.ptr;
+                    *actual_size        = allocation_size;
+                    active_handles[ptr] = { allocation_size, std::move(owner) };
+                }
             }
         }
 
