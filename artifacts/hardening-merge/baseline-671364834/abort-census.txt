@@ -1,0 +1,31 @@
+--- tail ---
+	add-auto-load-safe-path /opt/intel/oneapi/compiler/2026.1/lib/libsycl.so.9.0.0-gdb.py
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+To completely disable this security protection add
+	set auto-load safe-path /
+line to your configuration file "/home/kainlan/.config/gdb/gdbinit".
+For more information about this security protection see the
+"Auto-loading safe path" section in the GDB manual.  E.g., run from the shell:
+	info "(gdb)Auto-loading safe path"
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+⚠️ warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+56	in ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S
+#1  0x0000704f04ca061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=0, a6=0, nr=61) at ./nptl/cancellation.c:49
+⚠️ warning: 49	./nptl/cancellation.c: No such file or directory
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=0, a6=a6@entry=0, nr=61) at ./nptl/cancellation.c:75
+75	in ./nptl/cancellation.c
+#3  0x0000704f04d1cd4f in __GI___wait4 (pid=<optimized out>, stat_loc=<optimized out>, options=<optimized out>, usage=<optimized out>) at ../sysdeps/unix/sysv/linux/wait4.c:30
+⚠️ warning: 30	../sysdeps/unix/sysv/linux/wait4.c: No such file or directory
+#4  0x0000704f0dc8bcda in ggml_print_backtrace () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#5  0x0000704f0dc8ae49 in ggml_abort () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#6  0x0000704f0dca5ad4 in ggml_tallocr_alloc () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#7  0x0000704f0dca94a7 in alloc_tensor_range () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#8  0x0000704f0dca91ea in ggml_backend_alloc_ctx_tensors_from_buft_impl () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#9  0x0000704f0dca96b8 in ggml_backend_alloc_ctx_tensors () from /Apps/llama.cpp/build/bin/libggml-base.so.0
+#10 0x0000000000509b9a in test_case::eval(ggml_backend*, ggml_backend*, char const*, printer*) ()
+#11 0x000000000045cb35 in test_backend(ggml_backend*, ggml_backend_device*, test_mode, char const*, char const*, printer*, char const*, int)::$_5::operator()(ggml_backend*, ggml_backend*) const ()
+#12 0x0000000000417a18 in main ()
+[Inferior 1 (process 266884) detached]
