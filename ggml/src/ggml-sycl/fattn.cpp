@@ -561,8 +561,6 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
                                  packed.batch == batch && packed.n_kv >= n_kv && packed.n_blocks >= n_blocks &&
                                  packed.total_bytes >= total_bytes;
         if (!reuse_alloc) {
-            packed.reset();
-
             ggml_sycl::alloc_request req{};
             req.queue                               = stream;
             req.device                              = target_device;
@@ -572,21 +570,19 @@ bool ggml_sycl_fattn_xmx_update_packed_k_from_set_rows(const ggml_tensor * dst,
             req.intent.cohort_id                    = "fattn_xmx_packed_k_sidecar";
             req.intent.constraints.must_device      = true;
             req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
-            ggml_sycl::alloc_handle sidecar_owner{};
-            if (!ggml_sycl::unified_alloc(req, &sidecar_owner) || sidecar_owner.ptr == nullptr ||
-                sidecar_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
-                if (sidecar_owner.ptr != nullptr) {
-                    (void) ggml_sycl::unified_free(sidecar_owner);
-                }
-                packed.reset();
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (!allocation || allocation.owner.metadata().tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
                 return debug_reject("sidecar-alloc-failed", root);
             }
-            packed.ptr    = sidecar_owner.ptr;
-            packed.handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(sidecar_owner), GGML_LAYOUT_AOS);
-            if (!packed.handle.valid()) {
-                packed.reset();
+            ggml_sycl::mem_handle handle =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = handle.resolve(target_device);
+            if (!resolved.ptr || !resolved.on_device) {
                 return debug_reject("sidecar-handle-invalid", root);
             }
+            packed.reset();
+            packed.handle = std::move(handle);
+            packed.ptr    = resolved.ptr;
             try {
                 GGML_SYCL_FATTN_PRIVATE_FAILPOINT("sidecar-before-initial-fill");
                 zero_event = ggml_sycl::mem_fill_async(packed.handle, 0, total_bytes, *stream);
@@ -758,16 +754,15 @@ static bool ggml_sycl_fattn_alloc_device_owner(size_t                      bytes
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
     req.suppress_failure_log                = true;
 
-    ggml_sycl::alloc_handle device_buffer_owner{};
-    if (!ggml_sycl::unified_alloc(req, &device_buffer_owner) || !device_buffer_owner.ptr ||
-        device_buffer_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation || allocation.owner.metadata().tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
         return false;
     }
 
     ggml_sycl::mem_handle handle =
-        ggml_sycl::detail::from_legacy_owned_alloc(std::move(device_buffer_owner), GGML_LAYOUT_AOS);
-    auto resolved = handle.resolve(req.device);
-    if (!resolved || !resolved.on_device || !resolved.ptr) {
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = handle.resolve(req.device);
+    if (!resolved.ptr || !resolved.on_device) {
         handle = {};
         return false;
     }
@@ -1637,8 +1632,6 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
                              out->D == desc.D && out->H_kv == desc.H_kv && out->batch == desc.batch &&
                              out->total_bytes >= desc.total_packed_bytes;
     if (!reuse_alloc) {
-        out->reset();
-
         ggml_sycl::alloc_request req{};
         req.queue                               = stream;
         req.device                              = target_device;
@@ -1649,22 +1642,20 @@ bool ggml_sycl_fattn_xmx_materialize_packed_k(const fattn_params &              
         req.intent.constraints.must_device      = true;
         req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::KV;
 
-        ggml_sycl::alloc_handle packed_k_owner{};
-        if (!ggml_sycl::unified_alloc(req, &packed_k_owner) || packed_k_owner.ptr == nullptr ||
-            packed_k_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
-            if (packed_k_owner.ptr != nullptr) {
-                (void) ggml_sycl::unified_free(packed_k_owner);
-            }
-            out->reset();
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation || allocation.owner.metadata().tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
             return false;
         }
-        out->ptr         = packed_k_owner.ptr;
-        out->handle      = ggml_sycl::detail::from_legacy_owned_alloc(std::move(packed_k_owner), GGML_LAYOUT_AOS);
+        ggml_sycl::mem_handle handle =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = handle.resolve(target_device);
+        if (!resolved.ptr || !resolved.on_device) {
+            return false;
+        }
+        out->reset();
+        out->handle      = std::move(handle);
+        out->ptr         = resolved.ptr;
         out->total_bytes = desc.total_packed_bytes;
-        if (!out->handle.valid()) {
-            out->reset();
-            return false;
-        }
     }
 
     // Publish every field used by retry reuse before any submission can throw.
@@ -1814,16 +1805,18 @@ static bool ggml_sycl_fattn_xmx_v2_alloc_split_workspace_buffer(dpct::queue_ptr 
     req.intent.cohort_id                    = cohort_id;
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
-    ggml_sycl::alloc_handle workspace_owner{};
-    if (!ggml_sycl::unified_alloc(req, &workspace_owner) || workspace_owner.ptr == nullptr ||
-        workspace_owner.tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
-        if (workspace_owner.ptr != nullptr) {
-            (void) ggml_sycl::unified_free(workspace_owner);
-        }
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation || allocation.owner.metadata().tier != ggml_sycl::alloc_tier::DEVICE_VRAM) {
         return false;
     }
-    *out = ggml_sycl::detail::from_legacy_owned_alloc(std::move(workspace_owner), GGML_LAYOUT_AOS);
-    return out->valid();
+    ggml_sycl::mem_handle handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = handle.resolve(device);
+    if (!resolved.ptr || !resolved.on_device) {
+        return false;
+    }
+    *out = std::move(handle);
+    return true;
 }
 
 static bool ggml_sycl_fattn_xmx_v2_ensure_split_workspace(ggml_backend_sycl_context & ctx,

@@ -38330,8 +38330,7 @@ std::pair<void *, size_t> ggml_backend_sycl_context::get_staging_buffer(size_t n
     if (staging_buffer_ && staging_buffer_size_ >= needed_bytes) {
         return { staging_buffer_, staging_buffer_size_ };
     }
-    // Free old buffer if too small
-    free_staging_buffer();
+    // Keep the current owner published until its replacement is fully validated.
 
     // Query cache for available VRAM
     ggml_sycl::unified_cache * cache       = ggml_sycl::get_unified_cache_for_device(device);
@@ -38355,18 +38354,18 @@ std::pair<void *, size_t> ggml_backend_sycl_context::get_staging_buffer(size_t n
     req.intent.role                    = ggml_sycl::alloc_role::STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
-    ggml_sycl::alloc_handle device_staging_owner{};
-    if (!ggml_sycl::unified_alloc(req, &device_staging_owner) || device_staging_owner.ptr == nullptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
+        return { nullptr, 0 };
+    }
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(device);
+    if (!resolved.ptr || !resolved.on_device) {
         return { nullptr, 0 };
     }
 
-    staging_buffer_handle_ = ggml_sycl::detail::from_legacy_owned_alloc(std::move(device_staging_owner), GGML_LAYOUT_AOS);
-    auto resolved          = staging_buffer_handle_.resolve(device);
-    if (!resolved || !resolved.on_device) {
-        staging_buffer_handle_ = {};
-        return { nullptr, 0 };
-    }
-
+    staging_buffer_handle_ = std::move(replacement);
     staging_buffer_        = resolved.ptr;
     staging_buffer_size_   = alloc_size;
     staging_buffer_device_ = device;
@@ -38400,11 +38399,6 @@ void * ggml_backend_sycl_context::ensure_mmvq_host_staging(size_t needed, sycl::
     if (mmvq_host_staging && mmvq_host_staging_size >= needed) {
         return mmvq_host_staging;
     }
-    // Free previous allocation if too small
-    mmvq_host_staging_handle = {};
-    mmvq_host_staging        = nullptr;
-    mmvq_host_staging_size   = 0;
-
     ggml_sycl::alloc_request req{};
     req.queue                               = &queue;
     req.device                              = device;
@@ -38414,17 +38408,18 @@ void * ggml_backend_sycl_context::ensure_mmvq_host_staging(size_t needed, sycl::
     req.intent.cohort_id                    = "context_mmvq_host_staging";
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
-    ggml_sycl::alloc_handle host_staging_owner{};
-    if (!ggml_sycl::unified_alloc(req, &host_staging_owner) || host_staging_owner.ptr == nullptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         return nullptr;
     }
-    mmvq_host_staging_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_staging_owner), GGML_LAYOUT_AOS);
-    auto resolved            = mmvq_host_staging_handle.resolve(device);
-    if (!resolved) {
-        mmvq_host_staging_handle = {};
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(device);
+    if (!resolved.ptr) {
         return nullptr;
     }
-    mmvq_host_staging      = resolved.ptr;
+    mmvq_host_staging_handle = std::move(replacement);
+    mmvq_host_staging        = resolved.ptr;
     mmvq_host_staging_size = needed;
     return mmvq_host_staging;
 }
@@ -38433,10 +38428,6 @@ void * ggml_backend_sycl_context::ensure_readback_staging(size_t needed, sycl::q
     if (readback_staging && readback_staging_size >= needed) {
         return readback_staging;
     }
-    readback_staging_handle = {};
-    readback_staging        = nullptr;
-    readback_staging_size   = 0;
-
     ggml_sycl::alloc_request req{};
     req.queue                               = &queue;
     req.device                              = device;
@@ -38446,17 +38437,18 @@ void * ggml_backend_sycl_context::ensure_readback_staging(size_t needed, sycl::q
     req.intent.cohort_id                    = "context_readback_staging";
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
-    ggml_sycl::alloc_handle readback_owner{};
-    if (!ggml_sycl::unified_alloc(req, &readback_owner) || readback_owner.ptr == nullptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         return nullptr;
     }
-    readback_staging_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(readback_owner), GGML_LAYOUT_AOS);
-    auto resolved           = readback_staging_handle.resolve(device);
-    if (!resolved) {
-        readback_staging_handle = {};
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(device);
+    if (!resolved.ptr) {
         return nullptr;
     }
-    readback_staging      = resolved.ptr;
+    readback_staging_handle = std::move(replacement);
+    readback_staging        = resolved.ptr;
     readback_staging_size = needed;
     return readback_staging;
 }
@@ -40339,7 +40331,6 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
         ~scoped_mmvq_scratch_handle() { release(); }
 
         char * allocate(sycl::queue & q, int target, size_t bytes) {
-            release();
             if (bytes == 0 || target < 0) {
                 return nullptr;
             }
@@ -40355,22 +40346,19 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
             // the current Level Zero stack can fail first submit on those pointers.
             req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::WEIGHT;
 
-            ggml_sycl::alloc_handle scratch_owner{};
-            if (!ggml_sycl::unified_alloc(req, &scratch_owner) || !scratch_owner.ptr) {
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (!allocation) {
+                return nullptr;
+            }
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(target);
+            if (!resolved.ptr || !resolved.on_device) {
                 return nullptr;
             }
 
-            handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(scratch_owner), GGML_LAYOUT_AOS);
-            if (!handle.valid()) {
-                return nullptr;
-            }
-
-            auto resolved = handle.resolve(target);
-            if (!resolved || !resolved.on_device) {
-                handle = {};
-                return nullptr;
-            }
-
+            release();
+            handle = std::move(replacement);
             queue  = &q;
             device = target;
             return static_cast<char *>(resolved.ptr);
@@ -59557,14 +59545,15 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
         req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
         req.suppress_failure_log                = true;
 
-        ggml_sycl::alloc_handle xmx_scratch_owner{};
-        if (!ggml_sycl::unified_alloc(req, &xmx_scratch_owner) || !xmx_scratch_owner.ptr) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             GGML_SYCL_DEBUG("[XMX MoE] Failed to allocate scratch buffer '%s' (%zu bytes)\n", tag ? tag : "?", bytes);
             return nullptr;
         }
 
-        ggml_sycl::mem_handle owner = ggml_sycl::detail::from_legacy_owned_alloc(std::move(xmx_scratch_owner));
-        auto                  resolved = owner.resolve(ctx.device);
+        ggml_sycl::mem_handle owner =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = owner.resolve(ctx.device);
         if (!resolved || !resolved.on_device) {
             owner = {};
             GGML_SYCL_DEBUG("[XMX MoE] Scratch buffer '%s' did not resolve to device memory\n", tag ? tag : "?");
@@ -59573,9 +59562,9 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
 
         owned_scratch.emplace_back();
         xmx_moe_owned_scratch & scratch = owned_scratch.back();
+        scratch.owner                   = std::move(owner);
         scratch.ptr                     = resolved.ptr;
         scratch.bytes                   = bytes;
-        scratch.owner                   = std::move(owner);
         return resolved.ptr;
     };
     auto release_owned_scratch = [&](void * ptr, size_t bytes) {
@@ -61651,8 +61640,6 @@ struct secondary_layer_tg_buffers {
         if (ptr && needed <= size) {
             return true;
         }
-        reset_device(ptr, handle);
-        size = 0;
         ggml_sycl::alloc_request req{};
         req.queue                          = &q;
         req.size                           = needed;
@@ -61660,13 +61647,19 @@ struct secondary_layer_tg_buffers {
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.cohort_id               = name;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle owner{};
-        if (!ggml_sycl::unified_alloc(req, &owner) || owner.ptr == nullptr) {
-            handle = {};
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             return false;
         }
-        ptr    = static_cast<T *>(owner.ptr);
-        handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+        ggml_sycl::mem_handle replacement =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = replacement.resolve(ggml_sycl_get_device_id_from_queue(q));
+        if (!resolved.ptr || !resolved.on_device) {
+            return false;
+        }
+        reset_device(ptr, handle);
+        handle = std::move(replacement);
+        ptr    = static_cast<T *>(resolved.ptr);
         size   = needed;
         return true;
     }
@@ -61978,9 +61971,6 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         if (ptr && needed <= size) {
             return true;
         }
-        ptr    = nullptr;
-        size   = 0;
-        handle = {};
         ggml_sycl::alloc_request req{};
         req.queue                          = target_queue;
         req.size                           = needed;
@@ -61988,15 +61978,22 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.cohort_id               = name;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle owner{};
-        if (!ggml_sycl::unified_alloc(req, &owner) || owner.ptr == nullptr) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
+            return false;
+        }
+        ggml_sycl::mem_handle replacement =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const int  target_device = ggml_sycl_get_device_id_from_queue(*target_queue);
+        const auto resolved      = replacement.resolve(target_device);
+        if (!resolved.ptr || !resolved.on_device) {
             return false;
         }
         using ptr_type = std::remove_reference_t<decltype(ptr)>;
-        ptr            = static_cast<ptr_type>(owner.ptr);
-        handle         = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
+        handle         = std::move(replacement);
+        ptr            = static_cast<ptr_type>(resolved.ptr);
         size           = needed;
-        return ptr != nullptr;
+        return true;
     };
 
     // Ensure ALL slots have sufficient staging buffers for the current K/N.
@@ -72217,15 +72214,16 @@ static bool ggml_sycl_moe_down_sum_shadow_record(ggml_backend_sycl_context & ctx
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::SCRATCH;
 
-    ggml_sycl::alloc_handle owner{};
-    if (!ggml_sycl::unified_alloc(req, &owner) || !owner.ptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         fprintf(stderr, "[MOE-DOWN-SUM-SHADOW] alloc_failed tensor=%s layer=%d bytes=%zu\n",
                 final->name ? final->name : "?", layer, nbytes);
         return false;
     }
 
-    ggml_sycl::mem_handle handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
-    auto                  out    = handle.resolve(ctx.device);
+    ggml_sycl::mem_handle handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto out = handle.resolve(ctx.device);
     if (!out.ptr || !out.on_device) {
         fprintf(stderr, "[MOE-DOWN-SUM-SHADOW] resolve_failed tensor=%s layer=%d bytes=%zu\n",
                 final->name ? final->name : "?", layer, nbytes);
@@ -78636,12 +78634,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             int pipe_dev = ggml_sycl_get_device_id_from_queue(*pipe.dma_queue);
             for (int b = 0; b < 2; b++) {
                 if (pipe.scratch_size[b] < max_weight_bytes) {
-                    // Free old buffer.
-                    pipe.scratch_handle[b] = {};
-                    pipe.scratch_buf[b]    = nullptr;
-                    pipe.scratch_size[b]   = 0;
-
-                    // Allocate new buffer and immediately move ownership into a mem_handle.
+                    // Allocate and validate a replacement before disturbing the published buffer.
                     ggml_sycl::alloc_request req{};
                     req.queue                               = pipe.dma_queue.get();
                     req.device                              = pipe_dev;
@@ -78649,17 +78642,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     req.intent.role                         = ggml_sycl::alloc_role::STAGING;
                     req.intent.category                     = ggml_sycl::runtime_category::STAGING;
                     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::RUNTIME;
-                    ggml_sycl::alloc_handle scratch_owner{};
-                    if (!ggml_sycl::unified_alloc(req, &scratch_owner) || !scratch_owner.ptr) {
+                    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+                    if (!allocation) {
                         GGML_LOG_WARN("[SYCL] PP pipeline: scratch buf[%d] alloc failed (%.1f MB)\n", b,
                                       max_weight_bytes / (1024.0 * 1024.0));
                         pipe.enabled = false;
                         break;
                     }
-                    pipe.scratch_buf[b] = scratch_owner.ptr;
-                    pipe.scratch_handle[b] =
-                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(scratch_owner), GGML_LAYOUT_AOS);
-                    pipe.scratch_size[b] = max_weight_bytes;
+                    ggml_sycl::mem_handle replacement =
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                    const auto resolved = replacement.resolve(pipe_dev);
+                    if (!resolved.ptr || !resolved.on_device) {
+                        pipe.enabled = false;
+                        break;
+                    }
+                    pipe.scratch_handle[b] = std::move(replacement);
+                    pipe.scratch_buf[b]    = resolved.ptr;
+                    pipe.scratch_size[b]   = max_weight_bytes;
                 }
             }
 
@@ -83912,7 +83911,6 @@ static void ggml_sycl_mmvq_soa_pre_allocate_buffers(ggml_backend_sycl_context & 
             ctx.mmvq_soa_buffers.reset_usage();
             return;
         }
-        ctx.mmvq_soa_buffers.free_buffers(stream);
     }
 
     // Calculate buffer size (use max dimensions for all buffers)
@@ -83942,19 +83940,21 @@ static void ggml_sycl_mmvq_soa_pre_allocate_buffers(ggml_backend_sycl_context & 
     req.intent.constraints.must_device      = true;
     // Keep reordered activation scratch out of arena tail zones on B50.
     req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::WEIGHT;
-    ggml_sycl::alloc_handle bulk_owner{};
-    if (!ggml_sycl::unified_alloc(req, &bulk_owner) || !bulk_owner.ptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         GGML_LOG_ERROR("[MMVQ-SOA-GRAPH] Failed to allocate bulk Q8_1 buffer (%.1f MB)\n",
                        total_size / (1024.0 * 1024.0));
         return;
     }
-    ctx.mmvq_soa_buffers.bulk_owner = ggml_sycl::detail::from_legacy_owned_alloc(std::move(bulk_owner), GGML_LAYOUT_AOS);
-    auto resolved                   = ctx.mmvq_soa_buffers.bulk_owner.resolve(req.device);
-    if (!resolved || !resolved.on_device) {
-        ctx.mmvq_soa_buffers.bulk_owner = {};
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(req.device);
+    if (!resolved.ptr || !resolved.on_device) {
         GGML_LOG_ERROR("[MMVQ-SOA-GRAPH] Bulk Q8_1 buffer did not resolve on device %d\n", req.device);
         return;
     }
+    ctx.mmvq_soa_buffers.free_buffers(stream);
+    ctx.mmvq_soa_buffers.bulk_owner = std::move(replacement);
     void * bulk_ptr = resolved.ptr;
 
     ctx.mmvq_soa_buffers.src1_ddq_buffers.resize(soa_mmvq_count);
