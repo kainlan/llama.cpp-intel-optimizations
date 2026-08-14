@@ -12441,10 +12441,11 @@ static allocation_result promote_legacy_alloc_owner_with_coordinator(
             result.error = allocation_error::LEGACY_OWNERSHIP_MISMATCH;
             return;
         }
-        if (released == registered_release_status::LEASE_REFUSED) {
-            // Refusal atomically restored LIVE and embedded retry state in the
-            // exact registry row. The consumed alloc_handle is metadata only;
-            // its stack lifetime no longer participates in cleanup ownership.
+        if (released == registered_release_status::LEASE_REFUSED ||
+            released == registered_release_status::BUSY) {
+            // Refusal restores LIVE with embedded retry state; BUSY attaches
+            // that state directly to the exact in-flight claim. In both cases
+            // the consumed alloc_handle retains no stack-owned authority.
             result.error = allocation_error::RELEASE_RETAINED;
             return;
         }
@@ -12793,7 +12794,6 @@ static registered_release_status release_registered_allocation_owned(
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         auto it = g_runtime_alloc_registry.find(requested.ptr);
         if (it == g_runtime_alloc_registry.end()) return registered_release_status::NOT_FOUND;
-        if (it->second.state == runtime_alloc_state::RELEASING) return registered_release_status::BUSY;
         const runtime_alloc_ownership expected = mode == registered_release_mode::INTRUSIVE ?
                                                      runtime_alloc_ownership::INTRUSIVE :
                                                      runtime_alloc_ownership::LEGACY;
@@ -12802,6 +12802,13 @@ static registered_release_status release_registered_allocation_owned(
         if (require_exact_key ? !(requested.key() == live.key()) :
                                 (requested.device >= 0 && requested.device != live.device)) {
             return registered_release_status::KEY_MISMATCH;
+        }
+        if (it->second.state == runtime_alloc_state::RELEASING) {
+            // A consumed promotion token cannot retain cleanup authority on its
+            // stack. Attach that authority to the matching in-flight row so the
+            // claimant either fulfills it or merges it during rollback.
+            if (promotion_cleanup_on_refusal) it->second.promotion_cleanup_pending = true;
+            return registered_release_status::BUSY;
         }
         if (it->second.release_generation == UINT64_MAX) return registered_release_status::BUSY;
         detached.handle = live;
@@ -12826,6 +12833,10 @@ static registered_release_status release_registered_allocation_owned(
     }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Hold the real detached release transaction at RELEASING so tests can
+    // deterministically inject an exact promotion-cleanup handoff.
+    g_test_registry_claim_reached.store(true, std::memory_order_release);
+    while (g_test_pause_registry_claim.load(std::memory_order_acquire)) std::this_thread::yield();
     const bool physically_released = detached.test_no_physical_release ? detached.test_exact_leases == 0 :
                                                                          unified_free_record(detached);
 #else
@@ -12838,7 +12849,9 @@ static registered_release_status release_registered_allocation_owned(
             it->second.release_generation == detached.release_generation &&
             it->second.state == runtime_alloc_state::RELEASING) {
             it->second.owned_segments = std::move(detached.owned_segments);
-            it->second.promotion_cleanup_pending = detached.promotion_cleanup_pending;
+            // Pending may arrive on the current row while this detached claim
+            // is RELEASING. Rollback is a monotonic merge, never a stale copy.
+            it->second.promotion_cleanup_pending |= detached.promotion_cleanup_pending;
             it->second.state = runtime_alloc_state::LIVE;
         }
         return registered_release_status::LEASE_REFUSED;
@@ -12857,32 +12870,29 @@ static registered_release_status release_registered_allocation_owned(
 static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
     size_t released = 0;
     try {
-        for (;;) {
-            alloc_metadata exact{};
-            {
-                std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-                const auto it = std::find_if(g_runtime_alloc_registry.begin(), g_runtime_alloc_registry.end(),
-                                             [device](const auto & item) {
-                    const runtime_alloc_record & row = item.second;
-                    return row.state == runtime_alloc_state::LIVE &&
-                           row.ownership == runtime_alloc_ownership::LEGACY &&
-                           row.promotion_cleanup_pending && (device < 0 || row.handle.device == device);
-                });
-                if (it == g_runtime_alloc_registry.end()) break;
-                exact = it->second.handle;
+        std::vector<alloc_metadata> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+            pending.reserve(g_runtime_alloc_registry.size());
+            for (const auto & item : g_runtime_alloc_registry) {
+                const runtime_alloc_record & row = item.second;
+                if (row.ownership == runtime_alloc_ownership::LEGACY && row.promotion_cleanup_pending &&
+                    (device < 0 || row.handle.device == device)) {
+                    pending.push_back(row.handle);
+                }
             }
+        }
+        // A bounded identity snapshot visits every row at most once. Stable
+        // pointer order also makes refusal/fairness races deterministic.
+        std::sort(pending.begin(), pending.end(), [](const alloc_metadata & lhs, const alloc_metadata & rhs) {
+            return reinterpret_cast<uintptr_t>(lhs.ptr) < reinterpret_cast<uintptr_t>(rhs.ptr);
+        });
+        for (const alloc_metadata & exact : pending) {
             const registered_release_status status = release_registered_allocation_owned(
                 exact, registered_release_mode::LEGACY, true, true);
-            if (status == registered_release_status::RELEASED) {
-                ++released;
-                continue;
-            }
-            // Refusal restores the same row's pending bit atomically. BUSY is
-            // likewise retried at a later safe point rather than spinning.
-            if (status == registered_release_status::LEASE_REFUSED || status == registered_release_status::BUSY) {
-                break;
-            }
-            break;
+            if (status == registered_release_status::RELEASED) ++released;
+            // Refusal/BUSY keeps this exact row pending. Continue through the
+            // snapshot so one leased row cannot starve unrelated cleanup.
         }
     } catch (...) {
     }
@@ -12977,6 +12987,11 @@ bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadat
 
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept {
     return process_pending_legacy_promotion_cleanup(device);
+}
+
+registered_release_status allocation_registry_test_release_exact(
+    const alloc_metadata & metadata, registered_release_mode mode) noexcept {
+    return release_registered_allocation_owned(metadata, mode, true, false);
 }
 
 registered_release_status allocation_registry_test_claim(

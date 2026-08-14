@@ -375,6 +375,82 @@ void refused_legacy_promotion_uses_registry_retry_state() {
                  "PASS legacy-promotion-refusal-stack-dies-cleanly\n";
 }
 
+void in_flight_promotion_cleanup_pending_survives_rollback() {
+    fake_release_backend backend;
+    const size_t baseline_rows = allocation_registry_test_size();
+    const alloc_metadata exact = metadata(87);
+    check(allocation_registry_test_publish(exact, false), "handoff-race row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(exact), "handoff-race lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status claimant = registered_release_status::NOT_FOUND;
+    std::thread t1([&] {
+        claimant = allocation_registry_test_release_exact(exact, registered_release_mode::LEGACY);
+    });
+    while (!allocation_registry_test_claim_reached()) std::this_thread::yield();
+
+    allocation_owner_test_fail_next_control_allocations(1);
+    const allocation_result cleanup = allocation_registry_test_promote(exact, coordinator);
+    check(cleanup.error == allocation_error::RELEASE_RETAINED,
+          "in-flight promotion cleanup did not hand off retained authority");
+    check(allocation_registry_test_cleanup_pending(exact.ptr),
+          "in-flight row was not marked pending under the claim mutex");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(claimant == registered_release_status::LEASE_REFUSED,
+          "paused claimant did not take deterministic refusal rollback");
+    check(allocation_registry_test_contains(exact.ptr) && allocation_registry_test_cleanup_pending(exact.ptr),
+          "rollback overwrote pending authority that arrived while RELEASING");
+
+    check(allocation_registry_test_release_exact_lease(exact), "handoff-race lease release failed");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 1,
+          "handoff-race retry did not fulfill pending cleanup");
+    check(!allocation_registry_test_contains(exact.ptr) && allocation_registry_test_size() == baseline_rows,
+          "handoff-race success did not erase the exact pending row");
+    check(coordinator->live_controls() == 0, "handoff-race changed coordinator census");
+    std::cout << "PASS in-flight-promotion-cleanup-pending-handoff\n"
+                 "PASS in-flight-pending-or-merge-on-rollback\n";
+}
+
+void promotion_cleanup_retry_visits_all_snapshot_rows() {
+    fake_release_backend backend;
+    const size_t baseline_rows = allocation_registry_test_size();
+    const alloc_metadata refused = metadata(88);
+    const alloc_metadata releasable = metadata(89);
+    check(allocation_registry_test_publish(refused, false), "fairness refused-row publication failed");
+    check(allocation_registry_test_publish(releasable, false), "fairness releasable-row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(refused), "fairness refused lease acquisition failed");
+    check(allocation_registry_test_acquire_exact_lease(releasable), "fairness releasable lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(refused.device, release_fake, &backend);
+
+    allocation_owner_test_fail_next_control_allocations(1);
+    check(allocation_registry_test_promote(refused, coordinator).error == allocation_error::RELEASE_RETAINED,
+          "fairness refused row was not marked pending");
+    allocation_owner_test_fail_next_control_allocations(1);
+    check(allocation_registry_test_promote(releasable, coordinator).error == allocation_error::RELEASE_RETAINED,
+          "fairness releasable row was not marked pending");
+    check(allocation_registry_test_release_exact_lease(releasable), "fairness releasable lease release failed");
+
+    // Pointer-sorted snapshot visits the lower-address refused row first. The
+    // later row must still be freed in this same bounded pass.
+    check(allocation_registry_test_process_promotion_retries(refused.device) == 1,
+          "one refused pending row starved a later releasable row");
+    check(allocation_registry_test_contains(refused.ptr) &&
+              allocation_registry_test_cleanup_pending(refused.ptr) &&
+              !allocation_registry_test_contains(releasable.ptr),
+          "fairness pass did not preserve refusal and erase unrelated success");
+
+    check(allocation_registry_test_release_exact_lease(refused), "fairness refused lease release failed");
+    check(allocation_registry_test_process_promotion_retries(refused.device) == 1,
+          "fairness refused row did not release on the next pass");
+    check(allocation_registry_test_size() == baseline_rows, "fairness retry leaked registry rows");
+    check(coordinator->live_controls() == 0, "fairness retries changed coordinator census");
+    std::cout << "PASS promotion-cleanup-bounded-snapshot\n"
+                 "PASS promotion-cleanup-refusal-fairness\n";
+}
+
 void invalid_request_has_zero_coordinator_census() {
     const size_t before = allocation_coordinator_test_count();
     alloc_request invalid{};
@@ -436,6 +512,8 @@ int main() {
     concurrent_legacy_promotion_has_one_owner();
     legacy_promotion_failures_clean_exact_row();
     refused_legacy_promotion_uses_registry_retry_state();
+    in_flight_promotion_cleanup_pending_survives_rollback();
+    promotion_cleanup_retry_visits_all_snapshot_rows();
     invalid_request_has_zero_coordinator_census();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;

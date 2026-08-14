@@ -4290,6 +4290,8 @@ size_t allocation_registry_test_size() noexcept;
 bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
 bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadata) noexcept;
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
+registered_release_status allocation_registry_test_release_exact(
+    const alloc_metadata & metadata, registered_release_mode mode) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
