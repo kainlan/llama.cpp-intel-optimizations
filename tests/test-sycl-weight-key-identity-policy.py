@@ -164,7 +164,7 @@ def evaluate(key, sycl, header, loader, mem_header, mem_source, sycl_cmake):
                                    "#endif")
     retained_fail_definition = between(mem_source, "#ifdef GGML_SYCL_RETAINED_PUBLICATION_TESTING\nvoid fail_next_retained_handle_publication_for_test()",
                                        "#endif")
-    retained_test_target = between(sycl_cmake, "target_compile_definitions(test-mem-handle-eviction PRIVATE", ")")
+    retained_test_target = between(sycl_cmake, "target_compile_definitions(ggml-sycl-q1-route-test-objects PRIVATE", ")")
 
     anchors = {
         "ggml_sycl_cache_id size tripwire": tripwire,
@@ -294,7 +294,7 @@ def evaluate(key, sycl, header, loader, mem_header, mem_source, sycl_cmake):
             and "g_fail_next_retained_handle_publication.exchange" in retained_fail_branch
             and "fail_next_retained_handle_publication_for_test" in retained_fail_definition
             and "GGML_SYCL_RETAINED_PUBLICATION_TESTING=1" in retained_test_target
-            and not re.search(r"target_compile_definitions\(ggml-sycl[^)]*GGML_SYCL_RETAINED_PUBLICATION_TESTING",
+            and not re.search(r"target_compile_definitions\(ggml-sycl\s+[^)]*GGML_SYCL_RETAINED_PUBLICATION_TESTING",
                               sycl_cmake, re.S)),
 
         # Published split identities carry the owner prefix and must die with the

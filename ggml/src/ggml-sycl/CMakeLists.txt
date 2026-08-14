@@ -1817,10 +1817,6 @@ endif() # static SYCL backend fixture
 if (NOT GGML_BACKEND_DL)
 add_executable(test-mem-handle-eviction
     tests/test-mem-handle-eviction.cpp
-    unified-cache.cpp
-    model-lifecycle.cpp
-    pinned-pool.cpp
-    mem-handle.cpp
 )
 target_include_directories(test-mem-handle-eviction PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -1835,19 +1831,33 @@ target_compile_definitions(test-mem-handle-eviction PRIVATE
     GGML_SYCL_RETAINED_PUBLICATION_TESTING=1
     GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-mem-handle-eviction PRIVATE ggml-base ggml)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-mem-handle-eviction PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# This fixture exercises private failpoints in a complete embedded backend.
+# Linking ggml here also loads the ordinary ggml-sycl DSO, interposes calls
+# between the two copies, and leaves DSO globals holding owners from the
+# embedded allocation domain during process teardown.
+target_link_libraries(test-mem-handle-eviction PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME mem-handle-eviction COMMAND test-mem-handle-eviction)
 set_tests_properties(mem-handle-eviction PROPERTIES
     LABELS "sycl;handle;eviction;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
     TIMEOUT 120
     # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
     # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
     SKIP_RETURN_CODE 77
 )
+if (Python3_Interpreter_FOUND)
+    add_test(NAME mem-handle-eviction-b70-repeat-clean-exit
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-repeat-clean-exit.py
+            3 $<TARGET_FILE:test-mem-handle-eviction>)
+    set_tests_properties(mem-handle-eviction-b70-repeat-clean-exit PROPERTIES
+        LABELS "sycl;handle;eviction;B70;repeat;clean-exit"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 360
+        SKIP_RETURN_CODE 77)
+endif()
 
 # BUILD_TESTING must not alter the ordinary backend DSO. The failure injector
 # is compiled only into the direct-source executable above; prove the library's
@@ -4648,7 +4658,8 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     endforeach()
     target_compile_definitions(ggml-sycl-q1-route-test-objects PRIVATE
         GGML_SYCL_Q1_NVFP4_ROUTE_TESTING=1
-        GGML_SYCL_PRIVATE_TESTING=1)
+        GGML_SYCL_PRIVATE_TESTING=1
+        GGML_SYCL_RETAINED_PUBLICATION_TESTING=1)
 
     add_library(ggml-sycl-private-fixtures INTERFACE)
     target_link_libraries(ggml-sycl-private-fixtures INTERFACE
@@ -4715,6 +4726,7 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         TIMEOUT 30)
 
     set(_ggml_sycl_private_fixture_consumers
+        test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle

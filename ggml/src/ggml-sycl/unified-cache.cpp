@@ -686,8 +686,9 @@ residency_diagnostics_snapshot residency_diagnostics_snapshot_for_test() {
     return g_residency_diag;
 }
 
-// Per-device cache storage (for PER_DEVICE and AUTO modes)
-static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;
+// Per-device cache synchronization (for PER_DEVICE and AUTO modes). The owner
+// map itself is declared after the allocation registry below so static teardown
+// destroys caches while their release registry is still alive.
 static std::shared_mutex                                       g_cache_rw_mutex;
 static size_t                                                  g_unified_cache_budget      = 0;  // 0 = auto-calculate
 static int                                                     g_unified_cache_budget_pct  = 100;
@@ -1043,6 +1044,11 @@ struct runtime_alloc_record {
 };
 
 static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry;
+// Keep cache owners later in declaration order than the registry they call from
+// unified_cache::~unified_cache(). Reverse static destruction then tears caches
+// down first instead of asking release_registered_allocation_owned() to access
+// an already-destroyed unordered_map.
+static std::unordered_map<int, std::shared_ptr<unified_cache>> g_device_caches;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<bool> g_test_pause_registry_claim{ false };
 static std::atomic<bool> g_test_registry_claim_reached{ false };
