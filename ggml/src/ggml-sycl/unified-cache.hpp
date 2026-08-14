@@ -4039,6 +4039,15 @@ struct release_attempt {
 
 class allocation_release_coordinator;
 
+// Physical relationship between an intrusive owner and cache storage. This is
+// fixed before coordinator admission; shutdown must never infer it later from
+// pointer containment after caches may already have changed.
+enum class allocation_control_class : uint8_t {
+    CACHE_BACKING = 0,
+    CACHE_SUBALLOCATION,
+    EXTERNAL_EXACT,
+};
+
 // Preallocated, intrusive allocation ownership state. The control is created
 // before physical allocation, then becomes the sole source of published
 // metadata. Its retry link is embedded so a refused final release can be
@@ -4046,6 +4055,7 @@ class allocation_release_coordinator;
 class alloc_owner_control final {
   public:
     const alloc_metadata & metadata() const noexcept { return metadata_; }
+    allocation_control_class ownership_class() const noexcept { return ownership_class_; }
     uint32_t use_count() const noexcept { return refs_.load(std::memory_order_acquire); }
 
   private:
@@ -4054,7 +4064,8 @@ class alloc_owner_control final {
     friend class allocation_release_coordinator;
     friend struct allocation_owner_internal_access;
 
-    explicit alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator) noexcept;
+    explicit alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator,
+                                 allocation_control_class ownership_class) noexcept;
     ~alloc_owner_control() = default;
 
     void retain() noexcept;
@@ -4064,6 +4075,7 @@ class alloc_owner_control final {
 
     std::atomic<uint32_t> refs_{ 1 };
     alloc_metadata metadata_{};
+    allocation_control_class ownership_class_ = allocation_control_class::EXTERNAL_EXACT;
     std::shared_ptr<allocation_release_coordinator> coordinator_;
     alloc_owner_control * retry_next_ = nullptr;
     bool published_ = false;
@@ -4075,6 +4087,7 @@ using allocation_release_test_backend = release_attempt (*)(const alloc_metadata
 
 struct allocation_control_snapshot {
     alloc_metadata metadata{};
+    allocation_control_class ownership_class = allocation_control_class::EXTERNAL_EXACT;
     uint32_t       refs  = 0;
     bool           retry = false;
 };
@@ -4091,6 +4104,7 @@ class allocation_release_coordinator : public std::enable_shared_from_this<alloc
     size_t live_controls() const noexcept { return live_controls_.load(std::memory_order_acquire); }
     size_t retry_count() const noexcept { return retry_count_.load(std::memory_order_acquire); }
     bool can_detach() const noexcept;
+    bool accepting() const noexcept;
     size_t process_retries() noexcept;
     // Internal lifecycle diagnostics. The snapshot is observational: it never
     // changes ownership or waives a live control.
@@ -4103,7 +4117,7 @@ class allocation_release_coordinator : public std::enable_shared_from_this<alloc
     friend struct allocation_owner_internal_access;
     release_attempt retire(alloc_owner_control * control) noexcept;
     release_attempt release_physical(alloc_owner_control * control) noexcept;
-    bool try_register_control(alloc_owner_control * control) noexcept;
+    bool publish_control(alloc_owner_control * control, const alloc_metadata & metadata) noexcept;
     void unregister_control(alloc_owner_control * control) noexcept;
     void abandon_control(alloc_owner_control * control) noexcept;
 
@@ -4265,11 +4279,16 @@ allocation_owner_test_fixture allocation_owner_test_create(
     allocation_release_test_backend backend,
     void * context,
     allocation_error injected_failure = allocation_error::NONE) noexcept;
+allocation_result allocation_owner_test_create_on_coordinator(
+    const alloc_metadata & metadata,
+    const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 
 // Fail only the next N alloc_owner_control allocations. Unlike overriding the
 // process-wide operator new, this scoped seam is deterministic under TSAN and
 // cannot perturb the runtime, standard library, or unrelated test threads.
 void allocation_owner_test_fail_next_control_allocations(uint32_t count) noexcept;
+void allocation_owner_test_pause_control_publication(bool pause) noexcept;
+bool allocation_owner_test_control_publication_reached() noexcept;
 
 // Deterministic host-only seams for the coordinator admission and registry
 // ownership protocols. They perform no physical allocation or release.

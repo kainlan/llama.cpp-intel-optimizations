@@ -689,6 +689,95 @@ static bool global_cache_static_destruction_exits_cleanly(const char * self) {
     return true;
 }
 
+static release_attempt publication_race_release_backend(const alloc_metadata &, void * context) noexcept {
+    static_cast<std::atomic<unsigned> *>(context)->fetch_add(1, std::memory_order_release);
+    return { release_attempt_status::RELEASED };
+}
+
+static bool accepted_control_publication_is_atomic_with_close_snapshot() {
+    TEST_BEGIN("B70_accepted_control_publication_is_atomic_with_close_snapshot");
+    static int marker;
+    alloc_metadata metadata{};
+    metadata.ptr = &marker;
+    metadata.size = sizeof(marker);
+    metadata.device = 7;
+    metadata.id = 0x7070;
+    metadata.role = alloc_role::COMPUTE;
+    metadata.category = runtime_category::COMPUTE;
+
+    std::atomic<unsigned> releases{ 0 };
+    auto seed = allocation_owner_test_create(metadata, publication_race_release_backend, &releases,
+                                             allocation_error::CONTROL_ALLOCATION_FAILED);
+    TEST_ASSERT(seed.coordinator != nullptr, "test coordinator creation failed");
+
+    allocation_result published;
+    allocation_owner_test_pause_control_publication(true);
+    std::thread publisher([&] {
+        published = allocation_owner_test_create_on_coordinator(metadata, seed.coordinator);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!allocation_owner_test_control_publication_reached() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    if (!allocation_owner_test_control_publication_reached()) {
+        allocation_owner_test_pause_control_publication(false);
+        publisher.join();
+        TEST_FAIL("publication did not reach deterministic admission barrier");
+    }
+    std::thread closer([&] { allocation_coordinator_test_close(seed.coordinator); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    allocation_owner_test_pause_control_publication(false);
+    publisher.join();
+    closer.join();
+
+    TEST_ASSERT(published, "accepted registration lost the close race");
+    const auto controls = seed.coordinator->snapshot_controls();
+    TEST_ASSERT(controls.size() == 1, "snapshot missed the accepted registration");
+    TEST_ASSERT(controls[0].metadata == metadata, "snapshot observed partial control metadata");
+    TEST_ASSERT(controls[0].ownership_class == allocation_control_class::EXTERNAL_EXACT,
+                "snapshot observed an uninitialized ownership classification");
+    TEST_ASSERT(published.owner.reset().released(), "published control cleanup failed");
+    TEST_ASSERT(releases.load(std::memory_order_acquire) == 1, "release backend was not invoked exactly once");
+    TEST_PASS();
+    return true;
+}
+
+static bool retained_pinned_suballocation_refuses_preteardown(sycl::queue & q) {
+    TEST_BEGIN("B50_B70_retained_pinned_suballocation_refuses_preteardown");
+    constexpr size_t mib = 1024ull * 1024ull;
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    if (!cache->host_zones_configured()) cache->configure_host_zones(2ull * mib, 2ull * mib, 4ull * mib, 2ull * mib);
+    TEST_ASSERT(cache->host_zones_configured(), "host zones unavailable for pinned-owner fixture");
+
+    alloc_request req{};
+    req.queue = &q;
+    req.size = 4096;
+    req.intent.role = alloc_role::STAGING;
+    req.intent.category = runtime_category::STAGING;
+    req.intent.constraints.must_host_pinned = true;
+    req.intent.constraints.use_pinned_pool = true;
+    mem_handle retained = unified_allocate(req);
+    const int device = retained.device();
+    resolved_ptr resolved = retained.resolve();
+    TEST_ASSERT(device >= 0 && resolved.ptr != nullptr && !resolved.on_device, "pinned suballocation failed");
+    const size_t capacity_before = cache->host_zone_capacity(host_zone_id::STAGING);
+    std::memset(resolved.ptr, 0x5a, req.size);
+
+    TEST_ASSERT(!shutdown_unified_cache(), "shutdown destroyed caches beneath a retained pinned owner");
+    TEST_ASSERT(get_unified_cache_for_device(device) == cache, "refused shutdown detached the global cache");
+    TEST_ASSERT(cache->host_zones_configured() &&
+                    cache->host_zone_capacity(host_zone_id::STAGING) == capacity_before,
+                "refused shutdown destroyed or reconfigured the pinned pool");
+    TEST_ASSERT(static_cast<unsigned char *>(resolved.ptr)[0] == 0x5a,
+                "pinned backing became unusable after refused shutdown");
+
+    retained = {};
+    TEST_ASSERT(shutdown_unified_cache(), "shutdown retry failed after pinned owner release");
+    TEST_PASS();
+    return true;
+}
+
 static bool explicit_global_cache_shutdown_is_clean() {
     TEST_BEGIN("explicit_global_cache_shutdown_is_clean");
     TEST_ASSERT(shutdown_unified_cache(), "explicit global cache shutdown failed");
@@ -1042,9 +1131,11 @@ int main(int argc, char ** argv) {
     ok &= exact_scratch_shutdown_record_survives_for_retry(q);
     ok &= scratch_regrow_refusal_preserves_exact_record(q);
     ok &= concurrent_settle_destroy_closing_wins(q);
+    ok &= accepted_control_publication_is_atomic_with_close_snapshot();
     ok &= global_cache_static_destruction_exits_cleanly(argv[0]);
-    // The fixture owns a process-global cache, so drain it while q and the SYCL
-    // runtime are still alive rather than relying on static destruction.
+    // Retain a real pinned suballocation across the first shutdown attempt;
+    // retry drains the process-global cache while q and SYCL are still alive.
+    ok &= retained_pinned_suballocation_refuses_preteardown(q);
     ok &= explicit_global_cache_shutdown_is_clean();
 
     fprintf(stderr, "-------------------------------------------\n");
