@@ -121,8 +121,8 @@ request_fixture make_request(sycl::queue & queue,
 }
 
 bool allocation_live(void * ptr) {
-    ggml_sycl::alloc_handle allocation{};
-    return ggml_sycl::unified_lookup(ptr, &allocation);
+    ggml_sycl::alloc_metadata metadata{};
+    return ggml_sycl::unified_lookup(ptr, &metadata);
 }
 
 void inject(ExpertPrefetcher & prefetcher, prefetch_request request) {
