@@ -191,11 +191,17 @@ print("PASS staging-resize-capacity-qualified-source-gate")
 # transaction behind the exact queue terminal. The retirement ticket predates
 # owner-vector growth and failed barrier/publication paths drain before unwind.
 retirement = region(RUNTIME, "class ggml_sycl_old_owner_retirement", "// Construct this before direct_stage_expert")
-assert retirement.index("retained_handle_publish_ticket publish_ticket_") < retirement.index("std::vector<ggml_sycl::mem_handle>         old_owners_")
+# Field order (ticket before the owner vector) is the property; match on the
+# declarations rather than on their column alignment, which clang-format moves
+# whenever a neighbouring member name changes length.
+assert retirement.index("publish_ticket_ =") < retirement.index("old_owners_;")
 assert "old_owners_.reserve(owner_capacity)" in retirement
-assert "queue_.ext_oneapi_submit_barrier()" in retirement
+# The queue is held by pointer so the private host fixture can drive this
+# transaction with no device; null means there is no submission to fence or
+# drain, and every production caller passes a live queue.
+assert "queue_->ext_oneapi_submit_barrier()" in retirement
 assert "retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_)" in retirement
-assert "ggml_sycl_drain_direct_stage_queue(queue_)" in retirement
+assert "ggml_sycl_drain_direct_stage_queue(*queue_)" in retirement
 for owner in ("g_split_secondary_gpu.q8_handle", "g_split_secondary_gpu.f32_handle", "output_handle"):
     assert f"retirement.hold({owner})" in secondary
 assert secondary.count("retirement.secure()") == 1
@@ -211,8 +217,16 @@ assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
 assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
 moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
 assert "moe_expert_ptrs_handle[device]        = {};" not in moe_table
-assert moe_table.count("std::vector<ggml_sycl::mem_handle> new_handles(count)") == 3
-assert moe_table.count("std::vector<void *>                new_payload(count, nullptr)") == 3
+# The three publication sites share one constructor helper, so the
+# same-allocation host-vector failure has a single seam. The "built off to the
+# side, published only once complete" property moves with it: assert the call
+# count here and the ordering inside the helper itself.
+assert moe_table.count("ggml_sycl_build_moe_table_views(count,") == 3
+table_views = region(RUNTIME, "static void ggml_sycl_build_moe_table_views", "#if defined(GGML_SYCL_PRIVATE_TESTING)")
+assert "std::vector<ggml_sycl::mem_handle> new_handles(count)" in table_views
+assert "std::vector<void *>                new_payload(count, nullptr)" in table_views
+assert table_views.index("new_payload(count, nullptr)") < table_views.index("handles.swap(new_handles)")
+assert table_views.index("handles.swap(new_handles)") < table_views.index("payload.swap(new_payload)")
 assert moe_table.count("catch (const std::bad_alloc &)") >= 3
 assert "ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)" in moe_table
 assert "return true;" in moe_table and "return false;" in moe_table

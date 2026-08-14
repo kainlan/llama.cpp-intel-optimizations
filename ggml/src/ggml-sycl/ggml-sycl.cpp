@@ -125,6 +125,12 @@
 // this file actually dispatches on (llama.cpp-cwev).
 #include "ggml-sycl/xmx-dispatch-gate.hpp"
 
+// Failpoint seams for the transactional staging-replacement region. Compiled
+// only into the private-fixture objects, so the ordinary DSO gains no symbol.
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+#    include "tests/staging-replacement-failpoint-seam.hpp"
+#endif
+
 // The XMX GEMM dispatch sites below call ggml_sycl_xmx_available() and
 // ggml_sycl_xmx_supports_type(), which are declared in mmq_xmx.hpp -- included
 // here only under GGML_SYCL_MMQ_XMX. GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX
@@ -2899,7 +2905,64 @@ static void ggml_sycl_drain_direct_stage_queue(sycl::queue & queue) noexcept {
     }
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Deterministic count-limited failpoints for the staging-replacement region.
+// Relaxed atomics: a scenario arms and reads from one thread, and the seams
+// must not introduce ordering the production path does not already have.
+namespace {
+struct ggml_sycl_staging_failpoint_slot {
+    std::atomic<uint32_t> armed{ 0 };
+    std::atomic<uint32_t> reached{ 0 };
+    std::atomic<uint32_t> traversals{ 0 };
+};
+
+ggml_sycl_staging_failpoint_slot g_staging_failpoints[GGML_SYCL_STAGING_FAILPOINT_COUNT];
+std::atomic<uint32_t>            g_staging_failpoint_retirement_drains{ 0 };
+
+bool ggml_sycl_staging_failpoint_fire(ggml_sycl_staging_failpoint fp) noexcept {
+    auto & slot = g_staging_failpoints[fp];
+    slot.traversals.fetch_add(1, std::memory_order_relaxed);
+    uint32_t armed = slot.armed.load(std::memory_order_relaxed);
+    while (armed != 0 && !slot.armed.compare_exchange_weak(armed, armed - 1, std::memory_order_relaxed)) {
+    }
+    if (armed == 0) {
+        return false;
+    }
+    slot.reached.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void ggml_sycl_staging_failpoint_throw_if_armed(ggml_sycl_staging_failpoint fp) {
+    if (ggml_sycl_staging_failpoint_fire(fp)) {
+        throw std::runtime_error("ggml-sycl staging replacement failpoint");
+    }
+}
+
+void ggml_sycl_staging_failpoint_throw_bad_alloc_if_armed(ggml_sycl_staging_failpoint fp) {
+    if (ggml_sycl_staging_failpoint_fire(fp)) {
+        // The publication sites catch std::bad_alloc specifically, so a generic
+        // exception here would escape the branch this seam exists to exercise.
+        throw std::bad_alloc();
+    }
+}
+}  // namespace
+
+#    define GGML_SYCL_STAGING_FAILPOINT_FIRED(fp)          ggml_sycl_staging_failpoint_fire(fp)
+#    define GGML_SYCL_STAGING_FAILPOINT_THROW(fp)          ggml_sycl_staging_failpoint_throw_if_armed(fp)
+#    define GGML_SYCL_STAGING_FAILPOINT_THROW_BADALLOC(fp) ggml_sycl_staging_failpoint_throw_bad_alloc_if_armed(fp)
+#    define GGML_SYCL_STAGING_FAILPOINT_COUNT_RETIREMENT_DRAIN() \
+        g_staging_failpoint_retirement_drains.fetch_add(1, std::memory_order_relaxed)
+#else
+#    define GGML_SYCL_STAGING_FAILPOINT_FIRED(fp)                false
+#    define GGML_SYCL_STAGING_FAILPOINT_THROW(fp)                ((void) 0)
+#    define GGML_SYCL_STAGING_FAILPOINT_THROW_BADALLOC(fp)       ((void) 0)
+#    define GGML_SYCL_STAGING_FAILPOINT_COUNT_RETIREMENT_DRAIN() ((void) 0)
+#endif
+
 static bool ggml_sycl_checked_add_size(size_t a, size_t b, size_t * out) noexcept {
+    if (GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_ARITHMETIC_BOUNDARY)) {
+        return false;
+    }
     if (!out || a > std::numeric_limits<size_t>::max() - b) {
         return false;
     }
@@ -2908,6 +2971,9 @@ static bool ggml_sycl_checked_add_size(size_t a, size_t b, size_t * out) noexcep
 }
 
 static bool ggml_sycl_checked_mul_size(size_t a, size_t b, size_t * out) noexcept {
+    if (GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_ARITHMETIC_BOUNDARY)) {
+        return false;
+    }
     if (!out || (a != 0 && b > std::numeric_limits<size_t>::max() / a)) {
         return false;
     }
@@ -2931,7 +2997,12 @@ static bool ggml_sycl_checked_round_up_size(size_t value, size_t alignment, size
 // only after secure() succeeds.
 class ggml_sycl_old_owner_retirement {
   public:
-    explicit ggml_sycl_old_owner_retirement(sycl::queue & queue, size_t owner_capacity) : queue_(queue) {
+    // The queue is held by pointer rather than by reference for one reason: the
+    // private host fixture drives this transaction on a machine with no device,
+    // where null means "no submission exists to fence against or drain". Every
+    // production caller passes a live queue, so the guarded branches below are
+    // unreachable outside that fixture.
+    explicit ggml_sycl_old_owner_retirement(sycl::queue * queue, size_t owner_capacity) : queue_(queue) {
         old_owners_.reserve(owner_capacity);
     }
 
@@ -2947,28 +3018,119 @@ class ggml_sycl_old_owner_retirement {
             return true;
         }
         try {
-            const sycl::event prior_queue_terminal = queue_.ext_oneapi_submit_barrier();
+            GGML_SYCL_STAGING_FAILPOINT_THROW(GGML_SYCL_STAGING_FAILPOINT_BARRIER_SUBMIT);
+            const sycl::event prior_queue_terminal = queue_ ? queue_->ext_oneapi_submit_barrier() : sycl::event{};
+            GGML_SYCL_STAGING_FAILPOINT_THROW(GGML_SYCL_STAGING_FAILPOINT_RETENTION_PUBLISH);
             ggml_sycl::retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_);
             secured_ = true;
             return true;
         } catch (...) {
-            ggml_sycl_drain_direct_stage_queue(queue_);
+            drain_rollback();
             return false;
         }
     }
 
     void publication_failed() noexcept {
         if (!secured_) {
-            ggml_sycl_drain_direct_stage_queue(queue_);
+            drain_rollback();
         }
     }
 
   private:
+    void drain_rollback() noexcept {
+        GGML_SYCL_STAGING_FAILPOINT_COUNT_RETIREMENT_DRAIN();
+        if (queue_) {
+            ggml_sycl_drain_direct_stage_queue(*queue_);
+        }
+    }
+
     ggml_sycl::retained_handle_publish_ticket publish_ticket_ = ggml_sycl::begin_retained_handle_publish();
-    std::vector<ggml_sycl::mem_handle>         old_owners_;
-    sycl::queue &                              queue_;
-    bool                                       secured_ = false;
+    std::vector<ggml_sycl::mem_handle>        old_owners_;
+    sycl::queue *                             queue_   = nullptr;
+    bool                                      secured_ = false;
 };
+
+// The two host-side pointer-table views are one unit: a partially rebuilt pair
+// must never reach publication, so both are built off to the side and the caller
+// swaps them in only after the transaction is secured. Keeping the construction
+// in one helper also gives the same-allocation host-vector failure a single seam.
+static void ggml_sycl_build_moe_table_views(size_t                               count,
+                                            std::vector<ggml_sycl::mem_handle> & handles,
+                                            std::vector<void *> &                payload) {
+    GGML_SYCL_STAGING_FAILPOINT_THROW_BADALLOC(GGML_SYCL_STAGING_FAILPOINT_HOST_VECTOR);
+    std::vector<ggml_sycl::mem_handle> new_handles(count);
+    std::vector<void *>                new_payload(count, nullptr);
+    handles.swap(new_handles);
+    payload.swap(new_payload);
+}
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void ggml_sycl_staging_failpoint_arm(ggml_sycl_staging_failpoint fp, uint32_t fires) {
+    g_staging_failpoints[fp].armed.store(fires, std::memory_order_relaxed);
+}
+
+void ggml_sycl_staging_failpoint_reset() {
+    for (auto & slot : g_staging_failpoints) {
+        slot.armed.store(0, std::memory_order_relaxed);
+        slot.reached.store(0, std::memory_order_relaxed);
+        slot.traversals.store(0, std::memory_order_relaxed);
+    }
+    g_staging_failpoint_retirement_drains.store(0, std::memory_order_relaxed);
+}
+
+uint32_t ggml_sycl_staging_failpoint_reached(ggml_sycl_staging_failpoint fp) {
+    return g_staging_failpoints[fp].reached.load(std::memory_order_relaxed);
+}
+
+uint32_t ggml_sycl_staging_failpoint_traversals(ggml_sycl_staging_failpoint fp) {
+    return g_staging_failpoints[fp].traversals.load(std::memory_order_relaxed);
+}
+
+uint32_t ggml_sycl_staging_failpoint_armed_remaining(ggml_sycl_staging_failpoint fp) {
+    return g_staging_failpoints[fp].armed.load(std::memory_order_relaxed);
+}
+
+uint32_t ggml_sycl_staging_failpoint_retirement_drains() {
+    return g_staging_failpoint_retirement_drains.load(std::memory_order_relaxed);
+}
+
+bool ggml_sycl_staging_failpoint_checked_add(size_t a, size_t b, size_t * out) {
+    return ggml_sycl_checked_add_size(a, b, out);
+}
+
+bool ggml_sycl_staging_failpoint_checked_mul(size_t a, size_t b, size_t * out) {
+    return ggml_sycl_checked_mul_size(a, b, out);
+}
+
+bool ggml_sycl_staging_failpoint_checked_round_up(size_t value, size_t alignment, size_t * out) {
+    return ggml_sycl_checked_round_up_size(value, alignment, out);
+}
+
+bool ggml_sycl_staging_failpoint_build_table_views(size_t                               count,
+                                                   std::vector<ggml_sycl::mem_handle> * handles,
+                                                   std::vector<void *> *                payload) {
+    if (!handles || !payload) {
+        return false;
+    }
+    try {
+        ggml_sycl_build_moe_table_views(count, *handles, *payload);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_sycl_staging_failpoint_run_retirement(sycl::queue *                              queue,
+                                                const std::vector<ggml_sycl::mem_handle> & owners) {
+    ggml_sycl_old_owner_retirement retirement(queue, owners.size());
+    for (const auto & owner : owners) {
+        retirement.hold(owner);
+    }
+    // Mirror the production call sites exactly: they bail the moment secure()
+    // returns false, and secure() has already drained by then.
+    return retirement.secure();
+}
+#endif
 
 // Construct this before direct_stage_expert(). Field order is intentional: the
 // publisher ticket exists before owner-vector allocation and remains active
@@ -48544,12 +48706,12 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                 staging_req.intent.category                = ggml_sycl::runtime_category::STAGING;
                 staging_req.intent.constraints.must_device = true;
                 ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(staging_req);
-                if (allocation) {
+                if (allocation && !GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_ALLOCATION)) {
                     ggml_sycl::mem_handle staging_handle =
                         ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                     auto staging_resolved = staging_handle.resolve(device_id);
                     if (staging_resolved && staging_resolved.on_device) {
-                        ggml_sycl_old_owner_retirement retirement(*stream, 1);
+                        ggml_sycl_old_owner_retirement retirement(stream, 1);
                         retirement.hold(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
                         if (!retirement.secure()) {
                             return false;
@@ -49771,10 +49933,8 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         if (extra->moe_expert_handles[device].size() != count ||
             extra->moe_expert_ptr_payload[device].size() != count) {
             try {
-                std::vector<ggml_sycl::mem_handle> new_handles(count);
-                std::vector<void *>                new_payload(count, nullptr);
-                extra->moe_expert_handles[device].swap(new_handles);
-                extra->moe_expert_ptr_payload[device].swap(new_payload);
+                ggml_sycl_build_moe_table_views(count, extra->moe_expert_handles[device],
+                                                extra->moe_expert_ptr_payload[device]);
             } catch (const std::bad_alloc &) {
                 return false;
             }
@@ -49797,10 +49957,10 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
             if (table_handle.valid() && table_handle.has_stable_owner_identity() && resolved.ptr &&
                 resolved.on_device == bufs->tables_on_device) {
                 try {
-                    std::vector<ggml_sycl::mem_handle> new_handles(count);
-                    std::vector<void *>                new_payload(count, nullptr);
-                    ggml_sycl_old_owner_retirement retirement(
-                        queue, extra->moe_expert_handles[device].size() + 1);
+                    std::vector<ggml_sycl::mem_handle> new_handles;
+                    std::vector<void *>                new_payload;
+                    ggml_sycl_build_moe_table_views(count, new_handles, new_payload);
+                    ggml_sycl_old_owner_retirement retirement(&queue, extra->moe_expert_handles[device].size() + 1);
                     retirement.hold(extra->moe_expert_ptrs_handle[device]);
                     for (const auto & old_owner : extra->moe_expert_handles[device]) {
                         retirement.hold(old_owner);
@@ -49847,10 +50007,11 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         return false;
     }
     try {
-        std::vector<ggml_sycl::mem_handle> new_handles(count);
-        std::vector<void *>                new_payload(count, nullptr);
+        std::vector<ggml_sycl::mem_handle> new_handles;
+        std::vector<void *>                new_payload;
+        ggml_sycl_build_moe_table_views(count, new_handles, new_payload);
         ggml_sycl::mem_fill(table_handle, 0, bytes, queue);
-        ggml_sycl_old_owner_retirement retirement(queue, extra->moe_expert_handles[device].size() + 1);
+        ggml_sycl_old_owner_retirement retirement(&queue, extra->moe_expert_handles[device].size() + 1);
         retirement.hold(extra->moe_expert_ptrs_handle[device]);
         for (const auto & old_owner : extra->moe_expert_handles[device]) {
             retirement.hold(old_owner);
@@ -55854,7 +56015,10 @@ static bool split_secondary_gpu_ensure(size_t                  q8_bytes,
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-        if (!allocation) {
+        // The seam fires after a successful allocation on purpose: rejecting the
+        // replacement here forces the fresh owner to unwind, which is the case a
+        // pre-allocation refusal would never reach.
+        if (!allocation || GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_ALLOCATION)) {
             return false;
         }
         *handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
@@ -55873,9 +56037,16 @@ static bool split_secondary_gpu_ensure(size_t                  q8_bytes,
     void *                 q8_ptr     = nullptr;
     void *                 f32_ptr    = nullptr;
     void *                 output_new = nullptr;
-    const bool grow_q8     = g_split_secondary_gpu.q8_size < q8_bytes;
-    const bool grow_f32    = g_split_secondary_gpu.f32_size < f32_bytes;
-    const bool grow_output = output_capacity < output_bytes;
+
+    // Each grow decision consumes one arm of the resize seam, so a fixture that
+    // wants all three buffers replaced while prior secondary work is still in
+    // flight arms it for exactly three fires.
+    const bool grow_q8 = g_split_secondary_gpu.q8_size < q8_bytes ||
+                         GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_RESIZE_IN_FLIGHT);
+    const bool grow_f32 = g_split_secondary_gpu.f32_size < f32_bytes ||
+                          GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_RESIZE_IN_FLIGHT);
+    const bool grow_output = output_capacity < output_bytes ||
+                             GGML_SYCL_STAGING_FAILPOINT_FIRED(GGML_SYCL_STAGING_FAILPOINT_RESIZE_IN_FLIGHT);
 
     if ((grow_q8 && !allocate_replacement(q8_bytes, &q8_replacement, &q8_ptr)) ||
         (grow_f32 && !allocate_replacement(f32_bytes, &f32_replacement, &f32_ptr)) ||
@@ -55884,7 +56055,7 @@ static bool split_secondary_gpu_ensure(size_t                  q8_bytes,
     }
 
     try {
-        ggml_sycl_old_owner_retirement retirement(*q, 3);
+        ggml_sycl_old_owner_retirement retirement(q, 3);
         if (grow_q8) {
             retirement.hold(g_split_secondary_gpu.q8_handle);
         }
