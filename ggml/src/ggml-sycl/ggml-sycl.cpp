@@ -32569,6 +32569,38 @@ struct ggml_backend_sycl_buffer_type_context {
     ggml_backend_sycl_context * sycl_ctx              = nullptr;
 };
 
+// ggml-alloc sizes a context buffer as the sum of per-tensor allocations padded
+// to this value, but ggml_tallocr_new then burns aligned_offset(base, 0, this)
+// bytes at the head without the measure pass ever accounting for them.  So a
+// base that is not aligned to what get_alignment() promises makes the buffer
+// short by exactly that offset, and the shortfall surfaces much later as
+// "not enough space in the buffer" on whichever tensor happens to run off the
+// end.  Every SYCL buffer type that hands out a non-null base must therefore
+// request at least this alignment from the allocator.
+static constexpr size_t GGML_SYCL_BUFFER_BASE_ALIGNMENT = 128;
+
+// Publish a device buffer only if its base honours the alignment contract above.
+// Failing the allocation is recoverable — ggml-alloc reports it and the scheduler
+// places the tensors elsewhere — whereas publishing a misaligned base is not: it
+// under-reserves silently and aborts later somewhere unrelated.  Deleting the
+// context releases the allocation through its managed mem_handle owner.
+static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffer_type_t         buft,
+                                                              ggml_backend_sycl_buffer_context * ctx,
+                                                              size_t                             size,
+                                                              const char *                       origin) {
+    if (ctx->dev_ptr != nullptr && (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT) != 0) {
+        GGML_LOG_WARN(
+            "[SYCL] refusing %s buffer at misaligned base %p (requires %zu-byte alignment); "
+            "publishing it would under-reserve the buffer by %zu bytes\n",
+            origin, ctx->dev_ptr, GGML_SYCL_BUFFER_BASE_ALIGNMENT,
+            GGML_SYCL_BUFFER_BASE_ALIGNMENT -
+                (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT));
+        delete ctx;
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+}
+
 static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     return ctx->name.c_str();
@@ -32656,6 +32688,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.queue                               = buft_ctx->stream;
                 runtime_req.device                              = buft_ctx->device;
                 runtime_req.size                                = size;
+                runtime_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                 runtime_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                 runtime_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                 runtime_req.intent.cohort_id                    = "backend-buffer-runtime-zone";
@@ -32669,7 +32702,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     ctx->set_managed_owner(std::move(runtime_h));
                     GGML_SYCL_DEBUG("[SYCL] Arena RUNTIME zone alloc: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                     buft_ctx->name.c_str());
-                    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone");
                 }
 
                 // RUNTIME zone full — for compute buffers, try the shared KV
@@ -32683,6 +32716,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     kv_req.queue                               = buft_ctx->stream;
                     kv_req.device                              = buft_ctx->device;
                     kv_req.size                                = size;
+                    kv_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                     kv_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                     kv_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                     kv_req.intent.cohort_id                    = "backend-buffer-kv-zone";
@@ -32697,7 +32731,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                         GGML_LOG_INFO(
                             "[SYCL] Arena RUNTIME zone full, runtime buffer (%.1f MB) allocated from KV zone (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena KV zone");
                     }
                     // KV zone also full — try the SCRATCH zone as last-resort
                     // registered unified-cache ownership.  Do not borrow from
@@ -32707,6 +32741,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     scratch_req.queue                               = buft_ctx->stream;
                     scratch_req.device                              = buft_ctx->device;
                     scratch_req.size                                = size;
+                    scratch_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                     scratch_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                     scratch_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                     scratch_req.intent.cohort_id                    = "backend-buffer-scratch-zone";
@@ -32722,7 +32757,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                             "[SYCL] Arena RUNTIME+KV full, runtime buffer allocated from SCRATCH zone: %.1f "
                             "MB (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena SCRATCH zone");
                     }
                     GGML_LOG_WARN(
                         "[SYCL] RUNTIME+KV+scratch all full for runtime buffer %zu MB, unified_alloc fallback\n",
@@ -32769,6 +32804,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     req.queue                               = alloc_stream;
     req.device                              = buft_ctx->device;
     req.size                                = size;
+    req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     req.intent.role                         = alloc_role;
     req.intent.category                     = alloc_cat;
     req.intent.constraints.use_pinned_pool  = buft_ctx->use_pinned_pool;
@@ -32886,14 +32922,14 @@ alloc_succeeded:
         // Restore device context
         ggml_sycl_set_device(buft_ctx->device);
     }
-    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -34251,15 +34287,20 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     // first layer's arena pointer as alloc_base — no synthetic base needed.
     // This eliminates init_tensor remapping and ensures tensors (including
     // VIEWs) always have valid device USM addresses.
-    const size_t         alloc_align  = 128;
+    const size_t         alloc_align  = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     const size_t         alloc_padded = (size + alloc_align - 1) & ~(alloc_align - 1);
     std::vector<uint8_t> alloc_base_storage;
     void *               alloc_base          = nullptr;
     bool                 alloc_base_is_arena = false;
 
+    // The arena pointer is only usable as an allocator base if it already honours
+    // the alignment this buffer type advertises; ggml-alloc reserves no slack for
+    // a misaligned base.  When it does not, take the synthetic base below, which
+    // aligns explicitly.
     if (arena_kv_active && kv_buffer_covers_all_layers && planned_buffer_layers > 0 && n_host_layers == 0 &&
         n_device_layers == planned_buffer_layers && n_arena_layers == planned_buffer_layers && arena_single_owner &&
-        arena_owner_device == device && arena_contiguous && arena_first_ptr != nullptr) {
+        arena_owner_device == device && arena_contiguous && arena_first_ptr != nullptr &&
+        (reinterpret_cast<uintptr_t>(arena_first_ptr) % alloc_align) == 0) {
         // All layers are contiguous in arena KV zone — use first layer's ptr
         alloc_base          = arena_first_ptr;
         alloc_base_is_arena = true;
@@ -34364,7 +34405,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
 
 static size_t tiered_kv_buft_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return 128;  // Standard SYCL device alignment
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;  // Standard SYCL device alignment
 }
 
 static size_t tiered_kv_buft_get_max_size(ggml_backend_buffer_type_t buft) {
@@ -34818,7 +34859,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(gg
 }
 
 static size_t ggml_backend_sycl_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -35543,7 +35584,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_tp_buffer_type_alloc_buffer(ggml_
 }
 
 static size_t ggml_backend_sycl_tp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -37354,7 +37395,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
                 GGML_SYCL_DEBUG("SYCL TP: Device %d using shared compute buffer: %p\n", dev_id, shared_ptr);
             }
         }
-        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "TP shared compute");
     }
     // Non-TP mode: use regular allocation
     return ggml_backend_sycl_buffer_type_alloc_buffer(buft, size);
