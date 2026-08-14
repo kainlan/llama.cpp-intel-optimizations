@@ -2382,11 +2382,6 @@ class unified_cache {
     // or during prestage yield loops (outside graph_compute_impl).
     void process_deferred_frees_public();
 
-    // Take ownership of an alloc_handle whose deleter was refused by exact
-    // arena authority. The deferred queue retries the same allocation identity
-    // at subsequent safe synchronization points.
-    bool defer_owned_alloc_release(alloc_handle * handle);
-
     // Check if there are any pending deferred frees (device or host)
     bool has_pending_deferred_frees() const;
 
@@ -3209,9 +3204,6 @@ class unified_cache {
         vram_zone_id      zone         = vram_zone_id::COUNT;
         bool              has_event    = false;
         sycl::event       event;
-        // Non-null only for a shared-owner deleter refusal. The queue owns this
-        // raw handle until unified_free() succeeds; refusal leaves it in place.
-        alloc_handle *    retry_handle = nullptr;
     };
 
     struct deferred_host_free_entry {
@@ -4237,7 +4229,7 @@ enum class allocation_error : uint8_t {
     PHYSICAL_ALLOCATION_FAILED,
     METADATA_PUBLICATION_FAILED,
     LEGACY_OWNERSHIP_MISMATCH,
-    LEGACY_RELEASE_RETAINED,
+    RELEASE_RETAINED,
 };
 
 struct allocation_result {
@@ -4263,6 +4255,11 @@ allocation_owner_test_fixture allocation_owner_test_create(
     void * context,
     allocation_error injected_failure = allocation_error::NONE) noexcept;
 
+// Fail only the next N alloc_owner_control allocations. Unlike overriding the
+// process-wide operator new, this scoped seam is deterministic under TSAN and
+// cannot perturb the runtime, standard library, or unrelated test threads.
+void allocation_owner_test_fail_next_control_allocations(uint32_t count) noexcept;
+
 // Deterministic host-only seams for the coordinator admission and registry
 // ownership protocols. They perform no physical allocation or release.
 std::shared_ptr<allocation_release_coordinator> allocation_coordinator_test_lookup(int device);
@@ -4277,6 +4274,11 @@ allocation_result allocation_registry_test_promote(
     const alloc_metadata & metadata,
     const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept;
 bool allocation_registry_test_contains(void * ptr) noexcept;
+bool allocation_registry_test_cleanup_pending(void * ptr) noexcept;
+size_t allocation_registry_test_size() noexcept;
+bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept;
+bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadata) noexcept;
+size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
 void allocation_registry_test_pause_claim(bool pause) noexcept;
 bool allocation_registry_test_claim_reached() noexcept;
@@ -4314,9 +4316,6 @@ registered_release_status release_registered_allocation(const alloc_metadata & e
 // Explicit raw-deallocator facade. Only ptr and an optional device are checked;
 // metadata-bearing callers must use release_registered_allocation_exact().
 registered_release_status release_registered_pointer(void * ptr, int expected_device = -1);
-// Transfer a refused owning handle to its device cache's durable retry queue.
-// Returns false without taking ownership when no live cache can accept it.
-bool       unified_defer_free(alloc_handle * handle);
 bool       unified_lookup(void * ptr, alloc_metadata * out);
 bool       unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, sycl::queue ** queue_out = nullptr);
 alloc_tier unified_select_tier(const alloc_request & req);
@@ -5021,6 +5020,10 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
 // id/generation/zone/offset/extent atomically.
 bool unified_cache_zone_allocate(int device_id, vram_zone_id zone, size_t size, alloc_handle * out,
                                  size_t align = 256);
+// Intrusive counterpart for owner-first callers. The control and exact
+// registry identity exist before the zone pointer can escape.
+allocation_result unified_cache_zone_allocate_owner(int device_id, vram_zone_id zone, size_t size,
+                                                     size_t align = 256) noexcept;
 
 // Free a sub-allocation from a VRAM zone (TLSF reclaim). Returns false when
 // exact allocation authority still has an independently admitted lease.

@@ -723,6 +723,7 @@ static std::atomic<uint32_t> g_test_arena_drain_timeout_ms{ 5000 };
 static std::atomic<bool>     g_test_pause_zone_settle{ false };
 static std::atomic<bool>     g_test_zone_settle_reached{ false };
 static std::atomic<bool>     g_test_arena_destroy_closing_reached{ false };
+static std::atomic<uint32_t> g_test_fail_control_allocations{ 0 };
 #endif
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static bool fail_expert_phase(expert_fault_phase phase) noexcept;
@@ -737,10 +738,22 @@ static std::unordered_map<int, std::shared_ptr<allocation_release_coordinator>> 
 thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
 
 static registered_release_status release_registered_allocation_owned(
-    const alloc_metadata & exact_key, registered_release_mode mode, bool require_exact_key);
+    const alloc_metadata & exact_key, registered_release_mode mode, bool require_exact_key,
+    bool promotion_cleanup_on_refusal = false);
+static size_t process_pending_legacy_promotion_cleanup(int device) noexcept;
+static bool has_pending_legacy_promotion_cleanup(int device) noexcept;
 
 struct allocation_owner_internal_access {
     static alloc_owner_control * create(const std::shared_ptr<allocation_release_coordinator> & coordinator) noexcept {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        uint32_t remaining = g_test_fail_control_allocations.load(std::memory_order_acquire);
+        while (remaining != 0) {
+            if (g_test_fail_control_allocations.compare_exchange_weak(
+                    remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return nullptr;
+            }
+        }
+#endif
         alloc_owner_control * control = new (std::nothrow) alloc_owner_control(coordinator);
         if (control && !control->coordinator_) {
             delete control;
@@ -891,7 +904,9 @@ void allocation_release_coordinator::abandon_control(alloc_owner_control * contr
 }
 
 size_t allocation_release_coordinator::process_retries() noexcept {
-    size_t released = 0;
+    // Legacy promotion failures have no control node to enqueue. Drain their
+    // registry-row embedded retry state at the same synchronization point.
+    size_t released = process_pending_legacy_promotion_cleanup(device_);
     for (;;) {
         alloc_owner_control * control = nullptr;
         {
@@ -1033,6 +1048,9 @@ struct runtime_alloc_record {
     bool                       uses_pinned_pool = false;
     bool                       zone_managed     = false;
     bool                       from_arena       = false;  // True if sub-allocated from arena (KV/RUNTIME/etc zone)
+    // Durable, allocation-free retry state for a consumed legacy promotion
+    // token. The exact row itself is the owner until a safe-point retry erases it.
+    bool                       promotion_cleanup_pending = false;
     vram_zone_id               vram_zone        = vram_zone_id::COUNT;  // Non-COUNT: zone_free on unified_free
     std::string                cohort_id;
     // Monotonic identity of the current LIVE -> RELEASING claim. Rollback and
@@ -1040,6 +1058,7 @@ struct runtime_alloc_record {
     uint64_t                   release_generation = 0;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     bool                       test_no_physical_release = false;
+    size_t                     test_exact_leases = 0;
 #endif
 };
 
@@ -3390,17 +3409,11 @@ bool unified_cache::shutdown_resources() {
     // on one queue never prevents the remaining queues from being drained.
     if (!drain_all_queues_noexcept()) return false;
 
-    // Retry owning alloc_handle releases before dismantling any cache state.
-    // An independently admitted exact token may still refuse the free; in that
-    // case the durable queue remains the owner and teardown is retryable.
+    // Retry registry-row embedded legacy promotion cleanup before dismantling
+    // cache state. An independent exact lease keeps the row pending and makes
+    // teardown retryable without retaining a caller-owned pointer.
     process_deferred_frees_public();
-    {
-        std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
-        if (std::any_of(deferred_frees_.begin(), deferred_frees_.end(),
-                        [](const deferred_free_entry & entry) { return entry.retry_handle != nullptr; })) {
-            return false;
-        }
-    }
+    if (has_pending_legacy_promotion_cleanup(get_device_id_from_queue(queue_))) return false;
     {
         std::lock_guard<std::mutex> lock(onednn_scratch_mutex_);
         if (onednn_scratch_refcount_ != 0) {
@@ -3656,15 +3669,7 @@ bool unified_cache::shutdown_resources() {
             } catch (...) {
             }
         }
-        if (entry.retry_handle) {
-            if (!unified_free(*entry.retry_handle)) {
-                // Exact authority still owns a lease. Preserve both the raw
-                // owner and runtime registry row for a later shutdown retry.
-                return false;
-            }
-            delete entry.retry_handle;
-            entry.retry_handle = nullptr;
-        } else if (entry.ptr) {
+        if (entry.ptr) {
             if (entry.zone_managed && entry.zone != vram_zone_id::COUNT) {
                 zone_free(entry.zone, entry.ptr);
             } else if (entry.managed) {
@@ -4543,10 +4548,15 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = nullptr;
     mem_handle direct_alloc_owner;
-    alloc_handle exact_owner{};
-    if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
-        ptr                = exact_owner.ptr;
-        direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
+    allocation_result exact_allocation =
+        unified_cache_zone_allocate_owner(cache_device, vram_zone_id::WEIGHT, dst_size);
+    if (exact_allocation) {
+        mem_handle candidate = mem_handle::from_owned_alloc(std::move(exact_allocation.owner), layout);
+        const auto resolved = candidate.resolve(cache_device);
+        if (resolved.ptr && resolved.on_device) {
+            direct_alloc_owner = std::move(candidate);
+            ptr                = resolved.ptr;
+        }
     }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
@@ -4557,10 +4567,14 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         req.intent.category                = runtime_category::EXPERT_CACHE;
         req.intent.cohort_id               = "direct_stage_weight";
         req.intent.constraints.must_device = true;
-        alloc_handle owner{};
-        if (unified_alloc(req, &owner) && owner.ptr) {
-            ptr                = owner.ptr;
-            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
+        allocation_result allocation = unified_allocate_owner(req);
+        if (allocation) {
+            mem_handle candidate = mem_handle::from_owned_alloc(std::move(allocation.owner), layout);
+            const auto resolved = candidate.resolve(cache_device);
+            if (resolved.ptr && resolved.on_device) {
+                direct_alloc_owner = std::move(candidate);
+                ptr                = resolved.ptr;
+            }
         }
     }
     if (!ptr) {
@@ -4862,10 +4876,17 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
     // placement-plan mode only.
     void *     ptr = nullptr;
     mem_handle direct_alloc_owner;
-    alloc_handle exact_owner{};
-    if (unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, dst_size, &exact_owner)) {
-        ptr                = exact_owner.ptr;
-        direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
+    bool owner_control_failed = false;
+    allocation_result exact_allocation =
+        unified_cache_zone_allocate_owner(cache_device, vram_zone_id::WEIGHT, dst_size);
+    owner_control_failed = exact_allocation.error == allocation_error::CONTROL_ALLOCATION_FAILED;
+    if (exact_allocation) {
+        mem_handle candidate = mem_handle::from_owned_alloc(std::move(exact_allocation.owner), layout);
+        const auto resolved = candidate.resolve(cache_device);
+        if (resolved.ptr && resolved.on_device) {
+            direct_alloc_owner = std::move(candidate);
+            ptr                = resolved.ptr;
+        }
     }
     if (!ptr && !!coherent_cache_placement_plan_owner(this)->entries.empty()) {
         alloc_request req{};
@@ -4876,13 +4897,23 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         req.intent.category                = runtime_category::EXPERT_CACHE;
         req.intent.cohort_id               = "direct_stage_expert";
         req.intent.constraints.must_device = true;
-        alloc_handle owner{};
-        if (unified_alloc(req, &owner) && owner.ptr) {
-            ptr                = owner.ptr;
-            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
+        allocation_result allocation = unified_allocate_owner(req);
+        owner_control_failed = owner_control_failed ||
+                               allocation.error == allocation_error::CONTROL_ALLOCATION_FAILED;
+        if (allocation) {
+            mem_handle candidate = mem_handle::from_owned_alloc(std::move(allocation.owner), layout);
+            const auto resolved = candidate.resolve(cache_device);
+            if (resolved.ptr && resolved.on_device) {
+                direct_alloc_owner = std::move(candidate);
+                ptr                = resolved.ptr;
+            }
         }
     }
     if (!ptr) {
+        // A control failure is not ordinary capacity pressure. Continuing into
+        // raw mmap publication would expose a pointer after ownership setup
+        // failed, defeating the owner-first contract.
+        if (owner_control_failed) return result;
         if (!coherent_cache_placement_plan_owner(this)->entries.empty()) {
             static std::atomic<int> planned_stage_fail_log{ 0 };
             if (planned_stage_fail_log.fetch_add(1, std::memory_order_relaxed) < 10) {
@@ -4943,16 +4974,22 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
             host_req.intent.cohort_id                           = "direct_stage_expert_host";
             host_req.intent.constraints.must_host_pinned        = true;
             host_req.intent.constraints.use_pinned_pool         = true;
-            alloc_handle host_owner{};
-            if (unified_alloc(host_req, &host_owner) && host_owner.ptr) {
-                host_ptr         = host_owner.ptr;
-                host_allocated   = true;
-                host_alloc_owner = detail::from_legacy_owned_alloc(std::move(host_owner), GGML_LAYOUT_AOS);
-                mem_handle src_handle =
-                    make_copy_handle_for_raw_ptr(const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
-                mem_copy(host_alloc_owner, src_handle, src_size, *queue, {});
-                loc = cache_location::HOST_PINNED;
-            } else {
+            allocation_result host_allocation = unified_allocate_owner(host_req);
+            if (host_allocation) {
+                mem_handle candidate =
+                    mem_handle::from_owned_alloc(std::move(host_allocation.owner), GGML_LAYOUT_AOS);
+                const auto resolved = candidate.resolve();
+                if (resolved.ptr && !resolved.on_device) {
+                    host_alloc_owner = std::move(candidate);
+                    host_ptr         = resolved.ptr;
+                    host_allocated   = true;
+                    mem_handle src_handle = make_copy_handle_for_raw_ptr(
+                        const_cast<void *>(src_ptr), GGML_LAYOUT_AOS, cache_device, src_size);
+                    mem_copy(host_alloc_owner, src_handle, src_size, *queue, {});
+                    loc = cache_location::HOST_PINNED;
+                }
+            }
+            if (!host_ptr) {
                 host_ptr = const_cast<void *>(src_ptr);
                 loc      = cache_location::HOST_MMAP;
                 GGML_LOG_WARN("[DIRECT-STAGE] host arena exhausted, raw mmap fallback\n");
@@ -5310,15 +5347,17 @@ direct_stage_result unified_cache::direct_stage_expert_tensor(const std::vector<
     }
 
     void * ptr = nullptr;
-    alloc_handle exact_owner{};
-    if (!unified_cache_zone_allocate(cache_device, vram_zone_id::WEIGHT, total_dst_size, &exact_owner)) {
+    allocation_result exact_allocation =
+        unified_cache_zone_allocate_owner(cache_device, vram_zone_id::WEIGHT, total_dst_size);
+    if (!exact_allocation) {
         GGML_LOG_ERROR("[DIRECT-STAGE] tensor-bulk exact expert zone allocation failed for %zu bytes (%zu experts)\n",
                        total_dst_size, expert_count);
         return result;
     }
-    ptr = exact_owner.ptr;
-    mem_handle bulk_owner = detail::from_legacy_owned_alloc(std::move(exact_owner), layout);
-    if (!bulk_owner.valid()) return result;
+    mem_handle bulk_owner = mem_handle::from_owned_alloc(std::move(exact_allocation.owner), layout);
+    const auto bulk_resolved = bulk_owner.resolve(cache_device);
+    if (!bulk_resolved.ptr || !bulk_resolved.on_device) return result;
+    ptr = bulk_resolved.ptr;
 
     auto release_unpublished_ptr = [&]() {
         if (!ptr) return;
@@ -6860,12 +6899,18 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
     if (!device_ptr && arena_active()) {
         // Allocation-time exact arena owner: stage_expert_group copies and the
         // published entry retain this same capability through terminal use.
-        alloc_handle owner{};
-        if (unified_cache_zone_allocate(get_device_id_from_queue(queue_), vram_zone_id::WEIGHT, size, &owner)) {
-            device_ptr        = owner.ptr;
-            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
-            is_pool_alloc     = true; // arena bytes are accounted by the zone
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: exact arena weight alloc %zu bytes\n", size);
+        const int device = get_device_id_from_queue(queue_);
+        allocation_result allocation =
+            unified_cache_zone_allocate_owner(device, vram_zone_id::WEIGHT, size);
+        if (allocation) {
+            mem_handle candidate = mem_handle::from_owned_alloc(std::move(allocation.owner), layout);
+            const auto resolved = candidate.resolve(device);
+            if (resolved.ptr && resolved.on_device) {
+                direct_alloc_owner = std::move(candidate);
+                device_ptr         = resolved.ptr;
+                is_pool_alloc      = true; // arena bytes are accounted by the zone
+                GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: exact arena weight alloc %zu bytes\n", size);
+            }
         }
     }
 
@@ -6898,27 +6943,21 @@ void * unified_cache::allocate_slot(const ggml_sycl_cache_id & key,
             }
         }
 
-        try {
-            device_ptr = unified_cache_malloc_device_tracked(size, queue_, "unified_cache:slot");
-        } catch (const sycl::exception & e) {
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] allocate_slot: malloc_device failed: %s\n", e.what());
-            return nullptr;
-        }
-        if (device_ptr) {
-            alloc_handle owner = unified_cache_adopt_raw_device_allocation(
-                device_ptr, size, queue_, alloc_role::WEIGHT, runtime_category::EXPERT_CACHE, "unified_cache:slot");
-            if (!owner.ptr) {
-                GGML_LOG_ERROR(
-                    "[UNIFIED-CACHE] allocate_slot failed to adopt direct device allocation ptr=%p size=%zu\n",
-                    device_ptr, size);
-                GGML_ASSERT(false && "allocate_slot direct allocation adoption failed");
-                return nullptr;
-            }
-            direct_alloc_owner = detail::from_legacy_owned_alloc(std::move(owner), layout);
-        }
-        if (!device_ptr) {
-            return nullptr;
-        }
+        alloc_request req{};
+        req.queue                          = &queue_;
+        req.device                         = get_device_id_from_queue(queue_);
+        req.size                           = size;
+        req.intent.role                    = alloc_role::WEIGHT;
+        req.intent.category                = runtime_category::EXPERT_CACHE;
+        req.intent.cohort_id               = "unified_cache:slot";
+        req.intent.constraints.must_device = true;
+        allocation_result allocation = unified_allocate_owner(req);
+        if (!allocation) return nullptr;
+        mem_handle candidate = mem_handle::from_owned_alloc(std::move(allocation.owner), layout);
+        const auto resolved = candidate.resolve(req.device);
+        if (!resolved.ptr || !resolved.on_device) return nullptr;
+        direct_alloc_owner = std::move(candidate);
+        device_ptr         = resolved.ptr;
     }
 
     if (!device_ptr) {
@@ -9274,30 +9313,6 @@ void unified_cache::process_deferred_frees_public() {
     process_deferred_frees_locked();
 }
 
-bool unified_cache::defer_owned_alloc_release(alloc_handle * handle) {
-    if (!handle || !handle->ptr) {
-        return false;
-    }
-    deferred_free_entry entry{};
-    entry.ptr          = handle->ptr;
-    entry.size         = handle->size;
-    entry.retry_handle = handle;
-    {
-        std::lock_guard<std::mutex> lock(deferred_frees_mutex_);
-        const auto duplicate = std::find_if(deferred_frees_.begin(), deferred_frees_.end(), [&](const auto & pending) {
-            return pending.retry_handle && pending.retry_handle->ptr == handle->ptr &&
-                   pending.retry_handle->alloc_id == handle->alloc_id;
-        });
-        if (duplicate != deferred_frees_.end()) {
-            return false;
-        }
-        deferred_frees_.push_back(entry);
-    }
-    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred refused owner: ptr=%p size=%zu alloc_id=%llu\n", handle->ptr,
-                    handle->size, static_cast<unsigned long long>(handle->alloc_id));
-    return true;
-}
-
 void unified_cache::process_deferred_frees_locked() {
     // P7: finalize any completed async D2H evictions first.
     // This reclaims VRAM from entries whose D2H copies have completed.
@@ -9306,6 +9321,7 @@ void unified_cache::process_deferred_frees_locked() {
         finalize_evictions_locked();
     }
     (void) finalize_retired_entries_locked();
+    (void) process_pending_legacy_promotion_cleanup(get_device_id_from_queue(queue_));
 
     // Enqueue paths do not necessarily hold rw_mutex_, so serialize all vector
     // iteration/erasure separately. No queue wait is performed while pending.
@@ -9319,17 +9335,7 @@ void unified_cache::process_deferred_frees_locked() {
             continue;
         }
 
-        if (it->retry_handle) {
-            if (!unified_free(*it->retry_handle)) {
-                GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred owner still leased: ptr=%p size=%zu alloc_id=%llu\n",
-                                it->ptr, it->size,
-                                static_cast<unsigned long long>(it->retry_handle->alloc_id));
-                ++it;
-                continue;
-            }
-            delete it->retry_handle;
-            it->retry_handle = nullptr;
-        } else if (it->ptr) {
+        if (it->ptr) {
             const bool is_arena = vram_owns(it->ptr);
             const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(it->ptr);
             if (it->zone_managed) {
@@ -12309,6 +12315,10 @@ static size_t offload_buffer_pool_trim_host_zone(host_zone_id zone) {
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
+void allocation_owner_test_fail_next_control_allocations(uint32_t count) noexcept {
+    g_test_fail_control_allocations.store(count, std::memory_order_release);
+}
+
 allocation_owner_test_fixture allocation_owner_test_create(
     const alloc_metadata & metadata,
     allocation_release_test_backend backend,
@@ -12390,19 +12400,17 @@ static allocation_result promote_legacy_alloc_owner_with_coordinator(
 
     alloc_owner_control * control = nullptr;
     auto cleanup_legacy = [&](allocation_error primary) noexcept {
-        const registered_release_status released = release_registered_allocation_exact(
-            exact, registered_release_mode::LEGACY);
+        const registered_release_status released = release_registered_allocation_owned(
+            exact, registered_release_mode::LEGACY, true, true);
         if (released == registered_release_status::OWNERSHIP_MISMATCH) {
             result.error = allocation_error::LEGACY_OWNERSHIP_MISMATCH;
             return;
         }
         if (released == registered_release_status::LEASE_REFUSED) {
-            // The row was restored to LIVE by exact release. Transfer the
-            // consumed token to the cache retry coordinator when available;
-            // otherwise the exact LEGACY registry row durably retains it.
-            alloc_handle retry = std::move(handle);
-            (void) unified_defer_free(&retry);
-            result.error = allocation_error::LEGACY_RELEASE_RETAINED;
+            // Refusal atomically restored LIVE and embedded retry state in the
+            // exact registry row. The consumed alloc_handle is metadata only;
+            // its stack lifetime no longer participates in cleanup ownership.
+            result.error = allocation_error::RELEASE_RETAINED;
             return;
         }
         result.error = primary;
@@ -12741,7 +12749,8 @@ bool unified_lookup_runtime_allocation(const void * ptr, alloc_metadata * out, s
 }
 
 static registered_release_status release_registered_allocation_owned(
-    const alloc_metadata & requested, registered_release_mode mode, bool require_exact_key) {
+    const alloc_metadata & requested, registered_release_mode mode, bool require_exact_key,
+    bool promotion_cleanup_on_refusal) {
     if (!requested.ptr) return registered_release_status::NOT_FOUND;
 
     runtime_alloc_record detached;
@@ -12768,10 +12777,13 @@ static registered_release_status release_registered_allocation_owned(
         detached.from_arena = it->second.from_arena;
         detached.vram_zone = it->second.vram_zone;
         detached.cohort_id = it->second.cohort_id;
+        detached.promotion_cleanup_pending = it->second.promotion_cleanup_pending || promotion_cleanup_on_refusal;
         detached.release_generation = ++it->second.release_generation;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
         detached.test_no_physical_release = it->second.test_no_physical_release;
+        detached.test_exact_leases = it->second.test_exact_leases;
 #endif
+        it->second.promotion_cleanup_pending = false;
         it->second.state = runtime_alloc_state::RELEASING;
         // Release-only adjuncts have a single claimant and are never copied to
         // lookup output or another concurrent releaser.
@@ -12779,7 +12791,8 @@ static registered_release_status release_registered_allocation_owned(
     }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-    const bool physically_released = detached.test_no_physical_release || unified_free_record(detached);
+    const bool physically_released = detached.test_no_physical_release ? detached.test_exact_leases == 0 :
+                                                                         unified_free_record(detached);
 #else
     const bool physically_released = unified_free_record(detached);
 #endif
@@ -12790,6 +12803,7 @@ static registered_release_status release_registered_allocation_owned(
             it->second.release_generation == detached.release_generation &&
             it->second.state == runtime_alloc_state::RELEASING) {
             it->second.owned_segments = std::move(detached.owned_segments);
+            it->second.promotion_cleanup_pending = detached.promotion_cleanup_pending;
             it->second.state = runtime_alloc_state::LIVE;
         }
         return registered_release_status::LEASE_REFUSED;
@@ -12803,6 +12817,54 @@ static registered_release_status release_registered_allocation_owned(
         g_runtime_alloc_registry.erase(it);
     }
     return registered_release_status::RELEASED;
+}
+
+static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
+    size_t released = 0;
+    try {
+        for (;;) {
+            alloc_metadata exact{};
+            {
+                std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+                const auto it = std::find_if(g_runtime_alloc_registry.begin(), g_runtime_alloc_registry.end(),
+                                             [device](const auto & item) {
+                    const runtime_alloc_record & row = item.second;
+                    return row.state == runtime_alloc_state::LIVE &&
+                           row.ownership == runtime_alloc_ownership::LEGACY &&
+                           row.promotion_cleanup_pending && (device < 0 || row.handle.device == device);
+                });
+                if (it == g_runtime_alloc_registry.end()) break;
+                exact = it->second.handle;
+            }
+            const registered_release_status status = release_registered_allocation_owned(
+                exact, registered_release_mode::LEGACY, true, true);
+            if (status == registered_release_status::RELEASED) {
+                ++released;
+                continue;
+            }
+            // Refusal restores the same row's pending bit atomically. BUSY is
+            // likewise retried at a later safe point rather than spinning.
+            if (status == registered_release_status::LEASE_REFUSED || status == registered_release_status::BUSY) {
+                break;
+            }
+            break;
+        }
+    } catch (...) {
+    }
+    return released;
+}
+
+static bool has_pending_legacy_promotion_cleanup(int device) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+        return std::any_of(g_runtime_alloc_registry.begin(), g_runtime_alloc_registry.end(),
+                           [device](const auto & item) {
+            const runtime_alloc_record & row = item.second;
+            return row.promotion_cleanup_pending && (device < 0 || row.handle.device == device);
+        });
+    } catch (...) {
+        return true;
+    }
 }
 
 registered_release_status release_registered_allocation_exact(
@@ -12847,6 +12909,39 @@ allocation_result allocation_registry_test_promote(
 bool allocation_registry_test_contains(void * ptr) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
     return g_runtime_alloc_registry.find(ptr) != g_runtime_alloc_registry.end();
+}
+
+bool allocation_registry_test_cleanup_pending(void * ptr) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto it = g_runtime_alloc_registry.find(ptr);
+    return it != g_runtime_alloc_registry.end() && it->second.promotion_cleanup_pending;
+}
+
+size_t allocation_registry_test_size() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_alloc_registry.size();
+}
+
+bool allocation_registry_test_acquire_exact_lease(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || it->second.state != runtime_alloc_state::LIVE ||
+        !(it->second.handle.key() == metadata.key())) return false;
+    ++it->second.test_exact_leases;
+    return true;
+}
+
+bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadata) noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    const auto it = g_runtime_alloc_registry.find(metadata.ptr);
+    if (it == g_runtime_alloc_registry.end() || !(it->second.handle.key() == metadata.key()) ||
+        it->second.test_exact_leases == 0) return false;
+    --it->second.test_exact_leases;
+    return true;
+}
+
+size_t allocation_registry_test_process_promotion_retries(int device) noexcept {
+    return process_pending_legacy_promotion_cleanup(device);
 }
 
 registered_release_status allocation_registry_test_claim(
@@ -12899,14 +12994,6 @@ void allocation_registry_test_erase(void * ptr) noexcept {
 bool unified_free_ptr(void * ptr, int expected_device) {
     if (!ptr) return true;
     return release_registered_pointer(ptr, expected_device) == registered_release_status::RELEASED;
-}
-
-bool unified_defer_free(alloc_handle * handle) {
-    if (!handle || !handle->ptr) {
-        return false;
-    }
-    unified_cache * cache = get_existing_cache_for_device(handle->device);
-    return cache && cache->defer_owned_alloc_release(handle);
 }
 
 bool unified_free(const alloc_handle & handle) {
@@ -17758,6 +17845,29 @@ void * unified_cache_zone_alloc(int device_id, vram_zone_id zone, size_t size, s
         return nullptr;
     }
     return cache->zone_alloc(zone, size, align);
+}
+
+allocation_result unified_cache_zone_allocate_owner(
+    int device_id, vram_zone_id zone, size_t size, size_t align) noexcept {
+    alloc_request req{};
+    req.device                              = device_id;
+    req.size                                = size;
+    req.alignment                           = align;
+    req.intent.role                         = zone == vram_zone_id::KV ? alloc_role::KV : alloc_role::WEIGHT;
+    req.intent.category                     = zone == vram_zone_id::WEIGHT ? runtime_category::EXPERT_CACHE :
+                                                                            runtime_category::OTHER;
+    req.intent.cohort_id                    = "exact_zone_allocate_owner";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = zone;
+
+    allocation_result result = unified_allocate_owner(req);
+    if (!result) return result;
+    const alloc_metadata exact = result.owner.metadata();
+    if (!exact.zone_managed || exact.zone != zone || exact.generation == 0 || exact.extent != size) {
+        result.owner = {};
+        result.error = allocation_error::METADATA_PUBLICATION_FAILED;
+    }
+    return result;
 }
 
 bool unified_cache_zone_allocate(int device_id, vram_zone_id zone, size_t size, alloc_handle * out, size_t align) {

@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
-#include <new>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -14,8 +13,6 @@
 using namespace ggml_sycl;
 
 namespace {
-std::atomic<bool> fail_allocations{false};
-
 struct fake_release_backend {
     std::atomic<int> attempts{0};
     std::atomic<int> releases{0};
@@ -150,7 +147,6 @@ void refusal_is_allocation_free_and_retries_without_duplicates() {
     backend.refusals_remaining = 3;
     auto fixture = make_owner(backend, 3);
 
-    fail_allocations.store(true, std::memory_order_release);
     const release_attempt first = fixture.result.owner.reset();
     check(first.retry_scheduled(), "refused final release was not scheduled");
     check(fixture.coordinator->retry_count() == 1, "refused control was not queued exactly once");
@@ -158,7 +154,6 @@ void refusal_is_allocation_free_and_retries_without_duplicates() {
     check(fixture.coordinator->retry_count() == 1, "first refusal duplicated or lost embedded node");
     check(fixture.coordinator->process_retries() == 0, "second refused retry reported a release");
     check(fixture.coordinator->retry_count() == 1, "second refusal duplicated or cycled embedded node");
-    fail_allocations.store(false, std::memory_order_release);
 
     check(fixture.coordinator->process_retries() == 1, "successful retry did not release one control");
     check(fixture.coordinator->retry_count() == 0 && fixture.coordinator->live_controls() == 0,
@@ -338,9 +333,8 @@ void legacy_promotion_failures_clean_exact_row() {
     const alloc_metadata control_exact = metadata(85);
     check(allocation_registry_test_publish(control_exact, false), "control-failure row publication failed");
     auto open = std::make_shared<allocation_release_coordinator>(control_exact.device, release_fake, &backend);
-    fail_allocations.store(true, std::memory_order_release);
+    allocation_owner_test_fail_next_control_allocations(1);
     allocation_result control = allocation_registry_test_promote(control_exact, open);
-    fail_allocations.store(false, std::memory_order_release);
     check(control.error == allocation_error::CONTROL_ALLOCATION_FAILED,
           "control allocation failure returned wrong typed error");
     check(!allocation_registry_test_contains(control_exact.ptr),
@@ -348,6 +342,37 @@ void legacy_promotion_failures_clean_exact_row() {
     check(open->live_controls() == 0, "control allocation failure changed coordinator census");
     std::cout << "PASS legacy-promotion-admission-failure-cleans-row\n"
                  "PASS legacy-promotion-control-failure-cleans-row\n";
+}
+
+void refused_legacy_promotion_uses_registry_retry_state() {
+    fake_release_backend backend;
+    const size_t baseline_rows = allocation_registry_test_size();
+    const alloc_metadata exact = metadata(86);
+    check(allocation_registry_test_publish(exact, false), "retained-release row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(exact), "independent exact lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
+
+    // allocation_registry_test_promote creates and consumes its alloc_handle on
+    // its own stack. Returning from it is the UAF boundary under ASAN.
+    allocation_owner_test_fail_next_control_allocations(1);
+    const allocation_result refused = allocation_registry_test_promote(exact, coordinator);
+    check(refused.error == allocation_error::RELEASE_RETAINED,
+          "control-allocation failure plus lease refusal returned wrong typed state");
+    check(allocation_registry_test_contains(exact.ptr) && allocation_registry_test_cleanup_pending(exact.ptr),
+          "lease refusal did not restore LIVE registry-row retry state");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 0,
+          "retry released allocation while independent exact lease remained");
+    check(allocation_registry_test_contains(exact.ptr) && allocation_registry_test_cleanup_pending(exact.ptr),
+          "refused retry lost durable registry-row state");
+
+    check(allocation_registry_test_release_exact_lease(exact), "independent exact lease release failed");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 1,
+          "post-lease retry did not release exact row");
+    check(!allocation_registry_test_contains(exact.ptr) && allocation_registry_test_size() == baseline_rows,
+          "post-retry registry usage did not return to zero/baseline");
+    check(coordinator->live_controls() == 0, "failed promotion changed coordinator census");
+    std::cout << "PASS legacy-promotion-refusal-registry-row-retry\n"
+                 "PASS legacy-promotion-refusal-stack-dies-cleanly\n";
 }
 
 void invalid_request_has_zero_coordinator_census() {
@@ -390,17 +415,6 @@ void failure_accounting_and_metadata_nonownership() {
 }
 } // namespace
 
-void * operator new(std::size_t size) {
-    if (fail_allocations.load(std::memory_order_acquire)) throw std::bad_alloc();
-    if (void * ptr = std::malloc(size)) return ptr;
-    throw std::bad_alloc();
-}
-void * operator new[](std::size_t size) { return ::operator new(size); }
-void operator delete(void * ptr) noexcept { std::free(ptr); }
-void operator delete[](void * ptr) noexcept { std::free(ptr); }
-void operator delete(void * ptr, std::size_t) noexcept { std::free(ptr); }
-void operator delete[](void * ptr, std::size_t) noexcept { std::free(ptr); }
-
 static_assert(std::is_copy_constructible_v<alloc_metadata>);
 static_assert(std::is_trivially_destructible_v<alloc_metadata>);
 static_assert(!std::is_constructible_v<alloc_owner, alloc_metadata>);
@@ -421,6 +435,7 @@ int main() {
     concurrent_registry_claim_reports_busy();
     concurrent_legacy_promotion_has_one_owner();
     legacy_promotion_failures_clean_exact_row();
+    refused_legacy_promotion_uses_registry_retry_state();
     invalid_request_has_zero_coordinator_census();
     std::cout << "intrusive allocation owner deterministic runtime tests: PASS\n";
     return 0;
