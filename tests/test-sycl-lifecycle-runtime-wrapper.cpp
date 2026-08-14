@@ -748,16 +748,19 @@ int main() {
         std::fprintf(stderr, "failed to seed global runtime/pinned owner fixture\n");
         return 1;
     }
-    size_t measured_cache_drop = 0;
-#if defined(GGML_SYCL_PRIVATE_CARRIER)
+    size_t free_with_cache = 0;
+    size_t total_with_cache = 0;
+#if defined(GGML_SYCL_RUNTIME_MODULE)
     auto allocate_predictor_scores = reinterpret_cast<decltype(&ggml_backend_sycl_test_allocate_predictor_scores)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_test_allocate_predictor_scores"));
-    if (!allocate_predictor_scores || !allocate_predictor_scores()) {
+    const bool predictor_allocated = allocate_predictor_scores && allocate_predictor_scores();
+#else
+    const bool predictor_allocated = ggml_backend_sycl_test_allocate_predictor_scores();
+#endif
+    if (!predictor_allocated) {
         std::fprintf(stderr, "failed to create real predictor unified allocation\n");
         return 1;
     }
-    size_t free_with_cache = 0;
-    size_t total_with_cache = 0;
     initial_get_device_memory(0, &free_with_cache, &total_with_cache);
     constexpr size_t minimum_measured_drop = 1ull * 1024ull * 1024ull * 1024ull;
     if (total_with_cache != total_before_cache || free_before_cache < free_with_cache + minimum_measured_drop) {
@@ -765,8 +768,7 @@ int main() {
                      free_before_cache, free_with_cache);
         return 1;
     }
-    measured_cache_drop = free_before_cache - free_with_cache;
-#endif
+    const size_t measured_cache_drop = free_before_cache - free_with_cache;
     auto saved_model_load_begin = reinterpret_cast<decltype(&ggml_backend_sycl_model_load_begin)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_model_load_begin"));
     auto saved_host_compute = reinterpret_cast<decltype(&ggml_backend_sycl_host_compute_buffer_type)>(

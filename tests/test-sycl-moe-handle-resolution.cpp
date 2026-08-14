@@ -355,9 +355,9 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     ggml_sycl::mem_handle retained     = expert;
     owner                              = {};
     expert                             = {};
-    ggml_sycl::alloc_handle lookup{};
-    TEST_ASSERT(ggml_sycl::unified_lookup(base, &lookup) && lookup.alloc_id == alloc_id,
-                "retained expert lease must delay allocation free");
+    ggml_sycl::alloc_metadata lookup{};
+    TEST_ASSERT(ggml_sycl::unified_lookup(base, &lookup) && lookup.id == alloc_id && lookup.ptr == base,
+                "retained expert lease must preserve exact allocation metadata");
     // The admitted operand and normalized route deliberately copied the lease.
     // Release those fixture-owned copies before asserting final reclamation.
     admitted.batch.operands[0].lease = {};
