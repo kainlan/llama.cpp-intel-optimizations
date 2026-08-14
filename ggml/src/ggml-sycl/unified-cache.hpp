@@ -4073,6 +4073,12 @@ class alloc_owner_control final {
 using allocation_release_test_backend = release_attempt (*)(const alloc_metadata &, void *) noexcept;
 #endif
 
+struct allocation_control_snapshot {
+    alloc_metadata metadata{};
+    uint32_t       refs  = 0;
+    bool           retry = false;
+};
+
 class allocation_release_coordinator : public std::enable_shared_from_this<allocation_release_coordinator> {
   public:
     explicit allocation_release_coordinator(int device) noexcept : device_(device) {}
@@ -4086,6 +4092,9 @@ class allocation_release_coordinator : public std::enable_shared_from_this<alloc
     size_t retry_count() const noexcept { return retry_count_.load(std::memory_order_acquire); }
     bool can_detach() const noexcept;
     size_t process_retries() noexcept;
+    // Internal lifecycle diagnostics. The snapshot is observational: it never
+    // changes ownership or waives a live control.
+    std::vector<allocation_control_snapshot> snapshot_controls() const;
     // Internal lifecycle gate used by detach/shutdown and private fixtures.
     void close() noexcept;
 
@@ -4094,13 +4103,15 @@ class allocation_release_coordinator : public std::enable_shared_from_this<alloc
     friend struct allocation_owner_internal_access;
     release_attempt retire(alloc_owner_control * control) noexcept;
     release_attempt release_physical(alloc_owner_control * control) noexcept;
-    bool try_register_control() noexcept;
+    bool try_register_control(alloc_owner_control * control) noexcept;
+    void unregister_control(alloc_owner_control * control) noexcept;
     void abandon_control(alloc_owner_control * control) noexcept;
 
     enum class admission_state : uint8_t { OPEN = 0, CLOSING };
     int device_ = -1;
     mutable std::mutex admission_mutex_;
     admission_state admission_state_ = admission_state::OPEN;
+    std::vector<alloc_owner_control *> controls_;
     mutable std::mutex retry_mutex_;
     alloc_owner_control * retry_head_ = nullptr;
     std::atomic<size_t> live_controls_{ 0 };
@@ -5195,6 +5206,7 @@ bool shutdown_unified_cache();
 bool unified_cache_shutdown_state_clean() noexcept;
 bool unified_cache_shutdown_owner_census_for_test(uint64_t out[4]) noexcept;
 bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexcept;
+bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) noexcept;
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void unified_cache_test_fail_next_arena_free();
 void unified_cache_test_fail_next_shutdown_clean();

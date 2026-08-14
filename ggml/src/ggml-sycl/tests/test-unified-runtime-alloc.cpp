@@ -693,6 +693,11 @@ static bool explicit_global_cache_shutdown_is_clean() {
     TEST_BEGIN("explicit_global_cache_shutdown_is_clean");
     TEST_ASSERT(shutdown_unified_cache(), "explicit global cache shutdown failed");
     TEST_ASSERT(unified_cache_shutdown_state_clean(), "global cache retained owners after explicit shutdown");
+    uint64_t controls[3]{};
+    TEST_ASSERT(unified_cache_shutdown_allocation_control_census_for_test(controls),
+                "allocation-control census failed after explicit shutdown");
+    TEST_ASSERT(controls[0] == 0 && controls[1] == 0 && controls[2] == 0,
+                "explicit shutdown did not detach a zero-control coordinator map");
     TEST_PASS();
     return true;
 }

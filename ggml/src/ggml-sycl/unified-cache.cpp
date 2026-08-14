@@ -774,7 +774,7 @@ struct allocation_owner_internal_access {
 };
 
 alloc_owner_control::alloc_owner_control(std::shared_ptr<allocation_release_coordinator> coordinator) noexcept {
-    if (coordinator && coordinator->try_register_control()) coordinator_ = std::move(coordinator);
+    if (coordinator && coordinator->try_register_control(this)) coordinator_ = std::move(coordinator);
 }
 
 void alloc_owner_control::retain() noexcept {
@@ -851,11 +851,26 @@ release_attempt shared_alloc_owner::reset() noexcept {
     return control ? control->release_ref() : release_attempt{};
 }
 
-bool allocation_release_coordinator::try_register_control() noexcept {
+bool allocation_release_coordinator::try_register_control(alloc_owner_control * control) noexcept {
+    if (!control) return false;
     std::lock_guard<std::mutex> lock(admission_mutex_);
     if (admission_state_ != admission_state::OPEN) return false;
+    try {
+        controls_.push_back(control);
+    } catch (...) {
+        return false;
+    }
     live_controls_.fetch_add(1, std::memory_order_acq_rel);
     return true;
+}
+
+void allocation_release_coordinator::unregister_control(alloc_owner_control * control) noexcept {
+    std::lock_guard<std::mutex> lock(admission_mutex_);
+    const auto it = std::find(controls_.begin(), controls_.end(), control);
+    GGML_ASSERT(it != controls_.end());
+    *it = controls_.back();
+    controls_.pop_back();
+    live_controls_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void allocation_release_coordinator::close() noexcept {
@@ -865,7 +880,27 @@ void allocation_release_coordinator::close() noexcept {
 
 bool allocation_release_coordinator::can_detach() const noexcept {
     std::lock_guard<std::mutex> lock(admission_mutex_);
-    return admission_state_ == admission_state::CLOSING && live_controls() == 0 && retry_count() == 0;
+    return admission_state_ == admission_state::CLOSING && controls_.empty() && retry_count() == 0;
+}
+
+std::vector<allocation_control_snapshot> allocation_release_coordinator::snapshot_controls() const {
+    std::lock_guard<std::mutex> admission_lock(admission_mutex_);
+    std::lock_guard<std::mutex> retry_lock(retry_mutex_);
+    std::vector<allocation_control_snapshot> snapshot;
+    snapshot.reserve(controls_.size());
+    for (const alloc_owner_control * control : controls_) {
+        allocation_control_snapshot item;
+        item.metadata = control->metadata();
+        item.refs     = control->use_count();
+        for (const alloc_owner_control * retry = retry_head_; retry; retry = retry->retry_next_) {
+            if (retry == control) {
+                item.retry = true;
+                break;
+            }
+        }
+        snapshot.push_back(item);
+    }
+    return snapshot;
 }
 
 release_attempt allocation_release_coordinator::release_physical(alloc_owner_control * control) noexcept {
@@ -885,7 +920,7 @@ release_attempt allocation_release_coordinator::retire(alloc_owner_control * con
     // taking the intrusive retry leaf lock.
     release_attempt attempt = release_physical(control);
     if (attempt.released() || attempt.status == release_attempt_status::INVALID) {
-        live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+        unregister_control(control);
         delete control;
         return attempt;
     }
@@ -899,7 +934,7 @@ release_attempt allocation_release_coordinator::retire(alloc_owner_control * con
 }
 
 void allocation_release_coordinator::abandon_control(alloc_owner_control * control) noexcept {
-    live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+    unregister_control(control);
     delete control;
 }
 
@@ -919,7 +954,7 @@ size_t allocation_release_coordinator::process_retries() noexcept {
         }
         const release_attempt attempt = release_physical(control);
         if (attempt.released() || attempt.status == release_attempt_status::INVALID) {
-            live_controls_.fetch_sub(1, std::memory_order_acq_rel);
+            unregister_control(control);
             delete control;
             ++released;
             continue;
@@ -15738,10 +15773,53 @@ bool unified_cache_shutdown_runtime_alloc_census_for_test(uint64_t out[8]) noexc
     }
 }
 
+static void log_allocation_control_snapshot(
+    const char * phase,
+    const std::vector<std::shared_ptr<allocation_release_coordinator>> & coordinators) noexcept {
+    try {
+        for (const auto & coordinator : coordinators) {
+            if (!coordinator) continue;
+            const auto controls = coordinator->snapshot_controls();
+            for (size_t i = 0; i < controls.size(); ++i) {
+                const auto & control = controls[i];
+                const auto & m = control.metadata;
+                GGML_LOG_ERROR(
+                    "[UNIFIED-CACHE] allocation-control phase=%s device=%d index=%zu ptr=%p size=%zu id=%llu "
+                    "alloc_id=%llu generation=%llu tier=%d role=%d category=%d zone=%d refs=%u retry=%d\n",
+                    phase ? phase : "unknown", coordinator->device(), i, m.ptr, m.size,
+                    static_cast<unsigned long long>(m.id), static_cast<unsigned long long>(m.alloc_id),
+                    static_cast<unsigned long long>(m.generation), static_cast<int>(m.tier),
+                    static_cast<int>(m.role), static_cast<int>(m.category), static_cast<int>(m.zone),
+                    control.refs, control.retry ? 1 : 0);
+            }
+        }
+    } catch (...) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] allocation-control snapshot failed phase=%s\n",
+                       phase ? phase : "unknown");
+    }
+}
+
+bool unified_cache_shutdown_allocation_control_census_for_test(uint64_t out[3]) noexcept {
+    if (!out) return false;
+    out[0] = out[1] = out[2] = 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
+        out[0] = g_allocation_coordinators.size();
+        for (const auto & item : g_allocation_coordinators) {
+            out[1] += item.second->live_controls();
+            out[2] += item.second->retry_count();
+        }
+        return true;
+    } catch (...) {
+        out[0] = out[1] = out[2] = 0;
+        return false;
+    }
+}
+
 bool shutdown_unified_cache() {
     // Intrusive controls and their embedded retry nodes keep the per-device
-    // release backend attached. Retry outside coordinator leaf locks, then
-    // refuse teardown while any external owner remains live.
+    // release backend attached. Close allocation admission first; cache-owned
+    // controls are then released by cache teardown, before the zero census.
     std::vector<std::shared_ptr<allocation_release_coordinator>> release_coordinators;
     {
         std::lock_guard<std::mutex> lock(g_allocation_coordinator_mutex);
@@ -15754,16 +15832,10 @@ bool shutdown_unified_cache() {
             release_coordinators.push_back(item.second);
         }
     }
-    for (const auto & coordinator : release_coordinators) {
-        if (coordinator) (void) coordinator->process_retries();
-    }
-    for (const auto & coordinator : release_coordinators) {
-        if (coordinator && !coordinator->can_detach()) {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown refused: device=%d live allocation controls=%zu retries=%zu\n",
-                           coordinator->device(), coordinator->live_controls(), coordinator->retry_count());
-            return false;
-        }
-    }
+    // This pre-teardown inventory distinguishes expected cache-owned controls
+    // from external owners and gives an exact identity when shutdown later
+    // refuses. It is diagnostic only; no control is force-cleared.
+    log_allocation_control_snapshot("pre-cache-teardown", release_coordinators);
 
     // Explicit module shutdown runs while SYCL is still valid. Detach the map
     // under its lock, then destroy caches without the registry lock held so
@@ -15803,6 +15875,21 @@ bool shutdown_unified_cache() {
     // cache destructor has released its chunks may those queues be destroyed.
     caches.clear();
     owner_snapshot.clear();
+    // unified_cache::shutdown_resources() releases arena state, while the cache
+    // destructor releases host_arena_/pinned_chunk_pool owners. Only now can
+    // the coordinator census distinguish a real external owner from those
+    // cache-owned pinned chunks.
+    for (const auto & coordinator : release_coordinators) {
+        if (coordinator) (void) coordinator->process_retries();
+    }
+    for (const auto & coordinator : release_coordinators) {
+        if (coordinator && !coordinator->can_detach()) {
+            log_allocation_control_snapshot("post-cache-destruction-refusal", release_coordinators);
+            GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown refused: device=%d live allocation controls=%zu retries=%zu\n",
+                           coordinator->device(), coordinator->live_controls(), coordinator->retry_count());
+            return false;
+        }
+    }
     shutdown_shared_context_queues();
     // The clean postcondition is meaningful only after these final allocation
     // owners are gone; otherwise a 2 GiB chunk can survive until DSO destruction.
