@@ -6540,8 +6540,6 @@ struct managed_host_pinned_buffer {
             return true;
         }
 
-        reset();
-
         ggml_sycl::alloc_request req{};
         req.queue                               = &q;
         req.device                              = device;
@@ -6552,21 +6550,21 @@ struct managed_host_pinned_buffer {
         req.intent.constraints.must_host_pinned = true;
         req.intent.constraints.use_pinned_pool  = true;
 
-        ggml_sycl::alloc_handle owner{};
-        if (!ggml_sycl::unified_alloc(req, &owner) || owner.ptr == nullptr) {
-            bytes = 0;
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             return false;
         }
-
-        handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
-        bytes  = needed_bytes;
-        if (zero_init) {
-            if (!handle.valid()) {
-                reset();
-                return false;
-            }
-            ggml_sycl::mem_fill(handle, 0, needed_bytes, q);
+        ggml_sycl::mem_handle replacement =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = replacement.resolve(device);
+        if (!resolved.ptr || resolved.on_device) {
+            return false;
         }
+        if (zero_init) {
+            ggml_sycl::mem_fill(replacement, 0, needed_bytes, q);
+        }
+        handle = std::move(replacement);
+        bytes  = needed_bytes;
         return true;
     }
 
@@ -48463,12 +48461,9 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
 
         if (aos_needs_staging) {
             device_staging = static_cast<uint8_t *>(extra->xmx_staging_ptr(device_id));
-            if (device_staging && extra->xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size) {
-                extra->xmx_mxfp4_tiled_aos_staging_handle[device_id] = {};
-                extra->xmx_mxfp4_tiled_aos_staging_size[device_id]   = 0;
-                device_staging                                       = nullptr;
-            }
-            if (!device_staging) {
+            const bool staging_too_small =
+                device_staging && extra->xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size;
+            if (!device_staging || staging_too_small) {
                 ggml_sycl::alloc_request staging_req{};
                 staging_req.queue                          = stream;
                 staging_req.device                         = device_id;
@@ -48483,8 +48478,13 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                     auto staging_resolved = staging_handle.resolve(device_id);
                     if (staging_resolved && staging_resolved.on_device) {
                         device_staging = static_cast<uint8_t *>(staging_resolved.ptr);
+                        auto old_staging = std::move(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
                         extra->xmx_mxfp4_tiled_aos_staging_handle[device_id] = std::move(staging_handle);
                         extra->xmx_mxfp4_tiled_aos_staging_size[device_id]   = aos_expert_size;
+                        if (old_staging.valid()) {
+                            ggml_sycl::retain_handles_until_event({ std::move(old_staging) },
+                                                                  stream->ext_oneapi_submit_barrier());
+                        }
                     }
                 }
             }
@@ -49055,7 +49055,7 @@ static layout_mode ggml_sycl_moe_mmvq_layout(const ggml_tensor * tensor, bool al
 
 // Forward declaration — defined below after this helper.
 // table_index: sequential index into pre-allocated Phase 4 tables (-1 to skip).
-static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
+static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
                                            int                     device,
                                            int64_t                 n_experts,
                                            sycl::queue &           queue,
@@ -49224,8 +49224,8 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     const bool table_was_valid = extra->moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
                                  extra->moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
 
-    ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, q, table_index);
-    if (!extra->moe_ptrs_ptr(device)) {
+    if (!ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, q, table_index) ||
+        extra->moe_expert_ptrs_size[device] < static_cast<size_t>(n_experts) * sizeof(void *)) {
         return nullptr;
     }
     const bool force_refresh = !table_was_valid;
@@ -49675,18 +49675,18 @@ static const void * const * moe_fusion_ensure_full_local_ptr_table(ggml_backend_
     return table;
 }
 
-static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
+static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
                                            int                     device,
                                            int64_t                 n_experts,
                                            sycl::queue &           queue,
                                            int                     table_index) {
     if (!extra || n_experts <= 0) {
-        return;
+        return false;
     }
     const size_t count = static_cast<size_t>(n_experts);
     const size_t bytes = count * sizeof(void *);
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
-        return;
+        return false;
     }
     // Use raw accessor: ensure_moe_ptr_table manages the allocation lifecycle and must
     // bypass the validity flag (which only guards dispatch-side consumers).
@@ -49704,14 +49704,7 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         if (table_view_reset) {
             ggml_sycl_invalidate_moe_full_local_probe(extra, device);
         }
-        return;
-    }
-    if (extra->moe_ptrs_ptr_raw(device) != nullptr) {
-        extra->moe_expert_ptrs_handle[device]        = {};
-        extra->moe_expert_ptrs_size[device]          = 0;
-        extra->moe_expert_ptrs_from_prealloc[device] = false;
-        extra->moe_device_table_valid[device]        = false;
-        extra->moe_expert_ptr_payload[device].clear();
+        return true;
     }
 
     // Try Phase 4 pre-allocated table first (avoids runtime malloc_device).
@@ -49726,16 +49719,18 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
             const auto            resolved     = table_handle.resolve(device);
             if (table_handle.valid() && table_handle.has_stable_owner_identity() && resolved.ptr &&
                 resolved.on_device == bufs->tables_on_device) {
+                std::vector<ggml_sycl::mem_handle> new_handles(count);
+                std::vector<void *>                new_payload(count, nullptr);
                 extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
                 extra->moe_expert_ptrs_size[device]          = bytes;
                 extra->moe_expert_ptrs_from_prealloc[device] = true;
                 extra->moe_device_table_valid[device]        = true;
-                extra->moe_expert_handles[device].assign(count, ggml_sycl::mem_handle{});
-                extra->moe_expert_ptr_payload[device].assign(count, nullptr);
+                extra->moe_expert_handles[device]            = std::move(new_handles);
+                extra->moe_expert_ptr_payload[device]        = std::move(new_payload);
                 ggml_sycl_invalidate_moe_full_local_probe(extra, device);
                 GGML_SYCL_DEBUG("[MOE] Using pre-allocated table %d for device %d (%zu bytes)\n", table_index, device,
                                 bytes);
-                return;
+                return true;
             }
         }
     }
@@ -49751,7 +49746,7 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
     if (!allocation) {
         GGML_LOG_ERROR("[MOE] Failed to allocate expert pointer table (%zu bytes)\n", count * sizeof(void *));
-        return;
+        return false;
     }
     ggml_sycl::mem_handle table_handle =
         ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
@@ -49759,16 +49754,19 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     void *     table    = resolved.ptr;
     if (!table || !resolved.on_device) {
         GGML_LOG_ERROR("[MOE] Failed to resolve expert pointer table (%zu bytes)\n", count * sizeof(void *));
-        return;
+        return false;
     }
-    extra->moe_expert_ptrs_handle[device] = std::move(table_handle);
-    ggml_sycl::mem_fill(extra->moe_expert_ptrs_handle[device], 0, bytes, queue);
+    std::vector<ggml_sycl::mem_handle> new_handles(count);
+    std::vector<void *>                new_payload(count, nullptr);
+    ggml_sycl::mem_fill(table_handle, 0, bytes, queue);
+    extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
     extra->moe_expert_ptrs_size[device]          = bytes;
     extra->moe_expert_ptrs_from_prealloc[device] = false;
     extra->moe_device_table_valid[device]        = true;
-    extra->moe_expert_handles[device].assign(count, ggml_sycl::mem_handle{});
-    extra->moe_expert_ptr_payload[device].assign(count, nullptr);
+    extra->moe_expert_handles[device]            = std::move(new_handles);
+    extra->moe_expert_ptr_payload[device]        = std::move(new_payload);
     ggml_sycl_invalidate_moe_full_local_probe(extra, device);
+    return true;
 }
 
 static void ggml_sycl_update_moe_hotset(ggml_sycl::unified_cache *   cache,
@@ -51013,9 +51011,10 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         }
     }
     if (!skip_device_copy) {
-        ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, *stream, tbl_idx);
+        const bool table_ready = ggml_sycl_ensure_moe_ptr_table(extra, device, n_experts, *stream, tbl_idx);
         GGML_SYCL_DEBUG("[MOE-PTR] ensure_moe_ptr_table done\n");
-        if (!extra->moe_ptrs_ptr(device) ||
+        if (!table_ready || !extra->moe_ptrs_ptr(device) ||
+            extra->moe_expert_ptrs_size[device] < static_cast<size_t>(n_experts) * sizeof(void *) ||
             extra->moe_expert_handles[device].size() != static_cast<size_t>(n_experts)) {
             return false;
         }
@@ -55224,7 +55223,7 @@ static bool validate_secondary_ops_after_scratch(const std::vector<secondary_mat
 // Ensure host-pinned resources and device-local counters are allocated for
 // host-mediated persistent TG multi-device sync. Grows buffers as needed
 // (idempotent). Device counters are zero-initialized on every call.
-static void ensure_split_persistent_resources(sycl::queue & primary_queue,
+static bool ensure_split_persistent_resources(sycl::queue & primary_queue,
                                               sycl::queue & secondary_queue,
                                               int           max_matmul_ops,
                                               int           max_N,
@@ -55247,41 +55246,31 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         // Safe on primary_queue: runs before kernel launch, no concurrent access.
         ggml_sycl::mem_fill(r.progress_counter_handle, 0, sizeof(int), primary_queue);
         ggml_sycl::mem_fill(r.merge_complete_handle, 0, sizeof(int), primary_queue);
-        return;
+        return true;
     }
 
     // (Re)allocate merge_buf for secondary GPU partial outputs
     if (r.merge_buf_size < need_merge) {
-        r.merge_buf = nullptr;
-        r.merge_buf_alloc.reset();
-        if (r.merge_buf_alloc.ensure(shared_queue, primary_device, static_cast<size_t>(need_merge) * sizeof(float),
-                                     ggml_sycl::alloc_role::GRAPH_TMP, ggml_sycl::runtime_category::GRAPH,
-                                     "split_merge_buf")) {
-            r.merge_buf = r.merge_buf_alloc.as<float>();
-        }
-        if (!r.merge_buf) {
+        if (!r.merge_buf_alloc.ensure(shared_queue, primary_device, static_cast<size_t>(need_merge) * sizeof(float),
+                                      ggml_sycl::alloc_role::GRAPH_TMP, ggml_sycl::runtime_category::GRAPH,
+                                      "split_merge_buf")) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified host alloc failed for merge_buf (%d floats)\n", need_merge);
-            r.merge_buf_size = 0;
-            return;
+            return false;
         }
+        r.merge_buf      = r.merge_buf_alloc.as<float>();
         r.merge_buf_size = need_merge;
     }
 
     // (Re)allocate activation_buf for cross-device matmul activation staging.
     // Primary GPU writes activations here; secondary GPU reads via PCIe zero-copy.
     if (r.activation_size < need_act) {
-        r.activation_buf = nullptr;
-        r.activation_alloc.reset();
-        if (r.activation_alloc.ensure(shared_queue, primary_device, static_cast<size_t>(need_act) * sizeof(float),
-                                      ggml_sycl::alloc_role::GRAPH_TMP, ggml_sycl::runtime_category::GRAPH,
-                                      "split_activation_buf")) {
-            r.activation_buf = r.activation_alloc.as<float>();
-        }
-        if (!r.activation_buf) {
+        if (!r.activation_alloc.ensure(shared_queue, primary_device, static_cast<size_t>(need_act) * sizeof(float),
+                                       ggml_sycl::alloc_role::GRAPH_TMP, ggml_sycl::runtime_category::GRAPH,
+                                       "split_activation_buf")) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified host alloc failed for activation_buf (%d floats)\n", need_act);
-            r.activation_size = 0;
-            return;
+            return false;
         }
+        r.activation_buf  = r.activation_alloc.as<float>();
         r.activation_size = need_act;
     }
 
@@ -55305,7 +55294,7 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         if (!r.progress_counter) {
             r.progress_counter_handle = {};
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device alloc failed for progress_counter\n");
-            return;
+            return false;
         }
     }
     // Allocate host-pinned staging for D2H progress reads.
@@ -55316,7 +55305,7 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         }
         if (!r.h_progress) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified host alloc failed for h_progress\n");
-            return;
+            return false;
         }
     }
     // Allocate device-local merge_complete: host writes via H2D memcpy on coord OOQ,
@@ -55339,7 +55328,7 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         if (!r.merge_complete) {
             r.merge_complete_handle = {};
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device alloc failed for merge_complete\n");
-            return;
+            return false;
         }
     }
     // Safe on primary_queue: runs before kernel launch, no concurrent access.
@@ -55358,18 +55347,22 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
         if (!allocation) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device alloc failed for q8_staging (%d bytes)\n", need_q8);
-            return;
+            return false;
         }
         ggml_sycl::mem_handle replacement =
             ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
         const auto resolved = replacement.resolve(secondary_device);
         if (!resolved.ptr || !resolved.on_device) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device resolve failed for q8_staging (%d bytes)\n", need_q8);
-            return;
+            return false;
         }
+        auto old_q8 = std::move(r.q8_staging_handle);
         r.q8_staging_handle = std::move(replacement);
         r.q8_staging        = resolved.ptr;
         r.q8_staging_size   = need_q8;
+        if (old_q8.valid()) {
+            ggml_sycl::retain_handles_until_event({ std::move(old_q8) }, secondary_queue.ext_oneapi_submit_barrier());
+        }
     }
 
     // Create OOQ on primary device for coordinator D2H/H2D memcpy operations.
@@ -55388,6 +55381,7 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         "[PERSISTENT-TG-SPLIT] Allocated BCS-mediated resources: "
         "merge=%d act=%d floats, q8=%d bytes, + 2 device counters + h_progress + coord OOQ\n",
         need_merge, need_act, need_q8);
+    return r.merge_buf_size >= need_merge && r.activation_size >= need_act && r.q8_staging_size >= need_q8;
 }
 
 // OOQ merge queue (UNUSED — kept for cleanup backward compatibility).
@@ -55725,7 +55719,7 @@ static struct {
     ggml_sycl::mem_handle f32_handle;
 } g_split_secondary_gpu;
 
-static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::queue * q) {
+static bool split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::queue * q) {
     const int secondary_device = ggml_sycl_get_device_id_from_queue(*q);
     if (g_split_secondary_gpu.q8_size < q8_bytes) {
         ggml_sycl::alloc_request req{};
@@ -55741,9 +55735,13 @@ static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::
                 ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
             const auto resolved = replacement.resolve(secondary_device);
             if (resolved.ptr && resolved.on_device) {
+                auto old_q8 = std::move(g_split_secondary_gpu.q8_handle);
                 g_split_secondary_gpu.q8_handle = std::move(replacement);
                 g_split_secondary_gpu.q8_dev    = static_cast<char *>(resolved.ptr);
                 g_split_secondary_gpu.q8_size   = q8_bytes;
+                if (old_q8.valid()) {
+                    ggml_sycl::retain_handles_until_event({ std::move(old_q8) }, q->ext_oneapi_submit_barrier());
+                }
             }
         }
     }
@@ -55761,12 +55759,18 @@ static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::
                 ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
             const auto resolved = replacement.resolve(secondary_device);
             if (resolved.ptr && resolved.on_device) {
+                auto old_f32 = std::move(g_split_secondary_gpu.f32_handle);
                 g_split_secondary_gpu.f32_handle = std::move(replacement);
                 g_split_secondary_gpu.f32_dev    = static_cast<float *>(resolved.ptr);
                 g_split_secondary_gpu.f32_size   = f32_bytes;
+                if (old_f32.valid()) {
+                    ggml_sycl::retain_handles_until_event({ std::move(old_f32) }, q->ext_oneapi_submit_barrier());
+                }
             }
         }
     }
+    return g_split_secondary_gpu.q8_dev && g_split_secondary_gpu.q8_size >= q8_bytes &&
+           g_split_secondary_gpu.f32_dev && g_split_secondary_gpu.f32_size >= f32_bytes;
 }
 
 // Secondary GPU weight loading via unified cache.
@@ -56160,8 +56164,7 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
 
         // Secondary GPU: H2D src1, Q8 quantize, MMVQ dispatch
         if (N_second > 0) {
-            split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, stream_second);
-            if (!g_split_secondary_gpu.q8_dev || !g_split_secondary_gpu.f32_dev) {
+            if (!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, stream_second)) {
                 return false;
             }
 
@@ -56202,13 +56205,18 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
                         ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                     const auto resolved = replacement.resolve(sec_dev);
                     if (resolved.ptr && resolved.on_device) {
+                        auto old_output = std::move(s_second_out_dev_handle);
                         s_second_out_dev_handle = std::move(replacement);
                         s_second_out_dev        = static_cast<float *>(resolved.ptr);
                         s_second_out_dev_sz     = second_out_bytes;
+                        if (old_output.valid()) {
+                            ggml_sycl::retain_handles_until_event({ std::move(old_output) },
+                                                                  stream_second->ext_oneapi_submit_barrier());
+                        }
                     }
                 }
             }
-            if (!s_second_out_dev) {
+            if (!s_second_out_dev || s_second_out_dev_sz < second_out_bytes) {
                 return false;
             }
 
@@ -89281,8 +89289,8 @@ static bool extract_persistent_plan_split(ggml_sycl::UnifiedKernel &           p
     }
 
     // Step 3: Ensure shared host-pinned resources and device counters are allocated.
-    ensure_split_persistent_resources(*split_cfg.queue[0], *split_cfg.queue[1], n_matmul_ops, max_N, max_K, n_devices);
-    if (!g_split_persistent.allocated) {
+    if (!ensure_split_persistent_resources(
+            *split_cfg.queue[0], *split_cfg.queue[1], n_matmul_ops, max_N, max_K, n_devices)) {
         GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] Failed to allocate shared resources\n");
         return false;
     }

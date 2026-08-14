@@ -64,9 +64,9 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 # Ten coherent runtime staging/workspace owner sites were migrated. The exact
 # compatibility inventory prevents either a silent regression or an unreviewed
 # widening of this bounded batch.
-assert RUNTIME.count("unified_alloc(") == 57
-assert RUNTIME.count("from_legacy_owned_alloc(") == 45
-assert RUNTIME.count("unified_allocate_owner(") == 26
+assert RUNTIME.count("unified_alloc(") == 56
+assert RUNTIME.count("from_legacy_owned_alloc(") == 44
+assert RUNTIME.count("unified_allocate_owner(") == 27
 assert CACHE.count("unified_alloc(") == 28
 assert CACHE.count("from_legacy_owned_alloc(") == 12
 assert CACHE.count("unified_allocate_owner(") == 10
@@ -117,11 +117,11 @@ staging_runtime_regions = (
     ("struct scoped_staging_handle", "auto set_root_override"),
     ("struct ggml_sycl_pool_host", "void ggml_sycl::L2PrefetchManagerDeleter"),
     ("static bool convert_tensor_layout", "static bool ggml_sycl_select_mul_mat_layout"),
-    ("static void ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset"),
+    ("static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset"),
     ("static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact", "static bool ggml_sycl_release_moe_tensor_layout"),
     ("static bool graph_preload_moe_experts", "static void graph_unpin_moe_experts"),
-    ("static void ensure_split_persistent_resources", "static sycl::queue *            g_split_merge_queue"),
-    ("static void split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
+    ("static bool ensure_split_persistent_resources", "static sycl::queue *            g_split_merge_queue"),
+    ("static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
     ("// Ensure device output buffer", "// H2D: host"),
     ("static ggml_sycl::mem_handle ggml_sycl_block_exec_alloc_host_stage_handle", "static bool ggml_sycl_block_exec_queue_matches_device"),
 )
@@ -160,7 +160,7 @@ for block in (common_stage, pp_stage):
 # Representative failure seam: replacement owners are resolved and routing is
 # validated before old staging metadata is published or cleared.
 for block, mutation in (
-    (region(RUNTIME, "static void split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
+    (region(RUNTIME, "static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
      "g_split_secondary_gpu.q8_handle = std::move(replacement)"),
     (cache_reorder, "reorder_temp_owner_  = std::move(replacement)"),
     (common_stage, "backing_handle   = std::move(replacement)"),
@@ -173,3 +173,40 @@ for block, mutation in (
     assert allocation < resolved < validation < publication
 print("PASS staging-owner-first-source-gate-17")
 print("PASS staging-replacement-failure-seam")
+
+# w288: resize helpers qualify success against the requested geometry.  A
+# surviving smaller pointer is never accepted after a failed growth attempt.
+secondary = region(RUNTIME, "static bool split_secondary_gpu_ensure", "// Secondary GPU weight loading")
+assert "q8_size >= q8_bytes" in secondary
+assert "f32_size >= f32_bytes" in secondary
+secondary_call = region(RUNTIME, "// Secondary GPU: H2D src1", "// CPU vec_dot:")
+assert "if (!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, stream_second))" in secondary_call
+assert "s_second_out_dev_sz < second_out_bytes" in secondary_call
+persistent = region(RUNTIME, "static bool ensure_split_persistent_resources", "// OOQ merge queue")
+assert "r.q8_staging_size >= need_q8" in persistent
+assert "return false;" in persistent
+assert "if (!ensure_split_persistent_resources(" in RUNTIME
+print("PASS staging-resize-capacity-qualified-source-gate")
+
+# Successful secondary replacements escrow the previous owner behind the exact
+# in-order secondary queue terminal, so an in-flight kernel cannot observe a
+# freed q8/f32/output/persistent-q8 allocation.
+for owner in ("old_q8", "old_f32", "old_output"):
+    assert f"std::move({owner})" in RUNTIME
+assert secondary.count("q->ext_oneapi_submit_barrier()") == 2
+assert "stream_second->ext_oneapi_submit_barrier()" in secondary_call
+assert "secondary_queue.ext_oneapi_submit_barrier()" in persistent
+print("PASS staging-in-flight-resize-owner-retention-source-gate")
+
+# XMX staging and MoE pointer-table growth are failure atomic: no old state is
+# cleared before a replacement resolves, and table payload vectors are built
+# locally before the owner/size/validity tuple is published.
+xmx_stage = region(RUNTIME, "const bool staging_too_small", "// Always use host staging")
+assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
+assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
+moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
+assert "moe_expert_ptrs_handle[device]        = {};" not in moe_table
+assert moe_table.count("std::vector<ggml_sycl::mem_handle> new_handles(count)") == 2
+assert moe_table.count("std::vector<void *>                new_payload(count, nullptr)") == 2
+assert "return true;" in moe_table and "return false;" in moe_table
+print("PASS xmx-moe-replacement-failure-atomic-source-gate")
