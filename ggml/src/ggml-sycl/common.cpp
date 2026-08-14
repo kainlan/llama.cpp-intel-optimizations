@@ -2518,10 +2518,6 @@ void * ggml_sycl_pp_ensure_stage_buffer(int stage, size_t size) {
         return resolve_stage_output(stage);
     }
 
-    // Free old buffer if it exists.
-    g_sycl_pp_config.stage_output_handle[stage] = {};
-    g_sycl_pp_config.stage_output_size[stage]   = 0;
-
     // Allocate host-pinned staging for inter-stage transfer. Intel Arc systems
     // without proven P2P need an explicit host-bounce buffer owned by unified_alloc.
     auto &                   q      = dpct::get_in_order_queue();
@@ -2536,19 +2532,21 @@ void * ggml_sycl_pp_ensure_stage_buffer(int stage, size_t size) {
     req.intent.constraints.must_host_pinned        = true;
     req.intent.constraints.require_host_usm_base   = true;
     req.intent.constraints.forbid_host_zone_growth = true;
-    ggml_sycl::alloc_handle stage_output_owner{};
-    if (ggml_sycl::unified_alloc(req, &stage_output_owner) && stage_output_owner.ptr) {
-        g_sycl_pp_config.stage_output_handle[stage] =
-            ggml_sycl::detail::from_legacy_owned_alloc(std::move(stage_output_owner), GGML_LAYOUT_AOS);
-    }
-    void * stage_output = resolve_stage_output(stage);
-    if (!stage_output) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         GGML_LOG_ERROR("SYCL PP: Failed to allocate stage output buffer\n");
-        g_sycl_pp_config.stage_output_handle[stage] = {};
-        g_sycl_pp_config.stage_output_size[stage]   = 0;
         return nullptr;
     }
-    g_sycl_pp_config.stage_output_size[stage] = size;
+    ggml_sycl::mem_handle replacement =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = replacement.resolve(dev_id);
+    if (!resolved.ptr || resolved.on_device) {
+        GGML_LOG_ERROR("SYCL PP: Failed to resolve host-pinned stage output buffer\n");
+        return nullptr;
+    }
+    g_sycl_pp_config.stage_output_handle[stage] = std::move(replacement);
+    g_sycl_pp_config.stage_output_size[stage]   = size;
+    void * stage_output = resolved.ptr;
 
     PP_DEBUG("Allocated stage %d host-pinned staging buffer: %zu bytes\n", stage, size);
 

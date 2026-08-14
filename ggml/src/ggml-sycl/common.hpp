@@ -5641,8 +5641,6 @@ struct ggml_backend_sycl_context {
                 return resolved ? resolved.ptr : nullptr;
             }
 
-            release();
-
             ggml_sycl::alloc_request req{};
             req.queue                               = &queue;
             req.device                              = device;
@@ -5654,19 +5652,20 @@ struct ggml_backend_sycl_context {
             // allocated from arena tail zones can return pointers that fail on first submit.
             // Weight-zone pointers are already exercised by S1-preloaded weights.
             req.intent.constraints.prefer_vram_zone = ggml_sycl::vram_zone_id::WEIGHT;
-            ggml_sycl::alloc_handle backing_owner{};
-            if (!ggml_sycl::unified_alloc(req, &backing_owner) || !backing_owner.ptr) {
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (!allocation) {
                 return nullptr;
             }
-            backing_capacity = backing_owner.size;
+            const size_t allocation_size = allocation.owner.metadata().size;
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(device);
+            if (!resolved.ptr || !resolved.on_device) {
+                return nullptr;
+            }
+            backing_handle   = std::move(replacement);
+            backing_capacity = allocation_size;
             backing_device   = device;
-            backing_handle   = ggml_sycl::detail::from_legacy_owned_alloc(std::move(backing_owner), GGML_LAYOUT_AOS);
-
-            auto resolved = backing_handle.resolve(device);
-            if (!resolved) {
-                release();
-                return nullptr;
-            }
             return resolved.ptr;
         }
 

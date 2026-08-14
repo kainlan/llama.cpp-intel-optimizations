@@ -8,6 +8,7 @@ FATTN = (SYCL / "fattn.cpp").read_text()
 RUNTIME = (SYCL / "ggml-sycl.cpp").read_text()
 CACHE = (SYCL / "unified-cache.cpp").read_text()
 COMMON = (SYCL / "common.hpp").read_text()
+COMMON_IMPL = (SYCL / "common.cpp").read_text()
 
 
 def region(source: str, start: str, end: str) -> str:
@@ -63,13 +64,18 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 # Ten coherent runtime staging/workspace owner sites were migrated. The exact
 # compatibility inventory prevents either a silent regression or an unreviewed
 # widening of this bounded batch.
-assert RUNTIME.count("unified_alloc(") == 70
-assert RUNTIME.count("from_legacy_owned_alloc(") == 56
-assert RUNTIME.count("unified_allocate_owner(") == 13
-assert CACHE.count("unified_alloc(") == 30
-assert CACHE.count("from_legacy_owned_alloc(") == 14
-assert COMMON.count("unified_alloc(") == 5
-assert COMMON.count("from_legacy_owned_alloc(") == 5
+assert RUNTIME.count("unified_alloc(") == 57
+assert RUNTIME.count("from_legacy_owned_alloc(") == 45
+assert RUNTIME.count("unified_allocate_owner(") == 26
+assert CACHE.count("unified_alloc(") == 28
+assert CACHE.count("from_legacy_owned_alloc(") == 12
+assert CACHE.count("unified_allocate_owner(") == 10
+assert COMMON.count("unified_alloc(") == 4
+assert COMMON.count("from_legacy_owned_alloc(") == 4
+assert COMMON.count("unified_allocate_owner(") == 3
+assert COMMON_IMPL.count("unified_alloc(") == 8
+assert COMMON_IMPL.count("from_legacy_owned_alloc(") == 8
+assert COMMON_IMPL.count("unified_allocate_owner(") == 4
 
 runtime_regions = (
     ("ggml_backend_sycl_context::get_staging_buffer", "ggml_backend_sycl_context::free_staging_buffer"),
@@ -102,3 +108,68 @@ for start, end, forbidden in (
     assert forbidden not in region(RUNTIME, start, end), start
 print("PASS runtime-workspace-owner-first-source-gate")
 print("PASS runtime-allocation-failure-leaves-output-untouched")
+
+# The next coherent STAGING batch closes 17 legacy sites: 13 in the runtime,
+# two in unified-cache, and one each in common.hpp/common.cpp. Exact legacy
+# variable names are forbidden so migrated adapters cannot silently regress.
+staging_runtime_regions = (
+    ("struct ggml_sycl_scoped_staging_handle", "struct ggml_sycl_f16_attention_route"),
+    ("struct scoped_staging_handle", "auto set_root_override"),
+    ("struct ggml_sycl_pool_host", "void ggml_sycl::L2PrefetchManagerDeleter"),
+    ("static bool convert_tensor_layout", "static bool ggml_sycl_select_mul_mat_layout"),
+    ("static void ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset"),
+    ("static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact", "static bool ggml_sycl_release_moe_tensor_layout"),
+    ("static bool graph_preload_moe_experts", "static void graph_unpin_moe_experts"),
+    ("static void ensure_split_persistent_resources", "static sycl::queue *            g_split_merge_queue"),
+    ("static void split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
+    ("// Ensure device output buffer", "// H2D: host"),
+    ("static ggml_sycl::mem_handle ggml_sycl_block_exec_alloc_host_stage_handle", "static bool ggml_sycl_block_exec_queue_matches_device"),
+)
+staging_runtime = "\n".join(region(RUNTIME, a, b) for a, b in staging_runtime_regions)
+for start, end in staging_runtime_regions:
+    assert "unified_allocate_owner(" in region(RUNTIME, start, end), start
+
+for forbidden in (
+    "alloc_handle xmx_staging_owner", "alloc_handle table_owner", "alloc_handle ids_pack_owner",
+    "alloc_handle device_owner", "alloc_handle q8_owner", "alloc_handle f32_owner",
+    "alloc_handle second_out_owner", "alloc_handle host_stage_owner",
+    "ggml_sycl_take_owned_alloc_handle(alloc",
+):
+    assert forbidden not in staging_runtime, forbidden
+for forbidden_call in (
+    "unified_alloc(staging_req", "unified_alloc(req, &table_owner", "unified_alloc(req, &ids_pack_owner",
+    "unified_alloc(req, &device_owner", "unified_alloc(req, &q8_owner", "unified_alloc(req, &f32_owner",
+    "unified_alloc(req, &second_out_owner", "unified_alloc(req, &host_stage_owner",
+):
+    assert forbidden_call not in RUNTIME, forbidden_call
+
+cache_reorder = region(CACHE, "bool unified_cache::reserve_reorder_temp", "bool unified_cache::reserve_persistent_scratch")
+cache_fill = region(CACHE, "bool unified_cache_fill_with_host_copy", "bool unified_cache_copy_from_host_async")
+for block in (cache_reorder, cache_fill):
+    assert "unified_allocate_owner(" in block
+    assert "unified_alloc(" not in block
+    assert "from_legacy_owned_alloc" not in block
+
+common_stage = region(COMMON, "void * ensure_buffer(size_t required_size", "ggml_sycl::mem_handle handle() const")
+pp_stage = region(COMMON_IMPL, "void * ggml_sycl_pp_ensure_stage_buffer", "sycl::event ggml_sycl_pp_stage_transfer")
+for block in (common_stage, pp_stage):
+    assert "unified_allocate_owner(" in block
+    assert "unified_alloc(" not in block
+    assert "from_legacy_owned_alloc" not in block
+
+# Representative failure seam: replacement owners are resolved and routing is
+# validated before old staging metadata is published or cleared.
+for block, mutation in (
+    (region(RUNTIME, "static void split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
+     "g_split_secondary_gpu.q8_handle = std::move(replacement)"),
+    (cache_reorder, "reorder_temp_owner_  = std::move(replacement)"),
+    (common_stage, "backing_handle   = std::move(replacement)"),
+    (pp_stage, "g_sycl_pp_config.stage_output_handle[stage] = std::move(replacement)"),
+):
+    allocation = block.index("unified_allocate_owner(")
+    resolved = block.index("resolve(", allocation)
+    validation = block.index("resolved.ptr", resolved)
+    publication = block.index(mutation, validation)
+    assert allocation < resolved < validation < publication
+print("PASS staging-owner-first-source-gate-17")
+print("PASS staging-replacement-failure-seam")

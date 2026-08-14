@@ -38116,16 +38116,22 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
         req.intent.constraints.forbid_host_zone_growth = true;
         req.suppress_failure_log                       = true;
 
-        ggml_sycl::alloc_handle handle{};
-        if (!ggml_sycl::unified_alloc(req, &handle) || !handle.ptr) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on host\n", __func__, rounded_size);
             return nullptr;
         }
-        void * ptr   = handle.ptr;
-        *actual_size = handle.size;
-        pool_size += handle.size;
-        active_handles[ptr] = { handle.size,
-                                ggml_sycl::detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS) };
+        const size_t allocation_size = allocation.owner.metadata().size;
+        ggml_sycl::mem_handle owner =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = owner.resolve(device);
+        if (!resolved.ptr || resolved.on_device) {
+            return nullptr;
+        }
+        void * ptr   = resolved.ptr;
+        *actual_size = allocation_size;
+        pool_size += allocation_size;
+        active_handles[ptr] = { allocation_size, std::move(owner) };
         return ptr;
     }
 
@@ -45087,13 +45093,19 @@ struct ggml_sycl_scoped_staging_handle {
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle alloc{};
-        if (!ggml_sycl::unified_alloc(req, &alloc) || !alloc.ptr) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             return false;
         }
-        handle = ggml_sycl_take_owned_alloc_handle(alloc, GGML_LAYOUT_AOS);
+        ggml_sycl::mem_handle replacement =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = replacement.resolve(target);
+        if (!resolved.ptr || !resolved.on_device) {
+            return false;
+        }
+        handle = std::move(replacement);
         device = target;
-        return handle.valid();
+        return true;
     }
 
     void * ptr() const {
@@ -46776,13 +46788,19 @@ static bool ggml_sycl_try_route_mul_mat_weight_owner(ggml_backend_sycl_context &
             req.intent.role                    = ggml_sycl::alloc_role::STAGING;
             req.intent.category                = ggml_sycl::runtime_category::STAGING;
             req.intent.constraints.must_device = true;
-            ggml_sycl::alloc_handle alloc{};
-            if (!ggml_sycl::unified_alloc(req, &alloc) || !alloc.ptr) {
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (!allocation) {
                 return false;
             }
-            handle = ggml_sycl_take_owned_alloc_handle(alloc, GGML_LAYOUT_AOS);
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(target);
+            if (!resolved.ptr || !resolved.on_device) {
+                return false;
+            }
+            handle = std::move(replacement);
             device = target;
-            return handle.valid();
+            return true;
         }
 
         void * ptr() const {
@@ -48458,10 +48476,10 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                 staging_req.intent.role                    = ggml_sycl::alloc_role::STAGING;
                 staging_req.intent.category                = ggml_sycl::runtime_category::STAGING;
                 staging_req.intent.constraints.must_device = true;
-                ggml_sycl::alloc_handle xmx_staging_owner{};
-                if (ggml_sycl::unified_alloc(staging_req, &xmx_staging_owner) && xmx_staging_owner.ptr) {
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(staging_req);
+                if (allocation) {
                     ggml_sycl::mem_handle staging_handle =
-                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(xmx_staging_owner), GGML_LAYOUT_AOS);
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                     auto staging_resolved = staging_handle.resolve(device_id);
                     if (staging_resolved && staging_resolved.on_device) {
                         device_staging = static_cast<uint8_t *>(staging_resolved.ptr);
@@ -49730,14 +49748,16 @@ static void ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
     req.intent.role                    = ggml_sycl::alloc_role::STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
-    ggml_sycl::alloc_handle table_owner{};
-    if (!ggml_sycl::unified_alloc(req, &table_owner) || !table_owner.ptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         GGML_LOG_ERROR("[MOE] Failed to allocate expert pointer table (%zu bytes)\n", count * sizeof(void *));
         return;
     }
-    ggml_sycl::mem_handle table_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(table_owner));
-    void *                table        = table_handle.resolve(device).ptr;
-    if (!table) {
+    ggml_sycl::mem_handle table_handle =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = table_handle.resolve(device);
+    void *     table    = resolved.ptr;
+    if (!table || !resolved.on_device) {
         GGML_LOG_ERROR("[MOE] Failed to resolve expert pointer table (%zu bytes)\n", count * sizeof(void *));
         return;
     }
@@ -50422,10 +50442,10 @@ static bool ggml_sycl_copy_ids_to_host(ggml_backend_sycl_context & ctx,
             req.intent.role                    = ggml_sycl::alloc_role::STAGING;
             req.intent.category                = ggml_sycl::runtime_category::STAGING;
             req.intent.constraints.must_device = true;
-            ggml_sycl::alloc_handle ids_pack_owner{};
-            if (ggml_sycl::unified_alloc(req, &ids_pack_owner) && ids_pack_owner.ptr) {
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (allocation) {
                 ggml_sycl::mem_handle ids_pack_handle =
-                    ggml_sycl::detail::from_legacy_owned_alloc(std::move(ids_pack_owner), GGML_LAYOUT_AOS);
+                    ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                 auto       ids_pack_resolved = ids_pack_handle.resolve(ids_owner);
                 int32_t *  ids_packed        = ids_pack_resolved && ids_pack_resolved.on_device ?
                                                    static_cast<int32_t *>(ids_pack_resolved.ptr) :
@@ -50729,9 +50749,7 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
             entry.from_prealloc = true;
             GGML_SYCL_DEBUG("[MOE-IDS] Using pre-allocated staging buffer (%zu bytes)\n", ids_bytes);
         } else {
-            // Fallback: runtime allocation
-            entry.device_handle = {};
-            entry.device_ids    = nullptr;
+            // Fallback: allocate and resolve a replacement before publication.
             ggml_sycl::alloc_request req{};
             req.queue                          = stream;
             req.device                         = ctx.device;
@@ -50739,16 +50757,20 @@ static const int32_t * ggml_sycl_get_moe_ids_device_ptr_exact(ggml_backend_sycl_
             req.intent.role                    = ggml_sycl::alloc_role::STAGING;
             req.intent.category                = ggml_sycl::runtime_category::STAGING;
             req.intent.constraints.must_device = true;
-            ggml_sycl::alloc_handle device_owner{};
-            if (ggml_sycl::unified_alloc(req, &device_owner) && device_owner.ptr) {
-                entry.device_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(device_owner), GGML_LAYOUT_AOS);
-            }
-            entry.device_ids    = entry.device_ids_ptr(ctx.device);
-            entry.device_bytes  = ids_bytes;
-            entry.from_prealloc = false;
-            if (!entry.device_ids) {
+            ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+            if (!allocation) {
                 return nullptr;
             }
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(ctx.device);
+            if (!resolved.ptr || !resolved.on_device) {
+                return nullptr;
+            }
+            entry.device_handle = std::move(replacement);
+            entry.device_ids    = static_cast<int32_t *>(resolved.ptr);
+            entry.device_bytes  = ids_bytes;
+            entry.from_prealloc = false;
         }
         ids_stage_alloc_us += ids_stage_us(alloc_t0, ids_stage_now());
     }
@@ -53636,9 +53658,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                     ids_entry.device_bytes  = ids_bytes;
                     ids_entry.from_prealloc = true;
                 } else {
-                    // Fallback: runtime allocation
-                    ids_entry.device_handle = {};
-                    ids_entry.device_ids    = nullptr;
+                    // Fallback: allocate and resolve a replacement before publication.
                     ggml_sycl::alloc_request req{};
                     req.queue                          = ctx.stream();
                     req.device                         = ctx.device;
@@ -53646,19 +53666,24 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                     req.intent.role                    = ggml_sycl::alloc_role::STAGING;
                     req.intent.category                = ggml_sycl::runtime_category::STAGING;
                     req.intent.constraints.must_device = true;
-                    ggml_sycl::alloc_handle device_owner{};
-                    if (ggml_sycl::unified_alloc(req, &device_owner) && device_owner.ptr) {
-                        ids_entry.device_handle =
-                            ggml_sycl::detail::from_legacy_owned_alloc(std::move(device_owner), GGML_LAYOUT_AOS);
-                    }
-                    ids_entry.device_ids    = ids_entry.device_ids_ptr(ctx.device);
-                    ids_entry.device_bytes  = ids_bytes;
-                    ids_entry.from_prealloc = false;
-                    if (!ids_entry.device_ids) {
+                    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+                    if (!allocation) {
                         GGML_LOG_ERROR("[GRAPH-PRELOAD] Failed to allocate device ids for %s (%zu bytes)\n", src0->name,
                                        ids_bytes);
                         return false;
                     }
+                    ggml_sycl::mem_handle replacement =
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                    const auto resolved = replacement.resolve(ctx.device);
+                    if (!resolved.ptr || !resolved.on_device) {
+                        GGML_LOG_ERROR("[GRAPH-PRELOAD] Failed to resolve device ids for %s (%zu bytes)\n", src0->name,
+                                       ids_bytes);
+                        return false;
+                    }
+                    ids_entry.device_handle = std::move(replacement);
+                    ids_entry.device_ids    = static_cast<int32_t *>(resolved.ptr);
+                    ids_entry.device_bytes  = ids_bytes;
+                    ids_entry.from_prealloc = false;
                 }
             }
         }
@@ -55323,10 +55348,6 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
 
     // Allocate q8_1 staging buffer on secondary device for input quantization
     if (r.q8_staging_size < need_q8) {
-        if (r.q8_staging) {
-            r.q8_staging_handle = {};
-            r.q8_staging        = nullptr;
-        }
         ggml_sycl::alloc_request req{};
         req.queue                          = &secondary_queue;
         req.device                         = secondary_device;
@@ -55334,18 +55355,21 @@ static void ensure_split_persistent_resources(sycl::queue & primary_queue,
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle q8_owner{};
-        if (ggml_sycl::unified_alloc(req, &q8_owner) && q8_owner.ptr) {
-            r.q8_staging_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(q8_owner), GGML_LAYOUT_AOS);
-        }
-        auto q8_resolved = r.q8_staging_handle.resolve(secondary_device);
-        r.q8_staging     = q8_resolved && q8_resolved.on_device ? q8_resolved.ptr : nullptr;
-        if (!r.q8_staging) {
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (!allocation) {
             GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device alloc failed for q8_staging (%d bytes)\n", need_q8);
-            r.q8_staging_size = 0;
             return;
         }
-        r.q8_staging_size = need_q8;
+        ggml_sycl::mem_handle replacement =
+            ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = replacement.resolve(secondary_device);
+        if (!resolved.ptr || !resolved.on_device) {
+            GGML_LOG_WARN("[PERSISTENT-TG-SPLIT] unified device resolve failed for q8_staging (%d bytes)\n", need_q8);
+            return;
+        }
+        r.q8_staging_handle = std::move(replacement);
+        r.q8_staging        = resolved.ptr;
+        r.q8_staging_size   = need_q8;
     }
 
     // Create OOQ on primary device for coordinator D2H/H2D memcpy operations.
@@ -55704,10 +55728,6 @@ static struct {
 static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::queue * q) {
     const int secondary_device = ggml_sycl_get_device_id_from_queue(*q);
     if (g_split_secondary_gpu.q8_size < q8_bytes) {
-        if (g_split_secondary_gpu.q8_dev) {
-            g_split_secondary_gpu.q8_handle = {};
-            g_split_secondary_gpu.q8_dev    = nullptr;
-        }
         ggml_sycl::alloc_request req{};
         req.queue                          = q;
         req.device                         = secondary_device;
@@ -55715,20 +55735,19 @@ static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle q8_owner{};
-        if (ggml_sycl::unified_alloc(req, &q8_owner) && q8_owner.ptr) {
-            g_split_secondary_gpu.q8_handle =
-                ggml_sycl::detail::from_legacy_owned_alloc(std::move(q8_owner), GGML_LAYOUT_AOS);
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (allocation) {
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(secondary_device);
+            if (resolved.ptr && resolved.on_device) {
+                g_split_secondary_gpu.q8_handle = std::move(replacement);
+                g_split_secondary_gpu.q8_dev    = static_cast<char *>(resolved.ptr);
+                g_split_secondary_gpu.q8_size   = q8_bytes;
+            }
         }
-        g_split_secondary_gpu.q8_dev =
-            static_cast<char *>(g_split_secondary_gpu.q8_handle.resolve(secondary_device).ptr);
-        g_split_secondary_gpu.q8_size = g_split_secondary_gpu.q8_dev ? q8_bytes : 0;
     }
     if (g_split_secondary_gpu.f32_size < f32_bytes) {
-        if (g_split_secondary_gpu.f32_dev) {
-            g_split_secondary_gpu.f32_handle = {};
-            g_split_secondary_gpu.f32_dev    = nullptr;
-        }
         ggml_sycl::alloc_request req{};
         req.queue                          = q;
         req.device                         = secondary_device;
@@ -55736,14 +55755,17 @@ static void split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
-        ggml_sycl::alloc_handle f32_owner{};
-        if (ggml_sycl::unified_alloc(req, &f32_owner) && f32_owner.ptr) {
-            g_split_secondary_gpu.f32_handle =
-                ggml_sycl::detail::from_legacy_owned_alloc(std::move(f32_owner), GGML_LAYOUT_AOS);
+        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+        if (allocation) {
+            ggml_sycl::mem_handle replacement =
+                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+            const auto resolved = replacement.resolve(secondary_device);
+            if (resolved.ptr && resolved.on_device) {
+                g_split_secondary_gpu.f32_handle = std::move(replacement);
+                g_split_secondary_gpu.f32_dev    = static_cast<float *>(resolved.ptr);
+                g_split_secondary_gpu.f32_size   = f32_bytes;
+            }
         }
-        g_split_secondary_gpu.f32_dev =
-            static_cast<float *>(g_split_secondary_gpu.f32_handle.resolve(secondary_device).ptr);
-        g_split_secondary_gpu.f32_size = g_split_secondary_gpu.f32_dev ? f32_bytes : 0;
     }
 }
 
@@ -56167,10 +56189,6 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
             // Ensure device output buffer
             if (s_second_out_dev_sz < second_out_bytes) {
                 int sec_dev = ggml_sycl_get_device_id_from_queue(*stream_second);
-                if (s_second_out_dev) {
-                    s_second_out_dev_handle = {};
-                    s_second_out_dev        = nullptr;
-                }
                 ggml_sycl::alloc_request req{};
                 req.queue                          = stream_second;
                 req.device                         = sec_dev;
@@ -56178,13 +56196,17 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
                 req.intent.role                    = ggml_sycl::alloc_role::STAGING;
                 req.intent.category                = ggml_sycl::runtime_category::STAGING;
                 req.intent.constraints.must_device = true;
-                ggml_sycl::alloc_handle second_out_owner{};
-                if (ggml_sycl::unified_alloc(req, &second_out_owner) && second_out_owner.ptr) {
-                    s_second_out_dev_handle =
-                        ggml_sycl::detail::from_legacy_owned_alloc(std::move(second_out_owner), GGML_LAYOUT_AOS);
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+                if (allocation) {
+                    ggml_sycl::mem_handle replacement =
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                    const auto resolved = replacement.resolve(sec_dev);
+                    if (resolved.ptr && resolved.on_device) {
+                        s_second_out_dev_handle = std::move(replacement);
+                        s_second_out_dev        = static_cast<float *>(resolved.ptr);
+                        s_second_out_dev_sz     = second_out_bytes;
+                    }
                 }
-                s_second_out_dev    = static_cast<float *>(s_second_out_dev_handle.resolve(sec_dev).ptr);
-                s_second_out_dev_sz = s_second_out_dev ? second_out_bytes : 0;
             }
             if (!s_second_out_dev) {
                 return false;
@@ -74543,11 +74565,17 @@ static ggml_sycl::mem_handle ggml_sycl_block_exec_alloc_host_stage_handle(sycl::
     req.intent.constraints.must_device           = false;
     req.intent.constraints.use_pinned_pool       = true;
     req.intent.constraints.require_host_usm_base = true;
-    ggml_sycl::alloc_handle host_stage_owner{};
-    if (!ggml_sycl::unified_alloc(req, &host_stage_owner) || !host_stage_owner.ptr) {
+    ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+    if (!allocation) {
         return {};
     }
-    return ggml_sycl::detail::from_legacy_owned_alloc(std::move(host_stage_owner), GGML_LAYOUT_AOS);
+    ggml_sycl::mem_handle owner =
+        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = owner.resolve(req.device);
+    if (!resolved.ptr || resolved.on_device) {
+        return {};
+    }
+    return owner;
 }
 
 static bool ggml_sycl_block_exec_queue_matches_device(sycl::queue & q, int device, bool require_single_device_context) {

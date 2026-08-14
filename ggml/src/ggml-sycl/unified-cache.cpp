@@ -14720,23 +14720,7 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
         return true;
     }
 
-    // Free existing if resizing
-    if (reorder_temp_buffer_) {
-        if (reorder_temp_owner_.valid()) {
-            reorder_temp_owner_ = {};
-        } else if (vram_owns(reorder_temp_buffer_)) {
-            zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
-        } else {
-            GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing alloc_handle owner ptr=%p\n",
-                           reorder_temp_buffer_);
-            GGML_ASSERT(false && "direct reorder temp buffer missing alloc_handle owner");
-        }
-        reorder_temp_buffer_ = nullptr;
-        reorder_temp_size_   = 0;
-        reorder_temp_owner_  = {};
-    }
-
-    // Allocate temp buffer for GPU-side AOS→SOA reorder.
+    // Allocate and validate a replacement before disturbing the published buffer.
     // Called from moe_hybrid_init_once under std::call_once — single-threaded.
     if (arena_active()) {
         alloc_request req{};
@@ -14748,20 +14732,29 @@ bool unified_cache::reserve_reorder_temp(size_t size_bytes) {
         req.intent.cohort_id                    = "moe-reorder-temp";
         req.intent.constraints.must_device      = true;
         req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
-        alloc_handle owner{};
-        if (!unified_alloc(req, &owner) || !owner.ptr) {
+        allocation_result allocation = unified_allocate_owner(req);
+        if (!allocation) {
             GGML_LOG_WARN("[UNIFIED-CACHE] failed to reserve GPU reorder temp buffer (%.1f MB)\n",
                           size_bytes / (1024.0f * 1024.0f));
             return false;
         }
-        reorder_temp_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
-        auto resolved       = reorder_temp_owner_.resolve(req.device);
-        if (!resolved || !resolved.on_device) {
+        mem_handle replacement = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = replacement.resolve(req.device);
+        if (!resolved.ptr || !resolved.on_device) {
             GGML_LOG_WARN("[UNIFIED-CACHE] failed to resolve GPU reorder temp buffer owner (%.1f MB)\n",
                           size_bytes / (1024.0f * 1024.0f));
-            reorder_temp_owner_ = {};
             return false;
         }
+        if (reorder_temp_buffer_ && !reorder_temp_owner_.valid()) {
+            if (vram_owns(reorder_temp_buffer_)) {
+                zone_free(vram_zone_id::SCRATCH, reorder_temp_buffer_);
+            } else {
+                GGML_LOG_ERROR("[UNIFIED-CACHE] direct reorder temp buffer missing owner ptr=%p\n",
+                               reorder_temp_buffer_);
+                GGML_ASSERT(false && "direct reorder temp buffer missing owner");
+            }
+        }
+        reorder_temp_owner_  = std::move(replacement);
         reorder_temp_buffer_ = resolved.ptr;
         reorder_temp_size_   = size_bytes;
         GGML_LOG_INFO("[UNIFIED-CACHE] Reserved GPU reorder temp buffer (unified): %.1f MB\n",
@@ -17387,14 +17380,20 @@ bool unified_cache_fill_with_host_copy(int           device_id,
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool  = true;
 
-    alloc_handle host_stage_owner{};
-    if (!unified_alloc(req, &host_stage_owner) || !host_stage_owner.ptr) {
+    allocation_result allocation = unified_allocate_owner(req);
+    if (!allocation) {
         GGML_LOG_ERROR("[UNIFIED-CACHE] %s: failed to allocate %.1f MB host fill buffer\n",
                        tag ? tag : "fill-with-host-copy", chunk_bytes / (1024.0 * 1024.0));
         return false;
     }
 
-    mem_handle src_handle = detail::from_legacy_owned_alloc(std::move(host_stage_owner), GGML_LAYOUT_AOS);
+    mem_handle src_handle = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+    const auto resolved = src_handle.resolve(device_id);
+    if (!resolved.ptr || resolved.on_device) {
+        GGML_LOG_ERROR("[UNIFIED-CACHE] %s: host fill owner resolved with wrong routing\n",
+                       tag ? tag : "fill-with-host-copy");
+        return false;
+    }
     mem_fill(src_handle, value, chunk_bytes, queue);
     size_t offset = 0;
     try {
