@@ -263,3 +263,34 @@ assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" i
 assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
 assert "g_expert_groups.swap(new_expert_groups)" in metadata
 print("PASS moe-metadata-atomic-publication-source-gate")
+
+# Reader side of the same contract. The writer publishing both registries under
+# one scoped_lock buys nothing if readers acquire them separately: a reader that
+# consults BOTH within one logical operation can otherwise pair one model's
+# metadata with the next model's groups, and expert_group_key carries no model
+# identity to catch it. Every such reader must go through one paired snapshot.
+snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
+assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
+assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
+assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
+
+# is_expert_resident must keep a lock-free overload, or a dual reader holding a
+# paired snapshot would have to re-enter the group lock to ask about residency --
+# reading a newer epoch than the metadata it holds, and deadlocking outright if
+# the snapshot lock were still held (shared_mutex is not recursive).
+assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
+resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
+assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
+
+# The two dual-consumer readers take the paired snapshot and never re-acquire
+# either mutex for the rest of the operation.
+for start, end, name in (
+    ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
+    ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
+):
+    block = region(RUNTIME, start, end)
+    assert "moe_snapshot_registries()" in block, name
+    assert "g_expert_groups_mutex" not in block, name
+    assert "g_moe_expert_meta_mutex" not in block, name
+    assert "is_expert_resident(" not in block, name
+print("PASS moe-registry-paired-snapshot-reader-source-gate")

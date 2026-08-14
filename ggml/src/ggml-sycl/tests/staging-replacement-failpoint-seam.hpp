@@ -69,9 +69,9 @@ GGML_SYCL_STAGING_FAILPOINT_LOCAL uint32_t ggml_sycl_staging_failpoint_traversal
 // the seam fewer times than it claimed to.
 GGML_SYCL_STAGING_FAILPOINT_LOCAL uint32_t ggml_sycl_staging_failpoint_armed_remaining(ggml_sycl_staging_failpoint fp);
 
-// Rollback drains taken by the retirement transaction (secure() catch plus
-// publication_failed()). This counts the staging region's own drains only, not
-// every ggml_sycl_drain_direct_stage_queue() caller.
+// Rollback drains taken by the retirement transaction's secure() handler. This
+// counts the staging region's own drains only, not every
+// ggml_sycl_drain_direct_stage_queue() caller.
 GGML_SYCL_STAGING_FAILPOINT_LOCAL uint32_t ggml_sycl_staging_failpoint_retirement_drains();
 
 // ---------------------------------------------------------------------------

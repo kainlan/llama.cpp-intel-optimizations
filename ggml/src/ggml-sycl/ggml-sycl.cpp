@@ -3025,25 +3025,22 @@ class ggml_sycl_old_owner_retirement {
             secured_ = true;
             return true;
         } catch (...) {
-            drain_rollback();
+            GGML_SYCL_STAGING_FAILPOINT_COUNT_RETIREMENT_DRAIN();
+            if (queue_) {
+                ggml_sycl_drain_direct_stage_queue(*queue_);
+            }
             return false;
         }
     }
 
-    void publication_failed() noexcept {
-        if (!secured_) {
-            drain_rollback();
-        }
-    }
+    // There is deliberately no post-publication rollback entry point. Every
+    // caller bails the moment secure() returns false, and everything it does
+    // afterwards -- moving handles, assigning sizes, setting the validity flag --
+    // is noexcept, so "secured but failed to publish" is not a reachable state.
+    // A future caller that adds a throwing step after secure() must drain the
+    // exact queue itself rather than reintroducing an unreachable hook here.
 
   private:
-    void drain_rollback() noexcept {
-        GGML_SYCL_STAGING_FAILPOINT_COUNT_RETIREMENT_DRAIN();
-        if (queue_) {
-            ggml_sycl_drain_direct_stage_queue(*queue_);
-        }
-    }
-
     ggml_sycl::retained_handle_publish_ticket publish_ticket_ = ggml_sycl::begin_retained_handle_publish();
     std::vector<ggml_sycl::mem_handle>        old_owners_;
     sycl::queue *                             queue_   = nullptr;
@@ -3577,10 +3574,38 @@ static ggml_sycl::moe_discovery_registry g_moe_discovery_registry(g_moe_live_dis
 // Checks the unified cache for ALL 3 tensors (gate, up, down) across multiple
 // layout modes (SOA, COALESCED, AOS, XMX_TILED).
 // Returns true only if all 3 tensors that have been registered are found.
-static bool is_expert_resident(int block_id, int expert_id, int device_id) {
-    std::shared_lock<std::shared_mutex> lock(g_expert_groups_mutex);
-    auto                                it = g_expert_groups.find(expert_group_key(block_id, expert_id));
-    if (it == g_expert_groups.end()) {
+// One consistent view of both MoE registries. moe_hybrid_init_once publishes
+// g_moe_expert_meta and g_expert_groups together under a single scoped_lock, so
+// a reader that consults BOTH within one logical operation has to acquire them
+// the same way. Taking them under separate locks admits a window in which a
+// concurrent init has swapped one and not the other, and expert_group_key
+// carries no model identity -- so a torn pair can resolve one model's metadata
+// against another model's group.
+struct moe_registry_snapshot {
+    std::vector<moe_expert_meta>                     meta;
+    std::unordered_map<int64_t, expert_tensor_group> groups;
+};
+
+static moe_registry_snapshot moe_snapshot_registries() {
+    moe_registry_snapshot snapshot;
+    std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);
+    snapshot.meta   = g_moe_expert_meta;
+    snapshot.groups = g_expert_groups;
+    return snapshot;
+}
+
+// Residency against a caller-held group view. Callers touching only the group
+// registry use the locking wrapper below. A caller that also reads the expert
+// metadata in the same operation must pass its paired snapshot here instead:
+// re-entering the group lock would read a possibly newer epoch than the
+// metadata it already holds, and doing so under a held scoped_lock would
+// deadlock on a non-recursive shared_mutex.
+static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups,
+                                  int                                                      block_id,
+                                  int                                                      expert_id,
+                                  int                                                      device_id) {
+    auto it = groups.find(expert_group_key(block_id, expert_id));
+    if (it == groups.end()) {
         return false;
     }
 
@@ -3638,6 +3663,11 @@ static bool is_expert_resident(int block_id, int expert_id, int device_id) {
 
     // At least one role must be registered
     return grp.has_gate || grp.has_up || grp.has_down;
+}
+
+static bool is_expert_resident(int block_id, int expert_id, int device_id) {
+    std::shared_lock<std::shared_mutex> lock(g_expert_groups_mutex);
+    return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id);
 }
 
 // Forward declarations needed by moe_prestage_popular_experts (defined later in file).
@@ -3885,13 +3915,16 @@ static void moe_prestage_popular_experts() {
         return;
     }
 
-    // Copy descriptors under the registry mutex. No registry element address
+    // Copy descriptors under the registry mutexes. No registry element address
     // may escape the critical section or be used by background staging.
-    std::vector<moe_expert_meta> expert_meta;
-    {
-        std::shared_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        expert_meta = g_moe_expert_meta;
-    }
+    //
+    // Both registries are taken as ONE paired snapshot: this pass reads the
+    // metadata here and then consults the group registry repeatedly (directly,
+    // and through is_expert_resident_in) far below. Acquiring them separately
+    // would let a moe_hybrid_init_once land in between and pair this model's
+    // metadata with the next model's groups.
+    const moe_registry_snapshot          registries  = moe_snapshot_registries();
+    const std::vector<moe_expert_meta> & expert_meta = registries.meta;
     if (expert_meta.empty()) {
         return;
     }
@@ -3993,7 +4026,7 @@ static void moe_prestage_popular_experts() {
             }
 
             // Skip experts already resident in VRAM on any device
-            if (is_expert_resident(meta.block_num, meta.expert_idx, device)) {
+            if (is_expert_resident_in(registries.groups, meta.block_num, meta.expert_idx, device)) {
                 skipped++;
                 continue;
             }
@@ -4136,15 +4169,15 @@ static void moe_prestage_popular_experts() {
         for (size_t gi = 0; gi < sorted_groups.size(); gi++) {
             const auto & mg = *sorted_groups[gi];
 
-            // Look up the expert group registry to get canonical cache keys
-            std::shared_lock<std::shared_mutex> grp_lock(g_expert_groups_mutex);
-            const int64_t                       gkey   = expert_group_key(mg.block_num, mg.expert_idx);
-            auto                                grp_it = g_expert_groups.find(gkey);
-            if (grp_it == g_expert_groups.end()) {
+            // Look up the expert group registry to get canonical cache keys.
+            // Reads the paired snapshot taken at entry, so these keys belong to
+            // the same publication epoch as the metadata that selected them.
+            const int64_t gkey   = expert_group_key(mg.block_num, mg.expert_idx);
+            auto          grp_it = registries.groups.find(gkey);
+            if (grp_it == registries.groups.end()) {
                 continue;
             }
             const auto & grp = grp_it->second;
-            grp_lock.unlock();
 
             // Build staging data for each tensor
             ggml_sycl::staging_tensor_data  gate_sd{}, up_sd{}, down_sd{};
@@ -4273,14 +4306,15 @@ static void moe_prestage_popular_experts() {
             "%.1f ms total (%s reorder)\n",
             expert_groups_staged, prestaged, total_ms, use_gpu_reorder ? "GPU" : "CPU");
 
-        // Post-prestage verification: check is_expert_resident() for STAGED experts.
+        // Post-prestage verification: re-check residency for STAGED experts,
+        // against the snapshot this pass has been using throughout.
         // Uses sorted_groups (popularity-sorted) to check the ones we actually staged.
         {
             int ok = 0, fail = 0, checked = 0;
             for (size_t gi = 0; gi < sorted_groups.size() && checked < 10; gi++) {
                 const auto & mg = *sorted_groups[gi];
                 checked++;
-                if (is_expert_resident(mg.block_num, mg.expert_idx, device)) {
+                if (is_expert_resident_in(registries.groups, mg.block_num, mg.expert_idx, device)) {
                     ok++;
                 } else {
                     fail++;
@@ -4384,14 +4418,16 @@ static void moe_prestage_popular_experts() {
                 }
 
                 // Skip experts already resident on GPU0 (cache IS the placement)
-                if (meta->block_num >= 0 && is_expert_resident(meta->block_num, meta->expert_idx, 0)) {
+                if (meta->block_num >= 0 &&
+                    is_expert_resident_in(registries.groups, meta->block_num, meta->expert_idx, 0)) {
                     continue;
                 }
 
                 // Skip experts already resident on a secondary GPU
                 bool already_on_secondary = false;
                 for (auto & b : sec_budgets) {
-                    if (meta->block_num >= 0 && is_expert_resident(meta->block_num, meta->expert_idx, b.dev)) {
+                    if (meta->block_num >= 0 &&
+                        is_expert_resident_in(registries.groups, meta->block_num, meta->expert_idx, b.dev)) {
                         b.skipped++;
                         already_on_secondary = true;
                         break;
@@ -4756,7 +4792,7 @@ static void moe_prestage_popular_experts() {
 
             const int n_gpus_pin = ggml_sycl_info().total_gpu_count;
             for (int d = 0; d < n_gpus_pin && d < GGML_SYCL_MAX_DEVICES; d++) {
-                if (!is_expert_resident(meta_ptr->block_num, meta_ptr->expert_idx, d)) {
+                if (!is_expert_resident_in(registries.groups, meta_ptr->block_num, meta_ptr->expert_idx, d)) {
                     continue;
                 }
                 ggml_sycl::unified_cache * pin_cache = ggml_sycl::get_unified_cache_for_device(d);
@@ -4764,9 +4800,8 @@ static void moe_prestage_popular_experts() {
                     continue;
                 }
 
-                std::shared_lock<std::shared_mutex> grp_lock(g_expert_groups_mutex);
-                auto grp_it = g_expert_groups.find(expert_group_key(meta_ptr->block_num, meta_ptr->expert_idx));
-                if (grp_it == g_expert_groups.end()) {
+                auto grp_it = registries.groups.find(expert_group_key(meta_ptr->block_num, meta_ptr->expert_idx));
+                if (grp_it == registries.groups.end()) {
                     continue;
                 }
                 const auto & grp = grp_it->second;
@@ -6593,16 +6628,16 @@ struct adaptive_prestage_state {
 
         std::vector<promotion_candidate> candidates;
 
-        // We need block_num for is_expert_resident checks. Build layer_hash->block_num map
-        // from g_moe_expert_meta.
+        // We need block_num for the residency checks. Build layer_hash->block_num
+        // from the metadata, and keep the group registry from the SAME snapshot:
+        // the residency check below consults the groups these block numbers were
+        // derived from, so the two must come from one publication epoch.
+        const moe_registry_snapshot      registries = moe_snapshot_registries();
         std::unordered_map<int64_t, int> expert_block_nums;
-        {
-            std::shared_lock<std::shared_mutex> meta_lock(g_moe_expert_meta_mutex);
-            for (const auto & meta : g_moe_expert_meta) {
-                if (meta.block_num >= 0) {
-                    int64_t key            = (int64_t(meta.layer_id) << 32) | int64_t(uint32_t(meta.expert_idx));
-                    expert_block_nums[key] = meta.block_num;
-                }
+        for (const auto & meta : registries.meta) {
+            if (meta.block_num >= 0) {
+                int64_t key            = (int64_t(meta.layer_id) << 32) | int64_t(uint32_t(meta.expert_idx));
+                expert_block_nums[key] = meta.block_num;
             }
         }
 
@@ -6622,7 +6657,7 @@ struct adaptive_prestage_state {
                 // Check if expert is already in VRAM via the cache
                 int64_t ekey  = (int64_t(hash_layer_id) << 32) | int64_t(uint32_t(e));
                 auto    bn_it = expert_block_nums.find(ekey);
-                if (bn_it != expert_block_nums.end() && is_expert_resident(bn_it->second, e, 0)) {
+                if (bn_it != expert_block_nums.end() && is_expert_resident_in(registries.groups, bn_it->second, e, 0)) {
                     continue;
                 }
 
@@ -6699,18 +6734,20 @@ struct adaptive_prestage_state {
                 // Re-check cache -- another thread may have promoted it.
                 // Use metadata to get block_num for is_expert_resident check.
                 {
-                    int block_num = -1;
-                    {
-                        std::shared_lock<std::shared_mutex> meta_lock(g_moe_expert_meta_mutex);
-                        for (const auto & meta : g_moe_expert_meta) {
-                            if (meta.layer_id == c.hash_layer_id && meta.expert_idx == c.expert_id &&
-                                meta.block_num >= 0) {
-                                block_num = meta.block_num;
-                                break;
-                            }
+                    // Paired snapshot: the block number comes from the metadata
+                    // and the residency answer from the groups, so both must be
+                    // read from one publication epoch. Re-snapshotted per
+                    // candidate on purpose -- this loop wants fresh state
+                    // between promotions, just not a torn pair within one.
+                    const moe_registry_snapshot registries = moe_snapshot_registries();
+                    int                         block_num  = -1;
+                    for (const auto & meta : registries.meta) {
+                        if (meta.layer_id == c.hash_layer_id && meta.expert_idx == c.expert_id && meta.block_num >= 0) {
+                            block_num = meta.block_num;
+                            break;
                         }
                     }
-                    if (block_num >= 0 && is_expert_resident(block_num, c.expert_id, 0)) {
+                    if (block_num >= 0 && is_expert_resident_in(registries.groups, block_num, c.expert_id, 0)) {
                         skipped++;
                         continue;
                     }
@@ -48711,14 +48748,23 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                         ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                     auto staging_resolved = staging_handle.resolve(device_id);
                     if (staging_resolved && staging_resolved.on_device) {
-                        ggml_sycl_old_owner_retirement retirement(stream, 1);
-                        retirement.hold(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
-                        if (!retirement.secure()) {
+                        // Same shape as the other three replacement sites: the
+                        // escrow's owner-vector reserve can throw, and that must
+                        // not escape the layout conversion. Nothing is queued on
+                        // this stream before secure(), so unlike the runtime
+                        // table path there is no drain owed in the handler.
+                        try {
+                            ggml_sycl_old_owner_retirement retirement(stream, 1);
+                            retirement.hold(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
+                            if (!retirement.secure()) {
+                                return false;
+                            }
+                            device_staging = static_cast<uint8_t *>(staging_resolved.ptr);
+                            extra->xmx_mxfp4_tiled_aos_staging_handle[device_id] = std::move(staging_handle);
+                            extra->xmx_mxfp4_tiled_aos_staging_size[device_id]   = aos_expert_size;
+                        } catch (const std::bad_alloc &) {
                             return false;
                         }
-                        device_staging = static_cast<uint8_t *>(staging_resolved.ptr);
-                        extra->xmx_mxfp4_tiled_aos_staging_handle[device_id] = std::move(staging_handle);
-                        extra->xmx_mxfp4_tiled_aos_staging_size[device_id]   = aos_expert_size;
                     }
                 }
             }
@@ -56424,13 +56470,17 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
         if (K < 0 || N_second < 0) {
             return false;
         }
-        size_t K_padded_size = 0;
-        size_t q8_blocks     = 0;
-        size_t q8_bytes      = 0;
+        size_t K_padded_size  = 0;
+        size_t q8_blocks      = 0;
+        size_t q8_bytes       = 0;
         size_t src1_f32_bytes = 0;
+        // Rounding to MATRIX_ROW_PADDING already lands on a whole number of
+        // Q8_1 blocks, so the second round-up this replaced was a no-op. That
+        // is a property of the two constants, not of this code, so assert it
+        // rather than leaving a redundant call to imply otherwise.
+        static_assert(MATRIX_ROW_PADDING % QK8_1 == 0,
+                      "K_padded must be a whole number of Q8_1 blocks; restore the QK8_1 round-up if this changes");
         if (!ggml_sycl_checked_round_up_size(static_cast<size_t>(K), MATRIX_ROW_PADDING, &K_padded_size) ||
-            K_padded_size > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
-            !ggml_sycl_checked_round_up_size(K_padded_size, QK8_1, &K_padded_size) ||
             K_padded_size > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
             !ggml_sycl_checked_mul_size(static_cast<size_t>(K), sizeof(float), &src1_f32_bytes)) {
             return false;
