@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Source gate for owner-first staging and w295 transactional growth contracts."""
+import os
+import re
+import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -7,6 +10,7 @@ SYCL = ROOT / "ggml/src/ggml-sycl"
 FATTN = (SYCL / "fattn.cpp").read_text()
 RUNTIME = (SYCL / "ggml-sycl.cpp").read_text()
 CACHE = (SYCL / "unified-cache.cpp").read_text()
+CACHE_HPP = (SYCL / "unified-cache.hpp").read_text()
 COMMON = (SYCL / "common.hpp").read_text()
 COMMON_IMPL = (SYCL / "common.cpp").read_text()
 
@@ -249,3 +253,211 @@ assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" i
 assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
 assert "g_expert_groups.swap(new_expert_groups)" in metadata
 print("PASS moe-metadata-atomic-publication-source-gate")
+
+# HM Task 2 (llama.cpp-81gt): CACHE_BACKING classification must be unforgeable.
+# `alloc_constraints.cache_backing` was a public caller-writable bool, so any
+# caller could mint the ownership class that shutdown exempts from destructive
+# teardown refusal. Provenance now comes from a private token whose header only
+# the two legitimate mint sites may include.
+PROVENANCE_HEADER = "allocation-provenance.hpp"
+PROVENANCE_MINTERS = ("unified-cache.cpp", "pinned-pool.cpp")
+
+
+def struct_body(source: str, name: str) -> str:
+    start = source.index("struct %s {" % name)
+    return source[start:source.index("\n};", start)]
+
+
+def check_cache_backing_not_public(header: str) -> list:
+    problems = []
+    for public_struct in ("alloc_constraints", "alloc_intent", "alloc_request"):
+        if "cache_backing" in struct_body(header, public_struct):
+            problems.append("%s still exposes caller-writable cache_backing" % public_struct)
+    return problems
+
+
+def _provenance_includers(skip_dot_directories: bool) -> list:
+    """Sources including the private header. skip_dot_directories is a parameter so the
+    real check and its control below exercise this one walk, never two copies of it."""
+    includers = []
+    for path in sorted(ROOT.rglob("*")):
+        if not path.is_file() or path.suffix not in (".c", ".cpp", ".h", ".hpp"):
+            continue
+        relative = path.relative_to(ROOT)
+        parts = relative.parts
+        if ".git" in parts or any(part.startswith("build") for part in parts):
+            continue
+        # Dot-prefixed scratch build dirs (.build-*) hold stale copies of these same
+        # sources; descending them reports findings against files nobody is editing.
+        if skip_dot_directories and any(part.startswith(".") for part in parts):
+            continue
+        if '#include "%s"' % PROVENANCE_HEADER in path.read_text(errors="ignore"):
+            includers.append(relative.as_posix())
+    return includers
+
+
+def check_provenance_header_private() -> list:
+    problems = []
+    includers = _provenance_includers(skip_dot_directories=True)
+    # Positive control: a header nobody includes would let this check pass
+    # vacuously forever, so absence is a failure rather than a clean result.
+    if not includers:
+        problems.append("no source includes %s -- the private provenance header is missing" % PROVENANCE_HEADER)
+    for included_by in includers:
+        if included_by.rsplit("/", 1)[-1] not in PROVENANCE_MINTERS:
+            problems.append("%s includes the private provenance header" % included_by)
+    return problems
+
+
+def check_dot_directory_skip_is_live() -> list:
+    """The dot-skip must be the reason a scratch copy is ignored, not luck.
+
+    Builds a throwaway dot-directory holding the private include, then asserts both
+    directions: the walk WOULD flag it without the skip (so the probe is real), and
+    does not flag it with the skip (so the skip is in force). Self-contained -- the
+    fixture is removed here, so the gate leaves no litter behind."""
+    problems = []
+    probe_dir = ROOT / (".contract-dotskip-probe-%d" % os.getpid())
+    try:
+        probe_dir.mkdir()
+        (probe_dir / "stale-copy.cpp").write_text('#include "%s"\n' % PROVENANCE_HEADER)
+        probe = "%s/stale-copy.cpp" % probe_dir.name
+        if probe not in _provenance_includers(skip_dot_directories=False):
+            problems.append("control is void: the dot-directory probe was undetectable even without the skip")
+        if probe in _provenance_includers(skip_dot_directories=True):
+            problems.append("dot-directory skip is not in force: %s was scanned" % probe)
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    if probe_dir.exists():
+        problems.append("control left its fixture behind at %s" % probe_dir)
+    return problems
+
+
+# CACHE_BACKING's second mint path. The unified_cache constructor's staging adopt
+# passes cache_backing=true as a plain bool to unified_cache_adopt_raw_host_allocation().
+# It cannot route through unified_allocate_owner_backing() -- that adopt runs during
+# cache construction and would depend circularly on the coordinator -- so it stays a
+# bootstrap mint. Unlike the token, nothing about a bool parameter is unforgeable by
+# construction, so its containment is asserted here instead: the helper must stay
+# TU-static (unreachable from another translation unit) AND exactly one call site may
+# pass true (so a second bootstrap mint cannot be added without review).
+ADOPT_MINT_HELPER = "unified_cache_adopt_raw_host_allocation"
+ADOPT_CACHE_BACKING_ARG = 6  # 0-based: ptr, size, queue, role, category, cohort_id, cache_backing
+
+
+def _blank_comments(source: str) -> str:
+    """Replace // and /* */ comment bodies with spaces, preserving offsets and string
+    literals. Without this, prose naming a function reads as a call to it -- the
+    comments documenting this very mechanism would otherwise keep the "scan matched
+    nothing" control below permanently satisfied by a phantom zero-argument call."""
+    out, index, size = [], 0, len(source)
+    while index < size:
+        char = source[index]
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            index += 1
+            while index < size:
+                if source[index] == "\\":
+                    out.append(source[index:index + 2])
+                    index += 2
+                    continue
+                out.append(source[index])
+                index += 1
+                if source[index - 1] == quote:
+                    break
+            continue
+        if source.startswith("//", index):
+            while index < size and source[index] != "\n":
+                out.append(" ")
+                index += 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            end = size if end < 0 else end + 2
+            out.extend("\n" if c == "\n" else " " for c in source[index:end])
+            index = end
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _call_argument_lists(source: str, function: str) -> list:
+    """Argument text of every CALL to `function`, skipping its declaration/definition."""
+    calls = []
+    for match in re.finditer(r"\b%s\s*\(" % function, source):
+        if re.search(r"alloc_handle[ \t]+$", source[max(0, match.start() - 40):match.start()]):
+            continue  # a signature, not a call
+        depth, index = 1, match.end()
+        while index < len(source) and depth:
+            if source[index] == "(":
+                depth += 1
+            elif source[index] == ")":
+                depth -= 1
+            index += 1
+        calls.append(source[match.end():index - 1])
+    return calls
+
+
+def _split_top_level_arguments(argument_text: str) -> list:
+    arguments, depth, current, in_string = [], 0, "", False
+    for char in argument_text:
+        if char == '"':
+            in_string = not in_string
+        if not in_string:
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                arguments.append(current.strip())
+                current = ""
+                continue
+        current += char
+    if current.strip():
+        arguments.append(current.strip())
+    return arguments
+
+
+def check_internal_backing_mint_stays_private(cache_cpp: str) -> list:
+    problems = []
+    # Scan code only. Comments in this file name the helper while explaining it.
+    cache_cpp = _blank_comments(cache_cpp)
+    signatures = re.findall(
+        r"^[ \t]*(static[ \t]+)?alloc_handle[ \t]+%s[ \t]*\(" % ADOPT_MINT_HELPER,
+        cache_cpp,
+        re.MULTILINE,
+    )
+    # Positive control: the forward declaration and the definition. If the symbol
+    # is renamed or removed this count drops and the gate fails loudly instead of
+    # silently vouching for a helper it can no longer see.
+    if len(signatures) != 2:
+        problems.append(
+            "expected 2 %s signatures (declaration + definition), found %d" % (ADOPT_MINT_HELPER, len(signatures)))
+    if any(not qualifier for qualifier in signatures):
+        problems.append(
+            "%s is no longer TU-static -- an exported backing mint is a forgeable authority" % ADOPT_MINT_HELPER)
+
+    calls = _call_argument_lists(cache_cpp, ADOPT_MINT_HELPER)
+    # Positive control again: zero calls means the scanner stopped matching real
+    # code, not that the codebase became safe.
+    if not calls:
+        problems.append("found no call to %s -- the call-site scan matched nothing" % ADOPT_MINT_HELPER)
+    minting = []
+    for argument_text in calls:
+        arguments = _split_top_level_arguments(argument_text)
+        if len(arguments) > ADOPT_CACHE_BACKING_ARG and arguments[ADOPT_CACHE_BACKING_ARG] == "true":
+            minting.append(" ".join(argument_text.split())[:80])
+    if len(minting) != 1:
+        problems.append(
+            "expected exactly 1 bootstrap mint (cache_backing=true) call to %s, found %d: %s" %
+            (ADOPT_MINT_HELPER, len(minting), minting))
+    return problems
+
+
+provenance_problems = (check_cache_backing_not_public(CACHE_HPP) + check_provenance_header_private() +
+                       check_dot_directory_skip_is_live() +
+                       check_internal_backing_mint_stays_private(CACHE))
+assert not provenance_problems, "\n".join(provenance_problems)
+print("PASS cache-backing-provenance-private-source-gate")

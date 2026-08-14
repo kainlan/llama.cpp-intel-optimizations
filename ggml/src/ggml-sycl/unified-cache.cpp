@@ -7,6 +7,7 @@
 #include "unified-cache.hpp"
 
 #include "alloc-registry.hpp"
+#include "allocation-provenance.hpp"
 #include "common.hpp"
 #include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
@@ -738,6 +739,11 @@ static std::mutex            g_runtime_alloc_mutex;
 static std::mutex            g_allocation_coordinator_mutex;
 static std::unordered_map<int, std::shared_ptr<allocation_release_coordinator>> g_allocation_coordinators;
 thread_local alloc_owner_control * g_allocating_owner_control = nullptr;
+
+// Internally-minted backing provenance for the legacy allocation adapter
+// beneath unified_allocate_owner_backing(). Only that overload sets it, so the
+// persistence sites below can never copy a caller-supplied request field.
+thread_local bool g_allocating_cache_backing = false;
 
 static registered_release_status release_registered_allocation_owned(
     const alloc_metadata & exact_key, registered_release_mode mode, bool require_exact_key,
@@ -2975,6 +2981,9 @@ unified_cache::unified_cache(sycl::queue & queue,
         staging_ = unified_cache_malloc_host_tracked(staging_size, queue_, "unified_cache:staging");
         if (staging_) {
             staging_size_ = staging_size;
+            // Internal provenance mint: this helper is TU-static; the literal
+            // `true` is cache-internal authority, not caller input. Must never
+            // be exported.
             alloc_handle owner =
                 unified_cache_adopt_raw_host_allocation(staging_, staging_size_, queue_, alloc_role::STAGING,
                                                         runtime_category::STAGING, "unified_cache:staging", true);
@@ -11734,7 +11743,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             rec.handle.alloc_id     = reserved_alloc_id;
             rec.handle.vram_zone    = zid;
             rec.handle.zone_managed  = true;
-            rec.handle.cache_backing = req.intent.constraints.cache_backing;
+            rec.handle.cache_backing = g_allocating_cache_backing;
             rec.queue                = req.queue;
             if (req.queue) rec.queue_keepalive = *req.queue;
             rec.zone_managed = true;
@@ -12070,7 +12079,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.arena_extent     = exact_arena.extent;
         rec.handle.vram_zone        = output_metadata.vram_zone;
         rec.handle.zone_managed     = output_metadata.zone_managed;
-        rec.handle.cache_backing    = req.intent.constraints.cache_backing;
+        rec.handle.cache_backing    = g_allocating_cache_backing;
         rec.handle.host_zone        = output_metadata.host_zone;
         rec.queue                   = req.queue;
         try {
@@ -12572,7 +12581,11 @@ allocation_result detail::promote_legacy_alloc_owner(alloc_handle && handle) noe
     }
 }
 
-allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
+// Shared body of the public and backing owner-allocation entry points.
+// internal_cache_backing is provenance the caller cannot express: it is true
+// only beneath unified_allocate_owner_backing(), which requires a private
+// cache_backing_token to reach.
+static allocation_result unified_allocate_owner_impl(const alloc_request & req, bool internal_cache_backing) noexcept {
     allocation_result result;
     alloc_owner_control * control = nullptr;
     try {
@@ -12583,7 +12596,7 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
         if (req.size == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
             (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0) ||
             (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) ||
-            (req.intent.constraints.cache_backing &&
+            (internal_cache_backing &&
              (!req.intent.constraints.require_host_usm_base || !req.intent.constraints.must_host_pinned))) {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
@@ -12593,8 +12606,14 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
         }
-        const bool pinned_backing = req.intent.constraints.cache_backing;
-        const bool cache_suballocation = !pinned_backing &&
+        const bool pinned_backing = internal_cache_backing;
+        // A standalone host USM base is a driver-visible allocation base, not an
+        // interior slice of any cache arena. Without the private backing token it
+        // is an ordinary external allocation, never a cache suballocation.
+        const bool standalone_host_usm_base =
+            req.intent.constraints.require_host_usm_base && req.intent.constraints.must_host_pinned;
+        const bool cache_suballocation =
+            !pinned_backing && !standalone_host_usm_base &&
             (req.intent.constraints.use_pinned_pool || req.intent.constraints.must_host_pinned ||
              req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT || req.intent.role == alloc_role::KV);
         const allocation_control_class ownership_class = pinned_backing ? allocation_control_class::CACHE_BACKING :
@@ -12608,11 +12627,20 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
 
         struct adapter_scope {
             alloc_owner_control * previous;
-            explicit adapter_scope(alloc_owner_control * current) : previous(g_allocating_owner_control) {
+            bool                  previous_cache_backing;
+
+            adapter_scope(alloc_owner_control * current, bool cache_backing) :
+                previous(g_allocating_owner_control),
+                previous_cache_backing(g_allocating_cache_backing) {
                 g_allocating_owner_control = current;
+                g_allocating_cache_backing = cache_backing;
             }
-            ~adapter_scope() { g_allocating_owner_control = previous; }
-        } scope(control);
+
+            ~adapter_scope() {
+                g_allocating_owner_control = previous;
+                g_allocating_cache_backing = previous_cache_backing;
+            }
+        } scope(control, internal_cache_backing);
 
         alloc_handle legacy;
         if (!unified_alloc(req, &legacy) || !legacy.ptr) {
@@ -12641,6 +12669,20 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
         result.error = allocation_error::CONTROL_ALLOCATION_FAILED;
         return result;
     }
+}
+
+allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
+    // Public entry point: backing provenance is not expressible by a caller.
+    return unified_allocate_owner_impl(req, false);
+}
+
+allocation_result unified_allocate_owner_backing(const alloc_request & req, cache_backing_token) noexcept {
+    // Reaching this overload required constructing a cache_backing_token, which
+    // only pinned_chunk_pool can do. The token is the whole authority; nothing
+    // about req is trusted to establish it. This is the pinned pool's mint path;
+    // the cache's own staging buffer bootstraps separately through the TU-static
+    // unified_cache_adopt_raw_host_allocation() (see allocation-provenance.hpp).
+    return unified_allocate_owner_impl(req, true);
 }
 
 mem_handle unified_allocate(const alloc_request & req) {

@@ -3915,6 +3915,11 @@ enum class offload_buffer_role : uint8_t {
     OTHER              = 6,
 };
 
+// Caller-writable routing constraints. Deliberately cannot express physical
+// cache/pool backing: such a field would let any caller mint the CACHE_BACKING
+// ownership class, which shutdown exempts from destructive-teardown refusal.
+// That provenance is minted privately (see allocation-provenance.hpp), so a
+// public must_host_pinned + require_host_usm_base request is EXTERNAL_EXACT.
 struct alloc_constraints {
     bool         must_device                = false;
     bool         must_host_pinned           = false;
@@ -3928,10 +3933,6 @@ struct alloc_constraints {
     // slice.  Some Level Zero copy paths need the host pointer to be a
     // driver-visible USM allocation base, not an interior TLSF suballocation.
     bool         require_host_usm_base      = false;
-    // This standalone allocation is physical backing owned by a cache/pool.
-    // Backing creation routes set this explicitly; ordinary standalone host
-    // allocations must not be inferred as backing from cohort names.
-    bool         cache_backing              = false;
     // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
