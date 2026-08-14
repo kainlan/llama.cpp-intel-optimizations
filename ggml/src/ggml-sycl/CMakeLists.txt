@@ -283,17 +283,10 @@ if (BUILD_TESTING)
     target_include_directories(test-sycl-lifecycle-runtime-wrapper PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     if (GGML_BACKEND_DL)
-        set(GGML_SYCL_RENAMED_RUNTIME_MODULE
-            "$<TARGET_FILE_DIR:ggml-sycl>/ggml-sycl-lifecycle-renamed$<TARGET_FILE_SUFFIX:ggml-sycl>")
-        add_custom_command(TARGET ggml-sycl POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "$<TARGET_FILE:ggml-sycl>" "${GGML_SYCL_RENAMED_RUNTIME_MODULE}"
-            COMMENT "Creating renamed SYCL lifecycle DSO fixture")
-        target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE
-            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>"
-            GGML_SYCL_RENAMED_RUNTIME_MODULE="${GGML_SYCL_RENAMED_RUNTIME_MODULE}")
+        # The DL fixture is wired to the private registry carrier declared after
+        # ggml-sycl's build settings are finalized below. The ordinary module
+        # remains a production artifact and is independently RTLD_NOW/audited.
         target_link_libraries(test-sycl-lifecycle-runtime-wrapper PRIVATE ggml ${CMAKE_DL_LIBS})
-        add_dependencies(test-sycl-lifecycle-runtime-wrapper ggml-sycl)
     else()
         # The mutable lifecycle controls live only in the private full-source
         # object fixture declared below. The ordinary ggml-sycl DSO remains on
@@ -4787,5 +4780,47 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
             ${_ggml_sycl_private_fixture_binaries})
     set_tests_properties(sycl-private-carrier-linkage PROPERTIES
         LABELS "sycl;private-carrier;artifact;host"
+        TIMEOUT 120)
+endif()
+
+# A DL lifecycle test needs mutable seed/failure procedures, but compiling those
+# procedures into the ordinary module would turn BUILD_TESTING into an ABI and
+# payload change. Clone the finalized backend settings into a private module:
+# its registry owns the callable procedures while libggml-sycl stays production
+# identical. The wrapper loads this carrier; the ordinary module is still built
+# first and passes its RTLD_NOW/dependency/seam POST_BUILD audit without loading
+# (or depending on) the carrier.
+if (BUILD_TESTING AND GGML_BACKEND_DL)
+    get_target_property(_sycl_lifecycle_carrier_sources ggml-sycl SOURCES)
+    add_library(ggml-sycl-lifecycle-private-carrier MODULE EXCLUDE_FROM_ALL
+        ${_sycl_lifecycle_carrier_sources})
+    foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_LIBRARIES)
+        get_target_property(_value ggml-sycl ${_property})
+        if (_value AND NOT _value STREQUAL "_value-NOTFOUND")
+            set_property(TARGET ggml-sycl-lifecycle-private-carrier PROPERTY ${_property} "${_value}")
+        endif()
+    endforeach()
+    target_compile_definitions(ggml-sycl-lifecycle-private-carrier PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
+    set_target_properties(ggml-sycl-lifecycle-private-carrier PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        OUTPUT_NAME ggml-sycl-lifecycle-private-carrier)
+
+    set(GGML_SYCL_RENAMED_RUNTIME_MODULE
+        "$<TARGET_FILE_DIR:ggml-sycl-lifecycle-private-carrier>/ggml-sycl-lifecycle-private-carrier-renamed$<TARGET_FILE_SUFFIX:ggml-sycl-lifecycle-private-carrier>")
+    add_custom_command(TARGET ggml-sycl-lifecycle-private-carrier POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:ggml-sycl-lifecycle-private-carrier>" "${GGML_SYCL_RENAMED_RUNTIME_MODULE}"
+        COMMENT "Creating renamed private SYCL lifecycle carrier fixture")
+    target_compile_definitions(test-sycl-lifecycle-runtime-wrapper PRIVATE
+        GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl-lifecycle-private-carrier>"
+        GGML_SYCL_RENAMED_RUNTIME_MODULE="${GGML_SYCL_RENAMED_RUNTIME_MODULE}")
+    add_dependencies(test-sycl-lifecycle-runtime-wrapper
+        ggml-sycl ggml-sycl-lifecycle-private-carrier)
+    add_test(NAME sycl-lifecycle-private-carrier-linkage
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-private-carrier-linkage.py
+            $<TARGET_FILE:ggml-sycl-lifecycle-private-carrier>)
+    set_tests_properties(sycl-lifecycle-private-carrier-linkage PROPERTIES
+        LABELS "sycl;lifecycle;private-carrier;artifact;host"
         TIMEOUT 120)
 endif()

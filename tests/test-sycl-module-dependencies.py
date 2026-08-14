@@ -26,11 +26,14 @@ elif sys.platform == "win32":
 else:
     readelf = shutil.which("readelf")
     nm = shutil.which("nm")
-    if not readelf or not nm:
-        raise SystemExit("readelf and nm are required for the ELF module dependency test")
+    strings_tool = shutil.which("strings")
+    if not readelf or not nm or not strings_tool:
+        raise SystemExit("readelf, nm, and strings are required for the ELF module dependency test")
     deps = subprocess.check_output([readelf, "-d", str(module)], text=True)
     symbols = subprocess.check_output([nm, "-D", "--undefined-only", "-C", str(module)], text=True)
     exports = subprocess.check_output([nm, "-D", "--defined-only", "-C", str(module)], text=True)
+    payload_symbols = subprocess.check_output([nm, "-C", str(module)], text=True)
+    payload_strings = subprocess.check_output([strings_tool, str(module)], text=True)
 
 if "ggml-cpu" in deps.lower() or "ggml_cpu" in deps.lower():
     raise SystemExit("SYCL module has a CPU DT_NEEDED/import dependency:\n" + deps)
@@ -66,6 +69,14 @@ private_exports = (
 leaked_exports = [line for line in exports.splitlines() if any(name in line for name in private_exports)]
 if leaked_exports:
     raise SystemExit("SYCL module exports private test/failure seams:\n" + "\n".join(leaked_exports))
+
+# The reload seed must not survive merely as a local symbol or string either.
+# It belongs to the separately built lifecycle carrier's registry; checking only
+# the dynamic export table would miss a hidden-but-still-mutable ordinary seam.
+if sys.platform not in ("darwin", "win32"):
+    reload_seed = "ggml_backend_sycl_test_seed_moe_module_state"
+    if reload_seed in payload_symbols or reload_seed in payload_strings:
+        raise SystemExit(f"ordinary SYCL module contains private reload seed payload {reload_seed}")
 
 try:
     if sys.platform == "win32":
