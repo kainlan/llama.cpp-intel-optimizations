@@ -2088,8 +2088,13 @@ target_link_options(test-sycl-mem-handle-concurrent-resolve PRIVATE ${MEM_HANDLE
 target_compile_definitions(test-sycl-mem-handle-concurrent-resolve PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE ggml-base ggml ggml-sycl)
+# The fixture defines a private mem_handle factory and calls private allocator
+# seams. Use the single private backend carrier; linking ordinary ggml-sycl as
+# well would duplicate backend process globals and their teardown.
+target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE
+    ggml-sycl-private-fixtures Threads::Threads)
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-mem-handle-concurrent-resolve PRIVATE IntelSYCL::SYCL_CXX)
 endif()
@@ -4728,6 +4733,7 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
+        test-sycl-mem-handle-concurrent-resolve
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle
         test-unified-cache-bugs
