@@ -572,7 +572,7 @@ done; done
 - [ ] New epic created: "EPIC: post-merge Q1/NVFP4 device decode program" (P1) with the ruling quoted in its description.
 - [ ] `sgox`, `zqoe`, `7vpd`, `5i7z`, `o54r`, `h690`, `tjk4` re-parented: `task_dep` edges added to the new epic; their `blocks` edges onto `bwmz` AND `ona8` removed (`task_dep_remove`). Their own sub-dependencies (`s0h5`, `hbyo`, `vpjy`, `ihkf`, `igi0`, `yej4`, `32dg8.15.15`) ride along — verify each still has a path to the new epic.
 - [ ] `bwmz` and `ona8` descriptions amended: done-criteria now = this plan; a comment quotes the 2026-08-14 owner ruling verbatim.
-- [ ] Remaining `bwmz` deps after re-scope: exactly `ona8`, `7m27`, `ytqx` (7m27/ytqx close via Tasks 10/12).
+- [ ] Remaining `bwmz` deps after re-scope: exactly `ona8`, `7m27`, `ytqx`, `0bot` (7m27/ytqx close via Tasks 10/12; 0bot via Task 8 + Task 13's green backend-ops). [Amended 2026-08-14: the original line omitted `0bot`, whose direct bwmz edge predates this plan and is semantically correct under hardening-first — lead ruling on llama.cpp-hfw0.]
 - [ ] Stale `in_progress` leases reset to open on every re-parented task (`o54r`, `7m27` currently carry `pi-orchestrator` leases; 7m27 stays in_progress only while Task 10 actively owns it).
 - [ ] `llama.cpp-0bot` re-scoped, not deferred: retitle/annotate to its minimal converter scope (Task 8) and keep it blocking `ona8`; its feature-program deps (`vpjy`, `zqoe`, `7vpd`, `5i7z`) move to the new epic.
 
