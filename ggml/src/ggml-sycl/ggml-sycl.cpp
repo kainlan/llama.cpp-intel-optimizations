@@ -2899,6 +2899,77 @@ static void ggml_sycl_drain_direct_stage_queue(sycl::queue & queue) noexcept {
     }
 }
 
+static bool ggml_sycl_checked_add_size(size_t a, size_t b, size_t * out) noexcept {
+    if (!out || a > std::numeric_limits<size_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+static bool ggml_sycl_checked_mul_size(size_t a, size_t b, size_t * out) noexcept {
+    if (!out || (a != 0 && b > std::numeric_limits<size_t>::max() / a)) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+static bool ggml_sycl_checked_round_up_size(size_t value, size_t alignment, size_t * out) noexcept {
+    if (!out || alignment == 0) {
+        return false;
+    }
+    const size_t remainder = value % alignment;
+    return remainder == 0 ? (*out = value, true) : ggml_sycl_checked_add_size(value, alignment - remainder, out);
+}
+
+// Retire replacement victims against the exact queue that may still reference
+// them. The publisher ticket is deliberately constructed before owner-vector
+// growth. Copies of every old owner remain in this object until publication is
+// secured; if barrier submission or retention publication throws, the queue is
+// drained before those copies can leave scope. Callers publish replacements
+// only after secure() succeeds.
+class ggml_sycl_old_owner_retirement {
+  public:
+    explicit ggml_sycl_old_owner_retirement(sycl::queue & queue, size_t owner_capacity) : queue_(queue) {
+        old_owners_.reserve(owner_capacity);
+    }
+
+    void hold(const ggml_sycl::mem_handle & owner) {
+        if (owner.valid()) {
+            old_owners_.push_back(owner);
+        }
+    }
+
+    bool secure() noexcept {
+        if (old_owners_.empty()) {
+            secured_ = true;
+            return true;
+        }
+        try {
+            const sycl::event prior_queue_terminal = queue_.ext_oneapi_submit_barrier();
+            ggml_sycl::retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_);
+            secured_ = true;
+            return true;
+        } catch (...) {
+            ggml_sycl_drain_direct_stage_queue(queue_);
+            return false;
+        }
+    }
+
+    void publication_failed() noexcept {
+        if (!secured_) {
+            ggml_sycl_drain_direct_stage_queue(queue_);
+        }
+    }
+
+  private:
+    ggml_sycl::retained_handle_publish_ticket publish_ticket_ = ggml_sycl::begin_retained_handle_publish();
+    std::vector<ggml_sycl::mem_handle>         old_owners_;
+    sycl::queue &                              queue_;
+    bool                                       secured_ = false;
+};
+
 // Construct this before direct_stage_expert(). Field order is intentional: the
 // publisher ticket exists before owner-vector allocation and remains active
 // throughout the submit-to-retain handoff. The two vector slots are also
@@ -7192,11 +7263,15 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                       expert_list.size(), n_with_host_ptr, expert_list.size() - n_with_host_ptr);
     }
 
-    // Store per-expert metadata for proactive pre-staging after warmup.
-    {
-        std::unique_lock<std::shared_mutex> lock(g_moe_expert_meta_mutex);
-        g_moe_expert_meta.clear();
-        g_moe_expert_meta.reserve(expert_list.size());
+    // Build both views off to the side. Readers must observe metadata and the
+    // derived group registry from the same allocation epoch; bad_alloc leaves
+    // the previously published pair untouched.
+    std::vector<moe_expert_meta>                         new_expert_meta;
+    std::unordered_map<int64_t, expert_tensor_group>     new_expert_groups;
+    int                                                   n_groups_registered = 0;
+    int                                                   n_complete          = 0;
+    try {
+        new_expert_meta.reserve(expert_list.size());
         for (const auto & info : expert_list) {
             moe_expert_meta meta{};
             meta.canonical_key = ggml_sycl_get_moe_expert_cache_key(info.tensor, info.extra, info.expert_idx);
@@ -7212,46 +7287,26 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             meta.expert_idx  = info.expert_idx;
             meta.tensor_role = moe_classify_tensor(info.tensor->name);
             meta.block_num   = moe_extract_block_number(info.tensor->name);
-            g_moe_expert_meta.push_back(meta);
+            new_expert_meta.push_back(std::move(meta));
         }
-        GGML_LOG_INFO("[MOE-HYBRID] Expert metadata stored: %zu entries for post-warmup pre-staging\n",
-                      g_moe_expert_meta.size());
-    }
 
-    // -----------------------------------------------------------------------
-    // Build expert group registry: maps (block_id, expert_id) -> cache keys
-    // for gate/up/down tensors.  Used by is_expert_resident() for dispatch.
-    // -----------------------------------------------------------------------
-    {
-        std::unique_lock<std::shared_mutex> lock(g_expert_groups_mutex);
-        g_expert_groups.clear();
-
-        std::shared_lock<std::shared_mutex> meta_lock(g_moe_expert_meta_mutex);
-        int                                 n_groups_registered = 0;
-        for (const auto & meta : g_moe_expert_meta) {
-            if (meta.block_num < 0) {
+        new_expert_groups.reserve(new_expert_meta.size());
+        for (const auto & meta : new_expert_meta) {
+            if (meta.block_num < 0 || !meta.canonical_key.valid) {
                 continue;
             }
-            if (!meta.canonical_key.valid) {
-                continue;
-            }
-
-            const int64_t gkey = expert_group_key(meta.block_num, meta.expert_idx);
-            auto &        grp  = g_expert_groups[gkey];
-
-            const ggml_sycl_cache_id ckey = meta.canonical_key;
-
+            auto & grp = new_expert_groups[expert_group_key(meta.block_num, meta.expert_idx)];
             switch (meta.tensor_role) {
                 case MOE_TENSOR_GATE:
-                    grp.gate_key = ckey;
+                    grp.gate_key = meta.canonical_key;
                     grp.has_gate = true;
                     break;
                 case MOE_TENSOR_UP:
-                    grp.up_key = ckey;
+                    grp.up_key = meta.canonical_key;
                     grp.has_up = true;
                     break;
                 case MOE_TENSOR_DOWN:
-                    grp.down_key = ckey;
+                    grp.down_key = meta.canonical_key;
                     grp.has_down = true;
                     break;
                 default:
@@ -7259,19 +7314,30 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             }
             n_groups_registered++;
         }
-
-        // Count how many groups have all 3 tensors registered
-        int n_complete = 0;
-        for (const auto & [key, grp] : g_expert_groups) {
+        for (const auto & entry : new_expert_groups) {
+            const auto & grp = entry.second;
             if (grp.has_gate && grp.has_up && grp.has_down) {
                 n_complete++;
             }
         }
-        GGML_LOG_INFO(
-            "[MOE-HYBRID] Expert group registry: %zu groups (%d complete with gate+up+down), "
-            "%d entries registered\n",
-            g_expert_groups.size(), n_complete, n_groups_registered);
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR("[MOE-HYBRID] Expert metadata allocation failed; retaining prior registry epoch\n");
+        return;
     }
+
+    const size_t published_meta_count  = new_expert_meta.size();
+    const size_t published_group_count = new_expert_groups.size();
+    {
+        std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);
+        g_moe_expert_meta.swap(new_expert_meta);
+        g_expert_groups.swap(new_expert_groups);
+    }
+    GGML_LOG_INFO("[MOE-HYBRID] Expert metadata stored: %zu entries for post-warmup pre-staging\n",
+                  published_meta_count);
+    GGML_LOG_INFO(
+        "[MOE-HYBRID] Expert group registry: %zu groups (%d complete with gate+up+down), "
+        "%d entries registered\n",
+        published_group_count, n_complete, n_groups_registered);
 
     // -----------------------------------------------------------------------
     // Early multi-GPU setup: register unified caches for secondary GPUs BEFORE
@@ -48389,10 +48455,16 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
         const int64_t                in_dim    = tensor->ne[0];
         const int64_t                out_dim   = tensor->ne[1];
         const int64_t                n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 1;
-        moe_xmx_fused::MXFPXMXConfig cfg       = moe_xmx_fused::MXFPXMXConfig::from_device(device_id);
+        if (in_dim < 0 || out_dim < 0 || tensor->ne[2] < 0) {
+            return false;
+        }
+        moe_xmx_fused::MXFPXMXConfig cfg = moe_xmx_fused::MXFPXMXConfig::from_device(device_id);
 
-        moe_xmx_fused::MXFPXMXLayoutInfo info        = moe_xmx_fused::MXFPXMXLayoutInfo::compute(out_dim, in_dim, cfg);
-        const size_t                     tiled_bytes = info.total_bytes * static_cast<size_t>(n_experts);
+        moe_xmx_fused::MXFPXMXLayoutInfo info = moe_xmx_fused::MXFPXMXLayoutInfo::compute(out_dim, in_dim, cfg);
+        size_t                           tiled_bytes = 0;
+        if (!ggml_sycl_checked_mul_size(info.total_bytes, static_cast<size_t>(n_experts), &tiled_bytes)) {
+            return false;
+        }
         if (extra->xmx_tiled_ptr(device_id) != nullptr) {
             if (!extra->xmx_mxfp4_tiled_conversion_complete[device_id]) {
                 extra->xmx_mxfp4_tiled_conversion_evt[device_id].wait();
@@ -48477,18 +48549,20 @@ static bool convert_tensor_layout(ggml_tensor * tensor,
                         ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
                     auto staging_resolved = staging_handle.resolve(device_id);
                     if (staging_resolved && staging_resolved.on_device) {
+                        ggml_sycl_old_owner_retirement retirement(*stream, 1);
+                        retirement.hold(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
+                        if (!retirement.secure()) {
+                            return false;
+                        }
                         device_staging = static_cast<uint8_t *>(staging_resolved.ptr);
-                        auto old_staging = std::move(extra->xmx_mxfp4_tiled_aos_staging_handle[device_id]);
                         extra->xmx_mxfp4_tiled_aos_staging_handle[device_id] = std::move(staging_handle);
                         extra->xmx_mxfp4_tiled_aos_staging_size[device_id]   = aos_expert_size;
-                        if (old_staging.valid()) {
-                            ggml_sycl::retain_handles_until_event({ std::move(old_staging) },
-                                                                  stream->ext_oneapi_submit_barrier());
-                        }
                     }
                 }
             }
-            if (!device_staging) {
+            // A failed growth leaves the old owner intact. It must not make an
+            // undersized raw pointer look usable for this expert.
+            if (!device_staging || extra->xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size) {
                 return false;
             }
             // Always use host staging for non-device memory due to driver bug where
@@ -49684,26 +49758,29 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         return false;
     }
     const size_t count = static_cast<size_t>(n_experts);
-    const size_t bytes = count * sizeof(void *);
+    size_t       bytes = 0;
+    if (!ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)) {
+        return false;
+    }
     if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return false;
     }
     // Use raw accessor: ensure_moe_ptr_table manages the allocation lifecycle and must
     // bypass the validity flag (which only guards dispatch-side consumers).
     if (extra->moe_ptrs_ptr_raw(device) != nullptr && extra->moe_expert_ptrs_size[device] == bytes) {
-        bool table_view_reset = false;
-        if (extra->moe_expert_handles[device].size() != count) {
-            extra->moe_expert_handles[device].assign(count, ggml_sycl::mem_handle{});
-            table_view_reset = true;
-        }
-        if (extra->moe_expert_ptr_payload[device].size() != count) {
-            extra->moe_expert_ptr_payload[device].assign(count, nullptr);
-            table_view_reset = true;
-        }
-        extra->moe_device_table_valid[device] = true;
-        if (table_view_reset) {
+        if (extra->moe_expert_handles[device].size() != count ||
+            extra->moe_expert_ptr_payload[device].size() != count) {
+            try {
+                std::vector<ggml_sycl::mem_handle> new_handles(count);
+                std::vector<void *>                new_payload(count, nullptr);
+                extra->moe_expert_handles[device].swap(new_handles);
+                extra->moe_expert_ptr_payload[device].swap(new_payload);
+            } catch (const std::bad_alloc &) {
+                return false;
+            }
             ggml_sycl_invalidate_moe_full_local_probe(extra, device);
         }
+        extra->moe_device_table_valid[device] = true;
         return true;
     }
 
@@ -49719,14 +49796,27 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
             const auto            resolved     = table_handle.resolve(device);
             if (table_handle.valid() && table_handle.has_stable_owner_identity() && resolved.ptr &&
                 resolved.on_device == bufs->tables_on_device) {
-                std::vector<ggml_sycl::mem_handle> new_handles(count);
-                std::vector<void *>                new_payload(count, nullptr);
-                extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
-                extra->moe_expert_ptrs_size[device]          = bytes;
-                extra->moe_expert_ptrs_from_prealloc[device] = true;
-                extra->moe_device_table_valid[device]        = true;
-                extra->moe_expert_handles[device]            = std::move(new_handles);
-                extra->moe_expert_ptr_payload[device]        = std::move(new_payload);
+                try {
+                    std::vector<ggml_sycl::mem_handle> new_handles(count);
+                    std::vector<void *>                new_payload(count, nullptr);
+                    ggml_sycl_old_owner_retirement retirement(
+                        queue, extra->moe_expert_handles[device].size() + 1);
+                    retirement.hold(extra->moe_expert_ptrs_handle[device]);
+                    for (const auto & old_owner : extra->moe_expert_handles[device]) {
+                        retirement.hold(old_owner);
+                    }
+                    if (!retirement.secure()) {
+                        return false;
+                    }
+                    extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
+                    extra->moe_expert_ptrs_size[device]          = bytes;
+                    extra->moe_expert_ptrs_from_prealloc[device] = true;
+                    extra->moe_expert_handles[device].swap(new_handles);
+                    extra->moe_expert_ptr_payload[device].swap(new_payload);
+                    extra->moe_device_table_valid[device] = true;
+                } catch (const std::bad_alloc &) {
+                    return false;
+                }
                 ggml_sycl_invalidate_moe_full_local_probe(extra, device);
                 GGML_SYCL_DEBUG("[MOE] Using pre-allocated table %d for device %d (%zu bytes)\n", table_index, device,
                                 bytes);
@@ -49756,15 +49846,28 @@ static bool ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,
         GGML_LOG_ERROR("[MOE] Failed to resolve expert pointer table (%zu bytes)\n", count * sizeof(void *));
         return false;
     }
-    std::vector<ggml_sycl::mem_handle> new_handles(count);
-    std::vector<void *>                new_payload(count, nullptr);
-    ggml_sycl::mem_fill(table_handle, 0, bytes, queue);
-    extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
-    extra->moe_expert_ptrs_size[device]          = bytes;
-    extra->moe_expert_ptrs_from_prealloc[device] = false;
-    extra->moe_device_table_valid[device]        = true;
-    extra->moe_expert_handles[device]            = std::move(new_handles);
-    extra->moe_expert_ptr_payload[device]        = std::move(new_payload);
+    try {
+        std::vector<ggml_sycl::mem_handle> new_handles(count);
+        std::vector<void *>                new_payload(count, nullptr);
+        ggml_sycl::mem_fill(table_handle, 0, bytes, queue);
+        ggml_sycl_old_owner_retirement retirement(queue, extra->moe_expert_handles[device].size() + 1);
+        retirement.hold(extra->moe_expert_ptrs_handle[device]);
+        for (const auto & old_owner : extra->moe_expert_handles[device]) {
+            retirement.hold(old_owner);
+        }
+        if (!retirement.secure()) {
+            return false;
+        }
+        extra->moe_expert_ptrs_handle[device]        = std::move(table_handle);
+        extra->moe_expert_ptrs_size[device]          = bytes;
+        extra->moe_expert_ptrs_from_prealloc[device] = false;
+        extra->moe_expert_handles[device].swap(new_handles);
+        extra->moe_expert_ptr_payload[device].swap(new_payload);
+        extra->moe_device_table_valid[device] = true;
+    } catch (const std::bad_alloc &) {
+        ggml_sycl_drain_direct_stage_queue(queue);
+        return false;
+    }
     ggml_sycl_invalidate_moe_full_local_probe(extra, device);
     return true;
 }
@@ -53493,9 +53596,17 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         any_moe = true;
 
         bool          host_weights   = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-        const int64_t n_ids          = ids->ne[0];
-        const int64_t n_tokens       = ids->ne[1];
-        const bool    plan_preloaded = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
+        const int64_t n_ids    = ids->ne[0];
+        const int64_t n_tokens = ids->ne[1];
+        size_t        total_batches_size = 0;
+        if (n_ids < 0 || n_tokens < 0 || src0->ne[2] < 0 ||
+            !ggml_sycl_checked_mul_size(static_cast<size_t>(n_ids), static_cast<size_t>(n_tokens),
+                                        &total_batches_size) ||
+            total_batches_size > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            GGML_LOG_ERROR("[GRAPH-PRELOAD] Invalid or overflowing MoE graph geometry for %s\n", src0->name);
+            return false;
+        }
+        const bool plan_preloaded = cache && !ggml_sycl_cache_plan_owner(cache)->entries.empty();
         const bool    prompt_down_transient_soa =
             plan_preloaded && ggml_sycl_moe_prompt_down_transient_soa_active(src0, ctx.device, n_tokens);
         // Check if this MoE layer has too many experts for blind preload
@@ -53506,7 +53617,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
                                                ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, host_weights, n_tokens) :
                                                ggml_sycl_select_moe_graph_layout(src0, ctx.device, host_weights);
         layout                           = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, layout,
-                                                                                  static_cast<size_t>(std::max<int64_t>(0, n_ids * n_tokens)),
+                                                                                  total_batches_size,
                                                                                   /*exact_override=*/false, n_tokens);
         if (plan_preloaded && n_tokens > 1 && src0->type == GGML_TYPE_MXFP4 &&
             moe_classify_tensor(src0->name) == MOE_TENSOR_DOWN) {
@@ -53563,7 +53674,7 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
 
         host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
 
-        const int64_t total_batches = n_ids * n_tokens;
+        const int64_t total_batches = static_cast<int64_t>(total_batches_size);
         const bool    selected_down_i8_materialize =
             plan_preloaded && layout == GGML_LAYOUT_MXFP4_I8 &&
             ggml_sycl_moe_decode_down_i8_selected_candidate(src0, ctx.device, n_tokens);
@@ -53646,7 +53757,10 @@ static bool graph_preload_moe_experts(ggml_backend_sycl_context & ctx, ggml_cgra
         }
 
         if (ids_on_host) {
-            const size_t ids_bytes = static_cast<size_t>(n_ids * n_tokens) * sizeof(int32_t);
+            size_t ids_bytes = 0;
+            if (!ggml_sycl_checked_mul_size(total_batches_size, sizeof(int32_t), &ids_bytes)) {
+                return false;
+            }
             if (!ids_entry.device_ids || ids_entry.device_bytes < ids_bytes) {
                 // Try Phase 4 pre-allocated IDs staging buffer first
                 void * prealloc_ids = ggml_sycl::moe_get_ids_staging(ctx.device, ids_bytes);
@@ -55719,58 +55833,94 @@ static struct {
     ggml_sycl::mem_handle f32_handle;
 } g_split_secondary_gpu;
 
-static bool split_secondary_gpu_ensure(size_t q8_bytes, size_t f32_bytes, sycl::queue * q) {
+static bool split_secondary_gpu_ensure(size_t                  q8_bytes,
+                                       size_t                  f32_bytes,
+                                       size_t                  output_bytes,
+                                       float *&                output_ptr,
+                                       size_t &                output_capacity,
+                                       ggml_sycl::mem_handle & output_handle,
+                                       sycl::queue *           q) {
+    if (!q) {
+        return false;
+    }
     const int secondary_device = ggml_sycl_get_device_id_from_queue(*q);
-    if (g_split_secondary_gpu.q8_size < q8_bytes) {
+
+    auto allocate_replacement = [&](size_t bytes, ggml_sycl::mem_handle * handle, void ** ptr) {
         ggml_sycl::alloc_request req{};
         req.queue                          = q;
         req.device                         = secondary_device;
-        req.size                           = q8_bytes;
+        req.size                           = bytes;
         req.intent.role                    = ggml_sycl::alloc_role::STAGING;
         req.intent.category                = ggml_sycl::runtime_category::STAGING;
         req.intent.constraints.must_device = true;
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-        if (allocation) {
-            ggml_sycl::mem_handle replacement =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-            const auto resolved = replacement.resolve(secondary_device);
-            if (resolved.ptr && resolved.on_device) {
-                auto old_q8 = std::move(g_split_secondary_gpu.q8_handle);
-                g_split_secondary_gpu.q8_handle = std::move(replacement);
-                g_split_secondary_gpu.q8_dev    = static_cast<char *>(resolved.ptr);
-                g_split_secondary_gpu.q8_size   = q8_bytes;
-                if (old_q8.valid()) {
-                    ggml_sycl::retain_handles_until_event({ std::move(old_q8) }, q->ext_oneapi_submit_barrier());
-                }
-            }
+        if (!allocation) {
+            return false;
         }
-    }
-    if (g_split_secondary_gpu.f32_size < f32_bytes) {
-        ggml_sycl::alloc_request req{};
-        req.queue                          = q;
-        req.device                         = secondary_device;
-        req.size                           = f32_bytes;
-        req.intent.role                    = ggml_sycl::alloc_role::STAGING;
-        req.intent.category                = ggml_sycl::runtime_category::STAGING;
-        req.intent.constraints.must_device = true;
-        ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-        if (allocation) {
-            ggml_sycl::mem_handle replacement =
-                ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-            const auto resolved = replacement.resolve(secondary_device);
-            if (resolved.ptr && resolved.on_device) {
-                auto old_f32 = std::move(g_split_secondary_gpu.f32_handle);
-                g_split_secondary_gpu.f32_handle = std::move(replacement);
-                g_split_secondary_gpu.f32_dev    = static_cast<float *>(resolved.ptr);
-                g_split_secondary_gpu.f32_size   = f32_bytes;
-                if (old_f32.valid()) {
-                    ggml_sycl::retain_handles_until_event({ std::move(old_f32) }, q->ext_oneapi_submit_barrier());
-                }
-            }
+        *handle = ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        const auto resolved = handle->resolve(secondary_device);
+        if (!resolved.ptr || !resolved.on_device) {
+            *handle = {};
+            return false;
         }
+        *ptr = resolved.ptr;
+        return true;
+    };
+
+    ggml_sycl::mem_handle q8_replacement;
+    ggml_sycl::mem_handle f32_replacement;
+    ggml_sycl::mem_handle output_replacement;
+    void *                 q8_ptr     = nullptr;
+    void *                 f32_ptr    = nullptr;
+    void *                 output_new = nullptr;
+    const bool grow_q8     = g_split_secondary_gpu.q8_size < q8_bytes;
+    const bool grow_f32    = g_split_secondary_gpu.f32_size < f32_bytes;
+    const bool grow_output = output_capacity < output_bytes;
+
+    if ((grow_q8 && !allocate_replacement(q8_bytes, &q8_replacement, &q8_ptr)) ||
+        (grow_f32 && !allocate_replacement(f32_bytes, &f32_replacement, &f32_ptr)) ||
+        (grow_output && !allocate_replacement(output_bytes, &output_replacement, &output_new))) {
+        return false;
     }
+
+    try {
+        ggml_sycl_old_owner_retirement retirement(*q, 3);
+        if (grow_q8) {
+            retirement.hold(g_split_secondary_gpu.q8_handle);
+        }
+        if (grow_f32) {
+            retirement.hold(g_split_secondary_gpu.f32_handle);
+        }
+        if (grow_output) {
+            retirement.hold(output_handle);
+        }
+        if (!retirement.secure()) {
+            return false;
+        }
+
+        if (grow_q8) {
+            g_split_secondary_gpu.q8_handle = std::move(q8_replacement);
+            g_split_secondary_gpu.q8_dev    = static_cast<char *>(q8_ptr);
+            g_split_secondary_gpu.q8_size   = q8_bytes;
+        }
+        if (grow_f32) {
+            g_split_secondary_gpu.f32_handle = std::move(f32_replacement);
+            g_split_secondary_gpu.f32_dev    = static_cast<float *>(f32_ptr);
+            g_split_secondary_gpu.f32_size   = f32_bytes;
+        }
+        if (grow_output) {
+            output_handle   = std::move(output_replacement);
+            output_ptr      = static_cast<float *>(output_new);
+            output_capacity = output_bytes;
+        }
+    } catch (const std::bad_alloc &) {
+        ggml_sycl_drain_direct_stage_queue(*q);
+        return false;
+    }
+
     return g_split_secondary_gpu.q8_dev && g_split_secondary_gpu.q8_size >= q8_bytes &&
-           g_split_secondary_gpu.f32_dev && g_split_secondary_gpu.f32_size >= f32_bytes;
+           g_split_secondary_gpu.f32_dev && g_split_secondary_gpu.f32_size >= f32_bytes && output_ptr &&
+           output_capacity >= output_bytes;
 }
 
 // Secondary GPU weight loading via unified cache.
@@ -56099,11 +56249,27 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
         }
 
         // --- Q8 quantize src1 and stage to devices ---
-        const int64_t K              = ne00;
-        const int64_t K_padded       = GGML_PAD(K, MATRIX_ROW_PADDING);
-        const size_t  q8_bytes       = K_padded / QK8_1 * sizeof(block_q8_1);
-        const size_t  src1_f32_bytes = K * sizeof(float);
-        float *       dst_dd         = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, device));
+        const int64_t K = ne00;
+        if (K < 0 || N_second < 0) {
+            return false;
+        }
+        size_t K_padded_size = 0;
+        size_t q8_blocks     = 0;
+        size_t q8_bytes      = 0;
+        size_t src1_f32_bytes = 0;
+        if (!ggml_sycl_checked_round_up_size(static_cast<size_t>(K), MATRIX_ROW_PADDING, &K_padded_size) ||
+            K_padded_size > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+            !ggml_sycl_checked_round_up_size(K_padded_size, QK8_1, &K_padded_size) ||
+            K_padded_size > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+            !ggml_sycl_checked_mul_size(static_cast<size_t>(K), sizeof(float), &src1_f32_bytes)) {
+            return false;
+        }
+        q8_blocks = K_padded_size / QK8_1;
+        if (!ggml_sycl_checked_mul_size(q8_blocks, sizeof(block_q8_1), &q8_bytes)) {
+            return false;
+        }
+        const int64_t K_padded = static_cast<int64_t>(K_padded_size);
+        float *       dst_dd   = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(dst, device));
 
         // Primary GPU: Q8 quantize on primary queue. Scratch lifetime is owned by
         // a mem_handle; raw pointer is only the quantize/MMVQ ABI.
@@ -56164,11 +56330,13 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
 
         // Secondary GPU: H2D src1, Q8 quantize, MMVQ dispatch
         if (N_second > 0) {
-            if (!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, stream_second)) {
+            // Ensure device output buffer together with q8/f32 staging in one retirement transaction.
+            size_t second_out_bytes = 0;
+            if (!ggml_sycl_checked_mul_size(static_cast<size_t>(N_second), sizeof(float), &second_out_bytes) ||
+                !split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, second_out_bytes, s_second_out_dev,
+                                            s_second_out_dev_sz, s_second_out_dev_handle, stream_second)) {
                 return false;
             }
-
-            const size_t second_out_bytes = N_second * sizeof(float);
             // Ensure ring slot host output buffer (primary-context pinned).
             // Allocated on dpct context so merge memcpy to dst (also dpct context)
             // stays within context.  Secondary queue D2H writes via L0 driver-level
@@ -56189,37 +56357,6 @@ static bool ggml_sycl_mul_mat_tensor_split(ggml_backend_sycl_context & ctx,
             if (!s_second_out_ring[ring_slot]) {
                 return false;
             }
-            // Ensure device output buffer
-            if (s_second_out_dev_sz < second_out_bytes) {
-                int sec_dev = ggml_sycl_get_device_id_from_queue(*stream_second);
-                ggml_sycl::alloc_request req{};
-                req.queue                          = stream_second;
-                req.device                         = sec_dev;
-                req.size                           = second_out_bytes;
-                req.intent.role                    = ggml_sycl::alloc_role::STAGING;
-                req.intent.category                = ggml_sycl::runtime_category::STAGING;
-                req.intent.constraints.must_device = true;
-                ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
-                if (allocation) {
-                    ggml_sycl::mem_handle replacement =
-                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
-                    const auto resolved = replacement.resolve(sec_dev);
-                    if (resolved.ptr && resolved.on_device) {
-                        auto old_output = std::move(s_second_out_dev_handle);
-                        s_second_out_dev_handle = std::move(replacement);
-                        s_second_out_dev        = static_cast<float *>(resolved.ptr);
-                        s_second_out_dev_sz     = second_out_bytes;
-                        if (old_output.valid()) {
-                            ggml_sycl::retain_handles_until_event({ std::move(old_output) },
-                                                                  stream_second->ext_oneapi_submit_barrier());
-                        }
-                    }
-                }
-            }
-            if (!s_second_out_dev || s_second_out_dev_sz < second_out_bytes) {
-                return false;
-            }
-
             // H2D: host → secondary device f32 buffer.
             // Use depends_on for cross-device sync: the patched L0 driver
             // supports cross-device event dependencies in depends_on.
@@ -91525,7 +91662,10 @@ normal_dispatch:
         }
         moe_prestage_popular_experts();
         if (!graph_preload_moe_experts(*sycl_ctx, cgraph)) {
-            GGML_LOG_WARN("[SYCL-GRAPH] PP→TG MoE planned-residency refresh failed; continuing with direct TG\n");
+            GGML_LOG_WARN("[SYCL-GRAPH] PP→TG MoE planned-residency refresh failed; suppressing graph path\n");
+            sycl_ctx->moe_graphs_disabled = true;
+            use_sycl_graph                = false;
+            graph_unpin_moe_experts(sycl_ctx);
         } else {
             GGML_LOG_INFO("[SYCL-GRAPH] PP→TG refreshed MoE planned residency before direct TG\n");
         }

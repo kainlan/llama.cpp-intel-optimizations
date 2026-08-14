@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source gate for the w274 owner-first FATTN and runtime workspace batch."""
+"""Source gate for owner-first staging and w295 transactional growth contracts."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,7 +66,7 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 # widening of this bounded batch.
 assert RUNTIME.count("unified_alloc(") == 56
 assert RUNTIME.count("from_legacy_owned_alloc(") == 44
-assert RUNTIME.count("unified_allocate_owner(") == 27
+assert RUNTIME.count("unified_allocate_owner(") == 25
 assert CACHE.count("unified_alloc(") == 28
 assert CACHE.count("from_legacy_owned_alloc(") == 12
 assert CACHE.count("unified_allocate_owner(") == 10
@@ -122,7 +122,6 @@ staging_runtime_regions = (
     ("static bool graph_preload_moe_experts", "static void graph_unpin_moe_experts"),
     ("static bool ensure_split_persistent_resources", "static sycl::queue *            g_split_merge_queue"),
     ("static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
-    ("// Ensure device output buffer", "// H2D: host"),
     ("static ggml_sycl::mem_handle ggml_sycl_block_exec_alloc_host_stage_handle", "static bool ggml_sycl_block_exec_queue_matches_device"),
 )
 staging_runtime = "\n".join(region(RUNTIME, a, b) for a, b in staging_runtime_regions)
@@ -161,7 +160,7 @@ for block in (common_stage, pp_stage):
 # validated before old staging metadata is published or cleared.
 for block, mutation in (
     (region(RUNTIME, "static bool split_secondary_gpu_ensure", "static const void * split_secondary_weight_load"),
-     "g_split_secondary_gpu.q8_handle = std::move(replacement)"),
+     "g_split_secondary_gpu.q8_handle = std::move(q8_replacement)"),
     (cache_reorder, "reorder_temp_owner_  = std::move(replacement)"),
     (common_stage, "backing_handle   = std::move(replacement)"),
     (pp_stage, "g_sycl_pp_config.stage_output_handle[stage] = std::move(replacement)"),
@@ -180,21 +179,27 @@ secondary = region(RUNTIME, "static bool split_secondary_gpu_ensure", "// Second
 assert "q8_size >= q8_bytes" in secondary
 assert "f32_size >= f32_bytes" in secondary
 secondary_call = region(RUNTIME, "// Secondary GPU: H2D src1", "// CPU vec_dot:")
-assert "if (!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, stream_second))" in secondary_call
-assert "s_second_out_dev_sz < second_out_bytes" in secondary_call
+assert "!split_secondary_gpu_ensure(q8_bytes, src1_f32_bytes, second_out_bytes" in secondary_call
+assert "s_second_out_dev_sz, s_second_out_dev_handle, stream_second" in secondary_call
 persistent = region(RUNTIME, "static bool ensure_split_persistent_resources", "// OOQ merge queue")
 assert "r.q8_staging_size >= need_q8" in persistent
 assert "return false;" in persistent
 assert "if (!ensure_split_persistent_resources(" in RUNTIME
 print("PASS staging-resize-capacity-qualified-source-gate")
 
-# Successful secondary replacements escrow the previous owner behind the exact
-# in-order secondary queue terminal, so an in-flight kernel cannot observe a
-# freed q8/f32/output/persistent-q8 allocation.
-for owner in ("old_q8", "old_f32", "old_output"):
-    assert f"std::move({owner})" in RUNTIME
-assert secondary.count("q->ext_oneapi_submit_barrier()") == 2
-assert "stream_second->ext_oneapi_submit_barrier()" in secondary_call
+# Successful secondary replacements escrow q8/f32/output old owners as one
+# transaction behind the exact queue terminal. The retirement ticket predates
+# owner-vector growth and failed barrier/publication paths drain before unwind.
+retirement = region(RUNTIME, "class ggml_sycl_old_owner_retirement", "// Construct this before direct_stage_expert")
+assert retirement.index("retained_handle_publish_ticket publish_ticket_") < retirement.index("std::vector<ggml_sycl::mem_handle>         old_owners_")
+assert "old_owners_.reserve(owner_capacity)" in retirement
+assert "queue_.ext_oneapi_submit_barrier()" in retirement
+assert "retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_)" in retirement
+assert "ggml_sycl_drain_direct_stage_queue(queue_)" in retirement
+for owner in ("g_split_secondary_gpu.q8_handle", "g_split_secondary_gpu.f32_handle", "output_handle"):
+    assert f"retirement.hold({owner})" in secondary
+assert secondary.count("retirement.secure()") == 1
+assert secondary.index("retirement.secure()") < secondary.index("g_split_secondary_gpu.q8_handle = std::move")
 assert "secondary_queue.ext_oneapi_submit_barrier()" in persistent
 print("PASS staging-in-flight-resize-owner-retention-source-gate")
 
@@ -206,7 +211,41 @@ assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
 assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
 moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
 assert "moe_expert_ptrs_handle[device]        = {};" not in moe_table
-assert moe_table.count("std::vector<ggml_sycl::mem_handle> new_handles(count)") == 2
-assert moe_table.count("std::vector<void *>                new_payload(count, nullptr)") == 2
+assert moe_table.count("std::vector<ggml_sycl::mem_handle> new_handles(count)") == 3
+assert moe_table.count("std::vector<void *>                new_payload(count, nullptr)") == 3
+assert moe_table.count("catch (const std::bad_alloc &)") >= 3
+assert "ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)" in moe_table
 assert "return true;" in moe_table and "return false;" in moe_table
+assert "retirement.hold(extra->moe_expert_ptrs_handle[device])" in moe_table
 print("PASS xmx-moe-replacement-failure-atomic-source-gate")
+
+# w295 geometry is rejected before pointer arithmetic/allocation and a surviving
+# undersized XMX pointer cannot pass the capacity gate.
+xmx_convert = region(RUNTIME, "static bool convert_tensor_layout", "static bool ggml_sycl_select_mul_mat_layout")
+assert "ggml_sycl_checked_mul_size(info.total_bytes" in xmx_convert
+assert "xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size" in xmx_convert
+assert xmx_convert.index("xmx_mxfp4_tiled_aos_staging_size[device_id] < aos_expert_size") < xmx_convert.index("// Always use host staging")
+assert "ggml_sycl_checked_round_up_size(static_cast<size_t>(K), MATRIX_ROW_PADDING" in RUNTIME
+assert "ggml_sycl_checked_mul_size(q8_blocks, sizeof(block_q8_1), &q8_bytes)" in RUNTIME
+assert "ggml_sycl_checked_mul_size(static_cast<size_t>(N_second), sizeof(float), &second_out_bytes)" in RUNTIME
+assert "ggml_sycl_checked_mul_size(total_batches_size, sizeof(int32_t), &ids_bytes)" in RUNTIME
+print("PASS overflow-safe-staging-geometry-source-gate")
+
+# Graph-preload failure propagates into graph suppression, rather than logging
+# and continuing through a stale graph path.
+refresh = region(RUNTIME, "if (refresh_moe_after_pp)", "const int descriptor_moe_graph_candidates")
+assert "if (!graph_preload_moe_experts(*sycl_ctx, cgraph))" in refresh
+assert "sycl_ctx->moe_graphs_disabled = true" in refresh
+assert "use_sycl_graph                = false" in refresh
+assert "graph_unpin_moe_experts(sycl_ctx)" in refresh
+print("PASS graph-preload-bool-propagation-source-gate")
+
+# Metadata and its derived group registry are built locally and atomically
+# swapped under both writer locks; bad_alloc preserves the old epoch.
+metadata = region(RUNTIME, "// Build both views off to the side", "// Early multi-GPU setup")
+assert "new_expert_meta" in metadata and "new_expert_groups" in metadata
+assert "catch (const std::bad_alloc &)" in metadata
+assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in metadata
+assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
+assert "g_expert_groups.swap(new_expert_groups)" in metadata
+print("PASS moe-metadata-atomic-publication-source-gate")
