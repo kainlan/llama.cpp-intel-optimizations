@@ -12,6 +12,7 @@
 
 #include "sycl-test-skip.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -750,17 +751,51 @@ static bool retained_pinned_suballocation_refuses_preteardown(sycl::queue & q) {
     if (!cache->host_zones_configured()) cache->configure_host_zones(2ull * mib, 2ull * mib, 4ull * mib, 2ull * mib);
     TEST_ASSERT(cache->host_zones_configured(), "host zones unavailable for pinned-owner fixture");
 
+    uint64_t census_before[3]{};
+    TEST_ASSERT(unified_cache_shutdown_allocation_control_census_for_test(census_before),
+                "allocation-control census unavailable");
+
     alloc_request req{};
     req.queue = &q;
+    req.device = 0;  // ONEAPI_DEVICE_SELECTOR remaps the selected B50/B70 to runtime device 0.
     req.size = 4096;
     req.intent.role = alloc_role::STAGING;
     req.intent.category = runtime_category::STAGING;
     req.intent.constraints.must_host_pinned = true;
     req.intent.constraints.use_pinned_pool = true;
+
+    const size_t used_before_failure = cache->host_zone_used(host_zone_id::STAGING);
+    allocation_owner_test_fail_next_control_allocations(1);
+    allocation_result failed = unified_allocate_owner(req);
+    TEST_ASSERT(!failed && failed.error == allocation_error::CONTROL_ALLOCATION_FAILED,
+                "injected control allocation failure unexpectedly succeeded");
+    uint64_t census_after_failure[3]{};
+    TEST_ASSERT(unified_cache_shutdown_allocation_control_census_for_test(census_after_failure) &&
+                    census_after_failure[0] == census_before[0] && census_after_failure[1] == census_before[1] &&
+                    census_after_failure[2] == census_before[2],
+                "failed allocation leaked an allocation control");
+    TEST_ASSERT(cache->host_zone_used(host_zone_id::STAGING) == used_before_failure,
+                "failed allocation leaked a pinned-pool registry row or TLSF block");
+
     mem_handle retained = unified_allocate(req);
-    const int device = retained.device();
+    const int device = req.device;
     resolved_ptr resolved = retained.resolve();
-    TEST_ASSERT(device >= 0 && resolved.ptr != nullptr && !resolved.on_device, "pinned suballocation failed");
+    TEST_ASSERT(retained.valid(), "pinned suballocation owner construction failed");
+    TEST_ASSERT(resolved.ptr != nullptr, "pinned suballocation did not resolve");
+    TEST_ASSERT(!resolved.on_device, "pinned suballocation resolved as device memory");
+    auto coordinator = allocation_coordinator_test_lookup(device);
+    TEST_ASSERT(coordinator != nullptr, "allocation coordinator unavailable");
+    const auto live = coordinator->snapshot_controls();
+    TEST_ASSERT(std::any_of(live.begin(), live.end(), [](const allocation_control_snapshot & control) {
+                    return control.ownership_class == allocation_control_class::CACHE_BACKING;
+                }),
+                "cache backing owner was not classified at its creation route");
+    const auto retained_control = std::find_if(live.begin(), live.end(), [&](const allocation_control_snapshot & c) {
+        return c.metadata.ptr == resolved.ptr;
+    });
+    TEST_ASSERT(retained_control != live.end() &&
+                    retained_control->ownership_class == allocation_control_class::CACHE_SUBALLOCATION,
+                "pinned pool slice was not classified as a cache suballocation");
     const size_t capacity_before = cache->host_zone_capacity(host_zone_id::STAGING);
     std::memset(resolved.ptr, 0x5a, req.size);
 

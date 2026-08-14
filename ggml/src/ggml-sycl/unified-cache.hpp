@@ -3928,6 +3928,10 @@ struct alloc_constraints {
     // slice.  Some Level Zero copy paths need the host pointer to be a
     // driver-visible USM allocation base, not an interior TLSF suballocation.
     bool         require_host_usm_base      = false;
+    // This standalone allocation is physical backing owned by a cache/pool.
+    // Backing creation routes set this explicitly; ordinary standalone host
+    // allocations must not be inferred as backing from cohort names.
+    bool         cache_backing              = false;
     // When arena is active and prefer_vram_zone != COUNT, unified_alloc routes
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
@@ -3986,6 +3990,7 @@ struct alloc_metadata {
 
     uint64_t     epoch_id     = 0;
     bool         zone_managed = false;
+    bool         cache_backing = false;  // Lifecycle annotation; not part of the exact release key.
     host_zone_id host_zone    = host_zone_id::COUNT;
 
     struct exact_key {
@@ -4010,8 +4015,9 @@ struct alloc_metadata {
         }
     };
 
-    // Canonical exact allocation identity and geometry. epoch_id and
-    // zone_managed are lifecycle/routing annotations, not release-key fields.
+    // Canonical exact allocation identity and geometry. epoch_id,
+    // zone_managed and cache_backing are lifecycle/routing annotations, not
+    // release-key fields.
     exact_key key() const noexcept {
         return { ptr, device, kind, role, category, id, generation, zone, offset, extent, size, host_zone };
     }

@@ -1232,6 +1232,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
                                                             alloc_role       role,
                                                             runtime_category category,
                                                             const char *     cohort_id,
+                                                            bool             cache_backing,
                                                             uint64_t         reserved_alloc_id = 0);
 static alloc_handle unified_cache_adopt_raw_device_allocation(void *           ptr,
                                                               size_t           size,
@@ -2976,7 +2977,7 @@ unified_cache::unified_cache(sycl::queue & queue,
             staging_size_ = staging_size;
             alloc_handle owner =
                 unified_cache_adopt_raw_host_allocation(staging_, staging_size_, queue_, alloc_role::STAGING,
-                                                        runtime_category::STAGING, "unified_cache:staging");
+                                                        runtime_category::STAGING, "unified_cache:staging", true);
             staging_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
             staging_       = staging_owner_.resolve().ptr;
             if (!staging_) {
@@ -11732,8 +11733,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             rec.handle.category     = cat;
             rec.handle.alloc_id     = reserved_alloc_id;
             rec.handle.vram_zone    = zid;
-            rec.handle.zone_managed = true;
-            rec.queue               = req.queue;
+            rec.handle.zone_managed  = true;
+            rec.handle.cache_backing = req.intent.constraints.cache_backing;
+            rec.queue                = req.queue;
             if (req.queue) rec.queue_keepalive = *req.queue;
             rec.zone_managed = true;
             rec.from_arena   = true;
@@ -12068,6 +12070,7 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         rec.handle.arena_extent     = exact_arena.extent;
         rec.handle.vram_zone        = output_metadata.vram_zone;
         rec.handle.zone_managed     = output_metadata.zone_managed;
+        rec.handle.cache_backing    = req.intent.constraints.cache_backing;
         rec.handle.host_zone        = output_metadata.host_zone;
         rec.queue                   = req.queue;
         try {
@@ -12507,8 +12510,10 @@ static allocation_result promote_legacy_alloc_owner_with_coordinator(
     };
 
     try {
-        const allocation_control_class ownership_class = exact.zone_managed ?
-            allocation_control_class::CACHE_SUBALLOCATION : allocation_control_class::EXTERNAL_EXACT;
+        const allocation_control_class ownership_class = exact.cache_backing ?
+            allocation_control_class::CACHE_BACKING :
+            exact.zone_managed ? allocation_control_class::CACHE_SUBALLOCATION :
+                                 allocation_control_class::EXTERNAL_EXACT;
         control = allocation_owner_internal_access::create(coordinator, ownership_class);
         if (!control) {
             cleanup_legacy(allocation_error::CONTROL_ALLOCATION_FAILED);
@@ -12577,7 +12582,9 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
         // control allocation. Invalid requests cannot perturb shutdown census.
         if (req.size == 0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES ||
             (req.alignment != 0 && (req.alignment & (req.alignment - 1)) != 0) ||
-            (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned)) {
+            (req.intent.constraints.must_device && req.intent.constraints.must_host_pinned) ||
+            (req.intent.constraints.cache_backing &&
+             (!req.intent.constraints.require_host_usm_base || !req.intent.constraints.must_host_pinned))) {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
         }
@@ -12586,8 +12593,7 @@ allocation_result unified_allocate_owner(const alloc_request & req) noexcept {
             result.error = allocation_error::INVALID_REQUEST;
             return result;
         }
-        const bool pinned_backing = req.intent.constraints.require_host_usm_base && req.intent.cohort_id &&
-                                    std::strncmp(req.intent.cohort_id, "pinned_chunk:", 13) == 0;
+        const bool pinned_backing = req.intent.constraints.cache_backing;
         const bool cache_suballocation = !pinned_backing &&
             (req.intent.constraints.use_pinned_pool || req.intent.constraints.must_host_pinned ||
              req.intent.constraints.prefer_vram_zone != vram_zone_id::COUNT || req.intent.role == alloc_role::KV);
@@ -15534,6 +15540,7 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
                                                             alloc_role       role,
                                                             runtime_category category,
                                                             const char *     cohort_id,
+                                                            bool             cache_backing,
                                                             uint64_t         reserved_alloc_id) {
     alloc_handle handle{};
     if (ptr == nullptr || size == 0) {
@@ -15544,10 +15551,11 @@ static alloc_handle unified_cache_adopt_raw_host_allocation(void *           ptr
     metadata.ptr      = ptr;
     metadata.size     = size;
     metadata.device   = ggml_sycl_get_device_id_from_queue(queue);
-    metadata.tier     = alloc_tier::HOST_PINNED;
-    metadata.role     = role;
-    metadata.category = category;
-    metadata.alloc_id = reserved_alloc_id != 0 ? reserved_alloc_id : unified_cache_mint_retention_identity();
+    metadata.tier          = alloc_tier::HOST_PINNED;
+    metadata.role          = role;
+    metadata.category      = category;
+    metadata.cache_backing = cache_backing;
+    metadata.alloc_id      = reserved_alloc_id != 0 ? reserved_alloc_id : unified_cache_mint_retention_identity();
     if (metadata.alloc_id == 0) {
         alloc_registry::instance().unregister_alloc(ptr);
         sycl::free(ptr, queue);
@@ -15876,6 +15884,15 @@ static bool snapshot_allocation_controls(
                         phase ? phase : "unknown", allocation_control_class_name(control.ownership_class),
                         coordinator->device(), i, m.ptr, m.size, static_cast<unsigned long long>(m.alloc_id),
                         control.refs, control.retry ? 1 : 0);
+                } else if (preteardown) {
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] allocation-control phase=%s class=%s device=%d index=%zu ptr=%p size=%zu "
+                        "id=%llu alloc_id=%llu generation=%llu tier=%d role=%d category=%d zone=%d refs=%u retry=%d\n",
+                        phase ? phase : "unknown", allocation_control_class_name(control.ownership_class),
+                        coordinator->device(), i, m.ptr, m.size, static_cast<unsigned long long>(m.id),
+                        static_cast<unsigned long long>(m.alloc_id), static_cast<unsigned long long>(m.generation),
+                        static_cast<int>(m.tier), static_cast<int>(m.role), static_cast<int>(m.category),
+                        static_cast<int>(m.zone), control.refs, control.retry ? 1 : 0);
                 } else {
                     GGML_LOG_ERROR(
                         "[UNIFIED-CACHE] allocation-control phase=%s class=%s device=%d index=%zu ptr=%p size=%zu "
@@ -15933,7 +15950,7 @@ bool shutdown_unified_cache() {
     // suballocation or external exact control must be released first: refusing
     // here leaves both the cache map and pinned pool fully intact for retry.
     if (!snapshot_allocation_controls("pre-cache-teardown", release_coordinators, true)) {
-        GGML_LOG_ERROR("[UNIFIED-CACHE] shutdown refused before cache teardown: live external allocation control\n");
+        GGML_LOG_WARN("[UNIFIED-CACHE] shutdown refused before cache teardown: live external allocation control\n");
         return false;
     }
 

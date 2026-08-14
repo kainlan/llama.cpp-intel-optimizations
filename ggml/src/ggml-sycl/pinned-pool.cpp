@@ -93,6 +93,7 @@ mem_handle allocate_pinned_chunk_owner(sycl::queue & queue, size_t chunk_size, b
     // host_pool_alloc() here would recurse, so request a standalone USM base
     // while still registering ownership through unified_alloc().
     req.intent.constraints.require_host_usm_base = true;
+    req.intent.constraints.cache_backing         = true;
 
     mem_handle owner    = unified_allocate(req);
     auto       resolved = owner.resolve();
