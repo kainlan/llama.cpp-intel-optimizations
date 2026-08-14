@@ -281,7 +281,7 @@ git commit -m "test(sycl): adversarially cover cache-backing provenance"
 **Acceptance Criteria:**
 - [ ] A fresh reviewer delivers a written verdict on `4f01993c9` covering, at minimum: exception-path owner retention (no leaked or double-released escrow on every early return), the checked arithmetic actually rejecting boundary values, publication atomicity vs concurrent readers, and drain ordering vs the terminal event.
 - [ ] Every finding fixed and re-reviewed to PASS (minor findings are not optional).
-- [ ] Failpoints exist for: forced allocation failure, barrier submission failure, retention-publication failure, resize while prior secondary work is in flight, arithmetic boundary rejection, same-allocation host-vector failure (the six from the handoff). Each is a private seam (ordinary `libggml-sycl.so` must export no new symbol — verify `nm -D build/bin/libggml-sycl.so | grep -i failpoint` returns nothing).
+- [ ] Failpoints exist for: forced allocation failure, barrier submission failure, retention-publication failure, resize while prior secondary work is in flight, arithmetic boundary rejection, same-allocation host-vector failure (the six from the handoff). Each is a private seam (ordinary `libggml-sycl.so` must export no new symbol — verify by NAMED-SYMBOL check: each new seam's exact name absent from `nm -D` on the ordinary DSO, with a positive control showing the same names present in the private test binary. [Amended 2026-08-14: a bare `grep -i failpoint` → 0 bar is unreliable — the DSO deliberately exports ~101 READ-ONLY `*_for_test` observers, and blanket greps match design-sanctioned exports; lead ruling on llama.cpp-2lfg.]).
 - [ ] `test-staging-replacement-failpoints` compiles and is registered (GPU execution is Task 11).
 
 **Implementation Guide:** Reviewer prompt must include the full commit (`git show 4f01993c9`), the staging-ownership rules from `docs/backend/sycl-memory-design.md`, and the prior P0/P1 finding text from tracker comment `llama.cpp-7m27` c-c98b. RED for each failpoint: with the seam armed, the staging path must take the drain/rollback branch and every owner (source, staging, destination, old-escrow) must still release exactly once — assert via the seam's release counters; with seams unarmed, behavior is byte-identical (positive control: the seam header compiled out of the ordinary DSO).
@@ -481,7 +481,7 @@ ONEAPI_DEVICE_SELECTOR=level_zero:0 ctest --test-dir build -R 'staging-replaceme
 ONEAPI_DEVICE_SELECTOR=level_zero:1 ctest --test-dir build -R 'staging-replacement-failpoints' --output-on-failure -j 1
 ```
 - [ ] All six failpoints exercised (per-seam reached-counters > 0 in the log — a green run with counter 0 is a no-op, not a pass), both GPUs, rc=0.
-- [ ] `nm -D build/bin/libggml-sycl.so | grep -ci failpoint` → 0 (no seam leakage into the ordinary DSO).
+- [ ] Named-symbol seam check: each of Task 4's six seam symbols absent from `nm -D` on the ordinary DSO, present (`nm --defined-only`) in the private test binary. [Amended 2026-08-14: replaces the bare `grep -ci failpoint → 0` bar — blanket test-ish greps match the ~101 deliberately-exported read-only observers; lead ruling on llama.cpp-2lfg.]
 - [ ] Evidence committed.
 
 ---
