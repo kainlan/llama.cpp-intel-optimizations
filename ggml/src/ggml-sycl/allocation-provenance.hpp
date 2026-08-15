@@ -46,7 +46,10 @@ namespace ggml_sycl {
 class cache_backing_token {
     friend class pinned_chunk_pool;  // the sole minter of this token
 
-    cache_backing_token() = default;
+    // User-provided, not defaulted: at C++17 aggregate initialization would
+    // bypass a defaulted private ctor. tests/test-cache-backing-forgery-compile.py
+    // fails if this is ever "cleaned up" back to `= default`.
+    cache_backing_token() {}
 };
 
 // Backing counterpart of unified_allocate_owner(). Classifies the resulting
