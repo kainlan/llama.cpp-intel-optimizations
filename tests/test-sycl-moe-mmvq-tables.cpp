@@ -72,10 +72,25 @@ bool dispatch_wrapper(ggml_type t, ggml_layout_mode l) {
     return moe_mmvq_any_dispatch_supports_layout(t, l);
 }
 
-// Deliberately inconsistent pair for the positive control: capability admits
-// Q4_K/AOS, no executor does.
+// The pair the positive control injects. It must be one no executor covers, or
+// the control silently detects nothing and stops being a control.
+//
+// This bit rots: the control originally injected Q4_K/AOS, and when wave 1 gave
+// Q4_K a real _id kernel the injection became legitimate and the control went
+// void -- reporting 0 violations while claiming to prove sensitivity. Q4_0 with
+// a oneDNN packed layout is durable instead: Q4_0 is covered for AoS only, and
+// the MMVQ path has no packed-layout kernel for any type. control_premise_holds()
+// below asserts that, so if a future wave ever covers it the control fails loudly
+// rather than quietly passing.
+constexpr ggml_type        k_control_type   = GGML_TYPE_Q4_0;
+constexpr ggml_layout_mode k_control_layout = GGML_LAYOUT_ONEDNN_WOQ;
+
+bool control_premise_holds() {
+    return !moe_mmvq_any_dispatch_supports_layout(k_control_type, k_control_layout);
+}
+
 bool fake_cap_over_advertising(ggml_type t, ggml_layout_mode l) {
-    return cap_wrapper(t, l) || (t == GGML_TYPE_Q4_K && l == GGML_LAYOUT_AOS);
+    return cap_wrapper(t, l) || (t == k_control_type && l == k_control_layout);
 }
 
 }  // namespace
@@ -94,13 +109,28 @@ int main() {
     }
 
     // 2. Positive control FIRST -- a control placed after the checks it protects
-    //    explains a failure but cannot prevent one.
-    const int control_violations = count_over_advertised(fake_cap_over_advertising, dispatch_wrapper, false);
-    if (control_violations != 1) {
+    //    explains a failure but cannot prevent one. Its premise is checked before
+    //    the control itself, because an injection that is no longer a violation
+    //    makes the control pass vacuously.
+    if (!control_premise_holds()) {
         std::printf(
-            "FAIL: positive control expected exactly 1 detected violation, got %d. "
-            "The subset checker is not sensitive and its zero below would mean nothing.\n",
-            control_violations);
+            "FAIL: positive control premise broken -- type=%d layout=%d is now covered by an "
+            "executor, so injecting it no longer creates a violation. Pick an uncovered pair.\n",
+            static_cast<int>(k_control_type), static_cast<int>(k_control_layout));
+        ++failures;
+    }
+    //    Measured as a DELTA against the real tables, not as an absolute count:
+    //    on a tree that already has a genuine violation an absolute "== 1" fails
+    //    and blames the checker for being insensitive, which is the opposite of
+    //    what is happening. The delta isolates the injection.
+    const int real_violations    = count_over_advertised(cap_wrapper, dispatch_wrapper, false);
+    const int control_violations = count_over_advertised(fake_cap_over_advertising, dispatch_wrapper, false);
+    if (control_violations - real_violations != 1) {
+        std::printf(
+            "FAIL: positive control did not detect its injected violation "
+            "(real=%d, with-injection=%d, delta=%d, want 1). "
+            "The subset checker is not sensitive, so its result below would mean nothing.\n",
+            real_violations, control_violations, control_violations - real_violations);
         ++failures;
     }
 
@@ -122,6 +152,11 @@ int main() {
         { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS, "nvfp4/AOS" },
         { GGML_TYPE_Q4_0,  GGML_LAYOUT_AOS, "q4_0/AOS"  },
         { GGML_TYPE_Q8_0,  GGML_LAYOUT_AOS, "q8_0/AOS"  },
+        // gx30 wave 1
+        { GGML_TYPE_Q4_1,  GGML_LAYOUT_AOS, "q4_1/AOS"  },
+        { GGML_TYPE_Q4_K,  GGML_LAYOUT_AOS, "q4_K/AOS"  },
+        { GGML_TYPE_Q5_K,  GGML_LAYOUT_AOS, "q5_K/AOS"  },
+        { GGML_TYPE_Q6_K,  GGML_LAYOUT_AOS, "q6_K/AOS"  },
     };
 
     for (const auto & req : required) {
@@ -138,7 +173,10 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    const ggml_type uncovered[] = { GGML_TYPE_Q4_K,   GGML_TYPE_Q6_K, GGML_TYPE_Q4_1,
+    // Wave 2 candidates (still no _id kernel) plus the float types, which MMVQ
+    // cannot serve at all. Covering any of these must move this list in the same
+    // change, which is the point.
+    const ggml_type uncovered[] = { GGML_TYPE_Q5_1,   GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
                                     GGML_TYPE_IQ4_XS, GGML_TYPE_F16,  GGML_TYPE_F32 };
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {

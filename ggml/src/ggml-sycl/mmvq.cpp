@@ -16506,6 +16506,21 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
             }
             have_kernel_event = true;
             break;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
+                ne00 > INT_MAX || ne01 > INT_MAX ||
+                !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
+                                          static_cast<int>(ne00), static_cast<int>(ne01),
+                                          static_cast<int>(total_batches), static_cast<int>(n_ids),
+                                          static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
+                                          q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
+                return false;
+            }
+            have_kernel_event = true;
+            break;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q4_0_q8_1_id_sycl(nullptr,           // vx (unused with expert_ptrs)
                                           dispatch_ptrs,     // expert pointer table or compact row list
@@ -22176,6 +22191,81 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &                    q,
                                             vec_dot_nvfp4_q8_1>(
                 q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
                 ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        default:
+            return false;
+    }
+    if (event_out) {
+        *event_out = event;
+    }
+    return true;
+}
+
+bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
+                              ggml_type                        weight_type,
+                              ggml_layout_mode                 weight_layout,
+                              const void * const *             expert_ptrs_device,
+                              const void *                     y_q8_1,
+                              const int32_t *                  ids_device,
+                              float *                          dst,
+                              int                              ncols,
+                              int                              nrows_per_expert,
+                              int                              total_batches,
+                              int                              n_ids,
+                              int                              n_tokens,
+                              int                              ne11,
+                              int64_t                          ids_nb0,
+                              int64_t                          ids_nb1,
+                              int64_t                          q8_nb11,
+                              int64_t                          q8_nb12,
+                              int64_t                          dst_nb1,
+                              int64_t                          dst_nb2,
+                              const std::vector<sycl::event> * deps,
+                              sycl::event *                    event_out) {
+    if (weight_layout != GGML_LAYOUT_AOS || !expert_ptrs_device || !y_q8_1 || !dst || ncols <= 0 ||
+        nrows_per_expert <= 0 || !mmvq_q1_nvfp4_aos_id_batch_shape_valid(total_batches, n_ids, n_tokens) || ne11 <= 0 ||
+        q8_nb11 <= 0 || q8_nb12 <= 0 || dst_nb1 <= 0 || dst_nb2 <= 0 ||
+        (ids_device && (ids_nb0 <= 0 || ids_nb1 <= 0))) {
+        return false;
+    }
+
+    sycl::event event;
+    switch (weight_type) {
+        case GGML_TYPE_Q4_1:
+            if (ncols % QK4_1 != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_Q4_1, QK4_0, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ,
+                                            vec_dot_q4_1_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q4_K:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event =
+                mmvq_submit_aos_id_impl<GGML_TYPE_Q4_K, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+                    q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
+                    n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q5_K:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event =
+                mmvq_submit_aos_id_impl<GGML_TYPE_Q5_K, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
+                    q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
+                    n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q6_K:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event =
+                mmvq_submit_aos_id_impl<GGML_TYPE_Q6_K, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                    q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
+                    n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
             break;
         default:
             return false;

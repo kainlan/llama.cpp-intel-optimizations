@@ -610,6 +610,36 @@ bool mmvq_submit_q1_nvfp4_aos_id(sycl::queue &        q,
                                  const sycl::event &  dependency,
                                  sycl::event *        event_out = nullptr);
 
+// Batched MoE AoS submit for the quantized types whose _id coverage was added
+// for llama.cpp-gx30 wave 1: Q4_1, Q4_K, Q5_K, Q6_K. Each dispatches the same
+// generic mmvq_submit_aos_id_impl<> that Q1_0/NVFP4 use; the per-type template
+// tuple is transcribed verbatim from the already-shipped non-indexed launcher
+// (mul_mat_vec_<t>_q8_1_sycl), because the two kernels share identical block
+// math and differ only in where the weight pointer and y offset come from.
+// Returns false rather than submitting for any shape the kernel cannot serve,
+// so the capability query can decline before submit instead of after.
+bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
+                              ggml_type                        weight_type,
+                              ggml_layout_mode                 weight_layout,
+                              const void * const *             expert_ptrs_device,
+                              const void *                     y_q8_1,
+                              const int32_t *                  ids_device,
+                              float *                          dst,
+                              int                              ncols,
+                              int                              nrows_per_expert,
+                              int                              total_batches,
+                              int                              n_ids,
+                              int                              n_tokens,
+                              int                              ne11,
+                              int64_t                          ids_nb0,
+                              int64_t                          ids_nb1,
+                              int64_t                          q8_nb11,
+                              int64_t                          q8_nb12,
+                              int64_t                          dst_nb1,
+                              int64_t                          dst_nb2,
+                              const std::vector<sycl::event> * deps      = nullptr,
+                              sycl::event *                    event_out = nullptr);
+
 // Decode-only composition over caller-supplied admitted workspace slices.
 // activation_f32 is contiguous [token][ne11][K]. ids_host is the packed,
 // immutable retained snapshot [token][top_k]; the adapter uploads that exact
