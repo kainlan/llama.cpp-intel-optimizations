@@ -174,6 +174,98 @@ static int test_kv_zone_root_does_not_cover_sibling_layers() {
     return 0;
 }
 
+// llama.cpp-init: the sibling of the fill defect above, in the OTHER branch of
+// tiered_kv_buffer_clear().  That branch used to coalesce *adjacent* arena KV
+// layers into contiguous runs and clear each run in one call, which mints its
+// destination from the run's base pointer — the first layer's.  This models the
+// GPT-OSS shape that reached it (iSWA: only every other layer is populated, and
+// the populated ones are adjacent in the zone), runs the old merge, and pins
+// that the merged run it produces is not expressible: adjacency makes the
+// layers contiguous but does not create an owner spanning them, so authority
+// stops at one layer no matter how many the run covers.  Each per-layer fill,
+// by contrast, is in range — which is the whole content of the fix.
+static int test_kv_clear_merge_run_has_no_owner() {
+    constexpr size_t          layer_bytes                        = 16;
+    constexpr size_t          n_slots                            = 8;  // 8 slots, every other one populated
+    constexpr size_t          n_populated                        = n_slots / 2;
+    alignas(64) unsigned char storage[layer_bytes * n_populated] = {};
+
+    const int kv_zone   = static_cast<int>(ggml_sycl::vram_zone_id::KV);
+    auto      authority = make_authority(kv_zone, 37, storage, sizeof(storage));
+
+    // Populated layers sit back to back in the zone; empty slots contribute no
+    // allocation at all, exactly as layer_allocs[even] does under iSWA.
+    struct modelled_layer {
+        unsigned char * ptr         = nullptr;
+        size_t          size        = 0;
+        uint64_t        alloc_id    = 0;
+        size_t          zone_offset = 0;
+    };
+
+    std::vector<modelled_layer>        layer_allocs(n_slots);
+    std::vector<ggml_sycl::mem_handle> zone_handles(n_slots);
+    for (size_t slot = 1, l = 0; slot < n_slots; slot += 2, ++l) {
+        auto & la      = layer_allocs[slot];
+        la.zone_offset = l * layer_bytes;
+        la.ptr         = storage + la.zone_offset;
+        la.size        = layer_bytes;
+        la.alloc_id    = 400 + l;
+        CHECK(authority->register_allocation(kv_zone, la.alloc_id, la.zone_offset, la.size),
+              "per-layer KV fake allocator record must register");
+        zone_handles[slot] = ggml_sycl::mem_handle::from_arena_zone(kv_zone, la.zone_offset, la.size, 0, 37,
+                                                                    la.alloc_id, la.size, authority);
+    }
+
+    // The merge the old clear performed: extend the active run while the next
+    // layer starts exactly where the run ends.
+    unsigned char * run_ptr  = nullptr;
+    size_t          run_size = 0;
+    size_t          n_runs   = 0;
+    for (const auto & la : layer_allocs) {
+        if (!la.ptr || la.size == 0) {
+            continue;
+        }
+        if (run_ptr && run_ptr + run_size == la.ptr) {
+            run_size += la.size;
+            continue;
+        }
+        run_ptr  = la.ptr;
+        run_size = la.size;
+        n_runs++;
+    }
+    CHECK(n_runs == 1 && run_ptr == storage && run_size == layer_bytes * n_populated,
+          "modelled merge must coalesce every populated layer into one whole-span run");
+
+    // No owner covers that run.  The run's base is the first layer's pointer,
+    // and that layer's record is the only one a lookup from it can reach.
+    const auto first = zone_handles[1].resolve();
+    // Order matters: this inequality has to be asserted BEFORE the exact-value
+    // check below.  After that check the compiler knows first.extent is
+    // layer_bytes and run_size is layer_bytes * n_populated, both constants, so
+    // it folds this comparison to true and drops the branch entirely — an
+    // assertion that cannot fail is not one.  Verified against the binary: put
+    // after, its message is absent from the built strings; put here, present.
+    CHECK(first.extent < run_size, "merged run must exceed the authority its base pointer carries");
+    CHECK(first.ptr == run_ptr && first.extent == layer_bytes,
+          "run base must resolve as the first layer's allocation, not the run");
+    CHECK(authority->resolve_allocation(kv_zone, 37, 400, 0, run_size) == nullptr,
+          "merged run must not resolve against the first layer's record");
+    CHECK(!zone_handles[1].slice(0, run_size).valid(), "first layer must not be wideable to the merged run");
+
+    // Per-layer fills, the shape the fix issues, each fit their own owner.
+    for (size_t slot = 1; slot < n_slots; slot += 2) {
+        const auto resolved = zone_handles[slot].resolve();
+        CHECK(resolved.ptr == layer_allocs[slot].ptr && resolved.extent == layer_allocs[slot].size,
+              "per-layer fill must resolve its own allocation exactly");
+    }
+
+    zone_handles.clear();
+    for (size_t l = 0; l < n_populated; ++l) {
+        CHECK(authority->unregister_allocation(kv_zone, l * layer_bytes), "per-layer KV fake record must unregister");
+    }
+    return 0;
+}
+
 static int test_arena_allocation_vs_settle_linearization() {
     alignas(64) unsigned char storage[64] = {};
     auto authority = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 3,
@@ -329,6 +421,9 @@ int main() {
     if (int rc = test_arena_debug_identity_includes_generation()) return rc;
     if (int rc = test_arena_authority_invalidation_and_chunk_bounds()) return rc;
     if (int rc = test_kv_zone_root_does_not_cover_sibling_layers()) {
+        return rc;
+    }
+    if (int rc = test_kv_clear_merge_run_has_no_owner()) {
         return rc;
     }
     if (int rc = test_arena_allocation_vs_settle_linearization()) return rc;

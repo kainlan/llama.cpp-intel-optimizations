@@ -34259,95 +34259,90 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
         return;
     }
 
-    // Clear per-layer allocations with one event wait per owner device.  Arena
-    // KV layers are adjacent suballocations of the unified-cache KV zone, so
-    // merge those into contiguous memset ranges instead of submitting one
-    // command per logical layer.  This preserves the per-layer smart handles
-    // while avoiding a Level Zero direct-submission pattern that can reset the
-    // B50 during context construction.
-    struct kv_clear_run {
-        int       owner_device = -1;
-        uint8_t * ptr          = nullptr;
-        size_t    size         = 0;
-        size_t    layers       = 0;
-    };
-
-    std::array<size_t, GGML_SYCL_MAX_DEVICES> device_clear_runs{};
+    // Clear per-layer allocations with a single wait for all device work.
+    //
+    // llama.cpp-init: this loop used to merge adjacent arena KV layers into
+    // contiguous runs and clear each run with one
+    // unified_cache_fill_with_host_copy call, to keep the command count down.
+    // Adjacency does not create a whole-span owner, though — for the same
+    // reason as llama.cpp-09ts above, the KV buffer is n_layers separate arena
+    // sub-allocations and no handle carries authority over more than one of
+    // them.  The merged call passed the run's total size with the run's base
+    // pointer, which is the FIRST layer's pointer, and
+    // unified_cache_fill_with_host_copy mints its destination from that raw
+    // pointer (unified-cache.cpp, make_copy_handle_for_raw_ptr) — so the H2D
+    // copy it issues to implement the fill asked the run's FIRST layer's
+    // allocation to absorb every sibling behind it.  On GPT-OSS that was
+    // 12 x 512 KiB merged into one 6 MiB copy against a 512 KiB extent, which
+    // require_resolved_range correctly rejects.
+    //
+    // Mistral never reaches this loop, and the reason is worth naming because
+    // it is not a defect in GPT-OSS's KV layout.  Those 12 layers are
+    // contiguous, aligned, single-owner and entirely arena-sourced — exactly
+    // what the alloc_base_is_arena fast path above was built for.  They are
+    // excluded by kv_buffer_covers_all_layers alone, which is
+    // buffer_kind == ALL_LAYERS: under iSWA this buffer is one attention
+    // kind's slice of the model's layers, so the term is false however
+    // well-formed the arena span is.
+    //
+    // Fill each arena layer through its own owning handle instead, exactly as
+    // that branch does.  Authority then matches the bytes written, and the
+    // command count stays acceptable because the submissions are asynchronous
+    // with a single wait rather than one blocking fill per run.
     std::array<size_t, GGML_SYCL_MAX_DEVICES> device_clear_layers{};
-    kv_clear_run                              active_run{};
-
-    auto submit_active_run = [&]() {
-        if (!active_run.ptr || active_run.size == 0) {
-            active_run = {};
-            return;
-        }
-        if (active_run.owner_device < 0 || active_run.owner_device >= GGML_SYCL_MAX_DEVICES) {
-            GGML_LOG_ERROR("[KV-TIER] invalid owner device %d for KV clear\n", active_run.owner_device);
-            SYCL_CHECK(dpct::default_error);
-        }
-        auto & owner_queue = tiered_kv_clear_queue_for_device(active_run.owner_device);
-        if (!ggml_sycl::unified_cache_fill_with_host_copy(active_run.owner_device, active_run.ptr, active_run.size,
-                                                          value, owner_queue, "kv_clear")) {
-            GGML_LOG_ERROR("[KV-TIER] Device %d: KV clear host-copy fill failed (ptr=%p size=%zu)\n",
-                           active_run.owner_device, active_run.ptr, active_run.size);
-            SYCL_CHECK(dpct::default_error);
-        }
-        device_clear_runs[active_run.owner_device]++;
-        device_clear_layers[active_run.owner_device] += active_run.layers;
-        active_run = {};
-    };
+    std::vector<sycl::event>                  fill_events;
+    std::vector<kv_layer_alloc *>             host_copy_layers;
+    fill_events.reserve(ctx->layer_allocs.size());
 
     for (auto & la : ctx->layer_allocs) {
         if (!la.ptr || la.size == 0) {
             continue;
         }
-        if (la.on_device) {
-            const int owner_device = la.owner_device >= 0 ? la.owner_device : ctx->device;
-            if (owner_device < 0 || owner_device >= GGML_SYCL_MAX_DEVICES) {
-                GGML_LOG_ERROR("[KV-TIER] invalid owner device %d for KV clear\n", owner_device);
-                SYCL_CHECK(dpct::default_error);
-            }
-            const bool arena_kv_layer = tiered_kv_layer_is_arena_kv(la);
-            if (arena_kv_layer) {
-                auto *     layer_ptr = static_cast<uint8_t *>(la.ptr);
-                const auto run_end   = active_run.ptr ? active_run.ptr + active_run.size : nullptr;
-                if (active_run.ptr && active_run.owner_device == owner_device && run_end == layer_ptr) {
-                    active_run.size += la.size;
-                    active_run.layers++;
-                } else {
-                    submit_active_run();
-                    active_run.owner_device = owner_device;
-                    active_run.ptr          = layer_ptr;
-                    active_run.size         = la.size;
-                    active_run.layers       = 1;
-                }
-            } else {
-                submit_active_run();
-                auto & owner_queue = tiered_kv_clear_queue_for_device(owner_device);
-                if (!ggml_sycl::unified_cache_fill_with_host_copy(owner_device, la.ptr, la.size, value, owner_queue,
-                                                                  "kv_clear")) {
-                    GGML_LOG_ERROR("[KV-TIER] Device %d: KV clear host-copy fill failed (ptr=%p size=%zu)\n",
-                                   owner_device, la.ptr, la.size);
-                    SYCL_CHECK(dpct::default_error);
-                }
-                device_clear_runs[owner_device]++;
-                device_clear_layers[owner_device]++;
-            }
-        } else {
-            submit_active_run();
+        if (!la.on_device) {
             ::memset(la.ptr, value, la.size);
-        }
-    }
-    submit_active_run();
-
-    for (int owner_device = 0; owner_device < GGML_SYCL_MAX_DEVICES; ++owner_device) {
-        if (device_clear_runs[owner_device] == 0) {
             continue;
         }
-        if (device_clear_layers[owner_device] > device_clear_runs[owner_device]) {
-            GGML_LOG_INFO("[KV-TIER] Device %d: merged %zu KV clear layers into %zu host-copy fill ranges\n",
-                          owner_device, device_clear_layers[owner_device], device_clear_runs[owner_device]);
+        const int owner_device = la.owner_device >= 0 ? la.owner_device : ctx->device;
+        if (owner_device < 0 || owner_device >= GGML_SYCL_MAX_DEVICES) {
+            GGML_LOG_ERROR("[KV-TIER] invalid owner device %d for KV clear\n", owner_device);
+            SYCL_CHECK(dpct::default_error);
         }
+        device_clear_layers[owner_device]++;
+        if (!tiered_kv_layer_is_arena_kv(la)) {
+            // Non-arena device layers keep the host-copy fill they have always
+            // used.  It is synchronous, so defer it past the batch wait below
+            // rather than interleaving a wait between two async submissions.
+            host_copy_layers.push_back(&la);
+            continue;
+        }
+        auto & owner_queue = tiered_kv_clear_queue_for_device(owner_device);
+        fill_events.push_back(ggml_sycl::mem_fill_async(la.zone_handle, value, la.size, owner_queue));
+    }
+
+    // Every fill is already enqueued, so this wait never interleaves a submit
+    // between two waits — the pattern that wedges libze (llama.cpp-zhzbp).
+    // Note this is wait_and_throw, not the sycl::event::wait(...) used
+    // elsewhere in this file: a KV clear that failed asynchronously must
+    // surface, not be swallowed.
+    sycl::event::wait_and_throw(fill_events);
+
+    for (auto * la : host_copy_layers) {
+        const int owner_device = la->owner_device >= 0 ? la->owner_device : ctx->device;
+        auto &    owner_queue  = tiered_kv_clear_queue_for_device(owner_device);
+        if (!ggml_sycl::unified_cache_fill_with_host_copy(owner_device, la->ptr, la->size, value, owner_queue,
+                                                          "kv_clear")) {
+            GGML_LOG_ERROR("[KV-TIER] Device %d: KV clear host-copy fill failed (ptr=%p size=%zu)\n", owner_device,
+                           la->ptr, la->size);
+            SYCL_CHECK(dpct::default_error);
+        }
+    }
+
+    for (int owner_device = 0; owner_device < GGML_SYCL_MAX_DEVICES; ++owner_device) {
+        if (device_clear_layers[owner_device] == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("[KV-TIER] Device %d: cleared %zu KV layers through per-layer owners\n", owner_device,
+                      device_clear_layers[owner_device]);
     }
 }
 
