@@ -222,8 +222,44 @@ def mmvq_extent_violations(source: str) -> list[str]:
     return found
 
 
+def ptr_table_refusal_violations(source: str) -> list[str]:
+    """An unroutable expert must refuse the pointer table, not abort the process.
+
+    Key validity is a property of the caller's tensor -- a tensor whose extra was
+    built outside a SYCL buffer's init_tensor carries no owner identity -- so this
+    is a condition external callers control.  The function returns bool and its
+    callers already treat false as "fall back".
+    """
+    body = function_or_none(source, "bool ggml_sycl_update_moe_ptr_table")
+    if body is None:
+        return ["ggml_sycl_update_moe_ptr_table is missing"]
+
+    found: list[str] = []
+    if "missing MoE cache key" in body:
+        found.append("update_moe_ptr_table still aborts on a missing MoE cache key")
+    if not re.search(r"if \(!expert_cache_key\.valid\) \{[^}]*?return false;", body, re.S):
+        found.append("update_moe_ptr_table does not refuse on an invalid expert cache key")
+    return found
+
+
 def test_sycl_buffer_bases_honour_advertised_alignment() -> None:
     assert violations(SOURCE.read_text()) == []
+
+
+def test_ptr_table_refuses_missing_cache_key() -> None:
+    assert ptr_table_refusal_violations(SOURCE.read_text()) == []
+
+
+def test_ptr_table_refusal_mutations_are_witnessed() -> None:
+    source = SOURCE.read_text()
+    mutations = [
+        # Reinstating the abort is the llama.cpp-f8ws wall-4 defect.
+        source.replace('            GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\\n", src0->name, (long) e, layer_id);\n            return false;',
+                       '            GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\\n", src0->name, (long) e, layer_id);\n            GGML_ASSERT(expert_cache_key.valid && "missing MoE cache key");\n            return false;', 1),
+    ]
+    for index, mutated in enumerate(mutations):
+        assert mutated != source, f"ptr-table mutation {index} did not change the source"
+        assert ptr_table_refusal_violations(mutated), f"ptr-table mutation {index} was not witnessed"
 
 
 def test_mmvq_raw_copies_carry_a_trusted_extent() -> None:

@@ -51664,8 +51664,12 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         const ggml_sycl_cache_id expert_base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
         ggml_sycl_cache_id expert_cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(expert_base_key, layout);
         if (!expert_cache_key.valid) {
+            // Key validity depends on the caller's tensor, not on anything this
+            // function controls: a tensor whose extra was built outside a SYCL
+            // buffer's init_tensor carries no owner identity and cannot mint one.
+            // Refuse the table like every other unroutable case -- callers already
+            // treat false as "fall back" -- rather than aborting the process.
             GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\n", src0->name, (long) e, layer_id);
-            GGML_ASSERT(expert_cache_key.valid && "missing MoE cache key");
             return false;
         }
         ggml_sycl::cache_layout_request req{};
