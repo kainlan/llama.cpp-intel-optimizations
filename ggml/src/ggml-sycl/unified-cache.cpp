@@ -3686,8 +3686,16 @@ bool unified_cache::shutdown_resources() {
                 }
                 ring += "seq=" + std::to_string(ev.seq) + (ev.acquire ? "+acquire:" : "-release:") + ev.site;
             }
+            // An empty ring is ambiguous and the ambiguity is expensive: it
+            // reads as "the lease was never recorded", when in fact
+            // record_lease_event() returns early unless g_ggml_sycl_debug is
+            // set, while debug_last_lease_site is assigned unconditionally.
+            // Say which of the two it is rather than letting the reader guess.
             GGML_LOG_ERROR("[UNIFIED-CACHE] lease ring for name_hash=0x%llx: %s\n",
-                           (unsigned long long) it->first.id.name_hash, ring.empty() ? "(empty)" : ring.c_str());
+                           (unsigned long long) it->first.id.name_hash,
+                           !ring.empty()     ? ring.c_str() :
+                           g_ggml_sycl_debug ? "(empty: debug enabled, no events recorded)" :
+                                               "(not recorded: set GGML_SYCL_DEBUG=1 to capture the ring)");
         }
         GGML_ASSERT(leases == 0 && "cache shutdown with an external weight lease");
         it = erase_entry_locked(it);

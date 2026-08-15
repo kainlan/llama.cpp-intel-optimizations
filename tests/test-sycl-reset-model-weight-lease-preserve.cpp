@@ -163,6 +163,29 @@ static bool test_reset_preserves_leased_entry_and_remaps_id(sycl::queue & q) {
         fprintf(stderr, "acquire_weight_lease failed to resolve either layout sibling\n");
         return false;
     }
+    // weight_ptr_lease_result is a plain aggregate with NO destructor -- its
+    // `entry` field is documented as "opaque handle for lease release", and the
+    // refcount bump acquire_entry_lease() made is nobody's until someone adopts
+    // it.  Production never holds the raw result: cpu-dispatch.cpp wraps it in a
+    // mem_handle via from_weight_lease_snapshot(), which takes over the bump
+    // ("ownership of the refcount bump transferred", mem-handle.cpp) and
+    // releases it in release_lease_state().
+    //
+    // Holding the raw result, as this test did, leaks in_use_count for the rest
+    // of the process.  That was invisible until 582fee665 added
+    // GGML_ASSERT(in_use_count == 0) to unified_cache::shutdown_resources(),
+    // after which this fixture aborted the whole binary at ~unified_cache --
+    // before any later test in this file could run.  Owning the lease the way
+    // production does is both the fix and the more faithful simulation.
+    ggml_sycl::mem_handle lease_owner = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, /*device=*/0, lease.ptr, lease.layout, lease.on_device, lease.entry, std::move(lease.storage_owner),
+        lease.has_ready_event, lease.ready_event);
+    if (!lease_owner.valid()) {
+        // The snapshot refuses (and releases the bump itself) when the entry is
+        // not a consistent authority for this pointer/layout/device tuple.
+        fprintf(stderr, "from_weight_lease_snapshot refused the lease; cannot simulate a live holder\n");
+        return false;
+    }
     if (lease.layout != GGML_LAYOUT_SOA) {
         fprintf(stderr, "test assumption violated: acquire_weight_lease did not resolve SOA (got layout=%d)\n",
                 (int) lease.layout);
