@@ -1,0 +1,4 @@
+Test project /Apps/llama.cpp/build
+  Test #163: test-sycl-moe-handle-resolution
+
+Total Tests: 1
