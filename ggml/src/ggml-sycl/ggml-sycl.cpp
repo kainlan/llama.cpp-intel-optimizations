@@ -34289,6 +34289,21 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
     // that branch does.  Authority then matches the bytes written, and the
     // command count stays acceptable because the submissions are asynchronous
     // with a single wait rather than one blocking fill per run.
+    //
+    // That also retires a warning this comment block replaced, which is worth
+    // recording rather than silently dropping: the merged host-copy fill was
+    // described as avoiding "a Level Zero direct-submission pattern that can
+    // reset the B50 during context construction", so moving arena layers to a
+    // device mem_fill_async is a real change in submission kind, not just in
+    // authority.  The concern is discharged by the mirror branch above, which
+    // already issues exactly this per-layer mem_fill_async + single
+    // wait_and_throw on the same card and is gate-verified there on Mistral's
+    // 32 layers — a strictly harder case than the 12 that reach here.  The
+    // original incident is not independently checkable: the warning arrived in
+    // 57509a200, a mega-commit whose own message says it absorbs accumulated
+    // working-set WIP, so git blame attributes the text but no reproduction.
+    // If a B50 reset ever resurfaces during context construction, this is the
+    // change to suspect first.
     std::array<size_t, GGML_SYCL_MAX_DEVICES> device_clear_layers{};
     std::vector<sycl::event>                  fill_events;
     std::vector<kv_layer_alloc *>             host_copy_layers;
