@@ -321,6 +321,32 @@ static void stage_trace_sample(const char * where,
                                int          usm_param  = -1,
                                int          graph_self = -1,
                                int          graph_any  = -1) {
+    // GATE THE ACCOUNTING, NOT ONLY THE PRINT.
+    //
+    // Everything below -- the cache lookup (a shared_mutex read lock), five
+    // pinned-pool/zone accessors, and the peak compare-exchange -- used to run
+    // on EVERY staging allocation whether tracing was on or off.  That is 65k+
+    // times per census and once per production MoE staging copy, which made the
+    // "diagnostics-only" claim on this trace false as written.
+    //
+    // The condition is HOISTED rather than wrapped around the fprintf, because
+    // on the !ok path the accounting must still run BEFORE the print: the
+    // failure line's whole value is the reservoir state at the instant it
+    // failed, and a print with unpopulated fields would be worse than no print.
+    // Emit when (!ok || enabled); so return early on its negation, (ok && !enabled).
+    if (ok && !stage_trace_enabled()) {
+        return;
+    }
+
+    // peak, graph_any_n and graph_self_n accumulate HERE, so gating the body
+    // makes them discontinuous when tracing is off: they then cover failure
+    // samples only.  `peak` is the dangerous one -- it would equal `committed`
+    // and read as "the pool never grew", a false all-clear on the one line
+    // anybody reads.  Say so in band rather than let a reader trust a number
+    // that is no longer a high-water mark.  alloc_ok/alloc_fail/retained/waited
+    // are incremented by the callers and stay continuous either way.
+    const bool cumulative_continuous = stage_trace_enabled();
+
     unified_cache * cache = device >= 0 ? get_unified_cache_for_device(device) : nullptr;
     if (!cache) {
         cache = get_unified_cache_for_device(0);
@@ -343,23 +369,21 @@ static void stage_trace_sample(const char * where,
     }
     const int usm_eff = (usm_param < 0 || graph_any < 0) ? -1 : ((usm_param || graph_any) ? 1 : 0);
 
-    if (!ok || stage_trace_enabled()) {
-        const unsigned long long allocs = g_stage_alloc_ok.load(std::memory_order_relaxed);
-        fprintf(stderr,
-                "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
-                "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
-                "zone_cap=%zu usm_param=%d graph_self=%d graph_any=%d usm_eff=%d graph_any_n=%llu "
-                "graph_self_n=%llu%s\n",
-                where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
-                (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
-                (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
-                (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
-                g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, usm_param,
-                graph_self, graph_any, usm_eff,
-                (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
-                (unsigned long long) g_stage_graph_self_seen.load(std::memory_order_relaxed),
-                (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "");
-    }
+    const unsigned long long allocs = g_stage_alloc_ok.load(std::memory_order_relaxed);
+    fprintf(stderr,
+            "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
+            "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
+            "zone_cap=%zu usm_param=%d graph_self=%d graph_any=%d usm_eff=%d graph_any_n=%llu "
+            "graph_self_n=%llu%s%s\n",
+            where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
+            (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
+            g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, usm_param,
+            graph_self, graph_any, usm_eff, (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_graph_self_seen.load(std::memory_order_relaxed),
+            (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "",
+            cumulative_continuous ? "" : " CUMULATIVE-GATED");
 }
 
 void stage_trace_mark(const char * tag) {
