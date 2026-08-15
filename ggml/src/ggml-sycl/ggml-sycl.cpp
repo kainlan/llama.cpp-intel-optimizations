@@ -16018,8 +16018,20 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     }
     mem_handle padded_owner = detail::from_legacy_owned_alloc(std::move(padded_allocation), GGML_LAYOUT_SOA);
     auto       padded_base  = padded_owner.resolve(0);
-    if (!padded_base.ptr ||
-        !extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(padded_owner), nullptr,
+    if (!padded_base.ptr) {
+        sycl::event::wait(stage_events);
+        return false;
+    }
+
+    // Fill the logical slice and publish the producing copy as this record's
+    // ready event, mirroring test_stage_soa_expert_handle() above. An event-less
+    // replacement leaves the pointer-table upload with nothing to chain, so the
+    // dep_chained assertion below would be checking a property the fixture never
+    // established rather than the upload's chaining behaviour.
+    const sycl::event padded_ready =
+        q.memcpy(static_cast<uint8_t *>(padded_base.ptr) + logical_offset, data.data(), data.size());
+    stage_events.push_back(padded_ready);
+    if (!extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(padded_owner), &padded_ready,
                                            logical_offset, data.size())) {
         sycl::event::wait(stage_events);
         return false;
