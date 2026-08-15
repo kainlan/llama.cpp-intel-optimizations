@@ -32702,7 +32702,13 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     ctx->set_managed_owner(std::move(runtime_h));
                     GGML_SYCL_DEBUG("[SYCL] Arena RUNTIME zone alloc: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                     buft_ctx->name.c_str());
-                    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone");
+                    if (ggml_backend_buffer_t published =
+                            ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone")) {
+                        return published;
+                    }
+                    // Refused: the context is gone and its allocation released.
+                    // Fall through to the next tier rather than failing the whole
+                    // allocation -- the tiers below can still serve this buffer.
                 }
 
                 // RUNTIME zone full — for compute buffers, try the shared KV
@@ -32731,7 +32737,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                         GGML_LOG_INFO(
                             "[SYCL] Arena RUNTIME zone full, runtime buffer (%.1f MB) allocated from KV zone (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena KV zone");
+                        if (ggml_backend_buffer_t published =
+                                ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena KV zone")) {
+                            return published;
+                        }
+                        // Refused -- fall through to the SCRATCH zone.
                     }
                     // KV zone also full — try the SCRATCH zone as last-resort
                     // registered unified-cache ownership.  Do not borrow from
@@ -32757,7 +32767,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                             "[SYCL] Arena RUNTIME+KV full, runtime buffer allocated from SCRATCH zone: %.1f "
                             "MB (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena SCRATCH zone");
+                        if (ggml_backend_buffer_t published =
+                                ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena SCRATCH zone")) {
+                            return published;
+                        }
+                        // Refused -- fall through to the legacy allocation path.
                     }
                     GGML_LOG_WARN(
                         "[SYCL] RUNTIME+KV+scratch all full for runtime buffer %zu MB, unified_alloc fallback\n",

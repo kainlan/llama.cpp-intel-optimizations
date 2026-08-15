@@ -14,6 +14,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+TLSF = ROOT / "ggml/src/ggml-sycl/tlsf-allocator.hpp"
 
 CONSTANT = "GGML_SYCL_BUFFER_BASE_ALIGNMENT"
 ALLOC_BUFFER = "static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer"
@@ -137,8 +138,90 @@ def violations(source: str) -> list[str]:
     return found
 
 
+def tlsf_violations(source: str) -> list[str]:
+    """The allocator must keep block offsets on MIN_BLOCK_SIZE granularity.
+
+    Offsets are what become device pointers.  split_block() puts the remainder at
+    (offset + size), so rounding an allocation by the caller's `alignment` — which
+    most callers leave at the allocator default of 64 — produces offsets that are
+    64- but not 128/256-aligned, and every buffer cut from them inherits that.
+    """
+    found: list[str] = []
+
+    body = function_or_none(source, "inline size_t tlsf_allocator::allocate")
+    if body is None:
+        return ["tlsf_allocator::allocate is missing"]
+
+    # The rounding granularity must be at least MIN_BLOCK_SIZE, never bare alignment.
+    if not re.search(r"granularity\s*=\s*alignment\s*>\s*MIN_BLOCK_SIZE\s*\?\s*alignment\s*:\s*MIN_BLOCK_SIZE", body):
+        found.append("allocate() does not raise the rounding granularity to MIN_BLOCK_SIZE")
+    if not re.search(r"size\s*=\s*\(size\s*\+\s*granularity\s*-\s*1\)\s*&\s*~\(granularity\s*-\s*1\)", body):
+        found.append("allocate() does not round the size by the granularity")
+    if re.search(r"size\s*=\s*\(size\s*\+\s*alignment\s*-\s*1\)\s*&\s*~\(alignment\s*-\s*1\)", body):
+        found.append("allocate() still rounds the size by the caller's alignment")
+
+    # The invariant is checked where it is produced, not merely documented.
+    if not re.search(r"TLSF_ASSERT\(\(blocks_\[block_id\]\.offset\s*%\s*MIN_BLOCK_SIZE\)\s*==\s*0", body):
+        found.append("allocate() does not assert the returned offset's MIN_BLOCK_SIZE alignment")
+
+    return found
+
+
+def zone_fallthrough_violations(source: str) -> list[str]:
+    """A refused zone buffer must fall through to the next tier, not fail the allocator.
+
+    The buffer-type allocator tries RUNTIME -> KV -> SCRATCH -> legacy.  Returning
+    the guard's nullptr from any of the first three skips the tiers below it and
+    turns a recoverable misalignment into a failed allocation.
+    """
+    alloc = function_or_none(source, ALLOC_BUFFER)
+    if alloc is None:
+        return [f"{ALLOC_BUFFER} is missing"]
+
+    found: list[str] = []
+    for zone in ("arena RUNTIME zone", "arena KV zone", "arena SCRATCH zone"):
+        if re.search(r"return\s+" + PUBLISH + r"\(buft, ctx, size, \"" + re.escape(zone) + r"\"\)", alloc):
+            found.append(f"'{zone}' returns the publish result instead of falling through")
+        if not re.search(r"=\s*\n?\s*" + PUBLISH + r"\(buft, ctx, size, \"" + re.escape(zone) + r"\"\)", alloc):
+            found.append(f"'{zone}' does not publish through the guarded helper")
+    return found
+
+
 def test_sycl_buffer_bases_honour_advertised_alignment() -> None:
     assert violations(SOURCE.read_text()) == []
+
+
+def test_tlsf_offsets_stay_block_aligned() -> None:
+    assert tlsf_violations(TLSF.read_text()) == []
+
+
+def test_refused_zone_buffers_fall_through() -> None:
+    assert zone_fallthrough_violations(SOURCE.read_text()) == []
+
+
+def test_tlsf_and_fallthrough_mutations_are_witnessed() -> None:
+    tlsf = TLSF.read_text()
+    tlsf_mutations = [
+        # Reinstating the alignment-based rounding is the llama.cpp-f8ws defect.
+        tlsf.replace("const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;",
+                     "const size_t granularity = alignment;", 1),
+        # \s* not \n: clang-format may join this assert onto one line.
+        re.sub(r"TLSF_ASSERT\(\(blocks_\[block_id\]\.offset % MIN_BLOCK_SIZE\) == 0 &&\s*\"[^\"]*\"\);",
+               "", tlsf, count=1),
+    ]
+    for index, mutated in enumerate(tlsf_mutations):
+        assert mutated != tlsf, f"tlsf mutation {index} did not change the source"
+        assert tlsf_violations(mutated), f"tlsf mutation {index} was not witnessed"
+
+    source = SOURCE.read_text()
+    fallthrough_mutations = [
+        re.sub(r"if \(ggml_backend_buffer_t published =\s*\n?\s*" + PUBLISH +
+               r"\(buft, ctx, size, \"arena RUNTIME zone\"\)\) \{\s*\n\s*return published;\s*\n\s*\}",
+               f"return {PUBLISH}(buft, ctx, size, \"arena RUNTIME zone\");", source, count=1),
+    ]
+    for index, mutated in enumerate(fallthrough_mutations):
+        assert mutated != source, f"fallthrough mutation {index} did not change the source"
+        assert zone_fallthrough_violations(mutated), f"fallthrough mutation {index} was not witnessed"
 
 
 def _drop_alignment(source: str, request: str) -> str:
