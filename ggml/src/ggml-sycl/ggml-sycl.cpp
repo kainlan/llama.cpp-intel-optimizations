@@ -61061,6 +61061,7 @@ struct moe_direct_submit_failure final {};
 // Pre-admission-only production witness. Saturating the counter bounds both
 // logging and counter mutation; no ownership or formatting allocation occurs.
 static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
+static std::atomic<uint32_t> g_moe_prompt_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_direct_authority_candidates{ 0 };
 static void ggml_sycl_moe_log_canonical_publish_pre_admission(
     const ggml_tensor * tensor, bool published, int kind, bool stable) noexcept {
@@ -61070,6 +61071,55 @@ static void ggml_sycl_moe_log_canonical_publish_pre_admission(
     if (current >= 16) return;
     fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
             tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+}
+
+static void ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(const ggml_tensor * tensor,
+                                                                     bool                published,
+                                                                     int                 kind,
+                                                                     bool                stable) noexcept {
+    uint32_t current = g_moe_prompt_canonical_publish_diagnostics.load(std::memory_order_relaxed);
+    while (current < 16 && !g_moe_prompt_canonical_publish_diagnostics.compare_exchange_weak(
+                               current, current + 1, std::memory_order_relaxed)) {
+    }
+    if (current >= 16) {
+        return;
+    }
+    fprintf(stderr, "[MOE-PROMPT-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+}
+
+// Publish allocation-owned AoS expert slices for one MUL_MAT_ID operand and
+// report whether expert 0 came back as a stable buffer-owned logical handle.
+//
+// Ordinary backend allocations (including test-backend-ops) may bypass the
+// model preload that normally publishes at set_tensor time, so BOTH admissions
+// in ggml_sycl_mul_mat_id must publish before the non-materializing retained
+// resolver runs.  The slices are views of the buffer's own mem_handle, so the
+// buffer remains the sole owner and the unified cache never learns of these
+// bytes at all; the record is keyed by (expert, layout), so a non-AoS request
+// misses rather than aliasing this AoS view.
+static bool ggml_sycl_publish_mmid_canonical_aos_experts(const ggml_tensor * src0,
+                                                         int                 device,
+                                                         ggml_layout_mode    route_layout,
+                                                         int *               out_kind,
+                                                         bool *              out_stable) {
+    *out_kind   = -1;
+    *out_stable = false;
+    if (route_layout != GGML_LAYOUT_AOS || !src0 || !src0->buffer || !src0->buffer->context ||
+        ggml_backend_buffer_is_host(src0->buffer)) {
+        return false;
+    }
+    const bool published = ggml_sycl_publish_backend_aos_expert_handles(
+        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0));
+    auto *                                                    extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
+    if (published && extra &&
+        extra->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, device,
+                                          ggml_sycl_moe_expert_layout_bytes(src0, GGML_LAYOUT_AOS, device), &expert0)) {
+        *out_kind   = static_cast<int>(expert0.logical_handle.kind());
+        *out_stable = expert0.logical_handle.has_stable_owner_identity();
+    }
+    return published;
 }
 static void ggml_sycl_moe_mark_direct_authority_pre_admission(const ggml_tensor * tensor) noexcept {
     uint32_t current = g_moe_direct_authority_candidates.load(std::memory_order_relaxed);
@@ -63509,6 +63559,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         retained_prompt_layout       = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
         retained_prompt_layout       = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, retained_prompt_layout,
                                                                               prompt_ids_snapshot.size(), has_override, ne12);
+        // Same publication the decode admission performs below: a backend
+        // allocation that never went through model preload has no expert
+        // storage records yet, so the retained resolver would refuse with
+        // route_unavailable before it ever reaches a cache key.
+        int        prompt_published_kind = -1;
+        bool       prompt_published_stable    = false;
+        const bool prompt_canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
+            src0, ctx.device, retained_prompt_layout, &prompt_published_kind, &prompt_published_stable);
+        ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(src0, prompt_canonical_published,
+                                                                 prompt_published_kind, prompt_published_stable);
         retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
             retained_prompt_layout, /*allow_materialize=*/false);
@@ -65005,25 +65065,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
     if (ne12 == 1) {
         ctx.moe_graphs_disabled_once = true;
-        bool canonical_published = false;
-        int  published_kind = -1;
-        bool published_stable = false;
-        if (route_layout == GGML_LAYOUT_AOS && src0->buffer && src0->buffer->context &&
-            !ggml_backend_buffer_is_host(src0->buffer)) {
-            canonical_published = ggml_sycl_publish_backend_aos_expert_handles(
-                static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context),
-                const_cast<ggml_tensor *>(src0));
-            auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
-            if (canonical_published && extra &&
-                extra->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, ctx.device,
-                                                  ggml_sycl_moe_expert_layout_bytes(
-                                                      src0, GGML_LAYOUT_AOS, ctx.device),
-                                                  &expert0)) {
-                published_kind   = static_cast<int>(expert0.logical_handle.kind());
-                published_stable = expert0.logical_handle.has_stable_owner_identity();
-            }
-        }
+        int        published_kind      = -1;
+        bool       published_stable    = false;
+        const bool canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
+            src0, ctx.device, route_layout, &published_kind, &published_stable);
         ggml_sycl_moe_log_canonical_publish_pre_admission(
             src0, canonical_published, published_kind, published_stable);
         const auto recipe_exec = ggml_sycl_take_execution_state_snapshot(&ctx);
