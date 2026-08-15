@@ -10927,8 +10927,7 @@ constexpr bool k_moe_mmid_route_compiled = true;
 #else
 constexpr bool k_moe_mmid_route_compiled = false;
 #endif
-constexpr bool k_moe_mmid_route_reachable_compiled =
-    k_moe_mmid_direct_route_validated || k_moe_mmid_route_compiled;
+constexpr bool k_moe_mmid_route_reachable_compiled = k_moe_mmid_direct_route_validated || k_moe_mmid_route_compiled;
 
 // Full admission predicate, mirrored exactly -- compile-time half plus the
 // per-context runtime authorization the admission site also consults.
@@ -12350,27 +12349,29 @@ static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int 
 // Report a materialization refusal.  WARN and never INFO: common_get_verbosity()
 // maps GGML_LOG_INFO below the default threshold, so an INFO diagnostic here
 // would never reach a log -- which is how this failure stayed invisible.
-static void ggml_sycl_moe_mmid_report_refusal(const char *                            site,
-                                              ggml_sycl::moe_mmid_materialize_reason  reason,
-                                              int                                     device,
-                                              size_t                                  device_pool_bytes,
-                                              size_t                                  host_pool_bytes) {
+static void ggml_sycl_moe_mmid_report_refusal(const char *                           site,
+                                              ggml_sycl::moe_mmid_materialize_reason reason,
+                                              int                                    device,
+                                              size_t                                 device_pool_bytes,
+                                              size_t                                 host_pool_bytes) {
     if (!ggml_sycl::moe_mmid_materialize_reason_is_refusal(reason)) {
         return;
     }
     GGML_LOG_WARN(
         "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s device=%d "
         "device_pool=%.1f MB host_pool=%.1f MB\n",
-        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), device,
-        device_pool_bytes / (1024.0 * 1024.0), host_pool_bytes / (1024.0 * 1024.0));
+        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), device, device_pool_bytes / (1024.0 * 1024.0),
+        host_pool_bytes / (1024.0 * 1024.0));
 }
 
 static bool ggml_sycl_materialize_published_mmid_workspaces(
-    const ggml_sycl::lifecycle::ModelToken & token,
+    const ggml_sycl::lifecycle::ModelToken &                          token,
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot,
-    ggml_sycl::moe_mmid_materialize_reason * out_reason = nullptr) {
+    ggml_sycl::moe_mmid_materialize_reason *                          out_reason = nullptr) {
     const auto set_reason = [&](ggml_sycl::moe_mmid_materialize_reason reason) {
-        if (out_reason) *out_reason = reason;
+        if (out_reason) {
+            *out_reason = reason;
+        }
     };
     set_reason(ggml_sycl::moe_mmid_materialize_reason::OK);
     if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
@@ -15574,8 +15575,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
     if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
         ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, next->plan->device_id,
-                                          next->plan->moe_mmid_device_pool_bytes,
-                                          next->plan->moe_mmid_host_pool_bytes);
+                                          next->plan->moe_mmid_device_pool_bytes, next->plan->moe_mmid_host_pool_bytes);
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         return;
     }
@@ -15749,10 +15749,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
             // results -- admission simply falls through to the generic MoE
             // dispatch -- which is exactly why it has to be loud: nothing
             // downstream would ever report it.
-            ggml_sycl_moe_mmid_report_refusal("context-bind", mmid_reason,
-                                              bound_snapshot->plan ? bound_snapshot->plan->device_id : -1,
-                                              bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_device_pool_bytes : 0,
-                                              bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
+            ggml_sycl_moe_mmid_report_refusal(
+                "context-bind", mmid_reason, bound_snapshot->plan ? bound_snapshot->plan->device_id : -1,
+                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_device_pool_bytes : 0,
+                bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
         }
     }
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_BUSY;
