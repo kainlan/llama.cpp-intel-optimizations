@@ -1248,8 +1248,57 @@ static void concurrent_depth_busy_and_reuse() {
     check(pool.acquire(99, 99).status == moe_mmid_lease_status::ACQUIRED, "released pool was not reusable");
 }
 
+// The refusal reason is the whole diagnostic surface for a materialization
+// failure: a GPT-OSS load that died here reported "result=16" and nothing else.
+// Pin the contract the log line depends on -- every reason names itself, names
+// itself distinctly, and success is never reportable as a refusal.
+static void materialize_reason_contract() {
+    const moe_mmid_materialize_reason all[] = {
+        moe_mmid_materialize_reason::OK,
+        moe_mmid_materialize_reason::NOT_APPLICABLE,
+        moe_mmid_materialize_reason::NO_SUBMIT_DEVICE,
+        moe_mmid_materialize_reason::NO_PLAN_VERSION,
+        moe_mmid_materialize_reason::NO_BACKEND_CONTEXT,
+        moe_mmid_materialize_reason::NO_QUEUE,
+        moe_mmid_materialize_reason::NO_QUEUE_COOKIE,
+        moe_mmid_materialize_reason::NO_QUEUE_LIFETIME,
+        moe_mmid_materialize_reason::REGISTRY_INVALID,
+        moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED,
+    };
+    constexpr size_t count = sizeof(all) / sizeof(all[0]);
+
+    for (size_t i = 0; i < count; ++i) {
+        const char * name = moe_mmid_materialize_reason_name(all[i]);
+        check(name != nullptr && name[0] != '\0', "a materialize reason has no name");
+        check(std::strcmp(name, "unknown") != 0, "a declared reason fell through to the unknown arm");
+        for (size_t j = i + 1; j < count; ++j) {
+            check(std::strcmp(name, moe_mmid_materialize_reason_name(all[j])) != 0,
+                  "two materialize reasons share a name -- a log line could not distinguish them");
+        }
+    }
+
+    // Success must never be reportable as a refusal. Without this the emitter
+    // would fire on every successful load: the same silent-noise failure in the
+    // opposite direction.
+    check(!moe_mmid_materialize_reason_is_refusal(moe_mmid_materialize_reason::OK),
+          "OK classified as a refusal");
+    check(!moe_mmid_materialize_reason_is_refusal(moe_mmid_materialize_reason::NOT_APPLICABLE),
+          "NOT_APPLICABLE (dense model, nothing planned) classified as a refusal");
+    for (size_t i = 2; i < count; ++i) {
+        check(moe_mmid_materialize_reason_is_refusal(all[i]),
+              "a genuine refusal was not classified as one -- it would be reported silently");
+    }
+
+    // The load_end defect's own reason must exist and be distinguishable; this
+    // is the value the B50/B70 failures resolve to.
+    check(std::strcmp(moe_mmid_materialize_reason_name(moe_mmid_materialize_reason::NO_BACKEND_CONTEXT),
+                      "no-backend-context") == 0,
+          "NO_BACKEND_CONTEXT name changed -- the gate grep for it would fail open");
+}
+
 int main() {
     try {
+        materialize_reason_contract();
         geometry_exact_and_boundary();
         exact_256_slice_start_after_128_bytes();
         broadcast_and_occurrences();

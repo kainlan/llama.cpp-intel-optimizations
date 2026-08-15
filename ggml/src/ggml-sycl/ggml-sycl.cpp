@@ -12313,15 +12313,44 @@ static uint64_t ggml_sycl_next_mmid_queue_cookie() {
 
 static ggml_backend_sycl_context * ggml_sycl_get_backend_context_for_device(int device);
 
+// Report a materialization refusal.  WARN and never INFO: common_get_verbosity()
+// maps GGML_LOG_INFO below the default threshold, so an INFO diagnostic here
+// would never reach a log -- which is how this failure stayed invisible.
+static void ggml_sycl_moe_mmid_report_refusal(const char *                            site,
+                                              ggml_sycl::moe_mmid_materialize_reason  reason,
+                                              int                                     device,
+                                              size_t                                  device_pool_bytes,
+                                              size_t                                  host_pool_bytes) {
+    if (!ggml_sycl::moe_mmid_materialize_reason_is_refusal(reason)) {
+        return;
+    }
+    GGML_LOG_WARN(
+        "[SYCL] MoE MMID workspace materialization refused at %s: reason=%s device=%d "
+        "device_pool=%.1f MB host_pool=%.1f MB\n",
+        site, ggml_sycl::moe_mmid_materialize_reason_name(reason), device,
+        device_pool_bytes / (1024.0 * 1024.0), host_pool_bytes / (1024.0 * 1024.0));
+}
+
 static bool ggml_sycl_materialize_published_mmid_workspaces(
     const ggml_sycl::lifecycle::ModelToken & token,
-    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot) {
+    const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot,
+    ggml_sycl::moe_mmid_materialize_reason * out_reason = nullptr) {
+    const auto set_reason = [&](ggml_sycl::moe_mmid_materialize_reason reason) {
+        if (out_reason) *out_reason = reason;
+    };
+    set_reason(ggml_sycl::moe_mmid_materialize_reason::OK);
     if (!snapshot || !snapshot->plan || snapshot->plan->moe_mmid_workspaces.empty()) {
+        set_reason(ggml_sycl::moe_mmid_materialize_reason::NOT_APPLICABLE);
         return true;
     }
     const int submit_device = snapshot->plan->device_id >= 0 ? snapshot->plan->device_id :
                               !snapshot->plan->devices.empty() ? snapshot->plan->devices.front() : -1;
-    if (submit_device < 0 || snapshot->version == 0) {
+    if (submit_device < 0) {
+        set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_SUBMIT_DEVICE);
+        return false;
+    }
+    if (snapshot->version == 0) {
+        set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_PLAN_VERSION);
         return false;
     }
     std::vector<ggml_sycl::moe_mmid_queue_binding> bindings;
@@ -12331,16 +12360,29 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
         // Materialization must bind the identical queue object or exact-queue
         // authority will (correctly) refuse every ordinary invocation.
         ggml_backend_sycl_context * backend = ggml_sycl_get_backend_context_for_device(workspace.owner_device);
-        sycl::queue * queue = backend ? backend->stream() : nullptr;
+        if (!backend) {
+            // No backend context is bound for this device.  During a model load
+            // that is the normal state, not a fault: llama_context -- and with
+            // it every ggml_backend_sycl_context -- is created only after
+            // llama_model_load returns.
+            set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_BACKEND_CONTEXT);
+            return false;
+        }
+        sycl::queue * queue = backend->stream();
         if (!queue) {
+            set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_QUEUE);
             return false;
         }
         const uint64_t cookie = ggml_sycl_next_mmid_queue_cookie();
         if (cookie == 0) {
+            set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_QUEUE_COOKIE);
             return false;
         }
         auto lifetime = backend->backend_queue_lifetime;
-        if (!lifetime) return false;
+        if (!lifetime) {
+            set_reason(ggml_sycl::moe_mmid_materialize_reason::NO_QUEUE_LIFETIME);
+            return false;
+        }
         bindings.push_back({ workspace.owner_device, queue, cookie,
                              ggml_sycl::workspace_admission_authority_issuer::queue(
                                  workspace.owner_device, queue, cookie, std::move(lifetime)) });
@@ -12349,8 +12391,14 @@ static bool ggml_sycl_materialize_published_mmid_workspaces(
         token.model.value, token.load.value, token.owner.generation };
     const auto result = ggml_sycl::unified_cache_materialize_moe_mmid_workspaces(
         owner, snapshot, submit_device, bindings);
-    return result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
-           result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED;
+    if (result == ggml_sycl::moe_mmid_materialize_status::PUBLISHED ||
+        result == ggml_sycl::moe_mmid_materialize_status::ALREADY_PUBLISHED) {
+        return true;
+    }
+    set_reason(result == ggml_sycl::moe_mmid_materialize_status::ALLOCATION_FAILED ?
+                   ggml_sycl::moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED :
+                   ggml_sycl::moe_mmid_materialize_reason::REGISTRY_INVALID);
+    return false;
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn      txn,
@@ -12423,7 +12471,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
         placement_inserted = true;
         // Expert registration and owner queues are complete at load_end. Make
         // every fixed pool available transactionally before publishing LIVE.
-        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot)) {
+        ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
+            ggml_sycl_moe_mmid_report_refusal("load_end", mmid_reason, plan_snapshot->plan->device_id,
+                                              plan_snapshot->plan->moe_mmid_device_pool_bytes,
+                                              plan_snapshot->plan->moe_mmid_host_pool_bytes);
             throw std::bad_alloc();
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
@@ -15471,7 +15523,11 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: publication ID exhausted\n");
         return;
     }
-    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next)) {
+    ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+    if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
+        ggml_sycl_moe_mmid_report_refusal("runtime-kv-update", mmid_reason, next->plan->device_id,
+                                          next->plan->moe_mmid_device_pool_bytes,
+                                          next->plan->moe_mmid_host_pool_bytes);
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         return;
     }

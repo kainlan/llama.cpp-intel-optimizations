@@ -282,6 +282,30 @@ using moe_mmid_blob_allocator =
 
 enum class moe_mmid_materialize_status : uint8_t { PUBLISHED, ALREADY_PUBLISHED, INVALID, ALLOCATION_FAILED };
 
+// Why a materialization attempt did not publish a pool.  The backend collapsed
+// every one of these into a bare `false`, which the caller turned into an
+// unnamed throw -- a failed load reported "result=16" and nothing else.  The
+// reason lives here rather than in the backend TU because it describes MMID
+// workspace materialization, and because a host test can link this file.
+enum class moe_mmid_materialize_reason : uint8_t {
+    OK,                          // published, or already published
+    NOT_APPLICABLE,              // no workspaces planned (dense model) -- not a refusal
+    NO_SUBMIT_DEVICE,
+    NO_PLAN_VERSION,
+    NO_BACKEND_CONTEXT,          // no ggml_backend_sycl_context bound for the owner device
+    NO_QUEUE,
+    NO_QUEUE_COOKIE,
+    NO_QUEUE_LIFETIME,
+    REGISTRY_INVALID,
+    REGISTRY_ALLOCATION_FAILED,
+};
+
+// Stable, distinct, never-null name for logs.  OK and NOT_APPLICABLE are not
+// refusals; moe_mmid_materialize_reason_is_refusal() is the predicate a caller
+// must use before reporting, so a successful path cannot emit a refusal line.
+const char * moe_mmid_materialize_reason_name(moe_mmid_materialize_reason reason) noexcept;
+bool         moe_mmid_materialize_reason_is_refusal(moe_mmid_materialize_reason reason) noexcept;
+
 struct moe_mmid_materialized_slices {
     moe_mmid_blob activation_f32;
     moe_mmid_blob activation_q8;
