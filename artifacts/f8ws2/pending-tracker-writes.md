@@ -1,5 +1,10 @@
 # Pending tracker writes (codescout lock unavailable, 2026-08-15 ~03:2x UTC)
 
+> ⚠️ **See CORRECTION at the end of this file before scoring census 5.** One
+> claim I made in c-62oe and repeated to the lead — "the dispatch admission path
+> never reads `g_moe_expert_meta`" — is FALSE as stated. The corrected trace, a
+> full reader table, and a pre-registered discriminator are at the bottom.
+
 `task_comment_add` failed three times with
 `MCP error -32603: cannot create lock file /Apps/llama.cpp/.codescout/.tasks.jsonl.lock`.
 The directory itself is writable (a `touch` probe succeeded), so this is the
@@ -105,3 +110,97 @@ it loads no model.
   **must not move**; registration defers to model provenance three ways so the
   model-load path is untouched, and any movement there is the signal that a
   deferral is incomplete
+
+---
+
+## ⚠️ CORRECTION to c-62oe, before census 5 is scored
+
+**What I claimed** (c-62oe, and repeated to the lead, who put it in the scoring
+notes): *"the dispatch admission path never reads `g_moe_expert_meta`."*
+
+**That is false as stated.** I checked the readers by region ("they are all in
+the prestaging region :3730–:6438") instead of by enclosing function. Enumerated
+properly — every reference, with the definition that encloses it — one reader
+sits directly on the route-resolution path:
+
+| line | enclosing function | keyed by | on the dispatch path? |
+|---:|---|---|---|
+| 3793 | `moe_prestage_popular_experts` | copies the list; its own `block_num < 0` guard at :3892 | no |
+| 4741 | `moe_expert_ensure_soa_cached` | `layer_id` + `expert_idx` | no |
+| **5124** | **`ggml_sycl_get_canonical_moe_expert_keys`** | **tensor NAME + `expert_idx`** | **YES — called at :5705** |
+| 5228 | `ggml_sycl_materialize_planned_expert_layout` | tensor NAME + `expert_idx` | only under `allow_materialize` |
+| 6170 | `moe_acquire_expert_stage_descriptor` | `layer_id` + `expert_idx` | no |
+| 6501/6580/6605 | `kv_expert_rebalance_check` | `layer_id` | no |
+| 6986 | `moe_compute_gate_norm_placement` | `layer_id` | no |
+| 7404 | `moe_hybrid_init_once` | the WRITER | n/a |
+
+### What survives the correction, precisely
+
+**Admission still does not read the list.** `ggml_sycl_resolve_moe_expert_route`
+gates at **:5700–5704**:
+
+```cpp
+const ggml_sycl_cache_id base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, expert_id);
+if (!base_key.valid) { route.reason = expert_resolve_reason::INVALID_REQUEST; return route; }
+```
+
+computed from the tensor and its extra alone. **That** is the gate universal
+provenance opens, and the guard cannot touch it.
+
+**But one line later, at :5705, the resolver DOES read the list:**
+
+```cpp
+std::vector<ggml_sycl_cache_id> canonical_keys = ggml_sycl_get_canonical_moe_expert_keys(src0, expert_id);
+```
+
+Those are *additional lookup keys*, tried only when the base-key lookup misses,
+and any key equal to `base_key` is skipped. So for a layer-less tensor the guard
+empties that fallback. It can only change an outcome where an entry exists under
+a key that DIFFERS from `base_key` for the same (name, expert) — which is why
+the equality skip exists at all.
+
+### The part I cannot settle by reading, and the discriminator for it
+
+All five `ggml_sycl_build_moe_resolved_batch` call sites pass
+`allow_materialize=false` (:63486, :63518, :63521, :63524, :65013), so
+`ggml_sycl_materialize_planned_expert_layout` is not reached *from the refusal
+paths*. What I could NOT establish statically is which path populates the
+per-expert cache entries for a synthetic MMID tensor. If that population is
+metadata-driven (Phase-2 upload keys off `g_moe_expert_meta`), then an empty
+metadata list means the route finds nothing and the case is still refused —
+with a DIFFERENT reason.
+
+**That difference is already printed, and it is the discriminator. Score census 5
+on the refusal REASON, not just the count** — `[MOE-PROMPT-REFUSAL] … reason=%s
+source_reason=%d` (:63490) and the decode twin (:65019):
+
+| observed | meaning | action |
+|---|---|---|
+| refusals → 0 | provenance opened the gate and staging followed | as predicted; nothing to do |
+| refusals persist, `reason=invalid_request` | **provenance itself still closed** — my change did not take | debug the mint/registration path, not the guard |
+| refusals persist, `reason=route_unavailable` / NOT_FOUND | provenance opened the gate; **nothing staged the expert** | the empty metadata list is the first suspect |
+
+The third row is the one my earlier "cannot suppress the refusal drop" claim
+would have hidden — it would have read as a provenance failure when it is a
+staging-input failure.
+
+**Contingency, if the third row is what census 5 shows:** the fix is NOT to
+delete the block_num guard. Keep the metas and move the guard onto the consumers
+that actually need a layer — `moe_prestage_popular_experts` already has its own
+at :3892, so the change is small and does not reopen the c-dqqi exposure.
+
+### Why the correction does not change the ruling
+
+The guard still stands. `layer_id` is a name hash
+(`moe_cache_layer_id`, FNV-1a, :7151), not a block number, so the layer-keyed
+readers were never protected by anything — the block_num guard is the only thing
+keeping layer-less metas out of them. That is a stronger justification for the
+guard than the one I gave, not a weaker one.
+
+**Process note:** this is [claims-run-one-step-past-the-evidence] on my own
+verification. The check I ran ("are the reader line numbers inside the
+prestaging region?") is adjacent to the claim I made ("is any reader on the
+dispatch path?") and fails open — a reader that lives at :5124, textually inside
+the region, is called from :5705, outside it. Region membership was never
+evidence about reachability. The enclosing-function enumeration above is the
+check I should have run first.
