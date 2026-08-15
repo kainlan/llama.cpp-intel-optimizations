@@ -34330,6 +34330,12 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
             host_copy_layers.push_back(&la);
             continue;
         }
+        // Redundant today — tiered_kv_layer_is_arena_kv already requires a valid
+        // zone_handle, so the branch above cannot be taken without one.  Kept to
+        // match the mirror branch and the other per-layer sites, and because it
+        // is the guard that fires if that predicate is ever widened: the fill
+        // below has no other check that it is filling through a real owner.
+        GGML_ASSERT(la.zone_handle.valid() && "arena KV layer missing owning mem_handle for clear");
         auto & owner_queue = tiered_kv_clear_queue_for_device(owner_device);
         fill_events.push_back(ggml_sycl::mem_fill_async(la.zone_handle, value, la.size, owner_queue));
     }
