@@ -61060,17 +61060,34 @@ struct moe_direct_submit_failure final {};
 
 // Pre-admission-only production witness. Saturating the counter bounds both
 // logging and counter mutation; no ownership or formatting allocation occurs.
+//
+// The cap was 16, which made the sample UNQUANTIFIABLE: censuses 6-8 each show
+// 15 published=1 and 1 published=0 on the prompt side, and at a cap of 16 that
+// is "1 of 16 SAMPLED", not "1 of ~660 occurrences".  The refusal rate -- the
+// only number that says whether the published=0 case is a rounding error or a
+// real hole -- could not be recovered from any log.  1024 covers the measured
+// MUL_MAT_ID population whole.
+//
+// `seq` is printed so saturation is SELF-DIAGNOSING (the RESERVOIR-UNMAPPED
+// lesson from ab8560e02): a capped counter that does not say it capped reads
+// exactly like a complete population.  max seq < cap => the rate is exact;
+// max seq == cap => the population overflowed and the rate is a LOWER BOUND.
+static constexpr uint32_t    k_moe_canonical_publish_log_cap = 1024;
 static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_prompt_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_direct_authority_candidates{ 0 };
 static void ggml_sycl_moe_log_canonical_publish_pre_admission(
     const ggml_tensor * tensor, bool published, int kind, bool stable) noexcept {
     uint32_t current = g_moe_decode_canonical_publish_diagnostics.load(std::memory_order_relaxed);
-    while (current < 16 && !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(
-                               current, current + 1, std::memory_order_relaxed)) {}
-    if (current >= 16) return;
-    fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
-            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+    while (current < k_moe_canonical_publish_log_cap &&
+           !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(current, current + 1,
+                                                                             std::memory_order_relaxed)) {
+    }
+    if (current >= k_moe_canonical_publish_log_cap) {
+        return;
+    }
+    fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d seq=%u\n",
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0, current + 1);
 }
 
 static void ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(const ggml_tensor * tensor,
@@ -61078,14 +61095,15 @@ static void ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(const ggml_
                                                                      int                 kind,
                                                                      bool                stable) noexcept {
     uint32_t current = g_moe_prompt_canonical_publish_diagnostics.load(std::memory_order_relaxed);
-    while (current < 16 && !g_moe_prompt_canonical_publish_diagnostics.compare_exchange_weak(
-                               current, current + 1, std::memory_order_relaxed)) {
+    while (current < k_moe_canonical_publish_log_cap &&
+           !g_moe_prompt_canonical_publish_diagnostics.compare_exchange_weak(current, current + 1,
+                                                                             std::memory_order_relaxed)) {
     }
-    if (current >= 16) {
+    if (current >= k_moe_canonical_publish_log_cap) {
         return;
     }
-    fprintf(stderr, "[MOE-PROMPT-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
-            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+    fprintf(stderr, "[MOE-PROMPT-CANONICAL] tensor=%s published=%d kind=%d stable=%d seq=%u\n",
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0, current + 1);
 }
 
 // Publish allocation-owned AoS expert slices for one MUL_MAT_ID operand and
