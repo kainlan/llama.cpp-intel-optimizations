@@ -204,3 +204,96 @@ dispatch path?") and fails open — a reader that lives at :5124, textually insi
 the region, is called from :5705, outside it. Region membership was never
 evidence about reachability. The enclosing-function enumeration above is the
 check I should have run first.
+
+---
+
+## → llama.cpp-f8ws (STAGING DESIGN + handoff) — queued 2026-08-15 ~04:4x, tracker lock unavailable again
+
+### The finding: there is NO "adopt an existing device pointer" primitive
+
+The cache has exactly two external-registration entry points,
+`register_host_expert` (`unified-cache.cpp:6341`) and `register_host_weight`.
+Both derive location from `query_location(ptr, dev)` and can produce **only**
+`HOST_PINNED` or `HOST_MMAP` (:6357-6367) — a device pointer handed to either is
+misclassified as `HOST_MMAP`. Every entry that legitimately carries
+`cache_location::DEVICE` (:4783, :4816, :5290) is created by a path that
+**allocated the memory itself**.
+
+The gap is precise: nothing can say *"this cache entry's bytes live at a device
+address somebody else owns."* That is exactly what a tensor already resident in
+its own SYCL backend buffer needs.
+
+### The primitive to add
+
+```cpp
+// Sibling of register_host_expert, for memory this cache did not allocate.
+bool register_device_expert(ggml_sycl_cache_id    key,
+                            void *                device_ptr,
+                            size_t                size,
+                            ggml_layout_mode      layout,
+                            mem_handle *          out_handle,
+                            std::shared_ptr<void> allocation_owner);   // REQUIRED
+```
+
+- `cache_loc = cache_location::DEVICE`, `host_resident = false`,
+  `owner_device = dev`. Do **not** derive the tier via `query_location()` —
+  validate with `sycl::get_pointer_type(...) == sycl::usm::alloc::device` and
+  refuse otherwise. Deriving is what confines the existing helpers to host.
+- `storage_owner = allocation_owner`, **refusing when empty**. This discharges
+  the lead's binding constraint where it cannot be forgotten: the owner is a
+  `std::shared_ptr<mem_handle>` holding a copy of the buffer's `managed_handle`,
+  so the entry cannot outlive the allocation and no raw pointer is ever the
+  ownership token.
+- `non_owning_external_host` stays **false**, correctly: the free predicate at
+  :9863 and :10358 is `device_ptr && !storage_owner && !non_owning_external_host
+  && !allocation_released_via_owner`. With `storage_owner` set, **reclaim never
+  `sycl::free`s this pointer** — the buffer's `mem_handle` stays the sole
+  releaser, as the contract requires.
+- Range validation `offset + size <= ggml_nbytes(tensor)`, mirroring the
+  arithmetic the identity gate already re-verifies.
+
+Lifetime rides machinery already built and tested: the entry is keyed by the
+canonical expert key, whose owner id carries the buffer tag, so
+`note_buffer_owner_dead()` drops it at buffer free and
+`weight_entry_reclaimable()` preserves it while the buffer lives.
+
+### The question that decides whether this works — partially answered
+
+A non-owning entry can only ever be **AOS** (it points at the tensor's own bytes).
+If dispatch requests SOA or a packed layout the lookup must MISS rather than
+alias, or the layout-specific key discipline breaks. So this works only where
+AOS is requested.
+
+Census evidence, with its limit: the only layout lines present read
+**`layout=aos`** for both MoE tensors (`leaf_0` q8_0 `reason=default-policy`;
+`as` mxfp4 `reason=xmx-tiled-not-…`). Encouraging — **but that log line is gated
+on `type == Q8_0 || MXFP4`, so it says nothing about the f16/f32 cases**, which
+are most of the 652.
+
+**Cheapest next step, before writing the primitive:** one `test-backend-ops` MMID
+subset with the MoE route log enabled, which emits `[MOE-AOS-REQUEST]` and
+`[MOE-RESOLVE]` with requested/actual layouts per case. AOS ⇒ the primitive
+collapses the 652. SOA/XMX-tiled ⇒ the copying path (buffer owner as allocation
+owner) is required instead. **One run decides which design gets built.**
+
+### Where it hooks
+
+A **pre-pass at the MMID dispatch site**, not inside the resolver: the resolver
+is the canonical decision seam and every prior round pushed allocating side
+effects out of it. A pre-pass also keeps `allow_materialize=false` true at all
+five `build_moe_resolved_batch` call sites, so refusal semantics do not move.
+
+### Branch state at handoff
+
+`f53c5c2c6`, tree clean, `BUILD_RC=0`, `ninja -n` clean, three py gates green.
+
+| commit | what |
+|---|---|
+| `23f83946a` | buffer-scoped weight provenance (minting proven firing by the subset run) |
+| `30e5bcc27` | block_num prestaging-planner precondition |
+| `ce3f6b74a` | teardown names the lease holder; two one-shot provenance observables |
+| `e2ff6b577` | refusals carry `recipe_reason`; sentinel `source_reason` fixed |
+| `f53c5c2c6` | fixture owns its lease as production does; ring message disambiguated |
+
+**Unverified:** ruling (b). The two buffer-lifetime cases have still never
+executed — `f53c5c2c6` is the first build in which they can.
