@@ -383,7 +383,23 @@ anyone.
    for the pinned pool's backing chunks. Its constructor is private and its only
    friend is `pinned_chunk_pool`, so an unauthorised caller cannot even name a
    valid argument to `unified_allocate_owner_backing()`. **Enforced by the
-   compiler.**
+   compiler** — but only if the constructor is written a specific way:
+
+   > ⚠️ **The constructor must be user-*provided* (`cache_backing_token() {}`),
+   > never `= default`.** The ggml subproject that builds these sources pins
+   > **C++17** (`ggml/CMakeLists.txt:288-289`, with
+   > `CMAKE_CXX_STANDARD_REQUIRED`), and at C++17 a
+   > defaulted constructor is not *user-provided*, so the class remains an
+   > **aggregate** — and aggregate initialization never consults access control.
+   > `cache_backing_token{}` therefore compiles from any translation unit,
+   > forging the authority the private constructor appears to protect. The rule
+   > changed only in C++20 ("no user-*declared* constructors"), so the guarantee
+   > this bullet claims is a property of the *spelling*, not of the `private:`
+   > keyword. Verified in both directions at C++17: defaulted → forgery
+   > compiles; user-provided → rejected. Hardened, with a permanent
+   > compile-failure gate, under **`llama.cpp-fhqe`**. Do not "clean this up"
+   > back to `= default`, and note that a future standard bump to C++20 would
+   > mask the defect rather than fix it.
 2. **A plain `bool` parameter on `unified_cache_adopt_raw_host_allocation()`**,
    for the unified cache's **own staging buffer**. That adopt runs during
    `unified_cache` construction and cannot route through the coordinator without
