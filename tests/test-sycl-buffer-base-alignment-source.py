@@ -15,6 +15,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 TLSF = ROOT / "ggml/src/ggml-sycl/tlsf-allocator.hpp"
+MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
 
 CONSTANT = "GGML_SYCL_BUFFER_BASE_ALIGNMENT"
 ALLOC_BUFFER = "static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer"
@@ -187,8 +188,58 @@ def zone_fallthrough_violations(source: str) -> list[str]:
     return found
 
 
+def mmvq_extent_violations(source: str) -> list[str]:
+    """mmvq's raw-pointer copies must supply their own length as the trusted extent.
+
+    The grouped row-aggregation copies source plain host std::vectors, which are
+    neither registered in alloc_registry nor USM chunks, so without a trusted
+    extent every handle resolves to extent 0 and the bounded mem-op aborts on a
+    perfectly valid copy (mem-ops.cpp require_resolved_range).
+    """
+    found: list[str] = []
+
+    helper = function_or_none(source, "static ggml_sycl::mem_handle mmvq_memcpy_handle_for_raw_ptr")
+    if helper is None:
+        return ["mmvq_memcpy_handle_for_raw_ptr is missing"]
+    if not re.search(r"trusted_extent\s*=\*/\s*bytes", helper):
+        found.append("mmvq_memcpy_handle_for_raw_ptr does not forward bytes as the trusted extent")
+    if not re.search(r"size_t\s+bytes", helper):
+        found.append("mmvq_memcpy_handle_for_raw_ptr does not take the copy length")
+
+    # Both wrappers must pass their length through; a call missing it would
+    # otherwise silently reintroduce the extent-0 handle.
+    for fn in ("static sycl::event mmvq_submit_memcpy_with_deps", "static void mmvq_memcpy_sync"):
+        body = function_or_none(source, fn)
+        if body is None:
+            found.append(f"{fn} is missing")
+            continue
+        calls = re.findall(r"mmvq_memcpy_handle_for_raw_ptr\(([^;]*?)\)\s*;", body, re.S)
+        if len(calls) != 2:
+            found.append(f"{fn} does not build exactly two raw-pointer handles")
+        for call in calls:
+            if not re.search(r",\s*bytes\s*$", call.strip()):
+                found.append(f"{fn} builds a handle without passing bytes")
+    return found
+
+
 def test_sycl_buffer_bases_honour_advertised_alignment() -> None:
     assert violations(SOURCE.read_text()) == []
+
+
+def test_mmvq_raw_copies_carry_a_trusted_extent() -> None:
+    assert mmvq_extent_violations(MMVQ.read_text()) == []
+
+
+def test_mmvq_extent_mutations_are_witnessed() -> None:
+    mmvq = MMVQ.read_text()
+    mutations = [
+        mmvq.replace("/*trusted_extent=*/bytes", "/*trusted_extent=*/0", 1),
+        re.sub(r"mmvq_memcpy_handle_for_raw_ptr\(dst, queue_device, dst_fallback_on_device, bytes\)",
+               "mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device, 0)", mmvq, count=1),
+    ]
+    for index, mutated in enumerate(mutations):
+        assert mutated != mmvq, f"mmvq mutation {index} did not change the source"
+        assert mmvq_extent_violations(mutated), f"mmvq mutation {index} was not witnessed"
 
 
 def test_tlsf_offsets_stay_block_aligned() -> None:

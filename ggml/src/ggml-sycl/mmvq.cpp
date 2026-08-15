@@ -1752,9 +1752,20 @@ static bool mxfp4_moe_ptr_table_has_device_layout_leases(const ggml_tensor *  te
     return true;
 }
 
-static ggml_sycl::mem_handle mmvq_memcpy_handle_for_raw_ptr(void * ptr, int device, bool fallback_on_device) {
+// `bytes` is the caller's own copy length, passed as the trusted extent for
+// pointers the allocator cannot size on its own.  Several of these copies source
+// plain host std::vectors (the grouped row-aggregation tables below), which are
+// never in alloc_registry and are not USM chunks, so every extent source resolves
+// to 0 and the bounded mem-op rejects an otherwise valid copy.  A registered
+// allocation's real remaining size still takes precedence over this value
+// (common.hpp: registered_remaining != 0 ? registered_remaining : trusted_extent),
+// so this only supplies a bound where there would otherwise be none.
+static ggml_sycl::mem_handle mmvq_memcpy_handle_for_raw_ptr(void * ptr,
+                                                            int    device,
+                                                            bool   fallback_on_device,
+                                                            size_t bytes) {
     return ggml_sycl_memcpy_handle_for_raw_ptr(ptr, device, GGML_LAYOUT_AOS, fallback_on_device,
-                                               /*fallback_unknown=*/true);
+                                               /*fallback_unknown=*/true, /*trusted_extent=*/bytes);
 }
 
 static sycl::event mmvq_submit_memcpy_with_deps(sycl::queue &                    queue,
@@ -1768,9 +1779,9 @@ static sycl::event mmvq_submit_memcpy_with_deps(sycl::queue &                   
         return deps.empty() ? sycl::event{} : queue.ext_oneapi_submit_barrier(deps);
     }
     const int             queue_device = ggml_sycl_get_device_id_from_queue(queue);
-    ggml_sycl::mem_handle dst_handle   = mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device);
+    ggml_sycl::mem_handle dst_handle = mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device, bytes);
     ggml_sycl::mem_handle src_handle =
-        mmvq_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device, src_fallback_on_device);
+        mmvq_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device, src_fallback_on_device, bytes);
 
     ggml_sycl_profile_label label{};
     label.name       = "sycl.memcpy.mmvq_with_deps";
@@ -1793,9 +1804,9 @@ static void mmvq_memcpy_sync(sycl::queue & queue,
         return;
     }
     const int             queue_device = ggml_sycl_get_device_id_from_queue(queue);
-    ggml_sycl::mem_handle dst_handle   = mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device);
+    ggml_sycl::mem_handle dst_handle = mmvq_memcpy_handle_for_raw_ptr(dst, queue_device, dst_fallback_on_device, bytes);
     ggml_sycl::mem_handle src_handle =
-        mmvq_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device, src_fallback_on_device);
+        mmvq_memcpy_handle_for_raw_ptr(const_cast<void *>(src), queue_device, src_fallback_on_device, bytes);
     ggml_sycl::mem_copy(dst_handle, src_handle, bytes, queue);
 }
 
