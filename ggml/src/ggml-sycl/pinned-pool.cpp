@@ -6,6 +6,7 @@
 
 #include "pinned-pool.hpp"
 
+#include "allocation-provenance.hpp"
 #include "common.hpp"
 #include "ggml-impl.h"
 
@@ -80,7 +81,10 @@ size_t resolve_alloc_timeout_ms() {
     return static_cast<size_t>(ms);
 }
 
-mem_handle allocate_pinned_chunk_owner(sycl::queue & queue, size_t chunk_size, bool runtime_pool) {
+mem_handle allocate_pinned_chunk_owner(sycl::queue &       queue,
+                                       size_t              chunk_size,
+                                       bool                runtime_pool,
+                                       cache_backing_token backing) {
     alloc_request req{};
     req.queue                                    = &queue;
     req.device                                   = ggml_sycl_get_device_id_from_queue(queue);
@@ -93,9 +97,14 @@ mem_handle allocate_pinned_chunk_owner(sycl::queue & queue, size_t chunk_size, b
     // host_pool_alloc() here would recurse, so request a standalone USM base
     // while still registering ownership through unified_alloc().
     req.intent.constraints.require_host_usm_base = true;
-    req.intent.constraints.cache_backing         = true;
 
-    mem_handle owner    = unified_allocate(req);
+    // CACHE_BACKING comes from the private token, not from anything in req: a
+    // request field would let any caller claim to be a cache's backing arena.
+    allocation_result allocation = unified_allocate_owner_backing(req, backing);
+    if (!allocation) {
+        return {};
+    }
+    mem_handle owner    = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
     auto       resolved = owner.resolve();
     if (!resolved.ptr || resolved.on_device) {
         return {};
@@ -863,7 +872,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
                           alloc_timeout_ms_);
         }
         auto future = std::async(std::launch::async, [&, backing_size]() {
-            return allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool);
+            return allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool, cache_backing_token{});
         });
 
         const auto status = future.wait_for(std::chrono::milliseconds(alloc_timeout_ms_));
@@ -898,7 +907,7 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
             GGML_LOG_INFO("[SYCL] pinned chunk malloc_host begin: size=%zu\n", backing_size);
         }
         try {
-            auto owner    = allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool);
+            auto owner    = allocate_pinned_chunk_owner(queue_, backing_size, runtime_pool, cache_backing_token{});
             auto resolved = owner.resolve();
             if (!resolved.ptr) {
                 GGML_LOG_ERROR("[SYCL] Failed to allocate pinned chunk (%zu bytes, nullptr)\n", backing_size);
