@@ -288,11 +288,14 @@ enum class moe_mmid_materialize_status : uint8_t { PUBLISHED, ALREADY_PUBLISHED,
 // reason lives here rather than in the backend TU because it describes MMID
 // workspace materialization, and because a host test can link this file.
 enum class moe_mmid_materialize_reason : uint8_t {
-    OK,                          // published, or already published
-    NOT_APPLICABLE,              // no workspaces planned (dense model) -- not a refusal
+    // published, or already published
+    OK,
+    // no workspaces planned (dense model) -- not a refusal
+    NOT_APPLICABLE,
     NO_SUBMIT_DEVICE,
     NO_PLAN_VERSION,
-    NO_BACKEND_CONTEXT,          // no ggml_backend_sycl_context bound for the owner device
+    // no ggml_backend_sycl_context bound for the owner device
+    NO_BACKEND_CONTEXT,
     NO_QUEUE,
     NO_QUEUE_COOKIE,
     NO_QUEUE_LIFETIME,

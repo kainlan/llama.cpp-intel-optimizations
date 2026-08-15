@@ -12,16 +12,26 @@ namespace ggml_sycl {
 
 const char * moe_mmid_materialize_reason_name(moe_mmid_materialize_reason reason) noexcept {
     switch (reason) {
-        case moe_mmid_materialize_reason::OK:                         return "ok";
-        case moe_mmid_materialize_reason::NOT_APPLICABLE:             return "not-applicable";
-        case moe_mmid_materialize_reason::NO_SUBMIT_DEVICE:           return "no-submit-device";
-        case moe_mmid_materialize_reason::NO_PLAN_VERSION:            return "no-plan-version";
-        case moe_mmid_materialize_reason::NO_BACKEND_CONTEXT:         return "no-backend-context";
-        case moe_mmid_materialize_reason::NO_QUEUE:                   return "no-queue";
-        case moe_mmid_materialize_reason::NO_QUEUE_COOKIE:            return "no-queue-cookie";
-        case moe_mmid_materialize_reason::NO_QUEUE_LIFETIME:          return "no-queue-lifetime";
-        case moe_mmid_materialize_reason::REGISTRY_INVALID:           return "registry-invalid";
-        case moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED: return "registry-allocation-failed";
+        case moe_mmid_materialize_reason::OK:
+            return "ok";
+        case moe_mmid_materialize_reason::NOT_APPLICABLE:
+            return "not-applicable";
+        case moe_mmid_materialize_reason::NO_SUBMIT_DEVICE:
+            return "no-submit-device";
+        case moe_mmid_materialize_reason::NO_PLAN_VERSION:
+            return "no-plan-version";
+        case moe_mmid_materialize_reason::NO_BACKEND_CONTEXT:
+            return "no-backend-context";
+        case moe_mmid_materialize_reason::NO_QUEUE:
+            return "no-queue";
+        case moe_mmid_materialize_reason::NO_QUEUE_COOKIE:
+            return "no-queue-cookie";
+        case moe_mmid_materialize_reason::NO_QUEUE_LIFETIME:
+            return "no-queue-lifetime";
+        case moe_mmid_materialize_reason::REGISTRY_INVALID:
+            return "registry-invalid";
+        case moe_mmid_materialize_reason::REGISTRY_ALLOCATION_FAILED:
+            return "registry-allocation-failed";
     }
     return "unknown";
 }
