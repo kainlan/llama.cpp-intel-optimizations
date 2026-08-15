@@ -40,14 +40,23 @@ inline bool moe_mmvq_batched_dispatch_supports_layout(enum ggml_type type, enum 
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
-        // gx30 wave 1. AoS only: these dispatch through mmvq_submit_quant_aos_id(),
-        // which instantiates the same generic kernel as the four above. No SoA or
-        // packed variant exists for them, so do not widen the layout here without
-        // adding the corresponding instantiation.
+        // gx30. AoS only: these dispatch through mmvq_submit_quant_aos_id(), which
+        // instantiates the same generic kernel as the four above. No SoA or packed
+        // variant exists for them, so do not widen the layout here without adding
+        // the corresponding instantiation.
+        //
+        // This is the complete set reachable by transcribing an existing generic
+        // mul_mat_vec_q<> tuple. The iq* family has no such tuple -- it uses
+        // per-type kernels -- so those types stay refused until someone writes
+        // their _id variants.
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
             return layout == GGML_LAYOUT_AOS;
         case GGML_TYPE_MXFP4:
             return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
@@ -72,6 +81,10 @@ inline bool moe_mmvq_batched_dispatch_supports_type(enum ggml_type type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
             return true;
         default:
             return false;
@@ -104,6 +117,10 @@ inline bool moe_mmvq_capability_supports_layout(enum ggml_type type, enum ggml_l
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
             return layout == GGML_LAYOUT_AOS;
         case GGML_TYPE_MXFP4:
             return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||

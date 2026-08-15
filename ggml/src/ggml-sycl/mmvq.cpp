@@ -16510,6 +16510,10 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
             if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
                 ne00 > INT_MAX || ne01 > INT_MAX ||
                 !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
@@ -22264,6 +22268,42 @@ bool mmvq_submit_quant_aos_id(sycl::queue &                    q,
             }
             event =
                 mmvq_submit_aos_id_impl<GGML_TYPE_Q6_K, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                    q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
+                    n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q5_0:
+            if (ncols % QK5_0 != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_Q5_0, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ,
+                                            vec_dot_q5_0_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q5_1:
+            if (ncols % QK5_1 != 0) {
+                return false;
+            }
+            event = mmvq_submit_aos_id_impl<GGML_TYPE_Q5_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ,
+                                            vec_dot_q5_1_q8_1>(
+                q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids, n_tokens,
+                ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q2_K:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event =
+                mmvq_submit_aos_id_impl<GGML_TYPE_Q2_K, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
+                    q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
+                    n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
+            break;
+        case GGML_TYPE_Q3_K:
+            if (ncols % QK_K != 0) {
+                return false;
+            }
+            event =
+                mmvq_submit_aos_id_impl<GGML_TYPE_Q3_K, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
                     q, expert_ptrs_device, y_q8_1, ids_device, dst, ncols, nrows_per_expert, total_batches, n_ids,
                     n_tokens, ne11, ids_nb0, ids_nb1, q8_nb11, q8_nb12, dst_nb1, dst_nb2, deps, nullptr);
             break;

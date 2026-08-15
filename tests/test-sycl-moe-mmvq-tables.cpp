@@ -152,11 +152,15 @@ int main() {
         { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS, "nvfp4/AOS" },
         { GGML_TYPE_Q4_0,  GGML_LAYOUT_AOS, "q4_0/AOS"  },
         { GGML_TYPE_Q8_0,  GGML_LAYOUT_AOS, "q8_0/AOS"  },
-        // gx30 wave 1
+        // gx30: every type with a generic mul_mat_vec_q<> tuple to transcribe
         { GGML_TYPE_Q4_1,  GGML_LAYOUT_AOS, "q4_1/AOS"  },
         { GGML_TYPE_Q4_K,  GGML_LAYOUT_AOS, "q4_K/AOS"  },
         { GGML_TYPE_Q5_K,  GGML_LAYOUT_AOS, "q5_K/AOS"  },
         { GGML_TYPE_Q6_K,  GGML_LAYOUT_AOS, "q6_K/AOS"  },
+        { GGML_TYPE_Q5_0,  GGML_LAYOUT_AOS, "q5_0/AOS"  },
+        { GGML_TYPE_Q5_1,  GGML_LAYOUT_AOS, "q5_1/AOS"  },
+        { GGML_TYPE_Q2_K,  GGML_LAYOUT_AOS, "q2_K/AOS"  },
+        { GGML_TYPE_Q3_K,  GGML_LAYOUT_AOS, "q3_K/AOS"  },
     };
 
     for (const auto & req : required) {
@@ -173,11 +177,13 @@ int main() {
     // 5. The types with no _id kernel family must stay unadvertised. This is the
     //    half that keeps a future coverage pass honest: widening capability for
     //    these without adding the kernel turns a clean refusal into a wrong answer.
-    // Wave 2 candidates (still no _id kernel) plus the float types, which MMVQ
-    // cannot serve at all. Covering any of these must move this list in the same
-    // change, which is the point.
-    const ggml_type uncovered[] = { GGML_TYPE_Q5_1,   GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-                                    GGML_TYPE_IQ4_XS, GGML_TYPE_F16,  GGML_TYPE_F32 };
+    // The two families that remain refused, for different reasons. iq* has no
+    // generic mul_mat_vec_q<> tuple to transcribe (it uses per-type kernels), and
+    // the float types cannot use MMVQ at all -- it quantizes the activation to
+    // Q8_1 and dispatches vec_dot_*_q8_1, meaningless for float weights. Covering
+    // either must move this list in the same change, which is the point.
+    const ggml_type uncovered[] = { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_S,
+                                    GGML_TYPE_F16,    GGML_TYPE_F32,     GGML_TYPE_BF16 };
     for (const ggml_type type : uncovered) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_mmvq_capability_supports_layout(type, layout)) {
