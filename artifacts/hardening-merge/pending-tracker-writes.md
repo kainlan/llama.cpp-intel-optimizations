@@ -36,3 +36,26 @@ WALL/COMMIT CHAIN on task/hm-f8ws: W1 tallocr 64-byte under-reservation →
 9c995f34a (real cause bdcbf8e57); W2 guard refusal semantics (2764 misaligned →
 ~2782 fails) → bdcbf8e57; W3 mem-ops.cpp:57 extent-0 false positive →
 c4a21dd47; W4 :51668 dead-lettered refusal → fb9fc070a.
+
+## → llama.cpp-f8ws (lane handoff 2 + layout experiment, 2026-08-15 ~04:5x)
+
+impl-f8ws2 stopped at context limit after: recipe_reason diagnostics + source_reason
+sentinel fix (e2ff6b577); lease-fixture leak disposition + fix (f53c5c2c6 — fixture
+held a raw lease result production always adopts; 582fee665's assert was RIGHT;
+drain-asymmetry separate); staging design to implementation-readiness (710d35ebb,
+brief in artifacts/f8ws2/pending-tracker-writes.md: register_device_expert with
+REQUIRED allocation_owner; get_pointer_type validation; storage_owner = buffer's
+managed_handle; free predicate :9863/:10358 skips storage_owner entries; hook =
+pre-pass at MMID dispatch, resolver untouched).
+
+LAYOUT EXPERIMENT (lead; GGML_SYCL_MOE_ROUTE_LOG=1 MMID subset,
+scratchpad/f8ws-layout-exp.log): 437 [MOE-DIRECT] resolve-direct-miss lines with
+buffer-owner TAGGED ids (0x8000000000000002 family) reaching direct resolution,
+requested layout=0 (AOS) across the refusing f16 population, entries=0/ptr=nil.
+VERDICT: AOS everywhere → non-owning primitive suffices; copying path NOT needed.
+
+LEASE TEST 3 (f53c5c2c6): 9 cases ran (was 1); ruling-(b) case 1 PASSED; case 2
+passed semantics then aborted unified-cache.cpp:9457 "deferred managed release
+failed" — classifier/deferred-release finding open + 2 ownerless-lease warnings
+to attribute. Successor: :9457 finding → register_device_expert → recipe split
+ticket → census 6.
