@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <thread>
 
 namespace ggml_sycl {
 
@@ -368,12 +369,36 @@ void stage_trace_mark(const char * tag) {
     stage_trace_sample("mark", tag, 0, true, /*device=*/-1);
 }
 
+// Bounded retry for a TERMINAL staging attempt (llama.cpp-480a).
+//
+// Wall 5 is a 32-BYTE pinned allocation failing with ~192 GB host free, so what
+// runs out is the driver's pinned/locked budget, not memory -- a condition
+// another process can create and then release.  Three hypotheses are refuted
+// (pool leak, growth refusal, constrained-path selection) and the surviving one
+// is external host pressure: census 6, the only run that ever aborted, was the
+// only one that ran while other worktrees were building.  An immediate abort
+// turns that transient state into a dead run.
+//
+// Deliberately NO forced drain, reap or eviction between attempts.  Retained
+// staging handles are released at graph-boundary drains, and reclaiming memory
+// that still has a live handle is forbidden outright by the unified-cache
+// ownership contract.  So this recovers from EXTERNAL pressure only -- exactly
+// the surviving hypothesis.  If the pressure is internal the retries change
+// nothing and the abort still fires, with the trace showing every attempt.
+//
+// The request is built once and reused across attempts: re-reading the graph
+// predicates mid-retry would mean a later attempt asked for a different
+// allocation shape than the one the trace line describes.
+static constexpr int k_stage_alloc_retries  = 4;
+static constexpr int k_stage_alloc_retry_us = 2000;
+
 static bool alloc_pinned_stage_handle(size_t           size,
                                       sycl::queue &    queue,
                                       int              device,
                                       const char *     cohort_id,
                                       bool             require_host_usm_base,
-                                      mem_handle *     out) {
+                                      mem_handle *     out,
+                                      int              retries = 0) {
     // Read both predicates ONCE: recording state is dynamic, so sampling it a
     // second time for the trace could report a value the request never used.
     const bool graph_self = ggml_sycl_graph_recording_this_thread();
@@ -397,17 +422,26 @@ static bool alloc_pinned_stage_handle(size_t           size,
     // rather than reset-scoped SCRATCH/STAGING zone slices.
     req.intent.constraints.require_host_usm_base = require_host_usm_base || graph_any;
 
-    *out = unified_allocate(req);
-    if (!out->valid()) {
+    for (int attempt = 0;; ++attempt) {
+        *out = unified_allocate(req);
+        if (out->valid()) {
+            g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
+            stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device, require_host_usm_base ? 1 : 0,
+                               graph_self ? 1 : 0, graph_any ? 1 : 0);
+            return true;
+        }
+        // Every attempt prints, tracing off or not: the whole value of the
+        // failure line is the reservoir state at the instant it failed, and a
+        // retry that succeeds would otherwise erase the evidence that the
+        // pressure was ever there.
         g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
         stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device, require_host_usm_base ? 1 : 0,
                            graph_self ? 1 : 0, graph_any ? 1 : 0);
-        return false;
+        if (attempt >= retries) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(k_stage_alloc_retry_us));
     }
-    g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
-    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device, require_host_usm_base ? 1 : 0, graph_self ? 1 : 0,
-                       graph_any ? 1 : 0);
-    return true;
 }
 
 static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
@@ -474,8 +508,10 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
                                        /*require_host_usm_base=*/true, &src_stage) &&
             !alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device",
                                        /*require_host_usm_base=*/true, &src_stage) &&
+            // Only the LAST attempt retries: the earlier two fall through to
+            // another device, which is a better answer to pressure than waiting.
             !alloc_pinned_stage_handle(size, queue, fallback_device, "mem-copy-cross-device",
-                                       /*require_host_usm_base=*/true, &src_stage)) {
+                                       /*require_host_usm_base=*/true, &src_stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for device %d -> %d copy",
                        size, src_device, dst_device);
         }
@@ -504,7 +540,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         if (!alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device-dst",
                                        /*require_host_usm_base=*/true, &dst_stage) &&
             !alloc_pinned_stage_handle(size, queue, fallback_device, "mem-copy-cross-device-dst",
-                                       /*require_host_usm_base=*/true, &dst_stage)) {
+                                       /*require_host_usm_base=*/true, &dst_stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte destination host-pinned staging buffer for device %d -> %d copy",
                        size, src_device, dst_device);
         }
@@ -539,7 +575,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
         if (!alloc_pinned_stage_handle(stage_bytes, *copy_queue, dst_device, "mem-copy-host-to-device",
-                                       /*require_host_usm_base=*/false, &stage)) {
+                                       /*require_host_usm_base=*/false, &stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for host -> device %d copy",
                        stage_bytes, dst_device);
         }
@@ -573,7 +609,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
         if (!alloc_pinned_stage_handle(stage_bytes, *copy_queue, src_device, "mem-copy-device-to-host",
-                                       /*require_host_usm_base=*/false, &stage)) {
+                                       /*require_host_usm_base=*/false, &stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for device %d -> host copy",
                        stage_bytes, src_device);
         }
