@@ -79132,10 +79132,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // after each gate/up/down expert matmul.  The fused kernel applies these biases
     // inline, so we capture the bias data pointers here for use during fusion.
     //
-    // IMPORTANT: bias_tensor->data is a DEVICE pointer (GPU memory).  The CPU fused
-    // kernel needs host-accessible data.  We copy each bias tensor to a host buffer
-    // during this scan.  Bias tensors are small (N_expert * N_ff * 4 bytes,
-    // typically a few hundred KB per layer), so the total host copy is negligible.
+    // The CPU fused kernel needs host-accessible data, so we copy each bias
+    // tensor to a host buffer during this scan.  Bias tensors are small
+    // (N_expert * N_ff * 4 bytes, typically a few hundred KB per layer), so the
+    // total host copy is negligible.
+    //
+    // bias_tensor->data is NOT a device pointer (llama.cpp-z2hf): weights resolve
+    // through the unified cache, and ->data is an interior pointer into the
+    // SYCL_Host pinned model buffer.  That buffer is a pinned-pool sub-allocation,
+    // which alloc_registry never records (only the _tracked malloc wrappers
+    // register) and which g_runtime_alloc_registry keys by exact base -- so an
+    // interior pointer is invisible to both.  That single fact drives both halves
+    // below: ggml_sycl_get_alloc_type() reports `unknown`, so the host fast path
+    // is skipped, and the copy has no extent authority but its own byte contract,
+    // which it must therefore pass (mem-ops rejects an unbounded endpoint).
     //
     // Once per OWNER, not once per process (llama.cpp-nlww). This was a
     // std::call_once, which cannot be reset, so the first MoE model in the
@@ -79225,7 +79235,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                         GGML_ABORT("expert bias host staging allocation failed");
                     }
                     ggml_sycl::mem_handle device_handle = ggml_sycl_copy_handle_for_raw_ptr(
-                        const_cast<void *>(cap.device_ptr), GGML_LAYOUT_AOS, queue_device);
+                        const_cast<void *>(cap.device_ptr), GGML_LAYOUT_AOS, queue_device, cap.total_bytes);
                     ggml_sycl::mem_copy(host_handle, device_handle, cap.total_bytes, *stream);
                     stream->wait();
                     void * staged_bias = host_handle.resolve().ptr;

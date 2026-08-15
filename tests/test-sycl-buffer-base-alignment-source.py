@@ -337,3 +337,52 @@ def test_mutations_are_witnessed() -> None:
     for index, mutated in enumerate(mutations):
         assert mutated != source, f"mutation {index} did not change the source"
         assert violations(mutated), f"mutation {index} was not witnessed"
+
+
+def moe_bias_extent_violations(source: str) -> list[str]:
+    """The MoE expert-bias pre-scan's staging copy must carry its own byte contract.
+
+    bias_tensor->data is an interior pointer into the SYCL_Host pinned model
+    buffer.  alloc_registry never records pinned-pool sub-allocations and the
+    runtime registry keys by exact base, so neither can size that pointer: a
+    handle minted without operation_bytes resolves to extent 0 and
+    require_resolved_range aborts an otherwise valid copy (llama.cpp-z2hf).
+    The scan runs before any node executes, so the abort takes the whole graph.
+    """
+    found: list[str] = []
+
+    calls = re.findall(
+        r"ggml_sycl_copy_handle_for_raw_ptr\(\s*const_cast<void \*>\(cap\.device_ptr\)(.*?)\)\s*;",
+        source, re.S)
+    if not calls:
+        return ["the expert-bias staging handle is missing"]
+    for call in calls:
+        if "cap.total_bytes" not in call:
+            found.append("the expert-bias staging handle omits its operation byte contract")
+
+    # The extent only bounds the copy if it is the copy's own length.
+    if "mem_copy(host_handle, device_handle, cap.total_bytes" not in source:
+        found.append("the expert-bias staging copy no longer runs on cap.total_bytes")
+
+    # The premise that sent one diagnosis down the wrong path: ->data is the
+    # host AOS copy here, not the cache's device residency.
+    if "bias_tensor->data is a DEVICE pointer" in source:
+        found.append("the stale 'bias_tensor->data is a DEVICE pointer' claim is back")
+    return found
+
+
+def test_moe_bias_staging_carries_its_byte_contract() -> None:
+    assert moe_bias_extent_violations(SOURCE.read_text()) == []
+
+
+def test_moe_bias_extent_mutations_are_witnessed() -> None:
+    source = SOURCE.read_text()
+    mutations = [
+        # Dropping the byte contract is the llama.cpp-z2hf abort.
+        source.replace("GGML_LAYOUT_AOS, queue_device, cap.total_bytes)", "GGML_LAYOUT_AOS, queue_device)", 1),
+        # Reinstating the false premise the corrected comment withdrew.
+        source.replace("bias_tensor->data is NOT a device pointer", "bias_tensor->data is a DEVICE pointer", 1),
+    ]
+    for index, mutated in enumerate(mutations):
+        assert mutated != source, f"moe-bias mutation {index} did not change the source"
+        assert moe_bias_extent_violations(mutated), f"moe-bias mutation {index} was not witnessed"
