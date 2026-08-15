@@ -33741,21 +33741,39 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
 
     // llama.cpp-zhzbp: when alloc_base is the contiguous arena KV zone
     // covering all on-device layers (n_host_layers == 0 && arena_kv_active),
-    // mirror the vmem branch above with a single memset + one .wait().  The
-    // per-layer loop below would issue 32+ stream->memset(...).wait() calls
-    // back-to-back; under patched libze 1.14.37435 the second-or-later
-    // .wait() in that loop wedges (size-independent: 64 MiB through 4 GiB
-    // all hang).  alloc_base_is_arena is set in tiered_kv_buft_alloc_buffer
-    // (assignment site at ggml-sycl.cpp:15364) only when every layer is
-    // sourced from the contiguous arena KV zone (gate also requires
-    // n_arena_layers == n_layers, so per-layer sycl::malloc_device fallbacks
-    // under VRAM pressure correctly drop to the per-layer loop below), so a
-    // single device memset across [alloc_base, alloc_base + alloc_base_size)
-    // is safe.
+    // the per-layer loop below would issue 32+ stream->memset(...).wait()
+    // calls back-to-back; under patched libze 1.14.37435 the second-or-later
+    // .wait() in that loop wedges (size-independent: 64 MiB through 4 GiB all
+    // hang).  What that workaround needs is a single wait, not a single fill —
+    // so submit every layer asynchronously and wait once at the end.
+    //
+    // llama.cpp-09ts: this branch used to mint one handle from ctx->alloc_base
+    // and fill alloc_base_size through it.  alloc_base is only the FIRST
+    // layer's arena pointer (tiered_kv_buft_alloc_buffer sets it to
+    // arena_first_ptr), and the KV buffer is n_layers separate arena
+    // sub-allocations rather than one allocation — there is no whole-span
+    // owner to mint from.  A handle derived from that pointer therefore
+    // carries authority over layer 0 alone (128 MiB of Mistral's 4 GiB
+    // buffer), and asking mem_fill to write the whole span through it is a
+    // request to write 31 sibling allocations it does not own.  Fill through
+    // each layer's own owning handle instead: authority then matches the
+    // bytes actually written, and the tail padding in alloc_base_size that no
+    // layer owns is no longer written at all.
     if (ctx->alloc_base_is_arena) {
-        ggml_sycl::mem_handle clear_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(ctx->alloc_base, GGML_LAYOUT_AOS, ctx->device);
-        ggml_sycl::mem_fill(clear_handle, value, ctx->alloc_base_size, *ctx->stream);
+        std::vector<sycl::event> fill_events;
+        fill_events.reserve(ctx->layer_allocs.size());
+        for (auto & la : ctx->layer_allocs) {
+            if (!la.ptr || la.size == 0) {
+                continue;
+            }
+            GGML_ASSERT(la.zone_handle.valid() && "arena KV layer missing owning mem_handle for clear");
+            fill_events.push_back(ggml_sycl::mem_fill_async(la.zone_handle, value, la.size, *ctx->stream));
+        }
+        // Every fill is already enqueued, so these waits never interleave a
+        // submit between two waits — the pattern that wedges libze.
+        for (auto & fill_event : fill_events) {
+            fill_event.wait_and_throw();
+        }
         return;
     }
 

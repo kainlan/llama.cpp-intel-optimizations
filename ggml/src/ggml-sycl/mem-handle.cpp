@@ -531,6 +531,13 @@ mem_handle mem_handle::from_arena_zone(int      zone_id,
         case static_cast<int>(vram_zone_id::ONEDNN):
             h.kind_ = mem_handle_kind::ARENA_ONEDNN;
             break;
+        case static_cast<int>(vram_zone_id::KV):
+        case static_cast<int>(vram_zone_id::WEIGHT):
+            // KV and WEIGHT are ordinary arena zones with no dedicated kind.
+            // The generic arena kind is correct for them: zone_id_ below keeps
+            // the real zone, and resolution is driven by zone_id_, not kind_.
+            h.kind_ = mem_handle_kind::ARENA_RUNTIME;
+            break;
         default:
             GGML_LOG_WARN("[MEM-HANDLE] from_arena_zone: unexpected zone_id %d, defaulting to ARENA_RUNTIME\n",
                           zone_id);

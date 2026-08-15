@@ -9,6 +9,7 @@
 #include <memory>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #define CHECK(cond, msg)                             \
     do {                                             \
@@ -130,6 +131,49 @@ static uint32_t allocation_lease_count(const std::shared_ptr<ggml_sycl::arena_au
     return 0;
 }
 
+// llama.cpp-09ts: the tiered KV buffer is one arena sub-allocation PER LAYER,
+// and its "base" pointer is just the first layer's.  This pins the two facts
+// tiered_kv_buffer_clear() has to respect: a root minted over layer 0 resolves
+// layer 0 only, and no view of it can be widened to cover the siblings.  A
+// whole-buffer fill through that root is therefore never expressible, which is
+// why the clear fills through each layer's own owning handle.  Uses the KV
+// zone id specifically — it is the zone with no dedicated mem_handle_kind, so
+// this also covers that KV resolves through zone_id_ rather than kind_.
+static int test_kv_zone_root_does_not_cover_sibling_layers() {
+    constexpr size_t          layer_bytes                     = 16;
+    constexpr size_t          n_layers                        = 4;
+    alignas(64) unsigned char storage[layer_bytes * n_layers] = {};
+
+    const int kv_zone   = static_cast<int>(ggml_sycl::vram_zone_id::KV);
+    auto      authority = make_authority(kv_zone, 31, storage, sizeof(storage));
+    for (size_t l = 0; l < n_layers; ++l) {
+        CHECK(authority->register_allocation(kv_zone, 300 + l, l * layer_bytes, layer_bytes),
+              "per-layer KV fake allocator record must register");
+    }
+
+    std::vector<ggml_sycl::mem_handle> layers;
+    for (size_t l = 0; l < n_layers; ++l) {
+        layers.push_back(ggml_sycl::mem_handle::from_arena_zone(kv_zone, l * layer_bytes, layer_bytes, 0, 31, 300 + l,
+                                                                layer_bytes, authority));
+        const auto resolved = layers.back().resolve();
+        CHECK(resolved.ptr == storage + l * layer_bytes && resolved.extent == layer_bytes,
+              "each KV layer handle must resolve its own allocation exactly");
+    }
+
+    // The buffer "base" is layer 0's pointer, and its authority stops there.
+    CHECK(layers.front().resolve().extent == layer_bytes,
+          "KV root must not inherit the extent of the whole layer span");
+    CHECK(!layers.front().slice(0, sizeof(storage)).valid(), "KV root must not be wideable to a whole-buffer view");
+    CHECK(authority->resolve_allocation(kv_zone, 31, 300, 0, sizeof(storage)) == nullptr,
+          "whole-span tuple must not resolve against a single layer's record");
+
+    layers.clear();
+    for (size_t l = 0; l < n_layers; ++l) {
+        CHECK(authority->unregister_allocation(kv_zone, l * layer_bytes), "per-layer KV fake record must unregister");
+    }
+    return 0;
+}
+
 static int test_arena_allocation_vs_settle_linearization() {
     alignas(64) unsigned char storage[64] = {};
     auto authority = make_authority(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 3,
@@ -247,14 +291,19 @@ static int test_arena_alias_count_and_publish_race() {
 }
 
 static int test_arena_debug_identity_includes_generation() {
-    ggml_sycl::mem_handle a =
-        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 1024, ggml_sycl::mem_handle::HOST_DEVICE, 7);
-    ggml_sycl::mem_handle b =
-        ggml_sycl::mem_handle::from_arena_zone(static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), 4096, 1024, ggml_sycl::mem_handle::HOST_DEVICE, 8);
+    // e4c665c88 made exact allocation identity mandatory: from_arena_zone
+    // refuses a mint whose allocation_id or allocation_extent is zero, so the
+    // defaulted five-argument form these calls used returned an empty handle
+    // and every assertion below read zeros.
+    const int             arena_zone = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
+    ggml_sycl::mem_handle a          = ggml_sycl::mem_handle::from_arena_zone(arena_zone, 4096, 1024,
+                                                                              ggml_sycl::mem_handle::HOST_DEVICE, 7, 501, 1024);
+    ggml_sycl::mem_handle b          = ggml_sycl::mem_handle::from_arena_zone(arena_zone, 4096, 1024,
+                                                                              ggml_sycl::mem_handle::HOST_DEVICE, 8, 501, 1024);
     a.set_debug_owner("arena-a");
     CHECK(a.debug_info().generation == 7, "generation 7 must be visible");
     CHECK(b.debug_info().generation == 8, "generation 8 must be visible");
-    CHECK(a.debug_info().zone_id == static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME), "zone must be visible");
+    CHECK(a.debug_info().zone_id == arena_zone, "zone must be visible");
     CHECK(a.debug_info().size == 1024, "size must be visible");
     CHECK(a.debug_info().offset == 0, "arena canonical root offset must be allocation-relative");
     CHECK(a.has_stable_owner_identity(), "arena handles must have stable owner identity");
@@ -275,6 +324,9 @@ int main() {
     }
     if (int rc = test_arena_debug_identity_includes_generation()) return rc;
     if (int rc = test_arena_authority_invalidation_and_chunk_bounds()) return rc;
+    if (int rc = test_kv_zone_root_does_not_cover_sibling_layers()) {
+        return rc;
+    }
     if (int rc = test_arena_allocation_vs_settle_linearization()) return rc;
     if (int rc = test_unrelated_zone_incarnations_are_independent()) return rc;
     if (int rc = test_arena_alias_count_and_publish_race()) return rc;
