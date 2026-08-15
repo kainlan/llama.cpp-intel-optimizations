@@ -306,12 +306,18 @@ if (BUILD_TESTING)
     target_include_directories(test-sycl-lifecycle-wrapper-overlap PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     if (GGML_BACKEND_DL)
-        target_compile_definitions(test-sycl-lifecycle-wrapper-overlap PRIVATE
-            GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl>")
+        # The candidate-binding failpoints this fixture drives are reachable
+        # only through the private carrier's registry; the ordinary module
+        # compiles none of them and its get_proc_address returns null for each.
+        # GGML_SYCL_RUNTIME_MODULE is pointed at that carrier below, once its
+        # build settings are finalized -- as for the runtime wrapper above.
         target_link_libraries(test-sycl-lifecycle-wrapper-overlap PRIVATE ggml ${CMAKE_DL_LIBS})
-        add_dependencies(test-sycl-lifecycle-wrapper-overlap ggml-sycl)
     else()
-        target_link_libraries(test-sycl-lifecycle-wrapper-overlap PRIVATE ggml-sycl ggml-cpu)
+        # Unlike the runtime wrapper above, GGML_SYCL_PRIVATE_CARRIER=1 is
+        # deliberately not set here: nothing in-tree reads that macro, and this
+        # fixture declares its failpoint seams as plain extern "C", so it needs
+        # no private-header gate to see them.
+        target_link_libraries(test-sycl-lifecycle-wrapper-overlap PRIVATE ggml-sycl-private-fixtures)
     endif()
     add_test(NAME sycl-lifecycle-wrapper-overlap COMMAND test-sycl-lifecycle-wrapper-overlap)
     set_tests_properties(sycl-lifecycle-wrapper-overlap PROPERTIES RUN_SERIAL TRUE LABELS "sycl;lifecycle;host")
@@ -2305,11 +2311,12 @@ target_link_options(test-sycl-tensor-placement PRIVATE ${TENSOR_PLACEMENT_TEST_S
 target_compile_definitions(test-sycl-tensor-placement PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-tensor-placement PRIVATE ggml-base ggml ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-tensor-placement PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# The plan-publication and provisional-placement controls this fixture drives
+# are compiled only into the private object backend; the ordinary DSO exports
+# none of them.
+target_link_libraries(test-sycl-tensor-placement PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-tensor-placement COMMAND test-sycl-tensor-placement)
 set_tests_properties(test-sycl-tensor-placement PROPERTIES
     LABELS "sycl;moe;tensor-placement;tdd"
@@ -2996,11 +3003,11 @@ target_link_options(test-dmmv-q4-0-coalesced PRIVATE "-fsycl")
 target_compile_definitions(test-dmmv-q4-0-coalesced PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-dmmv-q4-0-coalesced PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-dmmv-q4-0-coalesced PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_layout_override_guard exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-dmmv-q4-0-coalesced PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-dmmv-q4-0-coalesced COMMAND test-dmmv-q4-0-coalesced)
 set_tests_properties(test-dmmv-q4-0-coalesced PROPERTIES
     LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
@@ -3024,11 +3031,11 @@ target_link_options(test-dmmv-q6k-coalesced PRIVATE "-fsycl")
 target_compile_definitions(test-dmmv-q6k-coalesced PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-dmmv-q6k-coalesced PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-dmmv-q6k-coalesced PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_layout_override_guard exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-dmmv-q6k-coalesced PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-dmmv-q6k-coalesced COMMAND test-dmmv-q6k-coalesced)
 set_tests_properties(test-dmmv-q6k-coalesced PROPERTIES
     LABELS "sycl;dequant;dmmv;tdd;0igs-batch2"
@@ -3132,11 +3139,11 @@ target_link_options(test-mmq-q6k-gpu PRIVATE "-fsycl")
 target_compile_definitions(test-mmq-q6k-gpu PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-mmq-q6k-gpu PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-mmq-q6k-gpu PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_get_layout_override exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-mmq-q6k-gpu PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-mmq-q6k-gpu COMMAND test-mmq-q6k-gpu)
 set_tests_properties(test-mmq-q6k-gpu PROPERTIES
     LABELS "sycl;mmq;tdd;0igs-batch2"
@@ -3340,11 +3347,11 @@ target_link_options(test-q8-0-layout-cache-path PRIVATE "-fsycl")
 target_compile_definitions(test-q8-0-layout-cache-path PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-q8-0-layout-cache-path PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-q8-0-layout-cache-path PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_layout_override_guard exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-q8-0-layout-cache-path PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-q8-0-layout-cache-path COMMAND test-q8-0-layout-cache-path)
 set_tests_properties(test-q8-0-layout-cache-path PROPERTIES
     LABELS "sycl;layout;tdd;0igs-batch2"
@@ -3368,11 +3375,11 @@ target_link_options(test-q8-0-layout-cache-path-mmvq PRIVATE "-fsycl")
 target_compile_definitions(test-q8-0-layout-cache-path-mmvq PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-q8-0-layout-cache-path-mmvq PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-q8-0-layout-cache-path-mmvq PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_layout_override_guard exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-q8-0-layout-cache-path-mmvq PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-q8-0-layout-cache-path-mmvq COMMAND test-q8-0-layout-cache-path-mmvq)
 set_tests_properties(test-q8-0-layout-cache-path-mmvq PROPERTIES
     LABELS "sycl;layout;mmvq;tdd;0igs-batch2"
@@ -3486,11 +3493,12 @@ target_compile_definitions(test-sycl-moe-resolved-batch PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
     GGML_SYCL_RETENTION_IDENTITY_TESTING=1
+    GGML_SYCL_PRIVATE_TESTING=1
 )
-target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-moe-resolved-batch PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# mem_handle::set_canonical_identity_for_test, which this fixture's friend
+# lease builder calls under GGML_SYCL_RETENTION_IDENTITY_TESTING, is declared
+# and defined only in the private object backend.
+target_link_libraries(test-sycl-moe-resolved-batch PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-sycl-moe-resolved-batch COMMAND test-sycl-moe-resolved-batch)
 set_tests_properties(test-sycl-moe-resolved-batch PROPERTIES
     LABELS "sycl;moe;host;retained-route"
@@ -3953,6 +3961,7 @@ target_link_options(test-xmx-host-streaming PRIVATE "-fsycl")
 target_compile_definitions(test-xmx-host-streaming PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
 )
 # llama.cpp-u2mz: test-xmx-host-streaming.cpp gates its whole body on
 # GGML_SYCL_XMX_GEMM && GGML_SYCL_MMQ_XMX, but both are set on the LIBRARY as
@@ -3966,10 +3975,9 @@ endif()
 if (GGML_SYCL_XMX_GEMM)
     target_compile_definitions(test-xmx-host-streaming PRIVATE GGML_SYCL_XMX_GEMM)
 endif()
-target_link_libraries(test-xmx-host-streaming PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-xmx-host-streaming PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+# ggml_sycl::test_layout_override_guard exists only in the private object
+# backend; the ordinary DSO carries no layout-override seam.
+target_link_libraries(test-xmx-host-streaming PRIVATE ggml-sycl-private-fixtures)
 add_test(NAME test-xmx-host-streaming COMMAND test-xmx-host-streaming)
 set_tests_properties(test-xmx-host-streaming PROPERTIES
     LABELS "sycl;xmx;tdd;0igs-batch2"
@@ -4931,7 +4939,16 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
         test-q6k-reorder-dispatch
         test-layer-stream-owner-lifecycle
         test-sycl-q1-nvfp4-admitted-device
-        test-layout-cache)
+        test-layout-cache
+        test-sycl-tensor-placement
+        test-sycl-moe-resolved-batch
+        test-sycl-lifecycle-wrapper-overlap
+        test-xmx-host-streaming
+        test-q8-0-layout-cache-path
+        test-q8-0-layout-cache-path-mmvq
+        test-mmq-q6k-gpu
+        test-dmmv-q6k-coalesced
+        test-dmmv-q4-0-coalesced)
     set(_ggml_sycl_private_fixture_binaries)
     foreach(_consumer IN LISTS _ggml_sycl_private_fixture_consumers)
         list(APPEND _ggml_sycl_private_fixture_binaries $<TARGET_FILE:${_consumer}>)
@@ -4989,6 +5006,10 @@ if (BUILD_TESTING AND GGML_BACKEND_DL)
         GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl-lifecycle-private-carrier>"
         GGML_SYCL_RENAMED_RUNTIME_MODULE="${GGML_SYCL_RENAMED_RUNTIME_MODULE}")
     add_dependencies(test-sycl-lifecycle-runtime-wrapper
+        ggml-sycl ggml-sycl-lifecycle-private-carrier)
+    target_compile_definitions(test-sycl-lifecycle-wrapper-overlap PRIVATE
+        GGML_SYCL_RUNTIME_MODULE="$<TARGET_FILE:ggml-sycl-lifecycle-private-carrier>")
+    add_dependencies(test-sycl-lifecycle-wrapper-overlap
         ggml-sycl ggml-sycl-lifecycle-private-carrier)
     add_test(NAME sycl-lifecycle-private-carrier-linkage
         COMMAND ${Python3_EXECUTABLE}
