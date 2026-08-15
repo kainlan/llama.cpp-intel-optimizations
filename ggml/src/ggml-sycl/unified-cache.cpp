@@ -3653,8 +3653,43 @@ bool unified_cache::shutdown_resources() {
     // Canonical entry destructors may release shared bulk-allocation owners;
     // run them before arena_destroy(), after their mirror leases are gone.
     for (auto it = entries_.begin(); it != entries_.end();) {
-        GGML_ASSERT(it->second.in_use_count.load() == 0 &&
-                    "cache shutdown with an external weight lease");
+        // Name the holder before dying.  A live lease here is a leaked
+        // reference or a stale owner (the memory contract's words), and the fix
+        // is always to find that owner -- never to reap the entry.  But the
+        // bare assert says only THAT one exists, not which entry, how many
+        // leases, or who took the last one, so every occurrence costs a fresh
+        // investigation from zero.  The entry already carries the answer:
+        // debug_last_lease_site and the acquire/release ring are recorded on
+        // every acquire_entry_lease().
+        //
+        // Emitted at ERROR, deliberately: GGML_LOG_INFO is dropped below the
+        // default verbosity threshold (common/log.cpp) and GGML_SYCL_DEBUG
+        // needs an env var nobody sets on the run that actually aborts, so a
+        // diagnostic at either level is invisible exactly when it is needed.
+        const uint32_t leases = it->second.in_use_count.load();
+        if (leases != 0) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] shutdown found a live weight lease: model=%llu name_hash=0x%llx layout=%d "
+                "leases=%u size=%zu location=%d owner_mask=0x%08x owner_tagged=%d last_lease_site=%s\n",
+                (unsigned long long) it->first.id.model_id, (unsigned long long) it->first.id.name_hash,
+                (int) it->second.layout, leases, it->second.size, (int) it->second.location, it->second.owner_mask,
+                it->second.owner_tagged ? 1 : 0,
+                it->second.debug_last_lease_site ? it->second.debug_last_lease_site : "(none)");
+            std::string ring;
+            for (int i = 0; i < unified_cache_entry::kDebugLeaseRingSize; ++i) {
+                const auto & ev = it->second.debug_lease_ring[i];
+                if (!ev.site) {
+                    continue;
+                }
+                if (!ring.empty()) {
+                    ring += ' ';
+                }
+                ring += "seq=" + std::to_string(ev.seq) + (ev.acquire ? "+acquire:" : "-release:") + ev.site;
+            }
+            GGML_LOG_ERROR("[UNIFIED-CACHE] lease ring for name_hash=0x%llx: %s\n",
+                           (unsigned long long) it->first.id.name_hash, ring.empty() ? "(empty)" : ring.c_str());
+        }
+        GGML_ASSERT(leases == 0 && "cache shutdown with an external weight lease");
         it = erase_entry_locked(it);
     }
     id_to_key_.clear();

@@ -326,6 +326,58 @@ def ownership_class_violations(cache: str) -> list[str]:
     return found
 
 
+def observability_violations(source: str, cache: str) -> list[str]:
+    """Two questions must be answerable from a DEFAULT-verbosity run.
+
+    "Did minting fire?" and "who held the lease that aborted teardown?" were
+    both unanswerable from the census-5 and lease-test logs, for the same
+    reason: GGML_LOG_INFO is dropped below the default threshold in every tool
+    and test-llama-archs' log callback downgrades WARN too, so a probe at
+    either level reads as "the path never ran" on a run where it ran fine.
+    """
+    found: list[str] = []
+
+    mint = function_or_none(source, MINT)
+    if mint is None:
+        found.append(f"{MINT} is missing")
+    else:
+        code = strip_comments(mint)
+        if "ggml_sycl_diag_emit_warn" not in code:
+            found.append("minting has no verbosity-independent observable")
+        if "exchange(true" not in code:
+            # Not one-shot would put a line per buffer into a census log.
+            found.append("the minting observable is not one-shot")
+
+    register = function_or_none(source, REGISTER)
+    if register is None:
+        found.append(f"{REGISTER} is missing")
+    else:
+        code = strip_comments(register)
+        if "ggml_sycl_diag_emit_warn" not in code:
+            found.append("registration has no verbosity-independent observable")
+        if "exchange(true" not in code:
+            found.append("the registration observable is not one-shot")
+
+    shutdown = function_or_none(cache, "bool unified_cache::shutdown_resources")
+    if shutdown is None:
+        found.append("unified_cache::shutdown_resources is missing")
+    else:
+        code = strip_comments(shutdown)
+        # The invariant itself must survive. Naming the holder is an aid to
+        # fixing the leak, never a licence to stop aborting on one -- reclaiming
+        # an entry somebody still holds is what the memory contract forbids.
+        if "cache shutdown with an external weight lease" not in code:
+            found.append("shutdown no longer aborts on a live weight lease")
+        if "shutdown found a live weight lease" not in code:
+            found.append("shutdown aborts on a live lease without naming the holder")
+        if "debug_last_lease_site" not in code or "debug_lease_ring" not in code:
+            found.append("the shutdown diagnostic does not report the lease's acquisition site or ring")
+        if "GGML_LOG_ERROR" not in code:
+            found.append("the shutdown diagnostic is not emitted at ERROR")
+
+    return found
+
+
 # --- methodology controls -------------------------------------------------
 # Ordered before the assertions that depend on them: an anchor that no longer
 # exists makes every check below it vacuous, and a mutation that does not change
@@ -464,3 +516,36 @@ def test_ownership_class_mutations_are_witnessed() -> None:
     for index, mutated in enumerate(mutations):
         assert mutated != cache, f"ownership mutation {index} did not change the source"
         assert ownership_class_violations(mutated), f"ownership mutation {index} was not witnessed"
+
+
+def test_provenance_and_teardown_are_observable_at_default_verbosity() -> None:
+    assert observability_violations(SYCL.read_text(), CACHE.read_text()) == []
+
+
+def test_observability_mutations_are_witnessed() -> None:
+    source = SYCL.read_text()
+    cache = CACHE.read_text()
+    source_mutations = [
+        # An INFO-level probe is the documented trap: invisible at default
+        # verbosity, so a run that DID mint looks like one that never ran.
+        source.replace('ggml_sycl_diag_emit_warn("[SYCL] buffer-scoped provenance: minted first buffer owner',
+                       'GGML_LOG_INFO("[SYCL] buffer-scoped provenance: minted first buffer owner', 1),
+        source.replace('        ggml_sycl_diag_emit_warn(\n            "[SYCL] buffer-scoped provenance: registered first tensor',
+                       '        GGML_LOG_INFO(\n            "[SYCL] buffer-scoped provenance: registered first tensor', 1),
+    ]
+    for index, mutated in enumerate(source_mutations):
+        assert mutated != source, f"observability mutation {index} did not change the source"
+        assert observability_violations(mutated, cache), f"observability mutation {index} was not witnessed"
+
+    shutdown = function(cache, "bool unified_cache::shutdown_resources")
+    cache_mutations = [
+        # Deleting the abort "fixes" the symptom by permitting the very thing
+        # the ownership contract forbids.
+        cache.replace(shutdown, shutdown.replace(
+            'GGML_ASSERT(leases == 0 && "cache shutdown with an external weight lease");', ''), 1),
+        # Back to an anonymous abort: every occurrence costs a fresh RCA.
+        cache.replace(shutdown, shutdown.replace('"[UNIFIED-CACHE] shutdown found a live weight lease: model=%llu ', '"'), 1),
+    ]
+    for index, mutated in enumerate(cache_mutations):
+        assert mutated != cache, f"shutdown mutation {index} did not change the source"
+        assert observability_violations(source, mutated), f"shutdown mutation {index} was not witnessed"

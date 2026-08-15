@@ -2301,6 +2301,13 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
 static std::mutex                                                     g_sycl_buffer_owner_mutex;
 static std::unordered_map<uint64_t, ggml_sycl::lifecycle::ModelToken> g_sycl_buffer_owners;
 
+// Raw-stderr WARN (defined below).  Provenance's "did it fire?" evidence must
+// not depend on verbosity: GGML_LOG_INFO is dropped below the default
+// threshold in every tool (common/log.cpp), and test-llama-archs' log callback
+// downgrades WARN as well -- so an INFO or plain-WARN probe reads as "the path
+// never ran" on a run where it ran fine.  This helper bypasses both.
+static void ggml_sycl_diag_emit_warn(const char * fmt, ...);
+
 // Mint an owner for one buffer allocation.  `alloc_seed` is the allocation id
 // the unified cache already minted for the buffer's backing allocation, so the
 // discriminator is existing monotonic identity, not a second counter.  Returns
@@ -2320,6 +2327,15 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_mint_buffer_owner(uint64_t all
         g_sycl_buffer_owners[id] = owner;
     } catch (...) {
         return {};
+    }
+    // One-shot, so it costs one line per process and cannot spam a census.
+    // This is the observable that answers "did minting fire at all?" -- the
+    // question that otherwise can only be answered by a diagnostic that
+    // default verbosity throws away.
+    static std::atomic<bool> logged_first_mint{ false };
+    if (!logged_first_mint.exchange(true, std::memory_order_acq_rel)) {
+        ggml_sycl_diag_emit_warn("[SYCL] buffer-scoped provenance: minted first buffer owner id=0x%llx slot=%u\n",
+                                 (unsigned long long) id, (unsigned) ggml_sycl::lifecycle::buffer_owner_slot);
     }
     return owner;
 }
@@ -22599,6 +22615,16 @@ static bool ggml_sycl_register_buffer_tensor_provenance(ggml_backend_sycl_buffer
         }
         ctx->provenance_cache_keys.push_back(key);
     };
+    // Minting an owner and USING it are different events, and only the second
+    // one proves the gate can now open.  One-shot, same raw-stderr channel.
+    static std::atomic<bool> logged_first_registration{ false };
+    if (!logged_first_registration.exchange(true, std::memory_order_acq_rel)) {
+        ggml_sycl_diag_emit_warn(
+            "[SYCL] buffer-scoped provenance: registered first tensor name=%s owner=0x%llx offset=%zu nbytes=%zu "
+            "device=%d\n",
+            name, (unsigned long long) owner.model.value, offset, nbytes, ctx->device);
+    }
+
     remember(ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device));
     if (ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT) {
         const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 0;
