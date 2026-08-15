@@ -64,3 +64,62 @@ NOT RUN BY ME (lead-only, per house standard)
     vacuously -- verify with -N first).  This is the gate that decides whether the
     :9457 abort is closed and all 9 cases pass.  It is built and registered here.
   - census 6, test-backend-ops, any model-loading gate.
+
+================================================================================
+CORRECTION, 01:40 -- prompted by impl-f8ws2's cross-commit-contamination warning
+================================================================================
+
+f8ws2 warned (relayed by the lead) that build/bin was not attributable to any
+single commit: build5 ran 00:46->00:57:59 while b94fb1373 landed at 00:56:49,
+mid-flight.  The warning is WELL-FOUNDED and I am recording it rather than
+waving it off, because it came within 8 seconds of biting (below).  It does not
+invalidate anything handed over, for reasons that are checkable:
+
+1. THE RED BASELINE IS UNAFFECTED.  build5 never recompiled ggml-sycl.cpp --
+   `grep -c "ggml-sycl.cpp.o" build5.log` = 0.  Every probe in the table above
+   targets that TU, so the object behind the RED column was frozen at the 00:38
+   build, which predates b94fb1373 entirely.  The first RED capture (from the
+   00:38 .so directly) and the second (from the 00:57:56 .so) agree on all four
+   probes, which is what two independent pre-change artifacts should do.
+
+2. THE GREEN ARTIFACTS ARE ATTRIBUTABLE AT OBJECT LEVEL.  Not inferred from the
+   link line -- read off the objects:
+
+     76041c5a5 committed 00:46:00  ->  unified-cache.cpp.o  00:46:38
+     b94fb1373 committed 00:56:49  ->  ggml-sycl.cpp.o      01:02:00
+     1c548e15b committed 01:02:08  ->  tests/ ONLY, zero ggml/ or src/ files
+                                       libggml-sycl.so      01:30:26
+
+   Each object postdates its own commit; the .so postdates every object.
+
+   THE 8-SECOND NEAR-MISS: ggml-sycl.cpp.o finished at 01:02:00 and 1c548e15b
+   landed at 01:02:08.  Had that commit touched ggml-sycl.cpp, the object would
+   have been exactly the ambiguous artifact f8ws2 is warning about.  It touched
+   only tests/CMakeLists.txt and one .py, so the TU is unambiguously b94fb1373's
+   source -- but the margin was eight seconds, not a design.
+
+3. THE DECISIVE TEST, and `ninja -n` IS THE WRONG INSTRUMENT FOR IT HERE.
+
+     find ggml src common -type f \( -name '*.cpp' -o -name '*.hpp' \
+          -o -name '*.h' -o -name '*.c' \) -newer build/bin/libggml-sycl.so.0.15.3
+     -> 0 files
+
+   Zero sources postdate the shipped .so.  That is the currency claim, and it
+   holds at the current HEAD.
+
+   ⚠️ `ninja -n` DOES NOT SETTLE CURRENCY IN THIS WORKTREE, and the summary above
+   leaned on it.  CMake's configure step depends on the git index:
+
+     ninja explain: output build.ninja older than most recent input
+                    /Apps/llama.cpp/.git/worktrees/llama.cpp-hm-f8ws/index
+
+   So ANY commit -- including the docs-only 96b92f074, which touched nothing but
+   artifacts/*.txt -- makes `ninja -n` print "[0/1] Re-running CMake" forever
+   after.  "ninja: no work to do" was true when measured (immediately after
+   build2, at HEAD 1c548e15b, before the docs commit) and stopped being true the
+   moment a commit of ANY kind landed.  It is a statement about the index
+   timestamp, not about whether the artifacts match the sources.
+
+   Worse, the regen is not free: it rewrites build.ninja and cascades into a
+   ~36-step relink (that is what build2 was).  So chasing "no work to do" costs a
+   full relink and buys nothing.  Use the `-newer` test above instead.
