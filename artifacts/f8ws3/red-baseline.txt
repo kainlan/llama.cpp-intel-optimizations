@@ -1,0 +1,22 @@
+RED baseline captured 2026-08-15 ~00:58 from build/bin/libggml-sycl.so.0.15.3, mtime 00:38:50.
+That artifact predates BOTH 76041c5a5 and b94fb1373, so it is a real pre-change capture.
+
+probe                                                              old .so
+-----------------------------------------------------------------  -------
+strings "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d..."      1   <- control: probe works
+strings "[MOE-PROMPT-CANONICAL] tensor=%s published=%d kind=%d..."      0   <- target (b94fb1373)
+nm -C   "ggml_sycl_publish_backend_aos_expert_handles("                 1   <- control: probe works
+nm -C   "ggml_sycl_publish_mmid_canonical_aos_experts("                 0   <- target (b94fb1373)
+
+Presence half fires first in both halves, so a 0 in the NEW column would be a
+measurement rather than an unmatchable pattern.  nm matched on the substring
+WITH the open paren, never grep -w (mangled-name trap).
+
+CAVEAT on the nm target: ggml_sycl_publish_mmid_canonical_aos_experts is static
+with two call sites, so the compiler may inline it away.  Its ABSENCE from the
+new .so would therefore NOT be evidence of failure; the string probe is the
+load-bearing one.
+
+76041c5a5 adds no new string or symbol -- it is a call swap plus comments.  Its
+artifact evidence is the currency check (ninja -n) plus its source gate, and
+nothing more is claimed for it.

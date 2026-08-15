@@ -1,0 +1,66 @@
+impl-f8ws3 build + gate record, 2026-08-15 01:30
+Worktree /Apps/llama.cpp-hm-f8ws, branch task/hm-f8ws, HEAD 1c548e15b, tree clean.
+
+COMMITS COVERED
+  76041c5a5 00:46:00  fix(sycl): release buffer-owned entries through their own owner
+  b94fb1373 00:56:49  fix(sycl): publish allocation-owned experts for the prompt admission too
+  1c548e15b 01:02:08  test(sycl): gate that both MUL_MAT_ID admissions publish before resolving
+
+BUILD
+  build1  start 00:59:21  end 01:14:22  BUILD_RC=0  0 error/FAILED lines  (-j 8)
+  build2  BUILD_RC=0  0 error/FAILED lines
+  build2 was NOT redundant: committing tests/CMakeLists.txt at 01:02 postdated build1's
+  CMake regen, so build1's `ninja -n` still reported "[0/1] Re-running CMake" -- work to
+  do, i.e. NOT current.  build2 absorbed the regen (36 steps, full ggml-sycl.cpp rebuild).
+
+  CURRENCY, not just freshness:
+    ninja -n ggml-sycl test-sycl-reset-model-weight-lease-preserve test-backend-ops \
+            llama-completion llama-cli llama-bench   ->   "ninja: no work to do."
+  Artifacts: libggml-sycl.so.0.15.3 01:30:26, all binaries 01:30:2x -- all postdate all
+  three commits.
+
+NOT A CPU-FALLBACK BUILD
+  GGML_SYCL:BOOL=ON
+  ldd | grep -cE 'libggml-sycl|libsycl'  = 2 for test-backend-ops AND llama-completion
+
+ARTIFACT PROBES -- both halves scored, presence control BEFORE absence
+  RED column captured from the 00:57:56 .so, which contains 76041c5a5 but not b94fb1373,
+  i.e. the immediately-prior artifact.  nm matched on the substring WITH the open paren,
+  never grep -w (mangled-name trap).
+
+  probe                                                        RED   GREEN
+  strings "[MOE-DECODE-CANONICAL] tensor=%s published=..."       1      1   <- control
+  strings "[MOE-PROMPT-CANONICAL] tensor=%s published=..."       0      1   <- b94fb1373
+  nm -C   "ggml_sycl_publish_backend_aos_expert_handles("        1      1   <- control
+  nm -C   "ggml_sycl_publish_mmid_canonical_aos_experts("        0      1   <- b94fb1373
+
+  Both controls fired in the RED column, so the two zeros there were measurements rather
+  than unmatchable patterns.  The nm target was at risk of proving nothing (static, two
+  call sites, could have been inlined away) -- it survived, but the string probe was the
+  load-bearing one and was treated as such.
+
+  76041c5a5 adds NO new string or symbol -- it is a call swap plus comments.  Its artifact
+  evidence is the currency check above plus its source gate, and nothing more is claimed.
+
+HOST-SAFE GATES (no GPU, no model load)
+  Registration selects a non-empty set first, so the run cannot pass vacuously:
+    ctest -N -R 'mmid-publish-parity'   ->   Test #358, "Total Tests: 1"
+
+    #355 test-sycl-universal-provenance-source ......... Passed  3.91 sec
+    #356 test-sycl-moe-refusal-reason-source .......... Passed  2.13 sec
+    #357 test-sycl-moe-prestage-block-guard-source .... Passed  2.88 sec
+    #358 test-sycl-mmid-publish-parity-source ......... Passed  1.40 sec
+    100% tests passed, 0 tests failed out of 4
+
+  The new gate carries 2 methodology controls ordered FIRST (both regions exist; regions
+  disjoint) and 5 witnessed mutations applied inside the region they target.  Its mutation
+  control failed on its first run and the GATE was wrong, not the source: allow_materialize
+  is an ARGUMENT, so a region ending at the resolver call's name excluded it and that check
+  would have passed on any tree at all.  Region now runs through the closing paren.
+
+NOT RUN BY ME (lead-only, per house standard)
+  - sycl-reset-model-weight-lease-preserve (GPU; ctest name has NO test- prefix, so
+    `-R '^test-sycl-reset-model-weight-lease-preserve$'` selects zero and passes
+    vacuously -- verify with -N first).  This is the gate that decides whether the
+    :9457 abort is closed and all 9 cases pass.  It is built and registered here.
+  - census 6, test-backend-ops, any model-loading gate.
