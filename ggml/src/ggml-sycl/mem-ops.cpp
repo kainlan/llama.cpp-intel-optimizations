@@ -260,6 +260,11 @@ static std::atomic<uint64_t> g_stage_alloc_fail{ 0 };
 static std::atomic<uint64_t> g_stage_retained{ 0 };
 static std::atomic<uint64_t> g_stage_waited{ 0 };
 static std::atomic<size_t>   g_stage_zone_peak{ 0 };
+// Lines that saw each graph-recording predicate true, printed on every line so a
+// run in which the flags never move is SELF-DIAGNOSING rather than silently void.
+// graph_self=1 implies graph_any=1, so (any_n - self_n) is the divergence count.
+static std::atomic<uint64_t> g_stage_graph_any_seen{ 0 };
+static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
 
 // Sample the STAGING zone and print one line.  Always called on FAILURE even
 // when tracing is off -- the abort that follows is the one event where the
@@ -286,7 +291,35 @@ static std::atomic<size_t>   g_stage_zone_peak{ 0 };
 // climbs is flagged inline as RESERVOIR-UNMAPPED -- the in-band positive
 // control, printed on every line so the next reader cannot repeat round 1's
 // mistake silently.
-static void stage_trace_sample(const char * where, const char * cohort, size_t bytes, bool ok, int device) {
+// WHICH PATH SATISFIED THE REQUEST (llama.cpp-480a, round 3).
+//
+// Wall 5 is nondeterministic: census 6 aborted on a 32-byte staging allocation,
+// censuses 5 and 7 completed, and census 7 proved the committed curve is flat --
+// there is no leak, so the pool is not what varies.  What varies is which path a
+// request of the SAME size takes.  require_host_usm_base makes the allocation a
+// standalone host-USM base instead of a slice of an existing chunk, and at the
+// aborting call site (the host->device path below) the PARAMETER is a literal
+// false -- so the only thing that can flip it there is the graph-recording
+// predicate.  These three fields let a traced run read that off directly.
+//
+// graph_self / graph_any are the two predicates, printed separately on purpose.
+// ggml_sycl_graph_recording_active() (graph_any) ORs a thread_local flag with a
+// PROCESS-WIDE atomic depth, so it is true on threads holding no graph at all,
+// while ggml_sycl_graph_recording_this_thread() (graph_self) is not.  common.hpp
+// :329-343 records that the wide predicate is the wrong question for "will the
+// allocation I am about to make be captured into a graph?" and names llama.cpp-
+// f9tg, where that exact substitution was the defect.  This allocation asks that
+// question with the wide one.  Whether that is wall 5's trigger is what the run
+// decides -- a failure carrying graph_any=1 graph_self=0 says yes and points at
+// a one-predicate fix; graph_any never reaching 1 kills the candidate outright.
+static void stage_trace_sample(const char * where,
+                               const char * cohort,
+                               size_t       bytes,
+                               bool         ok,
+                               int          device,
+                               int          usm_param  = -1,
+                               int          graph_self = -1,
+                               int          graph_any  = -1) {
     unified_cache * cache = device >= 0 ? get_unified_cache_for_device(device) : nullptr;
     if (!cache) {
         cache = get_unified_cache_for_device(0);
@@ -301,17 +334,29 @@ static void stage_trace_sample(const char * where, const char * cohort, size_t b
     while (committed > peak && !g_stage_zone_peak.compare_exchange_weak(peak, committed, std::memory_order_relaxed)) {
     }
 
+    if (graph_any > 0) {
+        g_stage_graph_any_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (graph_self > 0) {
+        g_stage_graph_self_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+    const int usm_eff = (usm_param < 0 || graph_any < 0) ? -1 : ((usm_param || graph_any) ? 1 : 0);
+
     if (!ok || stage_trace_enabled()) {
         const unsigned long long allocs = g_stage_alloc_ok.load(std::memory_order_relaxed);
         fprintf(stderr,
                 "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
                 "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
-                "zone_cap=%zu%s\n",
+                "zone_cap=%zu usm_param=%d graph_self=%d graph_any=%d usm_eff=%d graph_any_n=%llu "
+                "graph_self_n=%llu%s\n",
                 where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
                 (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
                 (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
                 (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
-                g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap,
+                g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, usm_param,
+                graph_self, graph_any, usm_eff,
+                (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
+                (unsigned long long) g_stage_graph_self_seen.load(std::memory_order_relaxed),
                 (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "");
     }
 }
@@ -329,6 +374,11 @@ static bool alloc_pinned_stage_handle(size_t           size,
                                       const char *     cohort_id,
                                       bool             require_host_usm_base,
                                       mem_handle *     out) {
+    // Read both predicates ONCE: recording state is dynamic, so sampling it a
+    // second time for the trace could report a value the request never used.
+    const bool graph_self = ggml_sycl_graph_recording_this_thread();
+    const bool graph_any  = ggml_sycl_graph_recording_active();
+
     alloc_request req{};
     req.queue                               = &queue;
     req.device                              = device;
@@ -345,16 +395,18 @@ static bool alloc_pinned_stage_handle(size_t           size,
     // replay it after graph-boundary host-zone resets.  Keep graph-recorded
     // staging allocations as standalone unified-cache-owned host USM bases
     // rather than reset-scoped SCRATCH/STAGING zone slices.
-    req.intent.constraints.require_host_usm_base = require_host_usm_base || ggml_sycl_graph_recording_active();
+    req.intent.constraints.require_host_usm_base = require_host_usm_base || graph_any;
 
     *out = unified_allocate(req);
     if (!out->valid()) {
         g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
-        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device);
+        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device, require_host_usm_base ? 1 : 0,
+                           graph_self ? 1 : 0, graph_any ? 1 : 0);
         return false;
     }
     g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
-    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device);
+    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device, require_host_usm_base ? 1 : 0, graph_self ? 1 : 0,
+                       graph_any ? 1 : 0);
     return true;
 }
 
