@@ -21384,6 +21384,15 @@ static bool mmvq_build_stream_segments(const ggml_tensor * src0,
     ctx.row_total_bytes = 0;
     ctx.total_rows      = total_rows;
 
+    // The AoS early return above is load-bearing for the switch below: every type
+    // llama.cpp-gx30 added (q4_1/q4_K/q5_K/q6_K/q5_0/q5_1/q2_K/q3_K) and the
+    // Q1_0/NVFP4 pair are admitted by capability for AoS ONLY, so they return here
+    // and can never reach that switch. Their absence from it is deliberate, not an
+    // oversight -- this is a segment-SIZING helper with no submit to wire in, and
+    // inventing per-type byte layouts to satisfy a coverage gate would be a forced
+    // fit. tests/test-sycl-moe-mmvq-consumer-coverage.py encodes this as its one
+    // EXEMPT entry, with a premise regex on the early return: delete that guard and
+    // the gate goes red rather than quietly excusing a now-real gap.
     if (layout == GGML_LAYOUT_AOS) {
         ctx.row_total_bytes = ggml_row_size(src0->type, ncols);
         return false;
