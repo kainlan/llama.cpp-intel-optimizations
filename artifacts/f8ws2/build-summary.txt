@@ -1,0 +1,16 @@
+# build log tail (full log was 2.4M of compiler warnings; rc and edges preserved)
+[93/112] Linking CXX shared library bin/libggml-sycl.so.0.15.3
+[95/112] Linking CXX shared library bin/libggml.so.0.15.3
+[97/112] Linking CXX shared library bin/libllama.so.0.0.13262
+[99/112] Linking CXX shared library bin/libmtmd.so.0.0.13262
+[101/112] Linking CXX executable bin/test-sycl-reset-model-weight-lease-preserve
+[102/112] Linking CXX shared library bin/libllama-common.so.0.0.13262
+[104/112] Linking CXX shared library bin/libllama-completion-impl.so
+[105/112] Linking CXX shared library bin/libllama-bench-impl.so
+[106/112] Linking CXX shared library bin/libllama-server-impl.so
+[107/112] Linking CXX shared library bin/libllama-cli-impl.so
+[108/112] Linking CXX executable bin/llama-completion
+[109/112] Linking CXX executable bin/llama-bench
+[110/112] Linking CXX executable bin/test-backend-ops
+[111/112] Linking CXX executable bin/llama-cli
+BUILD_RC=0

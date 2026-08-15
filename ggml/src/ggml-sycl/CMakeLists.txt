@@ -154,19 +154,21 @@ if (BUILD_TESTING)
     add_executable(test-sycl-lifecycle-load-txn
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-load-txn.cpp
         model-lifecycle.cpp)
-    target_include_directories(test-sycl-lifecycle-load-txn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(test-sycl-lifecycle-load-txn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     find_package(Threads REQUIRED)
     target_compile_definitions(test-sycl-lifecycle-load-txn PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-    target_link_libraries(test-sycl-lifecycle-load-txn PRIVATE Threads::Threads)
+    target_link_libraries(test-sycl-lifecycle-load-txn PRIVATE Threads::Threads ggml-base)
     set_target_properties(test-sycl-lifecycle-load-txn PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-load-txn COMMAND test-sycl-lifecycle-load-txn)
     add_executable(test-sycl-lifecycle-runtime-host
         tests/test-model-lifecycle-runtime.cpp
         model-lifecycle.cpp)
-    target_include_directories(test-sycl-lifecycle-runtime-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(test-sycl-lifecycle-runtime-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     target_compile_definitions(test-sycl-lifecycle-runtime-host PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-    target_link_libraries(test-sycl-lifecycle-runtime-host PRIVATE Threads::Threads)
+    target_link_libraries(test-sycl-lifecycle-runtime-host PRIVATE Threads::Threads ggml-base)
     set_target_properties(test-sycl-lifecycle-runtime-host PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-runtime-host COMMAND test-sycl-lifecycle-runtime-host)
@@ -175,9 +177,10 @@ if (BUILD_TESTING)
         tests/test-sycl-lifecycle-owner-reset.cpp
         execution-lifecycle.cpp
         model-lifecycle.cpp)
-    target_include_directories(test-sycl-lifecycle-owner-reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(test-sycl-lifecycle-owner-reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
     target_compile_definitions(test-sycl-lifecycle-owner-reset PRIVATE GGML_SYCL_PRIVATE_TESTING=1)
-    target_link_libraries(test-sycl-lifecycle-owner-reset PRIVATE Threads::Threads)
+    target_link_libraries(test-sycl-lifecycle-owner-reset PRIVATE Threads::Threads ggml-base)
     set_target_properties(test-sycl-lifecycle-owner-reset PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-lifecycle-owner-reset COMMAND test-sycl-lifecycle-owner-reset)
@@ -220,8 +223,9 @@ if (BUILD_TESTING)
         moe-graph-retention.cpp
         execution-lifecycle.cpp
         model-lifecycle.cpp)
-    target_include_directories(test-sycl-moe-graph-retention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(test-sycl-moe-graph-retention PRIVATE Threads::Threads)
+    target_include_directories(test-sycl-moe-graph-retention PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+    target_link_libraries(test-sycl-moe-graph-retention PRIVATE Threads::Threads ggml-base)
     set_target_properties(test-sycl-moe-graph-retention PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     add_test(NAME sycl-moe-graph-retention COMMAND test-sycl-moe-graph-retention)

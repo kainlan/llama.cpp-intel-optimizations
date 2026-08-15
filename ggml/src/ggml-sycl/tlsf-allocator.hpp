@@ -354,14 +354,20 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment) {
         return SIZE_MAX;
     }
 
-    // Round up to minimum block size and alignment
-    size = (size + alignment - 1) & ~(alignment - 1);
-    if (size < MIN_BLOCK_SIZE) {
-        size = MIN_BLOCK_SIZE;
-    }
+    // Every block offset must stay a multiple of MIN_BLOCK_SIZE.  The pool's
+    // first block starts at offset 0 and split_block() places the remainder at
+    // (offset + size), so that holds only while every allocated size is itself a
+    // multiple of MIN_BLOCK_SIZE.  Rounding by the caller's `alignment` instead
+    // breaks it: most callers leave alignment at the allocator default of 64, and
+    // the resulting remainders are 64- but not 128/256-aligned, so later
+    // allocations hand back offsets that violate the alignment this allocator
+    // promises (llama.cpp-f8ws).  Rounding by the larger of the two also
+    // satisfies any alignment <= MIN_BLOCK_SIZE for free.
+    const size_t granularity = alignment > MIN_BLOCK_SIZE ? alignment : MIN_BLOCK_SIZE;
+    size                     = (size + granularity - 1) & ~(granularity - 1);
 
-    // All offsets are naturally 256-byte aligned (MIN_BLOCK_SIZE = 256).
-    // Larger alignments are not supported — callers must use 256.
+    // Offsets carry MIN_BLOCK_SIZE alignment and no more, so a larger request
+    // cannot be honoured here; such callers must align above this allocator.
     TLSF_ASSERT(alignment <= MIN_BLOCK_SIZE && "TLSF only supports alignment <= MIN_BLOCK_SIZE (256)");
     size_t adjusted = size;
 
@@ -394,6 +400,10 @@ inline size_t tlsf_allocator::allocate(size_t size, size_t alignment) {
 
     // Record offset → block_id mapping for O(1) free()
     offset_to_block_[blocks_[block_id].offset] = block_id;
+
+    // Check the invariant where it is produced rather than only documenting it:
+    // every consumer that turns this offset into a device pointer relies on it.
+    TLSF_ASSERT((blocks_[block_id].offset % MIN_BLOCK_SIZE) == 0 && "TLSF block offset lost MIN_BLOCK_SIZE alignment");
 
     return blocks_[block_id].offset;
 }

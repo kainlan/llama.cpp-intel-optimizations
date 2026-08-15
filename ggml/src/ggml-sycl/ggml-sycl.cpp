@@ -2294,13 +2294,92 @@ static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
+// Buffer-scoped owner identities.
+//
+// A model load is not the only legitimate occasion on which weight provenance
+// is minted: every tensor allocated through a SYCL backend buffer has a real
+// owner too -- the buffer.  Those owners live here rather than in the
+// lifecycle Registry because the Registry hands out one of 32 model slots per
+// token, and a buffer-per-case workload (test-backend-ops allocates and frees
+// one per case) would exhaust that table immediately.  Their ids carry
+// lifecycle::buffer_owner_id_tag, so a bare model_id says which table answers
+// for it and the two id spaces cannot alias.
+static std::mutex                                                     g_sycl_buffer_owner_mutex;
+static std::unordered_map<uint64_t, ggml_sycl::lifecycle::ModelToken> g_sycl_buffer_owners;
+
+// Raw-stderr WARN (defined below).  Provenance's "did it fire?" evidence must
+// not depend on verbosity: GGML_LOG_INFO is dropped below the default
+// threshold in every tool (common/log.cpp), and test-llama-archs' log callback
+// downgrades WARN as well -- so an INFO or plain-WARN probe reads as "the path
+// never ran" on a run where it ran fine.  This helper bypasses both.
+static void ggml_sycl_diag_emit_warn(const char * fmt, ...);
+
+// Mint an owner for one buffer allocation.  `alloc_seed` is the allocation id
+// the unified cache already minted for the buffer's backing allocation, so the
+// discriminator is existing monotonic identity, not a second counter.  Returns
+// a zeroed token when no identity can be derived.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_mint_buffer_owner(uint64_t alloc_seed) noexcept {
+    const uint64_t id = ggml_sycl::lifecycle::buffer_owner_id_from_seed(alloc_seed);
+    if (id == 0) {
+        return {};
+    }
+    const ggml_sycl::lifecycle::ModelToken owner{
+        { id },
+        { id },
+        { ggml_sycl::lifecycle::buffer_owner_slot, alloc_seed }
+    };
+    try {
+        std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+        g_sycl_buffer_owners[id] = owner;
+    } catch (...) {
+        return {};
+    }
+    // One-shot, so it costs one line per process and cannot spam a census.
+    // This is the observable that answers "did minting fire at all?" -- the
+    // question that otherwise can only be answered by a diagnostic that
+    // default verbosity throws away.
+    static std::atomic<bool> logged_first_mint{ false };
+    if (!logged_first_mint.exchange(true, std::memory_order_acq_rel)) {
+        ggml_sycl_diag_emit_warn("[SYCL] buffer-scoped provenance: minted first buffer owner id=0x%llx slot=%u\n",
+                                 (unsigned long long) id, (unsigned) ggml_sycl::lifecycle::buffer_owner_slot);
+    }
+    return owner;
+}
+
+// Resolve a buffer-scoped owner.  A retired buffer answers with a zeroed
+// token, so its tensors fail the canonical resolver's owner gate exactly as an
+// unowned tensor does -- the identity dies with the buffer.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_lookup_buffer_owner(uint64_t model_id) noexcept {
+    std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+    const auto                  it = g_sycl_buffer_owners.find(model_id);
+    return it == g_sycl_buffer_owners.end() ? ggml_sycl::lifecycle::ModelToken{} : it->second;
+}
+
+static void ggml_sycl_retire_buffer_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {
+    if (owner.model.value == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+    g_sycl_buffer_owners.erase(owner.model.value);
+}
+
 // Resolve a wrapper's owner without ever substituting another model. A nonzero
 // model_id is an assertion: it must name the exact bound load candidate, the
-// load whose finishing effects are running on this thread, or an exact LIVE
-// registry token. Stale/mutated wrappers fail closed.
+// load whose finishing effects are running on this thread, an exact LIVE
+// registry token, or -- for a tagged id -- a live buffer owner. Stale/mutated
+// wrappers fail closed.
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t model_id) noexcept {
     if (model_id == 0) {
         return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+    }
+
+    // Buffer-scoped ids never enter the model Registry, so they are resolved
+    // here and nowhere else.  Everything downstream -- the identity row
+    // cross-check, the expert range arithmetic, every residency refusal --
+    // runs unchanged on the token this returns.  This adds a SOURCE of
+    // identity, not a bypass of any gate.
+    if (ggml_sycl::lifecycle::is_buffer_owner_id(model_id)) {
+        return ggml_sycl_lookup_buffer_owner(model_id);
     }
 
     auto &     registry = ggml_sycl::lifecycle::global_registry();
@@ -7501,6 +7580,16 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             meta.expert_idx  = info.expert_idx;
             meta.tensor_role = moe_classify_tensor(info.tensor->name);
             meta.block_num   = moe_extract_block_number(info.tensor->name);
+            // Prestaging-planner precondition, mirroring the group-registry
+            // guard below: the planner keys and groups its work by layer, so a
+            // tensor whose name carries no "blk.N." layer number has no place
+            // in it -- every such meta would share one layer -1 bucket.  This
+            // is NOT a provenance exemption.  The canonical key above is what
+            // grants admission to compute and keeps its full strength; this
+            // decides only what the prestaging planner plans for.
+            if (meta.block_num < 0) {
+                continue;
+            }
             new_expert_meta.push_back(std::move(meta));
         }
 
@@ -22071,6 +22160,12 @@ GGML_API void ggml_backend_sycl_get_gpu_list(int * id_list, int max_len) try {
     std::exit(1);
 }
 
+// Defined once the weight-cache drop helpers below are declared.  Teardown
+// must not dereference a single tensor (see the destructor's own comment), so
+// everything it needs is captured at registration time.
+struct ggml_backend_sycl_buffer_context;
+static void ggml_sycl_release_buffer_provenance(ggml_backend_sycl_buffer_context * ctx) noexcept;
+
 // sycl buffer
 struct ggml_backend_sycl_buffer_context {
     struct allocation_metadata {
@@ -22097,6 +22192,12 @@ struct ggml_backend_sycl_buffer_context {
     ggml_backend_sycl_context * sycl_ctx = nullptr;
     // Track both tensor and extra so we can null tensor->extra on reset
     std::vector<std::pair<ggml_tensor *, ggml_tensor_extra_gpu *>> tensor_extras;
+    // Buffer-scoped weight provenance.  The owner is minted when the buffer is
+    // published; the keys are the cache identities its tensors were registered
+    // under, captured at registration time because the destructor may not
+    // dereference a tensor to recompute them.
+    ggml_sycl::lifecycle::ModelToken                               buffer_owner{};
+    std::vector<ggml_sycl_cache_id>                                provenance_cache_keys;
     // TP compute buffer support: per-device pointers
     // For TP compute buffers, we allocate on ALL TP devices and track base pointers here
     bool                                                           is_tp_compute_buffer               = false;
@@ -22160,6 +22261,11 @@ struct ggml_backend_sycl_buffer_context {
         if (!managed_handle.valid() && !is_tp_compute_buffer && dev_ptr != nullptr && stream != nullptr) {
             GGML_ASSERT(false && "SYCL backend buffer missing mem_handle owner");
         }
+        // Drop this buffer's weight provenance before the extras go: the cache
+        // entries it admitted, the identity rows it registered, and the owner
+        // token itself.  Table erasures only -- allocation release stays with
+        // mem_handle, and nothing here touches a tensor pointer.
+        ggml_sycl_release_buffer_provenance(this);
         // Release extra allocations.  Do NOT touch tensor->extra or tensor->layout
         // here — the ggml_context that owns the tensors may already be freed by the
         // time this buffer destructor runs (destruction order: gallocr frees buffers
@@ -22629,6 +22735,151 @@ static void ggml_sycl_invalidate_backend_buffer_weights(ggml_backend_sycl_buffer
     }
 }
 
+// Retire one buffer's provenance.  Called from ~ggml_backend_sycl_buffer_context,
+// which is why this cannot be ggml_sycl_invalidate_backend_buffer_weights():
+// that walks tensor_extras and dereferences tensor->extra / tensor->ne[2], and
+// by destructor time the ggml_context owning those tensors may already be gone
+// (gallocr frees buffers first).  Every key it needs was computed while the
+// tensors were unquestionably alive, at registration.
+static void ggml_sycl_release_buffer_provenance(ggml_backend_sycl_buffer_context * ctx) noexcept {
+    if (!ctx || ctx->buffer_owner.model.value == 0) {
+        return;
+    }
+    try {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            for (const ggml_sycl_cache_id & key : ctx->provenance_cache_keys) {
+                ggml_sycl_drop_all_weight_cache_entries(cache, key);
+            }
+            // Backstop for anything the stored keys do not name -- a layout
+            // variant staged under a derived key, say.  Once the owner is gone
+            // the cache stops classifying its entries as buffer-owned, so an
+            // unleased straggler is reclaimable rather than pinned forever as
+            // "unattributed"; a still-leased one is reported as the leak it is.
+            cache->note_buffer_owner_dead(ctx->buffer_owner.model.value);
+        }
+        ggml_sycl_erase_weight_identities_for_owner(ctx->buffer_owner);
+    } catch (...) {
+        // Teardown is noexcept: a failure to erase a lookup row must not
+        // escape into buffer free.  The owner retirement below is what makes
+        // any surviving row unresolvable, so this fails safe.
+    }
+    ggml_sycl_retire_buffer_owner(ctx->buffer_owner);
+    ctx->buffer_owner = {};
+    ctx->provenance_cache_keys.clear();
+}
+
+// Give one tensor buffer-scoped provenance, and record the cache identities it
+// becomes reachable under so teardown can drop them without touching a tensor.
+//
+// The parent identity is synthetic but truthful: the file_id names this buffer
+// (never zero), the offset is the tensor's real byte offset inside it, and the
+// size is its real ggml_nbytes().  The expert range arithmetic in
+// ggml_sycl_get_moe_expert_cache_key() then works out exactly -- ne[2]*nb[2]
+// equals ggml_nbytes() for a contiguous tensor, so it fits with zero slack and
+// a non-contiguous one still fails the gate.
+static bool ggml_sycl_register_buffer_tensor_provenance(ggml_backend_sycl_buffer_context * ctx,
+                                                        ggml_tensor *                      tensor,
+                                                        ggml_tensor_extra_gpu *            extra) {
+    if (!ctx || !tensor || !extra || ctx->buffer_owner.model.value == 0) {
+        return false;
+    }
+    // Model provenance always wins.  A weight whose extra is already attributed
+    // has it; one whose identity row exists but has not yet been copied onto
+    // the extra acquires it lazily in ggml_backend_sycl_get_weight_cache_key(),
+    // so minting here would take the tensor away from its model.
+    if (extra->model_id != 0) {
+        return false;
+    }
+    const char * name = ggml_get_name(tensor);
+    if (!name || !name[0]) {
+        return false;
+    }
+    // A load transaction in flight means the loader owns whatever lands in this
+    // buffer, whether or not it has registered the row yet.
+    if (ggml_sycl_bound_load_candidate()) {
+        return false;
+    }
+    // The tensor must live inside this buffer for the offset to mean anything.
+    if (!ctx->dev_ptr || !tensor->data) {
+        return false;
+    }
+    const char * base   = static_cast<const char *>(ctx->dev_ptr);
+    const char * data   = static_cast<const char *>(tensor->data);
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (data < base || static_cast<size_t>(data - base) > ctx->size_bytes ||
+        nbytes > ctx->size_bytes - static_cast<size_t>(data - base)) {
+        return false;
+    }
+    const size_t offset = static_cast<size_t>(data - base);
+    if (nbytes == 0) {
+        return false;
+    }
+
+    const ggml_sycl::lifecycle::ModelToken owner = ctx->buffer_owner;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+        // A row registered under the published plan owner, or an unowned row
+        // left by the loader, is model provenance this tensor can still
+        // resolve.  Both are the model's, not ours.
+        const auto                  plan_owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+        if (plan_owner.model.value != 0) {
+            const auto key = ggml_sycl_owner_name_key(plan_owner, name);
+            if (!key.empty() && g_sycl_weight_identities_by_name.count(key) != 0) {
+                return false;
+            }
+        }
+        if (g_sycl_weight_identities_unowned.count(name) != 0) {
+            return false;
+        }
+        const std::string owner_key = ggml_sycl_owner_name_key(owner, name);
+        if (owner_key.empty()) {
+            return false;
+        }
+        ggml_sycl_weight_identity identity{};
+        identity.file_idx                           = 0;
+        identity.file_id                            = ggml_sycl_file_id_from_model(owner.model.value, 0);
+        identity.file_offs                          = offset;
+        identity.nbytes                             = nbytes;
+        identity.model_id                           = owner.model.value;
+        identity.load_txn_id                        = owner.load.value;
+        identity.slot                               = owner.owner.slot;
+        identity.slot_generation                    = owner.owner.generation;
+        g_sycl_weight_identities_by_name[owner_key] = identity;
+    }
+    extra->model_id = owner.model.value;
+
+    // Capture the keys now -- see ggml_sycl_release_buffer_provenance().
+    auto remember = [ctx](const ggml_sycl_cache_id & key) {
+        if (!key.valid) {
+            return;
+        }
+        for (const ggml_sycl_cache_id & existing : ctx->provenance_cache_keys) {
+            if (ggml_sycl::detail::cache_id_equal(existing, key)) {
+                return;
+            }
+        }
+        ctx->provenance_cache_keys.push_back(key);
+    };
+    // Minting an owner and USING it are different events, and only the second
+    // one proves the gate can now open.  One-shot, same raw-stderr channel.
+    static std::atomic<bool> logged_first_registration{ false };
+    if (!logged_first_registration.exchange(true, std::memory_order_acq_rel)) {
+        ggml_sycl_diag_emit_warn(
+            "[SYCL] buffer-scoped provenance: registered first tensor name=%s owner=0x%llx offset=%zu nbytes=%zu "
+            "device=%d\n",
+            name, (unsigned long long) owner.model.value, offset, nbytes, ctx->device);
+    }
+
+    remember(ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device));
+    if (ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT) {
+        const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 0;
+        for (int64_t e = 0; e < n_experts; ++e) {
+            remember(ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e)));
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor, "\n").c_str());
@@ -22879,6 +23130,20 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
         if (extra->data_device_ptr(ctx->device) == nullptr && !extra->data_handle[ctx->device].is_weight()) {
             extra->set_data_device(ctx->device, tensor->data);
         }
+    }
+    // Universal provenance: every tensor this buffer allocated gets an
+    // admissible owner, so the canonical resolver admits any legitimate
+    // consumer's tensors through the one uniform path instead of only a model
+    // loader's.  The gate itself is untouched -- a tensor that cannot be given
+    // truthful identity here still fails it.
+    //
+    // Views are excluded on purpose: a view's bytes are its source's bytes, and
+    // minting a second parent identity for one range would mean two owners
+    // describing the same allocation.  Every path above that handles a view has
+    // already returned by this point.
+    if (tensor->view_src == nullptr && tensor->extra != nullptr) {
+        (void) ggml_sycl_register_buffer_tensor_provenance(ctx, tensor,
+                                                           static_cast<ggml_tensor_extra_gpu *>(tensor->extra));
     }
     if (ggml_is_quantized(tensor->type)) {
         // initialize padding to 0 to avoid possible NaN values
@@ -32814,6 +33079,48 @@ struct ggml_backend_sycl_buffer_type_context {
     ggml_backend_sycl_context * sycl_ctx              = nullptr;
 };
 
+// ggml-alloc sizes a context buffer as the sum of per-tensor allocations padded
+// to this value, but ggml_tallocr_new then burns aligned_offset(base, 0, this)
+// bytes at the head without the measure pass ever accounting for them.  So a
+// base that is not aligned to what get_alignment() promises makes the buffer
+// short by exactly that offset, and the shortfall surfaces much later as
+// "not enough space in the buffer" on whichever tensor happens to run off the
+// end.  Every SYCL buffer type that hands out a non-null base must therefore
+// request at least this alignment from the allocator.
+static constexpr size_t GGML_SYCL_BUFFER_BASE_ALIGNMENT = 128;
+
+// Publish a device buffer only if its base honours the alignment contract above.
+// Failing the allocation is recoverable — ggml-alloc reports it and the scheduler
+// places the tensors elsewhere — whereas publishing a misaligned base is not: it
+// under-reserves silently and aborts later somewhere unrelated.  Deleting the
+// context releases the allocation through its managed mem_handle owner.
+static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffer_type_t         buft,
+                                                              ggml_backend_sycl_buffer_context * ctx,
+                                                              size_t                             size,
+                                                              const char *                       origin) {
+    if (ctx->dev_ptr != nullptr && (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT) != 0) {
+        GGML_LOG_WARN(
+            "[SYCL] refusing %s buffer at misaligned base %p (requires %zu-byte alignment); "
+            "publishing it would under-reserve the buffer by %zu bytes\n",
+            origin, ctx->dev_ptr, GGML_SYCL_BUFFER_BASE_ALIGNMENT,
+            GGML_SYCL_BUFFER_BASE_ALIGNMENT -
+                (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT));
+        delete ctx;
+        return nullptr;
+    }
+    // Mint the buffer's owner here, at the single point where a buffer becomes
+    // visible and owned -- after the refusal above, so a rejected allocation
+    // never leaves an owner behind.  A buffer whose backing allocation carries
+    // no id simply gets no owner and behaves exactly as it did before.
+    ctx->buffer_owner = ggml_sycl_mint_buffer_owner(ctx->managed_meta.id);
+    if (ctx->buffer_owner.model.value != 0) {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            cache->note_buffer_owner_live(ctx->buffer_owner.model.value);
+        }
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+}
+
 static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_sycl_buffer_type_context * ctx = (ggml_backend_sycl_buffer_type_context *) buft->context;
     return ctx->name.c_str();
@@ -32901,6 +33208,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                 runtime_req.queue                               = buft_ctx->stream;
                 runtime_req.device                              = buft_ctx->device;
                 runtime_req.size                                = size;
+                runtime_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                 runtime_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                 runtime_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                 runtime_req.intent.cohort_id                    = "backend-buffer-runtime-zone";
@@ -32914,7 +33222,13 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     ctx->set_managed_owner(std::move(runtime_h));
                     GGML_SYCL_DEBUG("[SYCL] Arena RUNTIME zone alloc: %.1f MB (%s)\n", size / (1024.0 * 1024.0),
                                     buft_ctx->name.c_str());
-                    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                    if (ggml_backend_buffer_t published =
+                            ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena RUNTIME zone")) {
+                        return published;
+                    }
+                    // Refused: the context is gone and its allocation released.
+                    // Fall through to the next tier rather than failing the whole
+                    // allocation -- the tiers below can still serve this buffer.
                 }
 
                 // RUNTIME zone full — for compute buffers, try the shared KV
@@ -32928,6 +33242,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     kv_req.queue                               = buft_ctx->stream;
                     kv_req.device                              = buft_ctx->device;
                     kv_req.size                                = size;
+                    kv_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                     kv_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                     kv_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                     kv_req.intent.cohort_id                    = "backend-buffer-kv-zone";
@@ -32942,7 +33257,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                         GGML_LOG_INFO(
                             "[SYCL] Arena RUNTIME zone full, runtime buffer (%.1f MB) allocated from KV zone (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                        if (ggml_backend_buffer_t published =
+                                ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena KV zone")) {
+                            return published;
+                        }
+                        // Refused -- fall through to the SCRATCH zone.
                     }
                     // KV zone also full — try the SCRATCH zone as last-resort
                     // registered unified-cache ownership.  Do not borrow from
@@ -32952,6 +33271,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                     scratch_req.queue                               = buft_ctx->stream;
                     scratch_req.device                              = buft_ctx->device;
                     scratch_req.size                                = size;
+                    scratch_req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
                     scratch_req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
                     scratch_req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
                     scratch_req.intent.cohort_id                    = "backend-buffer-scratch-zone";
@@ -32967,7 +33287,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
                             "[SYCL] Arena RUNTIME+KV full, runtime buffer allocated from SCRATCH zone: %.1f "
                             "MB (%s)\n",
                             size / (1024.0 * 1024.0), buft_ctx->name.c_str());
-                        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+                        if (ggml_backend_buffer_t published =
+                                ggml_backend_sycl_buffer_publish(buft, ctx, size, "arena SCRATCH zone")) {
+                            return published;
+                        }
+                        // Refused -- fall through to the legacy allocation path.
                     }
                     GGML_LOG_WARN(
                         "[SYCL] RUNTIME+KV+scratch all full for runtime buffer %zu MB, unified_alloc fallback\n",
@@ -33014,6 +33338,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     req.queue                               = alloc_stream;
     req.device                              = buft_ctx->device;
     req.size                                = size;
+    req.alignment                           = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     req.intent.role                         = alloc_role;
     req.intent.category                     = alloc_cat;
     req.intent.constraints.use_pinned_pool  = buft_ctx->use_pinned_pool;
@@ -33131,14 +33456,14 @@ alloc_succeeded:
         // Restore device context
         ggml_sycl_set_device(buft_ctx->device);
     }
-    return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+    return ggml_backend_sycl_buffer_publish(buft, ctx, size, "device");
 } catch (const sycl::exception & exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
 
 static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -34515,15 +34840,20 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
     // first layer's arena pointer as alloc_base — no synthetic base needed.
     // This eliminates init_tensor remapping and ensures tensors (including
     // VIEWs) always have valid device USM addresses.
-    const size_t         alloc_align  = 128;
+    const size_t         alloc_align  = GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     const size_t         alloc_padded = (size + alloc_align - 1) & ~(alloc_align - 1);
     std::vector<uint8_t> alloc_base_storage;
     void *               alloc_base          = nullptr;
     bool                 alloc_base_is_arena = false;
 
+    // The arena pointer is only usable as an allocator base if it already honours
+    // the alignment this buffer type advertises; ggml-alloc reserves no slack for
+    // a misaligned base.  When it does not, take the synthetic base below, which
+    // aligns explicitly.
     if (arena_kv_active && kv_buffer_covers_all_layers && planned_buffer_layers > 0 && n_host_layers == 0 &&
         n_device_layers == planned_buffer_layers && n_arena_layers == planned_buffer_layers && arena_single_owner &&
-        arena_owner_device == device && arena_contiguous && arena_first_ptr != nullptr) {
+        arena_owner_device == device && arena_contiguous && arena_first_ptr != nullptr &&
+        (reinterpret_cast<uintptr_t>(arena_first_ptr) % alloc_align) == 0) {
         // All layers are contiguous in arena KV zone — use first layer's ptr
         alloc_base          = arena_first_ptr;
         alloc_base_is_arena = true;
@@ -34628,7 +34958,7 @@ static ggml_backend_buffer_t tiered_kv_buft_alloc_buffer(ggml_backend_buffer_typ
 
 static size_t tiered_kv_buft_get_alignment(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return 128;  // Standard SYCL device alignment
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;  // Standard SYCL device alignment
 }
 
 static size_t tiered_kv_buft_get_max_size(ggml_backend_buffer_type_t buft) {
@@ -35082,7 +35412,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(gg
 }
 
 static size_t ggml_backend_sycl_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -35807,7 +36137,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_tp_buffer_type_alloc_buffer(ggml_
 }
 
 static size_t ggml_backend_sycl_tp_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return GGML_SYCL_BUFFER_BASE_ALIGNMENT;
     GGML_UNUSED(buft);
 }
 
@@ -37618,7 +37948,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_compute_buffer_alloc(ggml_ba
                 GGML_SYCL_DEBUG("SYCL TP: Device %d using shared compute buffer: %p\n", dev_id, shared_ptr);
             }
         }
-        return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
+        return ggml_backend_sycl_buffer_publish(buft, ctx, size, "TP shared compute");
     }
     // Non-TP mode: use regular allocation
     return ggml_backend_sycl_buffer_type_alloc_buffer(buft, size);
@@ -51881,8 +52211,12 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         const ggml_sycl_cache_id expert_base_key = ggml_sycl_get_moe_expert_cache_key(src0, extra, static_cast<int>(e));
         ggml_sycl_cache_id expert_cache_key = ggml_sycl_layout_specific_moe_expert_cache_key(expert_base_key, layout);
         if (!expert_cache_key.valid) {
+            // Key validity depends on the caller's tensor, not on anything this
+            // function controls: a tensor whose extra was built outside a SYCL
+            // buffer's init_tensor carries no owner identity and cannot mint one.
+            // Refuse the table like every other unroutable case -- callers already
+            // treat false as "fall back" -- rather than aborting the process.
             GGML_LOG_ERROR("[MOE] Missing cache key for %s expert=%ld layer=%d\n", src0->name, (long) e, layer_id);
-            GGML_ASSERT(expert_cache_key.valid && "missing MoE cache key");
             return false;
         }
         ggml_sycl::cache_layout_request req{};
@@ -61012,23 +61346,102 @@ struct moe_direct_submit_failure final {};
 
 // Pre-admission-only production witness. Saturating the counter bounds both
 // logging and counter mutation; no ownership or formatting allocation occurs.
+//
+// The cap was 16, which made the sample UNQUANTIFIABLE: censuses 6-8 each show
+// 15 published=1 and 1 published=0 on the prompt side, and at a cap of 16 that
+// is "1 of 16 SAMPLED", not "1 of ~660 occurrences".  The refusal rate -- the
+// only number that says whether the published=0 case is a rounding error or a
+// real hole -- could not be recovered from any log.  1024 covers the measured
+// MUL_MAT_ID population whole.
+//
+// `seq` is printed so saturation is SELF-DIAGNOSING (the RESERVOIR-UNMAPPED
+// lesson from ab8560e02): a capped counter that does not say it capped reads
+// exactly like a complete population.  max seq < cap => the rate is exact;
+// max seq == cap => the population overflowed and the rate is a LOWER BOUND.
+static constexpr uint32_t    k_moe_canonical_publish_log_cap = 1024;
 static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
+static std::atomic<uint32_t> g_moe_prompt_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_direct_authority_candidates{ 0 };
-static void ggml_sycl_moe_log_canonical_publish_pre_admission(
-    const ggml_tensor * tensor, bool published, int kind, bool stable) noexcept {
-    uint32_t current = g_moe_decode_canonical_publish_diagnostics.load(std::memory_order_relaxed);
-    while (current < 16 && !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(
-                               current, current + 1, std::memory_order_relaxed)) {}
-    if (current >= 16) return;
-    fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d\n",
-            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0);
+// ONE witness for both admissions.  The two copies were structurally identical
+// apart from their counter and their tag -- which is the drifted-duplicate shape
+// b94fb1373's own message calls out: the prompt admission lost its publication
+// precisely because it sat ~1500 lines from its twin, and keeping two copies of
+// the witness invites the same divergence one level down, where the symptom
+// would be a census scoring a side that silently stopped reporting.
+//
+// The tag is a parameter rather than two format strings.  Runtime output is
+// unchanged, but note the artifact-probe consequence: `strings` no longer
+// contains the combined literal "[MOE-PROMPT-CANONICAL] tensor=%s published=...",
+// so c-nfsm's RED/GREEN form of that probe must become a search for the bare tag
+// "MOE-PROMPT-CANONICAL", which is still present as its own literal.
+static void ggml_sycl_moe_log_canonical_publish_pre_admission(std::atomic<uint32_t> & counter,
+                                                              const char *            tag,
+                                                              const ggml_tensor *     tensor,
+                                                              bool                    published,
+                                                              int                     kind,
+                                                              bool                    stable) noexcept {
+    uint32_t current = counter.load(std::memory_order_relaxed);
+    while (current < k_moe_canonical_publish_log_cap &&
+           !counter.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+    }
+    if (current >= k_moe_canonical_publish_log_cap) {
+        return;
+    }
+    fprintf(stderr, "[%s] tensor=%s published=%d kind=%d stable=%d seq=%u\n", tag,
+            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0, current + 1);
 }
+
+// Publish allocation-owned AoS expert slices for one MUL_MAT_ID operand and
+// report whether expert 0 came back as a stable buffer-owned logical handle.
+//
+// Ordinary backend allocations (including test-backend-ops) may bypass the
+// model preload that normally publishes at set_tensor time, so BOTH admissions
+// in ggml_sycl_mul_mat_id must publish before the non-materializing retained
+// resolver runs.  The slices are views of the buffer's own mem_handle, so the
+// buffer remains the sole owner and the unified cache never learns of these
+// bytes at all; the record is keyed by (expert, layout), so a non-AoS request
+// misses rather than aliasing this AoS view.
+static bool ggml_sycl_publish_mmid_canonical_aos_experts(const ggml_tensor * src0,
+                                                         int                 device,
+                                                         ggml_layout_mode    route_layout,
+                                                         int *               out_kind,
+                                                         bool *              out_stable) {
+    *out_kind   = -1;
+    *out_stable = false;
+    if (route_layout != GGML_LAYOUT_AOS || !src0 || !src0->buffer || !src0->buffer->context ||
+        ggml_backend_buffer_is_host(src0->buffer)) {
+        return false;
+    }
+    const bool published = ggml_sycl_publish_backend_aos_expert_handles(
+        static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context), const_cast<ggml_tensor *>(src0));
+    auto *                                                    extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
+    if (published && extra &&
+        extra->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, device,
+                                          ggml_sycl_moe_expert_layout_bytes(src0, GGML_LAYOUT_AOS, device), &expert0)) {
+        *out_kind   = static_cast<int>(expert0.logical_handle.kind());
+        *out_stable = expert0.logical_handle.has_stable_owner_identity();
+    }
+    return published;
+}
+// Same sampling idiom as the canonical-publish witness above: a named cap, and
+// seq so a reader can tell a complete population from a truncated one without
+// knowing the cap by heart.
+//
+// The VALUE deliberately stays 16 rather than adopting the publish cap of 1024.
+// Raising it would be a claim about this population's size, and unlike the
+// MUL_MAT_ID publish population this one has never been measured -- it appears
+// zero times in censuses 6, 7 and 8.  Naming the constant makes the cap
+// discoverable; changing it would be a different commit with evidence behind it.
+static constexpr uint32_t k_moe_direct_authority_log_cap = 16;
+
 static void ggml_sycl_moe_mark_direct_authority_pre_admission(const ggml_tensor * tensor) noexcept {
     uint32_t current = g_moe_direct_authority_candidates.load(std::memory_order_relaxed);
-    while (current < 16 && !g_moe_direct_authority_candidates.compare_exchange_weak(
-                               current, current + 1, std::memory_order_relaxed)) {}
-    if (current < 16) {
-        fprintf(stderr, "[MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=%s count=%u\n",
+    while (current < k_moe_direct_authority_log_cap &&
+           !g_moe_direct_authority_candidates.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+    }
+    if (current < k_moe_direct_authority_log_cap) {
+        fprintf(stderr, "[MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=%s seq=%u\n",
                 tensor && tensor->name[0] ? tensor->name : "?", current + 1);
     }
 }
@@ -63461,15 +63874,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         retained_prompt_layout       = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
         retained_prompt_layout       = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, retained_prompt_layout,
                                                                               prompt_ids_snapshot.size(), has_override, ne12);
+        // Same publication the decode admission performs below: a backend
+        // allocation that never went through model preload has no expert
+        // storage records yet, so the retained resolver would refuse with
+        // route_unavailable before it ever reaches a cache key.
+        int        prompt_published_kind      = -1;
+        bool       prompt_published_stable    = false;
+        const bool prompt_canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
+            src0, ctx.device, retained_prompt_layout, &prompt_published_kind, &prompt_published_stable);
+        ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_prompt_canonical_publish_diagnostics,
+                                                          "MOE-PROMPT-CANONICAL", src0, prompt_canonical_published,
+                                                          prompt_published_kind, prompt_published_stable);
         retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
             retained_prompt_layout, /*allow_materialize=*/false);
         if (!retained_prompt_batch_result) {
-            GGML_LOG_ERROR("[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                           src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
-                           retained_prompt_batch_result.expert_id,
-                           ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
-                           retained_prompt_batch_result.source_reason);
+            GGML_LOG_ERROR(
+                "[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
+                src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
+                retained_prompt_batch_result.expert_id,
+                ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
+                retained_prompt_batch_result.source_reason,
+                retained_prompt_batch_result.recipe_reason ? retained_prompt_batch_result.recipe_reason : "(unset)");
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
         }
 
@@ -64955,27 +65381,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
     if (ne12 == 1) {
         ctx.moe_graphs_disabled_once = true;
-        bool canonical_published = false;
-        int  published_kind = -1;
-        bool published_stable = false;
-        if (route_layout == GGML_LAYOUT_AOS && src0->buffer && src0->buffer->context &&
-            !ggml_backend_buffer_is_host(src0->buffer)) {
-            canonical_published = ggml_sycl_publish_backend_aos_expert_handles(
-                static_cast<ggml_backend_sycl_buffer_context *>(src0->buffer->context),
-                const_cast<ggml_tensor *>(src0));
-            auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-            ggml_tensor_extra_gpu::resolved_moe_expert_storage_record expert0{};
-            if (canonical_published && extra &&
-                extra->resolve_moe_storage_record(0, GGML_LAYOUT_AOS, ctx.device,
-                                                  ggml_sycl_moe_expert_layout_bytes(
-                                                      src0, GGML_LAYOUT_AOS, ctx.device),
-                                                  &expert0)) {
-                published_kind   = static_cast<int>(expert0.logical_handle.kind());
-                published_stable = expert0.logical_handle.has_stable_owner_identity();
-            }
-        }
-        ggml_sycl_moe_log_canonical_publish_pre_admission(
-            src0, canonical_published, published_kind, published_stable);
+        int        published_kind      = -1;
+        bool       published_stable    = false;
+        const bool canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
+            src0, ctx.device, route_layout, &published_kind, &published_stable);
+        ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_decode_canonical_publish_diagnostics,
+                                                          "MOE-DECODE-CANONICAL", src0, canonical_published,
+                                                          published_kind, published_stable);
         const auto recipe_exec = ggml_sycl_take_execution_state_snapshot(&ctx);
         ggml_sycl::lifecycle::ModelToken recipe_root{};
         const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
@@ -64994,11 +65406,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             recipe_queue_capability.valid() ? &recipe_queue_capability : nullptr);
         if (!retained_decode_batch_result) {
             ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
-            GGML_LOG_ERROR("[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                           src0->name ? src0->name : "?", retained_decode_batch_result.occurrence,
-                           retained_decode_batch_result.expert_id,
-                           ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
-                           retained_decode_batch_result.source_reason);
+            GGML_LOG_ERROR(
+                "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
+                src0->name ? src0->name : "?", retained_decode_batch_result.occurrence,
+                retained_decode_batch_result.expert_id,
+                ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
+                retained_decode_batch_result.source_reason,
+                retained_decode_batch_result.recipe_reason ? retained_decode_batch_result.recipe_reason : "(unset)");
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode admission failed");
         }
     }
@@ -93043,6 +93457,16 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
 }
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // llama.cpp-480a: segment the pinned-staging trace by graph so occupancy can
+    // be read as "returns to baseline" vs "climbs". Bracketing both sides is what
+    // makes that readable -- an entry sample alone cannot distinguish a graph that
+    // released its staging from one whose successor simply had not allocated yet.
+    ggml_sycl::stage_trace_mark("graph-enter");
+
+    struct stage_trace_exit {
+        ~stage_trace_exit() { ggml_sycl::stage_trace_mark("graph-exit"); }
+    } stage_trace_exit_guard;
+
     try {
         return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
     } catch (const ggml_sycl_fallback_error & error) {

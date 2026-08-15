@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <thread>
 
 namespace ggml_sycl {
 
@@ -228,12 +229,205 @@ static void wait_deps(const std::vector<sycl::event> & deps) {
     }
 }
 
-static bool alloc_pinned_stage_handle(size_t           size,
-                                      sycl::queue &    queue,
-                                      int              device,
-                                      const char *     cohort_id,
-                                      bool             require_host_usm_base,
-                                      mem_handle *     out) {
+// ---------------------------------------------------------------------------
+// Pinned-staging occupancy trace (llama.cpp-480a), off unless
+// GGML_SYCL_STAGE_TRACE=1.
+//
+// mem-ops.cpp:393 aborts on a 32-BYTE pinned staging allocation with ~192 GB of
+// host free, so the pool is exhausted rather than the host.  Two causes fit that
+// symptom and they need opposite fixes:
+//
+//   monotonic growth  -> a real leak; enlarging the pool only moves the abort
+//   high-water bursts -> sizing / drain cadence; the pool is simply too small
+//                        for the concurrent retention between drains
+//
+// The counters below separate them.  `retained` counts staging handles handed to
+// retain_handles_until_event(), which are released only at graph-boundary drains
+// (mem-handle.hpp:735); `waited` counts the ones released at scope exit instead.
+// The h2d path retains, its d2h sibling waits inline -- so if zone_used tracks
+// `retained` rather than concurrent copies, the retention path is the answer.
+static bool stage_trace_enabled() {
+    static int enabled = -1;
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char * env = std::getenv("GGML_SYCL_STAGE_TRACE");
+    enabled          = (env && std::atoi(env) != 0) ? 1 : 0;
+    return enabled != 0;
+}
+
+static std::atomic<uint64_t> g_stage_alloc_ok{ 0 };
+static std::atomic<uint64_t> g_stage_alloc_fail{ 0 };
+static std::atomic<uint64_t> g_stage_retained{ 0 };
+static std::atomic<uint64_t> g_stage_waited{ 0 };
+static std::atomic<size_t>   g_stage_zone_peak{ 0 };
+// Lines that saw each graph-recording predicate true, printed on every line so a
+// run in which the flags never move is SELF-DIAGNOSING rather than silently void.
+// graph_self=1 implies graph_any=1, so (any_n - self_n) is the divergence count.
+static std::atomic<uint64_t> g_stage_graph_any_seen{ 0 };
+static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
+
+// Sample the STAGING zone and print one line.  Always called on FAILURE even
+// when tracing is off -- the abort that follows is the one event where the
+// occupancy at the moment of failure is the whole story, and losing it costs a
+// GPU run to recover.
+// RE-AIMED (llama.cpp-480a, round 2).  Round 1 read
+// unified_cache_host_zone_used(STAGING) and printed 0 on all 76,441 lines while
+// 65,635 staging allocations SUCCEEDED -- the empty-probe trap in pure form.
+//
+// The fault is in the accessor, not the pool: unified_cache::host_zone_used()
+// returns 0 outright when `!host_arena_ || !host_arena_->zones_configured()`
+// (unified-cache.cpp:16702-16706).  Host zones are configured during model load,
+// and test-backend-ops never loads a model -- so under the census that number is
+// STRUCTURALLY zero and could never have moved, whatever the pool did.
+//
+// pinned_pool_committed() (= host_arena_->allocated()) carries no such
+// precondition: it reports bytes committed in chunks whenever the arena exists.
+// That is the reservoir a staging allocation actually draws from when zones are
+// absent, so it is what the trace now reads, and what `peak` now tracks.
+//
+// zone_cap is printed beside zone_used so a zero is SELF-DIAGNOSING: zone_cap=0
+// means the zone does not exist and zone_used=0 says nothing, rather than being
+// misreadable as "the pool is empty".  And `committed == 0` while alloc_ok
+// climbs is flagged inline as RESERVOIR-UNMAPPED -- the in-band positive
+// control, printed on every line so the next reader cannot repeat round 1's
+// mistake silently.
+// WHICH PATH SATISFIED THE REQUEST (llama.cpp-480a, round 3).
+//
+// Wall 5 is nondeterministic: census 6 aborted on a 32-byte staging allocation,
+// censuses 5 and 7 completed, and census 7 proved the committed curve is flat --
+// there is no leak, so the pool is not what varies.  What varies is which path a
+// request of the SAME size takes.  require_host_usm_base makes the allocation a
+// standalone host-USM base instead of a slice of an existing chunk, and at the
+// aborting call site (the host->device path below) the PARAMETER is a literal
+// false -- so the only thing that can flip it there is the graph-recording
+// predicate.  These three fields let a traced run read that off directly.
+//
+// graph_self / graph_any are the two predicates, printed separately on purpose.
+// ggml_sycl_graph_recording_active() (graph_any) ORs a thread_local flag with a
+// PROCESS-WIDE atomic depth, so it is true on threads holding no graph at all,
+// while ggml_sycl_graph_recording_this_thread() (graph_self) is not.  common.hpp
+// :329-343 records that the wide predicate is the wrong question for "will the
+// allocation I am about to make be captured into a graph?" and names llama.cpp-
+// f9tg, where that exact substitution was the defect.  This allocation asks that
+// question with the wide one.  Whether that is wall 5's trigger is what the run
+// decides -- a failure carrying graph_any=1 graph_self=0 says yes and points at
+// a one-predicate fix; graph_any never reaching 1 kills the candidate outright.
+static void stage_trace_sample(const char * where,
+                               const char * cohort,
+                               size_t       bytes,
+                               bool         ok,
+                               int          device,
+                               int          usm_param  = -1,
+                               int          graph_self = -1,
+                               int          graph_any  = -1) {
+    // GATE THE ACCOUNTING, NOT ONLY THE PRINT.
+    //
+    // Everything below -- the cache lookup (a shared_mutex read lock), five
+    // pinned-pool/zone accessors, and the peak compare-exchange -- used to run
+    // on EVERY staging allocation whether tracing was on or off.  That is 65k+
+    // times per census and once per production MoE staging copy, which made the
+    // "diagnostics-only" claim on this trace false as written.
+    //
+    // The condition is HOISTED rather than wrapped around the fprintf, because
+    // on the !ok path the accounting must still run BEFORE the print: the
+    // failure line's whole value is the reservoir state at the instant it
+    // failed, and a print with unpopulated fields would be worse than no print.
+    // Emit when (!ok || enabled); so return early on its negation, (ok && !enabled).
+    if (ok && !stage_trace_enabled()) {
+        return;
+    }
+
+    // peak, graph_any_n and graph_self_n accumulate HERE, so gating the body
+    // makes them discontinuous when tracing is off: they then cover failure
+    // samples only.  `peak` is the dangerous one -- it would equal `committed`
+    // and read as "the pool never grew", a false all-clear on the one line
+    // anybody reads.  Say so in band rather than let a reader trust a number
+    // that is no longer a high-water mark.  alloc_ok/alloc_fail/retained/waited
+    // are incremented by the callers and stay continuous either way.
+    const bool cumulative_continuous = stage_trace_enabled();
+
+    unified_cache * cache = device >= 0 ? get_unified_cache_for_device(device) : nullptr;
+    if (!cache) {
+        cache = get_unified_cache_for_device(0);
+    }
+    const size_t committed = cache ? cache->pinned_pool_committed() : 0;
+    const size_t budget    = cache ? cache->pinned_pool_budget() : 0;
+    const size_t chunks    = cache ? cache->pinned_pool_chunk_count() : 0;
+    const size_t zone_used = cache ? cache->host_zone_used(host_zone_id::STAGING) : 0;
+    const size_t zone_cap  = cache ? cache->host_zone_capacity(host_zone_id::STAGING) : 0;
+
+    size_t peak = g_stage_zone_peak.load(std::memory_order_relaxed);
+    while (committed > peak && !g_stage_zone_peak.compare_exchange_weak(peak, committed, std::memory_order_relaxed)) {
+    }
+
+    if (graph_any > 0) {
+        g_stage_graph_any_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (graph_self > 0) {
+        g_stage_graph_self_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+    const int usm_eff = (usm_param < 0 || graph_any < 0) ? -1 : ((usm_param || graph_any) ? 1 : 0);
+
+    const unsigned long long allocs = g_stage_alloc_ok.load(std::memory_order_relaxed);
+    fprintf(stderr,
+            "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
+            "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
+            "zone_cap=%zu usm_param=%d graph_self=%d graph_any=%d usm_eff=%d graph_any_n=%llu "
+            "graph_self_n=%llu%s%s\n",
+            where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
+            (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
+            g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, usm_param,
+            graph_self, graph_any, usm_eff, (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
+            (unsigned long long) g_stage_graph_self_seen.load(std::memory_order_relaxed),
+            (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "",
+            cumulative_continuous ? "" : " CUMULATIVE-GATED");
+}
+
+void stage_trace_mark(const char * tag) {
+    if (!stage_trace_enabled()) {
+        return;
+    }
+    stage_trace_sample("mark", tag, 0, true, /*device=*/-1);
+}
+
+// Bounded retry for a TERMINAL staging attempt (llama.cpp-480a).
+//
+// Wall 5 is a 32-BYTE pinned allocation failing with ~192 GB host free, so what
+// runs out is the driver's pinned/locked budget, not memory -- a condition
+// another process can create and then release.  Three hypotheses are refuted
+// (pool leak, growth refusal, constrained-path selection) and the surviving one
+// is external host pressure: census 6, the only run that ever aborted, was the
+// only one that ran while other worktrees were building.  An immediate abort
+// turns that transient state into a dead run.
+//
+// Deliberately NO forced drain, reap or eviction between attempts.  Retained
+// staging handles are released at graph-boundary drains, and reclaiming memory
+// that still has a live handle is forbidden outright by the unified-cache
+// ownership contract.  So this recovers from EXTERNAL pressure only -- exactly
+// the surviving hypothesis.  If the pressure is internal the retries change
+// nothing and the abort still fires, with the trace showing every attempt.
+//
+// The request is built once and reused across attempts: re-reading the graph
+// predicates mid-retry would mean a later attempt asked for a different
+// allocation shape than the one the trace line describes.
+static constexpr int k_stage_alloc_retries  = 4;
+static constexpr int k_stage_alloc_retry_us = 2000;
+
+static bool alloc_pinned_stage_handle(size_t        size,
+                                      sycl::queue & queue,
+                                      int           device,
+                                      const char *  cohort_id,
+                                      bool          require_host_usm_base,
+                                      mem_handle *  out,
+                                      int           retries = 0) {
+    // Read both predicates ONCE: recording state is dynamic, so sampling it a
+    // second time for the trace could report a value the request never used.
+    const bool graph_self = ggml_sycl_graph_recording_this_thread();
+    const bool graph_any  = ggml_sycl_graph_recording_active();
+
     alloc_request req{};
     req.queue                               = &queue;
     req.device                              = device;
@@ -250,13 +444,28 @@ static bool alloc_pinned_stage_handle(size_t           size,
     // replay it after graph-boundary host-zone resets.  Keep graph-recorded
     // staging allocations as standalone unified-cache-owned host USM bases
     // rather than reset-scoped SCRATCH/STAGING zone slices.
-    req.intent.constraints.require_host_usm_base = require_host_usm_base || ggml_sycl_graph_recording_active();
+    req.intent.constraints.require_host_usm_base = require_host_usm_base || graph_any;
 
-    *out = unified_allocate(req);
-    if (!out->valid()) {
-        return false;
+    for (int attempt = 0;; ++attempt) {
+        *out = unified_allocate(req);
+        if (out->valid()) {
+            g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
+            stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device, require_host_usm_base ? 1 : 0,
+                               graph_self ? 1 : 0, graph_any ? 1 : 0);
+            return true;
+        }
+        // Every attempt prints, tracing off or not: the whole value of the
+        // failure line is the reservoir state at the instant it failed, and a
+        // retry that succeeds would otherwise erase the evidence that the
+        // pressure was ever there.
+        g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
+        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device, require_host_usm_base ? 1 : 0,
+                           graph_self ? 1 : 0, graph_any ? 1 : 0);
+        if (attempt >= retries) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(k_stage_alloc_retry_us));
     }
-    return true;
 }
 
 static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
@@ -323,8 +532,10 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
                                        /*require_host_usm_base=*/true, &src_stage) &&
             !alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device",
                                        /*require_host_usm_base=*/true, &src_stage) &&
+            // Only the LAST attempt retries: the earlier two fall through to
+            // another device, which is a better answer to pressure than waiting.
             !alloc_pinned_stage_handle(size, queue, fallback_device, "mem-copy-cross-device",
-                                       /*require_host_usm_base=*/true, &src_stage)) {
+                                       /*require_host_usm_base=*/true, &src_stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for device %d -> %d copy",
                        size, src_device, dst_device);
         }
@@ -353,7 +564,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         if (!alloc_pinned_stage_handle(size, dst_queue, dst_device, "mem-copy-cross-device-dst",
                                        /*require_host_usm_base=*/true, &dst_stage) &&
             !alloc_pinned_stage_handle(size, queue, fallback_device, "mem-copy-cross-device-dst",
-                                       /*require_host_usm_base=*/true, &dst_stage)) {
+                                       /*require_host_usm_base=*/true, &dst_stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte destination host-pinned staging buffer for device %d -> %d copy",
                        size, src_device, dst_device);
         }
@@ -388,7 +599,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
         if (!alloc_pinned_stage_handle(stage_bytes, *copy_queue, dst_device, "mem-copy-host-to-device",
-                                       /*require_host_usm_base=*/false, &stage)) {
+                                       /*require_host_usm_base=*/false, &stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for host -> device %d copy",
                        stage_bytes, dst_device);
         }
@@ -407,8 +618,11 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             copied += cur;
         }
         if (retain_until_event) {
+            // Released only at a graph-boundary drain, not when this copy ends.
+            g_stage_retained.fetch_add(1, std::memory_order_relaxed);
             retain_handles_until_event({ dst, src, stage }, event, std::move(publish_ticket));
         } else {
+            g_stage_waited.fetch_add(1, std::memory_order_relaxed);
             event.wait_and_throw();
         }
         return event;
@@ -419,7 +633,7 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
         const size_t     stage_bytes     = std::min(size, max_stage_bytes);
         mem_handle stage;
         if (!alloc_pinned_stage_handle(stage_bytes, *copy_queue, src_device, "mem-copy-device-to-host",
-                                       /*require_host_usm_base=*/false, &stage)) {
+                                       /*require_host_usm_base=*/false, &stage, k_stage_alloc_retries)) {
             GGML_ABORT("[MEM-OPS] failed to allocate %zu byte host-pinned staging buffer for device %d -> host copy",
                        stage_bytes, src_device);
         }

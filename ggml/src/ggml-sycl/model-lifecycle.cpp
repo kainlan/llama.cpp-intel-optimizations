@@ -1,5 +1,7 @@
 #include "model-lifecycle.hpp"
 
+#include "ggml.h"
+
 #include <iterator>
 #include <new>
 
@@ -204,6 +206,12 @@ begin_result Registry::begin_outer() noexcept {
             generation = slots_[slot].generation;
         }
 #endif
+        // Enforced disjointness with buffer-scoped owner ids, which carry the
+        // top bit.  Both id spaces reach the same canonical resolver as a bare
+        // uint64_t, so a model id that ever set that bit would be resolved
+        // against the buffer-owner table instead of this Registry.
+        GGML_ASSERT(!is_buffer_owner_id(next_model_id_) && !is_buffer_owner_id(next_load_id_) &&
+                    "model identity must not collide with the buffer-owner id namespace");
         const ModelToken token{
             { next_model_id_ },
             { next_load_id_ },

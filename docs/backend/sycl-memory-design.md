@@ -224,11 +224,11 @@ buffers (`test-backend-ops` cases, and anything else allocating through
 `ggml_backend_sycl_buffer_type_alloc_buffer`) are refused rather than merely
 slower.
 
-### Buffer-scoped weight provenance *(landing under `llama.cpp-f8ws`)*
+### Buffer-scoped weight provenance
 
 The fix adds a **second legitimate minting occasion — buffer allocation** — and
-changes nothing else about the gates. Not merged at `0b7b49e07`; described here
-so the two mechanisms are not mistaken for one:
+changes nothing else about the gates. Merged with the `llama.cpp-f8ws` lane
+(2026-08-15); described here so the two mechanisms are not mistaken for one:
 
 - **Minted at buffer allocation.** The buffer context already holds a unique
   per-allocation id (`managed_meta.id`, from the cache's own retention-identity

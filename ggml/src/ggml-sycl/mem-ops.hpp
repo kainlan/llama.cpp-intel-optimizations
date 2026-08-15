@@ -69,4 +69,15 @@ void mem_fill(const mem_handle &               h,
               sycl::queue &                    queue,
               const std::vector<sycl::event> & deps = {});
 
+// Diagnostic for llama.cpp-480a, off unless GGML_SYCL_STAGE_TRACE=1.
+//
+// Emit a boundary marker so pinned-staging occupancy can be read PER CASE
+// rather than as one undifferentiated stream.  The whole question is whether
+// staging returns to baseline between units of work (a high-water / drain
+// cadence problem) or climbs monotonically (a real leak), and those two have
+// opposite fixes -- so the trace is useless without something to segment it.
+//
+// No-op and allocation-free when tracing is disabled.
+void stage_trace_mark(const char * tag);
+
 }  // namespace ggml_sycl

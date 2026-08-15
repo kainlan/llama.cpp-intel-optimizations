@@ -163,6 +163,29 @@ static bool test_reset_preserves_leased_entry_and_remaps_id(sycl::queue & q) {
         fprintf(stderr, "acquire_weight_lease failed to resolve either layout sibling\n");
         return false;
     }
+    // weight_ptr_lease_result is a plain aggregate with NO destructor -- its
+    // `entry` field is documented as "opaque handle for lease release", and the
+    // refcount bump acquire_entry_lease() made is nobody's until someone adopts
+    // it.  Production never holds the raw result: cpu-dispatch.cpp wraps it in a
+    // mem_handle via from_weight_lease_snapshot(), which takes over the bump
+    // ("ownership of the refcount bump transferred", mem-handle.cpp) and
+    // releases it in release_lease_state().
+    //
+    // Holding the raw result, as this test did, leaks in_use_count for the rest
+    // of the process.  That was invisible until 582fee665 added
+    // GGML_ASSERT(in_use_count == 0) to unified_cache::shutdown_resources(),
+    // after which this fixture aborted the whole binary at ~unified_cache --
+    // before any later test in this file could run.  Owning the lease the way
+    // production does is both the fix and the more faithful simulation.
+    ggml_sycl::mem_handle lease_owner = ggml_sycl::mem_handle::from_weight_lease_snapshot(
+        key, /*device=*/0, lease.ptr, lease.layout, lease.on_device, lease.entry, std::move(lease.storage_owner),
+        lease.has_ready_event, lease.ready_event);
+    if (!lease_owner.valid()) {
+        // The snapshot refuses (and releases the bump itself) when the entry is
+        // not a consistent authority for this pointer/layout/device tuple.
+        fprintf(stderr, "from_weight_lease_snapshot refused the lease; cannot simulate a live holder\n");
+        return false;
+    }
     if (lease.layout != GGML_LAYOUT_SOA) {
         fprintf(stderr, "test assumption violated: acquire_weight_lease did not resolve SOA (got layout=%d)\n",
                 (int) lease.layout);
@@ -696,6 +719,153 @@ static bool test_load_boundary_keeps_unattributed_while_a_model_is_live(sycl::qu
     return true;
 }
 
+// Universal provenance gives every tensor allocated through a SYCL backend
+// buffer an admissible owner, so weight cache entries can now be owned by a
+// BUFFER rather than by a model. That is a fourth lifetime, and the ruling it
+// implements has two halves, tested here in order:
+//
+//   1. a live buffer's entries survive reclaim, and
+//   2. they are fully dropped when the buffer is freed.
+//
+// Buffer owners are deliberately outside the 0..31 model-slot bitmask (32
+// slots; test-backend-ops allocates one buffer per case), so neither half can
+// be expressed through live_model_mask_. The methodology control is an
+// UNATTRIBUTED entry staged in the same cache and reclaimed by the same call:
+// with no model live, LOAD_BOUNDARY frees it. It is asserted FIRST, because
+// without it "the buffer entry survived" is equally satisfied by a reclaim
+// that did nothing at all.
+static bool test_live_buffer_owned_entries_survive_reclaim(sycl::queue & q) {
+    printf("\n=== Test: a live buffer's weight entries survive reclaim, and die with the buffer ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     data_buffer(128, 0x5a);
+    std::vector<uint8_t>     data_runtime(128, 0xa5);
+
+    const uint64_t owner_id = ggml_sycl::lifecycle::buffer_owner_id_from_seed(7);
+    if (owner_id == 0 || !ggml_sycl::lifecycle::is_buffer_owner_id(owner_id)) {
+        fprintf(stderr, "FAIL: buffer owner id 7 did not mint into the tagged namespace\n");
+        return false;
+    }
+    ggml_sycl_cache_id key_buffer  = ggml_sycl::test_make_cache_id(data_buffer.data(), owner_id);
+    ggml_sycl_cache_id key_runtime = ggml_sycl::test_make_cache_id(data_runtime.data());
+
+    if (!stage_with_idle_aos_sibling(cache, q, key_buffer, data_buffer, "the buffer-owned entry")) {
+        return false;
+    }
+    if (!stage_with_idle_aos_sibling(cache, q, key_runtime, data_runtime, "the unattributed entry")) {
+        return false;
+    }
+    cache.note_buffer_owner_live(owner_id);
+    if (!cache.buffer_owner_live(owner_id)) {
+        fprintf(stderr, "FAIL: the cache did not record the buffer owner as live\n");
+        return false;
+    }
+
+    // No model is live, so this is the mode/mask combination that reclaims
+    // everything it can.
+    cache.set_live_model_mask(0);
+    cache.reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::LOAD_BOUNDARY);
+
+    // Control first: the reclaim really ran.
+    if (cache.is_cached(key_runtime, GGML_LAYOUT_AOS)) {
+        fprintf(stderr,
+                "FAIL (control): the unattributed entry survived a load boundary with NO model\n"
+                "      live, so this reclaim freed nothing and proves nothing about the\n"
+                "      buffer-owned entry below.\n");
+        return false;
+    }
+    if (!cache.is_cached(key_buffer, GGML_LAYOUT_AOS)) {
+        fprintf(stderr,
+                "FAIL: a LIVE buffer's weight entry was reclaimed. Buffer ownership is an\n"
+                "      explicit class, not a fall-through to unattributed: the buffer can\n"
+                "      still resolve this entry, so nothing may free it.\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "validate() rejects the cache after the reclaim\n");
+        return false;
+    }
+    printf("  unattributed entry reclaimed, live buffer's entry preserved\n");
+
+    // Half two: freeing the buffer drops them. Asserted on the AOS sibling,
+    // which is the IDLE one -- stage_with_idle_aos_sibling() leaves the cache's
+    // own direct-stage mirror row holding a lease on SOA, and an entry with a
+    // live lease is preserved by design. That case is the next test.
+    const size_t dropped = cache.note_buffer_owner_dead(owner_id);
+    if (dropped == 0) {
+        fprintf(stderr, "FAIL: freeing the buffer dropped no entries\n");
+        return false;
+    }
+    if (cache.is_cached(key_buffer, GGML_LAYOUT_AOS)) {
+        fprintf(stderr,
+                "FAIL: the buffer's idle entry outlived the buffer. Its identity is minted by\n"
+                "      the buffer and dies with it, so a surviving entry is unreachable state.\n");
+        return false;
+    }
+    if (cache.buffer_owner_live(owner_id)) {
+        fprintf(stderr, "FAIL: the owner is still recorded as live after the buffer was freed\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "validate() rejects the cache after the buffer was freed\n");
+        return false;
+    }
+    printf("  buffer free dropped %zu entr%s\n", dropped, dropped == 1 ? "y" : "ies");
+
+    return true;
+}
+
+// The ownership contract does not bend for buffers either. Freeing a buffer
+// erases the entries nobody holds, but an entry with a live lease is preserved
+// and reported -- never force-reaped, which is the one thing the memory
+// contract forbids outright. A lease surviving its buffer IS a leak; the fix
+// for a leak is the missing release, not a reap.
+//
+// Both entries here belong to ONE buffer and differ in exactly one variable:
+// stage_with_idle_aos_sibling() leaves the cache's own direct-stage mirror row
+// leasing SOA and leaves AOS idle. The erasure of AOS is asserted FIRST, so
+// "SOA survived" cannot be satisfied by a call that erases nothing.
+static bool test_leased_entry_survives_its_buffer_free(sycl::queue & q) {
+    printf("\n=== Test: buffer free erases idle entries and preserves leased ones ===\n");
+
+    ggml_sycl::unified_cache cache(q, 64 * 1024);
+    std::vector<uint8_t>     data(128, 0x3c);
+
+    const uint64_t     owner_id = ggml_sycl::lifecycle::buffer_owner_id_from_seed(11);
+    ggml_sycl_cache_id key      = ggml_sycl::test_make_cache_id(data.data(), owner_id);
+
+    if (!stage_with_idle_aos_sibling(cache, q, key, data, "the buffer-owned entry")) {
+        return false;
+    }
+    cache.note_buffer_owner_live(owner_id);
+
+    const size_t dropped = cache.note_buffer_owner_dead(owner_id);
+
+    // Control first: this call does erase.
+    if (cache.is_cached(key, GGML_LAYOUT_AOS) || dropped == 0) {
+        fprintf(stderr,
+                "FAIL (control): freeing the buffer left its IDLE entry cached (dropped=%zu), so\n"
+                "      the preservation asserted below is an inability to erase rather than a\n"
+                "      lease decision.\n",
+                dropped);
+        return false;
+    }
+    if (!cache.is_cached(key, GGML_LAYOUT_SOA)) {
+        fprintf(stderr,
+                "FAIL: a LEASED entry was freed when its buffer went away. A live handle vetoes\n"
+                "      reclamation in every mode -- the leak is reported, and the missing release\n"
+                "      is the bug to fix, not the entry to reap.\n");
+        return false;
+    }
+    if (!cache.validate()) {
+        fprintf(stderr, "validate() rejects the cache after the buffer was freed\n");
+        return false;
+    }
+    printf("  idle entry erased (dropped=%zu), leased sibling preserved\n", dropped);
+
+    return true;
+}
+
 // Build a queue on a device already known to exist. Wrapped in a function so
 // the queue never has to be default-constructed into a temporary state --
 // sycl::queue's default ctor goes through the default selector and throws when
@@ -763,6 +933,8 @@ int main() {
     ok &= test_unrelated_thread_entry_not_claimed(q);
     ok &= test_replan_frees_own_staging_but_spares_a_live_model(q);
     ok &= test_load_boundary_keeps_unattributed_while_a_model_is_live(q);
+    ok &= test_live_buffer_owned_entries_survive_reclaim(q);
+    ok &= test_leased_entry_survives_its_buffer_free(q);
 
     printf("\nreset_model_weight_entries lease-preserve tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
