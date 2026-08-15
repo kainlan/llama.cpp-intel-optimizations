@@ -657,7 +657,17 @@ struct moe_resolved_batch_result {
     moe_batch_reject_reason reject        = moe_batch_reject_reason::NONE;
     size_t                  occurrence    = 0;
     int32_t                 expert_id     = -1;
+    // ⚠ source_reason's default TIES WITH A REAL VALUE: expert_resolve_reason::FOUND
+    // is 0, so an unset field reads as "the expert resolved".  The RECIPE_MISSING
+    // path below used to leave it unset, and a census duly reported
+    // source_reason=0 on 264 refusals -- which decodes to FOUND and invites the
+    // conclusion that residency succeeded.  It happened to BE true there (the
+    // route must pass validate_moe_batch_route to reach that branch at all), but
+    // the number was evidence for nothing.  Every reject path now assigns it.
     int                     source_reason = 0;
+    // Which capability clause declined, when reject == RECIPE_MISSING.  Without
+    // it a recipe refusal is anonymous and every investigation starts from zero.
+    const char *            recipe_reason = nullptr;
 
     explicit operator bool() const { return reject == moe_batch_reject_reason::NONE; }
 };
@@ -751,6 +761,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             out.occurrence    = i;
             out.expert_id     = expert_id;
             out.source_reason = route.source_reason;
+            out.recipe_reason = route.recipe_reason;
             out.batch.operands.clear();
             return out;
         }
@@ -789,9 +800,11 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
         operand.recipe_reason             = route.recipe_reason;
         operand.admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease);
         if (!route.recipe.valid) {
-            out.reject     = moe_batch_reject_reason::RECIPE_MISSING;
-            out.occurrence = i;
-            out.expert_id  = expert_id;
+            out.reject        = moe_batch_reject_reason::RECIPE_MISSING;
+            out.occurrence    = i;
+            out.expert_id     = expert_id;
+            out.source_reason = route.source_reason;
+            out.recipe_reason = route.recipe_reason;
             out.batch.operands.clear();
             return out;
         }

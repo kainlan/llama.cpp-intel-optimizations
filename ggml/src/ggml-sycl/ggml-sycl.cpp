@@ -63513,11 +63513,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
             retained_prompt_layout, /*allow_materialize=*/false);
         if (!retained_prompt_batch_result) {
-            GGML_LOG_ERROR("[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                           src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
-                           retained_prompt_batch_result.expert_id,
-                           ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
-                           retained_prompt_batch_result.source_reason);
+            GGML_LOG_ERROR(
+                "[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
+                src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
+                retained_prompt_batch_result.expert_id,
+                ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
+                retained_prompt_batch_result.source_reason,
+                retained_prompt_batch_result.recipe_reason ? retained_prompt_batch_result.recipe_reason : "(unset)");
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
         }
 
@@ -65042,11 +65044,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             recipe_queue_capability.valid() ? &recipe_queue_capability : nullptr);
         if (!retained_decode_batch_result) {
             ggml_sycl_moe_precomputed_skip_erase(g_moe_precomputed_mmid_skip, dst, ctx.device);
-            GGML_LOG_ERROR("[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d\n",
-                           src0->name ? src0->name : "?", retained_decode_batch_result.occurrence,
-                           retained_decode_batch_result.expert_id,
-                           ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
-                           retained_decode_batch_result.source_reason);
+            GGML_LOG_ERROR(
+                "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
+                src0->name ? src0->name : "?", retained_decode_batch_result.occurrence,
+                retained_decode_batch_result.expert_id,
+                ggml_sycl::moe_batch_reject_reason_name(retained_decode_batch_result.reject),
+                retained_decode_batch_result.source_reason,
+                retained_decode_batch_result.recipe_reason ? retained_decode_batch_result.recipe_reason : "(unset)");
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained decode admission failed");
         }
     }
