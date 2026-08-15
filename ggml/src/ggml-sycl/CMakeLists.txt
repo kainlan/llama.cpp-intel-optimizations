@@ -2928,6 +2928,36 @@ target_link_libraries(test-sycl-moe-handle-resolution PRIVATE ggml-base ggml ggm
 if (IntelSYCL_FOUND)
     target_link_libraries(test-sycl-moe-handle-resolution PRIVATE IntelSYCL::SYCL_CXX)
 endif()
+# Owner resolution across the load_end COMMITTING window (llama.cpp-mik6).
+# Genuinely host-only: it opens no queue and loads no model, so it carries
+# neither "cache"/"mem-handle" (reserved for the GPU-allocating OOM-hazard
+# family) nor a device selector -- the seam it reads is pure registry state.
+add_executable(test-sycl-lifecycle-commit-window-owner
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-lifecycle-commit-window-owner.cpp
+)
+target_include_directories(test-sycl-lifecycle-commit-window-owner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-lifecycle-commit-window-owner PRIVATE "-fsycl")
+target_link_options(test-sycl-lifecycle-commit-window-owner PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-lifecycle-commit-window-owner PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-lifecycle-commit-window-owner PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-lifecycle-commit-window-owner PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-lifecycle-commit-window-owner COMMAND test-sycl-lifecycle-commit-window-owner)
+set_tests_properties(sycl-lifecycle-commit-window-owner PROPERTIES
+    LABELS "sycl;lifecycle;owner;host;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"

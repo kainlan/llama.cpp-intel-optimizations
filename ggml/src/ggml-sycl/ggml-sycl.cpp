@@ -2295,8 +2295,9 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
 // Resolve a wrapper's owner without ever substituting another model. A nonzero
-// model_id is an assertion: it must name the exact bound load candidate or an
-// exact LIVE registry token. Stale/mutated wrappers fail closed.
+// model_id is an assertion: it must name the exact bound load candidate, the
+// load whose finishing effects are running on this thread, or an exact LIVE
+// registry token. Stale/mutated wrappers fail closed.
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t model_id) noexcept {
     if (model_id == 0) {
         return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
@@ -2319,6 +2320,20 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t m
             GGML_LOG_WARN("[SYCL] failed to acquire bound load effect while resolving wrapper model=%llu\n",
                           (unsigned long long) model_id);
         }
+    }
+
+    // A load's finishing effects run in a window neither branch above can see:
+    // prepare_end() has already moved the txn out of ACTIVE (so no load effect
+    // is admissible -- it waits for them all to drain first) and the ModelState
+    // is not published LIVE until after those effects return. S1-PRELOAD runs
+    // entirely inside it, and every owner-scoped identity it mints -- MoE expert
+    // cache keys, registered tensor-usage lookups -- resolves through here.
+    // bound_finisher_effect() is thread-scoped like the candidate binding and
+    // revalidates the COMMITTING phase and live effect serial under the registry
+    // lock, so it names one exact load and cannot outlive it.
+    const auto finisher = registry.bound_finisher_effect();
+    if (finisher.model.value == model_id && finisher.load.value != 0) {
+        return finisher;
     }
 
     const auto state = registry.find({ model_id });
