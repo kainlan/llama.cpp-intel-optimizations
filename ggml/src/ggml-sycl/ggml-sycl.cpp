@@ -61076,33 +61076,32 @@ static constexpr uint32_t    k_moe_canonical_publish_log_cap = 1024;
 static std::atomic<uint32_t> g_moe_decode_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_prompt_canonical_publish_diagnostics{ 0 };
 static std::atomic<uint32_t> g_moe_direct_authority_candidates{ 0 };
-static void ggml_sycl_moe_log_canonical_publish_pre_admission(
-    const ggml_tensor * tensor, bool published, int kind, bool stable) noexcept {
-    uint32_t current = g_moe_decode_canonical_publish_diagnostics.load(std::memory_order_relaxed);
+// ONE witness for both admissions.  The two copies were structurally identical
+// apart from their counter and their tag -- which is the drifted-duplicate shape
+// b94fb1373's own message calls out: the prompt admission lost its publication
+// precisely because it sat ~1500 lines from its twin, and keeping two copies of
+// the witness invites the same divergence one level down, where the symptom
+// would be a census scoring a side that silently stopped reporting.
+//
+// The tag is a parameter rather than two format strings.  Runtime output is
+// unchanged, but note the artifact-probe consequence: `strings` no longer
+// contains the combined literal "[MOE-PROMPT-CANONICAL] tensor=%s published=...",
+// so c-nfsm's RED/GREEN form of that probe must become a search for the bare tag
+// "MOE-PROMPT-CANONICAL", which is still present as its own literal.
+static void ggml_sycl_moe_log_canonical_publish_pre_admission(std::atomic<uint32_t> & counter,
+                                                              const char *            tag,
+                                                              const ggml_tensor *     tensor,
+                                                              bool                    published,
+                                                              int                     kind,
+                                                              bool                    stable) noexcept {
+    uint32_t current = counter.load(std::memory_order_relaxed);
     while (current < k_moe_canonical_publish_log_cap &&
-           !g_moe_decode_canonical_publish_diagnostics.compare_exchange_weak(current, current + 1,
-                                                                             std::memory_order_relaxed)) {
+           !counter.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
     }
     if (current >= k_moe_canonical_publish_log_cap) {
         return;
     }
-    fprintf(stderr, "[MOE-DECODE-CANONICAL] tensor=%s published=%d kind=%d stable=%d seq=%u\n",
-            tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0, current + 1);
-}
-
-static void ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(const ggml_tensor * tensor,
-                                                                     bool                published,
-                                                                     int                 kind,
-                                                                     bool                stable) noexcept {
-    uint32_t current = g_moe_prompt_canonical_publish_diagnostics.load(std::memory_order_relaxed);
-    while (current < k_moe_canonical_publish_log_cap &&
-           !g_moe_prompt_canonical_publish_diagnostics.compare_exchange_weak(current, current + 1,
-                                                                             std::memory_order_relaxed)) {
-    }
-    if (current >= k_moe_canonical_publish_log_cap) {
-        return;
-    }
-    fprintf(stderr, "[MOE-PROMPT-CANONICAL] tensor=%s published=%d kind=%d stable=%d seq=%u\n",
+    fprintf(stderr, "[%s] tensor=%s published=%d kind=%d stable=%d seq=%u\n", tag,
             tensor && tensor->name[0] ? tensor->name : "?", published ? 1 : 0, kind, stable ? 1 : 0, current + 1);
 }
 
@@ -61139,12 +61138,24 @@ static bool ggml_sycl_publish_mmid_canonical_aos_experts(const ggml_tensor * src
     }
     return published;
 }
+// Same sampling idiom as the canonical-publish witness above: a named cap, and
+// seq so a reader can tell a complete population from a truncated one without
+// knowing the cap by heart.
+//
+// The VALUE deliberately stays 16 rather than adopting the publish cap of 1024.
+// Raising it would be a claim about this population's size, and unlike the
+// MUL_MAT_ID publish population this one has never been measured -- it appears
+// zero times in censuses 6, 7 and 8.  Naming the constant makes the cap
+// discoverable; changing it would be a different commit with evidence behind it.
+static constexpr uint32_t k_moe_direct_authority_log_cap = 16;
+
 static void ggml_sycl_moe_mark_direct_authority_pre_admission(const ggml_tensor * tensor) noexcept {
     uint32_t current = g_moe_direct_authority_candidates.load(std::memory_order_relaxed);
-    while (current < 16 && !g_moe_direct_authority_candidates.compare_exchange_weak(
-                               current, current + 1, std::memory_order_relaxed)) {}
-    if (current < 16) {
-        fprintf(stderr, "[MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=%s count=%u\n",
+    while (current < k_moe_direct_authority_log_cap &&
+           !g_moe_direct_authority_candidates.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+    }
+    if (current < k_moe_direct_authority_log_cap) {
+        fprintf(stderr, "[MOE-DIRECT-AUTHORITY-CANDIDATE] tensor=%s seq=%u\n",
                 tensor && tensor->name[0] ? tensor->name : "?", current + 1);
     }
 }
@@ -63581,12 +63592,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // allocation that never went through model preload has no expert
         // storage records yet, so the retained resolver would refuse with
         // route_unavailable before it ever reaches a cache key.
-        int        prompt_published_kind = -1;
+        int        prompt_published_kind      = -1;
         bool       prompt_published_stable    = false;
         const bool prompt_canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
             src0, ctx.device, retained_prompt_layout, &prompt_published_kind, &prompt_published_stable);
-        ggml_sycl_moe_log_canonical_publish_pre_admission_prompt(src0, prompt_canonical_published,
-                                                                 prompt_published_kind, prompt_published_stable);
+        ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_prompt_canonical_publish_diagnostics,
+                                                          "MOE-PROMPT-CANONICAL", src0, prompt_canonical_published,
+                                                          prompt_published_kind, prompt_published_stable);
         retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
             retained_prompt_layout, /*allow_materialize=*/false);
@@ -65087,8 +65099,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         bool       published_stable    = false;
         const bool canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
             src0, ctx.device, route_layout, &published_kind, &published_stable);
-        ggml_sycl_moe_log_canonical_publish_pre_admission(
-            src0, canonical_published, published_kind, published_stable);
+        ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_decode_canonical_publish_diagnostics,
+                                                          "MOE-DECODE-CANONICAL", src0, canonical_published,
+                                                          published_kind, published_stable);
         const auto recipe_exec = ggml_sycl_take_execution_state_snapshot(&ctx);
         ggml_sycl::lifecycle::ModelToken recipe_root{};
         const auto recipe_plan = route_cache ? route_cache->get_placement_plan_snapshot() : nullptr;
@@ -93167,6 +93180,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     struct stage_trace_exit {
         ~stage_trace_exit() { ggml_sycl::stage_trace_mark("graph-exit"); }
     } stage_trace_exit_guard;
+
     try {
         return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
     } catch (const ggml_sycl_fallback_error & error) {

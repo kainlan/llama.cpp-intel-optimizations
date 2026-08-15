@@ -416,13 +416,13 @@ void stage_trace_mark(const char * tag) {
 static constexpr int k_stage_alloc_retries  = 4;
 static constexpr int k_stage_alloc_retry_us = 2000;
 
-static bool alloc_pinned_stage_handle(size_t           size,
-                                      sycl::queue &    queue,
-                                      int              device,
-                                      const char *     cohort_id,
-                                      bool             require_host_usm_base,
-                                      mem_handle *     out,
-                                      int              retries = 0) {
+static bool alloc_pinned_stage_handle(size_t        size,
+                                      sycl::queue & queue,
+                                      int           device,
+                                      const char *  cohort_id,
+                                      bool          require_host_usm_base,
+                                      mem_handle *  out,
+                                      int           retries = 0) {
     // Read both predicates ONCE: recording state is dynamic, so sampling it a
     // second time for the trace could report a value the request never used.
     const bool graph_self = ggml_sycl_graph_recording_this_thread();
