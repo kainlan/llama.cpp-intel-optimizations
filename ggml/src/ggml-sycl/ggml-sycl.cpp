@@ -93140,6 +93140,15 @@ static void ggml_backend_sycl_graph_boundary_exception_cleanup(ggml_backend_sycl
 }
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // llama.cpp-480a: segment the pinned-staging trace by graph so occupancy can
+    // be read as "returns to baseline" vs "climbs". Bracketing both sides is what
+    // makes that readable -- an entry sample alone cannot distinguish a graph that
+    // released its staging from one whose successor simply had not allocated yet.
+    ggml_sycl::stage_trace_mark("graph-enter");
+
+    struct stage_trace_exit {
+        ~stage_trace_exit() { ggml_sycl::stage_trace_mark("graph-exit"); }
+    } stage_trace_exit_guard;
     try {
         return ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
     } catch (const ggml_sycl_fallback_error & error) {

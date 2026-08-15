@@ -228,6 +228,68 @@ static void wait_deps(const std::vector<sycl::event> & deps) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pinned-staging occupancy trace (llama.cpp-480a), off unless
+// GGML_SYCL_STAGE_TRACE=1.
+//
+// mem-ops.cpp:393 aborts on a 32-BYTE pinned staging allocation with ~192 GB of
+// host free, so the pool is exhausted rather than the host.  Two causes fit that
+// symptom and they need opposite fixes:
+//
+//   monotonic growth  -> a real leak; enlarging the pool only moves the abort
+//   high-water bursts -> sizing / drain cadence; the pool is simply too small
+//                        for the concurrent retention between drains
+//
+// The counters below separate them.  `retained` counts staging handles handed to
+// retain_handles_until_event(), which are released only at graph-boundary drains
+// (mem-handle.hpp:735); `waited` counts the ones released at scope exit instead.
+// The h2d path retains, its d2h sibling waits inline -- so if zone_used tracks
+// `retained` rather than concurrent copies, the retention path is the answer.
+static bool stage_trace_enabled() {
+    static int enabled = -1;
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char * env = std::getenv("GGML_SYCL_STAGE_TRACE");
+    enabled          = (env && std::atoi(env) != 0) ? 1 : 0;
+    return enabled != 0;
+}
+
+static std::atomic<uint64_t> g_stage_alloc_ok{ 0 };
+static std::atomic<uint64_t> g_stage_alloc_fail{ 0 };
+static std::atomic<uint64_t> g_stage_retained{ 0 };
+static std::atomic<uint64_t> g_stage_waited{ 0 };
+static std::atomic<size_t>   g_stage_zone_peak{ 0 };
+
+// Sample the STAGING zone and print one line.  Always called on FAILURE even
+// when tracing is off -- the abort that follows is the one event where the
+// occupancy at the moment of failure is the whole story, and losing it costs a
+// GPU run to recover.
+static void stage_trace_sample(const char * where, const char * cohort, size_t bytes, bool ok) {
+    const size_t zone_used = unified_cache_host_zone_used(host_zone_id::STAGING);
+    size_t       peak      = g_stage_zone_peak.load(std::memory_order_relaxed);
+    while (zone_used > peak && !g_stage_zone_peak.compare_exchange_weak(peak, zone_used, std::memory_order_relaxed)) {
+    }
+    if (!ok || stage_trace_enabled()) {
+        fprintf(stderr,
+                "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d alloc_ok=%llu alloc_fail=%llu "
+                "retained=%llu waited=%llu zone_used=%zu zone_peak=%zu\n",
+                where, cohort ? cohort : "?", bytes, ok ? 1 : 0,
+                (unsigned long long) g_stage_alloc_ok.load(std::memory_order_relaxed),
+                (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
+                (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
+                (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), zone_used,
+                g_stage_zone_peak.load(std::memory_order_relaxed));
+    }
+}
+
+void stage_trace_mark(const char * tag) {
+    if (!stage_trace_enabled()) {
+        return;
+    }
+    stage_trace_sample("mark", tag, 0, true);
+}
+
 static bool alloc_pinned_stage_handle(size_t           size,
                                       sycl::queue &    queue,
                                       int              device,
@@ -254,8 +316,12 @@ static bool alloc_pinned_stage_handle(size_t           size,
 
     *out = unified_allocate(req);
     if (!out->valid()) {
+        g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
+        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false);
         return false;
     }
+    g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
+    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true);
     return true;
 }
 
@@ -407,8 +473,11 @@ static sycl::event mem_copy_submit(const mem_handle &               dst,
             copied += cur;
         }
         if (retain_until_event) {
+            // Released only at a graph-boundary drain, not when this copy ends.
+            g_stage_retained.fetch_add(1, std::memory_order_relaxed);
             retain_handles_until_event({ dst, src, stage }, event, std::move(publish_ticket));
         } else {
+            g_stage_waited.fetch_add(1, std::memory_order_relaxed);
             event.wait_and_throw();
         }
         return event;
