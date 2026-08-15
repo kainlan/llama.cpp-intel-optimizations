@@ -59,3 +59,20 @@ passed semantics then aborted unified-cache.cpp:9457 "deferred managed release
 failed" — classifier/deferred-release finding open + 2 ownerless-lease warnings
 to attribute. Successor: :9457 finding → register_device_expert → recipe split
 ticket → census 6.
+
+## → llama.cpp-f8ws (census 6 + lease verification, 2026-08-15 ~05:45)
+
+LEASE GATE 9/9 PASS (verbose rerun proves suite = nine cases; the "11" bar was
+arithmetic on an unverified baseline). Both ruling-(b) cases green; the formerly
+:9457-aborting case passes: RULING (b) VERIFIED ON HARDWARE, 76041c5a5 confirmed.
+
+CENSUS 6 at 1c548e15b (rc=134, truncated ~59.6k lines): route_unavailable 661→1
+(prompt publication works; published_zero=1 to reconcile). Refusals moved
+downstream: recipe_missing 616 (recipe_reason local 468 / direct 148 / recipe 1)
+→ llama.cpp-gx30 population ~616, histogram measured. Wall probes all 0;
+:57233/:57288 never fired. not_supported=11846 (truncated, = census 5's value).
+
+WALL 5: mem-ops.cpp:393 "failed to allocate 32 byte host-pinned staging buffer"
+with 192G free — pool-exhaustion/leak-shaped ("genuine defect" per the sweep's
+prediction). RCA assigned to impl-f8ws3: attribution first (publication-path
+accumulation vs pre-existing newly-reached), truncation-depth comparison c5 vs c6.
