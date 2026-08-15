@@ -4677,6 +4677,25 @@ else()
     message(STATUS "ggml-sycl: Python3 not found; layer-stream ownership contract test is not registered")
 endif()
 
+# MoE MMID workspace deferral contract (llama.cpp-7lvk). The behavioural arms
+# need a GPU and a loaded MoE model; these three properties do not, and they are
+# the ones a future edit is most likely to undo silently. --self-test poisons
+# each assertion and requires it to go red, so the gate cannot pass vacuously on
+# a tree that already carries the fix.
+if (Python3_Interpreter_FOUND)
+    add_test(NAME sycl-mmid-deferral-contract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mmid-deferral-contract.py
+            --self-test)
+    set_tests_properties(sycl-mmid-deferral-contract PROPERTIES
+        LABELS "sycl;moe;lifecycle;host-only;source-contract"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+else()
+    message(STATUS "ggml-sycl: Python3 not found; MMID deferral contract test is not registered")
+endif()
+
 # The closed production-route seam is never compiled into ordinary ggml-sycl,
 # including BUILD_TESTING=ON builds. Clone its finalized private build settings
 # onto an object-library backend, then expose that implementation and its exact

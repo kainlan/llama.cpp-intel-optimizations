@@ -10910,6 +10910,39 @@ void ggml_sycl_q1_nvfp4_test_failure_once(ggml_sycl_q1_nvfp4_test_failure failur
 }
 #endif
 
+// The MoE MMID direct route is fail-closed by owner ruling: this stays false
+// until B70 validation opens it.  Hoisted to file scope so the admission gate
+// (ggml_sycl_mul_mat_id) and the materialization gate (load_end / context bind)
+// read ONE constant and cannot drift apart -- materializing a pool for a route
+// that cannot execute reserves VRAM nothing will ever consume, and refusing to
+// materialize one the route CAN execute is a silent performance cliff.
+constexpr bool k_moe_mmid_direct_route_validated = false;
+
+// Compile-time reachability. In an ordinary build both operands are false, the
+// admission block folds away entirely, and nothing can consume a materialized
+// workspace -- so nothing is materialized either.
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+constexpr bool k_moe_mmid_route_compiled = true;
+#else
+constexpr bool k_moe_mmid_route_compiled = false;
+#endif
+constexpr bool k_moe_mmid_route_reachable_compiled =
+    k_moe_mmid_direct_route_validated || k_moe_mmid_route_compiled;
+
+// Full admission predicate, mirrored exactly -- compile-time half plus the
+// per-context runtime authorization the admission site also consults.
+static bool ggml_sycl_moe_mmid_route_reachable(const ggml_backend_sycl_context & ctx) {
+    if (k_moe_mmid_direct_route_validated) {
+        return true;
+    }
+#ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+    return ggml_sycl_q1_nvfp4_test_authorized(ctx);
+#else
+    (void) ctx;
+    return false;
+#endif
+}
+
 void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model_lifecycle_probe * out) {
     if (!out) {
         return;
@@ -12469,14 +12502,28 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end(ggml_sycl_load_txn  
             throw std::bad_alloc();
         }
         placement_inserted = true;
-        // Expert registration and owner queues are complete at load_end. Make
-        // every fixed pool available transactionally before publishing LIVE.
-        ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
-        if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
-            ggml_sycl_moe_mmid_report_refusal("load_end", mmid_reason, plan_snapshot->plan->device_id,
-                                              plan_snapshot->plan->moe_mmid_device_pool_bytes,
-                                              plan_snapshot->plan->moe_mmid_host_pool_bytes);
-            throw std::bad_alloc();
+        // Materialization binds backend-context queues, and no backend context
+        // exists during the first model load: llama_context -- and with it every
+        // ggml_backend_sycl_context -- is created only after llama_model_load
+        // returns. Deferring is correct rather than fatal, because the sole
+        // consumer (MUL_MAT_ID admission) needs a context, so nothing can
+        // consume a workspace before one exists. The context-bind hook resolves
+        // it. A later load that runs while a context IS live still materializes
+        // here, which is why the attempt is kept rather than removed.
+        //
+        // Only a reachable route is materialized at all: in an ordinary build
+        // the admission block folds away, so allocating the pools would reserve
+        // VRAM for a route that cannot execute.
+        if (k_moe_mmid_route_reachable_compiled) {
+            ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+            if (!ggml_sycl_materialize_published_mmid_workspaces(ticket.token, plan_snapshot, &mmid_reason)) {
+                // Deferred, not failed. Silent at INFO-and-below on purpose: the
+                // expected reason here is NO_BACKEND_CONTEXT on every first load,
+                // and a WARN on every load is noise. The bind hook reports if it
+                // is STILL unresolved once a context exists.
+                GGML_SYCL_DEBUG("[SYCL] MoE MMID workspaces deferred at load_end: reason=%s\n",
+                                ggml_sycl::moe_mmid_materialize_reason_name(mmid_reason));
+            }
         }
         ggml_sycl_prepared_plan_publication prepared_publication;
         {
@@ -15600,6 +15647,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         }
     } guard{ registry, std::move(ticket) };
 
+    // Retained past the locked scope below so a load_end deferral can be
+    // resolved OUTSIDE g_tensor_inventory_mutex. Copying the pointer under the
+    // lock is fine; materializing under it is not -- that allocates, and
+    // canonical §12 forbids allocation under the publication locks.
+    std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> bound_snapshot;
     try {
         std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
         const auto snapshot = ggml_sycl::lifecycle_select_placement_plan(model.model_id, model.load_txn_id, model.slot,
@@ -15607,6 +15659,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
         if (!snapshot) {
             return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
         }
+        bound_snapshot = snapshot;
         if (backend_ctx) {
             std::vector<int> aggregate_devices;
             if (snapshot->plan) {
@@ -15677,7 +15730,31 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
-    return g_runtime_update_succeeded ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_BUSY;
+    const bool inner_ok = g_runtime_update_succeeded;
+    // Resolve a load_end deferral now that a backend context exists. Idempotent:
+    // the MMID registry answers ALREADY_PUBLISHED when a pool is already live,
+    // so the registry itself is the deferred-state record and no parallel
+    // bookkeeping is kept (see the commit body).
+    //
+    // Only when the inner bind SUCCEEDED. On inner failure the deferral stays
+    // pending and stays silent: that failure has its own error surface, and a
+    // tripwire on top of it would blame the wrong mechanism.
+    if (inner_ok && bound_snapshot && backend_ctx && ggml_sycl_moe_mmid_route_reachable(*backend_ctx)) {
+        ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
+        if (!ggml_sycl_materialize_published_mmid_workspaces(token, bound_snapshot, &mmid_reason)) {
+            // TRIPWIRE. The route IS executable here and a planned pool is
+            // still unmaterialized at the point it should have resolved.
+            // Consequence is a silent performance cliff rather than wrong
+            // results -- admission simply falls through to the generic MoE
+            // dispatch -- which is exactly why it has to be loud: nothing
+            // downstream would ever report it.
+            ggml_sycl_moe_mmid_report_refusal("context-bind", mmid_reason,
+                                              bound_snapshot->plan ? bound_snapshot->plan->device_id : -1,
+                                              bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_device_pool_bytes : 0,
+                                              bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
+        }
+    }
+    return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_BUSY;
 }
 
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
@@ -65476,7 +65553,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Closed production DIRECT authority for decode Q1/NVFP4. Prompt and
     // secondary residency remain outside this route. All fall-throughs are
     // pre-submit refusals; once marked, the exact queue is drained/recovered.
-    constexpr bool q1_nvfp4_direct_b70_validated = false;
+    // One definition, shared with the materialization gate: see
+    // k_moe_mmid_direct_route_validated. Do not re-spell this as a literal --
+    // the two gates drifting is how a pool gets allocated for a route that
+    // cannot run it, or withheld from one that can.
+    constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated;
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
     const bool q1_nvfp4_private_test_authorized = ggml_sycl_q1_nvfp4_test_authorized(ctx);
 #else
