@@ -4776,10 +4776,77 @@ if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
             LABELS "sycl;host;source-contract;exports")
     endif()
 
+    # Adversarial cache-backing provenance (llama.cpp-fhqe).  CACHE_BACKING is
+    # the ownership class shutdown exempts from destructive-teardown refusal, so
+    # every route to it that is not one of the two private mints is a forgery.
+    #
+    # LABELS deliberately carry NO "cache"/"mem-handle"/"residency", same as the
+    # failpoint fixture above and for the same reason: rule 2 reserves those for
+    # the GPU-allocating OOM-hazard family, whose defining property is loading a
+    # model onto a device.  This fixture loads none -- two of its cases are pure
+    # host seams, and the device pair take 4 KiB of host-pinned USM plus one
+    # bounded pinned chunk.  Carrying "cache" would filter it out of the only
+    # sweep that would ever run it, and a permanent regression gate nothing runs
+    # is decoration.  RUN_SERIAL still holds because the last case drives
+    # shutdown_unified_cache(), which is process-global.
+    add_executable(test-sycl-cache-backing-provenance
+        tests/test-cache-backing-provenance.cpp)
+    target_link_libraries(test-sycl-cache-backing-provenance PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-cache-backing-provenance PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-cache-backing-provenance
+        COMMAND test-sycl-cache-backing-provenance)
+    set_tests_properties(sycl-cache-backing-provenance PROPERTIES
+        LABELS "sycl;provenance;owner;tdd"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        # The two host-only cases run first and unconditionally; 77 reports that
+        # the two device cases did not.  Without SKIP_RETURN_CODE ctest renders
+        # that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77)
+
+    # The token half of the same invariant is a COMPILE-TIME guarantee, and no
+    # running program can witness one -- so this arm compiles probe TUs and
+    # requires them to be rejected.  It is not redundant with the source gate in
+    # tests/test-sycl-owner-allocation-migration.py: that gate reads source text,
+    # and the aggregate-initialization escape this catches is invisible in source
+    # text (`= default` vs `{}` on a private constructor decides whether the
+    # class is an aggregate at C++17, hence whether `token{}` bypasses access
+    # control entirely).  Only the compiler can answer it.
+    #
+    # -std is derived from CMAKE_CXX_STANDARD rather than hardcoded: the escape
+    # exists at C++17 and closes at C++20, so the gate must ask the question at
+    # whatever standard the project actually builds with.
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME sycl-cache-backing-token-forgery-compile
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-cache-backing-forgery-compile.py
+                ${CMAKE_CXX_COMPILER}
+                -fsycl
+                -std=c++${CMAKE_CXX_STANDARD}
+                -DGGML_SYCL_WARP_SIZE=32
+                -DGGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+                -DGGML_SYCL_PRIVATE_TESTING=1
+                -I${CMAKE_CURRENT_SOURCE_DIR}
+                -I${CMAKE_CURRENT_SOURCE_DIR}/..
+                -I${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        set_tests_properties(sycl-cache-backing-token-forgery-compile PROPERTIES
+            LABELS "sycl;host;source-contract;provenance"
+            ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+            TIMEOUT 300
+            # 77 when the compiler cannot be run or the control probe does not
+            # compile: in both cases the rejection arms would be rejected for the
+            # wrong reason, which is a skip, never a pass.
+            SKIP_RETURN_CODE 77)
+    endif()
+
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
         test-sycl-staging-replacement-failpoints
+        test-sycl-cache-backing-provenance
         test-sycl-mem-handle-concurrent-resolve
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle
