@@ -40,6 +40,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #if !defined(_WIN32) && !defined(__SYCL_DEVICE_ONLY__)
 #    include <sys/mman.h>
@@ -2675,6 +2676,22 @@ class unified_cache {
     // LRU and this is the only reclaimer left.  Returns entries reclaimed.
     size_t release_model_slot(uint32_t slot);
 
+    // === Buffer lifetime (universal provenance) ===
+    // A SYCL backend buffer is the second minting occasion for weight
+    // provenance, and its entries are an ownership class of their own -- NOT
+    // "unattributed".  A live buffer's entries are never reclaimed; a dead
+    // buffer's are reclaimable in every mode, and one still leased after its
+    // buffer is gone is a leak and is reported as one.
+    //
+    // Buffer owners cannot be a bit in live_model_mask_ (32 slots, one buffer
+    // per test case), so liveness is a set keyed by the tagged owner id that
+    // ggml_sycl_cache_id::model_id already carries.
+    void   note_buffer_owner_live(uint64_t owner_id);
+    // Retire the owner and drop the entries it still holds. Returns the number
+    // of entries erased; leased entries are preserved, not force-reaped.
+    size_t note_buffer_owner_dead(uint64_t owner_id);
+    bool   buffer_owner_live(uint64_t owner_id) const;
+
     // Diagnostics / tests.
     uint32_t live_model_mask() const;
     size_t   owner_tagged_entry_count() const;
@@ -3297,6 +3314,11 @@ class unified_cache {
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
     // it is based on cannot disagree.
     uint32_t live_model_mask_ = 0;
+
+    // Live SYCL backend buffers, by tagged owner id. Guarded by rw_mutex_ for
+    // the same reason live_model_mask_ is: a reclaim decision and the liveness
+    // it rests on must be read under one lock.
+    std::unordered_set<uint64_t> live_buffer_owners_;
 
     // The single reclaim loop behind reset_model_weight_entries() and
     // release_model_slot().  `slot` is meaningful only for MODEL_TEARDOWN.

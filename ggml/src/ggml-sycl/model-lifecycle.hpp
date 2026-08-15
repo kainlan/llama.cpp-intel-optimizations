@@ -15,6 +15,31 @@ namespace ggml_sycl::lifecycle {
 constexpr uint32_t model_slot_count = 32;
 constexpr uint32_t no_model_slot    = UINT32_MAX;
 
+// Weight provenance has two legitimate minting occasions: a model load (this
+// Registry) and a SYCL backend buffer allocation.  Both hand out ModelTokens
+// that flow through the same canonical resolver, so the two id spaces must be
+// disjoint by construction rather than by luck -- both counters start at 1.
+// The top bit is reserved for buffer-scoped ids and Registry::begin_outer()
+// asserts that model ids keep it clear.
+constexpr uint64_t buffer_owner_id_tag = 1ull << 63;
+
+// Buffer owners deliberately do NOT consume one of the 32 model slots: a
+// buffer-per-case workload would exhaust the slot table on its first run.
+// This slot value is outside the 0..31 bitmask range and distinct from
+// no_model_slot, which the canonical resolver's partial-owner gate rejects.
+constexpr uint32_t buffer_owner_slot = UINT32_MAX - 1;
+
+inline bool is_buffer_owner_id(uint64_t id) noexcept {
+    return (id & buffer_owner_id_tag) != 0;
+}
+
+// Seeded from the allocation id the unified cache already mints for the
+// buffer, so the discriminator is an existing monotonic identity rather than a
+// new counter.  A zero or already-tagged seed cannot mint (returns 0).
+inline uint64_t buffer_owner_id_from_seed(uint64_t seed) noexcept {
+    return (seed == 0 || is_buffer_owner_id(seed)) ? 0 : (buffer_owner_id_tag | seed);
+}
+
 struct ModelId {
     uint64_t value = 0;
 };

@@ -2288,12 +2288,75 @@ static bool ggml_sycl_same_owner(const ggml_sycl::lifecycle::ModelToken & a,
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_identity_owner(
     const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot);
 
+// Buffer-scoped owner identities.
+//
+// A model load is not the only legitimate occasion on which weight provenance
+// is minted: every tensor allocated through a SYCL backend buffer has a real
+// owner too -- the buffer.  Those owners live here rather than in the
+// lifecycle Registry because the Registry hands out one of 32 model slots per
+// token, and a buffer-per-case workload (test-backend-ops allocates and frees
+// one per case) would exhaust that table immediately.  Their ids carry
+// lifecycle::buffer_owner_id_tag, so a bare model_id says which table answers
+// for it and the two id spaces cannot alias.
+static std::mutex                                                     g_sycl_buffer_owner_mutex;
+static std::unordered_map<uint64_t, ggml_sycl::lifecycle::ModelToken> g_sycl_buffer_owners;
+
+// Mint an owner for one buffer allocation.  `alloc_seed` is the allocation id
+// the unified cache already minted for the buffer's backing allocation, so the
+// discriminator is existing monotonic identity, not a second counter.  Returns
+// a zeroed token when no identity can be derived.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_mint_buffer_owner(uint64_t alloc_seed) noexcept {
+    const uint64_t id = ggml_sycl::lifecycle::buffer_owner_id_from_seed(alloc_seed);
+    if (id == 0) {
+        return {};
+    }
+    const ggml_sycl::lifecycle::ModelToken owner{
+        { id },
+        { id },
+        { ggml_sycl::lifecycle::buffer_owner_slot, alloc_seed }
+    };
+    try {
+        std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+        g_sycl_buffer_owners[id] = owner;
+    } catch (...) {
+        return {};
+    }
+    return owner;
+}
+
+// Resolve a buffer-scoped owner.  A retired buffer answers with a zeroed
+// token, so its tensors fail the canonical resolver's owner gate exactly as an
+// unowned tensor does -- the identity dies with the buffer.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_lookup_buffer_owner(uint64_t model_id) noexcept {
+    std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+    const auto                  it = g_sycl_buffer_owners.find(model_id);
+    return it == g_sycl_buffer_owners.end() ? ggml_sycl::lifecycle::ModelToken{} : it->second;
+}
+
+static void ggml_sycl_retire_buffer_owner(ggml_sycl::lifecycle::ModelToken owner) noexcept {
+    if (owner.model.value == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_sycl_buffer_owner_mutex);
+    g_sycl_buffer_owners.erase(owner.model.value);
+}
+
 // Resolve a wrapper's owner without ever substituting another model. A nonzero
-// model_id is an assertion: it must name the exact bound load candidate or an
-// exact LIVE registry token. Stale/mutated wrappers fail closed.
+// model_id is an assertion: it must name the exact bound load candidate, an
+// exact LIVE registry token, or -- for a tagged id -- a live buffer owner.
+// Stale/mutated wrappers fail closed.
 static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t model_id) noexcept {
     if (model_id == 0) {
         return ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+    }
+
+    // Buffer-scoped ids never enter the model Registry, so they are resolved
+    // here and nowhere else.  Everything downstream -- the identity row
+    // cross-check, the expert range arithmetic, every residency refusal --
+    // runs unchanged on the token this returns.  This adds a SOURCE of
+    // identity, not a bypass of any gate.
+    if (ggml_sycl::lifecycle::is_buffer_owner_id(model_id)) {
+        return ggml_sycl_lookup_buffer_owner(model_id);
     }
 
     auto &     registry = ggml_sycl::lifecycle::global_registry();
@@ -21826,6 +21889,12 @@ GGML_API void ggml_backend_sycl_get_gpu_list(int * id_list, int max_len) try {
     std::exit(1);
 }
 
+// Defined once the weight-cache drop helpers below are declared.  Teardown
+// must not dereference a single tensor (see the destructor's own comment), so
+// everything it needs is captured at registration time.
+struct ggml_backend_sycl_buffer_context;
+static void ggml_sycl_release_buffer_provenance(ggml_backend_sycl_buffer_context * ctx) noexcept;
+
 // sycl buffer
 struct ggml_backend_sycl_buffer_context {
     struct allocation_metadata {
@@ -21852,6 +21921,12 @@ struct ggml_backend_sycl_buffer_context {
     ggml_backend_sycl_context * sycl_ctx = nullptr;
     // Track both tensor and extra so we can null tensor->extra on reset
     std::vector<std::pair<ggml_tensor *, ggml_tensor_extra_gpu *>> tensor_extras;
+    // Buffer-scoped weight provenance.  The owner is minted when the buffer is
+    // published; the keys are the cache identities its tensors were registered
+    // under, captured at registration time because the destructor may not
+    // dereference a tensor to recompute them.
+    ggml_sycl::lifecycle::ModelToken                               buffer_owner{};
+    std::vector<ggml_sycl_cache_id>                                provenance_cache_keys;
     // TP compute buffer support: per-device pointers
     // For TP compute buffers, we allocate on ALL TP devices and track base pointers here
     bool                                                           is_tp_compute_buffer               = false;
@@ -21915,6 +21990,11 @@ struct ggml_backend_sycl_buffer_context {
         if (!managed_handle.valid() && !is_tp_compute_buffer && dev_ptr != nullptr && stream != nullptr) {
             GGML_ASSERT(false && "SYCL backend buffer missing mem_handle owner");
         }
+        // Drop this buffer's weight provenance before the extras go: the cache
+        // entries it admitted, the identity rows it registered, and the owner
+        // token itself.  Table erasures only -- allocation release stays with
+        // mem_handle, and nothing here touches a tensor pointer.
+        ggml_sycl_release_buffer_provenance(this);
         // Release extra allocations.  Do NOT touch tensor->extra or tensor->layout
         // here — the ggml_context that owns the tensors may already be freed by the
         // time this buffer destructor runs (destruction order: gallocr frees buffers
@@ -22384,6 +22464,141 @@ static void ggml_sycl_invalidate_backend_buffer_weights(ggml_backend_sycl_buffer
     }
 }
 
+// Retire one buffer's provenance.  Called from ~ggml_backend_sycl_buffer_context,
+// which is why this cannot be ggml_sycl_invalidate_backend_buffer_weights():
+// that walks tensor_extras and dereferences tensor->extra / tensor->ne[2], and
+// by destructor time the ggml_context owning those tensors may already be gone
+// (gallocr frees buffers first).  Every key it needs was computed while the
+// tensors were unquestionably alive, at registration.
+static void ggml_sycl_release_buffer_provenance(ggml_backend_sycl_buffer_context * ctx) noexcept {
+    if (!ctx || ctx->buffer_owner.model.value == 0) {
+        return;
+    }
+    try {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            for (const ggml_sycl_cache_id & key : ctx->provenance_cache_keys) {
+                ggml_sycl_drop_all_weight_cache_entries(cache, key);
+            }
+            // Backstop for anything the stored keys do not name -- a layout
+            // variant staged under a derived key, say.  Once the owner is gone
+            // the cache stops classifying its entries as buffer-owned, so an
+            // unleased straggler is reclaimable rather than pinned forever as
+            // "unattributed"; a still-leased one is reported as the leak it is.
+            cache->note_buffer_owner_dead(ctx->buffer_owner.model.value);
+        }
+        ggml_sycl_erase_weight_identities_for_owner(ctx->buffer_owner);
+    } catch (...) {
+        // Teardown is noexcept: a failure to erase a lookup row must not
+        // escape into buffer free.  The owner retirement below is what makes
+        // any surviving row unresolvable, so this fails safe.
+    }
+    ggml_sycl_retire_buffer_owner(ctx->buffer_owner);
+    ctx->buffer_owner = {};
+    ctx->provenance_cache_keys.clear();
+}
+
+// Give one tensor buffer-scoped provenance, and record the cache identities it
+// becomes reachable under so teardown can drop them without touching a tensor.
+//
+// The parent identity is synthetic but truthful: the file_id names this buffer
+// (never zero), the offset is the tensor's real byte offset inside it, and the
+// size is its real ggml_nbytes().  The expert range arithmetic in
+// ggml_sycl_get_moe_expert_cache_key() then works out exactly -- ne[2]*nb[2]
+// equals ggml_nbytes() for a contiguous tensor, so it fits with zero slack and
+// a non-contiguous one still fails the gate.
+static bool ggml_sycl_register_buffer_tensor_provenance(ggml_backend_sycl_buffer_context * ctx,
+                                                        ggml_tensor *                      tensor,
+                                                        ggml_tensor_extra_gpu *            extra) {
+    if (!ctx || !tensor || !extra || ctx->buffer_owner.model.value == 0) {
+        return false;
+    }
+    // Model provenance always wins.  A weight whose extra is already attributed
+    // has it; one whose identity row exists but has not yet been copied onto
+    // the extra acquires it lazily in ggml_backend_sycl_get_weight_cache_key(),
+    // so minting here would take the tensor away from its model.
+    if (extra->model_id != 0) {
+        return false;
+    }
+    const char * name = ggml_get_name(tensor);
+    if (!name || !name[0]) {
+        return false;
+    }
+    // A load transaction in flight means the loader owns whatever lands in this
+    // buffer, whether or not it has registered the row yet.
+    if (ggml_sycl_bound_load_candidate()) {
+        return false;
+    }
+    // The tensor must live inside this buffer for the offset to mean anything.
+    if (!ctx->dev_ptr || !tensor->data) {
+        return false;
+    }
+    const char * base   = static_cast<const char *>(ctx->dev_ptr);
+    const char * data   = static_cast<const char *>(tensor->data);
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (data < base || static_cast<size_t>(data - base) > ctx->size_bytes ||
+        nbytes > ctx->size_bytes - static_cast<size_t>(data - base)) {
+        return false;
+    }
+    const size_t offset = static_cast<size_t>(data - base);
+    if (nbytes == 0) {
+        return false;
+    }
+
+    const ggml_sycl::lifecycle::ModelToken owner = ctx->buffer_owner;
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
+        // A row registered under the published plan owner, or an unowned row
+        // left by the loader, is model provenance this tensor can still
+        // resolve.  Both are the model's, not ours.
+        const auto                  plan_owner = ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot());
+        if (plan_owner.model.value != 0) {
+            const auto key = ggml_sycl_owner_name_key(plan_owner, name);
+            if (!key.empty() && g_sycl_weight_identities_by_name.count(key) != 0) {
+                return false;
+            }
+        }
+        if (g_sycl_weight_identities_unowned.count(name) != 0) {
+            return false;
+        }
+        const std::string owner_key = ggml_sycl_owner_name_key(owner, name);
+        if (owner_key.empty()) {
+            return false;
+        }
+        ggml_sycl_weight_identity identity{};
+        identity.file_idx                           = 0;
+        identity.file_id                            = ggml_sycl_file_id_from_model(owner.model.value, 0);
+        identity.file_offs                          = offset;
+        identity.nbytes                             = nbytes;
+        identity.model_id                           = owner.model.value;
+        identity.load_txn_id                        = owner.load.value;
+        identity.slot                               = owner.owner.slot;
+        identity.slot_generation                    = owner.owner.generation;
+        g_sycl_weight_identities_by_name[owner_key] = identity;
+    }
+    extra->model_id = owner.model.value;
+
+    // Capture the keys now -- see ggml_sycl_release_buffer_provenance().
+    auto remember = [ctx](const ggml_sycl_cache_id & key) {
+        if (!key.valid) {
+            return;
+        }
+        for (const ggml_sycl_cache_id & existing : ctx->provenance_cache_keys) {
+            if (ggml_sycl::detail::cache_id_equal(existing, key)) {
+                return;
+            }
+        }
+        ctx->provenance_cache_keys.push_back(key);
+    };
+    remember(ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device));
+    if (ggml_sycl_get_tensor_usage(tensor) == tensor_usage::MOE_EXPERT_WEIGHT) {
+        const int64_t n_experts = tensor->ne[2] > 0 ? tensor->ne[2] : 0;
+        for (int64_t e = 0; e < n_experts; ++e) {
+            remember(ggml_sycl_get_moe_expert_cache_key(tensor, extra, static_cast<int>(e)));
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) try {
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor, "\n").c_str());
@@ -22634,6 +22849,20 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
         if (extra->data_device_ptr(ctx->device) == nullptr && !extra->data_handle[ctx->device].is_weight()) {
             extra->set_data_device(ctx->device, tensor->data);
         }
+    }
+    // Universal provenance: every tensor this buffer allocated gets an
+    // admissible owner, so the canonical resolver admits any legitimate
+    // consumer's tensors through the one uniform path instead of only a model
+    // loader's.  The gate itself is untouched -- a tensor that cannot be given
+    // truthful identity here still fails it.
+    //
+    // Views are excluded on purpose: a view's bytes are its source's bytes, and
+    // minting a second parent identity for one range would mean two owners
+    // describing the same allocation.  Every path above that handles a view has
+    // already returned by this point.
+    if (tensor->view_src == nullptr && tensor->extra != nullptr) {
+        (void) ggml_sycl_register_buffer_tensor_provenance(ctx, tensor,
+                                                           static_cast<ggml_tensor_extra_gpu *>(tensor->extra));
     }
     if (ggml_is_quantized(tensor->type)) {
         // initialize padding to 0 to avoid possible NaN values
@@ -32597,6 +32826,16 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_publish(ggml_backend_buffe
                 (reinterpret_cast<uintptr_t>(ctx->dev_ptr) % GGML_SYCL_BUFFER_BASE_ALIGNMENT));
         delete ctx;
         return nullptr;
+    }
+    // Mint the buffer's owner here, at the single point where a buffer becomes
+    // visible and owned -- after the refusal above, so a rejected allocation
+    // never leaves an owner behind.  A buffer whose backing allocation carries
+    // no id simply gets no owner and behaves exactly as it did before.
+    ctx->buffer_owner = ggml_sycl_mint_buffer_owner(ctx->managed_meta.id);
+    if (ctx->buffer_owner.model.value != 0) {
+        if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+            cache->note_buffer_owner_live(ctx->buffer_owner.model.value);
+        }
     }
     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
 }

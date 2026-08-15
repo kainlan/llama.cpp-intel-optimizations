@@ -9705,12 +9705,27 @@ static bool strict_lease_checks_enabled() {
 // the ones its own in-flight load just staged (tagging happens at load end), and
 // freeing them is the whole point of that call site.  With no other model live
 // both modes reduce exactly to the pre-0qlw behaviour.
-static bool weight_entry_reclaimable(const unified_cache_entry & entry, weight_reclaim_mode mode, uint32_t live_mask) {
+//
+// Buffer ownership is a FOURTH lifetime, and it is an explicit class rather
+// than a fall-through: a tensor allocated through a SYCL backend buffer is
+// owned by that buffer for exactly as long as the buffer exists. `buffer_owned`
+// says the entry's identity was minted by a buffer, `buffer_owner_live` says
+// that buffer is still alive. A live buffer vetoes reclaim in every mode
+// (including the replan, which is why the test sits above that early return);
+// a dead buffer's entries are ordinary reclaimable state.
+static bool weight_entry_reclaimable(const unified_cache_entry & entry,
+                                     weight_reclaim_mode         mode,
+                                     uint32_t                    live_mask,
+                                     bool                        buffer_owned,
+                                     bool                        buffer_owner_live) {
     if (entry.in_use_count.load() != 0) {
         return false;
     }
     if ((entry.owner_mask & live_mask) != 0) {
         return false;
+    }
+    if (buffer_owned) {
+        return !buffer_owner_live;
     }
     if (mode == weight_reclaim_mode::MID_LOAD_REPLAN) {
         return true;
@@ -9757,6 +9772,72 @@ void unified_cache::set_live_model_mask(uint32_t mask) {
 uint32_t unified_cache::live_model_mask() const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     return live_model_mask_;
+}
+
+// Is this cache id's owner a buffer? The tag lives in the id itself, so no
+// per-entry field is needed and an entry cannot disagree with its own key.
+static bool cache_id_is_buffer_owned(const ggml_sycl_cache_id & id) noexcept {
+    return ggml_sycl::lifecycle::is_buffer_owner_id(id.model_id);
+}
+
+void unified_cache::note_buffer_owner_live(uint64_t owner_id) {
+    if (!ggml_sycl::lifecycle::is_buffer_owner_id(owner_id)) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+    live_buffer_owners_.insert(owner_id);
+}
+
+bool unified_cache::buffer_owner_live(uint64_t owner_id) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    return live_buffer_owners_.count(owner_id) != 0;
+}
+
+size_t unified_cache::note_buffer_owner_dead(uint64_t owner_id) {
+    if (!ggml_sycl::lifecycle::is_buffer_owner_id(owner_id)) {
+        return 0;
+    }
+    std::vector<stale_weight_alloc> to_free;
+    size_t                          erased = 0;
+    size_t                          leased = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+        live_buffer_owners_.erase(owner_id);
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->first.id.model_id != owner_id) {
+                ++it;
+                continue;
+            }
+            // A live lease outlives its buffer only through a missing release.
+            // Preserve the entry -- reclaiming memory somebody still holds a
+            // handle to is exactly what the ownership contract forbids -- and
+            // let the next reclaim scan report it as the leak it is.
+            if (it->second.in_use_count.load() != 0) {
+                leased++;
+                ++it;
+                continue;
+            }
+            if (it->second.device_ptr && !it->second.storage_owner && !it->second.non_owning_external_host &&
+                !it->second.allocation_released_via_owner) {
+                to_free.push_back({ it->second.device_ptr, it->second.size, it->second.location,
+                                    it->second.host_resident, it->second.pool_allocated });
+            }
+            remap_or_erase_id_mapping_locked(it->first.id, it->first);
+            it = erase_entry_locked(it);
+            erased++;
+        }
+    }
+    free_stale_weight_allocs(to_free);
+    if (leased > 0) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] buffer owner 0x%llx freed with %zu weight entr%s still leased -- the buffer is gone, so "
+            "this is a leaked mem_handle rather than concurrent use\n",
+            (unsigned long long) owner_id, leased, leased == 1 ? "y" : "ies");
+    }
+    if (erased > 0) {
+        cache_generation_bump();
+    }
+    return erased;
 }
 
 size_t unified_cache::owner_tagged_entry_count() const {
@@ -9951,6 +10032,7 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
     size_t                          entries_erased        = 0;
     size_t                          entries_preserved     = 0;
     size_t                          entries_owned         = 0;
+    size_t                          entries_buffer_owned  = 0;
     size_t                          entries_untagged      = 0;
     size_t                          entries_leaked        = 0;
     size_t                          entries_unpinned      = 0;
@@ -10080,7 +10162,9 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
             if (bit != 0) {
                 pair.second.owner_mask &= ~bit;
             }
-            if (!weight_entry_reclaimable(pair.second, mode, live_mask)) {
+            const bool buffer_owned = cache_id_is_buffer_owned(pair.first.id);
+            if (!weight_entry_reclaimable(pair.second, mode, live_mask, buffer_owned,
+                                          buffer_owned && live_buffer_owners_.count(pair.first.id.model_id) != 0)) {
                 any_preserved = true;
             }
             if ((pair.second.owner_mask & live_mask) != 0) {
@@ -10102,8 +10186,15 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
         for (auto it = entries_.begin(); it != entries_.end();) {
             unified_cache_entry & entry         = it->second;
             const uint32_t        live          = entry.in_use_count.load();
-            const bool            owned_by_live = (entry.owner_mask & live_mask) != 0;
-            const bool            unattributed  = !entry.owner_tagged;
+            // A buffer-owned entry is attributed -- to a buffer -- so it must
+            // not fall through to the unattributed class, and while its buffer
+            // lives it is owned just as a live model's weight is.  Once the
+            // buffer is gone it is neither: no live owner, still attributed,
+            // which is precisely the state the leak detector below exists for.
+            const bool            buffer_owned  = cache_id_is_buffer_owned(it->first.id);
+            const bool            buffer_live   = buffer_owned && live_buffer_owners_.count(it->first.id.model_id) != 0;
+            const bool            owned_by_live = (entry.owner_mask & live_mask) != 0 || buffer_live;
+            const bool            unattributed  = !entry.owner_tagged && !buffer_owned;
             entries_seen++;
 
             // Teardown unpins everything the dying model owned but nobody else
@@ -10118,7 +10209,7 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                 entries_unpinned++;
             }
 
-            if (!weight_entry_reclaimable(entry, mode, live_mask)) {
+            if (!weight_entry_reclaimable(entry, mode, live_mask, buffer_owned, buffer_live)) {
                 entries_preserved++;
                 if (audit.active()) {
                     // Cohort splits the four reasons an entry survives, because
@@ -10129,6 +10220,7 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                     // the inventory and the summary line cannot disagree.
                     const char * why = (live != 0 && !owned_by_live && !unattributed) ? "weight:leaked_lease" :
                                        (live != 0)                                    ? "weight:leased" :
+                                       buffer_live                                    ? "weight:owned_by_live_buffer" :
                                        owned_by_live                                  ? "weight:owned_by_live_model" :
                                                                                         "weight:unattributed";
                     // ⚠ COLUMN SUBSTITUTION -- this site alone reuses three
@@ -10199,6 +10291,8 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
                                             (unsigned long long) it->first.id.name_hash, ring.c_str());
                         }
                     }
+                } else if (buffer_live) {
+                    entries_buffer_owned++;
                 } else if (owned_by_live) {
                     entries_owned++;
                 } else {
@@ -10244,11 +10338,11 @@ size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t 
         if (entries_preserved > 0) {
             GGML_LOG_WARN(
                 "[UNIFIED-CACHE] reclaim_weight_entries(%s) preserved %zu of %zu weight entries "
-                "(leased=%zu owned-by-live-model=%zu unattributed=%zu leaked=%zu erased=%zu unpinned=%zu "
-                "live_mask=0x%08x)\n",
+                "(leased=%zu owned-by-live-model=%zu owned-by-live-buffer=%zu unattributed=%zu leaked=%zu erased=%zu "
+                "unpinned=%zu live_mask=0x%08x)\n",
                 weight_reclaim_mode_name(mode), entries_preserved, entries_seen,
-                entries_preserved - entries_owned - entries_untagged, entries_owned, entries_untagged, entries_leaked,
-                entries_erased, entries_unpinned, live_mask);
+                entries_preserved - entries_owned - entries_buffer_owned - entries_untagged, entries_owned,
+                entries_buffer_owned, entries_untagged, entries_leaked, entries_erased, entries_unpinned, live_mask);
         }
         if (keep_direct_tables) {
             surviving_ids.reserve(id_to_key_.size());
