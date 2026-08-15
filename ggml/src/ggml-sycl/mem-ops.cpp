@@ -265,21 +265,54 @@ static std::atomic<size_t>   g_stage_zone_peak{ 0 };
 // when tracing is off -- the abort that follows is the one event where the
 // occupancy at the moment of failure is the whole story, and losing it costs a
 // GPU run to recover.
-static void stage_trace_sample(const char * where, const char * cohort, size_t bytes, bool ok) {
-    const size_t zone_used = unified_cache_host_zone_used(host_zone_id::STAGING);
-    size_t       peak      = g_stage_zone_peak.load(std::memory_order_relaxed);
-    while (zone_used > peak && !g_stage_zone_peak.compare_exchange_weak(peak, zone_used, std::memory_order_relaxed)) {
+// RE-AIMED (llama.cpp-480a, round 2).  Round 1 read
+// unified_cache_host_zone_used(STAGING) and printed 0 on all 76,441 lines while
+// 65,635 staging allocations SUCCEEDED -- the empty-probe trap in pure form.
+//
+// The fault is in the accessor, not the pool: unified_cache::host_zone_used()
+// returns 0 outright when `!host_arena_ || !host_arena_->zones_configured()`
+// (unified-cache.cpp:16702-16706).  Host zones are configured during model load,
+// and test-backend-ops never loads a model -- so under the census that number is
+// STRUCTURALLY zero and could never have moved, whatever the pool did.
+//
+// pinned_pool_committed() (= host_arena_->allocated()) carries no such
+// precondition: it reports bytes committed in chunks whenever the arena exists.
+// That is the reservoir a staging allocation actually draws from when zones are
+// absent, so it is what the trace now reads, and what `peak` now tracks.
+//
+// zone_cap is printed beside zone_used so a zero is SELF-DIAGNOSING: zone_cap=0
+// means the zone does not exist and zone_used=0 says nothing, rather than being
+// misreadable as "the pool is empty".  And `committed == 0` while alloc_ok
+// climbs is flagged inline as RESERVOIR-UNMAPPED -- the in-band positive
+// control, printed on every line so the next reader cannot repeat round 1's
+// mistake silently.
+static void stage_trace_sample(const char * where, const char * cohort, size_t bytes, bool ok, int device) {
+    unified_cache * cache = device >= 0 ? get_unified_cache_for_device(device) : nullptr;
+    if (!cache) {
+        cache = get_unified_cache_for_device(0);
     }
+    const size_t committed = cache ? cache->pinned_pool_committed() : 0;
+    const size_t budget    = cache ? cache->pinned_pool_budget() : 0;
+    const size_t chunks    = cache ? cache->pinned_pool_chunk_count() : 0;
+    const size_t zone_used = cache ? cache->host_zone_used(host_zone_id::STAGING) : 0;
+    const size_t zone_cap  = cache ? cache->host_zone_capacity(host_zone_id::STAGING) : 0;
+
+    size_t peak = g_stage_zone_peak.load(std::memory_order_relaxed);
+    while (committed > peak && !g_stage_zone_peak.compare_exchange_weak(peak, committed, std::memory_order_relaxed)) {
+    }
+
     if (!ok || stage_trace_enabled()) {
+        const unsigned long long allocs = g_stage_alloc_ok.load(std::memory_order_relaxed);
         fprintf(stderr,
-                "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d alloc_ok=%llu alloc_fail=%llu "
-                "retained=%llu waited=%llu zone_used=%zu zone_peak=%zu\n",
-                where, cohort ? cohort : "?", bytes, ok ? 1 : 0,
-                (unsigned long long) g_stage_alloc_ok.load(std::memory_order_relaxed),
+                "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
+                "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
+                "zone_cap=%zu%s\n",
+                where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
                 (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
                 (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
-                (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), zone_used,
-                g_stage_zone_peak.load(std::memory_order_relaxed));
+                (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
+                g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap,
+                (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "");
     }
 }
 
@@ -287,7 +320,7 @@ void stage_trace_mark(const char * tag) {
     if (!stage_trace_enabled()) {
         return;
     }
-    stage_trace_sample("mark", tag, 0, true);
+    stage_trace_sample("mark", tag, 0, true, /*device=*/-1);
 }
 
 static bool alloc_pinned_stage_handle(size_t           size,
@@ -317,11 +350,11 @@ static bool alloc_pinned_stage_handle(size_t           size,
     *out = unified_allocate(req);
     if (!out->valid()) {
         g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
-        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false);
+        stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device);
         return false;
     }
     g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
-    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true);
+    stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device);
     return true;
 }
 
