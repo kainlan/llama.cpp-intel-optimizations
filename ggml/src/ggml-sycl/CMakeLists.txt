@@ -4726,9 +4726,60 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;allocator;owner;host;tsan-capable"
         TIMEOUT 30)
 
+    # Forced-failure coverage for the transactional staging-replacement region
+    # (4f01993c9).  Most scenarios need no device; the last two repeat the
+    # rollback against a live queue, so the binary returns 77 when there is none.
+    #
+    # LABELS deliberately carry none of "residency"/"mem-handle"/"cache": rule 2
+    # above reserves those for the GPU-allocating OOM-hazard family, and this
+    # fixture allocates nothing on device -- its escrow owners are synthetic
+    # controls with an injected release backend.  Carrying "cache" here would
+    # filter it out of the only sweep that would run it.
+    add_executable(test-sycl-staging-replacement-failpoints
+        tests/test-staging-replacement-failpoints.cpp)
+    target_link_libraries(test-sycl-staging-replacement-failpoints PRIVATE
+        ggml-sycl-private-fixtures)
+    set_target_properties(test-sycl-staging-replacement-failpoints PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-staging-replacement-failpoints
+        COMMAND test-sycl-staging-replacement-failpoints)
+    set_tests_properties(sycl-staging-replacement-failpoints PROPERTIES
+        LABELS "sycl;staging;failpoint;owner;tdd"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        TIMEOUT 120
+        # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
+        # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+        SKIP_RETURN_CODE 77)
+
+    # BUILD_TESTING must not alter the ordinary backend DSO.  Both directions are
+    # checked in one place on purpose: the negative alone would pass forever if
+    # the seams were renamed away from "failpoint", so the same pattern must also
+    # be shown to match in the fixture that does compile them.
+    if (CMAKE_NM AND Python3_Interpreter_FOUND)
+        add_test(NAME sycl-staging-failpoint-no-export
+            COMMAND ${Python3_EXECUTABLE} -c [=[
+import subprocess
+import sys
+nm, dso, fixture = sys.argv[1], sys.argv[2], sys.argv[3]
+exported = subprocess.check_output([nm, "-D", "--defined-only", dso], text=True)
+leaked = [l for l in exported.splitlines() if "failpoint" in l.lower()]
+if leaked:
+    raise SystemExit("staging failpoint seams escaped into the ordinary ggml-sycl DSO:\n" + "\n".join(leaked))
+# Positive control: the pattern must be capable of matching something, or the
+# check above is a probe that can only ever return clean.
+compiled = subprocess.check_output([nm, "--defined-only", fixture], text=True)
+if not [l for l in compiled.splitlines() if "failpoint" in l.lower()]:
+    raise SystemExit("no failpoint symbol found in the private fixture: the export probe is vacuous")
+]=] ${CMAKE_NM} $<TARGET_FILE:ggml-sycl> $<TARGET_FILE:test-sycl-staging-replacement-failpoints>)
+        set_tests_properties(sycl-staging-failpoint-no-export PROPERTIES
+            LABELS "sycl;host;source-contract;exports")
+    endif()
+
     set(_ggml_sycl_private_fixture_consumers
         test-mem-handle-eviction
         test-sycl-intrusive-allocation-owner
+        test-sycl-staging-replacement-failpoints
         test-sycl-mem-handle-concurrent-resolve
         test-sycl-lifecycle-runtime-wrapper
         test-fattn-packed-k-lifecycle

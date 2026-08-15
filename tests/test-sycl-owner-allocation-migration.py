@@ -191,11 +191,17 @@ print("PASS staging-resize-capacity-qualified-source-gate")
 # transaction behind the exact queue terminal. The retirement ticket predates
 # owner-vector growth and failed barrier/publication paths drain before unwind.
 retirement = region(RUNTIME, "class ggml_sycl_old_owner_retirement", "// Construct this before direct_stage_expert")
-assert retirement.index("retained_handle_publish_ticket publish_ticket_") < retirement.index("std::vector<ggml_sycl::mem_handle>         old_owners_")
+# Field order (ticket before the owner vector) is the property; match on the
+# declarations rather than on their column alignment, which clang-format moves
+# whenever a neighbouring member name changes length.
+assert retirement.index("publish_ticket_ =") < retirement.index("old_owners_;")
 assert "old_owners_.reserve(owner_capacity)" in retirement
-assert "queue_.ext_oneapi_submit_barrier()" in retirement
+# The queue is held by pointer so the private host fixture can drive this
+# transaction with no device; null means there is no submission to fence or
+# drain, and every production caller passes a live queue.
+assert "queue_->ext_oneapi_submit_barrier()" in retirement
 assert "retain_handles_until_event_transactional(old_owners_, prior_queue_terminal, publish_ticket_)" in retirement
-assert "ggml_sycl_drain_direct_stage_queue(queue_)" in retirement
+assert "ggml_sycl_drain_direct_stage_queue(*queue_)" in retirement
 for owner in ("g_split_secondary_gpu.q8_handle", "g_split_secondary_gpu.f32_handle", "output_handle"):
     assert f"retirement.hold({owner})" in secondary
 assert secondary.count("retirement.secure()") == 1
@@ -211,8 +217,16 @@ assert "xmx_mxfp4_tiled_aos_staging_handle[device_id] = {}" not in xmx_stage
 assert xmx_stage.index("staging_resolved && staging_resolved.on_device") < xmx_stage.index("std::move(staging_handle)")
 moe_table = region(RUNTIME, "static bool ggml_sycl_ensure_moe_ptr_table", "static void ggml_sycl_update_moe_hotset")
 assert "moe_expert_ptrs_handle[device]        = {};" not in moe_table
-assert moe_table.count("std::vector<ggml_sycl::mem_handle> new_handles(count)") == 3
-assert moe_table.count("std::vector<void *>                new_payload(count, nullptr)") == 3
+# The three publication sites share one constructor helper, so the
+# same-allocation host-vector failure has a single seam. The "built off to the
+# side, published only once complete" property moves with it: assert the call
+# count here and the ordering inside the helper itself.
+assert moe_table.count("ggml_sycl_build_moe_table_views(count,") == 3
+table_views = region(RUNTIME, "static void ggml_sycl_build_moe_table_views", "#if defined(GGML_SYCL_PRIVATE_TESTING)")
+assert "std::vector<ggml_sycl::mem_handle> new_handles(count)" in table_views
+assert "std::vector<void *>                new_payload(count, nullptr)" in table_views
+assert table_views.index("new_payload(count, nullptr)") < table_views.index("handles.swap(new_handles)")
+assert table_views.index("handles.swap(new_handles)") < table_views.index("payload.swap(new_payload)")
 assert moe_table.count("catch (const std::bad_alloc &)") >= 3
 assert "ggml_sycl_checked_mul_size(count, sizeof(void *), &bytes)" in moe_table
 assert "return true;" in moe_table and "return false;" in moe_table
@@ -249,3 +263,34 @@ assert "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" i
 assert metadata.index("catch (const std::bad_alloc &)") < metadata.index("g_moe_expert_meta.swap")
 assert "g_expert_groups.swap(new_expert_groups)" in metadata
 print("PASS moe-metadata-atomic-publication-source-gate")
+
+# Reader side of the same contract. The writer publishing both registries under
+# one scoped_lock buys nothing if readers acquire them separately: a reader that
+# consults BOTH within one logical operation can otherwise pair one model's
+# metadata with the next model's groups, and expert_group_key carries no model
+# identity to catch it. Every such reader must go through one paired snapshot.
+snapshot = region(RUNTIME, "static moe_registry_snapshot moe_snapshot_registries", "// Residency against a caller-held")
+assert "std::scoped_lock      lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
+assert snapshot.index("scoped_lock") < snapshot.index("snapshot.meta   = g_moe_expert_meta")
+assert snapshot.index("snapshot.meta   = g_moe_expert_meta") < snapshot.index("snapshot.groups = g_expert_groups")
+
+# is_expert_resident must keep a lock-free overload, or a dual reader holding a
+# paired snapshot would have to re-enter the group lock to ask about residency --
+# reading a newer epoch than the metadata it holds, and deadlocking outright if
+# the snapshot lock were still held (shared_mutex is not recursive).
+assert "static bool is_expert_resident_in(const std::unordered_map<int64_t, expert_tensor_group> & groups" in RUNTIME
+resident = region(RUNTIME, "static bool is_expert_resident(int block_id", "// Forward declarations needed by moe_prestage")
+assert "return is_expert_resident_in(g_expert_groups, block_id, expert_id, device_id)" in resident
+
+# The two dual-consumer readers take the paired snapshot and never re-acquire
+# either mutex for the rest of the operation.
+for start, end, name in (
+    ("static void moe_prestage_popular_experts", "// SOA-correct expert caching: single-expert wrapper", "prestage"),
+    ("        // We need block_num for the residency checks", "    void worker_loop()", "rebalance"),
+):
+    block = region(RUNTIME, start, end)
+    assert "moe_snapshot_registries()" in block, name
+    assert "g_expert_groups_mutex" not in block, name
+    assert "g_moe_expert_meta_mutex" not in block, name
+    assert "is_expert_resident(" not in block, name
+print("PASS moe-registry-paired-snapshot-reader-source-gate")
