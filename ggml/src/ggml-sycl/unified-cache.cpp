@@ -9840,9 +9840,8 @@ size_t unified_cache::note_buffer_owner_dead(uint64_t owner_id) {
     if (!ggml_sycl::lifecycle::is_buffer_owner_id(owner_id)) {
         return 0;
     }
-    std::vector<stale_weight_alloc> to_free;
-    size_t                          erased = 0;
-    size_t                          leased = 0;
+    size_t erased = 0;
+    size_t leased = 0;
     {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
         live_buffer_owners_.erase(owner_id);
@@ -9860,17 +9859,27 @@ size_t unified_cache::note_buffer_owner_dead(uint64_t owner_id) {
                 ++it;
                 continue;
             }
-            if (it->second.device_ptr && !it->second.storage_owner && !it->second.non_owning_external_host &&
-                !it->second.allocation_released_via_owner) {
-                to_free.push_back({ it->second.device_ptr, it->second.size, it->second.location,
-                                    it->second.host_resident, it->second.pool_allocated });
-            }
+            // Release through the entry's own owner, never a hand-rolled
+            // predicate.  An entry can be owned FOUR ways -- storage_owner, a
+            // valid direct_alloc_owner, allocation_released_via_owner, and
+            // non_owning_external_host -- and release_entry_allocation_locked()
+            // is the single place that knows all four.
+            //
+            // Copying reclaim_weight_entries()' three-field test here omitted
+            // direct_alloc_owner, which is exactly what direct_stage_weight()
+            // sets.  Such an entry was pushed to the stale list, reached
+            // enqueue_deferred_free(ptr, size) -- the overload that builds a
+            // managed_alloc_ref with NO owner -- while erasing the entry
+            // simultaneously destroyed direct_alloc_owner and released the
+            // allocation for real.  The drain then found a managed record whose
+            // owner was invalid and whose pointer was already gone, and aborted
+            // on "deferred managed release failed" (:9457).
+            release_entry_allocation_locked(it->second);
             remap_or_erase_id_mapping_locked(it->first.id, it->first);
             it = erase_entry_locked(it);
             erased++;
         }
     }
-    free_stale_weight_allocs(to_free);
     if (leased > 0) {
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] buffer owner 0x%llx freed with %zu weight entr%s still leased -- the buffer is gone, so "
