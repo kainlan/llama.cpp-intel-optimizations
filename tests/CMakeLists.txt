@@ -388,6 +388,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
     set_tests_properties(test-backend-count-get-null-census PROPERTIES
         LABELS "backend;lifecycle;source;host" TIMEOUT 30)
+    # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
+    # gate checks capability against the launchers that EXIST; this checks it
+    # against what each consumer's own switch ENUMERATES. Census 9b died in the
+    # gap between those two readings.
+    add_test(NAME test-sycl-moe-mmvq-consumer-coverage
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-consumer-coverage.py)
+    set_tests_properties(test-sycl-moe-mmvq-consumer-coverage PROPERTIES
+        LABELS "sycl;moe;source;hostonly" TIMEOUT 30)
     add_test(NAME test-sycl-lifecycle-g1-harness
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-lifecycle-g1-harness.py)
     set_tests_properties(test-sycl-lifecycle-g1-harness PROPERTIES

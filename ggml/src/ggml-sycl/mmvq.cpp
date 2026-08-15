@@ -21023,6 +21023,46 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 }
             }
             break;
+        // Second MMID consumer for the types llama.cpp-gx30 admitted. This switch is
+        // narrower than the set of _id launchers that exist, which is the gap the
+        // census hit at the sibling switch in ggml_sycl_mmvq_dispatch: a type the
+        // capability query admits can reach a consumer whose own switch never
+        // enumerated it. All of these are AoS-only per moe_mmvq_capability_supports_layout;
+        // the submit helpers re-check that and refuse rather than assume it.
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_NVFP4:
+            if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
+                ne00 > INT_MAX || ne01 > INT_MAX ||
+                !mmvq_submit_q1_nvfp4_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids,
+                                             dst_d, static_cast<int>(ne00), static_cast<int>(ne01),
+                                             static_cast<int>(total_batches), static_cast<int>(n_ids),
+                                             static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
+                                             q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
+                GGML_ABORT("MoE GPU dispatch: Q1_0/NVFP4 AoS-id submit refused layout=%d ne00=%lld ne01=%lld",
+                           (int) layout, (long long) ne00, (long long) ne01);
+            }
+            have_kernel_event = true;
+            break;
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+            if (total_batches > INT_MAX || n_ids > INT_MAX || num_tokens > INT_MAX || ne11 > INT_MAX ||
+                ne00 > INT_MAX || ne01 > INT_MAX ||
+                !mmvq_submit_quant_aos_id(*stream, src0->type, layout, dispatch_ptrs, q8_1_buffer, dispatch_ids, dst_d,
+                                          static_cast<int>(ne00), static_cast<int>(ne01),
+                                          static_cast<int>(total_batches), static_cast<int>(n_ids),
+                                          static_cast<int>(num_tokens), static_cast<int>(ne11), ids_nb0, ids_nb1,
+                                          q8_nb11, q8_nb12, nb1, nb2, &kernel_deps, &kernel_event)) {
+                GGML_ABORT("MoE GPU dispatch: quant AoS-id submit refused type=%d layout=%d ne00=%lld ne01=%lld",
+                           (int) src0->type, (int) layout, (long long) ne00, (long long) ne01);
+            }
+            have_kernel_event = true;
+            break;
         default:
             GGML_ABORT("Unsupported type for MoE GPU dispatch");
     }
@@ -21756,6 +21796,32 @@ static void ggml_sycl_mmvq_dispatch(const ggml_tensor *     src0,
             case GGML_TYPE_IQ4_XS:
                 GGML_SYCL_KTRACE("mmvq_iq4_xs", " ne00=%lld row_diff=%lld", (long long) ne00, (long long) row_diff);
                 mul_mat_vec_iq4_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                break;
+            case GGML_TYPE_Q1_0:
+            case GGML_TYPE_NVFP4:
+                // These reach this switch only since llama.cpp-gx30 let a
+                // non-authoritative Q1_0/NVFP4 candidate fall through to the generic
+                // MMVQ admission; before that the capability query refused them, which
+                // is why this switch had no case and they landed in the default abort.
+                //
+                // AoS is the only layout capability admits for them
+                // (moe_mmvq_capability_supports_layout), so the reorder modes the other
+                // cases branch on cannot apply here.
+                if (fused_add) {
+                    // The AoS submit has no fused-add form. Dropping the add would be a
+                    // silently wrong result, which is worse than stopping.
+                    GGML_ABORT("mmvq Q1_0/NVFP4: fused add is not implemented for this type");
+                }
+                GGML_SYCL_KTRACE("mmvq_q1_nvfp4_aos", " ne00=%lld row_diff=%lld ne01=%lld row_low=%lld",
+                                 (long long) ne00, (long long) row_diff, (long long) ne01, (long long) row_low);
+                if (!mmvq_submit_q1_nvfp4_aos(*stream, src0->type, GGML_LAYOUT_AOS, src0_dd_i, src1_ddq_i_bs,
+                                              dst_dd_i_bs, static_cast<int>(ne00), static_cast<int>(row_diff),
+                                              static_cast<int>(ne01), static_cast<int>(row_low))) {
+                    GGML_ABORT(
+                        "mmvq Q1_0/NVFP4: AoS submit refused shape ne00=%lld row_diff=%lld ne01=%lld "
+                        "row_low=%lld",
+                        (long long) ne00, (long long) row_diff, (long long) ne01, (long long) row_low);
+                }
                 break;
             default:
                 GGML_ABORT("fatal error");
