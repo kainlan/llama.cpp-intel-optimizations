@@ -9099,12 +9099,31 @@ bool test_moe_storage_handle_first_route_and_negatives() {
         return false;
     }
 
-    // Unstable DIRECT pointers are ABI values, not ownership authority.
+    // Unstable DIRECT pointers are ABI values, not ownership authority. The
+    // handle carries the full expert extent so publication clears the geometry
+    // check; the refusal below is therefore attributable to missing owner
+    // identity, not to a short allocation view.
     clear_records();
-    if (!extra.remember_moe_storage_handle(
-            expert_id, GGML_LAYOUT_AOS,
-            mem_handle::from_direct(resolved.ptr, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0), nullptr,
-            /*logical_offset=*/0, expert_size)) {
+    mem_handle direct = mem_handle::from_direct(resolved.ptr, GGML_LAYOUT_AOS, /*on_device=*/true, /*device=*/0,
+                                                /*extent=*/expert_size);
+    if (direct.size() != expert_size || direct.has_stable_owner_identity()) {
+        return false;
+    }
+    if (!extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_AOS, direct, nullptr,
+                                           /*logical_offset=*/0, expert_size)) {
+        return false;
+    }
+    const ggml_tensor_extra_gpu::moe_expert_storage_record * direct_record =
+        extra.find_moe_storage_handle_on_device(expert_id, GGML_LAYOUT_AOS, /*owner_device=*/0);
+    if (!direct_record || direct_record->logical_bytes != expert_size || direct_record->logical_offset != 0 ||
+        direct_record->logical_offset + direct_record->logical_bytes > direct_record->handle.size() ||
+        direct_record->handle.has_stable_owner_identity()) {
+        return false;
+    }
+    ggml_tensor_extra_gpu::resolved_moe_expert_storage_record direct_logical{};
+    if (extra.resolve_moe_storage_record(expert_id, GGML_LAYOUT_AOS, /*owner_device=*/0, expert_size,
+                                         &direct_logical) ||
+        direct_logical.ptr) {
         return false;
     }
     if (!route_closed()) {
