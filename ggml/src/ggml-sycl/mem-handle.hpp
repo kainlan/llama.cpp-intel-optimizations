@@ -351,7 +351,11 @@ class mem_handle {
     // Create an arena zone handle.
     // zone_id maps to vram_zone_id (KV=0, WEIGHT=1, ONEDNN=2, RUNTIME=3, SCRATCH=4).
     // The handle kind is derived from zone_id:
-    //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN.
+    //   RUNTIME -> ARENA_RUNTIME, SCRATCH -> ARENA_SCRATCH, ONEDNN -> ARENA_ONEDNN,
+    //   KV and WEIGHT -> ARENA_RUNTIME (no dedicated kind; the real zone stays in
+    //   zone_id_, which is what resolution keys off, so the generic arena kind is
+    //   correct for them). Any other value also falls back to ARENA_RUNTIME, with a
+    //   warning.
     static mem_handle from_arena_zone(int zone_id,
                                       size_t offset,
                                       size_t size,

@@ -295,11 +295,15 @@ static int test_arena_debug_identity_includes_generation() {
     // refuses a mint whose allocation_id or allocation_extent is zero, so the
     // defaulted five-argument form these calls used returned an empty handle
     // and every assertion below read zeros.
-    const int             arena_zone = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
-    ggml_sycl::mem_handle a          = ggml_sycl::mem_handle::from_arena_zone(arena_zone, 4096, 1024,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE, 7, 501, 1024);
-    ggml_sycl::mem_handle b          = ggml_sycl::mem_handle::from_arena_zone(arena_zone, 4096, 1024,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE, 8, 501, 1024);
+    // Both mints deliberately reuse one allocation id so that generation is the
+    // only axis that differs, which is what the stable-identity assertion below
+    // isolates.
+    constexpr uint64_t    shared_allocation_id = 501;
+    const int             arena_zone           = static_cast<int>(ggml_sycl::vram_zone_id::RUNTIME);
+    ggml_sycl::mem_handle a                    = ggml_sycl::mem_handle::from_arena_zone(
+        arena_zone, 4096, 1024, ggml_sycl::mem_handle::HOST_DEVICE, 7, shared_allocation_id, 1024);
+    ggml_sycl::mem_handle b = ggml_sycl::mem_handle::from_arena_zone(
+        arena_zone, 4096, 1024, ggml_sycl::mem_handle::HOST_DEVICE, 8, shared_allocation_id, 1024);
     a.set_debug_owner("arena-a");
     CHECK(a.debug_info().generation == 7, "generation 7 must be visible");
     CHECK(b.debug_info().generation == 8, "generation 8 must be visible");

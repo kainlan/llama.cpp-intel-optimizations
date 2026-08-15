@@ -33769,11 +33769,12 @@ static void tiered_kv_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) 
             GGML_ASSERT(la.zone_handle.valid() && "arena KV layer missing owning mem_handle for clear");
             fill_events.push_back(ggml_sycl::mem_fill_async(la.zone_handle, value, la.size, *ctx->stream));
         }
-        // Every fill is already enqueued, so these waits never interleave a
-        // submit between two waits — the pattern that wedges libze.
-        for (auto & fill_event : fill_events) {
-            fill_event.wait_and_throw();
-        }
+        // Every fill is already enqueued, so this wait never interleaves a
+        // submit between two waits — the pattern that wedges libze.  Note this
+        // is wait_and_throw, not the sycl::event::wait(...) used elsewhere in
+        // this file: a KV clear that failed asynchronously must surface, not be
+        // swallowed.
+        sycl::event::wait_and_throw(fill_events);
         return;
     }
 
