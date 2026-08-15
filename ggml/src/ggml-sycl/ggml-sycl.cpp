@@ -24125,6 +24125,12 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
         // that is not block-aligned would be refused at submit, which is worse
         // than refusing here. Secondary residency keeps the old refusal -- the
         // fall-through is validated for the local executor only.
+        //
+        // Admitting here does NOT mean Q1_0/NVFP4 execute. choose_moe_batch_executor()
+        // in moe-resolved-batch.hpp rejects them unconditionally while the B70 oracle
+        // gate is closed, so they still refuse one layer down (census 10: 85 such
+        // refusals, reason=capability_unsupported, carrying capability=local-mmvq from
+        // right here). That is deliberate, not a bug in either layer.
         const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
                                              K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
         if (!local_executor_shape_ok) {

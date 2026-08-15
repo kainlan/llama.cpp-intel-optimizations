@@ -639,6 +639,12 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     if (direct_q1_nvfp4) {
         // Production capability remains closed until all four B70 oracle cases
         // pass. A matching bundle is necessary but not sufficient to advertise.
+        //
+        // This gate, not the capability query, is why Q1_0/NVFP4 do not execute.
+        // ggml_sycl_moe_query_route_capability() (ggml-sycl.cpp, the Q1_0/NVFP4
+        // fall-through) deliberately ADMITS them as MMVQ_COMPAT, so a reader
+        // tracing "capability says local-mmvq but nothing runs" lands here. The
+        // two layers disagree on purpose; do not "fix" the admission to match.
         (void) workspace_bundle;
         out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
         return out;
