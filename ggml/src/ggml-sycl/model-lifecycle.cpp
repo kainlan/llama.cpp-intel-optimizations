@@ -1,6 +1,6 @@
 #include "model-lifecycle.hpp"
 
-#include "ggml-impl.h"
+#include "ggml.h"
 
 #include <iterator>
 #include <new>
