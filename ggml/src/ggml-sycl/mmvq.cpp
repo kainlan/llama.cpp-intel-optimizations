@@ -9,6 +9,7 @@
 #include "mem-ops.hpp"
 #include "mmvq-launch-geometry.hpp"  // Row padding for the sub-group-per-row launches
 #include "moe-layer-plan.hpp"
+#include "moe-mmvq-tables.hpp"
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
@@ -16153,27 +16154,15 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
         return false;
     }
 
-    // Only handle quantized types with _id kernels
-    switch (src0->type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
-            if (layout != GGML_LAYOUT_AOS) {
-                log_dispatch_reject("layout-unsupported-q");
-                return false;
-            }
-            break;
-        case GGML_TYPE_MXFP4:
-            if (layout != GGML_LAYOUT_AOS && layout != GGML_LAYOUT_SOA && layout != GGML_LAYOUT_COALESCED &&
-                layout != GGML_LAYOUT_MXFP4_I8 && layout != GGML_LAYOUT_MXFP4_DPAS && layout != GGML_LAYOUT_XMX_TILED) {
-                log_dispatch_reject("layout-unsupported-mxfp4");
-                return false;
-            }
-            break;
-        default:
-            log_dispatch_reject("type-unsupported");
-            return false;
+    // Only handle quantized types with _id kernels. The admitted set is shared
+    // with the capability query through moe-mmvq-tables.hpp so the two cannot
+    // drift; see that header for why an over-advertised pair is worse than a
+    // refusal here.
+    if (!moe_mmvq_batched_dispatch_supports_layout(src0->type, layout)) {
+        const char * reject_reason =
+            moe_mmvq_batched_dispatch_supports_type(src0->type) ? "layout-unsupported" : "type-unsupported";
+        log_dispatch_reject(reject_reason);
+        return false;
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS;

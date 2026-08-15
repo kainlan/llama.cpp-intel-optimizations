@@ -102,6 +102,7 @@
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
+#include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/onednn-woq.hpp"
@@ -23876,19 +23877,7 @@ static bool ggml_sycl_layout_supports_soa(ggml_type type) {
 }
 
 static bool ggml_sycl_moe_mmvq_batched_supports_layout(ggml_type type, layout_mode layout) {
-    switch (type) {
-        case GGML_TYPE_Q1_0:
-        case GGML_TYPE_NVFP4:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q8_0:
-            return layout == GGML_LAYOUT_AOS;
-        case GGML_TYPE_MXFP4:
-            return layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED ||
-                   layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS ||
-                   layout == GGML_LAYOUT_XMX_TILED || layout == GGML_LAYOUT_XMX_TILED_BUNDLE4;
-        default:
-            return false;
-    }
+    return moe_mmvq_capability_supports_layout(type, layout);
 }
 
 static bool ggml_sycl_moe_secondary_dispatch_supports_layout(ggml_type type, layout_mode layout) {
@@ -24115,15 +24104,34 @@ static moe_route_capability ggml_sycl_moe_query_route_capability(
                                              queue_capability && queue_capability->valid() &&
                                              queue_capability->owner_device() == submit_device;
         if (authoritative_candidate) {
-            cap.supported = true;
-            cap.kernel = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
+            cap.supported     = true;
+            cap.kernel        = moe_route_kernel::DEVICE_MMVQ_Q1_NVFP4_AOS;
             cap.reject_reason = moe_layer_reject_reason::NONE;
-            cap.reason = "direct-recipe-candidate";
-        } else {
-            cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
-            cap.reason = "direct-recipe-authority-unavailable";
+            cap.reason        = "direct-recipe-candidate";
+            return cap;
         }
-        return cap;
+        // Not selecting the DIRECT fast path is not a capability verdict. The
+        // generic batched MMVQ executor accepts these types in AOS for both
+        // phases and for rows > 1 -- mmvq_submit_q1_nvfp4_aos_id() imposes no
+        // phase or row-count constraint -- so a non-authoritative candidate
+        // falls through to the shared local admission below instead of being
+        // refused here. Returning at this point instead shadowed a kernel that
+        // already exists, and because the refusal escapes as
+        // ggml_sycl_fallback_error and ggml_backend_compare_graph_backend
+        // discards the resulting GGML_STATUS_FAILED, it surfaced as wrong
+        // numbers rather than as a clean decline.
+        //
+        // Fall through only where the executor's own preconditions hold: a K
+        // that is not block-aligned would be refused at submit, which is worse
+        // than refusing here. Secondary residency keeps the old refusal -- the
+        // fall-through is validated for the local executor only.
+        const bool local_executor_shape_ok = layout == GGML_LAYOUT_AOS && route_device == submit_device &&
+                                             K % qk == 0 && K % QK8_1 == 0 && K <= INT32_MAX && N <= INT32_MAX;
+        if (!local_executor_shape_ok) {
+            cap.reject_reason = moe_layer_reject_reason::CAPABILITY;
+            cap.reason        = "direct-recipe-authority-unavailable";
+            return cap;
+        }
     }
 
     const bool secondary = route_device != submit_device;

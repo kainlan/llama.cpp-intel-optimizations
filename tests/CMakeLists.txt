@@ -331,6 +331,15 @@ endif()
 # catch needs no upstream cooperation. Do not "tidy" this back.
 llama_build_and_test(test-archs-table.cpp)
 
+# Host-only gate for the batched-MoE MUL_MAT_ID coverage tables (llama.cpp-gx30).
+# Deliberately built unconditionally and NOT under a SYCL guard: it includes only
+# ggml.h plus a SYCL-free header, so it runs on any machine and needs no oneAPI
+# and no GPU. Guarding it behind GGML_SYCL would make the one check that catches
+# an over-advertised capability unavailable to exactly the agents who cannot
+# build the backend.
+llama_build_and_test(test-sycl-moe-mmvq-tables.cpp)
+set_tests_properties(test-sycl-moe-mmvq-tables PROPERTIES LABELS "sycl;moe;source;hostonly")
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
