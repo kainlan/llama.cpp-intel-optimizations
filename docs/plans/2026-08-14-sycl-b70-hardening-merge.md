@@ -580,6 +580,34 @@ done; done
 
 ---
 
+## Tracker-added tasks (16+) — execution-born, spec lives in the tracker
+
+Tasks numbered 16 and above were created DURING execution, in the tracker, and
+are not retro-specced here — their authoritative spec is the ticket description
+plus its lead-ruling comments. This section exists so the plan and the
+tracker's "HM Task N" numbering agree (a packet reviewer correctly flagged the
+desync on 2026-08-15).
+
+- **HM Task 16 = `llama.cpp-2lfg`** — repair the 9 never-compiled seam-consumer
+  test targets (private-fixture carrier migration). E2E-blocking via Task 13's
+  filtered sweep. Acceptance amended 2026-08-14: the named-11-mutable-seam nm
+  bar replaced the unsatisfiable blanket grep.
+- **HM Task 17 = `llama.cpp-f8ws`** — the backend-ops census/walls lane
+  (STAGE-TRACE instrumentation, wall 4 refusal, publisher unification, parity
+  gate, trusted-extent, TLSF offset-alignment, staging retry). Split-outs:
+  `llama.cpp-480a` (wall 5, paused with tripwire armed), `llama.cpp-gx30`
+  (recipe_missing contract tension), `llama.cpp-saka` (P1 graph-disable side
+  effect), `llama.cpp-fjtw` (mem_copy refusal-channel audit, post-merge).
+- **P0 gate-restoration tasks (2026-08-15, block Task 13):**
+  `llama.cpp-09ts` (Mistral gate aborts at mem-ops.cpp:57 — KV-clear
+  whole-buffer fill vs 128 MiB-extent handle) and `llama.cpp-mik6` (GPT-OSS
+  fails to load — 72/72 MoE expert cache failures, load txn rollback). Both sit
+  in the unverified window open since `f23bf786b` (2026-08-13): no real-model
+  gate ran on any tree containing it until the lead's 2026-08-15 probe. Their
+  `blocks` edges onto `llama.cpp-4dhw` (Task 13) are in the tracker.
+
+---
+
 ## End-to-End Validation (on the user's machine) — MANDATORY
 
 > Run AFTER all task tests pass, BEFORE declaring the work done. Owned by the lead at teardown. This is Tasks 13–14 executed and recorded; the list below is the final observable checklist.
