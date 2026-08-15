@@ -7350,6 +7350,16 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
             meta.expert_idx  = info.expert_idx;
             meta.tensor_role = moe_classify_tensor(info.tensor->name);
             meta.block_num   = moe_extract_block_number(info.tensor->name);
+            // Prestaging-planner precondition, mirroring the group-registry
+            // guard below: the planner keys and groups its work by layer, so a
+            // tensor whose name carries no "blk.N." layer number has no place
+            // in it -- every such meta would share one layer -1 bucket.  This
+            // is NOT a provenance exemption.  The canonical key above is what
+            // grants admission to compute and keeps its full strength; this
+            // decides only what the prestaging planner plans for.
+            if (meta.block_num < 0) {
+                continue;
+            }
             new_expert_meta.push_back(std::move(meta));
         }
 
