@@ -239,7 +239,7 @@ git commit -m "fix(sycl): mint cache-backing provenance privately"
 **Depends on:** Task 2
 **File scope:**
 - Create: `ggml/src/ggml-sycl/tests/test-cache-backing-provenance.cpp`
-- Modify: `tests/CMakeLists.txt` (register with `LABELS "cache"`, `RUN_SERIAL TRUE`, `SKIP_RETURN_CODE 77`, `ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1"` — copy an existing `test-sycl-*` private-fixture registration block verbatim as the template, e.g. the `test-mem-handle-eviction` one)
+- Modify: `ggml/src/ggml-sycl/CMakeLists.txt` (register with `RUN_SERIAL TRUE`, `SKIP_RETURN_CODE 77`, `ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1"` — private-fixture registrations live here, where `ggml-sycl-private-fixtures` exists; NOT tests/CMakeLists.txt. [Amended 2026-08-15: original line named the wrong file, and its `LABELS "cache"` would exclude the forgery gate from every standard sweep — a permanent gate nothing runs is decoration; the fixture is not in the OOM-hazard property family. Lead rulings on llama.cpp-fhqe.])
 
 **Description:** Handoff requirement #5: adversarial direct and legacy-promotion forgery tests, post-physical-allocation cleanup tests, and a two-device coordinator reset test. These prove the Task 2 fix closed the hole rather than moved it.
 
