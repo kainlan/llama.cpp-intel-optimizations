@@ -252,7 +252,11 @@ the cache.
 
 **What `mem_handle` does NOT own:**
 - Allocation — use `unified_alloc` / `unified_allocate` to create memory; the
-  resulting `alloc_handle` can then be wrapped in a `mem_handle`.
+  resulting `alloc_handle` can then be wrapped in a `mem_handle`. Owner-first
+  callers instead use `unified_allocate_owner()` (§3.1) and wrap the returned
+  `alloc_owner` with `mem_handle::from_owned_alloc()`, which moves the owner into
+  the handle's `shared_alloc_owner` — copies and slices of that handle are then
+  true ref-counted leases on one intrusive control, not pointer aliases.
 - Placement decisions — `from_weight()` records a device ID from the planner,
   but does not decide placement.
 - SYCL event dependencies — handles are value types. Event tracking belongs at the
@@ -317,6 +321,10 @@ these or be migrated (see §9 for temporary allowlisted sites):
 |---|---|---|
 | `unified_alloc(req, out)` | Primary allocator; routes by zone/tier | `bool` + `alloc_handle` |
 | `unified_allocate(req)` | Handle-returning wrapper around `unified_alloc` | `mem_handle` |
+| `unified_allocate_owner(req)` | **Owner-first allocator** (`unified-cache.hpp:4330`). The intrusive `alloc_owner_control` is created *before* any physical allocation, so an allocation can never exist without an owner | `allocation_result` (`alloc_owner` + typed `allocation_error`) |
+| `unified_cache_zone_allocate_owner(device_id, zone, size, align = 256)` | Owner-first VRAM-zone variant (`unified-cache.hpp:5064`); control and exact registry identity exist before the zone pointer can escape | `allocation_result` |
+| `unified_allocate_owner_backing(req, cache_backing_token)` | **Private, token-gated** (`allocation-provenance.hpp:56`). Classifies the owner `CACHE_BACKING`. Only `pinned_chunk_pool` can construct the token, and the header may be included only by `unified-cache.cpp` and `pinned-pool.cpp`. This is **one of two** `CACHE_BACKING` mint paths — see §3.1 | `allocation_result` |
+| `detail::promote_legacy_alloc_owner(handle)` | Allocator-private bridge (`unified-cache.hpp:4337`) promoting an existing legacy `alloc_handle` row to intrusive ownership. Not a caller entry point | `allocation_result` |
 | `unified_cache_allocate(device, size, category, queue)` | Bulk weight/arena slot allocator | `unified_alloc_result` (`unified-cache.hpp:2374`) |
 | `unified_cache_zone_alloc(device_id, zone, size, align = 256)` | Named VRAM zone allocation (`unified-cache.hpp:2856`) | `void *` |
 | `unified_cache_host_zone_alloc(zone, size, align)` | **Deprecated** — host-pinned zone allocation; migrate to `unified_allocate()` with `must_host_pinned` + `use_pinned_pool` | `void *` |
@@ -331,6 +339,70 @@ above.
 
 **Deallocation:** `unified_free(handle)`, `unified_free_ptr(ptr, device)`,
 `unified_cache_zone_free(device_id, zone, ptr)`, `unified_cache_arena_free(device_id, ptr, size)` (deprecated).
+
+**Deallocation of an `alloc_owner` is not on that list, and must not be.** An
+owner's physical release flows only through its
+`allocation_release_coordinator`: `~alloc_owner` / `alloc_owner::reset()` drop a
+reference on the intrusive `alloc_owner_control`, and the *last* reference calls
+`coordinator->retire(control)` → `release_physical(control)`
+(`unified-cache.hpp:4125-4126`, private to the coordinator). A refused final
+release is not lost — the control carries an embedded `retry_next_` link, so it
+is queued for `process_retries()` without allocating memory, and
+`release_attempt` reports `RELEASED` vs `RETRY_SCHEDULED` rather than a bare
+bool. Never free an owner's pointer by calling one of the functions above
+alongside the owner; that is a double-free with extra steps.
+
+### 3.1 Ownership classes and allocation provenance
+
+Every `alloc_owner_control` is stamped, **before coordinator admission**, with
+one of three `allocation_control_class` values (`unified-cache.hpp:4052-4056`).
+The class is the *physical* relationship between the owner and cache storage,
+and it is fixed at that moment on purpose: shutdown must never re-infer it later
+from pointer containment, because by then the caches may already have changed.
+
+| class | meaning | who gets it |
+|---|---|---|
+| `CACHE_BACKING` | The allocation **is** physical backing owned by a cache or pool — not a slice of anything else. This is an authority, not a hint: the pre-teardown census (`unified-cache.cpp:15919-15921`) treats a live control of this class as admissible and every other live control as a refusal | Only the two mint mechanisms below |
+| `CACHE_SUBALLOCATION` | An interior slice of storage the cache already owns — pinned-pool suballocation, a VRAM zone allocation, or a KV-role request (`unified-cache.cpp:12615-12618`) | Requests carrying `use_pinned_pool` / `must_host_pinned` / a `prefer_vram_zone` / `alloc_role::KV`, *except* a standalone host-USM base |
+| `EXTERNAL_EXACT` | Default. An exact, independently released allocation the cache did not carve out of its own storage | Everything else — including **every public standalone host-USM request** |
+
+**`EXTERNAL_EXACT` is the classification for public standalone host-USM
+requests.** `require_host_usm_base && must_host_pinned` means the caller is
+asking for a driver-visible allocation *base*, which is by definition not an
+interior slice of any arena. That combination is therefore excluded from
+`cache_suballocation` (`unified-cache.cpp:12613-12614`), and without the private
+token it lands in `EXTERNAL_EXACT`.
+
+**`CACHE_BACKING` is mintable through exactly TWO mechanisms, and they are
+enforced differently. Neither is reachable from a public `alloc_request`** — the
+caller-writable `alloc_constraints.cache_backing` bool that used to mint it was
+deleted, because a public bool granting a shutdown exemption is forgeable by
+anyone.
+
+1. **The private token — `cache_backing_token`** (`allocation-provenance.hpp`),
+   for the pinned pool's backing chunks. Its constructor is private and its only
+   friend is `pinned_chunk_pool`, so an unauthorised caller cannot even name a
+   valid argument to `unified_allocate_owner_backing()`. **Enforced by the
+   compiler.**
+2. **A plain `bool` parameter on `unified_cache_adopt_raw_host_allocation()`**,
+   for the unified cache's **own staging buffer**. That adopt runs during
+   `unified_cache` construction and cannot route through the coordinator without
+   a circular dependency, so it stays a bootstrap mint. **Enforced instead by the
+   helper being TU-static in `unified-cache.cpp`** — unreachable from any other
+   translation unit — **plus a source gate pinning it to a single call site.**
+
+Mechanism 2 is not weaker in *reach*, only in the kind of proof: staticness and
+the gate are checked by the build and by the test, not by the type system. **Do
+not describe the token as the only mint path** — that overstatement was a review
+finding against the code comments (`llama.cpp-81gt`, comment `c-by9u`) and it is
+equally wrong here.
+
+`tests/test-sycl-owner-allocation-migration.py` is the enforceable half of this
+subsection. It asserts that `cache_backing` is absent from the public request
+structs, that `allocation-provenance.hpp` is included only by `unified-cache.cpp`
+and `pinned-pool.cpp`, and that the bootstrap helper is still `static` with
+exactly one call site passing `true`. Mechanism 1 needs no gate — it is a
+compile error.
 
 ---
 

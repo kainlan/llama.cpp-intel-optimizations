@@ -381,7 +381,22 @@ that return `mem_handle`). Do not introduce direct `sycl::malloc_device`,
 `sycl::malloc_host`, `sycl::free`, raw TLSF allocation, or side caches outside
 the unified-cache implementation. Any low-level allocation implementation detail
 must remain inside unified-cache code and surface to the rest of the backend as
-a `mem_handle`.
+one of the **two sanctioned ownership surfaces**: a `mem_handle`, or an
+`alloc_owner` returned by `unified_allocate_owner()` (owner-first allocation —
+the intrusive control is minted before the physical allocation, so an allocation
+cannot exist unowned; wrap it with `mem_handle::from_owned_alloc()` to hand it to
+a consumer). The legacy `alloc_handle` from `unified_alloc()` remains allowlisted
+as a compatibility form, but it is a migration state, not a third surface — a raw
+pointer is never one at all.
+
+Allocation **provenance** is an authority, not a hint: an owner's
+`allocation_control_class` (`CACHE_BACKING` / `CACHE_SUBALLOCATION` /
+`EXTERNAL_EXACT`) is fixed before coordinator admission and decides, among other
+things, what survives destructive teardown. `CACHE_BACKING` must never become
+requestable through a public field — it is mintable only via the private
+`cache_backing_token` (pinned pool, compiler-enforced) or the TU-static bootstrap
+adopt for the cache's own staging buffer (gate-enforced); see the canonical
+contract §3.1.
 
 `mem_handle` is the ownership and lifetime token. Code that uses an allocation
 must hold a `mem_handle` (or an object that owns one) until the CPU thread,

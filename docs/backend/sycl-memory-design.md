@@ -135,6 +135,57 @@ returns 14 lines (the implementation's diagnostic strings, comments, the check's
 own text, and a historical planning doc under
 `ggml/src/ggml-sycl/docs/`), so it reads as a violation when nothing is wrong.
 
+## Owner-first allocation: `alloc_owner` under the handle
+
+`unified_allocate()` returns a `mem_handle` and is still the right front door for
+most call sites. But it has an ordering property that turned out to matter: the
+memory exists first, and something wraps it afterwards. If the wrap is skipped,
+forgotten, or fails, there is a live allocation with no owner, and the only
+record of it is a raw pointer somewhere.
+
+**`unified_allocate_owner()` inverts that order.** It allocates the intrusive
+`alloc_owner_control` *before* the physical allocation, so an allocation can
+never exist without an owner:
+
+```cpp
+ggml_sycl::alloc_request req{ &stream, device, bytes, false, intent };
+ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
+if (!allocation) { /* allocation.error is a typed allocation_error, not a bool */ }
+ggml_sycl::mem_handle h =
+    ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+```
+
+This is now the dominant shape in the backend, not a niche one: **48 call sites
+at `0b7b49e07`** (25 in `ggml-sycl.cpp`, 23 across `common.cpp`, `common.hpp`,
+`fattn.cpp`, `vram-pool.cpp`, `unified-cache.cpp` and the private fixtures).
+
+What the owner adds over a bare handle:
+
+- **`alloc_owner` is move-only**; the copyable form is `shared_alloc_owner`, and
+  `mem_handle::from_owned_alloc()` moves the owner in via
+  `std::move(owner).into_shared()`. Handle copies and `slice()` views retain
+  *that exact intrusive control* rather than allocating a second `shared_ptr`
+  control block — so a slice of a buffer is a real lease on the buffer's
+  allocation, not a pointer alias with a hopeful comment.
+- **Release is coordinator-mediated and can be refused.** Dropping the last
+  reference calls into the device's `allocation_release_coordinator`, which
+  returns a `release_attempt` (`RELEASED` / `RETRY_SCHEDULED` / …). A refused
+  final release is queued through a `retry_next_` pointer embedded in the
+  control, so the retry path allocates nothing — which is what lets it work
+  under the memory pressure that caused the refusal.
+- **Failure is typed.** `allocation_result::error` distinguishes
+  `INVALID_REQUEST`, `CONTROL_ALLOCATION_FAILED`, `PHYSICAL_ALLOCATION_FAILED`,
+  `METADATA_PUBLICATION_FAILED`, `RELEASE_RETAINED` — so a caller can tell "the
+  request was malformed" from "the device is out of memory" without logging.
+
+Each owner is also stamped with an `allocation_control_class` before the
+coordinator admits it: `CACHE_BACKING`, `CACHE_SUBALLOCATION`, or
+`EXTERNAL_EXACT`. That classification is the enforceable part of the contract and
+is specified in
+`docs/design/sycl-canonical-memory-architecture.md` §3.1 — including why
+`CACHE_BACKING` cannot be requested through any public field, and the two
+distinct mechanisms that can mint it.
+
 ## Weights: cache-managed WEIGHT handles
 
 Weights aren't allocated ad-hoc — they're materialized into the cache per the
@@ -156,6 +207,83 @@ never moves — always returns its cached pointer), `ARENA_RUNTIME/SCRATCH/ONEDN
 (views into fixed VRAM zones), and `CHUNK_LEASE` (a raw pointer plus a lease on
 its backing arena chunk, so the chunk can't be `sycl::free`'d while the pointer
 is in use).
+
+## Where a weight's provenance comes from
+
+A WEIGHT handle is keyed by `ggml_sycl_cache_id` — tensor identity, not pointer —
+and that identity has to be *minted* by something. Today the only minting
+occasion is a model load: `Registry::begin_outer()` issues a `ModelToken`, and
+every weight identity row is filed under
+`ggml_sycl_owner_name_key(owner, tensor_name)` so two loaded models cannot
+collide on a shared tensor name. Everything downstream — expert cache keys,
+residency reasons, ownership masks — reads that owner.
+
+The consequence is easy to miss: **a tensor that never went through a model load
+has no owner, so it cannot be admitted at all.** That is why ordinary backend
+buffers (`test-backend-ops` cases, and anything else allocating through
+`ggml_backend_sycl_buffer_type_alloc_buffer`) are refused rather than merely
+slower.
+
+### Buffer-scoped weight provenance *(landing under `llama.cpp-f8ws`)*
+
+The fix adds a **second legitimate minting occasion — buffer allocation** — and
+changes nothing else about the gates. Not merged at `0b7b49e07`; described here
+so the two mechanisms are not mistaken for one:
+
+- **Minted at buffer allocation.** The buffer context already holds a unique
+  per-allocation id (`managed_meta.id`, from the cache's own retention-identity
+  counter). That id *seeds* a buffer owner; it cannot *be* the token, because
+  `alloc_metadata` carries no model-identity field at all.
+- **Namespaced by the top bit.** Buffer-scoped owner ids carry
+  `1ull << 63`; the model `Registry` counts up from 1 and asserts the tag is
+  clear, so the two id spaces are disjoint by enforcement rather than by
+  assumption. Buffer owners take a sentinel slot outside the 32-slot model mask
+  and so land in the *unattributed* ownership class — which is why the explicit
+  drop below is load-bearing rather than belt-and-braces.
+- **Consumed at `init_tensor`**, which already has the buffer context in scope:
+  each tensor gets `extra->model_id` stamped and a row filed under
+  `ggml_sycl_owner_name_key(buffer_owner, name)`, with a truthful synthetic
+  parent identity (real byte offset within the buffer, real `ggml_nbytes`).
+- **Dropped at buffer free via stored cache ids.** The buffer destructor **must
+  not dereference tensors** — the `ggml_context` that owns them may already be
+  gone (gallocr frees buffers first). So each tensor's `ggml_sycl_cache_id` is
+  computed at registration time and stored on the buffer context as a plain
+  vector; teardown drops by stored key and touches no tensor pointer. All the
+  existing drop APIs are exact-key, so a stored key vector is required anyway.
+
+No new reclamation mechanism is introduced: these are lookup-table erasures.
+Memory release stays with `mem_handle` and the owner coordinator.
+
+### The non-owning storage-handle route (merged)
+
+There is a second, older answer for backend-buffer tensors that needs no cache
+identity at all, and it is worth knowing because it is what the expert resolver
+consults **first**.
+
+`ggml_sycl_publish_backend_aos_expert_handles()` slices the buffer's own
+`managed_handle` per expert — `ctx->managed_handle.slice(offset, expert_size)` —
+validates every slice before publishing any of it (pointer matches the expected
+address, on-device, correct layout, correct device, `has_stable_owner_identity()`
+true), and stores the slices on the tensor's `extra`, keyed by
+`moe_storage_handle_key(expert_id, layout)`. Publication is transactional: the
+previous records are taken aside first and rolled back if any step throws, so a
+partially installed prefix is not observable. It runs at the three points where
+an AoS upload becomes complete — `set_tensor`, `buffer_cpy_tensor`, and the MMID
+decode branch.
+
+`ggml_sycl_resolve_moe_expert_route()` then tries
+`ggml_sycl_try_moe_storage_handle_route()` for each candidate layout *before* it
+forms any cache key; a hit returns `FOUND` and the unified cache is never
+consulted. Two properties follow, and both are stronger than they look:
+
+- **These slices are owning, but they are not cache entries.** Each is a real
+  ref-counted lease on the buffer's allocation, so the bytes cannot go away
+  underneath a kernel — and because the cache never learns of them, no eviction
+  or free predicate can reach them either. "Non-owning" here means *the cache
+  does not own them*, not that nobody does.
+- **Layout discipline is structural.** The record key includes the layout, so a
+  request for SOA, XMX or a packed layout **misses** rather than silently
+  aliasing the AoS view.
 
 ## The rules that fall out of this
 
