@@ -4470,7 +4470,10 @@ if (BUILD_TESTING AND NOT GGML_BACKEND_DL)
         LABELS "sycl;moe;mmvq;adapter;device;B70;B50"
         SKIP_RETURN_CODE 77
         RUN_SERIAL TRUE
-        TIMEOUT 120)
+        # Cold-JIT run measured 171s under ambient load 2026-08-14; internal
+        # watchdog unchanged.  At the old 120 this reported Timeout on a run
+        # that goes on to PASS, which reads as a converter defect.
+        TIMEOUT 360)
 endif()
 
 # MMVQ sub-group-per-row launch geometry (llama.cpp-99ke).

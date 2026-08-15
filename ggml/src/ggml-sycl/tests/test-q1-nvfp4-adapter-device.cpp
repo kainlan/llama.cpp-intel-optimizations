@@ -1,5 +1,6 @@
 // Executable device regression test for the allocation-free admitted adapter.
 #include "mmvq.hpp"
+#include "convert.hpp"
 #include "unified-cache.hpp"
 #include "ggml-quants.h"
 #include "ggml-sycl.h"
@@ -256,6 +257,107 @@ void run_case(sycl::queue & q, ggml_type type, int ne11) {
             "overflow shape submitted");
 }
 
+uint16_t half_bits(sycl::half h) {
+    uint16_t bits;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+}
+
+// MUL_MAT_ID's four GGML_ASSERT(to_fp16_sycl != nullptr) sites are unreachable
+// only while ggml_get_to_fp16_sycl answers for these two types, and an
+// answering converter is only worth having if it agrees with the CPU dequant
+// reference bit for bit.  Both halves are asserted here, on quantizer output
+// and on synthetic blocks chosen for coverage the quantizer does not give.
+//
+// NVFP4 scale bytes stay inside what ggml_fp32_to_ue4m3 can emit: it saturates
+// at 0x7E and never sets bit 7.  0xFF is deliberately absent because
+// ggml_sycl_ue4m3_to_fp32 maps it to 0.0f while ggml_ue4m3_to_fp32 does not --
+// a pre-existing divergence in common.hpp that no encoder can reach, and not
+// this converter's contract to resolve.
+void fp16_converter_bit_exact(sycl::queue & q, ggml_type type) {
+    constexpr int64_t blocks = 5;
+    constexpr size_t  guard  = 13;
+    const int64_t     qk     = type == GGML_TYPE_Q1_0 ? QK1_0 : QK_NVFP4;
+    const int64_t     k      = blocks * qk;
+    const sycl::half  fence  = sycl::half(-7.5f);
+
+    // extra == nullptr keeps the getter on the plain AoS kernels, which is what
+    // the MMID converter path asks for.
+    ggml_tensor weight{};
+    ggml_tensor node{};
+    node.src[0] = &weight;
+
+    const to_fp16_sycl_t convert = ggml_get_to_fp16_sycl(type, &node);
+    require(convert != nullptr, "ggml_get_to_fp16_sycl returned null for a restored type");
+
+    usm_owner<unsigned char> quantized(q, ggml_row_size(type, k));
+    usm_owner<sycl::half>    device(q, k + 2 * guard);
+    std::vector<float>       reference(k);
+
+    auto compare_against_cpu_reference = [&]() {
+        if (type == GGML_TYPE_Q1_0) {
+            dequantize_row_q1_0(reinterpret_cast<const block_q1_0 *>(quantized.ptr), reference.data(), k);
+        } else {
+            dequantize_row_nvfp4(reinterpret_cast<const block_nvfp4 *>(quantized.ptr), reference.data(), k);
+        }
+        std::fill(device.ptr, device.ptr + k + 2 * guard, fence);
+        convert(quantized.ptr, device.ptr + guard, k, &q);
+        q.wait_and_throw();
+
+        for (size_t i = 0; i < guard; ++i) {
+            require(half_bits(device.ptr[i]) == half_bits(fence), "converter wrote before the row");
+            require(half_bits(device.ptr[guard + k + i]) == half_bits(fence), "converter wrote past the row");
+        }
+        for (int64_t i = 0; i < k; ++i) {
+            require(half_bits(device.ptr[guard + i]) == ggml_fp32_to_fp16(reference[i]),
+                    "converter output is not bit-exact against the CPU dequant reference");
+        }
+    };
+
+    // Quantizer output: the shape the MMID path actually feeds the converter.
+    std::vector<float> row(k);
+    for (int64_t i = 0; i < k; ++i) {
+        const int64_t ib = i / qk;
+        row[i] = (i % 7 == 3 ? -1.0f : 1.0f) * (0.125f + float((i * 5 + ib) % 23) / 3.0f) * float(1 << (ib % 4));
+    }
+    if (type == GGML_TYPE_Q1_0) {
+        quantize_row_q1_0_ref(row.data(), reinterpret_cast<block_q1_0 *>(quantized.ptr), k);
+    } else {
+        quantize_row_nvfp4_ref(row.data(), reinterpret_cast<block_nvfp4 *>(quantized.ptr), k);
+    }
+    compare_against_cpu_reference();
+
+    // Synthetic blocks: every nibble code in both positions, and for NVFP4 a
+    // distinct scale per sub-block so a collapsed sub-block index cannot pass.
+    if (type == GGML_TYPE_Q1_0) {
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            unsigned char *   block = quantized.ptr + ib * sizeof(block_q1_0);
+            const ggml_fp16_t d     = ggml_fp32_to_fp16(0.0625f * float(1 << ib));
+            std::memcpy(block, &d, sizeof(d));
+            for (int b = 0; b < QK1_0 / 8; ++b) {
+                block[sizeof(d) + b] = static_cast<unsigned char>((0xa5 ^ (b * 31 + ib * 7)) & 0xff);
+            }
+        }
+    } else {
+        // Encoder-reachable scales: zero, subnormal, four normals, saturation,
+        // and 0x7F, on which the SYCL and CPU decoders agree (both 0.0f).
+        static const unsigned char scales[] = { 0x00, 0x03, 0x38, 0x40, 0x44, 0x48, 0x7e, 0x7f };
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            unsigned char * block = quantized.ptr + ib * sizeof(block_nvfp4);
+            for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
+                block[sub] = scales[(sub + 4 * ib) % (sizeof(scales) / sizeof(scales[0]))];
+                for (int j = 0; j < QK_NVFP4_SUB / 2; ++j) {
+                    const int lo = (j + 3 * sub + ib) & 15;
+                    const int hi = (15 - j - 2 * sub - ib) & 15;
+                    block[QK_NVFP4 / QK_NVFP4_SUB + sub * (QK_NVFP4_SUB / 2) + j] =
+                        static_cast<unsigned char>((hi << 4) | lo);
+                }
+            }
+        }
+    }
+    compare_against_cpu_reference();
+}
+
 } // namespace
 
 int main() {
@@ -267,6 +369,8 @@ int main() {
         run_case(q, GGML_TYPE_Q1_0, 3);
         run_case(q, GGML_TYPE_NVFP4, 1);
         run_case(q, GGML_TYPE_NVFP4, 3);
+        fp16_converter_bit_exact(q, GGML_TYPE_Q1_0);
+        fp16_converter_bit_exact(q, GGML_TYPE_NVFP4);
         std::cout << "Q1/NVFP4 lifecycle-aware admitted device adapter: PASS\n";
         return 0;
     } catch (const sycl::exception & e) {
