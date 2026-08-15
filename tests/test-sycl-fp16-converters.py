@@ -167,18 +167,26 @@ def test_generic_nibble_adapter_is_not_nvfp4_subblock_mapping() -> None:
 def test_source_contract_mutations_fail_closed() -> None:
     assert _contract(SOURCE)
     mutations = (
-        SOURCE.replace(
-            "case GGML_TYPE_Q1_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
-            "case GGML_TYPE_Q2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
-            1,
+        (
+            "q1_0 registration renamed away",
+            SOURCE.replace(
+                "case GGML_TYPE_Q1_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
+                "case GGML_TYPE_Q2_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;",
+                1,
+            ),
         ),
-        SOURCE.replace("return dequantize_row_nvfp4_fp16_sycl;", "return dequantize_block_sycl<QK_NVFP4, 2, dequantize_nvfp4>;", 1),
-        SOURCE.replace("const int     sub = tid / 8;", "const int     sub = tid / 16;", 1),
-        SOURCE.replace("const int     j   = tid % 8;", "const int     j   = tid % 16;", 1),
-        SOURCE.replace("y[iy + 8]", "y[iy + 32]", 1),
-        SOURCE.replace("sycl::range<3>(1, 1, nb * 32)", "sycl::range<3>(1, 1, nb * 64)", 1),
+        (
+            "nvfp4 downgraded to the generic adapter",
+            SOURCE.replace("return dequantize_row_nvfp4_fp16_sycl;", "return dequantize_block_sycl<QK_NVFP4, 2, dequantize_nvfp4>;", 1),
+        ),
+        ("nvfp4 sub-block index collapsed", SOURCE.replace("const int     sub = tid / 8;", "const int     sub = tid / 16;", 1)),
+        ("nvfp4 lane index widened", SOURCE.replace("const int     j   = tid % 8;", "const int     j   = tid % 16;", 1)),
+        ("nvfp4 high-nibble offset moved off the sub-block", SOURCE.replace("y[iy + 8]", "y[iy + 32]", 1)),
+        ("nvfp4 launch geometry doubled", SOURCE.replace("sycl::range<3>(1, 1, nb * 32)", "sycl::range<3>(1, 1, nb * 64)", 1)),
     )
-    assert all(not _contract(mutated) for mutated in mutations)
+    for label, mutated in mutations:
+        assert mutated != SOURCE, f"mutation no longer applies to the source: {label}"
+        assert not _contract(mutated), f"contract still passed under mutation: {label}"
 
     dense_fn = _function(SUPPORT_SOURCE, "static bool ggml_sycl_mul_mat_type_supported(")
     dense_open_fn = dense_fn.replace(
