@@ -851,13 +851,24 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # (~3.2 GB) exceeds the B50's placement headroom (and physical VRAM) — the
 # fork disabled upstream's context fitter (fit_params=false under SYCL) and
 # the unified cache only validates, never shrinks. It is NOT a chat-correctness
-# or MMID regression — do not open that investigation. ⚠️ UPDATE: `-c 4096` no
-# longer rescues the gate — it clears init and then aborts mid-generation
-# (llama.cpp-fxrg, P0: tiered_kv_buffer_get_tensor omits its byte-contract
-# argument, so the server's prompt-checkpoint read gets a zero-extent
-# destination handle and the honest range guard refuses). BOTH defects block
-# the gate; there is currently NO workaround. llama-bench GPT-OSS runs are
-# unaffected (bench does not go through the in-process server path).
+# or MMID regression — do not open that investigation.
+# ✅ WORKAROUND (verified on hardware 2026-08-16): **add `-c 4096`** (or any
+# context below the limit the refusal itself prints). The gate then reaches
+# `1, 2, 3, 4, 5` with rc=0 and zero aborts. A second defect used to break even
+# that path — llama.cpp-fxrg, where tiered_kv_buffer_get_tensor omitted its
+# byte-contract argument so the server's prompt-checkpoint read got a
+# zero-extent destination handle and the range guard correctly refused — and it
+# is FIXED (c1f4504c8 + ff9d10cd0). Only the default-context init refusal
+# remains, tracked on llama.cpp-uize; its part 3 (re-place KV to host tiers
+# instead of refusing) is deliberately unimplemented pending an owner decision
+# on whether the canonical gate should pin `-c` at all.
+# The refusal message now tells the truth and does the arithmetic for you:
+#   runtime KV update rejected: budget-exceeded -- n_ctx=131072 n_ubatch=512
+#     vram=16569.0 MB (weights 13363.7 + kv 3090.0) budget=14828.0 MB over_by=1741.0 MB
+#   the KV cache for this context does not fit ...; the largest context that
+#     fits is about -c 56576
+# llama-bench GPT-OSS runs are unaffected throughout — bench does not go through
+# the in-process server path that the chat gate uses.
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
 # The gate is the digit sequence. (An older note here said the output starts
