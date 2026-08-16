@@ -9,6 +9,7 @@ COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
 UNIFIED_CACHE = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 MMVQ = ROOT / "ggml/src/ggml-sycl/mmvq.cpp"
 MMVQ_HEADER = ROOT / "ggml/src/ggml-sycl/mmvq.hpp"
+MEM_HANDLE = ROOT / "ggml/src/ggml-sycl/mem-handle.cpp"
 PREFETCH_HEADER = ROOT / "ggml/src/ggml-sycl/expert-prefetch.hpp"
 PREFETCH_SOURCE = ROOT / "ggml/src/ggml-sycl/expert-prefetch.cpp"
 LIFECYCLE_TEST = ROOT / "tests/test-sycl-moe-handle-resolution.cpp"
@@ -72,9 +73,16 @@ def violations(source: str) -> list[str]:
     logical_resolver = function(common, "bool resolve_moe_storage_record")
     owner = function(source, "void set_managed_owner")
     capability = function(source, "static moe_route_capability ggml_sycl_moe_query_route_capability")
+    # set_managed_owner takes the legacy alloc_handle, so it mints through the
+    # allocator-private adapter rather than the public from_owned_alloc. Score
+    # the adapter's body too: scoring only the call site would let it be
+    # reimplemented over a raw pointer with this gate still green.
+    legacy_adapter = function(MEM_HANDLE.read_text(), "mem_handle detail::from_legacy_owned_alloc")
 
     requirements = {
-        "allocation-time owner": "mem_handle::from_owned_alloc(std::move(h), GGML_LAYOUT_AOS)" in owner,
+        "allocation-time owner": "ggml_sycl::detail::from_legacy_owned_alloc(std::move(h), GGML_LAYOUT_AOS)" in owner,
+        "legacy adapter is owner-first": "mem_handle::from_owned_alloc(std::move(promotion.owner), layout)" in legacy_adapter
+            and "from_direct" not in legacy_adapter,
         "device tier only": "managed_meta.tier != ggml_sycl::alloc_tier::DEVICE_VRAM" in publish,
         "ordinary expert eligibility": "tensor_usage::MOE_EXPERT_WEIGHT" in publish,
         "AoS only": "extra->layout.mode != GGML_LAYOUT_AOS" in publish,
@@ -106,7 +114,11 @@ def violations(source: str) -> list[str]:
         "resolver requires key only for cache fallback": route.index("if (!base_key.valid)") < route.index("cache->resolve_expert"),
         "resolver retains canonical lease": "route.lease" in route and "logical.logical_handle" in storage_route,
         "resolver propagates ready event": "route.has_ready_event = logical.has_ready_event" in storage_route,
-        "Q1/NVFP4 executor gate remains disabled": "q1_nvfp4_direct_b70_validated = false" in source,
+        # One definition, read by both the admission and materialization gates.
+        # Score the definition's value AND that the admission site still reads it
+        # by name -- re-spelling it as a literal is how the two gates drift apart.
+        "Q1/NVFP4 executor gate remains disabled": "k_moe_mmid_direct_route_validated = false" in source
+            and "q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated" in source,
         "Q1/NVFP4 recipe is decode-only": "phase == moe_route_phase::DECODE && rows == 1" in capability,
         "Q1/NVFP4 recipe is exact primary": "route_device == submit_device" in capability,
         "Q1/NVFP4 recipe requires stable owner": "direct_recipe_candidate->has_stable_owner_identity()" in capability,
@@ -149,7 +161,19 @@ def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> N
                     "has_stable_owner_identity()", "out.handle.resolve"):
         assert witness in resolver, witness
     prestage = function(source, "static void moe_prestage_popular_experts")
-    assert "expert_meta = g_moe_expert_meta" in prestage
+    # The metadata copy is now half of a PAIRED snapshot: prestage consults the
+    # group registry repeatedly further down, and taking the two registries under
+    # separate locks would let a concurrent moe_hybrid_init_once pair this model's
+    # metadata with the next model's groups. So the property is stronger than a
+    # plain copy -- prestage must not reach the live global at all.
+    assert "moe_snapshot_registries()" in prestage
+    assert "expert_meta = registries.meta" in prestage
+    assert "g_moe_expert_meta" not in prestage
+    snapshot = function(source, "static moe_registry_snapshot moe_snapshot_registries")
+    assert "std::scoped_lock" in snapshot
+    assert "lock(g_moe_expert_meta_mutex, g_expert_groups_mutex)" in snapshot
+    assert re.search(r"snapshot\.meta\s*=\s*g_moe_expert_meta\s*;", snapshot)
+    assert re.search(r"snapshot\.groups\s*=\s*g_expert_groups\s*;", snapshot)
     assert "source_leases.push_back(std::move(source))" in prestage
     materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
     assert "meta_value = m" in materialize
@@ -250,7 +274,10 @@ def test_real_sycl_owned_slice_lifecycle_is_registered() -> None:
     test = function(LIFECYCLE_TEST.read_text(), "static bool test_canonical_owned_aos_slice_lifecycle")
     for witness in (
         "unified_alloc(req, &allocation)",
-        "mem_handle::from_owned_alloc",
+        # unified_alloc yields the legacy alloc_handle, so the fixture mints
+        # through the allocator-private adapter. violations() scores that the
+        # adapter is itself owner-first.
+        "ggml_sycl::detail::from_legacy_owned_alloc(std::move(allocation), GGML_LAYOUT_AOS)",
         "owner.slice(expert_bytes, expert_bytes)",
         "expert.resolve(1)",
         "unified_lookup(base, &lookup)",
@@ -381,13 +408,21 @@ def test_rejected_publication_cleanup_and_retirement_ordering() -> None:
     retire = function(cache, "expert_retire_status unified_cache::retire_expert_entry_exact")
     for witness in (
         "std::lock(direct_lock, cache_lock)",
-        "pair.second.retired = true",
+        # The retired-flag write moved into a helper that also maintains the
+        # pending-GC counter; the mirror handle became a scalar so retirement
+        # cannot fail allocating a vector after withdrawal has begun.
+        "transition_to_retired_locked(pair.second)",
         "direct_expert_entries_.erase",
-        "released_mirror_handles.clear()",
+        "released_mirror_handle.reset()",
         "finalize_retired_entries_locked",
     ):
         assert witness in retire, witness
     assert "cache_generation_bump" not in retire
+    # Score the extracted helper, not just the call: the entry must actually
+    # reach the retired state, which is what the inlined write used to prove.
+    transition = function(cache, "bool unified_cache::transition_to_retired_locked")
+    assert "entry.retired = true" in transition
+    assert "retired_pending_count_.fetch_add" in transition
 
     start = source.index("// Transaction rollback state machine:")
     rollback = source[start:source.index("dpas_down_tensors++", start)]
@@ -413,5 +448,16 @@ def test_mutations_are_witnessed() -> None:
         source.replace("ggml_sycl_invalidate_backend_weight_mutation(dst_ctx, dst);", "", 1),
         source.replace("ggml_sycl_invalidate_backend_buffer_weights(ctx);", "", 1),
         source.replace("replacement.reserve(expert_count);", "", 1),
+        source.replace("managed_handle = ggml_sycl::detail::from_legacy_owned_alloc(std::move(h), GGML_LAYOUT_AOS);",
+                       "managed_handle = ggml_sycl::mem_handle::from_direct(h.ptr, GGML_LAYOUT_AOS, true, h.device, h.size);", 1),
+        source.replace("constexpr bool k_moe_mmid_direct_route_validated = false;",
+                       "constexpr bool k_moe_mmid_direct_route_validated = true;", 1),
+        # Re-spelling the admission gate as a literal is the specific drift the
+        # one-definition rule exists to prevent, so it must be witnessed even
+        # though the value it names is unchanged.
+        source.replace("constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated;",
+                       "constexpr bool q1_nvfp4_direct_b70_validated = false;", 1),
     ]
+    # A mutation whose target string has drifted away is a silent no-op, which
+    # would leave violations() empty and fail here rather than pass vacuously.
     assert all(violations(mutated) for mutated in mutations)

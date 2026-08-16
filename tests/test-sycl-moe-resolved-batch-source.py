@@ -227,12 +227,25 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
         "independent down admission": "pair.down_weight, ctx.device, prompt_ids_snapshot.data()",
         "cross-role alignment": "align_moe_retained_role_batches(",
         "validated pair roles": "const bool prompt_pair_retained_roles_validated = [&]()",
-        "pair capability quarantined": "const bool prompt_pair_retained_roles_capable = false",
+        # The blanket quarantine was lifted when the route gained its transactional
+        # executor; eligibility is now narrowed to the proven MXFP4 all-primary
+        # path instead. Score the narrowing -- an unconditional `= true` and a
+        # re-widened predicate must both still be visible here.
+        "pair capability narrowed to MXFP4":
+            "prompt_pair_retained_roles_capable = prompt_pair_retained_roles_validated"
+            " && src0->type == GGML_TYPE_MXFP4",
         "retained pointer-table result": "ggml_sycl_upload_moe_retained_ptr_table_from_batch(",
-        "actual terminal owner": "ggml_sycl_retain_moe_terminal_bundle(std::move(terminal))",
-        "transactional terminal publication": "terminal.terminal_submitted = true",
+        # Terminal ownership moved from a retained bundle to the recorder's
+        # terminal token, published through the thread-local store.
+        "actual terminal owner":
+            "recorder.install_terminal(fused::TerminalToken(std::make_unique<EventOwner>(terminal_event)))",
+        "transactional terminal publication":
+            "static thread_local fused::PublicationStore publication_store",
         "transactional skip commit": "entry.set->insert(std::move(entry.node))",
-        "down table preflight": "if (gate_ptrs && up_ptrs && down_table.valid())",
+        # All three tables are now preflighted together with their ABI resolution
+        # and the stable identity of every storage handle, before any submit.
+        "down table preflight":
+            "const bool artifacts_ok = gate_table.valid() && up_table.valid() && down_table.valid()",
         "post-write failure waits": "terminal_event.wait()",
     }
     header_tokens = tokens(header)
@@ -329,11 +342,17 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
     pair_path_tokens = mmid_tokens[pair_start_tokens:pair_end_tokens]
     down_table_tokens = token_sequence_index(pair_path_tokens, "auto down_table")
     write_submit_tokens = token_sequence_index(
-        pair_path_tokens, "submitted = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(")
+        pair_path_tokens, "gate_up_ok = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(")
     skip_commit_tokens = token_sequence_index(pair_path_tokens, "entry.set->insert(std::move(entry.node))")
+    # Readiness is now attributed per destination rather than publishing the down
+    # terminal event for both: glu_dst is complete at the GLU event, down_dst at
+    # the terminal one. Score both, so collapsing them back onto one event -- in
+    # either direction -- is visible here.
     ready_publish_tokens = token_sequence_index(
-        pair_path_tokens, "ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, terminal_event)")
-    if not down_table_tokens < write_submit_tokens < skip_commit_tokens < ready_publish_tokens:
+        pair_path_tokens, "ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, executor.glu_event)")
+    down_ready_tokens = token_sequence_index(
+        pair_path_tokens, "ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, executor.terminal_event)")
+    if not down_table_tokens < write_submit_tokens < skip_commit_tokens < ready_publish_tokens < down_ready_tokens:
         failures.append("down preflight or transactional publication ordering")
     if contains_tokens(pair_path_tokens, "g_moe_precomputed_down_layer_skip") or contains_tokens(
             pair_path_tokens, "ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst"):
@@ -403,16 +422,27 @@ def violations(header: str, source: str, host_test: str, mem_handle_source: str)
 def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     source = SOURCE.read_text()
     mmid = function_definition(source, "static void ggml_sycl_mul_mat_id(")
-    start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = false")
+    # The gate is one file-scope definition shared with the materialization gate;
+    # the admission site must read it by name, never re-spell it as a literal.
+    start = mmid.index("constexpr bool q1_nvfp4_direct_b70_validated = k_moe_mmid_direct_route_validated")
     end = mmid.index("// MoE hybrid GPU+CPU dispatch gate", start)
     direct = mmid[start:end]
-    assert "q1_nvfp4_direct_b70_validated = false" in direct
+    assert "constexpr bool k_moe_mmid_direct_route_validated = false;" in source
     assert "(q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) && ne12 == 1" in direct
     validator = function_definition(HEADER.read_text(), "inline moe_batch_reject_reason validate_moe_batch_route(")
     assert "route.lease.kind() == mem_handle_kind::DIRECT && !route.lease.has_stable_owner_identity()" in validator
     assert "owned_direct_slice_route_acceptance" in HOST_TEST.read_text()
-    assert mmid.index("ggml_sycl_publish_backend_aos_expert_handles(") < mmid.index(
+    # Publication moved into a helper, but the ordering it guarantees did not:
+    # BOTH admissions must publish before the non-materializing retained
+    # resolver runs, so score two call sites bracketing their own admissions.
+    publisher = "ggml_sycl_publish_mmid_canonical_aos_experts("
+    assert mmid.count(publisher) == 2
+    assert mmid.index(publisher) < mmid.index(
+        "retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
+    assert mmid.rindex(publisher) < mmid.index(
         "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
+    helper = function_definition(source, "static bool ggml_sycl_publish_mmid_canonical_aos_experts(")
+    assert "ggml_sycl_publish_backend_aos_expert_handles(" in helper
     assert "std::make_shared<const std::vector<int32_t>>(decode.expert_ids)" in direct
     assert "completion->retained_ids = retained_ids" in direct
     move = direct.index("completion->bundle = std::move(admitted.bundle)")
@@ -431,7 +461,12 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     materialize_end = source.index("ggml_sycl_lifecycle_result ggml_backend_sycl_model_load_end", materialize_start)
     materialize = source[materialize_start:materialize_end]
     assert "ggml_sycl_get_backend_context_for_device(workspace.owner_device)" in materialize
-    assert "backend ? backend->stream() : nullptr" in materialize
+    # The null-backend ternary became an explicit refusal with a reason code, so
+    # score the refusal rather than the expression that used to stand in for it.
+    assert "sycl::queue * queue = backend->stream();" in materialize
+    assert "moe_mmid_materialize_reason::NO_BACKEND_CONTEXT" in materialize
+    assert materialize.index("moe_mmid_materialize_reason::NO_BACKEND_CONTEXT") < materialize.index(
+        "sycl::queue * queue = backend->stream();")
     assert ".default_queue()" not in materialize
     assert "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> & snapshot" in materialize
     assert "unified_cache_materialize_moe_mmid_workspaces(\n        owner, snapshot, submit_device" in materialize
@@ -439,8 +474,11 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
     pre_admit = mmid[:start]
     assert "ggml_sycl_moe_log_canonical_publish_pre_admission" in pre_admit
     assert "canonical_published" in pre_admit
-    assert "expert0->handle.kind()" in pre_admit
-    assert "expert0->handle.has_stable_owner_identity()" in pre_admit
+    # The expert-0 readback moved into the publisher helper along with the
+    # publish call, and the record is now a value rather than a pointer.
+    assert "expert0.logical_handle.kind()" in helper
+    assert "expert0.logical_handle.has_stable_owner_identity()" in helper
+    assert "resolve_moe_storage_record(0, GGML_LAYOUT_AOS, device" in helper
     assert pre_admit.index("ggml_sycl_moe_log_canonical_publish_pre_admission(") < pre_admit.index(
         "retained_decode_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(")
     query = function_definition(source, "static moe_route_capability ggml_sycl_moe_query_route_capability(")
@@ -454,9 +492,11 @@ def test_direct_decode_review_contract_is_closed_and_lifetime_safe() -> None:
         "invocation_backend && invocation_queue",
         "queue_capability && queue_capability->valid()",
         "queue_capability->owner_device() == submit_device",
-        'cap.reason = "direct-recipe-candidate"',
     ):
         assert witness in query, witness
+    # Vertical alignment pads this assignment, so match on tokens -- a literal
+    # single-space spelling breaks the next time clang-format realigns the block.
+    assert has_tokens(query, 'cap.reason = "direct-recipe-candidate"')
     assert "&normalized.lease" in source
     assert "ggml_sycl_moe_mark_direct_authority_pre_admission(src0)" in direct
     assert direct.index("ggml_sycl_moe_mark_direct_authority_pre_admission(src0)") < direct.index(
@@ -544,14 +584,20 @@ def test_contract_and_mutation_witnesses() -> None:
         ("drop-role-alignment-open", header.replace(
             "out.reject = moe_batch_reject_reason::NONE;", ""), source, host_test, mem_source),
         ("drop-down-table-preflight", header,
-         source.replace("gate_ptrs && up_ptrs && down_table.valid()", "gate_ptrs && up_ptrs"),
+         source.replace("gate_table.valid() && up_table.valid() && down_table.valid() &&",
+                        "gate_table.valid() && up_table.valid() &&"),
          host_test, mem_source),
-        ("enable-quarantined-role-capability", header,
-         source.replace("const bool prompt_pair_retained_roles_capable = false;",
-                        "const bool prompt_pair_retained_roles_capable = prompt_pair_retained_roles_validated;"),
+        ("widen-pair-role-capability", header,
+         source.replace("prompt_pair_retained_roles_validated && src0->type == GGML_TYPE_MXFP4;",
+                        "prompt_pair_retained_roles_validated;"),
          host_test, mem_source),
-        ("publish-before-terminal", header,
-         source.replace("terminal.terminal_submitted = true;", "terminal.terminal_submitted = false;"),
+        ("terminal-token-owns-nothing", header,
+         source.replace("fused::TerminalToken(std::make_unique<EventOwner>(terminal_event))",
+                        "fused::TerminalToken()"),
+         host_test, mem_source),
+        ("publication-store-not-retained", header,
+         source.replace("static thread_local fused::PublicationStore publication_store;",
+                        "fused::PublicationStore publication_store;"),
          host_test, mem_source),
         ("public-proof", header.replace("  private:\n    // Non-forgeable", "  public:\n    // forged"),
          source, host_test, mem_source),
