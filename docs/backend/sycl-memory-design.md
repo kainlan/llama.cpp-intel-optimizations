@@ -49,6 +49,45 @@ canonical contract §1 for the formal version):
    current pointer on dereference. Holding a handle guarantees the backing
    allocation cannot be freed or evicted underneath you.
 
+## Placement decides the executor (owner ruling, 2026-08-16 — do not drift)
+
+The division of labour between the planner and the dispatcher is fixed, and it
+runs in exactly one direction:
+
+> **The planning pass decides where data lives. Inference then executes each op
+> where its data already is.** A `mem_handle` can point at a specific GPU's VRAM
+> or at system host pinned memory; if the operand is in a device's VRAM, that
+> device runs the op — if it is in host pinned memory, the **CPU** runs the op.
+
+Placement is chosen for fit and for where execution will be most optimal — e.g.
+**dense weights fill VRAM first, before MoE experts are placed there** — and
+that decision is made once, in the planning pass. The dispatcher never
+re-litigates it at op time. Two symmetric failure modes are therefore forbidden:
+
+- **No GPU "zero-copy" reads of host memory.** Feeding a host-pinned pointer to
+  a GPU kernel is slower than CPU dispatch (measured: CPU AOS 18–30 GB/s vs GPU
+  zero-copy 11.3 GB/s) and breaks the tier abstraction.
+- **No weight streaming.** Copying host-resident weights into device scratch
+  per dispatch so the GPU can run the op is the same violation paid twice — a
+  PCIe copy *plus* scratch pressure. The answer to "this expert is
+  host-resident" is CPU expert dispatch (the `CpuExpertPool` machinery, live in
+  `ggml_sycl_mul_mat_id`), overlapped with GPU work via `sycl::depends_on`
+  (~9.7 µs cross-device latency). If a VRAM-starved configuration is too slow on
+  CPU, the fix is placement (budget, eviction priority), never a streaming path.
+
+Scope boundary, so the rule is not over-applied: staging that converts the
+*format* of **device-resident** data (e.g. on-device dequant of MXFP4 into an
+f16 scratch for oneDNN) is not a placement violation — the bytes never cross the
+host/device boundary. The rule governs *residency*, not layout conversion. Even
+so, such conversion scratch belongs to planned zones (see "Path-scoped zone
+sizing"), not ad-hoc per-dispatch transients.
+
+Conformance is auditable, not aspirational: `llama.cpp-v4jk` tracks the standing
+audit that no dispatch route can receive a host-resident operand and stage it to
+device (the routes themselves carry no residency branch — the diversion must be
+proven structural, upstream, where `requires_host_staging` and the HOST tier are
+modelled).
+
 ## The one allocation entry point
 
 All runtime/scratch/staging/KV/compute allocation goes through a single
@@ -303,9 +342,12 @@ is the short form; this is the why):
 - **Never add forced eviction / forced reap / zone-reset to reclaim memory that
   still has a live handle.** A live allocation at cleanup means a leaked
   reference or stale owner — fix that, don't force the free.
-- **Host-resident weights dispatch on CPU, not via GPU "zero-copy."** Feeding a
-  host-pinned pointer to a GPU kernel is slower (measured 1.6–2.6×) *and* breaks
-  the tier abstraction. Let `resolve()` report residency and route accordingly.
+- **Host-resident weights dispatch on CPU, not via GPU "zero-copy" — and not
+  via per-dispatch staging copies either.** Feeding a host-pinned pointer to a
+  GPU kernel is slower (measured 1.6–2.6×) *and* breaks the tier abstraction;
+  streaming the weight into device scratch to dodge that is the same violation
+  plus a copy. Let `resolve()` report residency and route accordingly. See
+  "Placement decides the executor" above for the full rule and its scope.
 
 ## Epoch-refcounted transient zones (llama.cpp-2757 / iiff Option C)
 

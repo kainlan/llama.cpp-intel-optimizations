@@ -658,7 +658,18 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
 ### Architecture
 - **The unified cache owns all GPU/host memory** (decision Feb 9, 2026). Weight placement, eviction (device→pinned host→mmap), and budget tracking all flow through it.
 - **Use smart handles, never hold a raw `void*` from the cache.** A raw VRAM pointer becomes dangling the moment the cache evicts to host → DEVICE_LOST errors or corrupted results. Handles must resolve location on dereference so the cache can move data between tiers transparently.
-- **Host-resident weights → CPU dispatch, not GPU PCIe "zero-copy."** Measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s (1.6–2.6x slower). Parallelize CPU work with GPU via `sycl::depends_on` (~9.7 µs cross-device latency). Never feed a host-pinned pointer to a GPU kernel as "zero-copy."
+- **PLACEMENT DECIDES THE EXECUTOR (owner ruling 2026-08-16; full statement in
+  `docs/backend/sycl-memory-design.md` § "Placement decides the executor").** The
+  planning pass puts data where it fits and where it runs best (dense weights fill
+  VRAM before experts); inference then executes each op **where its data already
+  is** — device-resident → that GPU runs it, host-pinned → the **CPU** runs it.
+  Both escape hatches are forbidden: no GPU PCIe "zero-copy" reads of host memory
+  (measured CPU AOS = 18–30 GB/s vs GPU zero-copy = 11.3 GB/s, 1.6–2.6x slower),
+  and **no weight streaming** (copying host-resident weights to device scratch
+  per dispatch). Host-resident experts go through the live CpuExpertPool path,
+  parallelized with GPU work via `sycl::depends_on` (~9.7 µs cross-device
+  latency). Format-conversion staging of *device-resident* data (on-device
+  dequant into planned scratch zones) is layout work, not a placement violation.
 - **The VRAM budget calc is correct by design for DISCRETE cards** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
   ⚠️ **It is catastrophically wrong for an INTEGRATED GPU, and that is the cause of this host's OOM history** (`llama.cpp-403s`, measured 2026-08-01). The Arrow Lake-S iGPU reports `global_mem_size` = **231.7 GB** — 94 % of the host's 246.9 GB — because for an integrated GPU "VRAM" *is* system RAM. `ggml-sycl.cpp:10043-10049` feeds that into the same budget path as a discrete card at a **default of 100 %**, and neither `ggml-sycl.cpp` nor `unified-cache.cpp` contains a single occurrence of `host_unified` or `is_integrated`. So the backend claims the machine.
   Isolated with one variable — same 19 MB model, same single-threaded `llama-completion`, only the selector changed: `level_zero:0` → peak `Shmem` **2.4 GB**; `level_zero:0,1` → **2.4 GB**; selector unset (adds the iGPU) → **127.8 GB**.
