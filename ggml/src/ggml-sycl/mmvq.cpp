@@ -20373,7 +20373,16 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                             (int) effective);
         }
     }
-    if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && layout != GGML_LAYOUT_AOS) {
+    // Complementary to the roster-derived downgrade in ggml_sycl_select_moe_mmvq_layout()
+    // / ggml_sycl_select_moe_expert_cache_layout() (ggml-sycl.cpp): those advertise only
+    // what moe-mmvq-tables.hpp backs, by DOWNGRADING an unsupported layout to AOS. This
+    // is the same roster consulted in the opposite direction -- a REFUSAL of a layout
+    // (e.g. a caller-forced one) that still names a (type, layout) pair no executor
+    // accepts. The two forms are not interchangeable: swapping this refusal for a
+    // downgrade would silently submit a kernel over data staged in the wrong layout
+    // instead of declining cleanly before submit.
+    if (moe_mmvq_batched_dispatch_supports_type(src0->type) &&
+        !moe_mmvq_any_dispatch_supports_layout(src0->type, layout)) {
         GGML_SYCL_DEBUG("[MMVQ] Layout=%d unsupported for MoE type=%d (%s)\n", (int) layout, src0->type,
                         src0->name ? src0->name : "?");
         mmvq_moe_trace(src0, "quant_layout_unsupported", ctx.device, (int) layout, forced_layout != nullptr, batch_size,

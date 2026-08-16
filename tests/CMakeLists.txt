@@ -1258,6 +1258,20 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;placement;moe"
         TIMEOUT 120
     )
+    # llama.cpp-zoly / llama.cpp-nkfc: the MoE MMVQ-ID layout advertisement
+    # (ggml_sycl_select_moe_mmvq_layout, ggml_sycl_select_moe_expert_cache_layout)
+    # and refusal (ggml_sycl_mul_mat_id_vec_q) sites must be roster-derived
+    # (moe-mmvq-tables.hpp), not a hand-maintained {Q4_0, Q8_0} type list.
+    # Content-greps the whole SYCL backend at run time rather than trusting a
+    # frozen list of sites -- see the module docstring for the deliberately
+    # unfixed common.hpp exception.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-mmvq-layout-roster-agreement-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;moe;hostonly"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-packed-k-live-source.py

@@ -25320,10 +25320,16 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
 layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int device, bool host_weights) {
     const char * reason   = nullptr;
     layout_mode  resolved = ggml_sycl_select_moe_gpu_layout(src0, device, &reason);
-    if (src0 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
-        // The q4_0/q8_0 MoE MMVQ-ID kernels consume AoS expert blocks. They do
-        // not have a reordered SOA/coalesced variant; choosing SOA here creates
-        // valid unified-cache handles for data the kernel then misinterprets.
+    if (src0 && moe_mmvq_batched_dispatch_supports_type(src0->type) &&
+        !moe_mmvq_any_dispatch_supports_layout(src0->type, resolved) &&
+        moe_mmvq_any_dispatch_supports_layout(src0->type, GGML_LAYOUT_AOS)) {
+        // The MoE MMVQ-ID kernels for AoS-only types (moe-mmvq-tables.hpp) consume
+        // AoS expert blocks. They do not have a reordered SOA/coalesced variant;
+        // advertising SOA/coalesced here creates valid unified-cache handles for
+        // data the kernel then misinterprets. This was originally spelled out for
+        // q4_0/q8_0 by name; it is now roster-derived so a type's pin lifts
+        // automatically once moe-mmvq-tables.hpp gains a kernel for it, with no
+        // edit required here.
         resolved = GGML_LAYOUT_AOS;
     }
     if (resolved == GGML_LAYOUT_XMX_TILED) {
@@ -25336,7 +25342,7 @@ layout_mode ggml_sycl_select_moe_mmvq_layout(const ggml_tensor * src0, int devic
         const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
         final_layout       = get_effective_layout_mode(extra);
     }
-    if (src0 && (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_MXFP4)) {
+    if (src0 && moe_mmvq_batched_dispatch_supports_type(src0->type)) {
         static std::mutex                      log_mutex;
         static std::unordered_set<std::string> logged;
         const std::string                      key = std::to_string(device) + ":" + (src0->name ? src0->name : "?");
@@ -25520,7 +25526,15 @@ static layout_mode ggml_sycl_select_moe_expert_cache_layout(const ggml_tensor * 
     }
 
     layout_mode resolved = ggml_sycl_select_moe_gpu_layout(src0, device, nullptr);
-    if (src0 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0)) {
+    if (src0 && moe_mmvq_batched_dispatch_supports_type(src0->type) &&
+        !moe_mmvq_any_dispatch_supports_layout(src0->type, resolved) &&
+        moe_mmvq_any_dispatch_supports_layout(src0->type, GGML_LAYOUT_AOS)) {
+        // Same roster-derived pin as ggml_sycl_select_moe_mmvq_layout() above: the
+        // MoE MMVQ-ID kernels for AoS-only types (moe-mmvq-tables.hpp) consume AoS
+        // expert blocks with no reordered SOA/coalesced variant, and advertising
+        // SOA/coalesced here would hand the kernel valid unified-cache handles for
+        // data it misinterprets. Roster-derived so the pin lifts automatically once
+        // a type gains a non-AOS _id kernel.
         return GGML_LAYOUT_AOS;
     }
     if (resolved == GGML_LAYOUT_XMX_TILED || resolved == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
