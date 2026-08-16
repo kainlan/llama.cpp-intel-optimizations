@@ -851,9 +851,13 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # (~3.2 GB) exceeds the B50's placement headroom (and physical VRAM) — the
 # fork disabled upstream's context fitter (fit_params=false under SYCL) and
 # the unified cache only validates, never shrinks. It is NOT a chat-correctness
-# or MMID regression — do not open that investigation. Until the uize fix
-# lands, add `-c 4096` to RUN the correctness check (the -c-pinning question
-# is an open owner decision, not doctrine).
+# or MMID regression — do not open that investigation. ⚠️ UPDATE: `-c 4096` no
+# longer rescues the gate — it clears init and then aborts mid-generation
+# (llama.cpp-fxrg, P0: tiered_kv_buffer_get_tensor omits its byte-contract
+# argument, so the server's prompt-checkpoint read gets a zero-extent
+# destination handle and the honest range guard refuses). BOTH defects block
+# the gate; there is currently NO workaround. llama-bench GPT-OSS runs are
+# unaffected (bench does not go through the in-process server path).
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
 # The gate is the digit sequence. (An older note here said the output starts
