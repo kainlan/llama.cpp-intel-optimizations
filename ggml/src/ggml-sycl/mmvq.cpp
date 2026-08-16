@@ -1192,26 +1192,31 @@ mxfp4_moe_gateup_prepack_result mxfp4_moe_gateup_prepack_selected_rows_submit(
 static uint8_t * mmvq_alloc_device_scratch(size_t                  bytes,
                                            sycl::queue &           queue,
                                            const char *            cohort_id,
-                                           ggml_sycl::mem_handle & owner) {
+                                           ggml_sycl::mem_handle & owner,
+                                           bool                    persistent = false) {
     owner = {};
     if (bytes == 0) {
         return nullptr;
     }
 
     ggml_sycl::alloc_request req{};
-    req.queue                          = &queue;
-    req.device                         = ggml_sycl_get_device_id_from_queue(queue);
-    req.size                           = bytes;
-    req.intent.role                    = ggml_sycl::alloc_role::COMPUTE;
-    req.intent.category                = ggml_sycl::runtime_category::COMPUTE;
-    req.intent.cohort_id               = cohort_id;
-    req.intent.constraints.must_device = true;
+    req.queue                               = &queue;
+    req.device                              = ggml_sycl_get_device_id_from_queue(queue);
+    req.size                                = bytes;
+    req.intent.role                         = ggml_sycl::alloc_role::COMPUTE;
+    req.intent.category                     = ggml_sycl::runtime_category::COMPUTE;
+    req.intent.cohort_id                    = cohort_id;
+    req.intent.constraints.must_device      = true;
     // Command graphs retain captured scratch pointers across replay. Reset-zone
     // slices cannot stay live across the graph-compute boundary, so graph
-    // recording must use standalone unified-cache allocations instead.
-    req.intent.constraints.prefer_vram_zone =
-        ggml_sycl_graph_recording_active() ? ggml_sycl::vram_zone_id::COUNT : ggml_sycl::vram_zone_id::SCRATCH;
-    req.suppress_failure_log = true;
+    // recording must use standalone unified-cache allocations instead. A
+    // persistent (cross-dispatch, cache-owned) caller needs the identical
+    // non-reset-eligible allocation for the same reason, even when not
+    // currently recording (llama.cpp-b2yb).
+    req.intent.constraints.prefer_vram_zone = (persistent || ggml_sycl_graph_recording_active()) ?
+                                                  ggml_sycl::vram_zone_id::COUNT :
+                                                  ggml_sycl::vram_zone_id::SCRATCH;
+    req.suppress_failure_log                = true;
 
     owner = ggml_sycl::unified_allocate(req);
     if (!owner.valid()) {
@@ -16748,16 +16753,53 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     }
                 }
 
-                if (!alloc_i32_scratch(grouped_experts_device, grouped_experts_host.size(),
-                                       "mmvq_moe_batched_grouped_experts") ||
-                    !alloc_i32_scratch(grouped_offsets_device, grouped_offsets_host.size(),
-                                       "mmvq_moe_batched_grouped_offsets") ||
-                    !alloc_i32_scratch(grouped_rows_device, grouped_rows_host.size(),
-                                       "mmvq_moe_batched_grouped_rows") ||
-                    !alloc_i32_scratch(grouped_chunk_groups_device, grouped_chunk_groups_host.size(),
-                                       "mmvq_moe_batched_grouped_chunk_groups") ||
-                    !alloc_i32_scratch(grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
-                                       "mmvq_moe_batched_grouped_chunk_starts")) {
+                auto * grouped_scratch_extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+                if (!grouped_scratch_extra) {
+                    log_xmx_reject("group-alloc");
+                    return false;
+                }
+                auto & grouped_scratch    = grouped_scratch_extra->moe_grouped_scratch[ctx.device];
+                auto   cached_i32_scratch = [&](ggml_sycl::mem_handle & cache_handle, size_t & cache_capacity,
+                                              int32_t *& ptr, size_t count, const char * cohort) -> bool {
+                    ptr = nullptr;
+                    if (count == 0) {
+                        return true;
+                    }
+                    if (cache_handle.valid() && cache_capacity >= count) {
+                        auto resolved = cache_handle.resolve(ctx.device);
+                        if (resolved && resolved.ptr && resolved.on_device) {
+                            ptr = reinterpret_cast<int32_t *>(resolved.ptr);
+                            return true;
+                        }
+                        // Cached handle no longer resolves (evicted) -- fall through
+                        // and reallocate below rather than dispatch on a stale pointer.
+                        cache_handle   = ggml_sycl::mem_handle{};
+                        cache_capacity = 0;
+                    }
+                    ggml_sycl::mem_handle fresh_handle;
+                    ptr = reinterpret_cast<int32_t *>(mmvq_alloc_device_scratch(
+                        count * sizeof(int32_t), *stream, cohort, fresh_handle, /*persistent=*/true));
+                    if (!ptr) {
+                        return false;
+                    }
+                    cache_handle   = std::move(fresh_handle);
+                    cache_capacity = count;
+                    return true;
+                };
+                if (!cached_i32_scratch(grouped_scratch.experts_handle, grouped_scratch.experts_capacity,
+                                        grouped_experts_device, grouped_experts_host.size(),
+                                        "mmvq_moe_batched_grouped_experts") ||
+                    !cached_i32_scratch(grouped_scratch.offsets_handle, grouped_scratch.offsets_capacity,
+                                        grouped_offsets_device, grouped_offsets_host.size(),
+                                        "mmvq_moe_batched_grouped_offsets") ||
+                    !cached_i32_scratch(grouped_scratch.rows_handle, grouped_scratch.rows_capacity, grouped_rows_device,
+                                        grouped_rows_host.size(), "mmvq_moe_batched_grouped_rows") ||
+                    !cached_i32_scratch(grouped_scratch.chunk_groups_handle, grouped_scratch.chunk_groups_capacity,
+                                        grouped_chunk_groups_device, grouped_chunk_groups_host.size(),
+                                        "mmvq_moe_batched_grouped_chunk_groups") ||
+                    !cached_i32_scratch(grouped_scratch.chunk_starts_handle, grouped_scratch.chunk_starts_capacity,
+                                        grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
+                                        "mmvq_moe_batched_grouped_chunk_starts")) {
                     log_xmx_reject("group-alloc");
                     return false;
                 }

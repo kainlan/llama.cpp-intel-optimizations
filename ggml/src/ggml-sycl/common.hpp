@@ -3775,6 +3775,30 @@ struct ggml_tensor_extra_gpu {
     bool                  moe_expert_ptrs_missing_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
     ggml_sycl::mem_handle moe_expert_ptrs_missing_handle[GGML_SYCL_MAX_DEVICES];
 
+    // Persistent per-tensor scratch for MXFP4 XMX-tiled grouped-decode
+    // dispatch metadata (llama.cpp-b2yb). Content is rebuilt on every
+    // dispatch -- routing is token-dependent -- but the underlying device
+    // allocation's SIZE is a pure function of (topk, num_tokens, n_experts)
+    // and does not vary call to call for a fixed batch shape, so only the
+    // allocation is cached. Must be requested from a non-SCRATCH zone (see
+    // mmvq_alloc_device_scratch's persistent= parameter) -- a bulk SCRATCH
+    // reset does not preserve slices, and a cached handle in that zone would
+    // dangle across the next reset.
+    struct moe_grouped_scratch_slot {
+        ggml_sycl::mem_handle experts_handle;
+        ggml_sycl::mem_handle offsets_handle;
+        ggml_sycl::mem_handle rows_handle;
+        ggml_sycl::mem_handle chunk_groups_handle;
+        ggml_sycl::mem_handle chunk_starts_handle;
+        size_t                experts_capacity      = 0;
+        size_t                offsets_capacity      = 0;
+        size_t                rows_capacity         = 0;
+        size_t                chunk_groups_capacity = 0;
+        size_t                chunk_starts_capacity = 0;
+    };
+
+    moe_grouped_scratch_slot moe_grouped_scratch[GGML_SYCL_MAX_DEVICES];
+
     // Read accessors: nullptr on an out-of-range dev, as elsewhere in this struct.
     void * moe_compact_ptr(int dev) const {
         if (!ggml_sycl_valid_device_index(dev)) {
