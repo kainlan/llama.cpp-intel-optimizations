@@ -1048,6 +1048,18 @@ void mem_handle::store_lease_state_locked(const lease_state & state) const {
 }
 
 void mem_handle::release_lease_state(const lease_state & state) noexcept {
+    // llama.cpp-vfd4: `state.entry` points into a unified_cache's entry map and
+    // the chunk branch below reaches a cache object. Once the shutdown flag is
+    // set, neither is guaranteed to still exist -- a handle owned by a
+    // file-static container is destroyed from __cxa_finalize, after the caches
+    // it borrows from may already have been torn down, so the decrement below
+    // would be a write through a dangling pointer. Abandon instead: the process
+    // is exiting and the OS reclaims the storage, so there is nothing to
+    // account for. This mirrors CpuExpertPool::~CpuExpertPool (cpu-expert-pool.cpp),
+    // which already skips its own cleanup for exactly this reason.
+    if (ggml_sycl_is_shutting_down()) {
+        return;
+    }
     if (state.entry) {
         // llama.cpp-fzem: record the release BEFORE the decrement below, not
         // after -- once in_use_count drops the entry may be evicted, and the

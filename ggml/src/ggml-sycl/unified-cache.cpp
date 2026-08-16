@@ -944,6 +944,19 @@ release_attempt allocation_release_coordinator::release_physical(alloc_owner_con
 }
 
 release_attempt allocation_release_coordinator::retire(alloc_owner_control * control) noexcept {
+    // llama.cpp-vfd4: release_physical() reaches g_runtime_alloc_registry and
+    // then a unified_cache, both file-statics. A mem_handle owned by another
+    // file-static container retires from __cxa_finalize, where destruction
+    // order across translation units is unspecified and those statics may
+    // already be gone. The check has to sit here rather than deeper: by the
+    // time control reaches unified_free_record it has already locked
+    // g_runtime_alloc_mutex. abandon_control() is the existing no-physical-
+    // release exit -- coordinator-local state only, so it stays valid while
+    // this method is executing.
+    if (ggml_sycl_is_shutting_down()) {
+        abandon_control(control);
+        return { release_attempt_status::INVALID };
+    }
     // Physical retirement can acquire registry/cache locks and must run before
     // taking the intrusive retry leaf lock.
     release_attempt attempt = release_physical(control);
@@ -11426,6 +11439,18 @@ static unified_cache * get_unified_cache_for_device_impl(int device_id, const de
         if (it != g_device_caches.end()) {
             return it->second.get();
         }
+    }
+
+    // llama.cpp-vfd4: never CONSTRUCT a cache once shutdown has begun. A miss
+    // during __cxa_finalize would otherwise run the whole unified_cache
+    // constructor -- which allocates its own staging buffer -- against a
+    // half-finalized module. Nothing has a legitimate reason to bring a new
+    // cache into existence at that point; the callers that reach here during
+    // teardown are release paths that only ever wanted an already-live one.
+    // Deliberately placed after the read-only fast path, so a lookup that still
+    // resolves keeps working -- this refuses creation, not lookup.
+    if (ggml_sycl_is_shutting_down()) {
+        return nullptr;
     }
 
     // Slow path: create cache under exclusive lock
