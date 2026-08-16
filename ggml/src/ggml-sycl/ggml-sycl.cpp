@@ -28536,6 +28536,25 @@ static sycl::event ggml_sycl_fill_onednn_woq(sycl::queue &                    qu
 }
 
 // Helper: Safe memcpy that handles mmap'd source memory via host staging
+//
+// llama.cpp-fxrg: `operation_bytes` is the ONLY authority an unknown external
+// pointer receives (see ggml_sycl_memcpy_handle_for_raw_ptr's own comment) --
+// omitting it, or passing the wrong quantity, mints a handle whose resolved
+// extent does not cover what the caller is about to move, and the copy either
+// aborts in require_resolved_range or (if you over-declare) claims bytes past
+// what the operation actually touches.
+//
+// The value passed here MUST be exactly this endpoint's OWN `offset + bytes
+// moved`, derived per call site from what the enclosing mem_copy actually
+// transfers for THIS pointer -- never copied from a neighbouring call site and
+// never assumed to equal the enclosing function's `size` parameter. Two ways
+// that assumption breaks, both found in this file's buffer-interface family:
+//   - the local `size` variable can be mutated after being saved (e.g. padded
+//     for row alignment) so the copy moves the ORIGINAL value, not `size`;
+//   - the pointer passed to this helper can already have a byte offset baked
+//     into it, in which case the matching `offset` argument to mem_copy for
+//     that endpoint is 0 and the required authority is just the bytes moved,
+//     not offset + bytes moved measured from some other, unadjusted base.
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(void *           ptr,
                                                                ggml_layout_mode layout,
                                                                int              fallback_device,
@@ -33012,9 +33031,10 @@ static bool dev2dev_memcpy(sycl::queue & q_dst,
         const int dst_device = ggml_sycl_get_device_id_from_queue(q_dst);
         const int src_device = ggml_sycl_get_device_id_from_queue(q_src);
 
-        ggml_sycl::mem_handle dst_handle = ggml_sycl_copy_handle_for_raw_ptr(ptr_dst, GGML_LAYOUT_AOS, dst_device);
+        ggml_sycl::mem_handle dst_handle =
+            ggml_sycl_copy_handle_for_raw_ptr(ptr_dst, GGML_LAYOUT_AOS, dst_device, size);
         ggml_sycl::mem_handle src_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr_src), GGML_LAYOUT_AOS, src_device);
+            ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr_src), GGML_LAYOUT_AOS, src_device, size);
 
         ggml_sycl::mem_copy(dst_handle, src_handle, size, q_dst);
         return true;
@@ -34285,9 +34305,9 @@ static void tiered_kv_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
     queue_ptr             q            = tiered_kv_queue_for_ptr(ctx, dst);
     const int             queue_device = ggml_sycl_get_device_id_from_queue(*q);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device);
+    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, queue_device, size);
     ggml_sycl::mem_handle src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, queue_device);
+        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, queue_device, size);
     ggml_sycl::mem_copy(dst_handle, src_handle, size, *q);
 }
 
@@ -34310,9 +34330,9 @@ static void tiered_kv_buffer_get_tensor(ggml_backend_buffer_t buffer,
     }
     queue_ptr             q            = tiered_kv_queue_for_ptr(ctx, src);
     const int             queue_device = ggml_sycl_get_device_id_from_queue(*q);
-    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(data, GGML_LAYOUT_AOS, queue_device);
+    ggml_sycl::mem_handle dst_handle   = ggml_sycl_copy_handle_for_raw_ptr(data, GGML_LAYOUT_AOS, queue_device, size);
     ggml_sycl::mem_handle src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device);
+        ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device, size);
     ggml_sycl::mem_copy(dst_handle, src_handle, size, *q);
 }
 
@@ -35562,9 +35582,9 @@ static void ggml_backend_sycl_split_buffer_set_tensor(ggml_backend_buffer_t buff
         ggml_sycl::mem_handle dst_handle =
             extra->data_handle[i].valid() ?
                 extra->data_handle[i] :
-                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(i), GGML_LAYOUT_AOS, i);
+                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(i), GGML_LAYOUT_AOS, i, original_size);
         ggml_sycl::mem_handle src_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(const_cast<char *>(buf_host), GGML_LAYOUT_AOS, i);
+            ggml_sycl_copy_handle_for_raw_ptr(const_cast<char *>(buf_host), GGML_LAYOUT_AOS, i, original_size);
         ggml_sycl::mem_copy(dst_handle, src_handle, original_size, *stream);
     }
 } catch (const sycl::exception & exc) {
@@ -35619,12 +35639,13 @@ static void ggml_backend_sycl_split_buffer_get_tensor(ggml_backend_buffer_t buff
         */
         ggml_sycl_set_device(i);
 
-        const queue_ptr       stream     = ctx->streams[i];
-        ggml_sycl::mem_handle dst_handle = ggml_sycl_copy_handle_for_raw_ptr(buf_host, GGML_LAYOUT_AOS, i);
+        const queue_ptr       stream = ctx->streams[i];
+        ggml_sycl::mem_handle dst_handle =
+            ggml_sycl_copy_handle_for_raw_ptr(buf_host, GGML_LAYOUT_AOS, i, original_size);
         ggml_sycl::mem_handle src_handle =
             extra->data_handle[i].valid() ?
                 extra->data_handle[i] :
-                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(i), GGML_LAYOUT_AOS, i);
+                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(i), GGML_LAYOUT_AOS, i, original_size);
         ggml_sycl::mem_copy(dst_handle, src_handle, original_size, *stream);
     }
 } catch (const sycl::exception & exc) {
@@ -36162,9 +36183,9 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_sycl::mem_handle dst_handle =
                 extra->data_handle[device].valid() ?
                     extra->data_handle[device] :
-                    ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device);
+                    ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device, size);
             ggml_sycl::mem_handle src_handle =
-                ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, device);
+                ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, device, size);
             ggml_sycl::mem_copy(dst_handle, src_handle, size, *stream);
             // DEBUG: Print first bytes of column-parallel weights to verify correct loading
             if (tensor->name[0] && strstr(tensor->name, "blk.0.attn_q.weight")) {
@@ -36242,9 +36263,9 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_sycl::mem_handle dst_handle =
                 extra->data_handle[device].valid() ?
                     extra->data_handle[device] :
-                    ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device);
+                    ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device, size);
             ggml_sycl::mem_handle src_handle =
-                ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, device);
+                ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(data), GGML_LAYOUT_AOS, device, size);
             ggml_sycl::mem_copy(dst_handle, src_handle, size, *stream);
             // DEBUG: Verify copy by reading back token 0, 1, 38, 100
             if (g_ggml_sycl_tp_debug && is_tok_embd) {
@@ -36317,23 +36338,27 @@ static void ggml_backend_sycl_tp_buffer_get_tensor(ggml_backend_buffer_t buffer,
         GGML_ASSERT(offset == 0 && size == shard_size);
 
         ggml_sycl::mem_handle dst_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(static_cast<void *>(data), GGML_LAYOUT_AOS, device);
+            ggml_sycl_copy_handle_for_raw_ptr(static_cast<void *>(data), GGML_LAYOUT_AOS, device, shard_size);
         ggml_sycl::mem_handle src_handle =
             extra->data_handle[device].valid() ?
                 extra->data_handle[device] :
-                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device);
+                ggml_sycl_copy_handle_for_raw_ptr(extra->data_device_ptr(device), GGML_LAYOUT_AOS, device, shard_size);
         ggml_sycl::mem_copy(dst_handle, src_handle, shard_size, *stream);
     } else {
         ggml_sycl::mem_handle dst_handle =
-            ggml_sycl_copy_handle_for_raw_ptr(static_cast<void *>(data), GGML_LAYOUT_AOS, device);
+            ggml_sycl_copy_handle_for_raw_ptr(static_cast<void *>(data), GGML_LAYOUT_AOS, device, size);
         ggml_sycl::mem_handle src_handle{};
         size_t                src_offset = 0;
         if (extra->data_handle[device].valid()) {
             src_handle = extra->data_handle[device];
             src_offset = offset;
         } else {
+            // NOTE: this pointer already carries `offset` (data_device_ptr(device) + offset),
+            // and the matching src_offset above stays 0 in this branch -- so the byte
+            // contract here is `size`, not `offset + size` (see the derivation-rule
+            // comment at ggml_sycl_copy_handle_for_raw_ptr's definition).
             src_handle = ggml_sycl_copy_handle_for_raw_ptr(static_cast<char *>(extra->data_device_ptr(device)) + offset,
-                                                           GGML_LAYOUT_AOS, device);
+                                                           GGML_LAYOUT_AOS, device, size);
         }
         ggml_sycl::mem_copy(dst_handle, 0, src_handle, src_offset, size, *stream);
     }

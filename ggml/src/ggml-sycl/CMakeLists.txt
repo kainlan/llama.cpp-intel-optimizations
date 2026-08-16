@@ -1964,6 +1964,47 @@ set_tests_properties(mem-ops PROPERTIES
     TIMEOUT 120
 )
 
+# Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
+# Regression for the P0 where the buffer-interface get/set_tensor family minted
+# mem_handles for caller-supplied host pointers with NO declared byte contract
+# (the 4-arg ggml_sycl_copy_handle_for_raw_ptr call site in ggml-sycl.cpp left
+# `operation_bytes` at its `= 0` default), which resolves to extent 0 and
+# aborts the first real copy through it. Direct sources, same reasoning as
+# test-mem-handle-wrong-device above: this needs its own compiled copy of
+# mem-ops.cpp (for ggml_sycl::mem_copy / require_resolved_range) alongside the
+# other seam-bearing TUs, not the ordinary DSO.
+add_executable(test-mem-handle-byte-contract
+    tests/test-mem-handle-byte-contract.cpp
+    unified-cache.cpp
+    model-lifecycle.cpp
+    pinned-pool.cpp
+    mem-handle.cpp
+    mem-ops.cpp
+)
+target_include_directories(test-mem-handle-byte-contract PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-mem-handle-byte-contract PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+# Direct sources provide the seam-bearing TUs; linking ggml-sycl here would
+# add a second implementation and silently exercise the ordinary DSO instead.
+target_link_libraries(test-mem-handle-byte-contract PRIVATE ggml-base ggml)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-mem-handle-byte-contract PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME mem-handle-byte-contract COMMAND test-mem-handle-byte-contract)
+set_tests_properties(mem-handle-byte-contract PROPERTIES
+    LABELS "sycl;handle;memory-ops;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    TIMEOUT 120
+)
+
 # Runtime allocation policy: reserve/allocate/rollback, tier selection, scoped
 # unified_alloc lifetime, offload-pool hit/miss accounting.
 endif() # static SYCL backend fixture
