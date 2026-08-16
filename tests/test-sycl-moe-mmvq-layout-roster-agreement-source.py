@@ -41,6 +41,28 @@ The two checks answer different questions ("does this exact old shape exist
 anywhere" vs. "do these three decisions still delegate entirely to the
 roster") and neither subsumes the other.
 
+HONEST SCOPE STATEMENT for the narrower check (team-lead review, second
+round): it inspects the TEXT of each site's if-condition -- recursively,
+preferring the innermost nested if, so a hardcoded list nested under an
+outer roster-derived if is found (this is what closes finding #2's original
+gap: previously a NON-recursive scan returned the outer, misleadingly-clean
+condition and missed a hardcoded list hiding one level deeper). It does NOT
+resolve what an opaque identifier in that condition refers to. Two bypasses
+follow directly from that limit and are accepted as out of scope, because
+closing them needs real data-flow analysis, not a regex/brace scanner:
+  (1) a hand-maintained list hoisted into a variable declared just before the
+      if, with the if referencing the variable (e.g.
+      `const bool aos_only = (t==Q4_0||t==Q8_0||t==Q6_K); if (roster_call(...)
+      && aos_only) {...}`);
+  (2) the same list hidden behind a helper function call in the condition.
+Both require deliberately restructuring the decision, not merely editing it,
+which is why they are accepted rather than chased. The bound: neither bypass
+can hide the exact {Q4_0, Q8_0} shape from the BROAD enumeration check above,
+which scans raw file text irrespective of if-statement scoping -- so a
+2-type hoisted variable or helper is still an offender there even though
+this narrower check cannot see through the indirection to it. Only a
+hoisted/wrapped list that is NOT exactly {Q4_0, Q8_0} escapes both checks.
+
 Not in scope, and deliberately so: llama.cpp-mn70's sibling consumer-side
 guard (R1, landed as 011064e2b) is a RUNTIME comparison against the observed
 storage layout (`get_effective_layout_mode(src0_extra) != layout`), not a
@@ -179,14 +201,23 @@ def matching_delimiter(text: str, opening: int, open_char: str, close_char: str)
 
 def if_statements(body: str):
     """Yield (condition_text, consequent_text) for every `if (...) { ... }` or
-    `if (...) stmt;` in body, in source order -- a minimal brace/paren-balanced
-    scanner in the same spirit as this repo's own
-    test-sycl-supports-op-indexed-moe-source.py (braced_body /
-    matching_delimiter), not a full C++ parser. A consequent's own nested
-    if-statements are not separately yielded (the scan resumes after the whole
-    consequent) -- irrelevant for this gate's use, which only needs to find
-    the one non-nested, marker-bearing if at each site; verified empirically
-    against the real sites in test_advertisement_and_refusal_sites_decide_layout_via_roster_only.
+    `if (...) stmt;` in body, RECURSIVELY -- both top-level ifs and every if
+    nested inside another if's consequent -- in a depth-first, parent-before-
+    child order. A minimal brace/paren-balanced scanner in the same spirit as
+    this repo's own test-sycl-supports-op-indexed-moe-source.py (braced_body /
+    matching_delimiter), not a full C++ parser.
+
+    Recursion is load-bearing, not cosmetic: an outer if's consequent_text
+    contains the FULL TEXT of everything nested inside it, so a marker that
+    actually lives inside a nested if also appears (as a substring) in every
+    enclosing if's consequent. Without recursion, only the outer if is ever
+    seen, and its (roster-derived, clean) condition is what a caller matching
+    on "consequent contains marker" would wrongly return -- exactly the
+    fail-open a team-lead review caught: a hand-maintained type list nested
+    under an outer if that itself carries a roster call. find_decision_condition
+    below is what turns "also visible" into "correctly selected": among all
+    matches, it prefers the one with the SHORTEST consequent, which is always
+    the innermost (a nested consequent is a strict substring of its parents').
     """
     position = 0
     while True:
@@ -214,24 +245,67 @@ def if_statements(body: str):
             consequent = body[rest : stmt_end + 1]
             position = stmt_end + 1
         yield condition, consequent
+        # Recurse into this if's own consequent to find anything nested
+        # inside it. This does not re-visit or double-yield: the recursive
+        # call scans a separately-extracted substring, while the outer loop's
+        # `position` above already advanced past this whole consequent in the
+        # ORIGINAL body, so the two scans cover disjoint textual roles even
+        # though one is a physical substring of the other.
+        yield from if_statements(consequent)
 
 
 def find_decision_condition(body: str, consequent_marker: str) -> str:
-    """The condition of the unique if-statement whose consequent contains
-    consequent_marker. Raising on zero-or-many is deliberate: ambiguity here
-    means the extraction itself is unsound for this body, not that the
-    invariant holds -- an "at least one" check would let a second, unrelated
-    marker occurrence hide a missing decision."""
-    matches = [cond for cond, cons in if_statements(body) if consequent_marker in cons]
-    if len(matches) != 1:
-        raise ValueError(
-            f"expected exactly one if-statement with {consequent_marker!r} in its "
-            f"consequent, found {len(matches)}"
-        )
-    return matches[0]
+    """The condition of the INNERMOST if-statement whose consequent contains
+    consequent_marker (searched recursively -- see if_statements). "Innermost"
+    is the match with the shortest consequent text: a nested if's consequent
+    is always a strict substring of every ancestor if's consequent that also
+    contains the marker, so the shortest matching consequent is unambiguously
+    the most deeply nested one, and picking it is what closes the nested-if
+    fail-open (a hand-maintained list nested under an outer roster-derived
+    if) rather than returning the outer, misleadingly-clean condition.
+
+    Raising on zero matches is deliberate: no marker occurrence at all means
+    the extraction itself is unsound for this body, not that the invariant
+    holds."""
+    matches = [(cond, cons) for cond, cons in if_statements(body) if consequent_marker in cons]
+    if not matches:
+        raise ValueError(f"expected at least one if-statement with {consequent_marker!r} in its consequent, found 0")
+    innermost_condition, _ = min(matches, key=lambda pair: len(pair[1]))
+    return innermost_condition
 
 
 LITERAL_TYPE_RE = re.compile(r"\bGGML_TYPE_[A-Z0-9_]+\b")
+
+
+def test_find_decision_condition_prefers_innermost_nested_if():
+    """Unit-level proof that the nested-if fail-open is closed, independent of
+    the real source. Constructs the exact hazard shape a team-lead review
+    caught (a hardcoded list nested under an outer if that itself carries a
+    roster call) and asserts find_decision_condition returns the INNER
+    condition, not the outer, misleadingly-clean one."""
+    nested = (
+        "if (moe_mmvq_batched_dispatch_supports_type(src0->type)) {\n"
+        "    if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 || "
+        "src0->type == GGML_TYPE_Q6_K) {\n"
+        "        resolved = GGML_LAYOUT_AOS;\n"
+        "    }\n"
+        "}\n"
+    )
+    condition = find_decision_condition(nested, "GGML_LAYOUT_AOS")
+    assert "GGML_TYPE_Q6_K" in condition, (
+        f"expected the INNER hardcoded-list condition, got the outer roster-derived one: {condition!r}"
+    )
+    assert not any(call in condition for call in ROSTER_CALLS), (
+        f"the selected condition should be the inner hand-maintained list, not the outer roster call: {condition!r}"
+    )
+
+    # Negative companion: when the marker-bearing if is NOT nested (the normal
+    # shape at all three real sites today), the single top-level match is
+    # still returned correctly -- recursion finding zero additional matches
+    # must not change behavior for the common case.
+    flat = "if (moe_mmvq_any_dispatch_supports_layout(src0->type, resolved)) {\n    resolved = GGML_LAYOUT_AOS;\n}\n"
+    flat_condition = find_decision_condition(flat, "GGML_LAYOUT_AOS")
+    assert "moe_mmvq_any_dispatch_supports_layout" in flat_condition
 
 
 def test_positive_control_regex_is_sensitive():
@@ -402,6 +476,7 @@ def test_advertisement_and_refusal_sites_decide_layout_via_roster_only():
 
 
 if __name__ == "__main__":
+    test_find_decision_condition_prefers_innermost_nested_if()
     test_positive_control_regex_is_sensitive()
     test_regex_does_not_over_match_longer_or_chains()
     test_no_hand_maintained_carveout_survives_outside_the_named_exception()
