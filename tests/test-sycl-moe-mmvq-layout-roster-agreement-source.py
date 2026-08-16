@@ -31,6 +31,38 @@ searching the pattern rather than re-checking known locations; see nkfc
 c-32rt). A future copy-paste instance is caught by the same regex, not missed
 because it wasn't on a list.
 
+The broad enumeration check above only recognizes the exact {Q4_0, Q8_0}
+shape. It is deliberately paired with a second, narrower check
+(test_advertisement_and_refusal_sites_decide_layout_via_roster_only) that
+asserts the SPECIFIC decision expression at each of the three fixed sites
+contains no literal GGML_TYPE_* comparison at all -- catching a revert to a
+hand-maintained list of ANY length or shape, not only the exact pre-fix one.
+The two checks answer different questions ("does this exact old shape exist
+anywhere" vs. "do these three decisions still delegate entirely to the
+roster") and neither subsumes the other.
+
+Not in scope, and deliberately so: llama.cpp-mn70's sibling consumer-side
+guard (R1, landed as 011064e2b) is a RUNTIME comparison against the observed
+storage layout (`get_effective_layout_mode(src0_extra) != layout`), not a
+hand-maintained TYPE list -- it is not exposed to the "reverts to a stale
+type roster" failure mode this gate exists to catch, so it is not asserted
+here. Stating this so a later reader does not "unify" the two checks; they
+protect different invariants (R1: consume what is materialized; R2: advertise
+only what has kernels -- nkfc c-gga1).
+
+Two in-tree exemplars show the R1/R2 shape this gate enforces, worth reading
+before touching either checked function (zoly c-8e6f/c-pqrc): the
+`!use_expert_cache` host-routing branch (ggml-sycl.cpp, near the expert-cache
+dispatch) resets a non-AOS route layout back to AOS rather than carrying it
+when the fallback path cannot honor it; and `ggml_sycl_select_moe_mmvq_layout`
+itself, twelve lines below its own roster-derived carve-out, already does
+the *consumer* half correctly for device-resident weights -- `final_layout =
+get_effective_layout_mode(extra)` under `!host_weights` discards whatever the
+selector chose and uses the storage layout instead. Neither exemplar is
+itself part of this gate's assertions; they are cited so a maintainer reading
+the three checked sites understands what "correct" already looks like
+elsewhere in the same file.
+
 Scope note (owner ruling, "layout follows residency" --
 docs/backend/sycl-memory-design.md): ggml/src/ggml-sycl/common.hpp's
 layout_policy::get_optimal / get_with_override also carries a {Q4_0, Q8_0} pin,
@@ -44,6 +76,14 @@ layout optimal for the residency they are in -- kernel availability is the
 right authority for ADVERTISEMENT, not for STORAGE. Do not "fix" that site by
 widening this gate to common.hpp; the endgame item (a layout-aware Q6_K _id
 launcher, generalized) is tracked separately, post-merge, per the ruling.
+
+The exemption is SITE-scoped (the get_optimal function body), not FILE-scoped
+-- common.hpp is otherwise fully covered by the broad enumeration check, so a
+future, unrelated hand-maintained carve-out landing anywhere else in that file
+is still caught rather than silently inheriting a whole-file pass. (get_optimal
+is the only site: get_with_override delegates to it and its own qtype
+comparison is single-type Q4_0, not a {Q4_0, Q8_0} chain, so it never matches
+find_carveouts on its own -- verified empirically below.)
 """
 
 import re
@@ -82,7 +122,9 @@ def find_carveouts(text: str):
     return matches
 
 # nkfc c-vcn5: deliberately not fixed by this ticket. See the module docstring.
-DELIBERATELY_UNFIXED = {SYCL_DIR / "common.hpp"}
+# SITE-scoped (the get_optimal function body), not FILE-scoped -- see docstring.
+COMMON_HPP = SYCL_DIR / "common.hpp"
+DELIBERATELY_UNFIXED_SIGNATURE = "static layout_mode get_optimal("
 
 ROSTER_CALLS = (
     "moe_mmvq_any_dispatch_supports_layout(",
@@ -101,10 +143,10 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", without_block)
 
 
-def function_body(text: str, signature: str) -> str:
-    """Extract a full function body by brace matching, not a guessed byte span --
-    a span rots the moment the function grows past it and reports a false
-    "roster call missing" instead of a real regression."""
+def function_span(text: str, signature: str):
+    """(start, end) of a full function body by brace matching, not a guessed
+    byte span -- a span rots the moment the function grows past it and reports
+    a false "roster call missing" instead of a real regression."""
     start = text.index(signature)
     opening = text.index("{", start)
     depth = 0
@@ -114,8 +156,82 @@ def function_body(text: str, signature: str) -> str:
         elif text[position] == "}":
             depth -= 1
             if depth == 0:
-                return text[start : position + 1]
+                return start, position + 1
     raise ValueError(f"unclosed function body: {signature}")
+
+
+def function_body(text: str, signature: str) -> str:
+    start, end = function_span(text, signature)
+    return text[start:end]
+
+
+def matching_delimiter(text: str, opening: int, open_char: str, close_char: str) -> int:
+    depth = 0
+    for position in range(opening, len(text)):
+        if text[position] == open_char:
+            depth += 1
+        elif text[position] == close_char:
+            depth -= 1
+            if depth == 0:
+                return position
+    raise ValueError(f"unclosed delimiter: {open_char}")
+
+
+def if_statements(body: str):
+    """Yield (condition_text, consequent_text) for every `if (...) { ... }` or
+    `if (...) stmt;` in body, in source order -- a minimal brace/paren-balanced
+    scanner in the same spirit as this repo's own
+    test-sycl-supports-op-indexed-moe-source.py (braced_body /
+    matching_delimiter), not a full C++ parser. A consequent's own nested
+    if-statements are not separately yielded (the scan resumes after the whole
+    consequent) -- irrelevant for this gate's use, which only needs to find
+    the one non-nested, marker-bearing if at each site; verified empirically
+    against the real sites in test_advertisement_and_refusal_sites_decide_layout_via_roster_only.
+    """
+    position = 0
+    while True:
+        idx = body.find("if", position)
+        if idx == -1:
+            return
+        before_ok = idx == 0 or not (body[idx - 1].isalnum() or body[idx - 1] == "_")
+        after = idx + 2
+        while after < len(body) and body[after].isspace():
+            after += 1
+        if not before_ok or after >= len(body) or body[after] != "(":
+            position = idx + 2
+            continue
+        cond_close = matching_delimiter(body, after, "(", ")")
+        condition = body[after + 1 : cond_close]
+        rest = cond_close + 1
+        while rest < len(body) and body[rest].isspace():
+            rest += 1
+        if rest < len(body) and body[rest] == "{":
+            brace_close = matching_delimiter(body, rest, "{", "}")
+            consequent = body[rest : brace_close + 1]
+            position = brace_close + 1
+        else:
+            stmt_end = body.index(";", rest)
+            consequent = body[rest : stmt_end + 1]
+            position = stmt_end + 1
+        yield condition, consequent
+
+
+def find_decision_condition(body: str, consequent_marker: str) -> str:
+    """The condition of the unique if-statement whose consequent contains
+    consequent_marker. Raising on zero-or-many is deliberate: ambiguity here
+    means the extraction itself is unsound for this body, not that the
+    invariant holds -- an "at least one" check would let a second, unrelated
+    marker occurrence hide a missing decision."""
+    matches = [cond for cond, cons in if_statements(body) if consequent_marker in cons]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one if-statement with {consequent_marker!r} in its "
+            f"consequent, found {len(matches)}"
+        )
+    return matches[0]
+
+
+LITERAL_TYPE_RE = re.compile(r"\bGGML_TYPE_[A-Z0-9_]+\b")
 
 
 def test_positive_control_regex_is_sensitive():
@@ -157,34 +273,57 @@ def test_regex_does_not_over_match_longer_or_chains():
 
 
 def test_no_hand_maintained_carveout_survives_outside_the_named_exception():
-    """Enumerate every remaining instance at commit time -- not a frozen list of four."""
+    """Enumerate every remaining instance at commit time -- not a frozen list of four.
+
+    The common.hpp exception is SITE-scoped (the get_optimal function body),
+    not FILE-scoped: any carve-out elsewhere in that file is still an offender.
+    """
     offenders = []
     for path in sycl_sources():
-        if path in DELIBERATELY_UNFIXED:
-            continue
         text = strip_comments(path.read_text(encoding="utf-8"))
+        exempt_span = None
+        if path == COMMON_HPP:
+            exempt_span = function_span(text, DELIBERATELY_UNFIXED_SIGNATURE)
         for match in find_carveouts(text):
+            if exempt_span and exempt_span[0] <= match.start() < exempt_span[1]:
+                continue
             line = text.count("\n", 0, match.start()) + 1
             offenders.append(f"{path.relative_to(ROOT)}:{line}: {match.group(0)}")
     assert not offenders, (
         "hand-maintained {Q4_0, Q8_0}-style layout carve-out found outside "
-        "common.hpp (which is deliberately left unfixed by llama.cpp-zoly per "
-        "the layout-follows-residency ruling; see this file's module "
-        "docstring) -- replace it with a roster call "
+        "layout_policy::get_optimal in common.hpp (which is deliberately left "
+        "unfixed by llama.cpp-zoly per the layout-follows-residency ruling; "
+        "see this file's module docstring) -- replace it with a roster call "
         "(moe_mmvq_any_dispatch_supports_layout / "
         "moe_mmvq_batched_dispatch_supports_type):\n" + "\n".join(offenders)
     )
 
 
 def test_deliberately_unfixed_site_still_exists_and_is_named_correctly():
-    """If common.hpp's pin is ever removed or moved, this gate's exception is stale."""
-    common_hpp = SYCL_DIR / "common.hpp"
-    text = strip_comments(common_hpp.read_text(encoding="utf-8"))
-    assert find_carveouts(text), (
-        "common.hpp no longer carries a {Q4_0, Q8_0}-shaped layout carve-out -- "
-        "if it was fixed, removed, or reworded, retire this gate's "
-        "DELIBERATELY_UNFIXED exception (and its citation of the "
-        "layout-follows-residency ruling) rather than leaving a stale carve-out"
+    """If get_optimal's pin is ever removed or moved, this gate's exception is stale."""
+    text = strip_comments(COMMON_HPP.read_text(encoding="utf-8"))
+    get_optimal_body = function_body(text, DELIBERATELY_UNFIXED_SIGNATURE)
+    assert find_carveouts(get_optimal_body), (
+        "layout_policy::get_optimal no longer carries a {Q4_0, Q8_0}-shaped "
+        "layout carve-out -- if it was fixed, removed, or reworded, retire "
+        "this gate's DELIBERATELY_UNFIXED_SIGNATURE exception (and its "
+        "citation of the layout-follows-residency ruling) rather than leaving "
+        "a stale carve-out"
+    )
+
+    # get_with_override delegates to get_optimal and must NOT independently
+    # carry the {Q4_0, Q8_0} shape -- if it grew one, the site-scoped
+    # exemption above would miss it (get_with_override is a separate function,
+    # outside the exempted span) and it would correctly show up as an offender
+    # in the broad enumeration test; this just makes that expectation explicit
+    # rather than relying on the other test to notice by accident.
+    override_body = function_body(text, "static layout_mode get_with_override(")
+    assert not find_carveouts(override_body), (
+        "get_with_override now independently carries a {Q4_0, Q8_0}-shaped "
+        "carve-out -- it is outside the site-scoped exemption "
+        "(DELIBERATELY_UNFIXED_SIGNATURE covers only get_optimal) and must "
+        "either be removed or the exemption widened deliberately, with the "
+        "docstring updated to say why"
     )
 
 
@@ -212,10 +351,61 @@ def test_advertisement_and_refusal_sites_consult_the_roster():
         )
 
 
+def test_advertisement_and_refusal_sites_decide_layout_via_roster_only():
+    """Stronger than 'a roster call appears somewhere in the function' (which
+    the widened logging gate call alone would satisfy without discriminating
+    anything -- team-lead review finding #2 on ccbd76ae5, the follow-up round
+    to that commit): the SPECIFIC decision expression governing the
+    carve-out/refusal must itself consult the roster and must contain no
+    literal GGML_TYPE_* comparison. A revert to a hand-maintained list of ANY
+    length or shape -- not only the exact {Q4_0, Q8_0} pair the broad
+    enumeration check above recognizes -- is caught here, because this check
+    is scoped to the decision itself rather than to "does a roster call exist
+    anywhere in this function". c-gga1's extended-stopgap-becomes-permanent
+    hazard is exactly a longer hardcoded list surviving unnoticed; that is
+    what this test is for.
+    """
+    ggml_sycl_cpp = (SYCL_DIR / "ggml-sycl.cpp").read_text(encoding="utf-8")
+    mmvq_cpp = (SYCL_DIR / "mmvq.cpp").read_text(encoding="utf-8")
+
+    mmvq_layout_fn = strip_comments(function_body(ggml_sycl_cpp, "layout_mode ggml_sycl_select_moe_mmvq_layout("))
+    expert_cache_fn = strip_comments(
+        function_body(ggml_sycl_cpp, "static layout_mode ggml_sycl_select_moe_expert_cache_layout(")
+    )
+    mmvq_dispatch_fn = strip_comments(function_body(mmvq_cpp, "bool ggml_sycl_mul_mat_id_vec_q("))
+
+    # (name, function body, the string marking the decision's consequent).
+    # ggml_sycl_select_moe_mmvq_layout / ggml_sycl_select_moe_expert_cache_layout
+    # both assign/return GGML_LAYOUT_AOS ONLY from their carve-out decision
+    # (verified: no other branch in either function does); the mmvq.cpp
+    # refusal is keyed on its trace-tag string, unique to that guard.
+    sites = (
+        ("ggml_sycl_select_moe_mmvq_layout", mmvq_layout_fn, "GGML_LAYOUT_AOS"),
+        ("ggml_sycl_select_moe_expert_cache_layout", expert_cache_fn, "GGML_LAYOUT_AOS"),
+        ("ggml_sycl_mul_mat_id_vec_q", mmvq_dispatch_fn, "quant_layout_unsupported"),
+    )
+    for name, body, marker in sites:
+        condition = find_decision_condition(body, marker)
+        assert any(call in condition for call in ROSTER_CALLS), (
+            f"{name}'s layout decision no longer calls a moe-mmvq-tables.hpp "
+            f"roster predicate in its condition -- did an edit revert it to a "
+            f"hand-maintained type list? condition was: {condition!r}"
+        )
+        literal_types = LITERAL_TYPE_RE.findall(condition)
+        assert not literal_types, (
+            f"{name}'s layout decision condition still contains a literal "
+            f"type comparison ({literal_types}) alongside (or instead of) the "
+            f"roster call -- ANY hand-maintained type list here defeats the "
+            f"fix, not just the exact {{Q4_0, Q8_0}} shape. condition was: "
+            f"{condition!r}"
+        )
+
+
 if __name__ == "__main__":
     test_positive_control_regex_is_sensitive()
     test_regex_does_not_over_match_longer_or_chains()
     test_no_hand_maintained_carveout_survives_outside_the_named_exception()
     test_deliberately_unfixed_site_still_exists_and_is_named_correctly()
     test_advertisement_and_refusal_sites_consult_the_roster()
+    test_advertisement_and_refusal_sites_decide_layout_via_roster_only()
     print("test-sycl-moe-mmvq-layout-roster-agreement-source: OK")
