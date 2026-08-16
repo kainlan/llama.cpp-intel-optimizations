@@ -21283,7 +21283,16 @@ static bool planner_moe_primary_executor_supports_layout_on_device(const placeme
         return planner_mxfp4_xmx_tiled_bundle4_supported(entry, device_id);
     }
     if (layout == GGML_LAYOUT_MXFP4_I8) {
-        return entry.expert_role == expert_tensor_role::DOWN && planner_mxfp4_i8_supported(entry, device_id);
+        // GATE/UP admitted alongside DOWN (llama.cpp-613w): this helper is
+        // the shared eligibility check maybe_upgrade_moe_gate_up_layouts_to_i8()
+        // relies on as its own skip_executor gate, but until this line it
+        // hardcoded DOWN regardless of caller -- the gate/up upgrade pass has
+        // existed since d87d54cdd9 (2026-05-21) and never once admitted a
+        // candidate because of this one check. planner_mxfp4_i8_supported()
+        // itself carries no role restriction (type/shape/device only).
+        return (entry.expert_role == expert_tensor_role::DOWN || entry.expert_role == expert_tensor_role::GATE ||
+                entry.expert_role == expert_tensor_role::UP) &&
+               planner_mxfp4_i8_supported(entry, device_id);
     }
     if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_COALESCED) {
         return true;
@@ -24251,6 +24260,18 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        // Gate/up claim the shared i8-upgrade VRAM budget BEFORE down, not
+        // evenly, and not the down-first order this block used to run in.
+        // Measured 2026-08-16 (llama.cpp-blvs, GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES
+        // raised to eliminate down's grouped-DPAS chunking entirely): pp512
+        // did not move (46.68 t/s vs a 46.95-47.52 t/s same-build band) --
+        // down's i8 upgrade is not where GPT-OSS PP time goes. Gate/up carry
+        // ~413 GB of the ~442 GB per-pass expert-weight traffic
+        // (llama.cpp-36wo); down carries ~29 GB. Running down first let it
+        // exhaust the scarce budget before gate/up -- the role that actually
+        // matters -- ever got a chance at it. Do not reorder this back
+        // without re-measuring; it is a deliberate policy, not incidental.
+        maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -24265,7 +24286,6 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         }
-        maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
