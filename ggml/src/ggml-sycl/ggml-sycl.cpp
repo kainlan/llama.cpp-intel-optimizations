@@ -22607,8 +22607,9 @@ GGML_API void ggml_backend_sycl_memcpy_d2h(const ggml_tensor * tensor, void * ds
     ggml_sycl_set_device(ctx->device);
     auto stream = ctx->stream ? ctx->stream : &(ggml_sycl_get_device(ctx->device).default_queue());
 
-    ggml_sycl::mem_handle dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, ctx->device);
-    ggml_sycl::mem_handle src_handle = ggml_sycl_copy_handle_for_raw_ptr(tensor->data, GGML_LAYOUT_AOS, ctx->device);
+    ggml_sycl::mem_handle dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, ctx->device, size);
+    ggml_sycl::mem_handle src_handle =
+        ggml_sycl_copy_handle_for_raw_ptr(tensor->data, GGML_LAYOUT_AOS, ctx->device, size);
     ggml_sycl::mem_copy(dst_handle, src_handle, size, *stream);
 
 } catch (const sycl::exception & exc) {
@@ -36878,10 +36879,10 @@ int32_t ggml_backend_sycl_sample_token_full(ggml_sycl_sampler_t sampler,
     sycl::queue & q             = *sampler->sycl_ctx->stream();
     float         debug_logits[5];
 
-    ggml_sycl::mem_handle debug_dst_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(debug_logits, GGML_LAYOUT_AOS, ggml_sycl_get_device_id_from_queue(q));
+    ggml_sycl::mem_handle debug_dst_handle = ggml_sycl_copy_handle_for_raw_ptr(
+        debug_logits, GGML_LAYOUT_AOS, ggml_sycl_get_device_id_from_queue(q), sizeof(debug_logits));
     ggml_sycl::mem_handle debug_src_handle =
-        ggml_sycl_copy_handle_for_raw_ptr(logits_at_idx, GGML_LAYOUT_AOS, buf_ctx->device);
+        ggml_sycl_copy_handle_for_raw_ptr(logits_at_idx, GGML_LAYOUT_AOS, buf_ctx->device, sizeof(debug_logits));
     ggml_sycl::mem_copy(debug_dst_handle, debug_src_handle, sizeof(debug_logits), q);
     GGML_LOG_INFO(
 
@@ -37789,10 +37790,11 @@ void ggml_backend_sycl_copy_device_to_tensor(void * src_device_ptr, ggml_tensor 
     } else {
         void * dst = tensor->data;
         GGML_ASSERT(dst != nullptr);
-        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, ctx->device);
+        dst_handle = ggml_sycl_copy_handle_for_raw_ptr(dst, GGML_LAYOUT_AOS, ctx->device, size);
     }
 
-    ggml_sycl::mem_handle src_handle = ggml_sycl_copy_handle_for_raw_ptr(src_device_ptr, GGML_LAYOUT_AOS, ctx->device);
+    ggml_sycl::mem_handle src_handle =
+        ggml_sycl_copy_handle_for_raw_ptr(src_device_ptr, GGML_LAYOUT_AOS, ctx->device, size);
     ggml_sycl::mem_copy(dst_handle, dst_offset, src_handle, 0, size, stream);
 
 } catch (const sycl::exception & exc) {
