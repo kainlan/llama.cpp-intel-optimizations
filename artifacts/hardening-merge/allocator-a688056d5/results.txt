@@ -1,0 +1,9 @@
+HM Task 7 certification at a688056d5 (2026-08-16, lead):
+sycl-cache-backing-provenance-lz0-r1.log: Passed 1.16 sec
+sycl-cache-backing-provenance-lz0-r2.log: Passed 0.90 sec
+sycl-cache-backing-provenance-lz1-r1.log: Passed 0.63 sec
+sycl-cache-backing-provenance-lz1-r2.log: Passed 1.03 sec
+sycl-runtime-alloc-lz0-r1.log: Passed 1.84 sec
+sycl-runtime-alloc-lz0-r2.log: Passed 1.51 sec
+sycl-runtime-alloc-lz1-r1.log: Passed 1.10 sec
+sycl-runtime-alloc-lz1-r2.log: Passed 1.27 sec
