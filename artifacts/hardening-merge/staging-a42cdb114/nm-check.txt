@@ -1,0 +1,7 @@
+nm -D failpoint-symbol absence (substring grep, never -w):
+staging_failpoint_arm: 0
+staging_failpoint_disarm: 0
+failpoint_reached: 0
+ggml_sycl_staging_failpoint: 0
+positive control (symbol that must exist):
+unified_alloc: 9

@@ -1,0 +1,2 @@
+HM Task 11 certification at a42cdb114 (2026-08-16, lead):
+lz0: Passed, lz1: Passed — all seam cases PASS incl device-sited pair on hardware
