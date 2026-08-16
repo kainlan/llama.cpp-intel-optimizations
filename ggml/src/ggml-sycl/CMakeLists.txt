@@ -1965,14 +1965,14 @@ set_tests_properties(mem-ops PROPERTIES
 )
 
 # Unregistered-external-pointer byte-contract authority (llama.cpp-fxrg).
-# Regression for the P0 where the buffer-interface get/set_tensor family minted
-# mem_handles for caller-supplied host pointers with NO declared byte contract
-# (the 4-arg ggml_sycl_copy_handle_for_raw_ptr call site in ggml-sycl.cpp left
-# `operation_bytes` at its `= 0` default), which resolves to extent 0 and
-# aborts the first real copy through it. Direct sources, same reasoning as
-# test-mem-handle-wrong-device above: this needs its own compiled copy of
-# mem-ops.cpp (for ggml_sycl::mem_copy / require_resolved_range) alongside the
-# other seam-bearing TUs, not the ordinary DSO.
+# Regression for the P0 where several ggml-sycl.cpp call sites minted
+# mem_handles for unregistered external pointers with a 3-arg call against the
+# 4-param ggml_sycl_copy_handle_for_raw_ptr(ptr, layout, device,
+# operation_bytes), leaving operation_bytes at its `= 0` default. That resolves
+# to extent 0, and aborts the first real copy through it. Direct sources, same
+# reasoning as test-mem-handle-wrong-device above: this needs its own compiled
+# copy of mem-ops.cpp (for ggml_sycl::mem_copy / require_resolved_range)
+# alongside the other seam-bearing TUs, not the ordinary DSO.
 add_executable(test-mem-handle-byte-contract
     tests/test-mem-handle-byte-contract.cpp
     unified-cache.cpp
@@ -2002,6 +2002,10 @@ add_test(NAME mem-handle-byte-contract COMMAND test-mem-handle-byte-contract)
 set_tests_properties(mem-handle-byte-contract PROPERTIES
     LABELS "sycl;handle;memory-ops;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    # The binary exits 77 when its device-dependent cases (the mem_copy-refusal
+    # proof) skipped on a device-less host -- without this, ctest renders that
+    # as Passed with the actual regression check silently absent.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 

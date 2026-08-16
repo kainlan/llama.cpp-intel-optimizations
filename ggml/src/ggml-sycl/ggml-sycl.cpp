@@ -28535,14 +28535,15 @@ static sycl::event ggml_sycl_fill_onednn_woq(sycl::queue &                    qu
     return sycl::event{};
 }
 
-// Helper: Safe memcpy that handles mmap'd source memory via host staging
+// Mint a mem_handle for a raw pointer, granting it a byte-contract for
+// operations against unknown/unregistered external pointers.
 //
 // llama.cpp-fxrg: `operation_bytes` is the ONLY authority an unknown external
-// pointer receives (see ggml_sycl_memcpy_handle_for_raw_ptr's own comment) --
-// omitting it, or passing the wrong quantity, mints a handle whose resolved
-// extent does not cover what the caller is about to move, and the copy either
-// aborts in require_resolved_range or (if you over-declare) claims bytes past
-// what the operation actually touches.
+// pointer receives -- see the comment on the call below. Omitting it, or
+// passing the wrong quantity, mints a handle whose resolved extent does not
+// cover what the caller is about to move, and the copy either aborts in
+// require_resolved_range or (if you over-declare) claims bytes past what the
+// operation actually touches.
 //
 // The value passed here MUST be exactly this endpoint's OWN `offset + bytes
 // moved`, derived per call site from what the enclosing mem_copy actually
@@ -28555,6 +28556,9 @@ static sycl::event ggml_sycl_fill_onednn_woq(sycl::queue &                    qu
 //     into it, in which case the matching `offset` argument to mem_copy for
 //     that endpoint is 0 and the required authority is just the bytes moved,
 //     not offset + bytes moved measured from some other, unadjusted base.
+// A third category is unregistered pointers that are NOT caller-supplied --
+// e.g. a debug-only readback into a local stack variable -- so "is this call
+// site caller-facing" is not the test; "is this pointer registry-known" is.
 static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(void *           ptr,
                                                                ggml_layout_mode layout,
                                                                int              fallback_device,
@@ -28573,6 +28577,7 @@ static ggml_sycl::mem_handle ggml_sycl_copy_handle_for_raw_ptr(const void *     
     return ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(ptr), layout, fallback_device, operation_bytes);
 }
 
+// Helper: Safe memcpy that handles mmap'd source memory via host staging
 static sycl::event ggml_sycl_safe_memcpy(sycl::queue &                    queue,
                                          void *                           dst,
                                          const void *                     src,
@@ -36287,7 +36292,7 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     size_t blk_row_size     = (4096 / 32) * 18;  // 128 blocks * 18 bytes = 2304 bytes/row
                     auto   read_debug_block = [&](auto & block, size_t byte_offset) {
                         ggml_sycl::mem_handle read_dst =
-                            ggml_sycl_copy_handle_for_raw_ptr(&block, GGML_LAYOUT_AOS, device);
+                            ggml_sycl_copy_handle_for_raw_ptr(&block, GGML_LAYOUT_AOS, device, sizeof(block));
                         ggml_sycl::mem_handle read_src{};
                         size_t                read_src_offset = 0;
                         if (extra->data_handle[device].valid()) {
@@ -36295,7 +36300,7 @@ static void ggml_backend_sycl_tp_buffer_set_tensor(ggml_backend_buffer_t buffer,
                             read_src_offset = byte_offset;
                         } else {
                             read_src = ggml_sycl_copy_handle_for_raw_ptr(static_cast<char *>(dev_ptr) + byte_offset,
-                                                                           GGML_LAYOUT_AOS, device);
+                                                                           GGML_LAYOUT_AOS, device, sizeof(block));
                         }
                         ggml_sycl::mem_copy(read_dst, 0, read_src, read_src_offset, sizeof(block), *stream);
                     };

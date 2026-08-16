@@ -2,27 +2,38 @@
 // Test: unregistered external pointers get authority ONLY from the operation's
 // declared byte contract (llama.cpp-fxrg)
 //
-// Regression coverage for the P0 fixed in this same change: the buffer-interface
-// get/set_tensor family (tiered_kv_buffer_*, split_buffer_*, tp_buffer_*,
-// dev2dev_memcpy) minted mem_handles for CALLER-SUPPLIED host pointers via
-// ggml_sycl_copy_handle_for_raw_ptr(ptr, layout, device) -- omitting the 4th
-// parameter, operation_bytes (default 0). An unknown external pointer with no
-// declared byte contract resolves to extent == 0, and mem_copy correctly
-// refuses it (require_resolved_range). f23bf786b added that guard; 6faf4c7ec
-// claimed to have migrated every call site to pass the byte contract and never
-// touched this family -- this test is what would have caught that omission.
+// Regression coverage for the P0 fixed in this same change: several call sites
+// in ggml-sycl.cpp (the buffer-interface get/set_tensor family --
+// tiered_kv_buffer_*, split_buffer_*, tp_buffer_*, dev2dev_memcpy -- plus a
+// debug-only readback path found by widening the search) minted mem_handles
+// for UNREGISTERED EXTERNAL pointers via ggml_sycl_copy_handle_for_raw_ptr(ptr,
+// layout, device) -- omitting the 4th parameter, operation_bytes (default 0).
+// "Unregistered external" is the actual defect condition, and it is broader
+// than "caller-supplied": the debug-only site mints a handle for a local stack
+// variable, which nobody hands to it from outside. An unknown external pointer
+// with no declared byte contract resolves to extent == 0, and mem_copy
+// correctly refuses it (require_resolved_range). f23bf786b added that guard;
+// 6faf4c7ec claimed to have migrated every call site to pass the byte contract
+// and never touched this family.
 //
-// This exercises the same underlying mechanism the fixed call sites use
-// (ggml_sycl_memcpy_handle_for_raw_ptr, the function ggml_sycl_copy_handle_for_raw_ptr
-// in ggml-sycl.cpp wraps) directly, since that wrapper is `static` to its TU and
-// not linkable from a separate test binary.
+// WHAT THIS TEST DOES AND DOES NOT COVER. It exercises the underlying minting
+// mechanism (ggml_sycl_memcpy_handle_for_raw_ptr, in common.hpp) and the
+// consuming guard (mem_copy / require_resolved_range) directly -- not the
+// fixed call sites themselves, which are `static` inside ggml-sycl.cpp and
+// unlinkable from a separate test binary. Reverting the byte-contract argument
+// at every one of those call sites leaves this test green: it is a test of the
+// mechanism the sites are supposed to use correctly, not a test that any given
+// site does. The regression bar for the call sites themselves is the canonical
+// GPT-OSS chat gate (CLAUDE.md), which exercises the tiered-KV path for real.
 //
 // Verifies:
 //   (1) An unregistered external host pointer minted with NO byte contract
 //       resolves to extent == 0.
 //   (2) The same pointer minted WITH a byte contract resolves to extent == bytes.
-//   (3) mem_copy refuses (aborts via GGML_ABORT) when either endpoint has no
-//       declared authority for the bytes being moved.
+//   (3) mem_copy refuses (aborts via GGML_ABORT, with the same "range rejected"
+//       message the real bug produced) when either endpoint has no declared
+//       authority for the bytes being moved -- and does not merely die some
+//       other way.
 //   (4) mem_copy succeeds, and the bytes actually transfer correctly, when both
 //       endpoints declare authority via the byte contract.
 //
@@ -47,9 +58,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -94,23 +107,54 @@ static int g_tests_skipped = 0;
         }                      \
     } while (0)
 
-// Runs `operation` in a forked child and reports whether it terminated
-// non-successfully (killed by a signal, or exited non-zero) -- i.e. whether a
-// GGML_ABORT actually fired. Mirrors test-mem-ops.cpp's expect_fatal.
+// Runs `operation` in a forked child, capturing its stderr, and reports
+// whether it died from the SPECIFIC abort this test targets -- not just
+// "died somehow". A bare non-zero-exit-or-signal check would also score a
+// queue-construction throw (the child constructs a sycl::queue too) as
+// "mem_copy aborted", which is a different failure wearing the same
+// pass/fail shape. Require BOTH halves: the process must have been killed by
+// SIGABRT (what GGML_ABORT raises), AND its captured stderr must contain the
+// "range rejected" text require_resolved_range prints -- so a stray abort
+// elsewhere in the child, or a survivable complaint with no abort, cannot
+// pass either.
 static bool expect_fatal(const std::function<void()> & operation) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return false;
+    }
     const pid_t child = fork();
     if (child == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
         operation();
         _exit(0);
     }
     if (child < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
         return false;
     }
+    close(pipefd[1]);
+    std::string captured;
+    char        buf[4096];
+    ssize_t     n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+        captured.append(buf, static_cast<size_t>(n));
+    }
+    close(pipefd[0]);
+
     int status = 0;
     if (waitpid(child, &status, 0) != child) {
         return false;
     }
-    return !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    bool signaled_abort = WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+    bool saw_refusal    = captured.find("range rejected") != std::string::npos;
+    if (!signaled_abort || !saw_refusal) {
+        fprintf(stderr, "expect_fatal: signaled_abort=%d saw_refusal=%d captured=[%s]\n", signaled_abort, saw_refusal,
+                captured.c_str());
+    }
+    return signaled_abort && saw_refusal;
 }
 
 // =============================================================================
@@ -244,6 +288,17 @@ int main() {
     if (!all_passed) {
         fprintf(stderr, "SOME TESTS FAILED\n");
         return 1;
+    }
+    // The mem_copy-refusal proof (cases 3-4) is the whole point of this test;
+    // on a device-less host it skips instead of running. A bare `return 0`
+    // here would let ctest render that as Passed with the actual regression
+    // check silently absent -- exactly the vacuous-green shape this program
+    // forbids. Match test-mem-ops.cpp's convention: exit 77 (ctest's
+    // SKIP_RETURN_CODE, set on this target's registration) so a skip reads as
+    // skipped, not passed, whenever anything skipped on a device-less run.
+    if (g_tests_skipped > 0 && n_gpu_devices < 1) {
+        fprintf(stderr, "ALL RUNNABLE TESTS PASSED, BUT %d SKIPPED -- NOT A FULL PASS\n", g_tests_skipped);
+        return 77;
     }
     fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;
