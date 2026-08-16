@@ -124,6 +124,7 @@ def expected_pre_guard_decisions():
         ("if", "src0_type==GGML_TYPE_BF16", reject),
         ("if", "ggml_is_permuted(a)&&!ggml_is_contiguous(a)&&a->ne[2]>1&&a->ne[3]>1&&src0_type==GGML_TYPE_F16", reject),
         ("if", "!ggml_is_permuted(a)&&ggml_is_permuted(b)&&b->ne[2]>1&&b->ne[3]>1&&a->ne[0]>128&&a->ne[2]==1&&src0_type==GGML_TYPE_F16", reject),
+        ("if", "!ggml_is_transposed(a)&&!ggml_is_transposed(b)&&a_type==GGML_TYPE_F16&&b->type==GGML_TYPE_F32&&b->ne[1]==1&&b->ne[3]>1&&b->ne[3]==a->ne[3]&&b->ne[2]>a->ne[2]&&a->nb[1]>ggml_row_size(a_type,a->ne[0])&&b->nb[1]>ggml_row_size(b->type,b->ne[0])&&(((a->nb[1]/ggml_type_size(a_type))&1)!=0||((b->nb[1]/ggml_type_size(b->type))&1)!=0)", reject),
     ]
 
 
