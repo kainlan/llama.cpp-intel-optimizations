@@ -42,61 +42,79 @@ anywhere" vs. "do these three decisions still delegate entirely to the
 roster") and neither subsumes the other.
 
 HONEST SCOPE STATEMENT for the narrower check (team-lead review, now on its
-third round): it inspects the TEXT of each site's if-condition -- recursively
-into nested consequents, so a hardcoded list nested under an outer
-roster-derived if is found (this is what closes finding #2's original gap:
-a NON-recursive scan returned the outer, misleadingly-clean condition and
+fourth round; the earlier "false-safe" errors in this paragraph's second and
+third drafts were themselves corrected by an independently-run 17-mutation
+regression matrix, not by re-reading the code -- see the matrix's own
+harness for the authoritative record). It inspects the TEXT of each site's
+if-condition -- recursively into nested consequents, so a hardcoded list
+nested under an outer roster-derived if is found (finding #2's fix: a
+NON-recursive scan returned the outer, misleadingly-clean condition and
 missed a hardcoded list hiding one level deeper). Among every marker-bearing
 if found, it selects the innermost ONLY when all of them form a single
-ancestor chain (each nested inside the next); if two matches stand in no
-containment relation -- e.g. two SIBLING ifs, one clean and one a
-hand-maintained list, neither nested in the other -- it raises rather than
-picking one by an arbitrary tiebreak (round 3's own fix: an earlier version
-of this check picked the shortest match unconditionally, which silently
-resolved that exact sibling ambiguity in favor of whichever consequent
-happened to be shorter -- a second fail-open of the identical severity,
-introduced by relaxing the many-match guard without re-deriving why doing so
-was still sound. See find_decision_condition's docstring for the property
-argument and test_find_decision_condition_raises_on_sibling_ambiguity for
-the closing proof).
+ancestor chain by INTERVAL containment (each match's [start, end) offset
+strictly inside the next's, not merely textually a substring of it -- see
+find_decision_condition's docstring for why offsets and not text); if two
+matches are not in that relation -- e.g. two SIBLING ifs, one clean and one a
+hand-maintained list, neither nested in the other, including two with
+byte-identical or textually-overlapping consequents -- it raises rather than
+picking one by a tiebreak (round 3 picked the shortest match unconditionally,
+which silently resolved sibling ambiguity by comment-length coincidence; that
+was fixed to a textual containment chain check, itself found unsound on the
+identical/overlapping-text shapes and replaced with the interval form here).
 
-Two DIFFERENT limit categories remain, genuinely out of scope, for two
-different reasons:
-  IDENTIFIER OPACITY -- the check cannot resolve what an opaque identifier in
-  a condition refers to, so it cannot see through:
-    (1) a hand-maintained list hoisted into a variable declared just before
-        the if, with the if referencing the variable (e.g. `const bool
-        aos_only = (t==Q4_0||t==Q8_0||t==Q6_K); if (roster_call(...) &&
-        aos_only) {...}`);
-    (2) the same list hidden behind a helper function call in the condition.
-  Both require deliberately restructuring the decision, not merely editing
-  it, which is why they are accepted rather than chased -- closing them needs
-  real data-flow analysis, not a regex/brace scanner.
+The what-was-caught-when is itself informative and is recorded, not just
+asserted: a 17-mutation matrix run against every prior gate revision confirms
+each successive fix strictly added coverage over its predecessor and lost
+none, with the sole exception below.
 
-  IF-SCOPING -- the check only walks `if`/nested-`if` structure, so it cannot
-  see a marker-bearing decision reached through a DIFFERENT control-flow
-  construct:
-    (3) an `else` branch (this scanner does not model `else` at all -- an
-        `if (roster_call) {...} else { hardcoded-list-decision }` is not
-        walked into the else side);
-    (4) a marker inside a nested `switch` or loop body rather than a nested
-        `if` (e.g. a hardcoded list gating one `case` of a switch inside the
-        consequent).
-  Both are architectural: the scanner is `if`-shaped by design, matching this
-  gate's three real sites, all of which are `if`-only today. Widening it to a
-  general C++ control-flow walker is a different, much larger tool.
+ONE limit category remains genuinely out of scope, for one reason:
+IDENTIFIER OPACITY -- the check cannot resolve what an opaque identifier in a
+condition refers to, so it cannot see through a hand-maintained list hoisted
+into a variable referenced by the condition (`const bool aos_only =
+(t==Q4_0||t==Q8_0||t==Q6_K); if (roster_call(...) && aos_only) {...}`), or
+the same list hidden behind a helper function call in the condition. Both
+require deliberately restructuring the decision, not merely editing it,
+which is why they are accepted rather than chased -- closing them needs real
+data-flow analysis, not a regex/brace scanner.
 
-This is intentionally NOT presented as an exhaustive list -- it is drawn from
-what two review rounds actually found, not from an attempt to enumerate every
-possible bypass, and the next one found should be added here rather than
-treated as evidence the check is broken. The bound that DOES generalize
-across every item above: none of them can hide the exact {Q4_0, Q8_0} shape
-from the BROAD enumeration check earlier in this file, which scans raw file
-text irrespective of if-statement scoping, else branches, or identifiers --
-so a 2-type version of any bypass above is still an offender there even
-though this narrower, decision-scoped check cannot see through it. Only a
-hoisted/wrapped/else/switch-gated list that is NOT exactly {Q4_0, Q8_0}
-escapes both checks.
+What is NOT in that category, corrected here because an earlier draft of
+this paragraph got both wrong in the SAFE direction (understating the check,
+which is the less dangerous mistake but still an inaccurate one): the check
+is NOT `if`-shaped by architecture in the sense of refusing to look inside
+other control-flow constructs. `if_statements` is a flat, structure-agnostic
+scan for `if (` tokens anywhere in the text, so a marker-bearing decision
+reached through an `else`/`else if` branch, or through a `for`/`while` loop
+body, IS found and chain-checked exactly like a top-level one, AS LONG AS
+the decision itself is shaped as an `if`. Verified, not assumed: the matrix
+above scores `else if` (M5a), a nested `else { if (...) }` (M5b), and a
+hardcoded array walked in a `for` loop guarded by an `if` (M5d) all RED.
+
+The one thing a flat `if (` scan genuinely cannot find is a decision with NO
+`if` token governing it at all -- a raw `switch` `case` label
+(`case GGML_TYPE_Q4_0: resolved = GGML_LAYOUT_AOS; break;`, no "if"
+anywhere) is the concrete instance the matrix caught (M5c, GREEN/blind on
+every revision including this one), and it is DELIBERATELY not fixed here:
+widening the scanner to walk `switch` bodies is a real, separate change that
+deserves its own justification rather than riding this documentation and
+offset fix. Filed as [ticket pending -- team lead to supply id]; reference it
+here once filed. Until then, treat M5c/this gap as a KNOWN, NAMED exception,
+not an oversight.
+
+Consequence for the bound below: it holds for IDENTIFIER OPACITY, but does
+NOT hold for the switch-case gap, and stating it as if it did would be the
+exact kind of implied completeness this whole paragraph exists to avoid.
+The bound: neither the hoisted-variable nor the helper-wrapper bypass can
+hide the exact {Q4_0, Q8_0} shape from the BROAD enumeration check earlier in
+this file, which scans raw file text irrespective of if-statement scoping or
+identifiers -- so a 2-type hoisted/wrapped list is still an offender there
+even though this narrower, decision-scoped check cannot see through the
+indirection to it. The switch-case idiom is EXEMPT from that bound: `case
+GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0:` uses `:`, not `==`, so OR_CHAIN_RE
+(anchored on `==` specifically so it does not collide with switch-case
+syntax -- see that regex's own comment) never matches it at ANY arity,
+including the exact pre-fix shape. A switch-form carve-out therefore escapes
+BOTH checks regardless of how many types it lists. This is not a hazard this
+file quietly hopes goes unnoticed: it is the reason the ticket above exists.
 
 Not in scope, and deliberately so: llama.cpp-mn70's sibling consumer-side
 guard (R1, landed as 011064e2b) is a RUNTIME comparison against the observed
@@ -235,12 +253,17 @@ def matching_delimiter(text: str, opening: int, open_char: str, close_char: str)
     raise ValueError(f"unclosed delimiter: {open_char}")
 
 
-def if_statements(body: str):
-    """Yield (condition_text, consequent_text) for every `if (...) { ... }` or
-    `if (...) stmt;` in body, RECURSIVELY -- both top-level ifs and every if
-    nested inside another if's consequent -- in a depth-first, parent-before-
-    child order. A minimal brace/paren-balanced scanner in the same spirit as
-    this repo's own test-sycl-supports-op-indexed-moe-source.py (braced_body /
+def if_statements(body: str, base_offset: int = 0):
+    """Yield (condition_text, consequent_text, consequent_start, consequent_end)
+    for every `if (...) { ... }` or `if (...) stmt;` in body, RECURSIVELY --
+    both top-level ifs and every if nested inside another if's consequent --
+    in a depth-first, parent-before-child order. consequent_start/end are
+    ABSOLUTE offsets into the TOP-LEVEL body first passed to this function
+    (base_offset threads that origin through recursion, since a recursive
+    call operates on an extracted substring and would otherwise report
+    positions relative to that substring instead). A minimal brace/paren-
+    balanced scanner in the same spirit as this repo's own
+    test-sycl-supports-op-indexed-moe-source.py (braced_body /
     matching_delimiter), not a full C++ parser.
 
     Recursion is load-bearing, not cosmetic: an outer if's consequent_text
@@ -250,10 +273,20 @@ def if_statements(body: str):
     seen, and its (roster-derived, clean) condition is what a caller matching
     on "consequent contains marker" would wrongly return -- exactly the
     fail-open a team-lead review caught: a hand-maintained type list nested
-    under an outer if that itself carries a roster call. find_decision_condition
-    below is what turns "also visible" into "correctly selected": among all
-    matches, it prefers the one with the SHORTEST consequent, which is always
-    the innermost (a nested consequent is a strict substring of its parents').
+    under an outer if that itself carries a roster call.
+
+    Offsets, not text, are what find_decision_condition below uses to decide
+    "innermost" -- a second team-lead review round caught that TEXTUAL
+    containment (`inner in outer`) is wrong on two adversarial shapes a
+    textual check cannot tell apart from genuine nesting: two SIBLING
+    consequents that happen to be byte-identical after comment-stripping
+    (`a in b` is True when a == b, even though neither contains the other),
+    and a short, braceless consequent that is an accidental TEXTUAL substring
+    of an unrelated, differently-braced SIBLING consequent elsewhere in the
+    body. INTERVAL containment (is [start,end) of one strictly inside
+    [start,end) of the other) is exact where substring containment is not,
+    because it is anchored to where the text actually IS, not merely what it
+    reads as.
     """
     position = 0
     while True:
@@ -275,64 +308,83 @@ def if_statements(body: str):
         if rest < len(body) and body[rest] == "{":
             brace_close = matching_delimiter(body, rest, "{", "}")
             consequent = body[rest : brace_close + 1]
+            consequent_start, consequent_end = rest, brace_close + 1
             position = brace_close + 1
         else:
             stmt_end = body.index(";", rest)
             consequent = body[rest : stmt_end + 1]
+            consequent_start, consequent_end = rest, stmt_end + 1
             position = stmt_end + 1
-        yield condition, consequent
+        yield condition, consequent, base_offset + consequent_start, base_offset + consequent_end
         # Recurse into this if's own consequent to find anything nested
         # inside it. This does not re-visit or double-yield: the recursive
         # call scans a separately-extracted substring, while the outer loop's
         # `position` above already advanced past this whole consequent in the
         # ORIGINAL body, so the two scans cover disjoint textual roles even
-        # though one is a physical substring of the other.
-        yield from if_statements(consequent)
+        # though one is a physical substring of the other. base_offset keeps
+        # the yielded positions anchored to the TOP-LEVEL body throughout.
+        yield from if_statements(consequent, base_offset + consequent_start)
 
 
 def find_decision_condition(body: str, consequent_marker: str) -> str:
     """The condition of the INNERMOST if-statement whose consequent contains
     consequent_marker (searched recursively -- see if_statements). "Innermost"
-    is the match with the shortest consequent text -- but ONLY once the
-    matches are confirmed to form a single nesting chain (see below). A nested
-    if's consequent is always a strict substring of every ANCESTOR if's
-    consequent that also contains the marker; that containment relation is
-    what makes "shortest = innermost" true, and it is a property of a chain of
-    ancestors, not of an arbitrary set of matches. Two matches that stand in
-    no containment relation at all -- e.g. two SIBLING if-statements, each
-    independently containing the marker -- are not "close" and "far"; they are
-    simply ambiguous, and "shortest" degenerates to shortest-by-accident.
+    is the match whose consequent INTERVAL -- not text -- is contained in
+    every other match's interval, and that containment is verified explicitly
+    before any match is trusted, rather than inferred from length.
 
-    So: order every match by consequent length, then verify each is a
-    substring of the next-longer one (i.e. every match nests inside the next).
-    If that chain check fails, the ambiguity is real and must not be silently
-    resolved by picking one -- raise, the same way zero matches raises. This
-    guard existed as "raise on anything other than exactly one match" before
-    nested-if support was added, and RELAXING it (many matches now allowed) to
-    add nested-if coverage would have silently reopened a hole of the same
-    class if it were not paired with this ordering check: a hand-maintained
-    list living in a SIBLING if next to the clean carve-out passes an "any
-    innermost" selection (the sibling's short consequent looks maximally
-    "innermost") while never actually being ambiguous-checked against the
-    carve-out's condition. Do not weaken this to "prefer the shortest" without
-    re-deriving why that is still sound -- it previously wasn't.
+    A nested if's consequent interval is always strictly inside every
+    ANCESTOR if's consequent interval that also contains the marker; that is
+    what makes "innermost = most contained" true, and it is a property of a
+    chain of ancestors, not of an arbitrary set of matches. Two matches that
+    stand in no containment relation at all -- e.g. two SIBLING if-statements,
+    each independently containing the marker -- are not "close" and "far";
+    they are simply ambiguous.
+
+    A second team-lead review round is why this is INTERVAL containment
+    (start/end offsets) and not TEXTUAL containment (`inner_text in
+    outer_text`), which was this function's first fix-round-3 form and was
+    itself found unsound on two adversarial shapes: two sibling consequents
+    that are byte-IDENTICAL after comment-stripping (`a in b` is True when
+    a == b, even though neither is nested in the other), and a short,
+    braceless consequent that is an accidental textual substring of an
+    unrelated, differently-shaped sibling elsewhere in the body. Offsets
+    cannot be fooled by either: they are anchored to where the text actually
+    lives, not to what it happens to read as.
+
+    So: order every match by interval length (end - start), then verify each
+    is INTERVAL-contained in the next-longer one (its [start, end) lies
+    entirely within the next match's [start, end)). If that chain check
+    fails, the ambiguity is real and must not be silently resolved by picking
+    one -- raise, the same way zero matches raises. This guard existed as
+    "raise on anything other than exactly one match" before nested-if support
+    was added, and RELAXING it (many matches now allowed) to add nested-if
+    coverage would have silently reopened a hole of the same class if it were
+    not paired with this containment check: a hand-maintained list living in
+    a SIBLING if next to the clean carve-out is not ambiguous-checked against
+    the carve-out's condition unless this loop runs. Do not weaken this to
+    "prefer the shortest" (by length OR by text) without re-deriving why that
+    is still sound -- twice now, it wasn't.
 
     Raising on zero matches is unchanged and deliberate: no marker occurrence
     at all means the extraction itself is unsound for this body, not that the
     invariant holds."""
-    matches = [(cond, cons) for cond, cons in if_statements(body) if consequent_marker in cons]
+    matches = [
+        (cond, start, end) for cond, cons, start, end in if_statements(body) if consequent_marker in cons
+    ]
     if not matches:
         raise ValueError(f"expected at least one if-statement with {consequent_marker!r} in its consequent, found 0")
-    ordered = sorted(matches, key=lambda pair: len(pair[1]))
-    for (_, inner_consequent), (_, outer_consequent) in zip(ordered, ordered[1:]):
-        if inner_consequent not in outer_consequent:
+    ordered = sorted(matches, key=lambda m: m[2] - m[1])
+    for (_, inner_start, inner_end), (_, outer_start, outer_end) in zip(ordered, ordered[1:]):
+        if not (outer_start <= inner_start and inner_end <= outer_end):
             raise ValueError(
-                f"{consequent_marker!r} occurs in two if-consequents that are not nested in one "
-                f"another -- the decision is ambiguous, so 'innermost' is undefined. This body needs "
-                f"a more specific marker, or the two matching if-statements need to be reconciled by "
-                f"hand before this check can trust either one."
+                f"{consequent_marker!r} occurs in two if-consequents whose intervals are not nested in "
+                f"one another (offsets [{inner_start},{inner_end}) vs [{outer_start},{outer_end})) -- the "
+                f"decision is ambiguous, so 'innermost' is undefined. This body needs a more specific "
+                f"marker, or the two matching if-statements need to be reconciled by hand before this "
+                f"check can trust either one."
             )
-    innermost_condition, _ = ordered[0]
+    innermost_condition, _, _ = ordered[0]
     return innermost_condition
 
 
@@ -413,6 +465,54 @@ def test_find_decision_condition_raises_on_sibling_ambiguity():
     )
     condition = find_decision_condition(nested, "GGML_LAYOUT_AOS")
     assert "GGML_TYPE_Q6_K" in condition
+
+
+def test_find_decision_condition_uses_offsets_not_text_for_containment():
+    """Unit-level proof of the third team-lead finding: TEXTUAL containment
+    (`inner in outer`) is unsound on two adversarial shapes that INTERVAL
+    containment (start/end offsets) resolves correctly. Both are constructed
+    to defeat a textual check specifically, not just to exercise the sibling
+    path generically."""
+    # Adversarial shape 1: two SIBLING consequents that are byte-identical.
+    # `"resolved = GGML_LAYOUT_AOS;" in "resolved = GGML_LAYOUT_AOS;"` is True
+    # (a string is always "contained in" an identical copy of itself), so a
+    # textual check would misread this as one nested inside the other and
+    # silently pick either -- exactly the ambiguity the chain check exists to
+    # catch, wearing a disguise a length/text comparison cannot see through.
+    identical_siblings = (
+        "if (moe_mmvq_any_dispatch_supports_layout(src0->type, resolved)) {\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "}\n"
+        "if (src0->type == GGML_TYPE_Q6_K) {\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "}\n"
+    )
+    try:
+        find_decision_condition(identical_siblings, "GGML_LAYOUT_AOS")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "byte-identical sibling consequents must raise, not be silently treated as nested"
+
+    # Adversarial shape 2: a short, BRACELESS clean consequent whose text is
+    # an accidental substring of an unrelated, differently-braced sibling's
+    # consequent -- textually "contained" (substring), but not intervally
+    # contained (disjoint byte ranges). A textual check would pick the clean
+    # (braceless) one as "innermost" merely because it is a substring by
+    # coincidence, not because it is structurally nested in anything.
+    braceless_substring_hazard = (
+        "if (moe_mmvq_any_dispatch_supports_layout(src0->type, resolved))\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "if (src0->type == GGML_TYPE_Q6_K) {\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "}\n"
+    )
+    try:
+        find_decision_condition(braceless_substring_hazard, "GGML_LAYOUT_AOS")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "a braceless consequent that is a textual substring of an unrelated sibling must still raise"
 
 
 def test_positive_control_regex_is_sensitive():
@@ -594,6 +694,7 @@ def test_advertisement_and_refusal_sites_decide_layout_via_roster_only():
 if __name__ == "__main__":
     test_find_decision_condition_prefers_innermost_nested_if()
     test_find_decision_condition_raises_on_sibling_ambiguity()
+    test_find_decision_condition_uses_offsets_not_text_for_containment()
     test_positive_control_regex_is_sensitive()
     test_regex_does_not_over_match_longer_or_chains()
     test_no_hand_maintained_carveout_survives_outside_the_named_exception()
