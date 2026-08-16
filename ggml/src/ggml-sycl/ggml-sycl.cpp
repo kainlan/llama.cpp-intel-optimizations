@@ -25778,32 +25778,6 @@ static bool ggml_sycl_moe_prompt_down_specialized_layout_proven(const ggml_tenso
            ggml_sycl_moe_planned_layout_complete(src0, device, GGML_LAYOUT_SOA);
 }
 
-// Sibling of ggml_sycl_moe_prompt_down_specialized_layout_proven(), widened to
-// admit GATE/UP (llama.cpp-613w). Deliberately a SEPARATE function rather than
-// a widened original: the original has several other production call sites
-// this fix did not individually verify are safe under a widened predicate, so
-// it is left untouched. Used only at the two call sites verified for this fix
-// (ggml_sycl_moe_phase_target_layout, ggml_sycl_moe_layout_for_selected_rows).
-static bool ggml_sycl_moe_prompt_gateup_specialized_layout_proven(const ggml_tensor * src0,
-                                                                  int                 device,
-                                                                  layout_mode         layout,
-                                                                  int64_t             n_tokens) {
-    if (n_tokens <= 1 || ggml_sycl_moe_prompt_down_specialized_layouts_enabled()) {
-        return true;
-    }
-    if (!src0 || src0->type != GGML_TYPE_MXFP4 || device < 0 || device >= ggml_sycl_info().device_count) {
-        return false;
-    }
-    const moe_tensor_type role = moe_classify_tensor(src0->name);
-    if ((role != MOE_TENSOR_GATE && role != MOE_TENSOR_UP) ||
-        (layout != GGML_LAYOUT_MXFP4_I8 && layout != GGML_LAYOUT_MXFP4_DPAS) ||
-        !ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, layout)) {
-        return false;
-    }
-    return ggml_sycl_moe_planned_layout_complete(src0, device, layout) &&
-           ggml_sycl_moe_planned_layout_complete(src0, device, GGML_LAYOUT_SOA);
-}
-
 static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, int device, layout_mode * out_layout);
 static bool ggml_sycl_materialize_moe_tensor_phase_layout(const ggml_tensor * src0,
                                                           int                 device,
@@ -26281,27 +26255,19 @@ static layout_mode ggml_sycl_moe_layout_for_selected_rows(const ggml_tensor * sr
     if (moe_kind != MOE_TENSOR_GATE && moe_kind != MOE_TENSOR_UP && moe_kind != MOE_TENSOR_DOWN) {
         return layout;
     }
-    if (n_tokens > 1 && (layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS) &&
-        (moe_kind == MOE_TENSOR_DOWN || moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP)) {
-        // GATE/UP (llama.cpp-613w): route through the sibling proven-check so
-        // the shared down-only ggml_sycl_moe_prompt_down_specialized_layout_proven()
-        // is not touched -- see the matching comment in
-        // ggml_sycl_moe_phase_target_layout().
-        const bool proven = moe_kind == MOE_TENSOR_DOWN ?
-                                ggml_sycl_moe_prompt_down_specialized_layout_proven(src0, device, layout, n_tokens) :
-                                ggml_sycl_moe_prompt_gateup_specialized_layout_proven(src0, device, layout, n_tokens);
-        if (!proven) {
-            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                static std::atomic<int> prompt_down_i8_guard_log{ 0 };
-                if (prompt_down_i8_guard_log.fetch_add(1, std::memory_order_relaxed) < 96) {
-                    fprintf(stderr,
-                            "[GRAPH-MOE-LAYOUT] tensor=%s device=%d selected=%s rows=%zu fallback=soa "
-                            "reason=prompt-down-specialized-layout-unproven\n",
-                            src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(layout), selected_rows);
-                }
+    if (n_tokens > 1 && moe_kind == MOE_TENSOR_DOWN &&
+        (layout == GGML_LAYOUT_MXFP4_I8 || layout == GGML_LAYOUT_MXFP4_DPAS) &&
+        !ggml_sycl_moe_prompt_down_specialized_layout_proven(src0, device, layout, n_tokens)) {
+        if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+            static std::atomic<int> prompt_down_i8_guard_log{ 0 };
+            if (prompt_down_i8_guard_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                fprintf(stderr,
+                        "[GRAPH-MOE-LAYOUT] tensor=%s device=%d selected=%s rows=%zu fallback=soa "
+                        "reason=prompt-down-specialized-layout-unproven\n",
+                        src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(layout), selected_rows);
             }
-            return GGML_LAYOUT_SOA;
         }
+        return GGML_LAYOUT_SOA;
     }
     if (layout == GGML_LAYOUT_XMX_TILED_BUNDLE4) {
         if (n_tokens > 1 || selected_rows == 0 || !ggml_sycl_moe_gateup_bundle4_supported(src0, device)) {
@@ -53185,30 +53151,19 @@ static layout_mode ggml_sycl_moe_phase_target_layout(const ggml_tensor * src0, i
         ggml_sycl_moe_decode_xmx_tiled_supported(src0, device)) {
         return GGML_LAYOUT_XMX_TILED;
     }
-    if ((moe_kind == MOE_TENSOR_DOWN || moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP) && plan_owned_here) {
+    if (moe_kind == MOE_TENSOR_DOWN && plan_owned_here) {
         const layout_mode adjusted_planned = ggml_sycl_adjust_layout_for_tensor(src0, planned_layout, device);
         if (adjusted_planned == planned_layout && planned_layout != GGML_LAYOUT_AOS &&
             planned_layout != GGML_LAYOUT_XMX_TILED &&
             ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, planned_layout)) {
-            if (!decode_phase && (planned_layout == GGML_LAYOUT_MXFP4_I8 || planned_layout == GGML_LAYOUT_MXFP4_DPAS)) {
-                // GATE/UP (llama.cpp-613w): route through the sibling proven-
-                // check so the shared down-only
-                // ggml_sycl_moe_prompt_down_specialized_layout_proven() is not
-                // touched -- it has other call sites this fix did not verify.
-                const bool proven =
-                    moe_kind == MOE_TENSOR_DOWN ?
-                        ggml_sycl_moe_prompt_down_specialized_layout_proven(src0, device, planned_layout,
-                                                                            /*n_tokens=*/2) :
-                        ggml_sycl_moe_prompt_gateup_specialized_layout_proven(src0, device, planned_layout,
-                                                                              /*n_tokens=*/2);
-                if (!proven) {
-                    return GGML_LAYOUT_SOA;
-                }
+            if (!decode_phase && (planned_layout == GGML_LAYOUT_MXFP4_I8 || planned_layout == GGML_LAYOUT_MXFP4_DPAS) &&
+                !ggml_sycl_moe_prompt_down_specialized_layout_proven(src0, device, planned_layout,
+                                                                     /*n_tokens=*/2)) {
+                return GGML_LAYOUT_SOA;
             }
             // The down projection has a dedicated planner-owned MXFP4_I8/DPAS
             // path. Treating it like gate/up SOA here releases those handles and
-            // drops decode and PP onto slower SOA fallback paths. Gate/up now
-            // share this path once their own upgrade is proven (llama.cpp-613w).
+            // drops decode and PP onto slower SOA fallback paths.
             return planned_layout;
         }
     }

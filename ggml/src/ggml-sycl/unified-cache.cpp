@@ -21283,16 +21283,7 @@ static bool planner_moe_primary_executor_supports_layout_on_device(const placeme
         return planner_mxfp4_xmx_tiled_bundle4_supported(entry, device_id);
     }
     if (layout == GGML_LAYOUT_MXFP4_I8) {
-        // GATE/UP admitted alongside DOWN (llama.cpp-613w): this helper is
-        // the shared eligibility check maybe_upgrade_moe_gate_up_layouts_to_i8()
-        // relies on as its own skip_executor gate, but until this line it
-        // hardcoded DOWN regardless of caller -- the gate/up upgrade pass has
-        // existed since d87d54cdd9 (2026-05-21) and never once admitted a
-        // candidate because of this one check. planner_mxfp4_i8_supported()
-        // itself carries no role restriction (type/shape/device only).
-        return (entry.expert_role == expert_tensor_role::DOWN || entry.expert_role == expert_tensor_role::GATE ||
-                entry.expert_role == expert_tensor_role::UP) &&
-               planner_mxfp4_i8_supported(entry, device_id);
+        return entry.expert_role == expert_tensor_role::DOWN && planner_mxfp4_i8_supported(entry, device_id);
     }
     if (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_COALESCED) {
         return true;
@@ -22828,15 +22819,10 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
                     complete = false;
                     return;
                 }
-                // Full i8 charge, not a delta against the old SOA charge:
-                // upgrade_role() below always preserves the SOA alternate
-                // (llama.cpp-613w), so those bytes stay charged as before and
-                // the i8 bytes are wholly additional -- mirroring
-                // maybe_upgrade_moe_down_layouts_to_i8()'s preserve_primary_soa
-                // branch, which is unconditional here since gate/up has no
-                // equivalent of down's opt-out flags to gate it behind.
+                const size_t old_charge =
+                    entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
                 const size_t new_charge = placement_vram_charge_bytes(i8_bytes);
-                extra_charge += new_charge;
+                extra_charge += new_charge > old_charge ? new_charge - old_charge : 0;
             }
         };
 
@@ -22879,27 +22865,10 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
         auto upgrade_role = [&](const std::vector<size_t> & indices) {
             for (size_t idx : indices) {
                 placement_entry & entry = plan.entries[idx];
-                // Preserve the SOA alternate before overwriting the primary
-                // layout (llama.cpp-613w), mirroring
-                // maybe_upgrade_moe_down_layouts_to_i8()'s preservation step.
-                // Without it, ggml_sycl_moe_prompt_*_specialized_layout_proven()
-                // can never see SOA as complete again for an upgraded expert,
-                // and any PP consumer that falls back to SOA finds nothing
-                // there. Down gates this behind two down-specific opt-out
-                // flags (planner_moe_prompt_down_specialized_layouts_enabled(),
-                // planner_moe_prompt_down_transient_soa_enabled()) that have no
-                // gate/up equivalent; gate/up always preserves, which is
-                // down's own conservative default with both flags unset.
-                if (entry.layout == GGML_LAYOUT_SOA) {
-                    const size_t soa_charge = entry.vram_charge_size != 0 ? entry.vram_charge_size :
-                                                                            placement_vram_charge_bytes(entry.dst_size);
-                    planner_entry_add_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id, entry.dst_size,
-                                                                 soa_charge);
-                }
-                entry.layout           = GGML_LAYOUT_MXFP4_I8;
-                entry.dst_size         = planner_layout_bytes_for_dims(entry.type, entry.ne[0], entry.ne[1],
-                                                                       GGML_LAYOUT_MXFP4_I8, entry.dst_size);
-                entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
+                entry.layout            = GGML_LAYOUT_MXFP4_I8;
+                entry.dst_size          = planner_layout_bytes_for_dims(entry.type, entry.ne[0], entry.ne[1],
+                                                                        GGML_LAYOUT_MXFP4_I8, entry.dst_size);
+                entry.vram_charge_size  = placement_vram_charge_bytes(entry.dst_size);
             }
         };
         upgrade_role(candidate.gate_indices);
@@ -24282,18 +24251,6 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
-        // Gate/up claim the shared i8-upgrade VRAM budget BEFORE down, not
-        // evenly, and not the down-first order this block used to run in.
-        // Measured 2026-08-16 (llama.cpp-blvs, GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES
-        // raised to eliminate down's grouped-DPAS chunking entirely): pp512
-        // did not move (46.68 t/s vs a 46.95-47.52 t/s same-build band) --
-        // down's i8 upgrade is not where GPT-OSS PP time goes. Gate/up carry
-        // ~413 GB of the ~442 GB per-pass expert-weight traffic
-        // (llama.cpp-36wo); down carries ~29 GB. Running down first let it
-        // exhaust the scarce budget before gate/up -- the role that actually
-        // matters -- ever got a chance at it. Do not reorder this back
-        // without re-measuring; it is a deliberate policy, not incidental.
-        maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         // Prompt cannot consume XMX_TILED gate/up by default. The planner
         // rewrites those primaries to SOA before packing so single-B50 GPT-OSS
         // does not budget duplicate full-model PP alternates and spill experts.
@@ -24308,6 +24265,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         }
+        maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         reorder_plan_entries_for_moe_materialization(plan, moe_groups);
     }
