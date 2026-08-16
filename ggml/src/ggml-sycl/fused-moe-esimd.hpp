@@ -936,6 +936,19 @@ inline bool fused_moe_esimd_available() {
     return true;
 }
 
+// The fused MoE kernels take their hidden-dimension block count as a TEMPLATE
+// parameter, and the launchers below only instantiate 90 (ncols 2880) and 128
+// (ncols 4096) -- every other size falls through to `<0>`.  fused_moe_q8_0_kernel
+// and fused_moe_mxfp4_kernel bound their accumulation loop by that parameter
+// directly, so under `<0>` the loop never executes and they write zeros over the
+// whole output while reporting success.  Callers must refuse an unsupported
+// hidden dimension instead of launching.
+inline bool fused_moe_esimd_supports_ncols(int64_t ncols) {
+    static_assert(MOE_QK8_0 == MOE_QK_MXFP4, "fused MoE block sizes must agree for a shared ncols check");
+    const int64_t blocks = ncols / MOE_QK8_0;
+    return blocks * MOE_QK8_0 == ncols && (blocks == 90 || blocks == 128);
+}
+
 // Launch fused MoE kernel for Q8_0 weights
 static void launch_fused_moe_q8_0(const void *    expert_weights,
                                   const void *    input,
@@ -1163,6 +1176,10 @@ static void launch_fused_moe_mxfp4_soa(const void *    expert_weights,  // Base 
 #else   // !SYCL_ESIMD_MOE_AVAILABLE
 
 inline bool fused_moe_esimd_available() {
+    return false;
+}
+
+inline bool fused_moe_esimd_supports_ncols(int64_t) {
     return false;
 }
 
