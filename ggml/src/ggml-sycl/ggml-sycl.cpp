@@ -59866,12 +59866,14 @@ static bool ggml_sycl_mul_mat_id_fused(ggml_backend_sycl_context &           ctx
     if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_MXFP4) {
         return false;
     }
-    // The fused kernels only have specializations for hidden dims 2880 and 4096;
-    // any other size reaches a fallback that silently writes zeros. Refuse here
-    // and let the caller route to the non-fused paths.
-    if (!fused_moe_esimd_supports_ncols(ne00)) {
-        GGML_SYCL_DEBUG("[MoE FUSED] ncols=%ld (%ld blocks) has no fused specialization for type %d, falling back\n",
-                        (long) ne00, (long) (ne00 / 32), src0->type);
+    // Q8_0's generic fused arm is repaired below but has never run on hardware, so
+    // keep routing other hidden dims to the non-fused paths, which are proven for
+    // these shapes. MXFP4 is deliberately NOT gated: its generic arm dispatches the
+    // dp4a kernel, which is correct at any hidden dim and is the working route for
+    // ne12 <= 32 (llama.cpp-kpv8).
+    if (src0->type == GGML_TYPE_Q8_0 && !fused_moe_esimd_supports_ncols(ne00)) {
+        GGML_SYCL_DEBUG("[MoE FUSED] Q8_0 ncols=%ld (%ld blocks) has no validated fused specialization, falling back\n",
+                        (long) ne00, (long) (ne00 / 32));
         return false;
     }
     // Input must be F32
@@ -68276,7 +68278,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    src0_layout_aos &&                          // AoS-only kernel
 
                                    (ne12 <= GGML_SYCL_FUSED_MOE_MAX_BATCH) &&  // Large batches use oneDNN
-                                   fused_moe_esimd_supports_ncols(ne00) &&     // no zero-writing `<0>` fallback
                                    (src0->type == GGML_TYPE_MXFP4) && src1->type == GGML_TYPE_F32;
         if (use_fused_moe) {
             const int64_t num_tokens = ids->ne[1];

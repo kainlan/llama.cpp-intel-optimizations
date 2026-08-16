@@ -132,9 +132,12 @@ void fused_moe_q8_0_kernel(const void * __restrict__ expert_weights,      // [nu
     // Read expert ID from ids tensor using proper 2D indexing
     const int32_t expert_id = *(const int32_t *) ((const char *) expert_ids + token_idx * ids_nb1 + id_idx * ids_nb0);
 
+    // Resolve block count (compile-time or runtime)
+    const int blocks_per_row = (HIDDEN_DIM_BLOCKS > 0) ? HIDDEN_DIM_BLOCKS : (ncols / MOE_QK8_0);
+
     // Expert weights: offset by expert_id * stride_expert
     const block_q8_0 * weights_row =
-        (const block_q8_0 *) ((const char *) expert_weights + expert_id * stride_expert) + row * HIDDEN_DIM_BLOCKS;
+        (const block_q8_0 *) ((const char *) expert_weights + expert_id * stride_expert) + row * blocks_per_row;
 
     // Compute input offset using proper 2D indexing (matching MMVQ kernel)
     // i11 = id_idx % ne11, i12 = token_idx
@@ -146,7 +149,7 @@ void fused_moe_q8_0_kernel(const void * __restrict__ expert_weights,      // [nu
     float partial_sum = 0.0f;
 
     // Process blocks assigned to this thread
-    for (int b = tid; b < HIDDEN_DIM_BLOCKS; b += MOE_WG_SIZE) {
+    for (int b = tid; b < blocks_per_row; b += MOE_WG_SIZE) {
         // Load scale
         float scale = static_cast<float>(weights_row[b].d);
 
@@ -256,9 +259,12 @@ void fused_moe_mxfp4_kernel(const void * __restrict__ expert_weights,
         return;
     }
 
+    // Resolve block count (compile-time or runtime)
+    const int blocks_per_row = (HIDDEN_DIM_BLOCKS > 0) ? HIDDEN_DIM_BLOCKS : (ncols / MOE_QK_MXFP4);
+
     // Expert weights: offset by expert_id * stride_expert
     const block_mxfp4 * weights_row =
-        (const block_mxfp4 *) ((const char *) expert_weights + expert_id * stride_expert) + row * HIDDEN_DIM_BLOCKS;
+        (const block_mxfp4 *) ((const char *) expert_weights + expert_id * stride_expert) + row * blocks_per_row;
 
     // Compute input offset using proper 2D indexing (matching MMVQ kernel)
     // i11 = id_idx % ne11, i12 = token_idx
@@ -268,7 +274,7 @@ void fused_moe_mxfp4_kernel(const void * __restrict__ expert_weights,
 
     float partial_sum = 0.0f;
 
-    for (int b = tid; b < HIDDEN_DIM_BLOCKS; b += MOE_WG_SIZE) {
+    for (int b = tid; b < blocks_per_row; b += MOE_WG_SIZE) {
         // MXFP4 scale: E8M0 exponent to FP32/2
         const float scale = sycl_e8m0_to_fp32_half(weights_row[b].e);
 
