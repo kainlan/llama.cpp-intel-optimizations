@@ -542,7 +542,31 @@ done; done
 ### Task 14: Perf matrix + landing (lead)
 
 **Track:** lead (GPU)
-**Depends on:** Tasks 9, 13, 15
+**Depends on:** Tasks 9, 13, 15, **and the MoE executor restoration (owner ruling 2026-08-16)**
+
+> ⚠️ **OWNER RULING 2026-08-16 — RESTORE BEFORE MERGING.** This task can no longer
+> reach step 1 with the branch as it stands. Commit `abecb785d` (2026-08-11) deleted
+> the default-ON MXFP4 fused MoE layer executor (`try_gpu_moe_pair`), and GPT-OSS 20B
+> is measured **13–19× under the PP512 floor and 2.3–2.7× under TG128 on both cards**
+> while Mistral is healthy — so step 1's gate cannot pass and step 2's paired-A/B
+> escape does not apply (this is a real, fully attributed regression, not load noise).
+> Interim mitigations were costed and are dead ends (`llama.cpp-36wo` c-j25z).
+>
+> The owner's decision is that **master never sees the regression**: the executor is
+> restored on this branch first, then Task 13 re-certifies at the restored SHA, then
+> this task runs. Restoration scope and its testable acceptance property live in
+> `llama.cpp-unpj` / `llama.cpp-omp4`; the attribution and both mechanisms are closed
+> in `llama.cpp-36wo` c-c36w. Restoration acceptance (over and above the floors in
+> step 1): **~9.7 GB of expert-weight traffic per pp512 pass, not ~442 GB** (each
+> expert's weights read once per op, not once per assigned token), TG recovering
+> ~2.3× of expert-weight read efficiency at 1.21 GB/token, and the 14 checks in
+> `tests/test-sycl-moe-sequence-graphlet-policy.cpp` currently skipped citing
+> `llama.cpp-unpj` re-armed.
+>
+> Consequence for step 3: the branch diverges further while the restoration lands, so
+> the "rebase FIRST if master has moved" note in **Gotchas** becomes more likely to
+> bind, not less — check `git log ..master` again at restoration completion, not only
+> before Task 13.
 **File scope:**
 - Create: `artifacts/hardening-merge/perf-final/`
 - Branches: `feature/sycl-b70-capability`, `master`
