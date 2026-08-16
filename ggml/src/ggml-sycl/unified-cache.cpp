@@ -22828,10 +22828,15 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
                     complete = false;
                     return;
                 }
-                const size_t old_charge =
-                    entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
+                // Full i8 charge, not a delta against the old SOA charge:
+                // upgrade_role() below always preserves the SOA alternate
+                // (llama.cpp-613w), so those bytes stay charged as before and
+                // the i8 bytes are wholly additional -- mirroring
+                // maybe_upgrade_moe_down_layouts_to_i8()'s preserve_primary_soa
+                // branch, which is unconditional here since gate/up has no
+                // equivalent of down's opt-out flags to gate it behind.
                 const size_t new_charge = placement_vram_charge_bytes(i8_bytes);
-                extra_charge += new_charge > old_charge ? new_charge - old_charge : 0;
+                extra_charge += new_charge;
             }
         };
 
@@ -22874,10 +22879,27 @@ static size_t maybe_upgrade_moe_gate_up_layouts_to_i8(placement_plan & plan,
         auto upgrade_role = [&](const std::vector<size_t> & indices) {
             for (size_t idx : indices) {
                 placement_entry & entry = plan.entries[idx];
-                entry.layout            = GGML_LAYOUT_MXFP4_I8;
-                entry.dst_size          = planner_layout_bytes_for_dims(entry.type, entry.ne[0], entry.ne[1],
-                                                                        GGML_LAYOUT_MXFP4_I8, entry.dst_size);
-                entry.vram_charge_size  = placement_vram_charge_bytes(entry.dst_size);
+                // Preserve the SOA alternate before overwriting the primary
+                // layout (llama.cpp-613w), mirroring
+                // maybe_upgrade_moe_down_layouts_to_i8()'s preservation step.
+                // Without it, ggml_sycl_moe_prompt_*_specialized_layout_proven()
+                // can never see SOA as complete again for an upgraded expert,
+                // and any PP consumer that falls back to SOA finds nothing
+                // there. Down gates this behind two down-specific opt-out
+                // flags (planner_moe_prompt_down_specialized_layouts_enabled(),
+                // planner_moe_prompt_down_transient_soa_enabled()) that have no
+                // gate/up equivalent; gate/up always preserves, which is
+                // down's own conservative default with both flags unset.
+                if (entry.layout == GGML_LAYOUT_SOA) {
+                    const size_t soa_charge = entry.vram_charge_size != 0 ? entry.vram_charge_size :
+                                                                            placement_vram_charge_bytes(entry.dst_size);
+                    planner_entry_add_alternate_layout_on_device(entry, GGML_LAYOUT_SOA, device_id, entry.dst_size,
+                                                                 soa_charge);
+                }
+                entry.layout           = GGML_LAYOUT_MXFP4_I8;
+                entry.dst_size         = planner_layout_bytes_for_dims(entry.type, entry.ne[0], entry.ne[1],
+                                                                       GGML_LAYOUT_MXFP4_I8, entry.dst_size);
+                entry.vram_charge_size = placement_vram_charge_bytes(entry.dst_size);
             }
         };
         upgrade_role(candidate.gate_indices);
