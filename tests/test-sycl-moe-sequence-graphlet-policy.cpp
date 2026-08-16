@@ -657,13 +657,31 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
     // site shares the ONE bounded staging retry and the always-on failure trace
     // rather than hand-rolling an alloc_request that had neither.
     //
-    // It is still the same predicate, now asserted as its two halves in the two
-    // places they live: this site must pass pointer_table_payload as the
-    // parameter, and the helper must OR that parameter with the recording
-    // predicate -- which `stage_alloc` below checks against mem-ops.cpp.  Delete
-    // either half and one of the two CHECKs goes red, so the guarantee is still
-    // covered end to end.  Matching the argument alone (not the call's line
-    // wrapping) keeps this from breaking on a reformat.
+    // It is still the same predicate: this site passes pointer_table_payload as
+    // the parameter, and the helper ORs it with the recording predicate.
+    //
+    // WHAT THIS CHECK IS, AND WHAT IT IS NOT.  It was verified by GREP, not by
+    // execution, and it has never actually run.  Two independent reasons, and
+    // both must be fixed before it means anything:
+    //
+    //   1. The CHECK at :324 fails at HEAD and terminates this function long
+    //      before here, so everything below :324 is unreached.
+    //   2. The `stage_alloc` CHECK below -- the half that would cover the
+    //      HELPER's side of the predicate -- asserts the literal
+    //      "require_host_usm_base || ggml_sycl_graph_recording_active()", which
+    //      does not exist in mem-ops.cpp (the code reads `require_host_usm_base
+    //      || graph_any`).  It is therefore unconditionally red, not a
+    //      trip-wire: it cannot distinguish a broken invariant from a working
+    //      one.
+    //
+    // So do NOT read the pair below as end-to-end coverage of the pointer-table
+    // invariant.  That coverage does not currently exist in either direction.
+    // llama.cpp-pbbb owns repairing :324 and the stage_alloc literal; once the
+    // function executes, this CHECK needs validating like any assertion that has
+    // never been observed to fail.
+    //
+    // Matching the argument alone (not the call's line wrapping) keeps this from
+    // breaking on a reformat.
     CHECK(contains(payload_copy, "alloc_pinned_stage_handle_terminal") &&
               contains(payload_copy, "/*require_host_usm_base=*/pointer_table_payload"),
           "graph-recorded payload H2D copies and sequence pointer-table prewarm must not retain reset-zone host staging slices");

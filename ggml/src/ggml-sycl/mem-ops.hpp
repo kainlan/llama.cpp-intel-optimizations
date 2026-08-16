@@ -95,6 +95,19 @@ void stage_trace_mark(const char * tag);
 // on this one, so non-terminal sites deliberately pass no retries and are not
 // served by this entry point.
 //
+// Unrelated to moe-mmid-workspace.hpp's `terminal` vocabulary (device_terminal,
+// terminal_release, queue_submission_authority::mint_terminal), which is about
+// submission-completion authority, not allocation attempts.  Same English word,
+// different subsystem; there is no relationship to infer.
+//
+// ONLY THE ggml-sycl.cpp PAYLOAD-STAGING SITE USES THIS.  The four staging
+// sites inside mem-ops.cpp still call the static alloc_pinned_stage_handle()
+// directly with k_stage_alloc_retries, and that is deliberate rather than a
+// half-finished migration: they are in the same TU as the static, so routing
+// them through this exported wrapper would add a call layer and buy nothing.
+// This entry point exists for callers that CANNOT see the static.  Do not
+// "complete" the migration on the assumption that uniformity is the goal.
+//
 // Recovers from TRANSIENT pressure only -- it performs no drain, reap or
 // eviction between attempts, because reclaiming memory that still has a live
 // handle is forbidden by the unified-cache ownership contract.

@@ -7060,6 +7060,20 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
     // used to spell out, while sharing the one bounded retry and the always-on
     // failure trace instead of hand-rolling an alloc_request that had neither
     // (llama.cpp-13u6).
+    //
+    // That also changes this site's OWNERSHIP SURFACE, which is a real change
+    // and not a refactor detail.  It previously took the legacy
+    // unified_alloc() + from_legacy_owned_alloc() path and minted a LEGACY
+    // ownership record; the helper uses unified_allocate_owner(), so the
+    // allocation now carries an INTRUSIVE owner control with EXTERNAL_EXACT
+    // provenance (standalone_host_usm_base, since must_host_pinned and
+    // require_host_usm_base are both set for this cohort).  The physical
+    // allocation path is identical -- the owner wrapper calls the same
+    // unified_alloc() internally -- but the owner-first form is the surface the
+    // memory contract sanctions, and the legacy one it is retiring.  Consequence
+    // worth knowing: the four silent failure paths in the owner wrapper are now
+    // reachable from here, which is why the retry above is load-bearing rather
+    // than belt-and-braces.
     ggml_sycl::mem_handle stage;
     if (!ggml_sycl::alloc_pinned_stage_handle_terminal(bytes, queue, device, cohort_id,
                                                        /*require_host_usm_base=*/pointer_table_payload, &stage)) {
