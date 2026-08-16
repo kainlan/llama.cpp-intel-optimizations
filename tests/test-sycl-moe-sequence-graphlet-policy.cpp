@@ -10,10 +10,26 @@
 #include <string>
 #include <vector>
 
+// Number of CHECK()s that actually EVALUATED, printed on every exit path.
+//
+// CHECK returns on first failure, so an early death silently strands every
+// assertion behind it -- and for six weeks that is exactly what happened here:
+// the CHECK at what was line 324 had failed since the file was written, so the
+// ~200 assertions after it had never once run while the suite reported a single
+// tidy FAIL line (llama.cpp-pbbb, and the CMakeLists comment at
+// ggml/src/ggml-sycl/CMakeLists.txt:2514-2536 that records the six weeks).
+// A bare rc cannot distinguish "one assertion failed" from "one assertion
+// failed and 200 were never reached", which is the whole reason that state was
+// invisible. This counter makes the reached set a reported number, so a repair
+// can be scored on coverage rather than on rc alone.
+static int g_checks_run = 0;
+
 #define CHECK(cond, msg)                                                        \
     do {                                                                        \
+        ++g_checks_run;                                                         \
         if (!(cond)) {                                                          \
             std::fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, msg); \
+            std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);        \
             return 1;                                                           \
         }                                                                       \
     } while (0)
@@ -106,11 +122,13 @@ static std::string required_region(const std::string & haystack,
     const size_t begin = haystack.find(begin_marker);
     if (begin == std::string::npos) {
         std::fprintf(stderr, "FAIL: missing region begin for %s: %s\n", label, begin_marker);
+        std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);
         std::exit(1);
     }
     const size_t end = end_marker ? haystack.find(end_marker, begin + std::strlen(begin_marker)) : std::string::npos;
     if (end_marker && end == std::string::npos) {
         std::fprintf(stderr, "FAIL: missing region end for %s: %s\n", label, end_marker);
+        std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);
         std::exit(1);
     }
     const size_t finish = end_marker ? end : haystack.size();
@@ -158,6 +176,7 @@ static std::string required_region_flex(const std::string & haystack,
     std::smatch      begin_match;
     if (!std::regex_search(haystack, begin_match, begin_re)) {
         std::fprintf(stderr, "FAIL: missing region begin for %s: %s\n", label, begin_marker);
+        std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);
         std::exit(1);
     }
     const size_t begin = static_cast<size_t>(begin_match.position(0));
@@ -170,6 +189,7 @@ static std::string required_region_flex(const std::string & haystack,
     const std::string tail = haystack.substr(after_begin);
     if (!std::regex_search(tail, end_match, end_re)) {
         std::fprintf(stderr, "FAIL: missing region end for %s: %s\n", label, end_marker);
+        std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);
         std::exit(1);
     }
     const size_t end = after_begin + static_cast<size_t>(end_match.position(0));
@@ -227,6 +247,7 @@ static std::string read_required_file(const char * rel) {
         return ss.str();
     }
     std::fprintf(stderr, "FAIL: could not read required source file: %s\n", rel);
+    std::fprintf(stderr, "CHECKS-EXECUTED: %d\n", g_checks_run);
     std::exit(1);
 }
 
@@ -318,10 +339,60 @@ static int test_sequence_graphlet_has_retention_and_identity() {
           "sequence graph records must own retained handles after recording");
     CHECK(!contains(sequence_fn, "reinterpret_cast<uintptr_t>(resolved.ptr)"),
           "sequence identity must not be raw pointer based inside the sequence implementation");
-    CHECK(contains(sycl, "force_persistent_descriptor_for_graph_recording") &&
-              contains(sycl, "g_moe_descriptor_dispatch_graph_recording_active") &&
-              contains(sycl, "moe_layer_find_persistent_descriptor(ctx, layer, pair, n_ids_pair)"),
-          "descriptor graph recording must force the persistent descriptor-backed route");
+    // "Descriptor graph recording must force the persistent descriptor-backed
+    // route", re-derived against the code that now implements it.
+    //
+    // The original spelling asserted three literals from the inline MoE pair
+    // planner:
+    //     const bool force_persistent_descriptor_for_graph_recording =
+    //         g_moe_descriptor_dispatch_graph_recording_active;
+    //     const moe_layer_persistent_descriptor * persistent_descriptor =
+    //         (moe_layer_descriptor_executor_enabled() ||
+    //          force_persistent_descriptor_for_graph_recording) ?
+    //             moe_layer_find_persistent_descriptor(ctx, layer, pair, n_ids_pair) : nullptr;
+    // "Force" meant: recording bypasses the opt-in descriptor-executor env and
+    // looks the persistent descriptor up anyway.
+    //
+    // abecb785d deleted that planner (-6076 net lines in this file); the local
+    // is gone under every spelling and moe_layer_decode_plan survives only in
+    // row-aggregation debug logging. So this was a STALE GATE, not a
+    // regression -- the invariant did not weaken, it moved and got stronger:
+    // the recorder now REFUSES to record without a complete persistent
+    // descriptor, where the planner merely preferred one.
+    //
+    // Asserted below in two halves, so deleting either goes red:
+    //   1. the resolver reaches moe_layer_find_persistent_descriptor with no
+    //      env gate in front of it -- that is what "force" now means; and
+    //   2. the recorder resolves it and bails with an explicit reject when it
+    //      is missing or incomplete.
+    const std::string descriptor_route =
+        required_region(sycl, "static const moe_layer_persistent_descriptor * moe_graph_descriptor_for_dispatch_node(",
+                        "static bool moe_graph_descriptor_ready_events_complete", "descriptor route for dispatch node");
+    CHECK(contains_normalized(descriptor_route,
+                              "return moe_layer_find_persistent_descriptor(*sycl_ctx, layer, *pair, "
+                              "pair->ids->ne[0]);"),
+          "descriptor route resolution must go through the persistent descriptor lookup");
+    CHECK(!contains(descriptor_route, "moe_layer_descriptor_executor_enabled") &&
+              !contains(descriptor_route, "GGML_SYCL_MOE_DESCRIPTOR_EXECUTOR"),
+          "descriptor route resolution must not be gated on the opt-in descriptor-executor env -- graph recording "
+          "forces the persistent descriptor-backed route");
+    const std::string record_preamble = required_region_flex(
+        sycl,
+        "    std::vector<ggml_sycl::mem_handle> * out_retained_handles,\n"
+        "    bool                                 require_descriptor_supported,\n"
+        "    const char **                        out_reject_reason,\n"
+        "    std::string *                        out_reject_detail) {",
+        "std::vector<ggml_sycl::mem_handle> * retained_handle_sink =", "descriptor MoE graph recorder preamble");
+    CHECK(contains(record_preamble, "moe_graph_descriptor_moe_dispatch_supported(sycl_ctx, node)") &&
+              contains(record_preamble, "set_record_reject(\"descriptor-unsupported\")"),
+          "descriptor graph recording must check descriptor support before recording");
+    CHECK(contains(record_preamble, "moe_graph_descriptor_for_dispatch_node(sycl_ctx, node)") &&
+              contains_normalized(record_preamble,
+                                  "if (!descriptor_for_record || !descriptor_for_record->complete()) {") &&
+              contains(record_preamble, "set_record_reject(\"descriptor-missing\")"),
+          "descriptor graph recording must refuse to record without a complete persistent descriptor");
+    CHECK(contains(sycl, "g_moe_descriptor_dispatch_graph_recording_active"),
+          "descriptor graph recording must still be marked by its recording flag");
 
     const std::string recorder = required_region(sycl,
                                                  "std::vector<ggml_sycl::mem_handle> * retained_handle_sink =",
@@ -498,9 +569,21 @@ static int test_sequence_graphlet_identity_requires_retained_pointer_table() {
     CHECK(!contains(prewarm, "sycl::malloc") && !contains(prewarm, "malloc_device") && !contains(prewarm, "zeMemAlloc"),
           "sequence prewarm must not allocate outside unified-cache helpers");
 
-    const std::string ptr_table_alloc = required_region(sycl, "static void ggml_sycl_ensure_moe_ptr_table",
-                                                        "static void ggml_sycl_update_moe_hotset",
-                                                        "MoE pointer-table allocation helper");
+    // The marker deliberately omits the return type and pins the parameter list
+    // instead. dd4f5d06c changed this helper from `static void` to
+    // `static bool` (so the caller could see the allocation fail rather than
+    // re-probe the extra), which silently un-anchored a marker that had the
+    // word "void" baked into it -- the helper never moved and its body never
+    // changed. Ending on `table_index) {` also excludes the forward
+    // declaration, whose last parameter carries `= -1`.
+    const std::string ptr_table_alloc =
+        required_region_flex(sycl,
+                             "ggml_sycl_ensure_moe_ptr_table(ggml_tensor_extra_gpu * extra,\n"
+                             "                                           int                     device,\n"
+                             "                                           int64_t                 n_experts,\n"
+                             "                                           sycl::queue &           queue,\n"
+                             "                                           int                     table_index) {",
+                             "static void ggml_sycl_update_moe_hotset", "MoE pointer-table allocation helper");
     CHECK(contains(ptr_table_alloc, "expert_ptr_tables_handle->slice") &&
               contains(ptr_table_alloc, "has_stable_owner_identity"),
           "preallocated pointer tables must retain stable owner-backed sliced mem_handles");
@@ -682,10 +765,25 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
     //
     // Matching the argument alone (not the call's line wrapping) keeps this from
     // breaking on a reformat.
-    CHECK(contains(payload_copy, "alloc_pinned_stage_handle_terminal") &&
-              contains(payload_copy, "/*require_host_usm_base=*/pointer_table_payload"),
+    // Pinned as ONE call, arguments included, not as two independent tokens.
+    // The two-token form was void on its first half and a mutation sweep proved
+    // it: swapping the call to a different helper left the check green, because
+    // the explanatory comment 13u6 added directly above the call (ggml-sycl.cpp,
+    // "The staging request itself is built by alloc_pinned_stage_handle_terminal")
+    // contains the helper's name, and `contains()` cannot tell prose from code.
+    // Documenting the invariant is what defeated the grep for it.
+    CHECK(contains_normalized(payload_copy,
+                              "if (!ggml_sycl::alloc_pinned_stage_handle_terminal(bytes, queue, device, cohort_id, "
+                              "/*require_host_usm_base=*/pointer_table_payload, &stage)) {"),
           "graph-recorded payload H2D copies and sequence pointer-table prewarm must not retain reset-zone host staging slices");
-    CHECK(contains(payload_copy, "moe_transient_ptr_table") && contains(payload_copy, "pointer_table_payload"),
+    // Same defect as the CHECK above, same cause: the cohort name and the flag
+    // name both appear in the prose comment beside the code, so asserting the
+    // two tokens separately passed even when the cohort the flag keys on was
+    // changed out from under it. Pin the predicate as one statement -- that is
+    // what ties "this specific cohort" to "forces a standalone host USM base".
+    CHECK(contains_normalized(payload_copy,
+                              "const bool pointer_table_payload = cohort_id && std::strcmp(cohort_id, "
+                              "\"moe_transient_ptr_table\") == 0;"),
           "MoE transient pointer-table payload staging must force standalone host USM outside graph recording too");
     CHECK(contains(payload_copy, "Command graphs capture the host source pointer") &&
               contains(payload_copy, "fallback/record-failure cleanup"),
@@ -695,7 +793,18 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
                                                     "static bool alloc_pinned_stage_handle",
                                                     "static sycl::event mem_copy_direct_submit",
                                                     "mem_copy graph-retained staging");
-    CHECK(contains(stage_alloc, "require_host_usm_base || ggml_sycl_graph_recording_active()"),
+    // 8701cc7cf hoisted the recording predicate into a `graph_any` local so the
+    // trace could report the value the request actually used, instead of
+    // re-sampling a dynamic flag:
+    //     -  ... = require_host_usm_base || ggml_sycl_graph_recording_active();
+    //     +  const bool graph_any = ggml_sycl_graph_recording_active();
+    //     +  ... = require_host_usm_base || graph_any;
+    // Semantics identical, so this too was a STALE GATE rather than a
+    // regression -- but it had been unconditionally red since that commit, and
+    // sat behind the terminator above where nothing could see it. Both halves
+    // are asserted so hoisting further, or dropping the OR, still goes red.
+    CHECK(contains_normalized(stage_alloc, "const bool graph_any = ggml_sycl_graph_recording_active();") &&
+              contains(stage_alloc, "require_host_usm_base || graph_any"),
           "generic graph-recorded H2D staging must use standalone host USM bases");
     CHECK(contains(stage_alloc, "replay it after graph-boundary host-zone resets"),
           "mem_copy stage allocator must document graph-boundary reset safety");
@@ -815,21 +924,44 @@ static int test_sequence_graphlet_tg_diagnostics_after_replay_drain() {
                                                       "PP-to-TG pending exchange");
     CHECK(contains(pp_tg_pending, "sycl_ctx->moe_fa_post_prompt_record_pending = true"),
           "consuming the global PP-to-TG pending flag must arm the sequence graphlet first-decode skip");
-    const std::string host_ids_required = required_region(sycl, "const bool grouped_xmx_ids_required",
-                                                          "auto host_profile_plan_detail_last",
-                                                          "sequence graphlet host-id requirement gate");
-    CHECK(contains(host_ids_required, "!g_ggml_sycl_graph_recording") &&
-              contains_normalized(host_ids_required, "const bool host_ids_required = !g_ggml_sycl_graph_recording"),
-          "sequence graph recording must not force host-ID D2H for diagnostics or batched XMX grouping");
-    const std::string down_direct_ids = required_region(sycl, "const bool down_full_table_direct_ids",
-                                                       "const bool direct_down_sum_layout_ready",
-                                                       "sequence graphlet down direct-id planning");
-    CHECK(contains(down_direct_ids, "!g_ggml_sycl_graph_recording && !ensure_pair_ids_host") &&
-              contains(down_direct_ids, "down_full_table_graph_recording_device_ids") &&
-              contains(down_direct_ids, "g_ggml_sycl_graph_recording && down_full_table_pp_direct_ids") &&
-              contains(down_direct_ids, "down_layout != GGML_LAYOUT_XMX_TILED || g_ggml_sycl_graph_recording") &&
-              contains(down_direct_ids, "!g_ggml_sycl_graph_recording &&"),
-          "sequence graph recording must not force XMX full-table down paths through host-ID waits");
+    // "Graph recording must not force a host-ID D2H", re-derived.
+    //
+    // This used to be two CHECKs over five planner-local booleans --
+    // grouped_xmx_ids_required, host_ids_required, down_full_table_direct_ids,
+    // down_full_table_graph_recording_device_ids, ensure_pair_ids_host -- all
+    // of which abecb785d deleted along with the inline MoE pair planner. None
+    // survives under any spelling (each is 0 occurrences), so both regions had
+    // become unanchorable, and being behind the terminator meant nobody saw it.
+    //
+    // The invariant itself did NOT go away, and this is where it is now
+    // enforced. In ggml_sycl_update_moe_ptr_table, a request that would need
+    // host-side IDs while a graph is recording is REFUSED -- it returns false
+    // and tells the caller to disable graphs or supply host ids -- rather than
+    // falling back to a D2H copy of the ids. Refusing is strictly stronger than
+    // the planner's "don't require them"; the point of both is that recording
+    // never triggers the copy.
+    //
+    // The mmvq-side half of the old pair (device-ID grouping without a host-ID
+    // wait) is asserted separately below and its literals are all intact --
+    // only the ggml-sycl.cpp planner locals died, so the replacement is scoped
+    // to those.
+    const std::string ptr_table_update = required_region_flex(
+        sycl,
+        "bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,\n"
+        "                                    const ggml_tensor *          src0,\n"
+        "                                    const ggml_tensor *          ids,",
+        "static bool ggml_sycl_moe_tensor_plan_primary_layout", "MoE pointer-table update host-ID policy");
+    CHECK(contains_normalized(ptr_table_update,
+                              "if (g_ggml_sycl_graph_recording && !ids_on_host && !ids_host_override) {") &&
+              contains(ptr_table_update, "ids are device-only during graph recording"),
+          "graph recording must refuse a device-only-ID pointer-table update instead of forcing a host-ID D2H");
+    // The refusal is only a refusal if it returns before the D2H below it.
+    const size_t recording_refusal_pos =
+        find_normalized(ptr_table_update, "if (g_ggml_sycl_graph_recording && !ids_on_host && !ids_host_override) {");
+    const size_t ids_d2h_pos = ptr_table_update.find("check per-layer IDs cache before D2H copy");
+    CHECK(recording_refusal_pos != std::string::npos && ids_d2h_pos != std::string::npos &&
+              recording_refusal_pos < ids_d2h_pos,
+          "the graph-recording ID refusal must precede the host-ID D2H path it exists to avoid");
     const std::string mmvq = read_required_file("ggml/src/ggml-sycl/mmvq.cpp");
     const std::string mmvq_scratch = required_region(mmvq, "static uint8_t * mmvq_alloc_device_scratch",
                                                      "struct ggml_sycl_mmvq_temp_release_marker_kernel",
@@ -1442,20 +1574,80 @@ static int test_xmx_tiled_original_layout_validator_contract() {
     CHECK(contains(mmvq, "mxfp4_moe_xmx_tiled_validate_output_original(") &&
               contains(mmvq, "used_xmx_tiled_dpas && have_kernel_event"),
           "original-layout XMX validator must only hook into the existing XMX_TILED validation point");
+    // afe475f74 made the MoE metadata registry value-owned, so the validator
+    // takes `const moe_expert_meta & meta` and a separate `source_aos` pointer
+    // instead of reading `meta->data_ptr`. The comparison it performs is
+    // unchanged -- staged bytes against the original AoS expert bytes -- so this
+    // was a STALE GATE from a pointer-to-reference refactor, not a lost check.
+    // Anchored on the validator's own region now, so a caller elsewhere that
+    // merely mentions these names cannot satisfy it.
+    const std::string materialize_validator =
+        required_region_flex(sycl, "static void ggml_sycl_validate_xmx_tiled_materialization_original(sycl::queue &",
+                             "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE] tensor=%s expert=%d device=%d failed=unknown",
+                             "XMX_TILED original-layout materialization validator");
+    // Both operands of the comparison are pinned, not merely named. Spotting
+    // the tokens "source_aos" and "meta.bytes" somewhere in the region is not
+    // enough: a mutation that renamed the source parameter left every one of
+    // those tokens present elsewhere in the body and the check still passed,
+    // i.e. it was void. What makes it a real trip-wire is naming the two
+    // buffers the comparison actually reads -- `expected`, reconstructed from
+    // the ORIGINAL AoS bytes, and `actual`, read back from the staged pointer.
     CHECK(contains(sycl, "GGML_SYCL_XMX_TILED_VALIDATE_MATERIALIZATION_ORIGINAL") &&
-              contains(sycl, "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE]") &&
-              contains(sycl, "ggml_sycl_fill_xmx_tiled_host_cpu") && contains(sycl, "meta->data_ptr") &&
-              contains(sycl, "meta->bytes") && contains(sycl, "source_layout=%s"),
-          "XMX_TILED materialization validator must compare staged bytes against original AoS expert bytes");
+              contains(materialize_validator, "[MOE-XMX-MATERIALIZE-ORIGINAL-VALIDATE]") &&
+              contains(materialize_validator, "source_layout=%s"),
+          "XMX_TILED materialization validator must stay env-gated and keep its source-layout diagnostic");
+    CHECK(contains_normalized(materialize_validator, "const void * reference_aos = source_aos;") &&
+              contains_normalized(materialize_validator,
+                                  "::ggml_sycl_fill_xmx_tiled_host_cpu(expected.data(), expected.size(), "
+                                  "reference_aos, meta.bytes, tiled_ctx);"),
+          "XMX_TILED materialization validator must rebuild its expected bytes from the original AoS expert bytes");
+    CHECK(contains_normalized(materialize_validator,
+                              "::ggml_sycl_safe_memcpy_sync(queue, actual.data(), staged_ptr, staged_bytes);") &&
+              contains(materialize_validator, "actual[i] == expected[i]"),
+          "XMX_TILED materialization validator must compare the staged bytes it read back against those expected "
+          "bytes");
     CHECK(contains(sycl, "GGML_SYCL_MOE_AGGRESSIVE_XMX_TILED") &&
               contains(sycl, "moe_aggressive_partial_tg_xmx_tiled_env_enabled") &&
               contains(sycl, "moe_aggressive_partial_tg_env_enabled()") &&
               !contains(sycl, "false && gate_up_has_plan"),
           "selected-row XMX_TILED route must be reopened only by an explicit aggressive XMX env, not by a hard-coded false guard");
-    CHECK(contains(sycl, "current_ptr_table_layer_hash") && contains(sycl, "partner_layer_hash") &&
-              contains(sycl, "moe_cache_layer_id(plan.current.weight->name)") &&
-              contains(sycl, "moe_cache_layer_id(partner_weight->name)"),
-          "selected gate/up pointer-table uploads must use role-specific table hashes to avoid preallocated table aliasing");
+    // The four literals here were planner locals (current_ptr_table_layer_hash,
+    // partner_layer_hash and their two moe_cache_layer_id() initialisers), all
+    // removed with the inline MoE pair planner in abecb785d. The anti-aliasing
+    // property they protected did not go away: the per-role pointer-table
+    // helper now derives its own hash from THAT role's weight name, so gate,
+    // up and down cannot land on the same preallocated table.
+    //
+    // It is structurally stronger than the planner form. moe_cache_layer_id()
+    // is an FNV-1a over the whole tensor name, and the hash is computed at the
+    // point of use from role.weight->name rather than being passed in, so there
+    // is no longer a call site that COULD hand two roles the same value.
+    // Each role's table upload must hash THAT role's own weight name. Asserting
+    // the three calls whole -- weight, batch and hash argument together -- is
+    // what makes this an anti-aliasing check rather than a name-spotting one: a
+    // copy-paste that fed roles.up.batch a gate-derived hash would still contain
+    // every individual identifier below, and would still fail here.
+    CHECK(contains_normalized(sycl,
+                              "ctx, pair.gate_weight, roles.gate.batch, "
+                              "moe_cache_layer_id(pair.gate_weight->name), gate_layout);") &&
+              contains_normalized(sycl,
+                                  "ctx, pair.up_weight, roles.up.batch, "
+                                  "moe_cache_layer_id(pair.up_weight->name), up_layout);") &&
+              contains_normalized(sycl,
+                                  "ctx, pair.down_weight, roles.down.batch, "
+                                  "moe_cache_layer_id(pair.down_weight->name), down_layout);"),
+          "selected gate/up pointer-table uploads must use role-specific table hashes to avoid preallocated table "
+          "aliasing");
+    // The graphlet prewarm path reaches the same tables by a different route and
+    // must derive its hash per role too, or the two routes disagree about which
+    // preallocated table a role owns.
+    CHECK(contains_normalized(sycl,
+                              "const int role_layer_hash = moe_cache_layer_id(role.weight->name ? "
+                              "role.weight->name : \"\");") &&
+              contains_normalized(sycl,
+                                  "moe_fusion_ensure_full_local_ptr_table_from_descriptor(*sycl_ctx, role, "
+                                  "role_layer_hash)"),
+          "the graphlet pointer-table prewarm must derive its table hash from the same per-role weight name");
     return 0;
 }
 
@@ -1853,6 +2045,7 @@ int main() {
     if (int rc = test_sequence_graphlet_rejects_known_unsafe_paths()) {
         return rc;
     }
+    std::printf("CHECKS-EXECUTED: %d\n", g_checks_run);
     std::puts("PASS: MoE sequence graphlet policy/no-activation guard");
     return 0;
 }
