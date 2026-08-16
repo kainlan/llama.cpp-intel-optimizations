@@ -23142,19 +23142,31 @@ static bool account_moe_mmid_workspaces(placement_plan & plan,
 
 bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
                                             const std::vector<placement_tensor_info> & tensor_inventory,
-                                            int n_expert_used) noexcept {
+                                            int n_expert_used,
+                                            moe_mmid_runtime_reason * reason) noexcept {
+    // Every `return false` below reports WHY. One shared message covering all of
+    // them read as an MMID workspace fault when the cause was a KV-driven VRAM
+    // budget overrun, which is a different problem with a different fix
+    // (llama.cpp-uize).
+    auto refuse = [&](moe_mmid_runtime_reason r) {
+        if (reason) *reason = r;
+        return false;
+    };
+    if (reason) *reason = moe_mmid_runtime_reason::OK;
     try {
         placement_plan demand = plan;
         plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);
-        if (!demand.moe_mmid_workspace_valid) return false;
+        if (!demand.moe_mmid_workspace_valid) return refuse(moe_mmid_runtime_reason::DEMAND_INVALID);
         // Runtime KV refresh has already restored the existing global MMID
         // charge. Stable geometry is not a budget bypass: validate before the
         // early return, accepting the exact boundary and rejecting budget+1.
         if (!plan.multi_device) {
-            size_t admitted = 0;
-            if (!moe_mmid_admit_single_device_total(plan.vram_bytes, 0, plan.vram_budget, &admitted) ||
-                admitted != plan.vram_bytes) {
-                return false;
+            size_t     admitted = 0;
+            const auto verdict  = moe_mmid_classify_single_device_admit(plan.vram_bytes, 0, plan.vram_budget,
+                                                                        /*growth_arm=*/false, &admitted);
+            if (verdict != moe_mmid_runtime_reason::OK || admitted != plan.vram_bytes) {
+                return refuse(verdict == moe_mmid_runtime_reason::OK ? moe_mmid_runtime_reason::BUDGET_EXCEEDED :
+                                                                       verdict);
             }
         }
         bool fits = demand.moe_mmid_workspaces.size() == plan.moe_mmid_workspaces.size();
@@ -23171,18 +23183,25 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
 
         size_t old_global = 0;
         for (const auto & workspace : plan.moe_mmid_workspaces) {
-            if (old_global > SIZE_MAX - workspace.device_pool_bytes) return false;
+            if (old_global > SIZE_MAX - workspace.device_pool_bytes)
+                return refuse(moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW);
             old_global += workspace.device_pool_bytes;
         }
-        if (old_global != plan.moe_mmid_device_pool_bytes || plan.vram_bytes < old_global) return false;
+        if (old_global != plan.moe_mmid_device_pool_bytes || plan.vram_bytes < old_global)
+            return refuse(moe_mmid_runtime_reason::GLOBAL_CHARGE_MISMATCH);
         const size_t base_vram = plan.vram_bytes - old_global;
-        if (base_vram > SIZE_MAX - demand.moe_mmid_device_pool_bytes) return false;
+        if (base_vram > SIZE_MAX - demand.moe_mmid_device_pool_bytes)
+            return refuse(moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW);
         const size_t new_vram = base_vram + demand.moe_mmid_device_pool_bytes;
         if (!plan.multi_device) {
-            size_t admitted = 0;
-            if (!moe_mmid_admit_single_device_total(base_vram, demand.moe_mmid_device_pool_bytes,
-                                                     plan.vram_budget, &admitted) ||
-                admitted != new_vram) return false;
+            size_t     admitted = 0;
+            const auto verdict  = moe_mmid_classify_single_device_admit(
+                base_vram, demand.moe_mmid_device_pool_bytes, plan.vram_budget, /*growth_arm=*/true, &admitted);
+            if (verdict != moe_mmid_runtime_reason::OK || admitted != new_vram) {
+                return refuse(verdict == moe_mmid_runtime_reason::OK ?
+                                  moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED :
+                                  verdict);
+            }
         }
         auto new_per_device = plan.per_device_vram;
         if (plan.multi_device) {
@@ -23194,11 +23213,13 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
             size_t checked_total = plan.vram_bytes;
             if (!moe_mmid_reaccount_replacement(old_charges, new_charges, plan.devices,
                                                 plan.per_device_vram_budgets, &new_per_device, &checked_total) ||
-                checked_total != new_vram) return false;
+                checked_total != new_vram)
+                return refuse(moe_mmid_runtime_reason::PER_DEVICE_REACCOUNT_FAILED);
         }
         if (demand.moe_mmid_host_pool_bytes > plan.moe_mmid_host_pool_bytes) {
             const size_t growth = demand.moe_mmid_host_pool_bytes - plan.moe_mmid_host_pool_bytes;
-            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth) return false;
+            if (plan.host_zone_scratch_bytes > SIZE_MAX - growth || plan.host_bytes > SIZE_MAX - growth)
+                return refuse(moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW);
             plan.host_zone_scratch_bytes += growth;
             plan.host_bytes += growth;
         }
@@ -23210,7 +23231,10 @@ bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,
         plan.per_device_vram = std::move(new_per_device);
         return true;
     } catch (...) {
-        return false;
+        // Not an overflow: the plan copy and its vectors allocate, so this is
+        // almost always bad_alloc. Naming it arithmetic would be the same class
+        // of lie this commit exists to remove.
+        return refuse(moe_mmid_runtime_reason::EXCEPTION);
     }
 }
 

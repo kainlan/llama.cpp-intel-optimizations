@@ -117,6 +117,37 @@ bool moe_mmid_admit_single_device_total(size_t   base_bytes,
                                         size_t   budget_bytes,
                                         size_t * admitted_total) noexcept;
 
+// Why a runtime plan update was refused. Every refusal in
+// replan_moe_mmid_workspaces_for_runtime() carries one of these, because a
+// single shared message cannot distinguish causes that need opposite responses:
+// a VRAM budget overrun is the caller's context size, while a charge mismatch is
+// a planner defect. Lives here rather than in unified-cache.hpp so the
+// host-only workspace-plan test can link the classifier below.
+enum class moe_mmid_runtime_reason : uint8_t {
+    OK = 0,
+    DEMAND_INVALID,               // recomputed demand is not a valid workspace set
+    BUDGET_EXCEEDED,              // stable geometry, already over the device budget
+    GROWTH_BUDGET_EXCEEDED,       // base + the larger workspace pool exceeds it
+    GLOBAL_CHARGE_MISMATCH,       // published pool total disagrees with the plan
+    PER_DEVICE_REACCOUNT_FAILED,  // multi-device replacement accounting refused
+    HOST_GROWTH_OVERFLOW,         // host zone growth would overflow
+    ARITHMETIC_OVERFLOW,          // a checked size computation overflowed
+    EXCEPTION,                    // an allocation or container operation threw
+};
+
+// Stable, greppable spellings for the log. Never returns null.
+const char * moe_mmid_runtime_reason_name(moe_mmid_runtime_reason reason) noexcept;
+
+// Classifies the single-device admission both budget arms of the runtime replan
+// perform. `growth_arm` selects which refusal the caller gets, so the two arms
+// stay distinguishable in the log; on success `admitted_total` receives the
+// admitted sum. Pure arithmetic, so the host-only test can drive it directly.
+moe_mmid_runtime_reason moe_mmid_classify_single_device_admit(size_t   base_bytes,
+                                                              size_t   workspace_bytes,
+                                                              size_t   budget_bytes,
+                                                              bool     growth_arm,
+                                                              size_t * admitted_total) noexcept;
+
 bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
                                     const std::vector<std::pair<int, size_t>> & new_charges,
                                     const std::vector<int> &                    devices,

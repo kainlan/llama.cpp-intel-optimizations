@@ -925,6 +925,13 @@ enum ggml_sycl_lifecycle_result {
     GGML_SYCL_LIFECYCLE_EFFECT_FAILED,
     GGML_SYCL_LIFECYCLE_BUSY,
     GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND,
+    // A deterministic refusal of a runtime plan update (budget or accounting),
+    // as opposed to the transient BUSY above. Callers must NOT retry it: the
+    // inputs cannot change between attempts, so a retry loop only multiplies
+    // the error output. Appended last on purpose -- these values reach users as
+    // `result=%d` and are quoted in tickets and logs (BUSY is 17), so inserting
+    // mid-enum would silently renumber every recorded value.
+    GGML_SYCL_LIFECYCLE_PLAN_REJECTED,
 };
 
 // Registry-resolved static/DL parity entry point. Applies the exact inventory

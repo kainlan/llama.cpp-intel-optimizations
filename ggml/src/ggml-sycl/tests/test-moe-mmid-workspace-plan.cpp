@@ -365,6 +365,84 @@ static void stable_geometry_single_device_budget_boundary() {
           "stable geometry overflow mutated admission output");
 }
 
+// The runtime replan refuses for causes that need opposite responses: a budget
+// overrun is the caller's context size, a charge mismatch is a planner defect.
+// They shared one message until llama.cpp-uize, where a KV-driven budget
+// overrun was reported as an MMID workspace fault. These cases pin that the
+// classifier keeps them apart.
+static void runtime_reason_classification() {
+    moe_mmid_workspace_geometry geometry;
+    check(moe_mmid_plan_workspace({ 64, 96, 2, 2, 8 }, false, &geometry), "reason-classification setup failed");
+
+    const size_t workspace    = geometry.device_slot_bytes;
+    const size_t exact_budget = 1000 + workspace;
+
+    // Identity / exact boundary: a plan that exactly equals its budget is
+    // ADMITTED. Assert this before trusting any refusal below -- a classifier
+    // that rejected the boundary would refuse every one of these causes for the
+    // wrong reason and still look like it worked.
+    size_t admitted = 77;
+    check(moe_mmid_classify_single_device_admit(1000, workspace, exact_budget, false, &admitted) ==
+                  moe_mmid_runtime_reason::OK &&
+              admitted == exact_budget,
+          "exact-budget admission was not classified OK");
+
+    const size_t unchanged = admitted;
+    check(moe_mmid_classify_single_device_admit(1001, workspace, exact_budget, false, &admitted) ==
+                  moe_mmid_runtime_reason::BUDGET_EXCEEDED &&
+              admitted == unchanged,
+          "budget+1 on the stable arm was not BUDGET_EXCEEDED, or mutated output");
+
+    // Same overshoot, other arm: the two budget refusals must stay
+    // distinguishable, which is the entire reason the enum exists.
+    check(moe_mmid_classify_single_device_admit(1001, workspace, exact_budget, true, &admitted) ==
+                  moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED &&
+              admitted == unchanged,
+          "budget+1 on the growth arm was not GROWTH_BUDGET_EXCEEDED, or mutated output");
+
+    // Overflow is never reported as a budget verdict on either arm: the sum a
+    // budget comparison needs does not exist.
+    const size_t max = std::numeric_limits<size_t>::max();
+    check(moe_mmid_classify_single_device_admit(max, 1, max, false, &admitted) ==
+                  moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW &&
+              moe_mmid_classify_single_device_admit(max, 1, max, true, &admitted) ==
+                  moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW &&
+              admitted == unchanged,
+          "size overflow was classified as a budget verdict, or mutated output");
+
+    // A null output must not change the verdict or crash.
+    check(moe_mmid_classify_single_device_admit(1000, workspace, exact_budget, false, nullptr) ==
+                  moe_mmid_runtime_reason::OK &&
+              moe_mmid_classify_single_device_admit(1001, workspace, exact_budget, false, nullptr) ==
+                  moe_mmid_runtime_reason::BUDGET_EXCEEDED,
+          "null admitted_total changed the verdict");
+
+    // Every enumerator needs its own name: a shared or empty spelling puts two
+    // causes behind one string in the log, which is the defect this replaces.
+    const moe_mmid_runtime_reason reasons[] = {
+        moe_mmid_runtime_reason::OK,
+        moe_mmid_runtime_reason::DEMAND_INVALID,
+        moe_mmid_runtime_reason::BUDGET_EXCEEDED,
+        moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED,
+        moe_mmid_runtime_reason::GLOBAL_CHARGE_MISMATCH,
+        moe_mmid_runtime_reason::PER_DEVICE_REACCOUNT_FAILED,
+        moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW,
+        moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW,
+        moe_mmid_runtime_reason::EXCEPTION,
+    };
+    const size_t n_reasons = sizeof(reasons) / sizeof(reasons[0]);
+    for (size_t i = 0; i < n_reasons; ++i) {
+        const char * name = moe_mmid_runtime_reason_name(reasons[i]);
+        check(name != nullptr && name[0] != '\0', "a runtime reason has no name");
+        for (size_t j = i + 1; j < n_reasons; ++j) {
+            check(std::strcmp(name, moe_mmid_runtime_reason_name(reasons[j])) != 0,
+                  "two runtime reasons share one name");
+        }
+    }
+    check(moe_mmid_runtime_reason_name(static_cast<moe_mmid_runtime_reason>(200)) != nullptr,
+          "an out-of-range runtime reason returned a null name");
+}
+
 static void runtime_per_device_rebuild_is_atomic() {
     const std::vector<int>    devices{ 0, 1 };
     const std::vector<size_t> budgets{ 1000, 400 };
@@ -1307,6 +1385,7 @@ int main() {
         concurrent_depth_busy_and_reuse();
         finalized_owner_accounting();
         stable_geometry_single_device_budget_boundary();
+        runtime_reason_classification();
         runtime_per_device_rebuild_is_atomic();
         replacement_accounting_is_atomic();
         cookie_saturates_without_reuse();

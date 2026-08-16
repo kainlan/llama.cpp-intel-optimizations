@@ -374,6 +374,43 @@ bool moe_mmid_admit_single_device_total(size_t   base_bytes,
     return true;
 }
 
+const char * moe_mmid_runtime_reason_name(moe_mmid_runtime_reason reason) noexcept {
+    switch (reason) {
+        case moe_mmid_runtime_reason::OK:                          return "ok";
+        case moe_mmid_runtime_reason::DEMAND_INVALID:              return "demand-invalid";
+        case moe_mmid_runtime_reason::BUDGET_EXCEEDED:             return "budget-exceeded";
+        case moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED:      return "growth-budget-exceeded";
+        case moe_mmid_runtime_reason::GLOBAL_CHARGE_MISMATCH:      return "global-charge-mismatch";
+        case moe_mmid_runtime_reason::PER_DEVICE_REACCOUNT_FAILED: return "per-device-reaccount-failed";
+        case moe_mmid_runtime_reason::HOST_GROWTH_OVERFLOW:        return "host-growth-overflow";
+        case moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW:         return "arithmetic-overflow";
+        case moe_mmid_runtime_reason::EXCEPTION:                   return "exception";
+    }
+    return "unknown";
+}
+
+moe_mmid_runtime_reason moe_mmid_classify_single_device_admit(size_t   base_bytes,
+                                                              size_t   workspace_bytes,
+                                                              size_t   budget_bytes,
+                                                              bool     growth_arm,
+                                                              size_t * admitted_total) noexcept {
+    // Overflow is reported as overflow, never as a budget verdict: the sum a
+    // budget comparison would need does not exist, so calling it "over budget"
+    // would send a reader looking for memory that was never the problem.
+    if (base_bytes > SIZE_MAX - workspace_bytes) {
+        return moe_mmid_runtime_reason::ARITHMETIC_OVERFLOW;
+    }
+    size_t admitted = 0;
+    if (!moe_mmid_admit_single_device_total(base_bytes, workspace_bytes, budget_bytes, &admitted)) {
+        return growth_arm ? moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED :
+                            moe_mmid_runtime_reason::BUDGET_EXCEEDED;
+    }
+    if (admitted_total != nullptr) {
+        *admitted_total = admitted;
+    }
+    return moe_mmid_runtime_reason::OK;
+}
+
 bool moe_mmid_reaccount_replacement(const std::vector<std::pair<int, size_t>> & old_charges,
                                     const std::vector<std::pair<int, size_t>> & new_charges,
                                     const std::vector<int> &                    devices,

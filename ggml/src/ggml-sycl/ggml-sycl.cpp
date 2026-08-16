@@ -15489,6 +15489,44 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
     }
 }
 
+// Largest n_ctx whose device-resident KV would still fit the plan's VRAM budget,
+// or 0 when no useful suggestion exists.
+//
+// Counts the full-attention layers the PLAN actually placed on a device;
+// placement_kv_info::n_full_attn_layers() counts them model-wide and would
+// overstate the cost when part of the KV is host-resident. SWA layers are a
+// constant: kv_bytes_per_swa_layer() caps their cells at n_swa + n_ubatch.
+//
+// Rounded DOWN to a multiple of 256 because llama_context applies
+// GGML_PAD(n_ctx, 256), which would round a suggestion back over the budget.
+static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan &    plan,
+                                                const ggml_sycl::placement_kv_info & kv_info) {
+    const size_t per_cell_layer =
+        static_cast<size_t>(kv_info.n_embd_k_gqa + kv_info.n_embd_v_gqa) * sizeof(ggml_fp16_t);
+    if (per_cell_layer == 0 || plan.vram_bytes < plan.kv_vram_bytes) {
+        return 0;
+    }
+    size_t       full_layers = 0;
+    size_t       swa_bytes   = 0;
+    const size_t n_layers    = plan.kv_layer_count();
+    for (uint32_t layer = 0; layer < n_layers; ++layer) {
+        if (plan.get_kv_device(static_cast<int>(layer)) < 0) {
+            continue;
+        }
+        if (plan.kv_per_swa_layer > 0 && layer < plan.swa_layer_mask.size() && plan.swa_layer_mask[layer]) {
+            swa_bytes += plan.kv_per_swa_layer;
+        } else {
+            ++full_layers;
+        }
+    }
+    const size_t non_kv_bytes = plan.vram_bytes - plan.kv_vram_bytes;
+    if (full_layers == 0 || plan.vram_budget <= non_kv_bytes + swa_bytes) {
+        return 0;
+    }
+    const size_t cells = (plan.vram_budget - non_kv_bytes - swa_bytes) / (full_layers * per_cell_layer);
+    return static_cast<uint32_t>((cells / 256) * 256);
+}
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
@@ -15541,7 +15579,10 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
     if (!next_plan.rebuild_runtime_per_device_vram()) {
-        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device KV accounting failed\n");
+        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device KV accounting failed -- "
+                       "n_ctx=%u n_ubatch=%u kv=%.1f MB budget=%.1f MB\n",
+                       n_ctx, next_kv_info.n_ubatch, next_plan.kv_vram_bytes / (1024.0 * 1024.0),
+                       next_plan.vram_budget / (1024.0 * 1024.0));
         return;
     }
     std::vector<std::pair<int, size_t>> old_mmid_charges;
@@ -15552,12 +15593,20 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         if (!ggml_sycl::moe_mmid_reaccount_replacement({}, old_mmid_charges, next_plan.devices,
                                                         next_plan.per_device_vram_budgets,
                                                         &next_plan.per_device_vram, &next_plan.vram_bytes)) {
-            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded\n");
+            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded -- "
+                           "n_ctx=%u n_ubatch=%u vram=%.1f MB (weights %.1f + kv %.1f) budget=%.1f MB\n",
+                           n_ctx, next_kv_info.n_ubatch, next_plan.vram_bytes / (1024.0 * 1024.0),
+                           next_plan.weight_vram_bytes / (1024.0 * 1024.0),
+                           next_plan.kv_vram_bytes / (1024.0 * 1024.0),
+                           next_plan.vram_budget / (1024.0 * 1024.0));
             return;
         }
     } else {
         if (next_plan.vram_bytes > SIZE_MAX - current->plan->moe_mmid_device_pool_bytes) {
-            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow\n");
+            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow -- "
+                           "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
+                           n_ctx, next_plan.vram_bytes / (1024.0 * 1024.0),
+                           current->plan->moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
             return;
         }
         next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
@@ -15565,9 +15614,35 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     next_plan.planner_n_ctx     = n_ctx;
     next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
     next_plan.planner_n_seq_max = n_seq_max;
+    ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
     if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(
-            next_plan, g_tensor_inventory_detail, next_kv_info.n_expert_used)) {
-        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace demand/accounting failed\n");
+            next_plan, g_tensor_inventory_detail, next_kv_info.n_expert_used, &replan_reason)) {
+        // Report the cause and the numbers behind it. The predecessor of this
+        // line named MMID workspaces for every refusal, including the common one
+        // that has no MMID component at all -- a KV-driven budget overrun -- and
+        // that misdirection cost a full investigation (llama.cpp-uize).
+        //
+        // ERROR, not INFO, and deliberately: GGML_LOG_INFO is dropped at default
+        // verbosity, so a diagnostic emitted at INFO is invisible in exactly the
+        // runs that need it.
+        const double mb = 1024.0 * 1024.0;
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime KV update rejected: %s -- n_ctx=%u n_ubatch=%u vram=%.1f MB "
+            "(weights %.1f + kv %.1f) budget=%.1f MB over_by=%.1f MB\n",
+            ggml_sycl::moe_mmid_runtime_reason_name(replan_reason), n_ctx, next_kv_info.n_ubatch,
+            next_plan.vram_bytes / mb, next_plan.weight_vram_bytes / mb, next_plan.kv_vram_bytes / mb,
+            next_plan.vram_budget / mb,
+            next_plan.vram_bytes > next_plan.vram_budget ? (next_plan.vram_bytes - next_plan.vram_budget) / mb : 0.0);
+        if (replan_reason == ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED ||
+            replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED) {
+            const uint32_t fits = ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info);
+            if (fits >= 256) {
+                GGML_LOG_ERROR(
+                    "[SYCL-PLAN] the KV cache for this context does not fit the device budget; "
+                    "the largest context that fits is about -c %u\n",
+                    fits);
+            }
+        }
         return;
     }
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
@@ -15763,7 +15838,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                 bound_snapshot->plan ? bound_snapshot->plan->moe_mmid_host_pool_bytes : 0);
         }
     }
-    return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_BUSY;
+    // PLAN_REJECTED, not BUSY. The inner refusal is deterministic -- the same
+    // n_ctx against the same budget refuses identically every time -- and
+    // llama_context retries BUSY seven times with backoff, which turned one
+    // decision into eight identical error lines and no different outcome
+    // (llama.cpp-uize). Genuine transients above still return BUSY.
+    return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
