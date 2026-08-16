@@ -57644,8 +57644,35 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             }
         }
 
+        // Reconcile the advertised layout against what the cache actually
+        // materialized. This path submits src0_storage directly and performs no
+        // per-expert reorder staging, so an advertised layout that disagrees with
+        // storage is applied to bytes in the other layout -- garbage from the first
+        // element out. Refuse, and let the caller fall through to the non-fused
+        // paths.
+        //
+        // This is NOT a ban on advertised != storage in general. mmvq's
+        // mxfp4_moe_reorder_dispatch legitimately dispatches SOA over an AoS base
+        // because the expert pointer table stages the per-expert data in the
+        // requested layout on the fly. The staging is what makes the disagreement
+        // safe there, and its absence is what makes it unsafe here -- do not
+        // generalize this guard to executors that stage.
+        bool layout_reconciled = true;
+        if (forced_layout && src0->extra) {
+            const auto *      layout_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+            const layout_mode stored       = get_effective_layout_mode(layout_extra);
+            if (stored != *forced_layout) {
+                GGML_LOG_WARN(
+                    "[MXFP4-DIRECT] refusing %s: advertised layout=%s disagrees with materialized storage layout=%s "
+                    "and this path does not stage\n",
+                    src0->name ? src0->name : "(null)", ggml_sycl_layout_mode_name(*forced_layout),
+                    ggml_sycl_layout_mode_name(stored));
+                layout_reconciled = false;
+            }
+        }
+
         const void * src0_data = nullptr;
-        if (src0_storage) {
+        if (layout_reconciled && src0_storage) {
             const sycl::usm::alloc alloc = ggml_sycl_get_alloc_type(src0_storage);
             GGML_SYCL_DEBUG(
                 "[MXFP4-DIRECT] src0=%s src0_storage=%p alloc_type=%d ne=[%lld,%lld,%lld,%lld] M=%lld layout=%d\n",
@@ -57660,7 +57687,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 src0_data = src0_storage;
             }
         }
-        if (!src0_data) {
+        if (layout_reconciled && !src0_data) {
             auto resolved = ggml_sycl_resolve(src0, ctx.device);
             if (resolved) {
                 src0_data = resolved.ptr;
@@ -65306,7 +65333,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
         }
-        GGML_SYCL_DEBUG("[MoE] All MMVQ layouts failed, falling back to host routing\n");
+        // "declined", not "failed", and deliberately makes no claim about WHY. MMVQ
+        // refuses for reasons that have nothing to do with layout -- exceeding its
+        // adaptive PP batch threshold is the common one -- and reading this line as a
+        // layout verdict is what justifies re-deriving a layout here instead of
+        // keeping the one already resolved for this tensor. Check the [MMVQ] trace
+        // for the actual reason.
+        GGML_SYCL_DEBUG(
+            "[MoE] MMVQ declined every attempted layout (reason is not necessarily layout-related; see the [MMVQ] "
+            "trace), falling back to host routing\n");
     }  // end GPU fast-paths block
     GGML_SYCL_DEBUG("[MoE] GPU probe paths did not select type %d; resolving planner-owned MoE route\n", src0->type);
     // The planner-owned route below may select grouped local GPU PP, secondary GPU,
