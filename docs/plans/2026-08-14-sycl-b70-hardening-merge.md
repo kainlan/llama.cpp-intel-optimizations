@@ -617,7 +617,16 @@ desync on 2026-08-15).
 **Steps Claude runs itself (exact commands in Tasks 13–14):**
 1. Canonical build at final SHA: rc=0, `GGML_SYCL:BOOL=ON`, ldd count ≥2.
 2. Filtered ctest sweep `-j 1` + excluded cache/mem-handle family serially: both rc=0.
-3. Full `test-backend-ops` on B70 pinned: **rc=0** (the headline: at plan start this was rc=134).
+3. Full `test-backend-ops` on B70 pinned: **AMENDED BAR** (owner ruling 2026-08-16,
+   recorded on `llama.cpp-4dhw`): the q8_0 numeric defect fixed (`llama.cpp-0uqn`) and
+   the 14 unaccounted failures attributed (`llama.cpp-nyj0`); the remaining failures
+   must partition EXACTLY into the three enumerated feature/policy classes — float MMID
+   (`llama.cpp-0yi9`), iq* family (`llama.cpp-wh7o`), q1_0/nvfp4 oracle gate (deliberate
+   fail-closed policy) — with nothing outside them. Literal rc=0 is unreachable without
+   contradicting the fail-closed mandate; the certification is "zero failures outside
+   the enumerated classes; all wrong-answer defects in covered paths fixed."
+   (At plan start the suite aborted at rc=134 after 59k lines; it now completes with
+   5487/5956 and a fully-enumerated residual.)
 4. Mistral digit gate on B50: output begins `1, 2, 3, 4, 5, 6, 7, 8, 9, 10`.
 5. GPT-OSS chat gate on B50: answer line exactly `1, 2, 3, 4, 5`.
 6. Arch sweep pinned `0,1`: rc=0, zero `roundtrip mismatch` lines.
