@@ -41,27 +41,62 @@ The two checks answer different questions ("does this exact old shape exist
 anywhere" vs. "do these three decisions still delegate entirely to the
 roster") and neither subsumes the other.
 
-HONEST SCOPE STATEMENT for the narrower check (team-lead review, second
-round): it inspects the TEXT of each site's if-condition -- recursively,
-preferring the innermost nested if, so a hardcoded list nested under an
-outer roster-derived if is found (this is what closes finding #2's original
-gap: previously a NON-recursive scan returned the outer, misleadingly-clean
-condition and missed a hardcoded list hiding one level deeper). It does NOT
-resolve what an opaque identifier in that condition refers to. Two bypasses
-follow directly from that limit and are accepted as out of scope, because
-closing them needs real data-flow analysis, not a regex/brace scanner:
-  (1) a hand-maintained list hoisted into a variable declared just before the
-      if, with the if referencing the variable (e.g.
-      `const bool aos_only = (t==Q4_0||t==Q8_0||t==Q6_K); if (roster_call(...)
-      && aos_only) {...}`);
-  (2) the same list hidden behind a helper function call in the condition.
-Both require deliberately restructuring the decision, not merely editing it,
-which is why they are accepted rather than chased. The bound: neither bypass
-can hide the exact {Q4_0, Q8_0} shape from the BROAD enumeration check above,
-which scans raw file text irrespective of if-statement scoping -- so a
-2-type hoisted variable or helper is still an offender there even though
-this narrower check cannot see through the indirection to it. Only a
-hoisted/wrapped list that is NOT exactly {Q4_0, Q8_0} escapes both checks.
+HONEST SCOPE STATEMENT for the narrower check (team-lead review, now on its
+third round): it inspects the TEXT of each site's if-condition -- recursively
+into nested consequents, so a hardcoded list nested under an outer
+roster-derived if is found (this is what closes finding #2's original gap:
+a NON-recursive scan returned the outer, misleadingly-clean condition and
+missed a hardcoded list hiding one level deeper). Among every marker-bearing
+if found, it selects the innermost ONLY when all of them form a single
+ancestor chain (each nested inside the next); if two matches stand in no
+containment relation -- e.g. two SIBLING ifs, one clean and one a
+hand-maintained list, neither nested in the other -- it raises rather than
+picking one by an arbitrary tiebreak (round 3's own fix: an earlier version
+of this check picked the shortest match unconditionally, which silently
+resolved that exact sibling ambiguity in favor of whichever consequent
+happened to be shorter -- a second fail-open of the identical severity,
+introduced by relaxing the many-match guard without re-deriving why doing so
+was still sound. See find_decision_condition's docstring for the property
+argument and test_find_decision_condition_raises_on_sibling_ambiguity for
+the closing proof).
+
+Two DIFFERENT limit categories remain, genuinely out of scope, for two
+different reasons:
+  IDENTIFIER OPACITY -- the check cannot resolve what an opaque identifier in
+  a condition refers to, so it cannot see through:
+    (1) a hand-maintained list hoisted into a variable declared just before
+        the if, with the if referencing the variable (e.g. `const bool
+        aos_only = (t==Q4_0||t==Q8_0||t==Q6_K); if (roster_call(...) &&
+        aos_only) {...}`);
+    (2) the same list hidden behind a helper function call in the condition.
+  Both require deliberately restructuring the decision, not merely editing
+  it, which is why they are accepted rather than chased -- closing them needs
+  real data-flow analysis, not a regex/brace scanner.
+
+  IF-SCOPING -- the check only walks `if`/nested-`if` structure, so it cannot
+  see a marker-bearing decision reached through a DIFFERENT control-flow
+  construct:
+    (3) an `else` branch (this scanner does not model `else` at all -- an
+        `if (roster_call) {...} else { hardcoded-list-decision }` is not
+        walked into the else side);
+    (4) a marker inside a nested `switch` or loop body rather than a nested
+        `if` (e.g. a hardcoded list gating one `case` of a switch inside the
+        consequent).
+  Both are architectural: the scanner is `if`-shaped by design, matching this
+  gate's three real sites, all of which are `if`-only today. Widening it to a
+  general C++ control-flow walker is a different, much larger tool.
+
+This is intentionally NOT presented as an exhaustive list -- it is drawn from
+what two review rounds actually found, not from an attempt to enumerate every
+possible bypass, and the next one found should be added here rather than
+treated as evidence the check is broken. The bound that DOES generalize
+across every item above: none of them can hide the exact {Q4_0, Q8_0} shape
+from the BROAD enumeration check earlier in this file, which scans raw file
+text irrespective of if-statement scoping, else branches, or identifiers --
+so a 2-type version of any bypass above is still an offender there even
+though this narrower, decision-scoped check cannot see through it. Only a
+hoisted/wrapped/else/switch-gated list that is NOT exactly {Q4_0, Q8_0}
+escapes both checks.
 
 Not in scope, and deliberately so: llama.cpp-mn70's sibling consumer-side
 guard (R1, landed as 011064e2b) is a RUNTIME comparison against the observed
@@ -118,11 +153,12 @@ SYCL_DIR = ROOT / "ggml/src/ggml-sycl"
 # whose full set of compared types is EXACTLY {Q4_0, Q8_0} -- no more, no
 # fewer. Matched as a full maximal chain (not a 2-of-N substring) so a
 # DIFFERENT, legitimate invariant that happens to mention the same two types
-# alongside others (e.g. "Q4_0 || Q8_0 || Q6_K", a reorder-capability check
-# used by dmmv.cpp/getrows.cpp/mmq.cpp) is not misread as this defect. See
-# test_regex_does_not_over_match_longer_or_chains below -- those three files
-# are the reason this needs to be a full-chain match, not a substring one.
-# Deliberately anchored on "==" so it cannot match an unrelated `case
+# alongside others (e.g. "Q4_0 || Q8_0 || Q6_K") is not misread as this
+# defect. See test_regex_does_not_over_match_longer_or_chains below for the
+# full, current accounting of every such chain in-tree (by enclosing
+# function, not a file list here that would just go stale the same way) --
+# that accounting is the reason this needs to be a full-chain match, not a
+# substring one. Deliberately anchored on "==" so it cannot match an unrelated `case
 # GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0:` switch label pair, which uses ":" and
 # is a different (legitimate) shape entirely.
 _IDENT = r"[A-Za-z_][A-Za-z0-9_]*(?:(?:->|\.)[A-Za-z_][A-Za-z0-9_]*)*"
@@ -257,20 +293,46 @@ def if_statements(body: str):
 def find_decision_condition(body: str, consequent_marker: str) -> str:
     """The condition of the INNERMOST if-statement whose consequent contains
     consequent_marker (searched recursively -- see if_statements). "Innermost"
-    is the match with the shortest consequent text: a nested if's consequent
-    is always a strict substring of every ancestor if's consequent that also
-    contains the marker, so the shortest matching consequent is unambiguously
-    the most deeply nested one, and picking it is what closes the nested-if
-    fail-open (a hand-maintained list nested under an outer roster-derived
-    if) rather than returning the outer, misleadingly-clean condition.
+    is the match with the shortest consequent text -- but ONLY once the
+    matches are confirmed to form a single nesting chain (see below). A nested
+    if's consequent is always a strict substring of every ANCESTOR if's
+    consequent that also contains the marker; that containment relation is
+    what makes "shortest = innermost" true, and it is a property of a chain of
+    ancestors, not of an arbitrary set of matches. Two matches that stand in
+    no containment relation at all -- e.g. two SIBLING if-statements, each
+    independently containing the marker -- are not "close" and "far"; they are
+    simply ambiguous, and "shortest" degenerates to shortest-by-accident.
 
-    Raising on zero matches is deliberate: no marker occurrence at all means
-    the extraction itself is unsound for this body, not that the invariant
-    holds."""
+    So: order every match by consequent length, then verify each is a
+    substring of the next-longer one (i.e. every match nests inside the next).
+    If that chain check fails, the ambiguity is real and must not be silently
+    resolved by picking one -- raise, the same way zero matches raises. This
+    guard existed as "raise on anything other than exactly one match" before
+    nested-if support was added, and RELAXING it (many matches now allowed) to
+    add nested-if coverage would have silently reopened a hole of the same
+    class if it were not paired with this ordering check: a hand-maintained
+    list living in a SIBLING if next to the clean carve-out passes an "any
+    innermost" selection (the sibling's short consequent looks maximally
+    "innermost") while never actually being ambiguous-checked against the
+    carve-out's condition. Do not weaken this to "prefer the shortest" without
+    re-deriving why that is still sound -- it previously wasn't.
+
+    Raising on zero matches is unchanged and deliberate: no marker occurrence
+    at all means the extraction itself is unsound for this body, not that the
+    invariant holds."""
     matches = [(cond, cons) for cond, cons in if_statements(body) if consequent_marker in cons]
     if not matches:
         raise ValueError(f"expected at least one if-statement with {consequent_marker!r} in its consequent, found 0")
-    innermost_condition, _ = min(matches, key=lambda pair: len(pair[1]))
+    ordered = sorted(matches, key=lambda pair: len(pair[1]))
+    for (_, inner_consequent), (_, outer_consequent) in zip(ordered, ordered[1:]):
+        if inner_consequent not in outer_consequent:
+            raise ValueError(
+                f"{consequent_marker!r} occurs in two if-consequents that are not nested in one "
+                f"another -- the decision is ambiguous, so 'innermost' is undefined. This body needs "
+                f"a more specific marker, or the two matching if-statements need to be reconciled by "
+                f"hand before this check can trust either one."
+            )
+    innermost_condition, _ = ordered[0]
     return innermost_condition
 
 
@@ -308,6 +370,51 @@ def test_find_decision_condition_prefers_innermost_nested_if():
     assert "moe_mmvq_any_dispatch_supports_layout" in flat_condition
 
 
+def test_find_decision_condition_raises_on_sibling_ambiguity():
+    """Unit-level proof of the second team-lead finding: closing the nested-if
+    hole by simply picking the shortest marker-bearing consequent (without a
+    chain check) opens a SIBLING hole of the same severity. A hand-maintained
+    list living in a second, sibling if -- next to the clean, roster-derived
+    carve-out, not nested inside or around it -- must not be silently resolved
+    by "shortest wins"; it must raise, because the two matches are genuinely
+    ambiguous, not near-and-far.
+
+    This is the reviewer's realistic mutation shape: a clean carve-out
+    immediately followed by a second if, unrelated in nesting, that also
+    assigns GGML_LAYOUT_AOS from a hardcoded list -- e.g. a well-intentioned
+    "stopgap until the Q6_K launcher lands" someone adds next to, rather than
+    inside, the roster-derived decision.
+    """
+    sibling = (
+        "if (moe_mmvq_any_dispatch_supports_layout(src0->type, resolved)) {\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "}\n"
+        "if (src0->type == GGML_TYPE_Q6_K) {\n"
+        "    // stopgap until the Q6_K launcher lands\n"
+        "    resolved = GGML_LAYOUT_AOS;\n"
+        "}\n"
+    )
+    try:
+        find_decision_condition(sibling, "GGML_LAYOUT_AOS")
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "two sibling if-statements both matching the marker must raise, not silently pick one"
+
+    # Negative companion: the nested case (a genuine ancestor chain) must
+    # still resolve, not raise -- the chain check must not over-fire on real
+    # nesting, only on an actual sibling ambiguity.
+    nested = (
+        "if (moe_mmvq_batched_dispatch_supports_type(src0->type)) {\n"
+        "    if (src0->type == GGML_TYPE_Q6_K) {\n"
+        "        resolved = GGML_LAYOUT_AOS;\n"
+        "    }\n"
+        "}\n"
+    )
+    condition = find_decision_condition(nested, "GGML_LAYOUT_AOS")
+    assert "GGML_TYPE_Q6_K" in condition
+
+
 def test_positive_control_regex_is_sensitive():
     """A regex that has never been observed to fire is not evidence it works."""
     injected = "if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) { resolved = GGML_LAYOUT_AOS; }"
@@ -328,11 +435,20 @@ def test_positive_control_regex_is_sensitive():
 def test_regex_does_not_over_match_longer_or_chains():
     """A 2-of-N substring of a longer chain is a DIFFERENT invariant, not this one.
 
-    dmmv.cpp, getrows.cpp, ggml-sycl.cpp (onednn scratch + CPU-dispatch reorder)
-    and mmq.cpp all legitimately OR Q4_0/Q8_0 together with one or more OTHER
-    types to answer "is reorder/coalesced capable", a broader and already-
-    generalized question unrelated to this ticket's AoS-only pin. A matcher
-    that flags the Q4_0/Q8_0 substring inside those chains produces false
+    Nine such superset chains exist at HEAD (c1f4504c8): dmmv.cpp (2),
+    getrows.cpp (1), mmq.cpp (1), and ggml-sycl.cpp (5) -- each legitimately
+    ORs Q4_0/Q8_0 together with one or more OTHER types to answer a question
+    broader than, and unrelated to, this ticket's AoS-only pin. Cited by
+    enclosing function rather than line number, since line numbers here have
+    already been observed to drift by dozens of lines between two commits in
+    one day -- a frozen list would just manufacture the next miscount. The
+    five in ggml-sycl.cpp, and they are NOT all the same question (do not
+    over-generalize the shape): `onednn_pp_unified_scratch_enabled` (oneDNN
+    PP scratch-buffer sizing heuristic), `ggml_backend_sycl_buffer_init_tensor`
+    and `ggml_backend_sycl_buffer_set_tensor` (CPU-dispatch SoA-reorder-on-
+    upload eligibility), `ggml_sycl_mul_mat` (dispatch routing), and
+    `ggml_backend_sycl_device_supports_op` (capability query). A matcher that
+    flags the Q4_0/Q8_0 substring inside any of these chains produces false
     positives on healthy code -- this is a negative control against that,
     built from the real shapes found in-tree rather than an invented example.
     """
@@ -477,6 +593,7 @@ def test_advertisement_and_refusal_sites_decide_layout_via_roster_only():
 
 if __name__ == "__main__":
     test_find_decision_condition_prefers_innermost_nested_if()
+    test_find_decision_condition_raises_on_sibling_ambiguity()
     test_positive_control_regex_is_sensitive()
     test_regex_does_not_over_match_longer_or_chains()
     test_no_hand_maintained_carveout_survives_outside_the_named_exception()
