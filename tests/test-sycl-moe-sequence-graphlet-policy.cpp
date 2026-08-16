@@ -651,8 +651,21 @@ static int test_sequence_graphlet_graph_recording_staging_uses_host_usm_base() {
                                                      "static sycl::event ggml_sycl_copy_payload_to_handle_async",
                                                      "// Per-secondary-GPU staging buffers",
                                                      "payload copy graph-retained staging");
-    CHECK(contains(payload_copy,
-                   "require_host_usm_base = ggml_sycl_graph_recording_active() || pointer_table_payload"),
+    // The predicate used to be spelled out here as
+    //   require_host_usm_base = ggml_sycl_graph_recording_active() || pointer_table_payload
+    // and moved into alloc_pinned_stage_handle_terminal (llama.cpp-13u6) so this
+    // site shares the ONE bounded staging retry and the always-on failure trace
+    // rather than hand-rolling an alloc_request that had neither.
+    //
+    // It is still the same predicate, now asserted as its two halves in the two
+    // places they live: this site must pass pointer_table_payload as the
+    // parameter, and the helper must OR that parameter with the recording
+    // predicate -- which `stage_alloc` below checks against mem-ops.cpp.  Delete
+    // either half and one of the two CHECKs goes red, so the guarantee is still
+    // covered end to end.  Matching the argument alone (not the call's line
+    // wrapping) keeps this from breaking on a reformat.
+    CHECK(contains(payload_copy, "alloc_pinned_stage_handle_terminal") &&
+              contains(payload_copy, "/*require_host_usm_base=*/pointer_table_payload"),
           "graph-recorded payload H2D copies and sequence pointer-table prewarm must not retain reset-zone host staging slices");
     CHECK(contains(payload_copy, "moe_transient_ptr_table") && contains(payload_copy, "pointer_table_payload"),
           "MoE transient pointer-table payload staging must force standalone host USM outside graph recording too");

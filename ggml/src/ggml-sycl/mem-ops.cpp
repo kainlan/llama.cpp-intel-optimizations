@@ -292,6 +292,17 @@ static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
 // climbs is flagged inline as RESERVOIR-UNMAPPED -- the in-band positive
 // control, printed on every line so the next reader cannot repeat round 1's
 // mistake silently.
+// WHICH ZONE THE REQUEST ACTUALLY USED (llama.cpp-13u6).  zone_used/zone_cap
+// sample STAGING, but every request traced here carries role == EXPERT_STAGING,
+// and select_zone() routes that role to SCRATCH before the WEIGHT/STAGING
+// disjuncts are even consulted (unified-cache.cpp, "role decides before
+// category").  So zone_used has been reporting occupancy of a zone these
+// allocations never touch: a zone that is FULL and a zone that is untouched
+// print the same 0 here, which is round 1's fault in a new place -- the number
+// was well-formed and about the wrong object.  scratch_used/scratch_cap are the
+// zone the request lands in.  Both are printed rather than one substituted for
+// the other: a KV-role or kv_spill request routes elsewhere again, so a reader
+// needs to see that SCRATCH is not universal either.
 // WHICH PATH SATISFIED THE REQUEST (llama.cpp-480a, round 3).
 //
 // Wall 5 is nondeterministic: census 6 aborted on a 32-byte staging allocation,
@@ -313,6 +324,29 @@ static std::atomic<uint64_t> g_stage_graph_self_seen{ 0 };
 // question with the wide one.  Whether that is wall 5's trigger is what the run
 // decides -- a failure carrying graph_any=1 graph_self=0 says yes and points at
 // a one-predicate fix; graph_any never reaching 1 kills the candidate outright.
+// Decode allocation_error so the trace does not ship yet another number the
+// next reader has to go look up.  A code printed without its name is a field
+// that only helps whoever already knows the answer.
+static const char * stage_alloc_error_name(int code) {
+    switch (static_cast<allocation_error>(code)) {
+        case allocation_error::NONE:
+            return "none";
+        case allocation_error::INVALID_REQUEST:
+            return "invalid_request";
+        case allocation_error::CONTROL_ALLOCATION_FAILED:
+            return "control_alloc_failed";
+        case allocation_error::PHYSICAL_ALLOCATION_FAILED:
+            return "physical_alloc_failed";
+        case allocation_error::METADATA_PUBLICATION_FAILED:
+            return "metadata_publication_failed";
+        case allocation_error::LEGACY_OWNERSHIP_MISMATCH:
+            return "legacy_ownership_mismatch";
+        case allocation_error::RELEASE_RETAINED:
+            return "release_retained";
+    }
+    return "?";
+}
+
 static void stage_trace_sample(const char * where,
                                const char * cohort,
                                size_t       bytes,
@@ -320,7 +354,8 @@ static void stage_trace_sample(const char * where,
                                int          device,
                                int          usm_param  = -1,
                                int          graph_self = -1,
-                               int          graph_any  = -1) {
+                               int          graph_any  = -1,
+                               int          alloc_err  = -1) {
     // GATE THE ACCOUNTING, NOT ONLY THE PRINT.
     //
     // Everything below -- the cache lookup (a shared_mutex read lock), five
@@ -351,11 +386,13 @@ static void stage_trace_sample(const char * where,
     if (!cache) {
         cache = get_unified_cache_for_device(0);
     }
-    const size_t committed = cache ? cache->pinned_pool_committed() : 0;
-    const size_t budget    = cache ? cache->pinned_pool_budget() : 0;
-    const size_t chunks    = cache ? cache->pinned_pool_chunk_count() : 0;
-    const size_t zone_used = cache ? cache->host_zone_used(host_zone_id::STAGING) : 0;
-    const size_t zone_cap  = cache ? cache->host_zone_capacity(host_zone_id::STAGING) : 0;
+    const size_t committed    = cache ? cache->pinned_pool_committed() : 0;
+    const size_t budget       = cache ? cache->pinned_pool_budget() : 0;
+    const size_t chunks       = cache ? cache->pinned_pool_chunk_count() : 0;
+    const size_t zone_used    = cache ? cache->host_zone_used(host_zone_id::STAGING) : 0;
+    const size_t zone_cap     = cache ? cache->host_zone_capacity(host_zone_id::STAGING) : 0;
+    const size_t scratch_used = cache ? cache->host_zone_used(host_zone_id::SCRATCH) : 0;
+    const size_t scratch_cap  = cache ? cache->host_zone_capacity(host_zone_id::SCRATCH) : 0;
 
     size_t peak = g_stage_zone_peak.load(std::memory_order_relaxed);
     while (committed > peak && !g_stage_zone_peak.compare_exchange_weak(peak, committed, std::memory_order_relaxed)) {
@@ -373,14 +410,15 @@ static void stage_trace_sample(const char * where,
     fprintf(stderr,
             "[STAGE-TRACE] where=%s cohort=%s bytes=%zu ok=%d dev=%d alloc_ok=%llu alloc_fail=%llu "
             "retained=%llu waited=%llu committed=%zu peak=%zu budget=%zu chunks=%zu zone_used=%zu "
-            "zone_cap=%zu usm_param=%d graph_self=%d graph_any=%d usm_eff=%d graph_any_n=%llu "
-            "graph_self_n=%llu%s%s\n",
+            "zone_cap=%zu scratch_used=%zu scratch_cap=%zu alloc_err=%d(%s) usm_param=%d graph_self=%d "
+            "graph_any=%d usm_eff=%d graph_any_n=%llu graph_self_n=%llu%s%s\n",
             where, cohort ? cohort : "?", bytes, ok ? 1 : 0, device, allocs,
             (unsigned long long) g_stage_alloc_fail.load(std::memory_order_relaxed),
             (unsigned long long) g_stage_retained.load(std::memory_order_relaxed),
             (unsigned long long) g_stage_waited.load(std::memory_order_relaxed), committed,
-            g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, usm_param,
-            graph_self, graph_any, usm_eff, (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
+            g_stage_zone_peak.load(std::memory_order_relaxed), budget, chunks, zone_used, zone_cap, scratch_used,
+            scratch_cap, alloc_err, alloc_err < 0 ? "n/a" : stage_alloc_error_name(alloc_err), usm_param, graph_self,
+            graph_any, usm_eff, (unsigned long long) g_stage_graph_any_seen.load(std::memory_order_relaxed),
             (unsigned long long) g_stage_graph_self_seen.load(std::memory_order_relaxed),
             (committed == 0 && allocs > 0) ? " RESERVOIR-UNMAPPED" : "",
             cumulative_continuous ? "" : " CUMULATIVE-GATED");
@@ -447,11 +485,26 @@ static bool alloc_pinned_stage_handle(size_t        size,
     req.intent.constraints.require_host_usm_base = require_host_usm_base || graph_any;
 
     for (int attempt = 0;; ++attempt) {
-        *out = unified_allocate(req);
+        // unified_allocate() is exactly this pair, minus the error code, which it
+        // drops on the floor.  That dropped byte is the whole reason wall 5 has
+        // been unattributable: EVERY failure path between here and the physical
+        // allocator reports itself ONLY through this enum -- four of them return
+        // silently (unified-cache.cpp: INVALID_REQUEST, absent coordinator,
+        // CONTROL_ALLOCATION_FAILED, METADATA_PUBLICATION_FAILED) and log
+        // nothing at all.  So a run could show 102 staging failures and zero
+        // allocator log lines, which is precisely what the -v prediction run
+        // showed (llama.cpp-13u6).  Keep the code and print it.
+        allocation_result allocation = unified_allocate_owner(req);
+        const int         alloc_err  = static_cast<int>(allocation.error);
+        if (allocation) {
+            *out = mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+        } else {
+            *out = {};
+        }
         if (out->valid()) {
             g_stage_alloc_ok.fetch_add(1, std::memory_order_relaxed);
             stage_trace_sample("alloc", cohort_id, size, /*ok=*/true, device, require_host_usm_base ? 1 : 0,
-                               graph_self ? 1 : 0, graph_any ? 1 : 0);
+                               graph_self ? 1 : 0, graph_any ? 1 : 0, alloc_err);
             return true;
         }
         // Every attempt prints, tracing off or not: the whole value of the
@@ -460,12 +513,21 @@ static bool alloc_pinned_stage_handle(size_t        size,
         // pressure was ever there.
         g_stage_alloc_fail.fetch_add(1, std::memory_order_relaxed);
         stage_trace_sample("alloc", cohort_id, size, /*ok=*/false, device, require_host_usm_base ? 1 : 0,
-                           graph_self ? 1 : 0, graph_any ? 1 : 0);
+                           graph_self ? 1 : 0, graph_any ? 1 : 0, alloc_err);
         if (attempt >= retries) {
             return false;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(k_stage_alloc_retry_us));
     }
+}
+
+bool alloc_pinned_stage_handle_terminal(size_t        size,
+                                        sycl::queue & queue,
+                                        int           device,
+                                        const char *  cohort_id,
+                                        bool          require_host_usm_base,
+                                        mem_handle *  out) {
+    return alloc_pinned_stage_handle(size, queue, device, cohort_id, require_host_usm_base, out, k_stage_alloc_retries);
 }
 
 static sycl::event mem_copy_direct_submit(const mem_handle &               dst,

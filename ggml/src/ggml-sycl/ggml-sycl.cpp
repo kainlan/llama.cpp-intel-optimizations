@@ -7042,16 +7042,7 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
         return deps.empty() ? queue.ext_oneapi_submit_barrier() : queue.ext_oneapi_submit_barrier(deps);
     }
 
-    ggml_sycl::alloc_request req{};
-    req.queue                                    = &queue;
-    req.device                                   = device;
-    req.size                                     = bytes;
-    req.intent.role                              = ggml_sycl::alloc_role::EXPERT_STAGING;
-    req.intent.category                          = ggml_sycl::runtime_category::STAGING;
-    req.intent.cohort_id                         = cohort_id;
-    req.intent.constraints.must_host_pinned      = true;
-    req.intent.constraints.use_pinned_pool       = true;
-    const bool pointer_table_payload             = cohort_id && std::strcmp(cohort_id, "moe_transient_ptr_table") == 0;
+    const bool            pointer_table_payload = cohort_id && std::strcmp(cohort_id, "moe_transient_ptr_table") == 0;
     // Command graphs capture the host source pointer for the replayed H2D copy.
     // SCRATCH/STAGING zone slices are individually freed the instant their
     // mem_handle releases (iiff Option C step 2), so a graph-recorded pointer
@@ -7062,16 +7053,19 @@ static sycl::event ggml_sycl_copy_payload_to_handle_async(sycl::queue &         
     // payloads standalone too so fallback/record-failure cleanup cannot leave
     // a `moe_transient_ptr_table` staging allocation dangling after its own
     // release.
-    req.intent.constraints.require_host_usm_base = ggml_sycl_graph_recording_active() || pointer_table_payload;
-
-    ggml_sycl::alloc_handle payload_stage_owner{};
-    if (!ggml_sycl::unified_alloc(req, &payload_stage_owner) || !payload_stage_owner.ptr) {
+    //
+    // The staging request itself is built by alloc_pinned_stage_handle_terminal
+    // (mem-ops.cpp), which ORs the parameter below with
+    // ggml_sycl_graph_recording_active() -- reproducing the predicate this site
+    // used to spell out, while sharing the one bounded retry and the always-on
+    // failure trace instead of hand-rolling an alloc_request that had neither
+    // (llama.cpp-13u6).
+    ggml_sycl::mem_handle stage;
+    if (!ggml_sycl::alloc_pinned_stage_handle_terminal(bytes, queue, device, cohort_id,
+                                                       /*require_host_usm_base=*/pointer_table_payload, &stage)) {
         GGML_ABORT("[MEM-HANDLE] failed host-pinned payload staging alloc bytes=%zu cohort=%s", bytes,
                    cohort_id ? cohort_id : "?");
     }
-
-    ggml_sycl::mem_handle stage =
-        ggml_sycl::detail::from_legacy_owned_alloc(std::move(payload_stage_owner), GGML_LAYOUT_AOS);
     ggml_sycl::mem_handle src =
         ggml_sycl::mem_handle::from_direct(const_cast<void *>(payload), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, 0 + bytes);
     ggml_sycl::mem_copy(stage, 0, src, 0, bytes, queue);
