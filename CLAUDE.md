@@ -670,6 +670,12 @@ Confirmed lessons from prior work on this fork. Treat them as defaults.
   parallelized with GPU work via `sycl::depends_on` (~9.7 µs cross-device
   latency). Format-conversion staging of *device-resident* data (on-device
   dequant into planned scratch zones) is layout work, not a placement violation.
+  **Companion rule — LAYOUT FOLLOWS RESIDENCY** (owner ruling 2026-08-16, same
+  doc section): weights are materialized in the optimal layout for the processor
+  that executes them, per device (B50-optimal on the B50, B70-optimal on the
+  B70, CPU-optimal for host-pinned); routes consume the materialized layout,
+  never advertise past it, and only advertise (type, layout) pairs whose kernels
+  exist. AOS fallback is a correctness stopgap, not the design.
 - **The VRAM budget calc is correct by design for DISCRETE cards** (`min(total*pct, free_at_init)`). Low free VRAM is a system problem (other GPUs active, driver overhead), not an app bug to "fix" by ignoring free VRAM — fix the root cause at the system level.
   ⚠️ **It is catastrophically wrong for an INTEGRATED GPU, and that is the cause of this host's OOM history** (`llama.cpp-403s`, measured 2026-08-01). The Arrow Lake-S iGPU reports `global_mem_size` = **231.7 GB** — 94 % of the host's 246.9 GB — because for an integrated GPU "VRAM" *is* system RAM. `ggml-sycl.cpp:10043-10049` feeds that into the same budget path as a discrete card at a **default of 100 %**, and neither `ggml-sycl.cpp` nor `unified-cache.cpp` contains a single occurrence of `host_unified` or `is_integrated`. So the backend claims the machine.
   Isolated with one variable — same 19 MB model, same single-threaded `llama-completion`, only the selector changed: `level_zero:0` → peak `Shmem` **2.4 GB**; `level_zero:0,1` → **2.4 GB**; selector unset (adds the iGPU) → **127.8 GB**.
@@ -838,6 +844,16 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 # GPT-OSS B50 chat correctness gate. With --no-display-prompt the prompt echo
 # lands on the interactive "> " line and the model's ANSWER is the next line,
 # on its own:
+# ⚠️ KNOWN ISSUE (llama.cpp-uize, 2026-08-16): as written, this gate currently
+# FAILS CONTEXT INIT on the B50 — "[SYCL-PLAN] runtime KV update rejected: MMID
+# workspace demand/accounting failed" then a segfault. That message is LYING
+# about the cause: llama-cli defaults to n_ctx_train=131072 and 131K of KV
+# (~3.2 GB) exceeds the B50's placement headroom (and physical VRAM) — the
+# fork disabled upstream's context fitter (fit_params=false under SYCL) and
+# the unified cache only validates, never shrinks. It is NOT a chat-correctness
+# or MMID regression — do not open that investigation. Until the uize fix
+# lands, add `-c 4096` to RUN the correctness check (the -c-pinning question
+# is an open owner decision, not doctrine).
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
 # The gate is the digit sequence. (An older note here said the output starts

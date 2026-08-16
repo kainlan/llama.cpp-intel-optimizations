@@ -88,6 +88,36 @@ device (the routes themselves carry no residency branch — the diversion must b
 proven structural, upstream, where `requires_host_staging` and the HOST tier are
 modelled).
 
+### Layout follows residency (owner ruling, 2026-08-16 — do not drift)
+
+The companion rule to placement-decides-executor: **wherever a weight lives, it
+is materialized in the optimal memory layout for the processor that executes on
+it** — per device, not globally. Weights resident in B50 VRAM are arranged in
+the optimal format for the B50's kernels; B70-resident weights in the optimal
+format for the B70 (the two cards' capabilities differ — tile shapes, XMX
+generation — so "optimal" is a per-device answer); host-pinned weights that the
+CPU runs are arranged in the CPU's optimal format (AOS today, per the measured
+CPU-AOS numbers above).
+
+Three consequences, all enforceable:
+
+- **The route layout follows the materialized layout, never the reverse.** A
+  dispatch must consume what the cache actually materialized (or trigger the
+  staging that re-materializes it) — it must never *advertise* a layout and then
+  read differently-arranged bytes through it. The 2026-08-16 MMID NaN family
+  (`llama.cpp-mn70`/`zoly`/`nkfc`) was exactly this drift: routes advertising
+  SOA over AOS bytes with nothing reconciling them.
+- **A layout may only be advertised if an executor kernel exists for that
+  (type, layout) on that device** — the producer rule in `llama.cpp-nkfc`,
+  anchored on the launcher roster.
+- **"Fall back to AOS" is a correctness stopgap, not the design.** Where a
+  type's optimal layout on a device has no matching indexed kernel yet (e.g.
+  q6_K SOA/coalesced MMID today), the short-term fix is consistent AOS
+  (materialization, advertisement, and kernel all agreeing); the design-conformant
+  endgame is materializing the optimal layout *and* providing its kernel, the
+  way MXFP4 already has layout-aware `_id` launchers. Track the gap; don't
+  let the stopgap quietly become the architecture.
+
 ## The one allocation entry point
 
 All runtime/scratch/staging/KV/compute allocation goes through a single
