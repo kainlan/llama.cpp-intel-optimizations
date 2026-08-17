@@ -60563,7 +60563,16 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
     if (total_pairs <= 0 || n_input_rows <= 0) {
         return reject_xmx("shape-overflow");
     }
-    if (!xmx_forced) {
+    // llama.cpp-twl6: the sorted wrapper is diagnostic-only and must not be
+    // armed by GGML_SYCL_XMX_MOE=1 (which also selects planner layouts) -- at
+    // higher dispatch priority it pre-empts the grouped-DPAS PP route and
+    // measured 5x slower on the B70, rc=134 abort on the B50. It now requires
+    // its own explicit opt-in.
+    static const bool xmx_sorted_wrapper_enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_XMX_MOE_SORTED");
+        return env && std::atoi(env) != 0;
+    }();
+    if (!xmx_sorted_wrapper_enabled) {
         return reject_xmx("diagnostic-only-current-sorted-wrapper");
     }
     sycl::queue * stream = ctx.stream();
@@ -64537,23 +64546,40 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                    [expected](const auto & operand) { return operand.actual_layout == expected; });
             };
             // This is the exact production executor intersection, not the wider
-            // retained-cache capability set. Gate/up consumes SOA only; cached-Q8
-            // down consumes SOA or MXFP4_I8. XMX_TILED and MXFP4_DPAS refuse here,
-            // before table upload, ID staging, escrow, or any output write.
+            // retained-cache capability set. Gate/up consumes SOA or (opt-in,
+            // see below) XMX_TILED; cached-Q8 down consumes SOA or MXFP4_I8.
+            // MXFP4_DPAS refuses here, before table upload, ID staging, escrow,
+            // or any output write.
             //
             // Restoration note (llama.cpp-twl6): gate/up's grouped-DPAS GEMM route
             // (weight_layout==GGML_LAYOUT_XMX_TILED, opt-in via
-            // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP) is intentionally NOT admitted here.
-            // mmvq_moe_prompt_q8_preflight() below hard-refuses any gate_layout !=
-            // GGML_LAYOUT_SOA (mmvq.cpp:17469) -- it's the SOA cached-Q8-reuse
-            // artifact shared with the down leg, and the grouped-DPAS XMX kernel
-            // does its own independent Q8 quantization instead of consuming that
-            // artifact. Widening this admission gate alone would not reach a
-            // working dispatch, only a preflight refusal that falls back anyway.
-            // Gate/up XMX_TILED dispatches through the non-fused per-tensor path
-            // (mmvq_moe_batched_dispatch's own XMX_TILED case), reached once
-            // ggml_sycl_select_moe_planned_graph_layout promotes the layout.
-            const bool executor_layouts_ok = gate_layout == GGML_LAYOUT_SOA && up_layout == gate_layout &&
+            // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP) is now admitted here and through
+            // the abi_ok/preflight checks below (mmvq_moe_prompt_q8_preflight,
+            // mmvq.cpp) -- a prior note here claimed the preflight's Q8 buffer
+            // is layout-dependent and would refuse XMX_TILED anyway; verified
+            // false: mxfp4_moe_prompt_q8_bytes() sizes purely from tensor shape,
+            // and mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa (mmvq.cpp) resolves
+            // the SAME buffer from prompt_q8_preflight->q8_owner and re-quantizes
+            // into it unconditionally, regardless of weight_layout.
+            // STILL UNREACHED, though: the sole call site below
+            // (mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa) hardcodes
+            // direct_xmx_eligible=false, xmx_tiled_grouped_eligible=false, so
+            // the grouped-DPAS branches (mmvq.cpp grouped_decode_shape /
+            // device_grouped_shape) can never fire from this call; with
+            // GGML_SYCL_MOE_GATEUP_PREPACK unset, weight_layout==XMX_TILED then
+            // hits the used_xmx_tiled_dpas safety-net refusal (mmvq.cpp ~18700)
+            // and gate_up_ok comes back false -- safe (no incorrect dispatch),
+            // but this widened admission alone does not yet make the route
+            // reachable. Wiring those two eligibility args is tracked as a
+            // llama.cpp-twl6 follow-up, not done here.
+            // Gate/up XMX_TILED can also dispatch through the non-fused
+            // per-tensor path (mmvq_moe_batched_dispatch's own XMX_TILED case),
+            // reached once ggml_sycl_select_moe_planned_graph_layout promotes
+            // the layout -- that route is unaffected by this admission gate.
+            const bool gate_layout_admissible =
+                gate_layout == GGML_LAYOUT_SOA ||
+                (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+            const bool executor_layouts_ok = gate_layout_admissible && up_layout == gate_layout &&
                 all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
                 (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
                 all_layout(roles.down, down_layout);
@@ -64749,7 +64775,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const auto ids_resolved = ids.resolve(ctx.device);
                                 const bool ids_identity_exact = ids_resolved && ids_resolved.ptr == ids_device &&
                                     static_cast<std::uintptr_t>(ids.stable_identity_hash()) == bundle.ids_identity;
-                                const bool abi_ok = gate_layout == GGML_LAYOUT_SOA &&
+                                const bool gate_layout_admissible =
+                                    gate_layout == GGML_LAYOUT_SOA ||
+                                    (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+                                const bool abi_ok = gate_layout_admissible &&
                                     (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
                                     gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
                                     down_table.resolve_abi(ctx.device) && ids_identity_exact;

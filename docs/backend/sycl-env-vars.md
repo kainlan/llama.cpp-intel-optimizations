@@ -71,6 +71,7 @@ Consequences worth knowing before you reach for this flag:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `GGML_SYCL_PP_PIPELINE=1` | OFF | Enable double-buffered FP16 weight dequant prefetch. B50 GPT-OSS `llama-bench` PP improves to ~1030-1043 tok/s, but GPT-OSS chat correctness currently fails with repeated `isNaN`, so keep this opt-in until fixed. |
+| `GGML_SYCL_XMX_MOE_SORTED=1` | OFF | Arms the diagnostic-only `try_xmx_sorted_moe` sorted MoE wrapper. Decoupled from `GGML_SYCL_XMX_MOE` (llama.cpp-twl6): at higher dispatch priority it used to pre-empt the grouped-DPAS PP route whenever `GGML_SYCL_XMX_MOE=1` was set, measuring 5x slower on the B70 and an rc=134 abort on the B50. Diagnostic use only. |
 
 ## Kernel dispatch tuning
 

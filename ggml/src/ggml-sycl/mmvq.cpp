@@ -17523,7 +17523,8 @@ bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
         !down_weight || !down_dst || !glu_dst_handle || !glu_dst_handle->valid() ||
         gate_weight->type != GGML_TYPE_MXFP4 || up_weight->type != GGML_TYPE_MXFP4 ||
         down_weight->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || glu_dst->type != GGML_TYPE_F32 ||
-        down_dst->type != GGML_TYPE_F32 || gate_layout != GGML_LAYOUT_SOA ||
+        down_dst->type != GGML_TYPE_F32 ||
+        (gate_layout != GGML_LAYOUT_SOA && gate_layout != GGML_LAYOUT_XMX_TILED) ||
         (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8) || ids_nb0 <= 0 || ids_nb1 <= 0) {
         return false;
     }
