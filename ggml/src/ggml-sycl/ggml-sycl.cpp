@@ -66060,10 +66060,73 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // call fails closed to "reuse-q8" exactly as before, so pair.down_dst
                         // proceeds through the existing, unmodified decode path below.
                         const layout_mode    down_layout = decode_pair_role_layout(pair.down_weight);
+                        const bool           down_layout_table_eligible =
+                            down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8;
                         const void * const * down_full_table =
-                            (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) ?
+                            down_layout_table_eligible ?
                                 moe_fusion_full_local_ptr_table(pair.down_weight, ctx.device, down_layout) :
                                 nullptr;
+
+                        // llama.cpp-ihqu (c-bnfm): 0d302e41b added an in-line
+                        // build-on-miss fallback for gate/up (block above,
+                        // ~:65813-65893) but never ported it to down, so
+                        // moe_fusion_full_local_ptr_table() -- a pure query --
+                        // misses on every non-graph decode call and down fusion
+                        // never engages ([MOE-DOWN-CACHED-REJECT] reason=no-down-
+                        // full-table, 408/408). Mirror the gate/up block exactly:
+                        // attempt ggml_sycl_update_moe_ptr_table() once, re-query
+                        // on success, and memoize a permanent failure so a
+                        // rebuild isn't retried every token. down_fail_key lives
+                        // in a disjoint high bit range from the gate (role bit 0)
+                        // / up (role bit 1) keys in
+                        // g_moe_decode_ptr_table_build_failed_generation so a
+                        // down failure can never alias, or be aliased by, a
+                        // gate/up entry for the same layer/device. Fail-open: on
+                        // build failure or a re-query miss, down_full_table stays
+                        // null and the existing reject/unfused path below runs
+                        // exactly as before this change.
+                        std::vector<sycl::event> down_ptr_table_build_events;
+                        if (!down_full_table && down_layout_table_eligible && pair_layout_ok &&
+                            decode_ptr_table_build_enabled) {
+                            const int64_t down_fail_key = (INT64_C(1) << 48) |
+                                                          (static_cast<int64_t>(blk_layer_id) << 8) |
+                                                          (static_cast<int64_t>(ctx.device) << 1);
+                            auto *         down_w_extra = pair.down_weight ?
+                                                              static_cast<ggml_tensor_extra_gpu *>(pair.down_weight->extra) :
+                                                              nullptr;
+                            const uint64_t down_generation =
+                                down_w_extra ? down_w_extra->moe_expert_storage_generation : 0;
+                            const auto down_fail_it =
+                                g_moe_decode_ptr_table_build_failed_generation.find(down_fail_key);
+                            const bool down_build_skipped =
+                                down_fail_it != g_moe_decode_ptr_table_build_failed_generation.end() &&
+                                down_fail_it->second == down_generation;
+                            if (!down_build_skipped) {
+                                const bool host_resident_down =
+                                    ggml_sycl_is_host_resident_weight(pair.down_weight, ctx.stream());
+                                sycl::event down_table_event;
+                                if (ggml_sycl_update_moe_ptr_table(ctx, pair.down_weight, ids, down_layout,
+                                                                   &down_table_event,
+                                                                   moe_ptr_table_coverage::FULL_TABLE,
+                                                                   /*ids_host_override=*/nullptr,
+                                                                   /*skip_device_copy=*/false,
+                                                                   /*force_cache_aos=*/host_resident_down,
+                                                                   /*skip_cpu_routed_experts=*/host_resident_down,
+                                                                   /*exact_layout_required=*/false)) {
+                                    down_full_table =
+                                        moe_fusion_full_local_ptr_table(pair.down_weight, ctx.device, down_layout);
+                                }
+                                if (down_full_table) {
+                                    down_ptr_table_build_events.push_back(down_table_event);
+                                    g_moe_decode_ptr_table_build_failed_generation.erase(down_fail_key);
+                                } else {
+                                    g_moe_decode_ptr_table_build_failed_generation[down_fail_key] = down_generation;
+                                }
+                            }
+                        }
+                        const std::vector<sycl::event> * down_ptr_table_build_deps =
+                            down_ptr_table_build_events.empty() ? nullptr : &down_ptr_table_build_events;
+
                         const bool cached_q8_needs_host_grouping = down_layout == GGML_LAYOUT_XMX_TILED &&
                                                                    !g_ggml_sycl_graph_recording &&
                                                                    !use_device_ids_for_pair_glu;
@@ -66080,8 +66143,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 static_cast<int>(gate_up_dispatch_entries), n_ids_pair, ids_device_nb0, ids_device_nb1,
                                 down_layout, decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr,
                                 decode_q8_handles_ok ? &decode_down_storage.handle : nullptr,
-                                down_ids_host_for_cached_q8, down_ids_host_count_for_cached_q8, /*deps=*/nullptr,
-                                &down_event, &down_event_set);
+                                down_ids_host_for_cached_q8, down_ids_host_count_for_cached_q8,
+                                down_ptr_table_build_deps, &down_event, &down_event_set);
                             if (ok_down) {
                                 ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst,
                                                                       ctx.device);
