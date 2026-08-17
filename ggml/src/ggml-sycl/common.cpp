@@ -269,9 +269,14 @@ int ggml_sycl_get_device_id_from_queue(sycl::queue & queue) {
 // Since Intel Arc lacks P2P, we duplicate to each device's local memory
 // ============================================================================
 #include <unordered_map>
+#include <vector>
 
+// llama.cpp-1df8: no cached raw void* fields here. A pointer alone carries no
+// lifetime/ownership signal back to this cache, and this cache is what frees
+// entries on resize -- caching the ABI view separately from the owning
+// mem_handle is exactly how the UAF happened. Resolve the handle at the point
+// of use instead (ggml_sycl::mem_handle::resolve()).
 struct StagedBuffer {
-    void *                ptrs[GGML_SYCL_MAX_DEVICES];            // Per-device cached ABI views
     ggml_sycl::mem_handle device_handles[GGML_SYCL_MAX_DEVICES];  // Per-device managed allocations
     size_t                size;
 };
@@ -297,7 +302,33 @@ struct staging_cache_key_hash {
     }
 };
 
+// llama.cpp-1df8: keying on a raw address (legacy_src) is only reachable when
+// the caller has no ggml_sycl_cache_id at all -- every current call site
+// (ggml_sycl_get_data_ptr_slow, ggml_sycl_ensure_weight_on_device,
+// graph_prestage_leaf_tensors, all in ggml-sycl.cpp) already mints one via
+// ggml_backend_sycl_get_tensor_cache_key(), so this fallback is exercised
+// only through the address-less two-/one-argument overloads below, which
+// have no callers in this tree today but remain part of the public API.
+// Minting a cache_id from within this file is not feasible -- it needs the
+// caller's tensor/model identity -- so the fallback stays, gated by a
+// warn-once so a future caller of the bare-pointer overloads is visible
+// instead of silently keying on an address.
+static void warn_legacy_staging_key_once(const void * src) {
+    static std::atomic<bool> warned{ false };
+    bool                     expected = false;
+    if (warned.compare_exchange_strong(expected, true)) {
+        GGML_LOG_WARN(
+            "[STAGING] no ggml_sycl_cache_id for src=%p -- keying the staging cache on a raw pointer address. "
+            "Prefer the ggml_sycl_get_staged_ptr_device() overload that takes a ggml_sycl_cache_id "
+            "(llama.cpp-1df8).\n",
+            src);
+    }
+}
+
 static staging_cache_key make_staging_cache_key(const void * src, ggml_sycl_cache_id cache_id) {
+    if (!cache_id.valid) {
+        warn_legacy_staging_key_once(src);
+    }
     staging_cache_key key{};
     key.id         = cache_id;
     key.legacy_src = cache_id.valid ? nullptr : src;
@@ -306,16 +337,31 @@ static staging_cache_key make_staging_cache_key(const void * src, ggml_sycl_cach
 
 static std::unordered_map<staging_cache_key, StagedBuffer, staging_cache_key_hash> g_tp_staging_cache;
 static std::mutex                                                                 g_tp_staging_mutex;
+// llama.cpp-1df8: handles retired by a concurrent resize (see the resize
+// branch below) rather than dropped in place. The raw pointer this cache
+// hands out carries no completion signal back to the cache, so an in-place
+// drop can free memory a caller is still reading/writing through. Draining
+// happens in ggml_sycl_clear_staging_cache(), which runs at the start of the
+// next graph_compute only after the preceding graph's async staging/CPU work
+// has already been drained (see the WEDGE-48330 / skgik comments at the
+// graph_compute_impl prologue in ggml-sycl.cpp) -- so retiring here defers
+// the physical free to that existing synchronization point instead of an
+// arbitrary concurrent moment. This narrows the window; it does not replace
+// priority-1 of llama.cpp-1df8 (callers holding the handle themselves), which
+// is required for full closure and needs the ggml-sycl.cpp call sites
+// migrated to ggml_sycl_get_staged_handle_device().
+static std::vector<ggml_sycl::mem_handle> g_tp_staging_retired;
 
 // Runtime staging cache for single-GPU mode (non-weight data like positions, masks)
 struct RuntimeStagedData {
-    void *                ptr;  // Pinned memory cached ABI view
     size_t                size;
     ggml_sycl::mem_handle handle;
 };
 
 static std::unordered_map<staging_cache_key, RuntimeStagedData, staging_cache_key_hash> g_runtime_staging_cache;
 static std::mutex                                                                      g_runtime_staging_mutex;
+// See g_tp_staging_retired above; same rationale, runtime-cache resize path.
+static std::vector<ggml_sycl::mem_handle> g_runtime_staging_retired;
 
 static size_t runtime_staging_min_bytes() {
     static size_t min_bytes = []() -> size_t {
@@ -333,11 +379,23 @@ static size_t runtime_staging_min_bytes() {
     return min_bytes;
 }
 
-// Get or create a staged copy of mmap'd data for a specific device
-// Works in both TP mode and single-GPU mode (via host cache pinned memory)
-void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device, ggml_sycl_cache_id cache_id) {
+// Get or create a staged copy of mmap'd data for a specific device.
+// Works in both TP mode and single-GPU mode (via host cache pinned memory).
+//
+// Returns the owning mem_handle (llama.cpp-1df8 priority 1): the caller must
+// keep the returned handle alive for at least the duration of the consuming
+// copy/kernel. Holding the handle is what makes this safe under a concurrent
+// resize on the same key -- the resize below retires rather than frees the
+// superseded allocation, but only a caller-held handle guarantees the buffer
+// survives for as long as the caller is actually using it. An
+// invalid/default-constructed handle (check with .valid()) means failure or
+// a cache-bypass (e.g. payload below runtime_staging_min_bytes()).
+ggml_sycl::mem_handle ggml_sycl_get_staged_handle_device(const void *       src,
+                                                         size_t             size,
+                                                         int                device,
+                                                         ggml_sycl_cache_id cache_id) {
     if (src == nullptr || size == 0) {
-        return nullptr;
+        return {};
     }
     const staging_cache_key key = make_staging_cache_key(src, cache_id);
 
@@ -347,18 +405,25 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         // Small payloads are copied directly and do not benefit from
         // persistent pinned staging.
         if (size < runtime_staging_min_bytes()) {
-            return nullptr;
+            return {};
         }
         std::lock_guard<std::mutex> lock(g_runtime_staging_mutex);
         auto                        it = g_runtime_staging_cache.find(key);
         if (it != g_runtime_staging_cache.end() && it->second.size >= size) {
             // Runtime tensors are mutable; the cache owns reusable staging
             // storage, not immutable content.
-            std::memcpy(it->second.ptr, src, size);
-            return it->second.ptr;
+            auto resolved = it->second.handle.resolve(device);
+            if (!resolved.ptr) {
+                return {};
+            }
+            std::memcpy(resolved.ptr, src, size);
+            return it->second.handle;
         }
         if (it != g_runtime_staging_cache.end()) {
-            it->second.handle = {};
+            // Retire, do not drop in place -- another thread may still be
+            // reading/writing through a handle it already holds for this
+            // stale entry. See g_runtime_staging_retired above.
+            g_runtime_staging_retired.push_back(std::move(it->second.handle));
             g_runtime_staging_cache.erase(it);
         }
         auto &                   q = ggml_sycl_get_device(device).default_queue();
@@ -373,24 +438,25 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         req.intent.constraints.use_pinned_pool  = true;
         ggml_sycl::allocation_result allocation = ggml_sycl::unified_allocate_owner(req);
         if (!allocation) {
-            return nullptr;
+            return {};
         }
         ggml_sycl::mem_handle dst_handle =
             ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
         auto staged = dst_handle.resolve(device);
         if (!staged.ptr || staged.on_device) {
-            return nullptr;
+            return {};
         }
         ggml_sycl::mem_handle src_handle =
             ggml_sycl::mem_handle::from_direct(const_cast<void *>(src), GGML_LAYOUT_AOS,
                                                /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, size);
         ggml_sycl::mem_copy(dst_handle, src_handle, size, q);
-        g_runtime_staging_cache[key] = { staged.ptr, size, std::move(dst_handle) };
-        return g_runtime_staging_cache[key].ptr;
+        ggml_sycl::mem_handle ret    = dst_handle;
+        g_runtime_staging_cache[key] = { size, std::move(dst_handle) };
+        return ret;
     }
     // Multi-process mode: No cross-device staging needed (each process has its own data)
     if (g_sycl_tp_config.is_multiprocess) {
-        return nullptr;
+        return {};
     }
 
     std::lock_guard<std::mutex> lock(g_tp_staging_mutex);
@@ -398,19 +464,20 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
     // Check if already staged for this device
     auto it = g_tp_staging_cache.find(key);
     if (it != g_tp_staging_cache.end()) {
-        if (it->second.size >= size && it->second.ptrs[device] != nullptr) {
-            return it->second.ptrs[device];
+        if (it->second.size >= size && it->second.device_handles[device].valid()) {
+            return it->second.device_handles[device];
         }
         // Size mismatch or device not staged - need to re-allocate
         if (it->second.size < size) {
             GGML_SYCL_DEBUG("[STAGING] Size mismatch for %p: cached=%zu, requested=%zu, reallocating\n", src,
                             it->second.size, size);
-            // Free all staged handles via unified-cache (mubmt.9)
+            // Retire (not drop) the superseded handles via unified-cache
+            // (mubmt.9). See g_tp_staging_retired above: another thread may
+            // already hold one of these handles for in-flight work.
             int num_local_devices = g_sycl_tp_config.is_multiprocess ? 1 : g_sycl_tp_config.world_size;
             for (int i = 0; i < num_local_devices; i++) {
-                int dev_id                        = g_sycl_tp_config.devices[i];
-                it->second.device_handles[dev_id] = {};
-                it->second.ptrs[dev_id]           = nullptr;
+                int dev_id = g_sycl_tp_config.devices[i];
+                g_tp_staging_retired.push_back(std::move(it->second.device_handles[dev_id]));
             }
             g_tp_staging_cache.erase(it);
             it = g_tp_staging_cache.end();
@@ -429,19 +496,16 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
         g_tp_staging_cache[key] = {};
         entry                   = &g_tp_staging_cache[key];
         entry->size             = size;
-        for (int i = 0; i < GGML_SYCL_MAX_DEVICES; i++) {
-            entry->ptrs[i] = nullptr;
-        }
     } else {
         entry = &it->second;
     }
 
     // Allocate on the requested device if not already done
-    if (entry->ptrs[device] == nullptr) {
+    if (!entry->device_handles[device].valid()) {
         sycl::queue * tp_queue = g_tp_shared_queues[device];
         if (tp_queue == nullptr) {
             GGML_LOG_ERROR("[STAGING] TP queue not initialized for device %d\n", device);
-            return nullptr;
+            return {};
         }
 
         try {
@@ -461,7 +525,7 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
             auto                  device_res    = device_handle.resolve(device);
             if (!device_res || !device_res.on_device || !device_res.ptr) {
                 GGML_LOG_ERROR("[STAGING] unified_alloc failed for %zu bytes on device %d\n", size, device);
-                return nullptr;
+                return {};
             }
             void * staged                 = device_res.ptr;
             entry->device_handles[device] = std::move(device_handle);
@@ -484,7 +548,7 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
             if (!host_res || host_res.on_device || host_res.ptr == nullptr) {
                 GGML_LOG_ERROR("[STAGING] failed to allocate pinned host staging buffer for %zu bytes\n", size);
                 entry->device_handles[device] = {};
-                return nullptr;
+                return {};
             }
             GGML_SYCL_DEBUG("[STAGING] Host buffer at %p, copying through mem_handle helpers...\n", host_res.ptr);
 
@@ -498,19 +562,31 @@ void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device
             ggml_sycl::mem_copy(entry->device_handles[device], host_handle, size, *tp_queue);
             GGML_SYCL_DEBUG("[STAGING] mem_handle copy done\n");
 
-            entry->ptrs[device] = staged;
             GGML_SYCL_DEBUG("[STAGING] Staged %zu bytes from %p to device %d: %p (handle=%p)\n", size, src, device,
                             staged, entry->device_handles[device].resolve(device).ptr);
         } catch (const sycl::exception & e) {
             GGML_LOG_ERROR("[STAGING] Failed to allocate/copy %zu bytes on device %d: %s (code=%d)\n", size, device,
                            e.what(), static_cast<int>(e.code().value()));
             entry->device_handles[device] = {};
-            entry->ptrs[device]           = nullptr;
-            return nullptr;
+            return {};
         }
     }
 
-    return entry->ptrs[device];
+    return entry->device_handles[device];
+}
+
+// Legacy raw-pointer API (kept for the existing ggml-sycl.cpp call sites --
+// llama.cpp-1df8 leaves those untouched pending sequencing). Resolves the
+// handle immediately and hands back only the ABI view; the returned pointer
+// carries none of the lifetime guarantee ggml_sycl_get_staged_handle_device()
+// provides, so it remains exposed to the same class of race until callers
+// migrate to the handle-returning form.
+void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device, ggml_sycl_cache_id cache_id) {
+    ggml_sycl::mem_handle handle = ggml_sycl_get_staged_handle_device(src, size, device, cache_id);
+    if (!handle.valid()) {
+        return nullptr;
+    }
+    return handle.resolve(device).ptr;
 }
 
 void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device) {
@@ -533,9 +609,17 @@ void ggml_sycl_clear_staging_cache() {
             entry.second.handle = {};
         }
         g_runtime_staging_cache.clear();
+        // Release entries retired by a concurrent resize since the last
+        // clear -- see g_runtime_staging_retired above.
+        g_runtime_staging_retired.clear();
     }
 
     std::lock_guard<std::mutex> lock(g_tp_staging_mutex);
+
+    // Release entries retired by a concurrent resize since the last clear --
+    // see g_tp_staging_retired above. Must happen even when the live cache
+    // below is already empty.
+    g_tp_staging_retired.clear();
 
     if (g_tp_staging_cache.empty()) {
         return;
@@ -550,7 +634,6 @@ void ggml_sycl_clear_staging_cache() {
         for (int i = 0; i < num_local_devices; i++) {
             int dev_id                          = g_sycl_tp_config.devices[i];
             entry.second.device_handles[dev_id] = {};
-            entry.second.ptrs[dev_id]           = nullptr;
         }
     }
     g_tp_staging_cache.clear();

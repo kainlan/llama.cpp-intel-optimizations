@@ -134,7 +134,18 @@ sycl::context * ggml_sycl_get_tp_context();
 void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device, ggml_sycl_cache_id cache_id);
 void * ggml_sycl_get_staged_ptr_device(const void * src, size_t size, int device);
 void * ggml_sycl_get_staged_ptr(const void * src, size_t size);  // Legacy: returns device 0's pointer
-void   ggml_sycl_clear_staging_cache();
+
+// Preferred entry point (llama.cpp-1df8): same lookup/allocate as
+// ggml_sycl_get_staged_ptr_device(), but returns the owning mem_handle
+// instead of a bare pointer. Hold the returned handle for at least the
+// duration of the consuming copy/kernel -- a live handle keeps the physical
+// allocation alive no matter what a concurrent resize does to this cache's
+// map entry. Empty/invalid handle on failure (check via .resolve(device)).
+ggml_sycl::mem_handle ggml_sycl_get_staged_handle_device(const void *       src,
+                                                         size_t             size,
+                                                         int                device,
+                                                         ggml_sycl_cache_id cache_id = ggml_sycl_cache_id{});
+void                  ggml_sycl_clear_staging_cache();
 
 // Internal getters for seq_ids host pointers (set by llama layer, used by fattn)
 const int32_t * ggml_sycl_get_seq_ids_host_q(size_t * count);
