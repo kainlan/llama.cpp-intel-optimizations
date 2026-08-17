@@ -65620,8 +65620,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // graph_preload_moe_experts() on the SYCL command-graph path, so on a
                 // default (non-graph) run the table is silently never built and every
                 // fused decode dispatch below falls through. Attempt the build here,
-                // in-line, when the query misses -- env-gated and default OFF so an
-                // unset env leaves behavior byte-identical to the query-only form above.
+                // in-line, when the query misses -- env-gated, default ON as of
+                // llama.cpp-3hs5 (verified on B50+B70 hardware: correct output, no
+                // per-token rebuild, tg128 +84% B50 / B70 tg128 crash eliminated).
+                // GGML_SYCL_MOE_PTR_TABLE_DECODE=0 opts back out to the query-only
+                // form above, for bisection.
                 // Mirrors the ONLY production call site (graph_preload_moe_experts(),
                 // ~line 54764): FULL_TABLE coverage (every expert, not a selected-ids
                 // view), exact_layout_required=false (matches every production caller --
@@ -65641,7 +65644,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // the H2D pointer-table copy completing, per the event/ordering contract.
                 static const bool decode_ptr_table_build_enabled = [] {
                     const char * env = std::getenv("GGML_SYCL_MOE_PTR_TABLE_DECODE");
-                    return env && std::atoi(env) != 0;
+                    return env == nullptr || std::atoi(env) != 0;
                 }();
                 bool                     table_built_gate   = false;
                 bool                     table_built_up     = false;
