@@ -17553,6 +17553,20 @@ static void moe_layer_group_profile_record(const moe_layer_decode_plan &      pl
 }
 
 static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pairs;
+// llama.cpp-3hs5: per (layer, device, role) generation at which an in-line
+// RESTORE-T1 decode pointer-table build (see ggml_sycl_mul_mat_id) was last
+// attempted and FAILED -- either ggml_sycl_update_moe_ptr_table() itself
+// returned false, or it returned true but the immediate re-query still could
+// not resolve every expert at pair_layout. Without this, a permanently-failing
+// build (e.g. a layout the builder cannot materialize for this weight) would
+// be re-attempted on every decode dispatch of every token, which is a build
+// storm, not a fix. Keyed on the weight's moe_expert_storage_generation so a
+// legitimate re-materialization (weight evicted/reloaded, generation bumped)
+// re-arms the attempt instead of being suppressed forever. A SUCCESSFUL build
+// does not need an entry here: moe_fusion_full_local_ptr_table() memoizes
+// success itself via extra->moe_full_local_probe_{generation,layout,ok}[device],
+// so later tokens hit that probe directly and never re-enter the build path.
+static thread_local std::unordered_map<int64_t, uint64_t>     g_moe_decode_ptr_table_build_failed_generation;
 static thread_local std::unordered_set<int>                   g_moe_precomputed_down_layer_skip;
 static thread_local bool                                      g_moe_segmented_graph_dispatch_active            = false;
 thread_local bool                                             g_moe_descriptor_dispatch_graph_recording_active = false;
@@ -65629,41 +65643,87 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const char * env = std::getenv("GGML_SYCL_MOE_PTR_TABLE_DECODE");
                     return env && std::atoi(env) != 0;
                 }();
-                bool                     table_built_gate = false;
-                bool                     table_built_up   = false;
+                bool                     table_built_gate   = false;
+                bool                     table_built_up     = false;
+                bool                     gate_build_skipped = false;
+                bool                     up_build_skipped   = false;
                 std::vector<sycl::event> ptr_table_build_events;
                 if (pair_layout_ok && decode_ptr_table_build_enabled) {
+                    // Build once, not once per token: a SUCCESSFUL build below is picked
+                    // up by moe_fusion_full_local_ptr_table()'s own success memoization
+                    // (extra->moe_full_local_probe_{generation,layout,ok}[device]), so the
+                    // gate_full_table/up_full_table query above this block already returns
+                    // non-null on every later call and this if-block is skipped entirely --
+                    // no per-token rebuild. What that probe does NOT cover is a PERMANENT
+                    // failure, so g_moe_decode_ptr_table_build_failed_generation (keyed on
+                    // layer/device/role, valued by moe_expert_storage_generation) guards
+                    // against retrying a build that keeps failing every dispatch. A
+                    // generation mismatch against a stale failure entry means the weight
+                    // was re-materialized since, so the attempt re-arms.
+                    auto weight_storage_generation = [](const ggml_tensor * weight) -> uint64_t {
+                        auto * w_extra = weight ? static_cast<ggml_tensor_extra_gpu *>(weight->extra) : nullptr;
+                        return w_extra ? w_extra->moe_expert_storage_generation : 0;
+                    };
+                    const int64_t gate_fail_key =
+                        (static_cast<int64_t>(blk_layer_id) << 8) | (static_cast<int64_t>(ctx.device) << 1) | 0;
+                    const int64_t up_fail_key =
+                        (static_cast<int64_t>(blk_layer_id) << 8) | (static_cast<int64_t>(ctx.device) << 1) | 1;
+
                     if (!gate_full_table) {
-                        const bool host_resident_gate =
-                            ggml_sycl_is_host_resident_weight(pair.gate_weight, ctx.stream());
-                        sycl::event gate_table_event;
-                        if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout, &gate_table_event,
-                                                           moe_ptr_table_coverage::FULL_TABLE,
-                                                           /*ids_host_override=*/nullptr, /*skip_device_copy=*/false,
-                                                           /*force_cache_aos=*/host_resident_gate,
-                                                           /*skip_cpu_routed_experts=*/host_resident_gate,
-                                                           /*exact_layout_required=*/false)) {
-                            gate_full_table =
-                                moe_fusion_full_local_ptr_table(pair.gate_weight, ctx.device, pair_layout);
+                        const uint64_t gate_generation = weight_storage_generation(pair.gate_weight);
+                        const auto gate_fail_it = g_moe_decode_ptr_table_build_failed_generation.find(gate_fail_key);
+                        if (gate_fail_it != g_moe_decode_ptr_table_build_failed_generation.end() &&
+                            gate_fail_it->second == gate_generation) {
+                            gate_build_skipped = true;
+                        } else {
+                            const bool host_resident_gate =
+                                ggml_sycl_is_host_resident_weight(pair.gate_weight, ctx.stream());
+                            sycl::event gate_table_event;
+                            if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout,
+                                                               &gate_table_event, moe_ptr_table_coverage::FULL_TABLE,
+                                                               /*ids_host_override=*/nullptr,
+                                                               /*skip_device_copy=*/false,
+                                                               /*force_cache_aos=*/host_resident_gate,
+                                                               /*skip_cpu_routed_experts=*/host_resident_gate,
+                                                               /*exact_layout_required=*/false)) {
+                                gate_full_table =
+                                    moe_fusion_full_local_ptr_table(pair.gate_weight, ctx.device, pair_layout);
+                            }
                             table_built_gate = gate_full_table != nullptr;
                             if (table_built_gate) {
                                 ptr_table_build_events.push_back(gate_table_event);
+                                g_moe_decode_ptr_table_build_failed_generation.erase(gate_fail_key);
+                            } else {
+                                g_moe_decode_ptr_table_build_failed_generation[gate_fail_key] = gate_generation;
                             }
                         }
                     }
                     if (!up_full_table) {
-                        const bool  host_resident_up = ggml_sycl_is_host_resident_weight(pair.up_weight, ctx.stream());
-                        sycl::event up_table_event;
-                        if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
-                                                           moe_ptr_table_coverage::FULL_TABLE,
-                                                           /*ids_host_override=*/nullptr, /*skip_device_copy=*/false,
-                                                           /*force_cache_aos=*/host_resident_up,
-                                                           /*skip_cpu_routed_experts=*/host_resident_up,
-                                                           /*exact_layout_required=*/false)) {
-                            up_full_table  = moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout);
+                        const uint64_t up_generation = weight_storage_generation(pair.up_weight);
+                        const auto     up_fail_it    = g_moe_decode_ptr_table_build_failed_generation.find(up_fail_key);
+                        if (up_fail_it != g_moe_decode_ptr_table_build_failed_generation.end() &&
+                            up_fail_it->second == up_generation) {
+                            up_build_skipped = true;
+                        } else {
+                            const bool host_resident_up =
+                                ggml_sycl_is_host_resident_weight(pair.up_weight, ctx.stream());
+                            sycl::event up_table_event;
+                            if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
+                                                               moe_ptr_table_coverage::FULL_TABLE,
+                                                               /*ids_host_override=*/nullptr,
+                                                               /*skip_device_copy=*/false,
+                                                               /*force_cache_aos=*/host_resident_up,
+                                                               /*skip_cpu_routed_experts=*/host_resident_up,
+                                                               /*exact_layout_required=*/false)) {
+                                up_full_table =
+                                    moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout);
+                            }
                             table_built_up = up_full_table != nullptr;
                             if (table_built_up) {
                                 ptr_table_build_events.push_back(up_table_event);
+                                g_moe_decode_ptr_table_build_failed_generation.erase(up_fail_key);
+                            } else {
+                                g_moe_decode_ptr_table_build_failed_generation[up_fail_key] = up_generation;
                             }
                         }
                     }
@@ -65683,10 +65743,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
                             "[MOE-DECODE-PAIR-ELIGIBILITY] tensor=%s layer=%d device=%d layout=%s "
-                            "pair_layout_ok=%d full_gpu_cover=%d table_built_gate=%d table_built_up=%d\n",
+                            "pair_layout_ok=%d full_gpu_cover=%d table_built_gate=%d table_built_up=%d "
+                            "gate_build_skip=%d up_build_skip=%d\n",
                             pair.gate_weight->name ? pair.gate_weight->name : "?", blk_layer_id, ctx.device,
                             ggml_sycl_layout_mode_name(pair_layout), pair_layout_ok ? 1 : 0, full_gpu_cover ? 1 : 0,
-                            table_built_gate ? 1 : 0, table_built_up ? 1 : 0);
+                            table_built_gate ? 1 : 0, table_built_up ? 1 : 0, gate_build_skipped ? 1 : 0,
+                            up_build_skipped ? 1 : 0);
                 }
 
                 const int64_t   n_ids_pair = ids->ne[0];
