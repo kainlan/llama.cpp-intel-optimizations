@@ -3206,6 +3206,33 @@ struct ggml_tensor_extra_gpu {
         }
     }
 
+    // Handle-taking sibling of set_data_device() (llama.cpp-1df8). The raw-pointer
+    // overload above always reconstructs a handle via from_chunk_ptr(), which is
+    // correct ONLY when `ptr` resolves to an arena chunk lease -- for a pointer
+    // backed by an EXTERNAL_EXACT allocation (e.g. the TP/runtime staging cache's
+    // device buffer; see ggml_sycl_get_data_ptr_slow's staged_handle comment)
+    // from_chunk_ptr() cannot find a chunk and silently downgrades to an
+    // unprotected DIRECT handle with nothing keeping the allocation alive. Call
+    // this instead when the caller already holds the OWNING handle so data_handle
+    // shares that ownership directly, with no raw-pointer reconstruction step.
+    // Not a general replacement for set_data_device(): only use it where the
+    // caller's handle is itself the allocation's owner (or a share of it).
+    void set_data_device_handle(int dev, ggml_sycl::mem_handle handle) {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_data_device_handle: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_data_device_handle: device index out of range");
+        }
+        auto resolved = handle.resolve(dev);
+        if (!resolved.ptr) {
+            data_device[dev] = nullptr;
+            data_handle[dev] = ggml_sycl::mem_handle{};
+            return;
+        }
+        data_device[dev] = resolved.ptr;
+        data_handle[dev] = std::move(handle);
+    }
+
     bool set_owned_data_device(int                     dev,
                                ggml_sycl::alloc_handle owner,
                                size_t                  bytes,

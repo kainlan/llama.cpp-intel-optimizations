@@ -20850,24 +20850,31 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
 
             size_t             nbytes            = ggml_nbytes(tensor);
             ggml_sycl_cache_id staging_cache_key = ggml_backend_sycl_get_tensor_cache_key(tensor, device);
-            void * staged = ggml_sycl_get_staged_ptr_device(tensor->data, nbytes, device, staging_cache_key);
-            if (staged != nullptr) {
-                const sycl::usm::alloc staged_alloc     = ggml_sycl_get_alloc_type(staged);
-                const bool             staged_on_device = staged_alloc == sycl::usm::alloc::device;
+            // Hold the OWNING handle (llama.cpp-1df8): the device-side staging
+            // allocation backing this pointer is minted with must_device=true and
+            // no prefer_vram_zone/use_pinned_pool/KV role, so unified_allocate()
+            // classifies it EXTERNAL_EXACT -- it is never a suballocation of the
+            // VRAM arena's arena_chunks_. from_chunk_ptr()'s arena_acquire_chunk_lease()
+            // lookup therefore always misses for this pointer and silently
+            // downgrades to an unprotected DIRECT handle with nothing refcounted.
+            // Only a copy of the handle the staging cache itself owns keeps the
+            // buffer alive across a concurrent resize/retire of that cache entry.
+            ggml_sycl::mem_handle staged_handle =
+                ggml_sycl_get_staged_handle_device(tensor->data, nbytes, device, staging_cache_key);
+            auto staged_res = staged_handle.resolve(device);
+            if (staged_res.ptr != nullptr) {
+                void * staged = staged_res.ptr;
                 if (is_input_tensor && !tp_enabled) {
-                    ggml_sycl::mem_handle dst_handle =
-                        ggml_sycl::mem_handle::from_chunk_ptr(staged, device, GGML_LAYOUT_AOS, staged_on_device);
                     ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
                         tensor->data, GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
                     sycl::queue & q = ggml_sycl_get_device(device).default_queue();
-                    ggml_sycl::mem_copy(dst_handle, src_handle, nbytes, q);
+                    ggml_sycl::mem_copy(staged_handle, src_handle, nbytes, q);
                 }
                 GGML_SYCL_DEBUG(
                     "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, staged non-device %p -> %p (%zu bytes, "
                     "type=%d)\n",
                     tensor->name, device, tensor->data, staged, nbytes, (int) ptr_type);
-                g_data_ptr_cache[{ tensor, device }] =
-                    ggml_sycl::mem_handle::from_chunk_ptr(staged, device, GGML_LAYOUT_AOS, staged_on_device);
+                g_data_ptr_cache[{ tensor, device }] = staged_handle;
                 return staged;
             }
             GGML_SYCL_DEBUG(
@@ -42621,11 +42628,19 @@ static void ggml_sycl_ensure_weight_on_device(const ggml_tensor * src0, int devi
         extra->set_data_device(device, cached_ptr, GGML_LAYOUT_AOS, /*on_device=*/false);
     } else {
         // MMAP tier — not USM, GPU cannot access. Stage to pinned memory.
-        size_t             nbytes            = ggml_nbytes(src0);
-        ggml_sycl_cache_id staging_cache_key = ggml_backend_sycl_get_tensor_cache_key(src0, device);
-        void *             staged = ggml_sycl_get_staged_ptr_device(cached_ptr, nbytes, device, staging_cache_key);
-        if (staged) {
-            extra->set_data_device(device, staged);
+        // Hold the OWNING handle (llama.cpp-1df8): this is a weight going through
+        // the MMAP-tier fallback rather than the from_cache_id() weight path, and
+        // the staging device buffer is EXTERNAL_EXACT (see the T1 finding on that
+        // ticket) -- set_data_device()'s from_chunk_ptr() reconstruction cannot
+        // lease it and would silently store an unprotected DIRECT handle. Route
+        // through set_data_device_handle() so extra->data_handle shares ownership
+        // of the staging cache's own handle directly.
+        size_t                nbytes            = ggml_nbytes(src0);
+        ggml_sycl_cache_id    staging_cache_key = ggml_backend_sycl_get_tensor_cache_key(src0, device);
+        ggml_sycl::mem_handle staged_handle =
+            ggml_sycl_get_staged_handle_device(cached_ptr, nbytes, device, staging_cache_key);
+        if (staged_handle.valid()) {
+            extra->set_data_device_handle(device, std::move(staged_handle));
         }
     }
 }
