@@ -567,6 +567,36 @@ done; done
 > the "rebase FIRST if master has moved" note in **Gotchas** becomes more likely to
 > bind, not less — check `git log ..master` again at restoration completion, not only
 > before Task 13.
+>
+> ⚠️ **ONE ALTERNATE ROUTE WAS TRIED AND IS CLOSED — do not re-derive it**
+> (`llama.cpp-8w5h` epic / `llama.cpp-613w`, 2026-08-16, reverted in `4b34dbfba`).
+> The idea was to reach the same traffic property *without* restoring the deleted
+> executor, by promoting gate/up to the `MXFP4_I8` layout so the existing
+> `mxfp4_i8_grouped_dpas` route would consume them. It got further than expected and
+> still failed, in a way worth recording because the failure is **structural, not a
+> bug to fix**:
+> - The layout promotion itself worked — gate/up became i8 candidates for the first
+>   time since May, and a follow-up fixed the graph-time completeness abort cleanly.
+> - But `mxfp4_i8_grouped_dpas` recorded **0 dispatches with 8 i8 tensors resident**:
+>   the layout is **necessary but not sufficient**. The remaining gate is a
+>   request-side function whose only read of the plan's per-expert layout is
+>   down-gated, sitting upstream of both fixes, and it can only refuse-and-fall-back —
+>   it can never promote.
+> - It also cost throughput rather than gaining it (pp512 **43.08 vs 47.82**), for a
+>   reason that is not tunable: the completeness check requires the standard layout to
+>   be *preserved*, so each upgrade charges the **full i8 copy** — ~522 MB/layer
+>   against ~1.4 GB of headroom. Gate/up consumed 2088.3 MB for 4 of 24 layers,
+>   leaving 69.2 MB against a 64.0 MB guard, so *down* was declined on all 24.
+> - Arithmetic killed a third attempt before it was built: total traffic would land
+>   ~552–560 GB against the ~442 GB baseline, and breakeven needs 10–11 of 24 layers
+>   ≈ **2.5× the available headroom**. (Formula validated first against `36wo`'s own
+>   figures — 412.88 vs ~413, 9.68 vs ~9.7 — before being trusted here.)
+>
+> **Why this does not weaken the ruling above:** the two-resident-copies cost is what
+> made the shortcut unfundable, and the originally-deleted executor **does not carry
+> it** — it consumed MXFP4 at `XMX_TILED` directly, with no second copy. So the
+> constraint that killed the shortcut does not apply to the restoration this task is
+> gated on. `llama.cpp-unpj` / `llama.cpp-omp4` remain the path.
 **File scope:**
 - Create: `artifacts/hardening-merge/perf-final/`
 - Branches: `feature/sycl-b70-capability`, `master`
