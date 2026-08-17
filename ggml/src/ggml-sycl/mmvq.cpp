@@ -1253,13 +1253,70 @@ struct mmvq_deferred_temp_release {
         have_event = true;
     }
 
+    // Destructors are implicitly noexcept (C++11+): letting a SYCL/UR exception
+    // escape here calls std::terminate and kills the whole process on what is
+    // otherwise a recoverable resource-exhaustion condition (e.g. level_zero
+    // UR_RESULT_ERROR_OUT_OF_RESOURCES while submitting the release marker under
+    // heavy live-allocation pressure). Every fallible step below is therefore
+    // individually guarded so a failure degrades to a logged, best-effort skip
+    // instead of a crash, and so a failure in one step never prevents whatever
+    // cleanup the remaining steps can still perform.
     ~mmvq_deferred_temp_release() {
         if (handles.empty() || !stream) {
             return;
         }
-        sycl::event done =
-            have_event ? std::move(event) : ggml_sycl_submit_marker<ggml_sycl_mmvq_temp_release_marker_kernel>(*stream);
-        ggml_sycl::retain_handles_until_event(std::move(handles), std::move(done));
+
+        static std::atomic<bool> logged{ false };
+
+        sycl::event done;
+        bool        have_done = false;
+        try {
+            done      = have_event ? std::move(event) :
+                                     ggml_sycl_submit_marker<ggml_sycl_mmvq_temp_release_marker_kernel>(*stream);
+            have_done = true;
+        } catch (const sycl::exception & e) {
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_ERROR(
+                    "[SYCL-MMVQ] mmvq_deferred_temp_release: marker submission for %zu deferred handle(s) "
+                    "failed (%s); skipping deferred release for this batch, remaining state left intact\n",
+                    handles.size(), e.what());
+            }
+        } catch (const std::exception & e) {
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_ERROR(
+                    "[SYCL-MMVQ] mmvq_deferred_temp_release: marker submission for %zu deferred handle(s) "
+                    "failed (%s); skipping deferred release for this batch, remaining state left intact\n",
+                    handles.size(), e.what());
+            }
+        }
+
+        if (!have_done) {
+            // No synchronization point could be obtained, so it is not safe to
+            // claim the handles are done being referenced by in-flight work.
+            // Fall through and let `handles` (a member) release normally via its
+            // own destructor when this object finishes destructing -- that still
+            // goes through each mem_handle's ordinary (unified-cache-backed)
+            // release path, it simply forgoes the deferred-until-event ordering.
+            return;
+        }
+
+        try {
+            ggml_sycl::retain_handles_until_event(std::move(handles), std::move(done));
+        } catch (const sycl::exception & e) {
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_ERROR(
+                    "[SYCL-MMVQ] mmvq_deferred_temp_release: retain_handles_until_event failed (%s); "
+                    "deferred handles release via normal destruction instead of event-gated release\n",
+                    e.what());
+            }
+        } catch (const std::exception & e) {
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_ERROR(
+                    "[SYCL-MMVQ] mmvq_deferred_temp_release: retain_handles_until_event failed (%s); "
+                    "deferred handles release via normal destruction instead of event-gated release\n",
+                    e.what());
+            }
+        }
     }
 };
 
