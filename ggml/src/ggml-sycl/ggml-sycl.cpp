@@ -64494,6 +64494,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
     }();
     const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
+    if (cpu_tg_candidate && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        fprintf(stderr, "[MOE-PP-FUSION-GATE] tensor=%s ne12=%lld xmx_moe_forced=%d admit_attempt=%d\n", src0->name,
+                (long long) ne12, xmx_moe_forced ? 1 : 0, (ne12 != 1 && !xmx_moe_forced) ? 1 : 0);
+    }
     if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced) {
         const auto & roles   = retained_prompt_roles_result.bundle;
         const int    layer   = src0->name ? parse_layer_id_from_name(src0->name) : -1;
@@ -64561,17 +64565,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // and mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa (mmvq.cpp) resolves
             // the SAME buffer from prompt_q8_preflight->q8_owner and re-quantizes
             // into it unconditionally, regardless of weight_layout.
-            // STILL UNREACHED, though: the sole call site below
-            // (mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa) hardcodes
-            // direct_xmx_eligible=false, xmx_tiled_grouped_eligible=false, so
-            // the grouped-DPAS branches (mmvq.cpp grouped_decode_shape /
-            // device_grouped_shape) can never fire from this call; with
-            // GGML_SYCL_MOE_GATEUP_PREPACK unset, weight_layout==XMX_TILED then
-            // hits the used_xmx_tiled_dpas safety-net refusal (mmvq.cpp ~18700)
-            // and gate_up_ok comes back false -- safe (no incorrect dispatch),
-            // but this widened admission alone does not yet make the route
-            // reachable. Wiring those two eligibility args is tracked as a
-            // llama.cpp-twl6 follow-up, not done here.
+            // NOW REACHABLE: the sole call site below
+            // (mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa) wires
+            // xmx_tiled_grouped_eligible to the real computed expression
+            // (gate_layout == GGML_LAYOUT_XMX_TILED &&
+            // ggml_sycl_xmx_moe_allow_unsafe_pp()), so the grouped-DPAS
+            // branches (mmvq.cpp grouped_decode_shape / device_grouped_shape)
+            // CAN fire from this call once that flag admits an XMX_TILED gate
+            // layout. direct_xmx_eligible remains hardcoded false at that
+            // call site -- unaffected by this admission widening, since that
+            // parameter only gates the separate weight_layout==SOA direct-XMX
+            // path (mmvq.cpp), not the XMX_TILED grouped route.
             // Gate/up XMX_TILED can also dispatch through the non-fused
             // per-tensor path (mmvq_moe_batched_dispatch's own XMX_TILED case),
             // reached once ggml_sycl_select_moe_planned_graph_layout promotes

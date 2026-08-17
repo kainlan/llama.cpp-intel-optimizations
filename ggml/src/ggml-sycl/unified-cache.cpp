@@ -2950,6 +2950,22 @@ static bool copy_trace_enabled() {
     return enabled != 0;
 }
 
+// Diagnostic for allocations that escape the arena's per-zone accounting
+// (COUNT-zone requests, or a full/inactive zone falling through to a raw
+// device malloc). Off by default; every check below this point is a single
+// atomic load in the hot path.
+static bool ext_alloc_trace_enabled() {
+    static std::atomic<int> cached{ -1 };
+    int                     enabled = cached.load(std::memory_order_acquire);
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char * env = std::getenv("GGML_SYCL_EXT_ALLOC_TRACE");
+    enabled          = (env && std::atoi(env) != 0) ? 1 : 0;
+    cached.store(enabled, std::memory_order_release);
+    return enabled != 0;
+}
+
 static bool copy_to_device_sync_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     enabled = cached.load(std::memory_order_acquire);
@@ -12045,6 +12061,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
         }
         if (!ptr && !kv_spill_to_host) {
             ptr = unified_cache_malloc_device_tracked(alloc_size, *req.queue, "unified_alloc:device");
+            if (ptr && ext_alloc_trace_enabled()) {
+                static std::atomic<size_t> total_external_bytes{ 0 };
+                const size_t               total_now =
+                    total_external_bytes.fetch_add(alloc_size, std::memory_order_relaxed) + alloc_size;
+                fprintf(stderr,
+                        "[EXT-ALLOC] device=%d bytes=%zu cohort=%s role=%d category=%d prefer_vram_zone=%d "
+                        "total_external=%zu\n",
+                        req.device, alloc_size, req.intent.cohort_id ? req.intent.cohort_id : "?",
+                        static_cast<int>(req.intent.role), static_cast<int>(req.intent.category),
+                        static_cast<int>(req.intent.constraints.prefer_vram_zone), total_now);
+            }
         }
         // KV arena spill: redirect to host-pinned path.
         if (!ptr && kv_spill_to_host) {
