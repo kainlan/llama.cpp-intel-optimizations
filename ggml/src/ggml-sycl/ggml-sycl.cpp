@@ -17599,6 +17599,13 @@ static thread_local const char *             g_moe_last_residual_add_id_skip_kin
 static thread_local moe_precomputed_skip_set g_moe_down_sum_fusion_disabled;
 static thread_local std::unordered_map<moe_precomputed_skip_key, int, moe_precomputed_skip_key_hash>
     g_moe_precomputed_down_sum_final;
+// llama.cpp-kzjv: was a function-local static inside ggml_sycl_mul_mat_id's PP
+// pair-glu admission. Promoted to file scope so ggml_sycl_materialize_moe_phase_layouts()
+// can flush() it before releasing a superseded layout -- see the call there and
+// PublicationStore::flush()'s doc comment for why an unflushed store leaks the
+// last committed publication's leases (in_use_count stays nonzero forever,
+// so drop_expert_entries_for_tensor_layout() silently skips those entries).
+static thread_local ggml_sycl::moe_fused::PublicationStore g_moe_prompt_fusion_publication_store;
 
 static bool ggml_sycl_make_moe_precomputed_skip_key(const ggml_tensor *        tensor,
                                                     int                        device,
@@ -54256,6 +54263,20 @@ static bool ggml_sycl_materialize_moe_phase_layouts(ggml_backend_sycl_context & 
         return true;
     }
 
+    // llama.cpp-kzjv: retire any PP pair-glu fusion publication that is still
+    // holding per-expert leases before this function starts releasing/
+    // materializing layouts below. The escrow in ggml_sycl_mul_mat_id's PP
+    // admission only retires a publication when a LATER commit into the same
+    // store supersedes it; the final PP commit of a pass has nothing to
+    // supersede it, so without this flush its leases are still held here,
+    // in_use_count stays nonzero, and drop_expert_entries_for_tensor_layout()
+    // silently skips those entries -- leaving the tensor half-released in a
+    // mixed layout state that the next phase's dispatch then refuses. By the
+    // time this function runs (a later graph_compute call than the one that
+    // submitted the fused kernels), their terminal events have long since
+    // signaled, so the wait inside flush() is not a stall.
+    g_moe_prompt_fusion_publication_store.flush();
+
     std::unordered_set<const ggml_tensor *> seen;
     size_t                                  considered = 0;
     size_t                                  complete   = 0;
@@ -64809,11 +64830,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                         // The store is thread-local graph publication authority.
                         // Replacing it retires the previous terminal owner only
-                        // after its exact owner-queue event has completed.
-                        static thread_local fused::PublicationStore publication_store;
-                        const auto before = publication_store.snapshot();
-                        const auto result = mmvq_submit_retained_prompt_fusion(
-                            fusion_bundle, executor, publication_store, before.publication.generation);
+                        // after its exact owner-queue event has completed. It is
+                        // now file-scope (g_moe_prompt_fusion_publication_store)
+                        // rather than a local static -- see its declaration and
+                        // llama.cpp-kzjv: the LAST publication into this store is
+                        // never superseded within a PP pass, so it is only ever
+                        // retired by an explicit flush(), not by this replace-on-
+                        // commit path alone.
+                        const auto before = g_moe_prompt_fusion_publication_store.snapshot();
+                        const auto result = mmvq_submit_retained_prompt_fusion(fusion_bundle, executor,
+                                                                               g_moe_prompt_fusion_publication_store,
+                                                                               before.publication.generation);
                         if (result.status) {
                             std::vector<std::pair<moe_precomputed_skip_set *, moe_precomputed_skip_key>> committed;
                             try {

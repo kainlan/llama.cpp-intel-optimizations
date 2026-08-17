@@ -196,6 +196,21 @@ class PublicationStore {
 
     Snapshot snapshot() const;
 
+    // llama.cpp-kzjv: a commit only retires the PREVIOUS publication -- it is
+    // replaced by, and destructed as part of, the NEXT commit's lock-guarded
+    // swap in Transaction::commit(). The publication that is never superseded
+    // (the last commit of a run, or of a store shared across an entire phase)
+    // is therefore never retired by that mechanism and holds its owners'
+    // leases forever. flush() is the explicit "nobody is coming to supersede
+    // this" release: it detaches the current ownership under the lock and
+    // lets it destruct (waiting on its terminal event, then releasing every
+    // leased handle) once the lock is dropped, exactly like the retirement
+    // path inside commit(). Safe to call when nothing is currently published
+    // (a no-op) and safe to call from a different call site than the one that
+    // published, since ownership lifetime is not tied to any particular
+    // Transaction instance.
+    void flush() noexcept;
+
   private:
     friend class Transaction;
     mutable std::mutex          mutex_;

@@ -69,6 +69,19 @@ PublicationStore::Snapshot PublicationStore::snapshot() const {
     return { publication_, ownership_ };
 }
 
+void PublicationStore::flush() noexcept {
+    // Detach under the lock, mirroring Transaction::commit()'s retirement
+    // swap; the local `retired` then destructs after the lock is released, so
+    // a slow terminal wait never holds mutex_. publication_ (generation,
+    // ready, skip_*) is left untouched -- only ownership changes hands, so a
+    // later commit's stale-generation check is unaffected by a flush.
+    std::shared_ptr<const void> retired;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        retired = std::move(ownership_);
+    }
+}
+
 Status SubmitRecorder::validate_owners(const OwnerBundle & owners) const noexcept {
     std::array<unsigned, 10> counts{};
     for (const auto & entry : owners.entries_) {

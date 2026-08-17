@@ -393,6 +393,48 @@ void test_wait_reentry_and_contended_publication() {
     CHECK(store.snapshot().publication.generation == 2);
 }
 
+void test_publication_store_flush() {
+    // llama.cpp-kzjv: a commit only retires the PREVIOUS publication (the one
+    // it replaces). The publication that nothing ever supersedes -- the last
+    // commit into a store shared across a whole phase -- must still release
+    // its owners once nobody is coming to replace it. flush() is that
+    // explicit release.
+    Trace            trace;
+    PublicationStore store;
+    Transaction      transaction(ordinary_plan());
+    preflight_ok(transaction);
+    TestSubmitter submitter(Behavior::success, trace);
+    CHECK(transaction.submit(submitter));
+    CHECK(transaction.commit(store));
+    CHECK(trace.copy().empty());  // nothing retired it yet -- store still owns it
+
+    store.flush();
+    const auto values = trace.copy();
+    CHECK(!values.empty() && values.front() == "wait");  // flush waited on the terminal, then released owners
+
+    // A flushed store is left in a normal, reusable state: generation is
+    // untouched, and a later commit builds on it exactly as if the flushed
+    // publication had been retired by a real supersession.
+    CHECK(store.snapshot().publication.generation == 1);
+    CHECK(!store.snapshot().ownership_lease);
+
+    Trace       second_trace;
+    Transaction second(ordinary_plan(), store.snapshot().publication.generation);
+    preflight_ok(second);
+    TestSubmitter second_submitter(Behavior::success, second_trace);
+    CHECK(second.submit(second_submitter));
+    CHECK(second.commit(store));
+    CHECK(store.snapshot().publication.generation == 2);
+
+    // flush() on an empty store (nothing published, or already flushed) is a
+    // harmless no-op -- it must not crash or disturb publication_ state.
+    PublicationStore empty_store;
+    empty_store.flush();
+    CHECK(!empty_store.snapshot().ownership_lease);
+    store.flush();
+    CHECK(!second_trace.copy().empty() && second_trace.copy().front() == "wait");
+}
+
 void test_optional_down() {
     Trace      trace;
     FusionPlan plan = ordinary_plan();
@@ -589,6 +631,7 @@ int main() {
     test_postwrite_escrow_lifetime();
     test_publication_lifetime_and_failure();
     test_wait_reentry_and_contended_publication();
+    test_publication_store_flush();
     test_optional_down();
     test_prompt_bundle_preflight_and_no_write();
     test_prompt_postwrite_quarantine_failpoints();
