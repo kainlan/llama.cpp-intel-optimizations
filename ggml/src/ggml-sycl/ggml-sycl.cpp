@@ -64846,9 +64846,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     pair.up_bias ? pair.up_bias->nb[1] : 0,
                                     static_cast<int>(roles.gate.batch.operands.size()), pair.ids->ne[0], ids_nb0,
                                     ids_nb1, pair.glu_op, ggml_get_op_params_f32(pair.glu_dst, 2),
-                                    ggml_get_op_params_f32(pair.glu_dst, 3), gate_layout, &glu, false, false, nullptr,
-                                    nullptr, roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
-                                    &glu_event, &glu_event_set, &recorder, &ids_deps, &q8_preflight);
+                                    ggml_get_op_params_f32(pair.glu_dst, 3), gate_layout, &glu,
+                                    /*direct_xmx_eligible=*/false,
+                                    // llama.cpp-twl6 change 5: the grouped-DPAS branches inside the
+                                    // producer are gated on this parameter; a literal false made them
+                                    // unreachable from PP even after the XMX_TILED admission widening.
+                                    // For SOA gate layouts this expression stays false, so default
+                                    // behavior is unchanged; every grouped-branch failure inside the
+                                    // producer fails closed to a refusal, never a wrong dispatch.
+                                    gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp(),
+                                    nullptr, nullptr, roles.gate.batch.expert_ids.data(),
+                                    roles.gate.batch.expert_ids.size(), &glu_event, &glu_event_set, &recorder,
+                                    &ids_deps, &q8_preflight);
                                 if (!gate_up_ok || !glu_event_set) {
                                     return recorder.write_started() ?
                                         fused::Status{ fused::ErrorCode::submitted_without_terminal,
