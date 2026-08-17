@@ -65544,6 +65544,245 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     }
     pp_phase_log("ids-ready", GGML_LAYOUT_AOS, ids_host.size());
 
+    // ---- llama.cpp-haqk / llama.cpp-unpj RESTORE-T1 ------------------------
+    // abecb785d ("fix(sycl): make retained prompt fusion transactional",
+    // 2026-08-11) deleted try_gpu_moe_pair, the MXFP4-only fused MoE layer
+    // executor that served both prompt and decode -- only the caller-side
+    // wiring was lost. mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa and
+    // mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4 are unchanged, and
+    // the grouped-metadata kernels they can reach on the XMX_TILED path
+    // (mxfp4_build_grouped_metadata_from_ids_sycl,
+    // mxfp4_xmx_tiled_grouped_direct_q8_sycl in mmvq.cpp) were never touched.
+    // This restores the caller for the decode (ne12 == 1) branch: fuse gate+up
+    // into one dispatch when every expert is locally GPU-resident, and let a
+    // null pair_ids_host_arg unlock device-side ID grouping instead of the
+    // ids_host copy above when the (env-gated, default-off) grouped-decode /
+    // aggressive-partial-TG guards allow it. PP's GEMM-shaped gate/up route
+    // and the down-projection chunking fix are separate tasks (llama.cpp-omp4
+    // T2/T3) -- this block only ever engages when the CURRENT node is the
+    // GATE half of a decode-shaped pair.
+    bool decode_pair_glu_dispatched = false;
+    if (ne12 == 1 && !g_ggml_sycl_graph_recording && !xmx_moe_forced && src0->type == GGML_TYPE_MXFP4 &&
+        blk_layer_id >= 0 && is_gate_subop) {
+        auto decode_pair_it = g_moe_gate_up_pairs.find(blk_layer_id);
+        if (decode_pair_it != g_moe_gate_up_pairs.end()) {
+            const moe_gate_up_pair & pair = decode_pair_it->second;
+            const bool               decode_pair_topology_ok =
+                src0 == pair.gate_weight && dst == pair.gate_dst && pair.up_weight && pair.up_dst && pair.glu_dst &&
+                pair.down_dst && pair.down_weight && pair.src1 == src1 && pair.ids == ids && pair.gate_index >= 0 &&
+                pair.up_index > pair.gate_index && pair.glu_index > pair.up_index && pair.down_index > pair.glu_index &&
+                pair.up_weight->type == GGML_TYPE_MXFP4 && pair.up_weight->ne[0] == pair.gate_weight->ne[0] &&
+                pair.up_weight->ne[1] == pair.gate_weight->ne[1] && pair.up_weight->ne[2] == pair.gate_weight->ne[2] &&
+                pair.glu_dst->ne[2] == src1->ne[2] &&
+                (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
+                !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device) &&
+                !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_node_skip, pair.glu_dst, ctx.device);
+            if (decode_pair_topology_ok) {
+                ggml_sycl_ensure_weight_on_device(pair.up_weight, ctx.device);
+                auto decode_pair_role_layout = [&](const ggml_tensor * weight) -> layout_mode {
+                    const bool  host_resident = ggml_sycl_is_host_resident_weight(weight, ctx.stream());
+                    layout_mode layout        = has_override ? override_layout :
+                                                               ggml_sycl_select_moe_planned_graph_layout(weight, ctx.device,
+                                                                                                         host_resident, ne12);
+                    return ggml_sycl_adjust_layout_for_tensor(weight, layout, ctx.device);
+                };
+                const layout_mode pair_layout = decode_pair_role_layout(pair.gate_weight);
+                const bool        pair_layout_ok =
+                    pair_layout == decode_pair_role_layout(pair.up_weight) &&
+                    (pair_layout == GGML_LAYOUT_SOA || pair_layout == GGML_LAYOUT_MXFP4_I8 ||
+                     pair_layout == GGML_LAYOUT_XMX_TILED || pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4);
+
+                const void * const * gate_full_table =
+                    pair_layout_ok ? moe_fusion_full_local_ptr_table(pair.gate_weight, ctx.device, pair_layout) :
+                                     nullptr;
+                const void * const * up_full_table =
+                    pair_layout_ok ? moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout) : nullptr;
+                const bool full_gpu_cover = gate_full_table != nullptr && up_full_table != nullptr;
+
+                // Per-layer eligible/ineligible split, UNCAPPED (unlike the
+                // budget-limited [MOE-ROW-AGG]/[MOE-XMX-PP-POLICY]-style logs
+                // elsewhere in this file) so a GPU run can distinguish "wiring
+                // never reaches an eligible layer" from "wiring is broken on
+                // layers that ARE eligible" -- llama.cpp-haqk c-request from the
+                // lead. Every gate-node call through this block hits exactly one
+                // fprintf here, once per layer per token.
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    fprintf(stderr,
+                            "[MOE-DECODE-PAIR-ELIGIBILITY] tensor=%s layer=%d device=%d layout=%s "
+                            "pair_layout_ok=%d full_gpu_cover=%d\n",
+                            pair.gate_weight->name ? pair.gate_weight->name : "?", blk_layer_id, ctx.device,
+                            ggml_sycl_layout_mode_name(pair_layout), pair_layout_ok ? 1 : 0, full_gpu_cover ? 1 : 0);
+                }
+
+                const int64_t   n_ids_pair = ids->ne[0];
+                const size_t    ids_n_elem = static_cast<size_t>(n_ids_pair) * static_cast<size_t>(ids->ne[1]);
+                const int32_t * ids_data   = ids_host.empty() ? nullptr : ids_host.data();
+                const int64_t   gate_up_dispatch_entries = full_gpu_cover ? static_cast<int64_t>(ids_n_elem) : 0;
+
+                sycl::event     ids_copy_event;
+                int64_t         ids_device_nb0 = ids->nb[0];
+                int64_t         ids_device_nb1 = ids->nb[1];
+                const int32_t * ids_device =
+                    full_gpu_cover ?
+                        ggml_sycl_get_moe_ids_device_ptr(ctx, ids, &ids_copy_event, &ids_device_nb0, &ids_device_nb1) :
+                        nullptr;
+
+                // XMX_TILED grouped-down eligibility -- restored from the deleted
+                // xmx_tiled_grouped_pp_reason helper (abecb785d^), scoped to decode
+                // here. The env name and gate order are the executable spec pinned
+                // in test-sycl-moe-sequence-graphlet-policy.cpp's grouped-decode
+                // contract.
+                static const int xmx_grouped_pp_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_XMX_GROUPED_PP");
+                    return env ? std::atoi(env) : 1;
+                }();
+                const bool aggressive_partial_tg_xmx_candidate =
+                    ggml_sycl_moe_aggressive_partial_tg_xmx_supported(pair.gate_weight, ctx.device, ids_n_elem, ne12) &&
+                    ggml_sycl_moe_aggressive_partial_tg_xmx_supported(pair.up_weight, ctx.device, ids_n_elem, ne12);
+                const bool aggressive_partial_tg_xmx_route =
+                    aggressive_partial_tg_xmx_candidate && pair_layout == GGML_LAYOUT_XMX_TILED;
+                // Selected-expert materialization into the (otherwise-unread, once
+                // gate/up/GLU are all skip-marked below) gate_dst/up_dst buffers is
+                // reserved to the aggressive route, matching the deleted
+                // gate_split_tmp/up_split_tmp gating.
+                const bool allow_gate_up_materialize =
+                    pair_layout == GGML_LAYOUT_XMX_TILED && aggressive_partial_tg_xmx_route;
+                ggml_tensor * gate_materialize_tmp = allow_gate_up_materialize ? pair.gate_dst : nullptr;
+                ggml_tensor * up_materialize_tmp   = allow_gate_up_materialize ? pair.up_dst : nullptr;
+
+                const bool grouped_decode_candidate =
+                    (moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route) && full_gpu_cover &&
+                    ids_device != nullptr && ids_device_nb0 > 0 && ids_device_nb1 > 0 && pair.glu_dst->ne[2] <= 1;
+                auto xmx_tiled_grouped_pp_reason_fn = [&]() -> const char * {
+                    if (pair_layout != GGML_LAYOUT_XMX_TILED) {
+                        return "not-xmx-tiled";
+                    }
+                    if (gate_up_dispatch_entries != static_cast<int64_t>(ids_n_elem) || ids_n_elem == 0) {
+                        return "selected-grid";
+                    }
+                    if (ne12 <= 1 && !grouped_decode_candidate) {
+                        return "not-pp";
+                    }
+                    if (xmx_grouped_pp_enabled == 0 && !grouped_decode_candidate) {
+                        return "env-disabled";
+                    }
+                    if (!ids_data) {
+                        return "down-host-ids";
+                    }
+                    return "eligible";
+                };
+                const char * xmx_tiled_grouped_pp_reason = xmx_tiled_grouped_pp_reason_fn();
+                const bool   xmx_tiled_grouped_eligible  = strcmp(xmx_tiled_grouped_pp_reason, "eligible") == 0;
+
+                const bool use_device_grouped_moe_decode =
+                    (moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route) &&
+                    xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 &&
+                    ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED && pair.glu_dst->ne[2] <= 1;
+                const bool use_device_ids_for_pair_glu =
+                    use_device_grouped_moe_decode ||
+                    (full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 && ids_device_nb1 > 0 &&
+                     pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 && pair.glu_dst->ne[2] <= 1);
+                const int32_t * pair_ids_host_arg = use_device_ids_for_pair_glu ? nullptr : ids_data;
+                const int64_t   pair_ids_host_count_arg =
+                    use_device_ids_for_pair_glu ? 0 : static_cast<int64_t>(ids_n_elem);
+
+                static const int decode_pair_path_trace_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_PATH_TRACE");
+                    return env ? std::atoi(env) : 0;
+                }();
+                if (decode_pair_path_trace_enabled != 0 && use_device_ids_for_pair_glu) {
+                    // Positive device-id activation diagnostic. use_device_ids_for_pair_glu
+                    // is true here via one of two disjuncts; the primary one is:
+                    //   xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 && ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED && pair.glu_dst->ne[2] <= 1
+                    fprintf(stderr, "[MOE-PAIR] cur=%s reason=pair-glu-device-ids layout=%s entries=%lld\n",
+                            src0->name ? src0->name : "?", ggml_sycl_layout_mode_name(pair_layout),
+                            (long long) gate_up_dispatch_entries);
+                }
+
+                if (full_gpu_cover && ids_device != nullptr) {
+                    const float * gate_bias_ptr =
+                        pair.gate_bias ?
+                            static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.gate_bias, ctx.device)) :
+                            nullptr;
+                    const float * up_bias_ptr =
+                        pair.up_bias ?
+                            static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.up_bias, ctx.device)) :
+                            nullptr;
+                    sycl::event glu_event;
+                    bool        glu_event_set = false;
+                    const bool  ok_glu        = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
+                        ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_full_table, up_full_table,
+                        ids_device, gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
+                        pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(gate_up_dispatch_entries), n_ids_pair,
+                        ids_device_nb0, ids_device_nb1, pair.glu_op, ggml_get_op_params_f32(pair.glu_dst, 2),
+                        ggml_get_op_params_f32(pair.glu_dst, 3), pair_layout,
+                        /*glu_dst_handle_override=*/nullptr, /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible,
+                        gate_materialize_tmp, up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg,
+                        &glu_event, &glu_event_set);
+                    if (ok_glu) {
+                        ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device);
+                        if (pair.gate_biased) {
+                            ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.gate_biased,
+                                                                  ctx.device);
+                            ggml_sycl_moe_residual_add_id_skip_insert(pair.gate_biased, ctx.device);
+                        }
+                        if (pair.up_biased) {
+                            ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.up_biased,
+                                                                  ctx.device);
+                            ggml_sycl_moe_residual_add_id_skip_insert(pair.up_biased, ctx.device);
+                        }
+                        ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.glu_dst, ctx.device);
+                        if (glu_event_set) {
+                            ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event);
+                        }
+
+                        // Down: attempt the cached-Q8 consumer that pairs with the
+                        // GLU dispatch's optional Q8 artifact write. glu_dst_handle_override
+                        // above is null, so fused_glu_q8_candidate inside the GLU call never
+                        // fires and no artifact is produced -- this call fails closed to
+                        // "reuse-q8" and pair.down_dst proceeds through the existing,
+                        // unmodified decode path below. Wiring the matching producer is left
+                        // to whichever task pairs it with the PP cached-Q8 down work.
+                        const layout_mode    down_layout = decode_pair_role_layout(pair.down_weight);
+                        const void * const * down_full_table =
+                            (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) ?
+                                moe_fusion_full_local_ptr_table(pair.down_weight, ctx.device, down_layout) :
+                                nullptr;
+                        const bool cached_q8_needs_host_grouping = down_layout == GGML_LAYOUT_XMX_TILED &&
+                                                                   !g_ggml_sycl_graph_recording &&
+                                                                   !use_device_ids_for_pair_glu;
+                        const int32_t * down_ids_host_for_cached_q8 =
+                            cached_q8_needs_host_grouping ? ids_data : nullptr;
+                        const int64_t down_ids_host_count_for_cached_q8 =
+                            cached_q8_needs_host_grouping ? static_cast<int64_t>(ids_n_elem) : 0;
+                        if (down_full_table) {
+                            sycl::event down_event;
+                            bool        down_event_set = false;
+
+                            bool ok_down = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
+                                ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_full_table, ids_device,
+                                static_cast<int>(gate_up_dispatch_entries), n_ids_pair, ids_device_nb0, ids_device_nb1,
+                                down_layout, /*glu_src_handle_override=*/nullptr, /*down_dst_handle_override=*/nullptr,
+                                down_ids_host_for_cached_q8, down_ids_host_count_for_cached_q8, /*deps=*/nullptr,
+                                &down_event, &down_event_set);
+                            if (ok_down) {
+                                ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.down_dst,
+                                                                      ctx.device);
+                                if (down_event_set) {
+                                    ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event);
+                                }
+                            }
+                        }
+                        decode_pair_glu_dispatched = true;
+                    }
+                }
+            }
+        }
+    }
+    if (decode_pair_glu_dispatched) {
+        return;
+    }
+
     // MoE profiling: IDs D2H complete
     if (g_moe_profile_enabled) {
         moe_profile_ids_done_at("planner_host_routing");

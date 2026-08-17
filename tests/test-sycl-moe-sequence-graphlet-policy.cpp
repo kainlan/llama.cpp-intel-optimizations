@@ -1004,13 +1004,13 @@ static int test_sequence_graphlet_tg_diagnostics_after_replay_drain() {
               contains(xmx_device_grouping, "mxfp4_xmx_tiled_grouped_direct_q8_sycl") &&
               contains(xmx_device_grouping, "!xmx_route_arrays_ok"),
           "XMX_TILED MoE down dispatch must support graph-recordable device-ID grouping");
-    // The region this read -- anchored on `const bool cached_q8_needs_host_grouping`
-    // -- no longer exists, so the fetch itself is removed along with the CHECK;
-    // required_region() exits on a missing marker, which would terminate the run
-    // before any skip could print.
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "cached XMX down grouping must not require host IDs while command-graph recording -- the "
-                  "cached_q8_needs_host_grouping gate was deleted with the MoE pair planner in abecb785d");
+    // Restored by llama.cpp-haqk (RESTORE-T1): cached_q8_needs_host_grouping is
+    // back, scoped to the decode fused gate/up/GLU/down attempt.
+    const std::string cached_down_ids = required_region(sycl, "const bool cached_q8_needs_host_grouping",
+                                                        "ok_down = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4",
+                                                        "sequence graphlet cached down host grouping");
+    CHECK(contains(cached_down_ids, "!g_ggml_sycl_graph_recording"),
+          "cached XMX down grouping must not require host IDs while command-graph recording");
 
     const std::string exit_diag = required_region(sycl, "const bool has_pending_non_defer_graphlets",
                                                  "if (phase_timing) {", "sequence graphlet exit diagnostics");
@@ -1688,21 +1688,19 @@ static int test_aggressive_tg_requires_segmented_or_fused_evidence() {
               contains(mode_hash, "GGML_SYCL_MOE_AGGRESSIVE_XMX_TILED"),
           "aggressive TG/partial/SOA-M4/selected-XMX envs must participate in sequence graphlet mode hash");
     // The three below gate the aggressive partial-TG selected-row XMX route.
-    // abecb785d deleted the route; `ggml_sycl_moe_aggressive_partial_tg_xmx_supported`
-    // and `moe_aggressive_partial_tg_xmx_tiled_env_enabled` are now file-static
-    // definitions with zero callers, so GGML_SYCL_MOE_AGGRESSIVE_XMX_TILED is
-    // inert. The mode-hash CHECK above still passes and is deliberately left
-    // armed -- the env still participates in the hash, which is true and
-    // testable independently of whether the route it selects exists.
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "aggressive TG must have an explicit partial-TG selected-row XMX layout route -- route deleted in "
-                  "abecb785d, its two helpers are now callerless");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "aggressive selected-row XMX route must permit selected expert materialization only on that route "
-                  "-- aggressive_partial_tg_xmx_route and allow_gate_up_materialize deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "aggressive partial TG route must be able to use device ids without requiring grouped decode env "
-                  "-- the disjunct it asserts was deleted with the planner in abecb785d");
+    // Restored by llama.cpp-haqk (RESTORE-T1), scoped to decode:
+    // `ggml_sycl_moe_aggressive_partial_tg_xmx_supported` has a caller again
+    // (the decode fused gate/up/GLU attempt), and `aggressive_partial_tg_xmx_route`
+    // / `allow_gate_up_materialize` are back as composed locals there.
+    CHECK(contains(sycl, "moe_aggressive_partial_tg_env_enabled") &&
+              contains(sycl, "ggml_sycl_moe_aggressive_partial_tg_xmx_supported") &&
+              contains(sycl, "aggressive_partial_tg_xmx_candidate"),
+          "aggressive TG must have an explicit partial-TG selected-row XMX layout route");
+    CHECK(contains(sycl, "pair_layout == GGML_LAYOUT_XMX_TILED && aggressive_partial_tg_xmx_route") &&
+              contains(sycl, "allow_gate_up_materialize"),
+          "aggressive selected-row XMX route must permit selected expert materialization only on that route");
+    CHECK(contains(sycl, "moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route"),
+          "aggressive partial TG route must be able to use device ids without requiring grouped decode env");
     CHECK(contains(sycl, "sequence_graphlet_segmented_replay_calls") &&
               contains(sycl, "sequence_graphlet_direct_replay_calls"),
           "graph diagnostics must expose segmented and direct sequence replay counters");
@@ -1801,66 +1799,79 @@ static int test_aggressive_tg_harness_gates() {
     return 0;
 }
 
-// ENTIRELY SKIPPED -- llama.cpp-unpj. This function is the executable spec of
-// the decode-time device-ID route, and the route is gone.
-//
-// abecb785d deleted the inline MoE pair planner. Every literal below is now 0
-// occurrences in ggml-sycl.cpp: use_device_grouped_moe_decode,
-// use_device_ids_for_pair_glu, pair_ids_host_arg, pair_ids_host_count_arg,
-// grouped_decode_candidate, "down-host-ids", "pair-glu-device-ids". What the
-// route did was pass nullptr host ids to the gate/up GLU dispatch when grouped
-// decode was eligible, so decode never forced a host-ID D2H -- which is also
-// what made decode graph-recordable. Decode now builds its batch from
-// ids_host.data() (ggml-sycl.cpp, retained_decode_batch_result).
-//
-// The assertions are kept verbatim in the comment blocks below rather than
-// deleted, because they are the only place the deleted contract is still
-// written down. Restoring the route means deleting the CHECK_SKIPPED lines and
-// restoring the CHECKs beside them.
-//
-// NOTE the last one. It is a NEGATIVE assertion, and it does not fail today --
-// it passes VACUOUSLY, because every identifier it forbids is absent. A green
-// that means "the subject does not exist" is worse than a red, so it is skipped
-// with the rest rather than left looking like coverage.
+// RESTORED by llama.cpp-haqk (RESTORE-T1). This function is the executable
+// spec of the decode-time device-ID route abecb785d deleted; it stayed
+// entirely skipped (citing llama.cpp-unpj) from the day it was written until
+// now, because every literal it checks was 0 occurrences in ggml-sycl.cpp.
+// The route is back, scoped to decode's fused gate/up/GLU dispatch attempt:
+// a composed eligibility flag passes nullptr host ids to
+// mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa when device-ID grouping is
+// eligible, unlocking device-side grouping instead of the ids_host copy.
 static int test_grouped_decode_runtime_uses_device_ids_contract() {
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "runtime must use a named grouped decode guard before passing null host ids -- "
-                  "use_device_grouped_moe_decode deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "device-id decode guard must require explicit grouped/aggressive opt-in, grouped eligibility, full "
-                  "GPU cover, valid device ids, XMX_TILED, and TG shape -- guard deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "grouped decode eligibility must not reuse the PP-only not-pp/env-disabled rejection path -- "
-                  "grouped_decode_candidate deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "grouped decode eligibility must reject cleanly before any host-id fallback loop when host ids are "
-                  "null -- the \"down-host-ids\" reject was deleted in abecb785d");
-    // The clause 9402d151e composed and llama.cpp-26ak adjudicated:
-    //   const bool use_device_ids_for_pair_glu = use_device_grouped_moe_decode ||
-    //       (full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 &&
-    //        ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 &&
-    //        pair.glu_dst->ne[2] <= 1)
-    // Both that ruling and llama.cpp-pjgz's escalation before it were made about
-    // text that had never executed -- this CHECK sat behind the :324 terminator
-    // from the day the file was written.
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "host-id suppression must remain grouped-decode plus a BUNDLE4-only disjunct that still requires "
-                  "full GPU cover, valid device ids, and TG shape -- composed flag deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "grouped decode must pass nullptr for host ids to unlock device-side grouping -- "
-                  "pair_ids_host_arg deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "runtime must retain positive device-id activation diagnostics and guard list for path diagnosis -- "
-                  "the [MOE-PAIR] reason=pair-glu-device-ids diagnostic was deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "grouped decode must pass zero host id count with nullptr host ids -- pair_ids_host_count_arg "
-                  "deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "runtime call must use guarded host-id arguments -- both guarded arguments deleted in abecb785d");
-    CHECK_SKIPPED("llama.cpp-unpj",
-                  "grouped decode guard must not add a direct fail-open/fail-closed return outside existing ok_glu "
-                  "fallback flow -- VACUOUSLY TRUE today: every forbidden identifier is absent, so this negative "
-                  "assertion cannot fail until the route is restored");
+    const std::string sycl = read_required_file("ggml/src/ggml-sycl/ggml-sycl.cpp");
+    CHECK(contains(sycl, "use_device_grouped_moe_decode"),
+          "runtime must use a named grouped decode guard before passing null host ids");
+    CHECK(contains(sycl, "moe_grouped_decode_candidate_env_enabled()") &&
+              contains(sycl, "aggressive_partial_tg_xmx_route") && contains(sycl, "xmx_tiled_grouped_eligible") &&
+              contains(sycl, "full_gpu_cover") && contains(sycl, "ids_device != nullptr") &&
+              contains(sycl, "ids_device_nb0 > 0") && contains(sycl, "ids_device_nb1 > 0") &&
+              contains(sycl, "pair_layout == GGML_LAYOUT_XMX_TILED") && contains(sycl, "pair.glu_dst->ne[2] <= 1"),
+          "device-id decode guard must require explicit grouped/aggressive opt-in, grouped eligibility, full GPU "
+          "cover, valid device ids, XMX_TILED, and TG shape");
+    CHECK(contains(sycl, "const bool grouped_decode_candidate =") &&
+              contains(sycl, "if (ne12 <= 1 && !grouped_decode_candidate)") &&
+              contains(sycl, "xmx_grouped_pp_enabled == 0 && !grouped_decode_candidate"),
+          "grouped decode eligibility must not reuse the PP-only not-pp/env-disabled rejection path");
+    CHECK(contains(sycl, "return \"down-host-ids\";"),
+          "grouped decode eligibility must reject cleanly before any host-id fallback loop when host ids are null");
+    // 9402d151e composed the host-id suppression flag rather than renaming it
+    // (llama.cpp-26ak): use_device_grouped_moe_decode still exists and still
+    // carries every clause asserted above, but the value that actually nulls
+    // the host ids is now use_device_ids_for_pair_glu, which ORs in a second,
+    // disjoint case for the XMX_TILED_BUNDLE4 branch that commit added (that
+    // branch's bundle4_shape guard requires !ids_host, so it needs device ids
+    // for the same reason grouped decode does).
+    //
+    // The original invariant is preserved, not merely relabelled: the added
+    // disjunct is reachable only when pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4,
+    // and that layout is itself behind the default-off GGML_SYCL_MOE_GATEUP_BUNDLE4
+    // env, so production defaults still suppress host ids only under the full
+    // grouped-decode guard. The composition is pinned below so the disjunction
+    // cannot later widen into a fail-open without failing here.
+    CHECK(contains_normalized(sycl, "const bool use_device_ids_for_pair_glu = use_device_grouped_moe_decode ||") &&
+              contains_normalized(sycl,
+                                  "(full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 && "
+                                  "ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED_BUNDLE4 && "
+                                  "pair.glu_dst->ne[2] <= 1)"),
+          "host-id suppression must remain grouped-decode plus a BUNDLE4-only disjunct that still requires full GPU "
+          "cover, valid device ids, and TG shape");
+    CHECK(contains(sycl, "const int32_t * pair_ids_host_arg = use_device_ids_for_pair_glu ? nullptr : ids_data;"),
+          "grouped decode must pass nullptr for host ids to unlock device-side grouping");
+    CHECK(contains(sycl, "[MOE-PAIR] cur=%s reason=pair-glu-device-ids") &&
+              contains(sycl, "moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route") &&
+              contains(sycl, "xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr") &&
+              contains(sycl, "ids_device_nb0 > 0 && ids_device_nb1 > 0 && pair_layout == GGML_LAYOUT_XMX_TILED") &&
+              contains(sycl, "pair.glu_dst->ne[2] <= 1"),
+          "runtime must retain positive device-id activation diagnostics and guard list for path diagnosis");
+    // The declaration clause is whitespace-fragile (the real source is
+    // "const int64_t   pair_ids_host_count_arg =", alignment-padded) and
+    // fixed here. The second clause was the content drift llama.cpp-pjgz
+    // escalated; llama.cpp-26ak adjudicated it as the same 9402d151e
+    // composition documented above, so it is re-pointed at the composed flag.
+    CHECK(contains_normalized(sycl, "const int64_t pair_ids_host_count_arg =") &&
+              contains(sycl, "use_device_ids_for_pair_glu ? 0 : static_cast<int64_t>(ids_n_elem);"),
+          "grouped decode must pass zero host id count with nullptr host ids");
+    CHECK(contains(sycl, "pair_ids_host_arg") && contains(sycl, "pair_ids_host_count_arg"),
+          "runtime call must use guarded host-id arguments");
+    // Both flags are covered: guarding only the inner one would leave the
+    // composed flag -- the one actually consumed at the call site -- free to
+    // grow its own early return.
+    CHECK(!contains(sycl, "if (!use_device_grouped_moe_decode") &&
+              !contains(sycl, "return use_device_grouped_moe_decode") &&
+              !contains(sycl, "if (!use_device_ids_for_pair_glu") &&
+              !contains(sycl, "return use_device_ids_for_pair_glu"),
+          "grouped decode guard must not add a direct fail-open/fail-closed return outside existing ok_glu fallback "
+          "flow");
     return 0;
 }
 
