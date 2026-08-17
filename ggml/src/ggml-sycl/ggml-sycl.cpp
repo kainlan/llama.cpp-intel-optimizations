@@ -65970,6 +65970,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pair.up_bias ?
                             static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.up_bias, ctx.device)) :
                             nullptr;
+
+                    // Q8 artifact wiring (llama.cpp-ihqu): mint stable storage handles for the
+                    // GLU intermediate and down destination so the gate/up dispatch can write
+                    // its Q8 artifact and the cached-Q8 down consumer can reuse it. Lookup
+                    // failure is non-fatal: null overrides fall back to the pre-existing
+                    // unfused down path below, exactly as before this change.
+                    ggml_sycl_tensor_storage_handle decode_glu_storage{};
+                    ggml_sycl_tensor_storage_handle decode_down_storage{};
+                    const bool                      decode_q8_handles_ok =
+                        ggml_sycl_find_tensor_storage_handle(pair.glu_dst, ctx.device, &decode_glu_storage) &&
+                        decode_glu_storage.handle.has_stable_owner_identity() &&
+                        ggml_sycl_find_tensor_storage_handle(pair.down_dst, ctx.device, &decode_down_storage) &&
+                        decode_down_storage.handle.has_stable_owner_identity();
+
                     sycl::event glu_event;
                     bool        glu_event_set = false;
                     const bool  ok_glu        = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
@@ -65978,9 +65992,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(gate_up_dispatch_entries), n_ids_pair,
                         ids_device_nb0, ids_device_nb1, pair.glu_op, ggml_get_op_params_f32(pair.glu_dst, 2),
                         ggml_get_op_params_f32(pair.glu_dst, 3), pair_layout,
-                        /*glu_dst_handle_override=*/nullptr, /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible,
-                        gate_materialize_tmp, up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg,
-                        &glu_event, &glu_event_set, /*write_recorder=*/nullptr, ptr_table_build_deps);
+                        decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr,
+                        /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible, gate_materialize_tmp,
+                        up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg, &glu_event, &glu_event_set,
+                        /*write_recorder=*/nullptr, ptr_table_build_deps);
                     if (ok_glu) {
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device);
                         if (pair.gate_biased) {
@@ -65998,13 +66013,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, glu_event);
                         }
 
-                        // Down: attempt the cached-Q8 consumer that pairs with the
-                        // GLU dispatch's optional Q8 artifact write. glu_dst_handle_override
-                        // above is null, so fused_glu_q8_candidate inside the GLU call never
-                        // fires and no artifact is produced -- this call fails closed to
-                        // "reuse-q8" and pair.down_dst proceeds through the existing,
-                        // unmodified decode path below. Wiring the matching producer is left
-                        // to whichever task pairs it with the PP cached-Q8 down work.
+                        // Down: attempt the cached-Q8 consumer that pairs with the GLU
+                        // dispatch's optional Q8 artifact write. When decode_q8_handles_ok,
+                        // glu_dst_handle_override above is the minted handle for pair.glu_dst,
+                        // so fused_glu_q8_candidate inside the GLU call can fire and produce
+                        // the artifact this call reuses via "reuse-q8". When the handle lookup
+                        // failed (decode_q8_handles_ok false), the overrides stay null and this
+                        // call fails closed to "reuse-q8" exactly as before, so pair.down_dst
+                        // proceeds through the existing, unmodified decode path below.
                         const layout_mode    down_layout = decode_pair_role_layout(pair.down_weight);
                         const void * const * down_full_table =
                             (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) ?
@@ -66024,7 +66040,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             bool ok_down = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
                                 ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_full_table, ids_device,
                                 static_cast<int>(gate_up_dispatch_entries), n_ids_pair, ids_device_nb0, ids_device_nb1,
-                                down_layout, /*glu_src_handle_override=*/nullptr, /*down_dst_handle_override=*/nullptr,
+                                down_layout, decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr,
+                                decode_q8_handles_ok ? &decode_down_storage.handle : nullptr,
                                 down_ids_host_for_cached_q8, down_ids_host_count_for_cached_q8, /*deps=*/nullptr,
                                 &down_event, &down_event_set);
                             if (ok_down) {
@@ -66034,6 +66051,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, down_event);
                                 }
                             }
+                        } else if (decode_pair_path_trace_enabled != 0) {
+                            fprintf(stderr,
+                                    "[MOE-DOWN-CACHED-REJECT] reason=no-down-full-table layer-tensor=%s layout=%s\n",
+                                    pair.down_weight->name ? pair.down_weight->name : "?",
+                                    ggml_sycl_layout_mode_name(down_layout));
                         }
                         decode_pair_glu_dispatched = true;
                     }
