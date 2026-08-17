@@ -64500,18 +64500,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa, and skip-marks the
             // resulting ADD_ID nodes -- proven byte-identical on hardware
             // against a model (GPT-OSS) where every MoE tensor is biased.
-            // GGML_SYCL_MOE_PP_BIAS_FUSION (default OFF) gates the same
-            // relaxation here, mirroring that block exactly; with it unset,
-            // bias_topology_ok collapses to the original bias-free-only check
-            // and this admission is byte-identical to before. down_bias needs
-            // no gate at all: neither this dispatch nor the decode one ever
-            // passes a down bias pointer into the down kernel, so pair.down_dst
-            // is skip-marked (mmid_skip) but pair.down_biased (its ADD_ID) is
-            // never node-skip-marked in either block -- the graph's real
-            // ADD_ID for down always runs afterward, unaffected by this gate.
+            // GGML_SYCL_MOE_PP_BIAS_FUSION (default ON as of llama.cpp-kzjv
+            // c-hlfl: interleaved paired A/B on hardware measured +27.8%/+7.1%
+            // PP512 on B70/B50 with rc=0, UR=0, zero aborts in every arm, and
+            // the GPT-OSS chat gate passing) gates the same relaxation here,
+            // mirroring that block exactly. Set =0 to opt back out: with the
+            // env var forced to 0, bias_topology_ok collapses to the original
+            // bias-free-only check and this admission is byte-identical to
+            // before this ticket. down_bias needs no gate at all: neither this
+            // dispatch nor the decode one ever passes a down bias pointer into
+            // the down kernel, so pair.down_dst is skip-marked (mmid_skip) but
+            // pair.down_biased (its ADD_ID) is never node-skip-marked in
+            // either block -- the graph's real ADD_ID for down always runs
+            // afterward, unaffected by this gate.
             static const bool        pp_bias_fusion_enabled = [] {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_BIAS_FUSION");
-                return env && std::atoi(env) != 0;
+                return !env || std::atoi(env) != 0;
             }();
             const bool bias_topology_ok =
                 pp_bias_fusion_enabled || (!pair.gate_bias && !pair.up_bias && !pair.down_bias);
