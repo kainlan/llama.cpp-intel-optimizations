@@ -64455,14 +64455,37 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         auto         pair_it = g_moe_gate_up_pairs.find(layer);
         if (pair_it != g_moe_gate_up_pairs.end()) {
             const moe_gate_up_pair & pair = pair_it->second;
+            // llama.cpp-kzjv: bias tensors used to disqualify this admission
+            // unconditionally on the theory that the fused pipeline had no
+            // bias-add step and so could not correctly skip the graph's real
+            // ADD_ID nodes. That is falsified by the decode-side RESTORE-T1
+            // block (~:65564-65760): it resolves gate/up bias pointers via
+            // ggml_sycl_resolve_tensor_ptr(), passes them straight into
+            // mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa, and skip-marks the
+            // resulting ADD_ID nodes -- proven byte-identical on hardware
+            // against a model (GPT-OSS) where every MoE tensor is biased.
+            // GGML_SYCL_MOE_PP_BIAS_FUSION (default OFF) gates the same
+            // relaxation here, mirroring that block exactly; with it unset,
+            // bias_topology_ok collapses to the original bias-free-only check
+            // and this admission is byte-identical to before. down_bias needs
+            // no gate at all: neither this dispatch nor the decode one ever
+            // passes a down bias pointer into the down kernel, so pair.down_dst
+            // is skip-marked (mmid_skip) but pair.down_biased (its ADD_ID) is
+            // never node-skip-marked in either block -- the graph's real
+            // ADD_ID for down always runs afterward, unaffected by this gate.
+            static const bool        pp_bias_fusion_enabled = [] {
+                const char * env = std::getenv("GGML_SYCL_MOE_PP_BIAS_FUSION");
+                return env && std::atoi(env) != 0;
+            }();
+            const bool bias_topology_ok =
+                pp_bias_fusion_enabled || (!pair.gate_bias && !pair.up_bias && !pair.down_bias);
             // Admission is deliberately anchored at the first (gate) node. The
-            // complete gate/up/GLU/down chain must be ordered and bias-free:
-            // bias storage is not part of the exact ten-owner escrow contract.
+            // complete gate/up/GLU/down chain must be ordered.
             const bool topology_ok =
                 src0 == pair.gate_weight && dst == pair.gate_dst && pair.up_dst && pair.glu_dst && pair.down_dst &&
                 pair.src1 == src1 && pair.ids == ids && pair.gate_index >= 0 && pair.up_index > pair.gate_index &&
-                pair.glu_index > pair.up_index && pair.down_index > pair.glu_index && !pair.gate_bias && !pair.up_bias &&
-                !pair.down_bias && pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
+                pair.glu_index > pair.up_index && pair.down_index > pair.glu_index && bias_topology_ok &&
+                pair.down_dst->src[1] == pair.glu_dst && pair.down_dst->src[2] == ids &&
                 (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.down_dst, ctx.device);
@@ -64507,6 +64530,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 pair.down_weight->ne[0] == pair.glu_dst->ne[0] &&
                 pair.down_dst->ne[0] == pair.down_weight->ne[1] &&
                 pair.down_dst->ne[1] == pair.ids->ne[0] && pair.down_dst->ne[2] == pair.glu_dst->ne[2];
+            // Uncapped: every PP pair-admission attempt through this block
+            // hits exactly one fprintf here, so a run can distinguish "bias
+            // fusion never reaches an eligible layer" from "it reaches one but
+            // something else in topology/layout/shape still refuses it".
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                fprintf(stderr,
+                        "[MOE-PP-BIAS-FUSION-ADMIT] tensor=%s layer=%d device=%d bias_fusion_enabled=%d "
+                        "gate_bias=%d up_bias=%d down_bias=%d topology_ok=%d layouts_ok=%d shapes_ok=%d admitted=%d\n",
+                        pair.gate_weight->name ? pair.gate_weight->name : "?", layer, ctx.device,
+                        pp_bias_fusion_enabled ? 1 : 0, pair.gate_bias ? 1 : 0, pair.up_bias ? 1 : 0,
+                        pair.down_bias ? 1 : 0, topology_ok ? 1 : 0, executor_layouts_ok ? 1 : 0,
+                        executor_shapes_ok ? 1 : 0, (topology_ok && executor_layouts_ok && executor_shapes_ok) ? 1 : 0);
+            }
             if (topology_ok && executor_layouts_ok && executor_shapes_ok) {
                 auto gate_table = ggml_sycl_upload_moe_retained_ptr_table_from_batch(
                     ctx, pair.gate_weight, roles.gate.batch, moe_cache_layer_id(pair.gate_weight->name), gate_layout);
@@ -64721,14 +64757,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             }
                             fused::Status submit_writes(const fused::PromptFusionBundle &, fused::SubmitRecorder & recorder) override {
                                 std::vector<sycl::event> ids_deps{ ids_ready_event };
-                                const bool gate_up_ok = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
+                                // Mirrors the decode RESTORE-T1 block exactly: resolve gate/up bias
+                                // pointers only when the corresponding tensor exists. When
+                                // GGML_SYCL_MOE_PP_BIAS_FUSION is unset, topology_ok already forced
+                                // pair.gate_bias/pair.up_bias to null, so this resolves to the same
+                                // nullptr/nullptr/0/0 passed here before.
+                                const float *            gate_bias_ptr =
+                                    pair.gate_bias ? static_cast<const float *>(
+                                                         ggml_sycl_resolve_tensor_ptr(pair.gate_bias, ctx.device)) :
+                                                                nullptr;
+                                const float * up_bias_ptr = pair.up_bias ?
+                                                                static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(
+                                                                    pair.up_bias, ctx.device)) :
+                                                                nullptr;
+                                const bool    gate_up_ok  = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                                     ctx, pair.gate_weight, pair.up_weight, pair.src1, pair.glu_dst,
                                     gate_table.resolve_abi(ctx.device), up_table.resolve_abi(ctx.device), ids_device,
-                                    nullptr, nullptr, 0, 0, static_cast<int>(roles.gate.batch.operands.size()),
-                                    pair.ids->ne[0], ids_nb0, ids_nb1, pair.glu_op,
-                                    ggml_get_op_params_f32(pair.glu_dst, 2), ggml_get_op_params_f32(pair.glu_dst, 3),
-                                    gate_layout, &glu, false, false, nullptr, nullptr,
-                                    roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
+                                    gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
+                                    pair.up_bias ? pair.up_bias->nb[1] : 0,
+                                    static_cast<int>(roles.gate.batch.operands.size()), pair.ids->ne[0], ids_nb0,
+                                    ids_nb1, pair.glu_op, ggml_get_op_params_f32(pair.glu_dst, 2),
+                                    ggml_get_op_params_f32(pair.glu_dst, 3), gate_layout, &glu, false, false, nullptr,
+                                    nullptr, roles.gate.batch.expert_ids.data(), roles.gate.batch.expert_ids.size(),
                                     &glu_event, &glu_event_set, &recorder, &ids_deps, &q8_preflight);
                                 if (!gate_up_ok || !glu_event_set) {
                                     return recorder.write_started() ?
@@ -64777,6 +64827,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 down_storage.handle.set_ready_event(executor.terminal_event);
                                 ggml_sycl_set_tensor_ready_event(pair.glu_dst, ctx.device, executor.glu_event);
                                 ggml_sycl_set_tensor_ready_event(pair.down_dst, ctx.device, executor.terminal_event);
+                                // Mirrors the decode RESTORE-T1 block: once the fused write has
+                                // committed, the graph's own ADD_ID nodes for gate/up bias are
+                                // redundant (the fused kernel already applied the bias inline via
+                                // gate_bias_ptr/up_bias_ptr above) and must be skip-marked so they
+                                // do not re-apply it. down_bias is deliberately left untouched --
+                                // see the topology_ok comment above.
+                                if (pair.gate_biased) {
+                                    ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.gate_biased,
+                                                                          ctx.device);
+                                    ggml_sycl_moe_residual_add_id_skip_insert(pair.gate_biased, ctx.device);
+                                }
+                                if (pair.up_biased) {
+                                    ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_node_skip, pair.up_biased,
+                                                                          ctx.device);
+                                    ggml_sycl_moe_residual_add_id_skip_insert(pair.up_biased, ctx.device);
+                                }
+                                if (ggml_sycl::ggml_sycl_moe_route_log_enabled() &&
+                                    (pair.gate_biased || pair.up_biased)) {
+                                    fprintf(
+                                        stderr,
+                                        "[MOE-PP-BIAS-FUSION-COMMIT] tensor=%s layer=%d device=%d "
+                                        "gate_biased_skip=%d up_biased_skip=%d\n",
+                                        pair.gate_weight->name ? pair.gate_weight->name : "?",
+                                        parse_layer_id_from_name(pair.gate_weight->name ? pair.gate_weight->name : ""),
+                                        ctx.device, pair.gate_biased ? 1 : 0, pair.up_biased ? 1 : 0);
+                                }
                             } catch (...) {
                                 for (const auto & entry : committed) entry.first->erase(entry.second);
                                 executor.terminal_event.wait();
