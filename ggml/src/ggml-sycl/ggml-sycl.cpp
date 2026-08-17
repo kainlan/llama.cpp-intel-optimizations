@@ -65597,6 +65597,80 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                      nullptr;
                 const void * const * up_full_table =
                     pair_layout_ok ? moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout) : nullptr;
+
+                // llama.cpp-3hs5: moe_fusion_full_local_ptr_table() above is a pure
+                // QUERY -- it returns non-null only if the per-device pointer table was
+                // ALREADY built (extra->moe_device_table_valid[device] set, every stored
+                // handle resolving at pair_layout). The only production builder,
+                // ggml_sycl_update_moe_ptr_table(), was previously reachable solely from
+                // graph_preload_moe_experts() on the SYCL command-graph path, so on a
+                // default (non-graph) run the table is silently never built and every
+                // fused decode dispatch below falls through. Attempt the build here,
+                // in-line, when the query misses -- env-gated and default OFF so an
+                // unset env leaves behavior byte-identical to the query-only form above.
+                // Mirrors the ONLY production call site (graph_preload_moe_experts(),
+                // ~line 54764): FULL_TABLE coverage (every expert, not a selected-ids
+                // view), exact_layout_required=false (matches every production caller --
+                // the re-query above still enforces an EXACT pair_layout match), and
+                // force_cache_aos/skip_cpu_routed_experts derived from per-weight host
+                // residency, same as that call site's host_weights. Lease retention for
+                // the handles backing the returned pointer table is NOT reimplemented
+                // here: ggml_sycl_update_moe_ptr_table() -> ggml_sycl_set_moe_ptr_table_leases()
+                // already stores them durably in extra->moe_expert_ptrs_leases[device]
+                // (retained-until-event on replacement, since g_ggml_sycl_graph_recording
+                // is false on this path -- see the RESTORE-T1 comment's decode_pair_glu_dispatched
+                // guard above), which is the same mechanism graph_preload_moe_experts()
+                // additionally copies into ctx.graph_moe_expert_leases for graph-replay
+                // lifetime; direct dispatch here submits synchronously within this call
+                // and does not need that second copy. table_event above is chained into
+                // the GLU dispatch's `deps` argument below so kernel submission depends on
+                // the H2D pointer-table copy completing, per the event/ordering contract.
+                static const bool decode_ptr_table_build_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_PTR_TABLE_DECODE");
+                    return env && std::atoi(env) != 0;
+                }();
+                bool                     table_built_gate = false;
+                bool                     table_built_up   = false;
+                std::vector<sycl::event> ptr_table_build_events;
+                if (pair_layout_ok && decode_ptr_table_build_enabled) {
+                    if (!gate_full_table) {
+                        const bool host_resident_gate =
+                            ggml_sycl_is_host_resident_weight(pair.gate_weight, ctx.stream());
+                        sycl::event gate_table_event;
+                        if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout, &gate_table_event,
+                                                           moe_ptr_table_coverage::FULL_TABLE,
+                                                           /*ids_host_override=*/nullptr, /*skip_device_copy=*/false,
+                                                           /*force_cache_aos=*/host_resident_gate,
+                                                           /*skip_cpu_routed_experts=*/host_resident_gate,
+                                                           /*exact_layout_required=*/false)) {
+                            gate_full_table =
+                                moe_fusion_full_local_ptr_table(pair.gate_weight, ctx.device, pair_layout);
+                            table_built_gate = gate_full_table != nullptr;
+                            if (table_built_gate) {
+                                ptr_table_build_events.push_back(gate_table_event);
+                            }
+                        }
+                    }
+                    if (!up_full_table) {
+                        const bool  host_resident_up = ggml_sycl_is_host_resident_weight(pair.up_weight, ctx.stream());
+                        sycl::event up_table_event;
+                        if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
+                                                           moe_ptr_table_coverage::FULL_TABLE,
+                                                           /*ids_host_override=*/nullptr, /*skip_device_copy=*/false,
+                                                           /*force_cache_aos=*/host_resident_up,
+                                                           /*skip_cpu_routed_experts=*/host_resident_up,
+                                                           /*exact_layout_required=*/false)) {
+                            up_full_table  = moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout);
+                            table_built_up = up_full_table != nullptr;
+                            if (table_built_up) {
+                                ptr_table_build_events.push_back(up_table_event);
+                            }
+                        }
+                    }
+                }
+                const std::vector<sycl::event> * ptr_table_build_deps =
+                    ptr_table_build_events.empty() ? nullptr : &ptr_table_build_events;
+
                 const bool full_gpu_cover = gate_full_table != nullptr && up_full_table != nullptr;
 
                 // Per-layer eligible/ineligible split, UNCAPPED (unlike the
@@ -65609,9 +65683,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     fprintf(stderr,
                             "[MOE-DECODE-PAIR-ELIGIBILITY] tensor=%s layer=%d device=%d layout=%s "
-                            "pair_layout_ok=%d full_gpu_cover=%d\n",
+                            "pair_layout_ok=%d full_gpu_cover=%d table_built_gate=%d table_built_up=%d\n",
                             pair.gate_weight->name ? pair.gate_weight->name : "?", blk_layer_id, ctx.device,
-                            ggml_sycl_layout_mode_name(pair_layout), pair_layout_ok ? 1 : 0, full_gpu_cover ? 1 : 0);
+                            ggml_sycl_layout_mode_name(pair_layout), pair_layout_ok ? 1 : 0, full_gpu_cover ? 1 : 0,
+                            table_built_gate ? 1 : 0, table_built_up ? 1 : 0);
                 }
 
                 const int64_t   n_ids_pair = ids->ne[0];
@@ -65718,7 +65793,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         ggml_get_op_params_f32(pair.glu_dst, 3), pair_layout,
                         /*glu_dst_handle_override=*/nullptr, /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible,
                         gate_materialize_tmp, up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg,
-                        &glu_event, &glu_event_set);
+                        &glu_event, &glu_event_set, /*write_recorder=*/nullptr, ptr_table_build_deps);
                     if (ok_glu) {
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device);
                         if (pair.gate_biased) {
