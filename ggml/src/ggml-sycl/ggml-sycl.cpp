@@ -65551,6 +65551,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     pair_layout_ok ? moe_fusion_full_local_ptr_table(pair.up_weight, ctx.device, pair_layout) : nullptr;
                 const bool full_gpu_cover = gate_full_table != nullptr && up_full_table != nullptr;
 
+                // Per-layer eligible/ineligible split, UNCAPPED (unlike the
+                // budget-limited [MOE-ROW-AGG]/[MOE-XMX-PP-POLICY]-style logs
+                // elsewhere in this file) so a GPU run can distinguish "wiring
+                // never reaches an eligible layer" from "wiring is broken on
+                // layers that ARE eligible" -- llama.cpp-haqk c-request from the
+                // lead. Every gate-node call through this block hits exactly one
+                // fprintf here, once per layer per token.
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    fprintf(stderr,
+                            "[MOE-DECODE-PAIR-ELIGIBILITY] tensor=%s layer=%d device=%d layout=%s "
+                            "pair_layout_ok=%d full_gpu_cover=%d\n",
+                            pair.gate_weight->name ? pair.gate_weight->name : "?", blk_layer_id, ctx.device,
+                            ggml_sycl_layout_mode_name(pair_layout), pair_layout_ok ? 1 : 0, full_gpu_cover ? 1 : 0);
+                }
+
                 const int64_t   n_ids_pair = ids->ne[0];
                 const size_t    ids_n_elem = static_cast<size_t>(n_ids_pair) * static_cast<size_t>(ids->ne[1]);
                 const int32_t * ids_data   = ids_host.empty() ? nullptr : ids_host.data();
