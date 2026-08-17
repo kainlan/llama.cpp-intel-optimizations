@@ -25926,6 +25926,41 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                     return remember_layout(planned_layout);
                 }
             }
+            // Gate/up restoration (llama.cpp-twl6): the grouped-DPAS GEMM route for
+            // gate/up requires GGML_LAYOUT_XMX_TILED, but promoting to it at PP is
+            // gated behind the same GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP flag that
+            // ggml_sycl_moe_layout_for_selected_rows() already checks downstream --
+            // without this branch that keep-logic is unreachable dead code, because
+            // nothing upstream ever hands it XMX_TILED as the candidate layout for
+            // gate/up. Flag defaults off, so default behavior is unchanged.
+            if ((moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP) && ggml_sycl_xmx_moe_allow_unsafe_pp() &&
+                ggml_sycl_planner_authoritative_residency_active(device) &&
+                ggml_sycl_moe_decode_xmx_tiled_supported(src0, device)) {
+                const moe_planned_layout_probe gateup_xmx_probe =
+                    ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_XMX_TILED);
+                const int64_t n_experts_gateup = src0->ne[2] > 0 ? src0->ne[2] : 1;
+                if (gateup_xmx_probe.ok &&
+                    gateup_xmx_probe.local == static_cast<size_t>(std::max<int64_t>(0, n_experts_gateup)) &&
+                    gateup_xmx_probe.secondary == 0 && gateup_xmx_probe.host == 0) {
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        fprintf(stderr,
+                                "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 selected=%s host_weights=%d "
+                                "local=%zu secondary=%zu host=%zu missing=%zu reason=prompt-gateup-xmx-tiled-complete\n",
+                                src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(GGML_LAYOUT_XMX_TILED),
+                                host_weights ? 1 : 0, gateup_xmx_probe.local, gateup_xmx_probe.secondary,
+                                gateup_xmx_probe.host, gateup_xmx_probe.missing);
+                    }
+                    return remember_layout(GGML_LAYOUT_XMX_TILED);
+                }
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    fprintf(stderr,
+                            "[GRAPH-MOE-LAYOUT] tensor=%s device=%d plan=1 skip=%s host_weights=%d local=%zu "
+                            "secondary=%zu host=%zu missing=%zu reason=prompt-gateup-xmx-tiled-incomplete\n",
+                            src0->name ? src0->name : "?", device, ggml_sycl_layout_mode_name(GGML_LAYOUT_XMX_TILED),
+                            host_weights ? 1 : 0, gateup_xmx_probe.local, gateup_xmx_probe.secondary,
+                            gateup_xmx_probe.host, gateup_xmx_probe.missing);
+                }
+            }
             const moe_planned_layout_probe soa_probe =
                 ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_SOA);
             const bool secondary_supported =
@@ -64428,6 +64463,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // retained-cache capability set. Gate/up consumes SOA only; cached-Q8
             // down consumes SOA or MXFP4_I8. XMX_TILED and MXFP4_DPAS refuse here,
             // before table upload, ID staging, escrow, or any output write.
+            //
+            // Restoration note (llama.cpp-twl6): gate/up's grouped-DPAS GEMM route
+            // (weight_layout==GGML_LAYOUT_XMX_TILED, opt-in via
+            // GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP) is intentionally NOT admitted here.
+            // mmvq_moe_prompt_q8_preflight() below hard-refuses any gate_layout !=
+            // GGML_LAYOUT_SOA (mmvq.cpp:17469) -- it's the SOA cached-Q8-reuse
+            // artifact shared with the down leg, and the grouped-DPAS XMX kernel
+            // does its own independent Q8 quantization instead of consuming that
+            // artifact. Widening this admission gate alone would not reach a
+            // working dispatch, only a preflight refusal that falls back anyway.
+            // Gate/up XMX_TILED dispatches through the non-fused per-tensor path
+            // (mmvq_moe_batched_dispatch's own XMX_TILED case), reached once
+            // ggml_sycl_select_moe_planned_graph_layout promotes the layout.
             const bool executor_layouts_ok = gate_layout == GGML_LAYOUT_SOA && up_layout == gate_layout &&
                 all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
                 (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
