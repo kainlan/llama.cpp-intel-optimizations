@@ -90,6 +90,7 @@ Consequences worth knowing before you reach for this flag:
 | `GGML_SYCL_LAYOUT_OVERRIDE=<mode>` | Force a weight layout: `aos`, `soa`, `coalesced`, or `xmx_tiled`. Overrides the layout policy's own choice — use for A/B isolation, not as a default. (Migrated from AGENTS.md 2026-07-25, which was its only documentation.) |
 | `GGML_SYCL_USE_XMX_GEMM=1` | Route quantized MUL_MAT through the experimental XMX GEMM kernels (measured 5–11x **slower** for quantized models). Needs a build carrying **both** `GGML_SYCL_XMX_GEMM` and `GGML_SYCL_MMQ_XMX`; in a default build it does nothing. `=0` disables it on both dispatch paths (it did not until `llama.cpp-wvbw`; see below). |
 | `GGML_SYCL_XMX_THRESHOLD=N` | Upper batch bound for the XMX GEMM path; the gate is `batch >= 1 && batch < N`. Default **64**, stated only by the settings table in `ggml_check_sycl()` — not by the global's initializer. Same build requirement as above. See below. |
+| `GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES=N` | Caps the grouped-DPAS MXFP4 MoE row-list chunk size at `caps.N * N` rows per submission. Default **256** (raised from 16 on 2026-08-17, llama.cpp-e3xj): 16 forced ~23 chunks/layer on GPT-OSS pp512, each re-reading expert weight tiles; 256 measured +7.5% pp512 on B50 (136.4->146.7, interleaved r=2 pairs) and ~+30% on B70 (356->471-493). |
 
 ### The TG fast-path claims batch=1, so the force/override variables never see it
 

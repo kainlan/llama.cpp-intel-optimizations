@@ -923,7 +923,12 @@ static inline bool ggml_sycl_mxfp4_moe_coalesced_shape_ok(int64_t in_dim) {
     return in_dim > 0 && (in_dim % QK_MXFP4) == 0 && ((in_dim / QK_MXFP4) % MMVQ_COALESCED_TILE_BLOCKS) == 0;
 }
 
-static constexpr size_t GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES = 16;
+// Measured 2026-08-17 (llama.cpp-e3xj): the old default of 16 (256-row chunks)
+// forces ~23 chunks/layer on GPT-OSS pp512, and each chunk re-reads expert
+// weight tiles. 256 is worth +7.5% pp512 on B50 (136.4->146.7, interleaved
+// r=2 pairs) and ~+30% on B70 (356->471-493). Override with env var
+// GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES.
+static constexpr size_t GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES = 256;
 
 static inline size_t ggml_sycl_mxfp4_grouped_dpas_row_list_limit(const XMXCapabilities & caps) {
     if (caps.N == 0) {
