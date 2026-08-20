@@ -40529,6 +40529,10 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
     std::exit(1);
 }
 
+// Forward declaration: cached-env gate for the Q8_0 COALESCED oneDNN dequant
+// arm (defined later, near the other cached-env kernel-selection helpers).
+static bool ggml_sycl_q8_0_onednn_coalesced_enabled();
+
 inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                       const ggml_tensor *         src0,
                                       const ggml_tensor *         src1,
@@ -40710,19 +40714,45 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             if (src0->type != GGML_TYPE_F16) {
                 scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                      " : converting src0 to fp16");
-                // CRITICAL: Pass full_tensor=false to force standard AOS dequant.
-                // src0_dd_i is an AOS data pointer. With full_tensor=true (default),
-                // if the tensor has SOA layout metadata, the function returns an
-                // SOA-reorder dequant which produces garbage from AOS data.
-                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst, false);
-
-                GGML_ASSERT(to_fp16_sycl != nullptr);
                 size_t ne = row_diff * ne00;
                 if (!src0_pp_scratch) {
                     GGML_ASSERT(src0_as_f16.alloc(ne));
                 }
                 sycl::half * dst_f16 = src0_pp_scratch ? src0_pp_scratch : src0_as_f16.get();
-                to_fp16_sycl(src0_dd_i, dst_f16, ne, stream);
+
+                // Q8_0 dense weights materialized in COALESCED layout: dequant straight
+                // from the COALESCED bytes instead of routing through the AOS-only
+                // to_fp16_sycl() dispatch below (llama.cpp-e3xj). row_diff == src0->ne[1]
+                // is already guaranteed by the branch condition above this whole block,
+                // so the coalesced-source kernel's "full tensor, row 0-based" assumption
+                // holds. The lookup is independent of what src0_dd_i already resolved to
+                // -- if the COALESCED materialization isn't device/shared-resident (cache
+                // miss, host tier, etc.) this falls straight through to the unmodified
+                // AOS dequant below, never erroring.
+                void * q8_0_coalesced_ptr = nullptr;
+                if (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                    void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
+                    if (candidate) {
+                        const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
+                        if (ptr_type == sycl::usm::alloc::device || ptr_type == sycl::usm::alloc::shared) {
+                            q8_0_coalesced_ptr = candidate;
+                        }
+                    }
+                }
+
+                if (q8_0_coalesced_ptr) {
+                    const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
+                    dequantize_row_q8_0_coalesced_to_fp16_rowmajor(q8_0_coalesced_ptr, dst_f16, blocks_per_row,
+                                                                   static_cast<int>(row_diff), stream);
+                } else {
+                    // CRITICAL: Pass full_tensor=false to force standard AOS dequant.
+                    // src0_dd_i is an AOS data pointer. With full_tensor=true (default),
+                    // if the tensor has SOA layout metadata, the function returns an
+                    // SOA-reorder dequant which produces garbage from AOS data.
+                    const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst, false);
+                    GGML_ASSERT(to_fp16_sycl != nullptr);
+                    to_fp16_sycl(src0_dd_i, dst_f16, ne, stream);
+                }
             }
             const sycl::half * src0_ptr = src0->type == GGML_TYPE_F16 ?
                                               (const sycl::half *) src0_dd_i :
@@ -55384,6 +55414,7 @@ static constexpr ggml_sycl_mul_mat_kernel_caps k_mul_mat_kernel_caps[] = {
 
     { ggml_sycl_mul_mat_kernel::MMQ_AOS,        GGML_LAYOUT_AOS,            0                   },
     { ggml_sycl_mul_mat_kernel::ONEDNN_AOS,     GGML_LAYOUT_AOS,            0                   },
+    { ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED, GGML_LAYOUT_COALESCED,    0                   },
     { ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL, GGML_LAYOUT_AOS,            0                   },
 };
 
@@ -55406,6 +55437,20 @@ static bool ggml_sycl_dmmv_allow_reordered_layouts() {
         allow            = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
     }
     return allow != 0;
+}
+
+// Q8_0 dense weights materialized in COALESCED layout otherwise land on
+// MMQ_COALESCED (~3 TFLOPS) for large PP batches. Default ON: dequant the
+// COALESCED weight straight to FP16 (dequantize_row_q8_0_coalesced_to_fp16_rowmajor,
+// llama.cpp-e3xj) and route through the same oneDNN GEMM ONEDNN_AOS already uses.
+// Set GGML_SYCL_Q8_ONEDNN_COALESCED=0 to opt out and keep MMQ_COALESCED.
+static bool ggml_sycl_q8_0_onednn_coalesced_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_SYCL_Q8_ONEDNN_COALESCED");
+        enabled          = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
 }
 
 static layout_mode ggml_sycl_mul_mat_kernel_layout(ggml_sycl_mul_mat_kernel kernel) {
@@ -55467,6 +55512,8 @@ const char * ggml_sycl_mul_mat_kernel_name(ggml_sycl_mul_mat_kernel kernel) {
             return "MMQ_AOS";
         case ggml_sycl_mul_mat_kernel::ONEDNN_AOS:
             return "ONEDNN_AOS";
+        case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
+            return "ONEDNN_COALESCED";
         case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
             return "UNIFIED_MATMUL";
     }
@@ -55495,6 +55542,7 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_parse_force_kernel() {
         { "MMQ_COALESCED",  ggml_sycl_mul_mat_kernel::MMQ_COALESCED  },
         { "MMQ_AOS",        ggml_sycl_mul_mat_kernel::MMQ_AOS        },
         { "ONEDNN_AOS",     ggml_sycl_mul_mat_kernel::ONEDNN_AOS     },
+        { "ONEDNN_COALESCED", ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED },
         { "UNIFIED_MATMUL", ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL },
     };
 
@@ -55719,6 +55767,17 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
 
                 case ggml_sycl_mul_mat_kernel::ONEDNN_AOS:
                     break;
+
+                case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
+#if GGML_SYCL_DNNL
+                    if (src0->type != GGML_TYPE_Q8_0 || !ggml_sycl_layout_supports_coalesced(src0) ||
+                        !ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                        override_ok = false;
+                    }
+#else
+                    override_ok = false;
+#endif
+                    break;
                 case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
                     {
                         const bool src1_contiguous =
@@ -55845,6 +55904,15 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
             case ggml_sycl_mul_mat_kernel::ONEDNN_AOS:
                 return kernel;
                 break;
+
+            case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
+#if GGML_SYCL_DNNL
+                if (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_layout_supports_coalesced(src0) &&
+                    ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                    return kernel;
+                }
+#endif
+                break;
         }
     }
 
@@ -55927,6 +55995,11 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
 
         case ggml_sycl_mul_mat_kernel::ONEDNN_AOS:
             GGML_SYCL_KTRACE("mul_mat_dispatch_onednn", " type=%d ne1=%lld", src0->type, (long long) src1->ne[1]);
+            return ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, layout);
+
+        case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
+            GGML_SYCL_KTRACE("mul_mat_dispatch_onednn_coalesced", " type=%d ne1=%lld", src0->type,
+                             (long long) src1->ne[1]);
             return ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, layout);
 
         case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
@@ -56140,6 +56213,16 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
                     layout_kernel = ggml_sycl_mul_mat_kernel::DMMV_COALESCED;
                 } else if (batch <= MMVQ_MAX_BATCH_SIZE) {
                     layout_kernel = ggml_sycl_mul_mat_kernel::MMVQ_COALESCED;
+#if GGML_SYCL_DNNL
+                } else if (src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) &&
+                          src1->type == GGML_TYPE_F32 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                    // Mirrors the GGML_LAYOUT_AOS ONEDNN_AOS arm below: for large PP
+                    // batches, dequant the COALESCED weight straight to FP16 and route
+                    // through the same oneDNN GEMM, instead of landing on MMQ_COALESCED
+                    // (~3 TFLOPS). Falls back to MMQ_COALESCED at runtime if the
+                    // COALESCED materialization isn't device-resident (llama.cpp-e3xj).
+                    layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED;
+#endif
                 } else {
                     layout_kernel = ggml_sycl_mul_mat_kernel::MMQ_COALESCED;
                 }
