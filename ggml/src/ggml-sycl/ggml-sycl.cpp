@@ -64313,9 +64313,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         if (g_ggml_sycl_graph_recording) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt batch cannot enter graph sink");
         }
-        if (!ggml_sycl_copy_ids_to_host(ctx, ids, prompt_ids_snapshot)) {
+        // The gate/up/down MUL_MAT_ID nodes of a single PP layer share the
+        // identical `ids` tensor and its device contents don't change within
+        // one graph-compute pass. Reuse the same graph-local D2H cache the
+        // decode path already keys on (ids tensor identity + view offset +
+        // device); the map is cleared at every graph-compute boundary
+        // (ggml_sycl_moe_ids_cache_new_graph), so a cache hit can never read
+        // a stale snapshot. First consumer this pass pays the device
+        // wait; later consumers (up/down, repeat admissions) reuse the host
+        // snapshot without one. (llama.cpp-e3xj)
+        moe_ids_cache_entry uncached_prompt_ids_entry{};
+        auto & prompt_ids_entry = ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, uncached_prompt_ids_entry);
+        if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, prompt_ids_entry)) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID prompt expert ID admission failed");
         }
+        prompt_ids_snapshot            = prompt_ids_entry.host_ids;
         const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
         retained_prompt_layout =
             has_override ? override_layout :
