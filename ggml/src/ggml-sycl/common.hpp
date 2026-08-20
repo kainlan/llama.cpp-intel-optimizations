@@ -1460,12 +1460,17 @@ struct layout_policy {
         // ONEDNN_AOS comment). Route Q8_0 dense weights AOS instead so PP
         // reaches that arm; TG moves from DMMV/MMVQ_COALESCED to MMVQ_AOS.
         // The owner single-layout rule means this one layout must serve both
-        // axes, hence the opt-out escape while TG is A/B-tested as the
-        // acceptance gate: GGML_SYCL_Q8_DENSE_AOS=0 restores COALESCED.
+        // axes. MEASURED 2026-08-20 (llama.cpp-e3xj C25/C26): AOS is worth
+        // +38% B70 pp512 (847->1160) but COSTS -34% B50 tg128 (32.1->21.3) --
+        // MMVQ_AOS at batch=1 is far slower than the coalesced TG kernel, so
+        // AOS FAILS the all-consumers rule and the default is OFF. Set
+        // GGML_SYCL_Q8_DENSE_AOS=1 only for PP-dominated workloads that
+        // accept the TG loss. The layout-neutral way to recapture the PP win
+        // is an oneDNN arm that dequants from COALESCED (tracked on e3xj).
         static int q8_dense_aos_cached = -1;
         if (q8_dense_aos_cached < 0) {
             const char * env    = std::getenv("GGML_SYCL_Q8_DENSE_AOS");
-            q8_dense_aos_cached = (env && std::atoi(env) == 0) ? 0 : 1;  // Default ON
+            q8_dense_aos_cached = (env && std::atoi(env) != 0) ? 1 : 0;  // Default OFF (TG regression)
         }
         if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT) {
             if (skip_onednn_q4_0_cached && qtype == GGML_TYPE_Q4_0) {
