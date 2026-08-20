@@ -439,11 +439,35 @@ struct moe_batch_local_view {
 // the retained handles at submit time; repeated occurrences are preserved in
 // the batch and table entries are deduplicated only when expert ID and stable
 // handle identity agree. Conflicting identities fail closed.
+//
+// build_moe_resolved_batch() memoizes by expert_id (see its comment) and
+// copies the whole operand -- residency, owning_device, actual_layout, lease
+// included -- onto every repeat occurrence of an expert already seen in that
+// call. So the admission checks below (residency/device/layout, then
+// lease.resolve(), which each take a lock/atomic per call) produce an
+// identical result for every occurrence of one expert; only occurrence/
+// token_index/slot_index vary. Run the checks and the resolve once per
+// unique expert_id, on first sight, and reuse that result for repeats --
+// this preserves the exact reject reason/occurrence a full per-occurrence
+// re-check would report, because a repeat can never diverge from its first
+// occurrence's outcome.
 inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
     moe_batch_local_view                out;
     std::unordered_map<int32_t, size_t> expert_slots;
     expert_slots.reserve(batch.operands.size());
     for (const moe_resolved_operand & operand : batch.operands) {
+        const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
+        if (!inserted) {
+            if (!out.leases[existing->second].stable_identity_equal(operand.lease)) {
+                out.reject     = moe_batch_reject_reason::POINTER_MISMATCH;
+                out.occurrence = operand.occurrence;
+                return out;
+            }
+            if (operand.has_ready_event) {
+                out.ready_events.push_back(operand.ready_event);
+            }
+            continue;
+        }
         if (operand.residency != moe_batch_residency::PRIMARY_DEVICE || operand.owning_device != batch.submit_device ||
             operand.actual_layout != layout) {
             out.reject     = operand.actual_layout != layout ? moe_batch_reject_reason::LAYOUT_MISMATCH :
@@ -463,18 +487,9 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
             out.occurrence = operand.occurrence;
             return out;
         }
-        const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
-        if (!inserted) {
-            if (!out.leases[existing->second].stable_identity_equal(operand.lease)) {
-                out.reject     = moe_batch_reject_reason::POINTER_MISMATCH;
-                out.occurrence = operand.occurrence;
-                return out;
-            }
-        } else {
-            out.expert_ids.push_back(operand.expert_id);
-            out.expert_ptrs.push_back(resolved.ptr);
-            out.leases.push_back(operand.lease);
-        }
+        out.expert_ids.push_back(operand.expert_id);
+        out.expert_ptrs.push_back(resolved.ptr);
+        out.leases.push_back(operand.lease);
         if (operand.has_ready_event) {
             out.ready_events.push_back(operand.ready_event);
         }

@@ -64794,18 +64794,39 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // upload event and all role leases travel together.
                             view.ready_identity = view.table_identity;
                             view.occurrences.reserve(role.batch.operands.size());
+                            // build_moe_resolved_batch copies the whole operand (lease
+                            // included) onto every repeat occurrence of an expert, so
+                            // identity(operand.lease) -- a per-call lock via
+                            // stable_identity_hash() -- and the residency mapping are
+                            // identical for every occurrence of one expert. Memoize by
+                            // expert_id and skip the lock on repeats; occurrence/
+                            // token_index/slot_index still vary and are set per element.
+                            std::unordered_map<int32_t, std::pair<std::uintptr_t, fused::OccurrenceResidency>>
+                                expert_identity;
+                            expert_identity.reserve(role.batch.operands.size());
                             for (const auto & operand : role.batch.operands) {
-                                fused::OccurrenceResidency residency = fused::OccurrenceResidency::unavailable;
-                                if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
-                                    residency = fused::OccurrenceResidency::local;
-                                } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
-                                    residency = fused::OccurrenceResidency::secondary;
-                                } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
-                                    residency = fused::OccurrenceResidency::host;
+                                std::uintptr_t             lease_identity;
+                                fused::OccurrenceResidency residency;
+                                const auto                 memo = expert_identity.find(operand.expert_id);
+                                if (memo != expert_identity.end()) {
+                                    lease_identity = memo->second.first;
+                                    residency      = memo->second.second;
+                                } else {
+                                    lease_identity = identity(operand.lease);
+                                    residency      = fused::OccurrenceResidency::unavailable;
+                                    if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
+                                        residency = fused::OccurrenceResidency::local;
+                                    } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
+                                        residency = fused::OccurrenceResidency::secondary;
+                                    } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
+                                        residency = fused::OccurrenceResidency::host;
+                                    }
+                                    expert_identity.emplace(operand.expert_id,
+                                                            std::make_pair(lease_identity, residency));
                                 }
-                                view.occurrences.push_back({ operand.expert_id, operand.occurrence,
-                                    operand.token_index, operand.slot_index, identity(operand.lease),
-                                    static_cast<std::int64_t>(operand.actual_layout), residency });
+                                view.occurrences.push_back(
+                                    { operand.expert_id, operand.occurrence, operand.token_index, operand.slot_index,
+                                      lease_identity, static_cast<std::int64_t>(operand.actual_layout), residency });
                             }
                             return view;
                         };
