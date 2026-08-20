@@ -25711,7 +25711,13 @@ static bool moe_aggressive_partial_tg_xmx_tiled_env_enabled() {
 static bool ggml_sycl_moe_down_xmx_tiled_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_DOWN_XMX_TILED");
-        return env && std::atoi(env) != 0;
+        // llama.cpp-sk67: default flipped ON now that the down dispatcher has a
+        // working XMX_TILED grouped-DPAS arm (mmvq.cpp,
+        // mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4). Was OFF+non-
+        // functional (the dispatcher's entry guard rejected XMX_TILED
+        // outright); now ON+functional. Explicit GGML_SYCL_MOE_DOWN_XMX_TILED=0
+        // still opts out.
+        return !env || std::atoi(env) != 0;
     }();
     return enabled || moe_grouped_decode_candidate_env_enabled();
 }
@@ -25818,7 +25824,7 @@ static bool ggml_sycl_moe_prompt_down_specialized_layout_proven(const ggml_tenso
     }
     if (!src0 || src0->type != GGML_TYPE_MXFP4 || device < 0 || device >= ggml_sycl_info().device_count ||
         moe_classify_tensor(src0->name) != MOE_TENSOR_DOWN ||
-        (layout != GGML_LAYOUT_MXFP4_I8 && layout != GGML_LAYOUT_MXFP4_DPAS) ||
+        (layout != GGML_LAYOUT_MXFP4_I8 && layout != GGML_LAYOUT_MXFP4_DPAS && layout != GGML_LAYOUT_XMX_TILED) ||
         !ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, layout)) {
         return false;
     }
@@ -25846,7 +25852,14 @@ static layout_mode ggml_sycl_adjust_moe_runtime_layout(const ggml_tensor * src0,
         }
         return ggml_sycl_adjust_layout_for_tensor(src0, GGML_LAYOUT_SOA, device);
     }
-    if (requested == GGML_LAYOUT_XMX_TILED && n_tokens <= 1 && ggml_sycl_moe_decode_xmx_tiled_supported(src0, device) &&
+    // llama.cpp-sk67: used to require n_tokens<=1 (decode only). Despite its
+    // name, ggml_sycl_moe_decode_xmx_tiled_supported() is phase-agnostic (no
+    // n_tokens/ne12 reference in its body -- verified) and is already reused
+    // by the PP role-filter ggml_sycl_moe_prompt_xmx_tiled_supported() above.
+    // Drop the wall so XMX_TILED is admitted here the same way I8/DPAS
+    // already are: via the unconditional ggml_sycl_adjust_layout_for_tensor()
+    // fallback below, not gated on phase.
+    if (requested == GGML_LAYOUT_XMX_TILED && ggml_sycl_moe_decode_xmx_tiled_supported(src0, device) &&
         ggml_sycl_moe_planned_layout_complete(src0, device, GGML_LAYOUT_XMX_TILED)) {
         return GGML_LAYOUT_XMX_TILED;
     }
@@ -25858,7 +25871,10 @@ static bool ggml_sycl_moe_prompt_xmx_tiled_supported(const ggml_tensor * src0, i
         return false;
     }
     const moe_tensor_type moe_kind = moe_classify_tensor(src0->name);
-    if (moe_kind != MOE_TENSOR_GATE && moe_kind != MOE_TENSOR_UP) {
+    // llama.cpp-sk67: DOWN admitted alongside GATE/UP. ggml_sycl_moe_decode_xmx_tiled_supported()
+    // below already gates DOWN behind ggml_sycl_moe_down_xmx_tiled_enabled(), so this widening
+    // is a no-op unless that flag (default ON as of sk67) allows it.
+    if (moe_kind != MOE_TENSOR_GATE && moe_kind != MOE_TENSOR_UP && moe_kind != MOE_TENSOR_DOWN) {
         return false;
     }
     if (!ggml_sycl_moe_decode_xmx_tiled_supported(src0, device) ||
@@ -25962,7 +25978,10 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                         }
                     }
                 } else if (adjusted_planned == planned_layout && planned_layout != GGML_LAYOUT_AOS &&
-                           planned_layout != GGML_LAYOUT_XMX_TILED &&
+                           // llama.cpp-sk67: XMX_TILED used to be unconditionally excluded here
+                           // (down's grouped-DPAS route wasn't wired up yet). Admit it under the
+                           // same route-policy gate gate/up's own XMX_TILED admission below uses.
+                           (planned_layout != GGML_LAYOUT_XMX_TILED || ggml_sycl_xmx_moe_allow_unsafe_pp()) &&
                            ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, planned_layout) &&
                            ggml_sycl_moe_planned_layout_complete(src0, device, planned_layout)) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -25982,8 +26001,8 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
             // without this branch that keep-logic is unreachable dead code, because
             // nothing upstream ever hands it XMX_TILED as the candidate layout for
             // gate/up. Flag defaults off, so default behavior is unchanged.
-            if ((moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP) && ggml_sycl_xmx_moe_allow_unsafe_pp() &&
-                ggml_sycl_planner_authoritative_residency_active(device) &&
+            if ((moe_kind == MOE_TENSOR_GATE || moe_kind == MOE_TENSOR_UP || moe_kind == MOE_TENSOR_DOWN) &&
+                ggml_sycl_xmx_moe_allow_unsafe_pp() && ggml_sycl_planner_authoritative_residency_active(device) &&
                 ggml_sycl_moe_decode_xmx_tiled_supported(src0, device)) {
                 const moe_planned_layout_probe gateup_xmx_probe =
                     ggml_sycl_probe_moe_planned_layout(src0, device, GGML_LAYOUT_XMX_TILED);
@@ -64694,10 +64713,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const bool gate_layout_admissible =
                 gate_layout == GGML_LAYOUT_SOA ||
                 (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+            // llama.cpp-sk67: down_layout admits XMX_TILED under the same route-policy
+            // gate gate_layout_admissible already applies to gate/up above -- the down
+            // dispatcher now has a working grouped-DPAS XMX_TILED arm (mmvq.cpp).
+            const bool down_layout_admissible =
+                down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8 ||
+                (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
             const bool executor_layouts_ok = gate_layout_admissible && up_layout == gate_layout &&
-                all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
-                (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
-                all_layout(roles.down, down_layout);
+                                             all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
+                                             down_layout_admissible && all_layout(roles.down, down_layout);
             const int64_t expected_entries = pair.ids->ne[0] * pair.ids->ne[1];
             const bool executor_shapes_ok = expected_entries > 0 && pair.ids->ne[1] == pair.src1->ne[2] &&
                 static_cast<int64_t>(roles.gate.batch.operands.size()) == expected_entries &&
@@ -64914,10 +64938,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const bool gate_layout_admissible =
                                     gate_layout == GGML_LAYOUT_SOA ||
                                     (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
-                                const bool abi_ok = gate_layout_admissible &&
-                                    (down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8) &&
-                                    gate_table.resolve_abi(ctx.device) && up_table.resolve_abi(ctx.device) &&
-                                    down_table.resolve_abi(ctx.device) && ids_identity_exact;
+                                // llama.cpp-sk67: mirrors the down_layout_admissible widening at
+                                // the outer executor_layouts_ok admission gate above -- this is a
+                                // second, independent gate on the same PromptExecutor and must
+                                // stay in sync with it or a widened admission still gets refused
+                                // here at preflight.
+                                const bool down_layout_admissible =
+                                    down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8 ||
+                                    (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+                                const bool abi_ok = gate_layout_admissible && down_layout_admissible &&
+                                                    gate_table.resolve_abi(ctx.device) &&
+                                                    up_table.resolve_abi(ctx.device) &&
+                                                    down_table.resolve_abi(ctx.device) && ids_identity_exact;
                                 const bool q8_ok = abi_ok && mmvq_moe_prompt_q8_preflight(
                                     ctx, pair.gate_weight, pair.up_weight, pair.src1, pair.glu_dst,
                                     pair.down_weight, pair.down_dst, pair.ids->ne[0],
@@ -66238,8 +66270,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // call fails closed to "reuse-q8" exactly as before, so pair.down_dst
                         // proceeds through the existing, unmodified decode path below.
                         const layout_mode    down_layout = decode_pair_role_layout(pair.down_weight);
-                        const bool           down_layout_table_eligible =
-                            down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8;
+                        // llama.cpp-sk67: XMX_TILED admitted -- without this, decode_pair_role_layout()
+                        // could select XMX_TILED for down (via ggml_sycl_moe_down_xmx_tiled_enabled(),
+                        // default ON as of sk67) while this query stayed gated to SOA/MXFP4_I8, so
+                        // down_full_table would stay permanently null and the cached-Q8 dispatch below
+                        // would never even be attempted for down -- unlike gate/up's pair_layout_ok
+                        // check a few lines above, which already accepts XMX_TILED unconditionally.
+                        const bool           down_layout_table_eligible = down_layout == GGML_LAYOUT_SOA ||
+                                                                down_layout == GGML_LAYOUT_MXFP4_I8 ||
+                                                                down_layout == GGML_LAYOUT_XMX_TILED;
                         const void * const * down_full_table =
                             down_layout_table_eligible ?
                                 moe_fusion_full_local_ptr_table(pair.down_weight, ctx.device, down_layout) :

@@ -17523,9 +17523,14 @@ bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
         !down_weight || !down_dst || !glu_dst_handle || !glu_dst_handle->valid() ||
         gate_weight->type != GGML_TYPE_MXFP4 || up_weight->type != GGML_TYPE_MXFP4 ||
         down_weight->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || glu_dst->type != GGML_TYPE_F32 ||
-        down_dst->type != GGML_TYPE_F32 ||
-        (gate_layout != GGML_LAYOUT_SOA && gate_layout != GGML_LAYOUT_XMX_TILED) ||
-        (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8) || ids_nb0 <= 0 || ids_nb1 <= 0) {
+        down_dst->type != GGML_TYPE_F32 || (gate_layout != GGML_LAYOUT_SOA && gate_layout != GGML_LAYOUT_XMX_TILED) ||
+        // llama.cpp-sk67: XMX_TILED admitted -- down's cached-Q8 dispatcher
+        // (mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4) now has a
+        // grouped-DPAS arm for it, reading the identical Q8 SOA artifact this
+        // preflight sizes/reserves regardless of which layout consumes it.
+        (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8 &&
+         down_layout != GGML_LAYOUT_XMX_TILED) ||
+        ids_nb0 <= 0 || ids_nb1 <= 0) {
         return false;
     }
     const int gate_layer = mxfp4_moe_layer_from_name(gate_weight->name);
