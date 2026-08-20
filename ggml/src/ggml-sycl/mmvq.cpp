@@ -19016,6 +19016,80 @@ static void mxfp4_moe_down_q8_artifact_validate(sycl::queue * stream,
     }
 }
 
+// Buckets a MoE down dispatch's ids_host[] expert assignment into per-expert
+// row groups and exec_n-wide dispatch chunks. Shared by every grouped-DPAS
+// down kernel family that consumes the host-grouped shape (MXFP4_I8,
+// XMX_TILED): the bucketing algorithm and the row-slot encoding
+// (id * n_tokens + iid1, decoded the same way group_row_slots is read back
+// inside the grouped-DPAS kernels) are identical across families -- only the
+// kernel launched per chunk differs. ids_host is indexed [iid1 * n_ids + id],
+// matching every other ids_host reader in this file. Output vectors are
+// caller-owned (typically thread_local) so callers keep control of their own
+// allocation lifetime; this function only clears and fills them. Returns
+// false (leaving the outputs cleared or partially filled -- callers must not
+// use them) if any expert id is out of range or the resulting grouping is
+// empty/short of total_batches rows.
+static bool mxfp4_moe_down_build_grouped_host_metadata(const int32_t *        ids_host,
+                                                       int64_t                n_ids,
+                                                       int64_t                n_tokens,
+                                                       int64_t                n_experts,
+                                                       int64_t                total_batches,
+                                                       int                    exec_n,
+                                                       std::vector<int32_t> & experts_host,
+                                                       std::vector<int32_t> & offsets_host,
+                                                       std::vector<int32_t> & rows_host,
+                                                       std::vector<int32_t> & chunk_groups_host,
+                                                       std::vector<int32_t> & chunk_starts_host,
+                                                       std::vector<int32_t> & counts_host) {
+    experts_host.clear();
+    offsets_host.clear();
+    rows_host.clear();
+    chunk_groups_host.clear();
+    chunk_starts_host.clear();
+    counts_host.clear();
+
+    std::vector<std::vector<int32_t>> grouped_slots;
+    grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(n_experts, total_batches)));
+    std::vector<int32_t> expert_to_group(static_cast<size_t>(n_experts), -1);
+
+    for (int64_t id = 0; id < n_ids; ++id) {
+        for (int64_t iid1 = 0; iid1 < n_tokens; ++iid1) {
+            const int64_t ci  = iid1 * n_ids + id;
+            const int32_t eid = ids_host[ci];
+            if (eid < 0 || eid >= n_experts) {
+                return false;
+            }
+            int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
+            if (group_index < 0) {
+                group_index                               = static_cast<int32_t>(experts_host.size());
+                expert_to_group[static_cast<size_t>(eid)] = group_index;
+                experts_host.push_back(eid);
+                grouped_slots.emplace_back();
+            }
+            grouped_slots[static_cast<size_t>(group_index)].push_back(static_cast<int32_t>(id * n_tokens + iid1));
+        }
+    }
+
+    offsets_host.reserve(experts_host.size() + 1);
+    offsets_host.push_back(0);
+    for (size_t g = 0; g < grouped_slots.size(); ++g) {
+        auto & rows = grouped_slots[g];
+        std::sort(rows.begin(), rows.end());
+        const int rows_begin = static_cast<int>(rows_host.size());
+        rows_host.insert(rows_host.end(), rows.begin(), rows.end());
+        const int n_rows = static_cast<int>(rows.size());
+        counts_host.push_back(n_rows);
+        for (int row_start = 0; row_start < n_rows; row_start += exec_n) {
+            chunk_groups_host.push_back(static_cast<int32_t>(g));
+            chunk_starts_host.push_back(row_start);
+        }
+        offsets_host.push_back(rows_begin + n_rows);
+    }
+
+    return !experts_host.empty() && !chunk_groups_host.empty() &&
+           rows_host.size() == static_cast<size_t>(total_batches);
+}
+
 bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_context &      ctx,
                                                          const ggml_tensor *              down_weight,
                                                          const ggml_tensor *              glu_src,
@@ -19056,7 +19130,8 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
     };
     if (!down_weight || !glu_src || !down_dst || !down_ptrs_device || n_gpu_entries <= 0 ||
         down_weight->type != GGML_TYPE_MXFP4 ||
-        (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8)) {
+        (down_layout != GGML_LAYOUT_SOA && down_layout != GGML_LAYOUT_MXFP4_I8 &&
+         down_layout != GGML_LAYOUT_XMX_TILED)) {
         return trace_reject("args");
     }
 
@@ -19187,7 +19262,157 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
 
     sycl::event down_event;
     bool        have_down_event = false;
-    if (down_layout == GGML_LAYOUT_MXFP4_I8) {
+    if (down_layout == GGML_LAYOUT_XMX_TILED) {
+        // Single-matrix grouped-DPAS down route: reuses the exact kernel the
+        // generic dispatcher (mmvq_moe_batched_dispatch) already calls for
+        // gate/up XMX_TILED weights (mxfp4_xmx_tiled_grouped_direct_q8_sycl),
+        // against the down role's cached Q8 activation artifact -- same SOA
+        // convention (q8_nb11=q8_row_size, q8_nb12=ne11*q8_row_size) the I8
+        // arm below already reads from q8_buffer. No new kernel, no format
+        // change. On any rejection here have_down_event stays false and the
+        // function returns false below: there is no compatible fallback
+        // kernel in this file for XMX_TILED-materialized weight bytes (the
+        // I8/SOA reorder kernels below assume a different on-device layout),
+        // so falling through to them would silently read garbage.
+        const auto &  caps   = ggml_sycl_info().devices[runtime_device].xmx_caps;
+        constexpr int repeat = GGML_SYCL_MXFP4_MOE_XMX_M;
+        constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+        constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+
+        const bool grouped_shape =
+            direct_ids && ids_host != nullptr && ids_host_count == total_batches && total_batches >= exec_n &&
+            (ncols % k_per) == 0 && xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
+            xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) && caps.optimal_tiles_n > 0;
+        const int tile_n_total = caps.N * caps.optimal_tiles_n;
+        if (!grouped_shape) {
+            trace_reject("xmx-tiled-shape");
+        } else if (tile_n_total < repeat || (tile_n_total % repeat) != 0) {
+            trace_reject("xmx-tiled-tile-n-total");
+        } else {
+            static thread_local std::vector<int32_t> grouped_experts_host;
+            static thread_local std::vector<int32_t> grouped_offsets_host;
+            static thread_local std::vector<int32_t> grouped_rows_host;
+            static thread_local std::vector<int32_t> grouped_chunk_groups_host;
+            static thread_local std::vector<int32_t> grouped_chunk_starts_host;
+            std::vector<std::pair<int, int>>         chunk_passes;
+            std::vector<int32_t>                     grouped_counts_host;
+            bool                                     chunked_row_limit = false;
+
+            bool grouping_ok = mxfp4_moe_down_build_grouped_host_metadata(
+                ids_host, n_ids, n_tokens, n_experts, total_batches, exec_n, grouped_experts_host, grouped_offsets_host,
+                grouped_rows_host, grouped_chunk_groups_host, grouped_chunk_starts_host, grouped_counts_host);
+
+            if (grouping_ok) {
+                const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+                const auto   occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
+                    caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);
+                if (!occupancy.dispatch_ready) {
+                    if (mxfp4_grouped_chunk_row_limit_enabled() &&
+                        std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
+                        int       pass_begin       = 0;
+                        size_t    pass_rows        = 0;
+                        const int grouped_n_groups = static_cast<int>(grouped_experts_host.size());
+                        const int grouped_n_chunks = static_cast<int>(grouped_chunk_groups_host.size());
+                        for (int c = 0; c < grouped_n_chunks; ++c) {
+                            const int group = grouped_chunk_groups_host[static_cast<size_t>(c)];
+                            if (group < 0 || group >= grouped_n_groups) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const int row_start  = grouped_chunk_starts_host[static_cast<size_t>(c)];
+                            const int rows_begin = grouped_offsets_host[static_cast<size_t>(group)];
+                            const int rows_end   = grouped_offsets_host[static_cast<size_t>(group + 1)];
+                            const int group_rows = rows_end - rows_begin;
+                            if (row_start < 0 || row_start >= group_rows) {
+                                grouping_ok = false;
+                                break;
+                            }
+                            const size_t chunk_rows = static_cast<size_t>(std::min(exec_n, group_rows - row_start));
+                            if (pass_rows > 0 && pass_rows + chunk_rows > row_limit) {
+                                chunk_passes.emplace_back(pass_begin, c - pass_begin);
+                                pass_begin = c;
+                                pass_rows  = 0;
+                            }
+                            pass_rows += chunk_rows;
+                        }
+                        if (grouping_ok && pass_rows > 0) {
+                            chunk_passes.emplace_back(pass_begin, grouped_n_chunks - pass_begin);
+                        }
+                        chunked_row_limit = grouping_ok && !chunk_passes.empty();
+                    } else {
+                        grouping_ok = false;
+                    }
+                }
+            }
+
+            if (!grouping_ok) {
+                trace_reject("xmx-tiled-grouping");
+            } else {
+                int32_t *  grouped_experts_device      = nullptr;
+                int32_t *  grouped_offsets_device      = nullptr;
+                int32_t *  grouped_rows_device         = nullptr;
+                int32_t *  grouped_chunk_groups_device = nullptr;
+                int32_t *  grouped_chunk_starts_device = nullptr;
+                const bool alloc_ok = alloc_i32_scratch(grouped_experts_device, grouped_experts_host.size(),
+                                                        "mmvq_moe_down_xmx_tiled_grouped_experts") &&
+                                      alloc_i32_scratch(grouped_offsets_device, grouped_offsets_host.size(),
+                                                        "mmvq_moe_down_xmx_tiled_grouped_offsets") &&
+                                      alloc_i32_scratch(grouped_rows_device, grouped_rows_host.size(),
+                                                        "mmvq_moe_down_xmx_tiled_grouped_rows") &&
+                                      alloc_i32_scratch(grouped_chunk_groups_device, grouped_chunk_groups_host.size(),
+                                                        "mmvq_moe_down_xmx_tiled_grouped_chunk_groups") &&
+                                      alloc_i32_scratch(grouped_chunk_starts_device, grouped_chunk_starts_host.size(),
+                                                        "mmvq_moe_down_xmx_tiled_grouped_chunk_starts");
+                if (!alloc_ok) {
+                    trace_reject("xmx-tiled-alloc");
+                } else {
+                    std::vector<sycl::event> grouped_copy_events;
+                    grouped_copy_events.reserve(5 + dispatch_deps.size());
+                    grouped_copy_events.insert(grouped_copy_events.end(), dispatch_deps.begin(), dispatch_deps.end());
+                    grouped_copy_events.push_back(
+                        submit_memcpy_with_deps(grouped_experts_device, grouped_experts_host.data(),
+                                                grouped_experts_host.size() * sizeof(int32_t), dispatch_deps));
+                    grouped_copy_events.push_back(
+                        submit_memcpy_with_deps(grouped_offsets_device, grouped_offsets_host.data(),
+                                                grouped_offsets_host.size() * sizeof(int32_t), dispatch_deps));
+                    grouped_copy_events.push_back(submit_memcpy_with_deps(grouped_rows_device, grouped_rows_host.data(),
+                                                                          grouped_rows_host.size() * sizeof(int32_t),
+                                                                          dispatch_deps));
+                    grouped_copy_events.push_back(
+                        submit_memcpy_with_deps(grouped_chunk_groups_device, grouped_chunk_groups_host.data(),
+                                                grouped_chunk_groups_host.size() * sizeof(int32_t), dispatch_deps));
+                    grouped_copy_events.push_back(
+                        submit_memcpy_with_deps(grouped_chunk_starts_device, grouped_chunk_starts_host.data(),
+                                                grouped_chunk_starts_host.size() * sizeof(int32_t), dispatch_deps));
+
+                    const int grouped_n_chunks   = static_cast<int>(grouped_chunk_groups_host.size());
+                    auto      submit_chunk_range = [&](int chunk_begin, int chunk_count) {
+                        return mxfp4_xmx_tiled_grouped_direct_q8_sycl<repeat>(
+                            *stream, down_ptrs_device, q8_buffer, dst_d, grouped_experts_device, grouped_offsets_device,
+                            grouped_rows_device, grouped_chunk_groups_device + chunk_begin,
+                            grouped_chunk_starts_device + chunk_begin, static_cast<int>(ncols),
+                            static_cast<int>(ncols_y), static_cast<int>(nrows_per_expert), chunk_count,
+                            static_cast<int>(n_tokens), static_cast<int>(ne11), q8_row_size, ne11 * q8_row_size,
+                            down_dst->nb[1], down_dst->nb[2], grouped_copy_events, tile_n_total);
+                    };
+                    if (chunked_row_limit) {
+                        std::vector<sycl::event> chunk_events;
+                        chunk_events.reserve(chunk_passes.size());
+                        for (const auto & pass : chunk_passes) {
+                            chunk_events.push_back(submit_chunk_range(pass.first, pass.second));
+                        }
+                        down_event = ggml_sycl_submit_marker<mxfp4_xmx_tiled_grouped_chunk_join_kernel<repeat>>(
+                            *stream, chunk_events);
+                        profile_path = "down-xmx-tiled-chunked";
+                    } else {
+                        down_event   = submit_chunk_range(0, grouped_n_chunks);
+                        profile_path = "down-xmx-tiled";
+                    }
+                    have_down_event = true;
+                }
+            }
+        }
+    } else if (down_layout == GGML_LAYOUT_MXFP4_I8) {
         const auto &  caps            = ggml_sycl_info().devices[runtime_device].xmx_caps;
         constexpr int repeat          = GGML_SYCL_MXFP4_MOE_XMX_M;
         constexpr int exec_n          = GGML_SYCL_MXFP4_MOE_XMX_N;
@@ -19205,62 +19430,13 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
             static thread_local std::vector<int32_t> grouped_rows_host;
             static thread_local std::vector<int32_t> grouped_chunk_groups_host;
             static thread_local std::vector<int32_t> grouped_chunk_starts_host;
-            std::vector<std::vector<int32_t>>        grouped_slots;
             std::vector<std::pair<int, int>>         chunk_passes;
             std::vector<int32_t>                     grouped_counts_host;
             bool                                     chunked_row_limit = false;
 
-            grouped_experts_host.clear();
-            grouped_offsets_host.clear();
-            grouped_rows_host.clear();
-            grouped_chunk_groups_host.clear();
-            grouped_chunk_starts_host.clear();
-            grouped_slots.clear();
-            grouped_counts_host.clear();
-            grouped_slots.reserve(static_cast<size_t>(std::min<int64_t>(n_experts, total_batches)));
-            std::vector<int32_t> expert_to_group(static_cast<size_t>(n_experts), -1);
-
-            bool grouping_ok = true;
-            for (int64_t id = 0; id < n_ids && grouping_ok; ++id) {
-                for (int64_t iid1 = 0; iid1 < n_tokens; ++iid1) {
-                    const int64_t ci  = iid1 * n_ids + id;
-                    const int32_t eid = ids_host[ci];
-                    if (eid < 0 || eid >= n_experts) {
-                        grouping_ok = false;
-                        break;
-                    }
-                    int32_t group_index = expert_to_group[static_cast<size_t>(eid)];
-                    if (group_index < 0) {
-                        group_index                               = static_cast<int32_t>(grouped_experts_host.size());
-                        expert_to_group[static_cast<size_t>(eid)] = group_index;
-                        grouped_experts_host.push_back(eid);
-                        grouped_slots.emplace_back();
-                    }
-                    grouped_slots[static_cast<size_t>(group_index)].push_back(
-                        static_cast<int32_t>(id * n_tokens + iid1));
-                }
-            }
-
-            if (grouping_ok) {
-                grouped_offsets_host.reserve(grouped_experts_host.size() + 1);
-                grouped_offsets_host.push_back(0);
-                for (size_t g = 0; g < grouped_slots.size(); ++g) {
-                    auto & rows = grouped_slots[g];
-                    std::sort(rows.begin(), rows.end());
-                    const int rows_begin = static_cast<int>(grouped_rows_host.size());
-                    grouped_rows_host.insert(grouped_rows_host.end(), rows.begin(), rows.end());
-                    const int n_rows = static_cast<int>(rows.size());
-                    grouped_counts_host.push_back(n_rows);
-                    for (int row_start = 0; row_start < n_rows; row_start += exec_n) {
-                        grouped_chunk_groups_host.push_back(static_cast<int32_t>(g));
-                        grouped_chunk_starts_host.push_back(row_start);
-                    }
-                    grouped_offsets_host.push_back(rows_begin + n_rows);
-                }
-
-                grouping_ok = !grouped_experts_host.empty() && !grouped_chunk_groups_host.empty() &&
-                              grouped_rows_host.size() == static_cast<size_t>(total_batches);
-            }
+            bool grouping_ok = mxfp4_moe_down_build_grouped_host_metadata(
+                ids_host, n_ids, n_tokens, n_experts, total_batches, exec_n, grouped_experts_host, grouped_offsets_host,
+                grouped_rows_host, grouped_chunk_groups_host, grouped_chunk_starts_host, grouped_counts_host);
 
             if (grouping_ok) {
                 const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);

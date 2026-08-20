@@ -66312,11 +66312,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             cached_q8_needs_host_grouping ? ids_data : nullptr;
                         const int64_t down_ids_host_count_for_cached_q8 =
                             cached_q8_needs_host_grouping ? static_cast<int64_t>(ids_n_elem) : 0;
+                        // llama.cpp-y0it: decode_pair_glu_dispatched used to be set
+                        // (and this call return, below) UNCONDITIONALLY once this
+                        // whole ok_glu block was reached, regardless of whether down
+                        // was actually computed -- a refused down dispatch (missing
+                        // full_table, or the dispatcher itself rejecting for shape/
+                        // caps/alloc reasons) still marked this call "handled" and
+                        // returned, leaving pair.down_dst's output silently
+                        // uncomputed. ok_down is hoisted out of the `if
+                        // (down_full_table)` scope below so both rejection routes
+                        // (no table at all, or a rejected dispatch attempt) leave it
+                        // false. gate/up/glu are unaffected either way: their
+                        // skip-marks above already fired unconditionally on ok_glu,
+                        // so this flag change never causes them to be redispatched
+                        // -- it only decides whether THIS call's own return (which
+                        // would otherwise skip this node's normal fallback
+                        // computation) is safe to take.
+                        bool ok_down = false;
                         if (down_full_table) {
                             sycl::event down_event;
                             bool        down_event_set = false;
 
-                            bool ok_down = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
+                            ok_down = mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(
                                 ctx, pair.down_weight, pair.glu_dst, pair.down_dst, down_full_table, ids_device,
                                 static_cast<int>(gate_up_dispatch_entries), n_ids_pair, ids_device_nb0, ids_device_nb1,
                                 down_layout, decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr,
@@ -66336,7 +66353,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     pair.down_weight->name ? pair.down_weight->name : "?",
                                     ggml_sycl_layout_mode_name(down_layout));
                         }
-                        decode_pair_glu_dispatched = true;
+                        decode_pair_glu_dispatched = ok_down;
                     }
                 }
             }
