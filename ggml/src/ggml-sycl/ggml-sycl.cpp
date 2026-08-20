@@ -25980,8 +25980,15 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                 } else if (adjusted_planned == planned_layout && planned_layout != GGML_LAYOUT_AOS &&
                            // llama.cpp-sk67: XMX_TILED used to be unconditionally excluded here
                            // (down's grouped-DPAS route wasn't wired up yet). Admit it under the
-                           // same route-policy gate gate/up's own XMX_TILED admission below uses.
-                           (planned_layout != GGML_LAYOUT_XMX_TILED || ggml_sycl_xmx_moe_allow_unsafe_pp()) &&
+                           // same general route-policy gate gate/up's own XMX_TILED admission below
+                           // uses, AND (this branch is DOWN-specific -- moe_kind==MOE_TENSOR_DOWN is
+                           // the enclosing condition) the down-specific opt-out. Regression fix
+                           // (llama.cpp-sk67 C33/C34): the first commit here used only
+                           // ggml_sycl_xmx_moe_allow_unsafe_pp(), which already defaults ON for
+                           // gate/up's PP route independent of GGML_SYCL_MOE_DOWN_XMX_TILED --
+                           // GGML_SYCL_MOE_DOWN_XMX_TILED=0 could not disable this admission at all.
+                           (planned_layout != GGML_LAYOUT_XMX_TILED ||
+                            (ggml_sycl_xmx_moe_allow_unsafe_pp() && ggml_sycl_moe_down_xmx_tiled_enabled())) &&
                            ggml_sycl_moe_mmvq_batched_supports_layout(src0->type, planned_layout) &&
                            ggml_sycl_moe_planned_layout_complete(src0, device, planned_layout)) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -64713,12 +64720,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const bool gate_layout_admissible =
                 gate_layout == GGML_LAYOUT_SOA ||
                 (gate_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
-            // llama.cpp-sk67: down_layout admits XMX_TILED under the same route-policy
-            // gate gate_layout_admissible already applies to gate/up above -- the down
-            // dispatcher now has a working grouped-DPAS XMX_TILED arm (mmvq.cpp).
+            // llama.cpp-sk67: down_layout admits XMX_TILED under the same general
+            // route-policy gate gate_layout_admissible already applies to gate/up
+            // above, AND the down-specific opt-out. Regression fix (C33/C34): using
+            // only ggml_sycl_xmx_moe_allow_unsafe_pp() here left
+            // GGML_SYCL_MOE_DOWN_XMX_TILED=0 unable to disable this admission, since
+            // that flag already defaults ON for gate/up's PP route independent of
+            // the down-specific flag.
             const bool down_layout_admissible =
                 down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8 ||
-                (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+                (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp() &&
+                 ggml_sycl_moe_down_xmx_tiled_enabled());
             const bool executor_layouts_ok = gate_layout_admissible && up_layout == gate_layout &&
                                              all_layout(roles.gate, gate_layout) && all_layout(roles.up, up_layout) &&
                                              down_layout_admissible && all_layout(roles.down, down_layout);
@@ -64942,10 +64954,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // the outer executor_layouts_ok admission gate above -- this is a
                                 // second, independent gate on the same PromptExecutor and must
                                 // stay in sync with it or a widened admission still gets refused
-                                // here at preflight.
+                                // here at preflight. Regression fix (C33/C34): also requires the
+                                // down-specific opt-out, not just the general PP-XMX-TILED policy
+                                // flag (which already defaults ON for gate/up, independent of
+                                // GGML_SYCL_MOE_DOWN_XMX_TILED).
                                 const bool down_layout_admissible =
                                     down_layout == GGML_LAYOUT_SOA || down_layout == GGML_LAYOUT_MXFP4_I8 ||
-                                    (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp());
+                                    (down_layout == GGML_LAYOUT_XMX_TILED && ggml_sycl_xmx_moe_allow_unsafe_pp() &&
+                                     ggml_sycl_moe_down_xmx_tiled_enabled());
                                 const bool abi_ok = gate_layout_admissible && down_layout_admissible &&
                                                     gate_table.resolve_abi(ctx.device) &&
                                                     up_table.resolve_abi(ctx.device) &&

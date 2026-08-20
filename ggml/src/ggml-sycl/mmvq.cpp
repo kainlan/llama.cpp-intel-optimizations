@@ -19284,8 +19284,19 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
         constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
         constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
 
+        // Regression fix (llama.cpp-sk67 C33/C34): this used to require
+        // total_batches >= exec_n, copied from the I8 arm below. That floor is
+        // wrong for THIS kernel family -- the generic dispatcher's own
+        // XMX_TILED admission (mmvq_moe_batched_dispatch, ~:16610+) has no such
+        // requirement, because the grouped-DPAS kernel already masks unused
+        // lanes (lane_id[lane]=-1 for rows past a group's row_end) and the
+        // shared row-bucketing helper already emits a single partial chunk
+        // when a group has fewer than exec_n rows. At decode, total_batches
+        // (== topk) is essentially always below exec_n, so this floor made
+        // the arm reject unconditionally on every decode call once the
+        // planner started selecting XMX_TILED for down.
         const bool grouped_shape =
-            direct_ids && ids_host != nullptr && ids_host_count == total_batches && total_batches >= exec_n &&
+            direct_ids && ids_host != nullptr && ids_host_count == total_batches && total_batches > 0 &&
             (ncols % k_per) == 0 && xmx_capabilities_match_int8_tile(caps, repeat, exec_n, k_per) &&
             xmx_capabilities_support_sub_group(caps, GGML_SYCL_MXFP4_MOE_XMX_SG) && caps.optimal_tiles_n > 0;
         const int tile_n_total = caps.N * caps.optimal_tiles_n;
@@ -19311,7 +19322,20 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
                 const size_t row_limit = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
                 const auto   occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(
                     caps, grouped_counts_host.data(), grouped_counts_host.size(), row_limit);
-                if (!occupancy.dispatch_ready) {
+                // Regression fix (llama.cpp-sk67 C33/C34): mirrors the generic
+                // dispatcher's sparse_xmx_batch allowance (mmvq_moe_batched_dispatch,
+                // ~:16774), which this arm's occupancy handling was missing. "rows-
+                // per-expert" fires whenever a group's largest row count is below
+                // caps.N (guaranteed at decode -- topk rows per expert is always
+                // small) and "occupancy" fires on ordinary PP routing imbalance
+                // across 24 layers; neither is a hard kernel-capacity violation like
+                // "kernel-row-limit", so dispatching under-occupied is correct, just
+                // less SIMD-efficient. Rejecting these outright (the prior form of
+                // this check) meant every decode call failed here unconditionally
+                // and PP failed on any layer with imbalanced routing.
+                const bool sparse_xmx_batch = std::strcmp(occupancy.reason, "rows-per-expert") == 0 ||
+                                              std::strcmp(occupancy.reason, "occupancy") == 0;
+                if (!occupancy.dispatch_ready && !sparse_xmx_batch) {
                     if (mxfp4_grouped_chunk_row_limit_enabled() &&
                         std::strcmp(occupancy.reason, "kernel-row-limit") == 0 && row_limit >= exec_n) {
                         int       pass_begin       = 0;
