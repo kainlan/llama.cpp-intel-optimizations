@@ -758,10 +758,31 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
     out.batch.operands.reserve(count);
     std::vector<mem_handle> canonical_leases;
 
+    // resolver(expert_id) depends only on expert_id (plus the fixed src0/device/
+    // layout/count captured by the caller's closure) -- it is not a function of
+    // the occurrence index.  So every repeat occurrence of an expert already seen
+    // this call resolves to the identical route.  Memoize by expert_id and skip
+    // the resolver (string ops, mem_handle::resolve mutex, recipe lookup) on
+    // repeats; only the per-occurrence fields below (occurrence/token_index/
+    // slot_index) vary and are set on every iteration regardless of path taken.
+    std::unordered_map<int32_t, size_t> expert_first_index;
+    expert_first_index.reserve(count);
+
     for (size_t i = 0; i < count; ++i) {
-        const int32_t                 expert_id = out.batch.expert_ids[i];
-        moe_batch_route               route     = resolver(expert_id);
-        const moe_batch_reject_reason reject    = detail::validate_moe_batch_route(route, submit_device);
+        const int32_t expert_id = out.batch.expert_ids[i];
+
+        const auto memo = expert_first_index.find(expert_id);
+        if (memo != expert_first_index.end()) {
+            moe_resolved_operand operand = out.batch.operands[memo->second];
+            operand.occurrence           = i;
+            operand.token_index          = i / slots_per_token;
+            operand.slot_index           = i % slots_per_token;
+            out.batch.operands.push_back(std::move(operand));
+            continue;
+        }
+
+        moe_batch_route               route  = resolver(expert_id);
+        const moe_batch_reject_reason reject = detail::validate_moe_batch_route(route, submit_device);
         if (reject != moe_batch_reject_reason::NONE) {
             out.reject        = reject;
             out.occurrence    = i;
@@ -814,6 +835,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             out.batch.operands.clear();
             return out;
         }
+        expert_first_index.emplace(expert_id, out.batch.operands.size());
         out.batch.operands.push_back(std::move(operand));
     }
     return out;

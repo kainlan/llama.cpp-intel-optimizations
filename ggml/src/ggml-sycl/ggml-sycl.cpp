@@ -64334,19 +64334,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_prompt_canonical_publish_diagnostics,
                                                           "MOE-PROMPT-CANONICAL", src0, prompt_canonical_published,
                                                           prompt_published_kind, prompt_published_stable);
-        retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-            src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
-            retained_prompt_layout, /*allow_materialize=*/false);
-        if (!retained_prompt_batch_result) {
-            GGML_LOG_ERROR(
-                "[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
-                src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
-                retained_prompt_batch_result.expert_id,
-                ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
-                retained_prompt_batch_result.source_reason,
-                retained_prompt_batch_result.recipe_reason ? retained_prompt_batch_result.recipe_reason : "(unset)");
-            throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
-        }
+        // retained_prompt_batch_result's build (and the retained_prompt_groups
+        // population that depends on it) is deferred past the fused gate/up/
+        // GLU/down dispatch below -- see the comment at its new site, just
+        // after that block closes. Nothing between here and there reads
+        // either; both remain default/empty until then.
 
         // Multi-role prompt admission uses the same immutable ID snapshot, but
         // resolves each tensor independently. Role identities and layouts may
@@ -64432,23 +64424,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     };
     std::vector<const ggml_sycl::moe_resolved_operand *> retained_prompt_groups(
         static_cast<size_t>(std::max<int64_t>(0, n_experts)), nullptr);
-    if (ne12 != 1) {
-        for (const auto & operand : retained_prompt_batch_result.batch.operands) {
-            const size_t expert = static_cast<size_t>(operand.expert_id);
-            if (expert >= retained_prompt_groups.size()) {
-                throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert is out of range");
-            }
-            const auto * selected = retained_prompt_groups[expert];
-            if (selected &&
-                (!selected->lease.stable_identity_equal(operand.lease) || selected->residency != operand.residency ||
-                 selected->owning_device != operand.owning_device ||
-                 selected->actual_layout != operand.actual_layout)) {
-                throw ggml_sycl_fallback_error(
-                    "MUL_MAT_ID repeated prompt expert has conflicting retained occurrences");
-            }
-            retained_prompt_groups[expert] = &operand;
-        }
-    }
+    // Population is deferred alongside the batch build itself -- see the
+    // deferred block after the fused dispatch below. Left empty (all nullptr)
+    // here; neither this vector nor retained_prompt_batch_result is read by
+    // the fused block, and both are populated before any of their real
+    // consumers (retained_prompt_group_route_for_expert / _route_for_occurrence
+    // callers, all downstream of the fused-path early return).
     auto retained_prompt_group_route_for_expert = [&](int expert_id) -> moe_expert_route {
         if (expert_id < 0 || static_cast<size_t>(expert_id) >= retained_prompt_groups.size()) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert is out of range");
@@ -64985,6 +64966,48 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
             }
+        }
+    }
+
+    // Deferred from the top of the ne12 != 1 admission block above (see the
+    // comment there): the fused gate/up/GLU/down dispatch just above consumes
+    // retained_prompt_roles_result, never retained_prompt_batch_result, and
+    // returns on success before reaching this point -- so building src0's own
+    // batch (and the retained_prompt_groups index built from its operands)
+    // earlier was resolver work (string ops, mem_handle::resolve mutex, recipe
+    // lookup) paid on every PP call that fuses and then discarded unread.
+    // Every real consumer of either (retained_prompt_route_for_occurrence,
+    // retained_prompt_group_route_for_expert, and the unfused fallback further
+    // below) is reached only past this point, so building here -- same inputs,
+    // same admission gate -- is behavior-preserving whenever it does run.
+    if (ne12 != 1) {
+        retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+            src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
+            retained_prompt_layout, /*allow_materialize=*/false);
+        if (!retained_prompt_batch_result) {
+            GGML_LOG_ERROR(
+                "[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
+                src0->name ? src0->name : "?", retained_prompt_batch_result.occurrence,
+                retained_prompt_batch_result.expert_id,
+                ggml_sycl::moe_batch_reject_reason_name(retained_prompt_batch_result.reject),
+                retained_prompt_batch_result.source_reason,
+                retained_prompt_batch_result.recipe_reason ? retained_prompt_batch_result.recipe_reason : "(unset)");
+            throw ggml_sycl_fallback_error("MUL_MAT_ID retained prompt admission failed");
+        }
+        for (const auto & operand : retained_prompt_batch_result.batch.operands) {
+            const size_t expert = static_cast<size_t>(operand.expert_id);
+            if (expert >= retained_prompt_groups.size()) {
+                throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt expert is out of range");
+            }
+            const auto * selected = retained_prompt_groups[expert];
+            if (selected &&
+                (!selected->lease.stable_identity_equal(operand.lease) || selected->residency != operand.residency ||
+                 selected->owning_device != operand.owning_device ||
+                 selected->actual_layout != operand.actual_layout)) {
+                throw ggml_sycl_fallback_error(
+                    "MUL_MAT_ID repeated prompt expert has conflicting retained occurrences");
+            }
+            retained_prompt_groups[expert] = &operand;
         }
     }
 
