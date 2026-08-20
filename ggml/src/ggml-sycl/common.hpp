@@ -1451,9 +1451,28 @@ struct layout_policy {
             const char * env        = std::getenv("GGML_SYCL_SKIP_ONEDNN_Q4_0");
             skip_onednn_q4_0_cached = (env && std::atoi(env) != 0) ? 1 : 0;
         }
+        // llama.cpp-e3xj (2026-08-19): Q8_0 dense projections (ATTENTION/FFN/
+        // OUTPUT weights) were unconditionally COALESCED, but
+        // pick_kernel_for_layout's COALESCED case (ggml-sycl.cpp) has no
+        // oneDNN arm -- a COALESCED batch always lands on MMQ_COALESCED
+        // (measured ~3 TFLOPS) instead of the oneDNN jit:gemm arm that AOS
+        // batches unlock for PP (~3x faster; see pick_kernel_for_layout's
+        // ONEDNN_AOS comment). Route Q8_0 dense weights AOS instead so PP
+        // reaches that arm; TG moves from DMMV/MMVQ_COALESCED to MMVQ_AOS.
+        // The owner single-layout rule means this one layout must serve both
+        // axes, hence the opt-out escape while TG is A/B-tested as the
+        // acceptance gate: GGML_SYCL_Q8_DENSE_AOS=0 restores COALESCED.
+        static int q8_dense_aos_cached = -1;
+        if (q8_dense_aos_cached < 0) {
+            const char * env    = std::getenv("GGML_SYCL_Q8_DENSE_AOS");
+            q8_dense_aos_cached = (env && std::atoi(env) == 0) ? 0 : 1;  // Default ON
+        }
         if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT) {
             if (skip_onednn_q4_0_cached && qtype == GGML_TYPE_Q4_0) {
                 return GGML_LAYOUT_SOA;
+            }
+            if (qtype == GGML_TYPE_Q8_0 && q8_dense_aos_cached) {
+                return GGML_LAYOUT_AOS;
             }
             if (is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
@@ -1463,6 +1482,9 @@ struct layout_policy {
         // Output projection weights are consumed by MUL_MAT in decode; keep
         // them on matmul-optimized layouts instead of embedding-safe layouts.
         if (usage == tensor_usage::OUTPUT_WEIGHT) {
+            if (qtype == GGML_TYPE_Q8_0 && q8_dense_aos_cached) {
+                return GGML_LAYOUT_AOS;
+            }
             if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
             }
