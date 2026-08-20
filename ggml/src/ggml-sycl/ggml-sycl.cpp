@@ -55388,7 +55388,17 @@ static constexpr ggml_sycl_mul_mat_kernel k_mul_mat_priority[] = {
 
     ggml_sycl_mul_mat_kernel::MMVQ_COALESCED, ggml_sycl_mul_mat_kernel::MMVQ_SOA,
     ggml_sycl_mul_mat_kernel::MMVQ_AOS,       ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED,
-    ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS,   ggml_sycl_mul_mat_kernel::MMQ_COALESCED,
+    ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS,
+    // ONEDNN_COALESCED must precede MMQ_COALESCED here: this priority list, not
+    // pick_kernel_for_layout, is what ggml_sycl_mul_mat's default (non-forced-layout,
+    // non-layout-mismatched) call site actually consults -- ggml_sycl_select_preferred_kernel()
+    // returns the first eligible entry and UnifiedMatmulOrchestrator::select() takes that
+    // via set_decision()+return before pick_kernel_for_layout is ever reached, for any weight
+    // whose resolved layout already matches the returned kernel's layout (the common case for
+    // a COALESCED-materialized Q8_0 weight). MMQ_COALESCED was unconditionally eligible for
+    // Q8_0 and preceded ONEDNN_AOS (last entry), which is why the arm never fired (llama.cpp-e3xj).
+    ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED,
+    ggml_sycl_mul_mat_kernel::MMQ_COALESCED,
     ggml_sycl_mul_mat_kernel::MMQ_SOA,        ggml_sycl_mul_mat_kernel::MMQ_AOS,
     ggml_sycl_mul_mat_kernel::ONEDNN_AOS,
 };
@@ -56201,6 +56211,10 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
             } else if (ggml_sycl::onednn_woq::supports_dequant_fp16(src0->type)) {
                 decision.onednn_path = OneDnnPath::DequantFp16;
             }
+        } else if (kernel == ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED) {
+            // Diagnostic only (matches ONEDNN_AOS above) -- dispatch does its own
+            // independent GGML_LAYOUT_COALESCED weight lookup regardless of this field.
+            decision.onednn_path = OneDnnPath::DequantFp16;
         }
     };
 
