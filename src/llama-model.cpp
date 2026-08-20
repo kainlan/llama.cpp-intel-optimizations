@@ -277,10 +277,34 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             max_weight_slot = std::max(max_weight_slot, llama_model_sycl_align_up(k * n * sizeof(ggml_fp16_t), 256));
         }
         if (max_weight_slot > 0 && max_k > 0 && max_n > 0) {
-            constexpr uint32_t pp_moe_onednn_ring_depth = 1;
-            const size_t       max_rows = static_cast<size_t>(inventory.n_ubatch) *
-                                          static_cast<size_t>(hparams.n_expert_used);
-            inventory.pp_moe_onednn_weight_slot_bytes = max_weight_slot;
+            constexpr uint32_t pp_moe_onednn_ring_depth     = 1;
+            // The batched PP MoE oneDNN executor (try_pp_mxfp4_soa_onednn_f16_batched,
+            // ggml-sycl.cpp) requests scratch sized for every expert active in a
+            // single dispatch, not one -- active_count is bounded by n_expert, not
+            // n_expert_used (llama.cpp-dboi; f2bdfbffe made admission fail-closed,
+            // so an under-sized plan now refuses every real dispatch instead of
+            // silently growing the zone; moe-scratch-admission.hpp's own docstring
+            // cites the exact GPT-OSS case this fixes). Size the weight slot for
+            // the worst case: every expert resident at once. ~n_expert x
+            // per-expert fp16 bytes -- 506 MB for GPT-OSS 20B -- a VRAM tradeoff
+            // measured on hardware before the executor's default is flipped on.
+            const size_t       per_expert_weight_slot_bytes = max_weight_slot;
+            const size_t       worst_case_active_experts    = static_cast<size_t>(hparams.n_expert);
+            inventory.pp_moe_onednn_weight_slot_bytes       = per_expert_weight_slot_bytes * worst_case_active_experts;
+
+            // Activation/output slots are allocated RECTANGULARLY by the executor:
+            // max_rows_per_expert (the busiest active expert's row count) times
+            // active_count (how many distinct experts are active at all). A
+            // uniform split would total n_ubatch * n_expert_used rows, but
+            // routing need not be uniform: a token's n_expert_used picks are
+            // distinct experts, so any single expert can independently hold up to
+            // n_ubatch rows (one per token) while up to n_expert-1 other experts
+            // still count toward active_count with as little as one row each.
+            // The executor's true worst case is therefore one expert holding all
+            // n_ubatch rows times n_expert active experts, i.e. n_ubatch *
+            // n_expert -- which can exceed n_ubatch * n_expert_used by up to
+            // n_expert / n_expert_used (8x for GPT-OSS 20B, 32/4). Size for that.
+            const size_t max_rows = static_cast<size_t>(inventory.n_ubatch) * static_cast<size_t>(hparams.n_expert);
             inventory.pp_moe_onednn_activation_slot_bytes =
                 llama_model_sycl_align_up(max_rows * max_k * sizeof(ggml_fp16_t), 256);
             inventory.pp_moe_onednn_output_slot_bytes =
