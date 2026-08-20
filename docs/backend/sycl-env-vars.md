@@ -26,6 +26,7 @@ before treating any result as an active setting.
 | `GGML_SYCL_DISABLE_GRAPH=1` | OFF | Disable SYCL graph replay (minimal TG impact ~3%, mainly helps PP) |
 | `GGML_SYCL_ONEDNN_PP=0` | ON | Disable oneDNN for prompt processing |
 | `GGML_SYCL_UNIFIED_FORCE_LEGACY=1` | OFF | Force legacy kernel dispatch (skip unified kernel) |
+| `GGML_SYCL_XMX_TILED_PP=0` | ON | Disable the XMX_TILED grouped-DPAS PP route for MXFP4 gate/up (falls back to SOA at PP). Productized 2026-08-17 (llama.cpp-rzy7) from the verified diagnostic state (llama.cpp-e3xj): pp512 461±16 B70 / 149.9±0.9 B50, gates pass, TG neutral-positive, zero UR errors. The older `GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP=0` / `GGML_SYCL_XMX_MOE_PP=0` names are still honored as a compatibility opt-out when this variable is unset — despite the "unsafe" name, neither is a diagnostic-only knob anymore. Does not affect the separate `GGML_SYCL_XMX_MOE` prompt-XMX-forced diagnostic path. |
 
 `GGML_SYCL_DISABLE_GRAPH` controls graph replay, not graph-compute concurrency.
 The graph-compute mutex is process-global, but does not universally serialize

@@ -23803,6 +23803,9 @@ static bool ggml_sycl_xmx_tiled_enabled_for_device(int device_id) {
 #endif
 }
 
+// Kept as its own two-arg helper (rather than folded into the accessor below)
+// because tests/test-sycl-layout-choice.cpp exercises this exact default-false,
+// two-name-legacy-lookup shape directly through the ggml_sycl:: test wrapper.
 static bool ggml_sycl_xmx_moe_allow_unsafe_pp_from_env(const char * unsafe_env, const char * legacy_env) {
     if (unsafe_env) {
         return std::atoi(unsafe_env) != 0;
@@ -23813,9 +23816,27 @@ static bool ggml_sycl_xmx_moe_allow_unsafe_pp_from_env(const char * unsafe_env, 
     return false;
 }
 
+// llama.cpp-rzy7: the XMX_TILED grouped-DPAS PP route for MXFP4 gate/up is the
+// production PP route (measured llama.cpp-e3xj 2026-08-17: pp512 461+/-16 B70
+// / 149.9+/-0.9 B50, gates pass, TG neutral-positive, zero UR errors) and is
+// now ON BY DEFAULT. GGML_SYCL_XMX_TILED_PP=0 is the opt-out. The older
+// GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP / GGML_SYCL_XMX_MOE_PP names remain
+// honored as a compatibility fallback when the new variable is unset, each
+// still able to opt out explicitly with "0" -- only when all three are unset
+// does the route default on.
 static bool ggml_sycl_xmx_moe_allow_unsafe_pp() {
-    static const bool allow = ggml_sycl_xmx_moe_allow_unsafe_pp_from_env(
-        std::getenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP"), std::getenv("GGML_SYCL_XMX_MOE_PP"));
+    static const bool allow = [] {
+        if (const char * tiled_env = std::getenv("GGML_SYCL_XMX_TILED_PP")) {
+            return std::atoi(tiled_env) != 0;
+        }
+        if (const char * unsafe_env = std::getenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP")) {
+            return std::atoi(unsafe_env) != 0;
+        }
+        if (const char * legacy_env = std::getenv("GGML_SYCL_XMX_MOE_PP")) {
+            return std::atoi(legacy_env) != 0;
+        }
+        return true;
+    }();
     return allow;
 }
 

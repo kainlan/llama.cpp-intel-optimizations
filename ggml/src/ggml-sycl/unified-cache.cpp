@@ -20937,6 +20937,28 @@ static bool planner_moe_xmx_tiled_pp_proof_enabled() {
     return enabled;
 }
 
+// llama.cpp-rzy7: mirrors ggml_sycl_xmx_moe_allow_unsafe_pp() in ggml-sycl.cpp
+// (not visible from this TU, so replicated rather than shared). The XMX_TILED
+// grouped-DPAS PP route for MXFP4 gate/up is default ON (measured
+// llama.cpp-e3xj 2026-08-17); GGML_SYCL_XMX_TILED_PP=0 opts out, and the older
+// GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP / GGML_SYCL_XMX_MOE_PP names are honored as
+// a compatibility fallback when the new variable is unset.
+static bool planner_xmx_tiled_pp_route_active() {
+    static const bool active = [] {
+        if (const char * tiled_env = std::getenv("GGML_SYCL_XMX_TILED_PP")) {
+            return std::atoi(tiled_env) != 0;
+        }
+        if (const char * unsafe_env = std::getenv("GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP")) {
+            return std::atoi(unsafe_env) != 0;
+        }
+        if (const char * legacy_env = std::getenv("GGML_SYCL_XMX_MOE_PP")) {
+            return std::atoi(legacy_env) != 0;
+        }
+        return true;
+    }();
+    return active;
+}
+
 static bool planner_moe_xmx_moe_forced_from_env(const char * env) {
     return env != nullptr && std::atoi(env) != 0;
 }
@@ -21526,7 +21548,13 @@ static bool planner_moe_layout_needs_pp_soa_on_device(const placement_entry &   
         if (single_xmx.accepted) {
             return false;
         }
-        if (!planner_moe_xmx_tiled_pp_proof_enabled()) {
+        // llama.cpp-rzy7: a duplicate SOA reservation alongside an XMX_TILED
+        // primary violates the single-layout-owner ruling (2026-08-17) once
+        // the XMX_TILED PP route is the one that will actually run at PP --
+        // which is now the default (planner_xmx_tiled_pp_route_active()).
+        // GGML_SYCL_XMX_TILED_PP_PROOF remains honored as an explicit
+        // diagnostic override but is no longer required to reach this branch.
+        if (!planner_xmx_tiled_pp_route_active() && !planner_moe_xmx_tiled_pp_proof_enabled()) {
             return true;
         }
         return !pp_supported;
