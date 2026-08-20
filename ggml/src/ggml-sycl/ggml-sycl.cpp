@@ -25711,13 +25711,17 @@ static bool moe_aggressive_partial_tg_xmx_tiled_env_enabled() {
 static bool ggml_sycl_moe_down_xmx_tiled_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_DOWN_XMX_TILED");
-        // llama.cpp-sk67: default flipped ON now that the down dispatcher has a
-        // working XMX_TILED grouped-DPAS arm (mmvq.cpp,
-        // mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4). Was OFF+non-
-        // functional (the dispatcher's entry guard rejected XMX_TILED
-        // outright); now ON+functional. Explicit GGML_SYCL_MOE_DOWN_XMX_TILED=0
-        // still opts out.
-        return !env || std::atoi(env) != 0;
+        // llama.cpp-sk67: the down dispatcher has a working XMX_TILED
+        // grouped-DPAS arm (mmvq.cpp,
+        // mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4), but the route
+        // is DEFAULT OFF: C33 measured B50 pp512 194->104 and tg128 32->8.1
+        // with it on, because the cached Q8 GLU artifact writers tag
+        // cache.layout=SOA and the exact-match admission rejects XMX_TILED
+        // down consumers (llama.cpp-y0it c-icix), dropping those layers onto
+        // the worst unfused+requantize path. Until the artifact layout-tag
+        // compatibility lands, GGML_SYCL_MOE_DOWN_XMX_TILED=1 is the opt-in
+        // for testing that fix.
+        return env && std::atoi(env) != 0;
     }();
     return enabled || moe_grouped_decode_candidate_env_enabled();
 }
