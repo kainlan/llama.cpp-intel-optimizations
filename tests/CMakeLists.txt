@@ -376,12 +376,11 @@ endif()
 # cached, so the second call is cheap, and it creates the target locally so
 # it can be linked here. Exit codes: 0 = supported & numerics match (rel err
 # <= 2e-2), 42 = primitive creation refused (documented RED outcome), 1 =
-# wrong numerics, 77 = no GPU (inherited SKIP_RETURN_CODE from
-# llama_build_and_test).
+# wrong numerics, 43 = dnnl runtime error after primitive creation, 77 = no
+# GPU (inherited SKIP_RETURN_CODE from llama_build_and_test).
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-onednn-woq-mxfp4.cpp)
     set_tests_properties(test-onednn-woq-mxfp4 PROPERTIES LABELS "sycl;onednn;woq;mxfp4;tdd")
-    target_include_directories(test-onednn-woq-mxfp4 PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     if (TARGET IntelSYCL::SYCL_CXX)
         target_link_libraries(test-onednn-woq-mxfp4 PRIVATE IntelSYCL::SYCL_CXX)
     else()
