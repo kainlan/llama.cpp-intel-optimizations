@@ -825,3 +825,15 @@ scripts/bench-guard.sh --log artifacts/perf-recovery/e2e-b70.log -- env ONEAPI_D
 **Observed success:** `e2e-b50.log` header `# bench-guard: VALID` with pp512 ≥ **863** and tg128 ≥ **34.5** at default env; `e2e-b70.log` VALID with ≥ D3-derived thresholds; both gates emit their exact digit strings; Mistral rows at/above the baselines doc; `GGML_SYCL:BOOL=ON`. The lead records all figures in `docs/backend/sycl-perf-baselines.md` and closes the epic with the numbers table.
 
 Automated tests passing is necessary but NOT sufficient — this section is the gate.
+
+---
+
+## Amendment 1 — Option T (2026-08-21 evening, lead decision under the approved autonomy)
+
+**What changed:** Track B's route-table design and the policy's SOA layout demotion are superseded by measurement. The full evidence chain lives on llama.cpp-d0bp (c-kobw) and llama.cpp-1tjn.
+
+**Findings that forced it:** (1) modern decode dispatch is already decision-free per token — the per-op resolution the route table targeted is memoized upstream (census v2); (2) the decode host time was in-order submission backpressure, not dispatch cost (segment probe S1-S4 + zero unconditional waits in the hot functions); (3) the real regression is kernel-variant selection: the policy's SOA demotion starved the proven tiled-DPAS gate/up decode kernel (device events: 5.53 ms/token tiled vs 12.26 plain-SOA vs 25.8 for the never-before-measured SOA-native direct-xmx, which is hereby dead); (4) the baseline's simultaneous 909/35.2 relied on pre-single-layout duplicate materializations.
+
+**Option T, the single-layout-compliant resolution:** gate/up keep the DEFAULT XMX_TILED materialization on both phases (decode: proven DPAS kernel; PP: the batched WOQ executor gains a tiled→WOQ repack — new task C2b, llama.cpp-ntfx — at the same ~133 MB/pass cost as the SOA repack). Down keeps SOA under the policy (banked batched-PP win; its ~1 ms/token decode delta vs baseline's partial-i8 stays in llama.cpp-d0bp's continuing scope). The common.hpp policy demotion is REVERTED; the policy touches PP dispatch steering only.
+
+**Task impact:** B3 completes as (diagnosis chain + env-gated direct-xmx eligibility restoration + the demotion revert); B4's ids event-chaining is DOWN-SCOPED to cleanup priority (S1 measured 66 µs/call — real but small); C3 consumes two repack sources (tiled for gate/up, SOA for down) and depends on C2b; B5's tg bar unchanged (≥34.5) but its attainment now routes through d0bp's default-decode work (default tg 31.6 vs baseline 35.2 is a policy-independent gap: baseline's partial-i8 down + variant differences).
