@@ -4972,8 +4972,10 @@ static void ggml_sycl_invalidate_moe_layout_caches(ggml_tensor_extra_gpu * extra
 // GGML_SYCL_MOE_ROUTE_TABLE_DEBUG=1 knob, and are removed in the same commit
 // that wires the real site once the census names it.
 struct moe_decode_route_census {
-    std::atomic<uint64_t> raw_resolve_calls{ 0 };      // ggml_sycl_resolve_moe_expert_route() entries (any caller)
-    std::atomic<uint64_t> ptr_table_entry_calls{ 0 };  // ggml_sycl_update_moe_ptr_table() entries
+    std::atomic<uint64_t> mul_mat_id_calls{ 0 };   // ggml_sycl_mul_mat_id() entries, unconditional (v2 print trigger)
+    std::atomic<uint64_t> ne12_eq1_calls{ 0 };     // ...of which decode (ne12==1)
+    std::atomic<uint64_t> raw_resolve_calls{ 0 };  // ggml_sycl_resolve_moe_expert_route() entries (any caller)
+    std::atomic<uint64_t> ptr_table_entry_calls{ 0 };  // ggml_sycl_update_moe_ptr_table() entries (any caller)
     std::atomic<uint64_t> ptr_table_plan_branch_entries{
         0
     };  // ...needed-expert loop, plan_active && !exact_layout_required
@@ -4982,9 +4984,12 @@ struct moe_decode_route_census {
     std::atomic<uint64_t> pair_glu_block_entered{ 0 };        // RESTORE-T1 decode_pair_glu outer gate true
     std::atomic<uint64_t> pair_glu_topology_ok{ 0 };          // ...decode_pair_topology_ok true
     std::atomic<uint64_t> pair_glu_full_gpu_cover{ 0 };       // ...full_gpu_cover true (fused dispatch actually taken)
+    std::atomic<uint64_t> pair_glu_ptr_table_rebuild_attempts{
+        0
+    };  // ...gate/up/down ggml_sycl_update_moe_ptr_table() calls, scoped to THIS block
     std::atomic<uint64_t> decode_admission_calls{
         0
-    };  // the UNCONDITIONAL ne12==1 ggml_sycl_build_moe_resolved_batch call
+    };  // v1's suspect site: the UNCONDITIONAL ne12==1 ggml_sycl_build_moe_resolved_batch call, proven dead by lead
 };
 
 static moe_decode_route_census g_moe_decode_route_census;
@@ -4997,24 +5002,23 @@ static bool moe_decode_route_census_enabled() {
     return enabled;
 }
 
-// Printed once per 100 decode admissions (site guaranteed to fire exactly
-// once per ne12==1 mul_mat_id dispatch, unlike the other sites which may not
-// engage at all -- that non-engagement is precisely what this census is
-// checking for).
+// Called from ggml_sycl_mul_mat_id's entry, gated by the caller to fire
+// every 200th call -- the real function entry, counted regardless of which
+// internal branch/early-return the call takes (v1's decode_admission_calls
+// trigger sat on a site the team lead proved dead on the production decode
+// path).
 static void moe_decode_route_census_maybe_print() {
     if (!moe_decode_route_census_enabled()) {
         return;
     }
-    const uint64_t n = g_moe_decode_route_census.decode_admission_calls.load(std::memory_order_relaxed);
-    if (n == 0 || n % 100 != 0) {
-        return;
-    }
     fprintf(
         stderr,
-        "[MOE-ROUTE-CENSUS] decode_admission_calls=%llu raw_resolve_calls=%llu ptr_table_entry_calls=%llu "
-        "ptr_table_plan_branch_entries=%llu ptr_table_route_table_hits=%llu ptr_table_route_table_stored=%llu "
-        "pair_glu_block_entered=%llu pair_glu_topology_ok=%llu pair_glu_full_gpu_cover=%llu\n",
-        (unsigned long long) n,
+        "[MOE-ROUTE-CENSUS] mul_mat_id_calls=%llu ne12_eq1_calls=%llu raw_resolve_calls=%llu "
+        "ptr_table_entry_calls=%llu ptr_table_plan_branch_entries=%llu ptr_table_route_table_hits=%llu "
+        "ptr_table_route_table_stored=%llu pair_glu_block_entered=%llu pair_glu_topology_ok=%llu "
+        "pair_glu_full_gpu_cover=%llu pair_glu_ptr_table_rebuild_attempts=%llu decode_admission_calls=%llu\n",
+        (unsigned long long) g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed),
+        (unsigned long long) g_moe_decode_route_census.ne12_eq1_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.raw_resolve_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.ptr_table_entry_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.ptr_table_plan_branch_entries.load(std::memory_order_relaxed),
@@ -5022,7 +5026,10 @@ static void moe_decode_route_census_maybe_print() {
         (unsigned long long) g_moe_decode_route_census.ptr_table_route_table_stored.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.pair_glu_block_entered.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.pair_glu_topology_ok.load(std::memory_order_relaxed),
-        (unsigned long long) g_moe_decode_route_census.pair_glu_full_gpu_cover.load(std::memory_order_relaxed));
+        (unsigned long long) g_moe_decode_route_census.pair_glu_full_gpu_cover.load(std::memory_order_relaxed),
+        (unsigned long long) g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.load(
+            std::memory_order_relaxed),
+        (unsigned long long) g_moe_decode_route_census.decode_admission_calls.load(std::memory_order_relaxed));
 }
 
 namespace ggml_sycl {
@@ -64473,6 +64480,16 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
+    // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
+    // entry, counted regardless of which internal branch/early-return this
+    // call takes. The v1 census's print trigger sat at the ne12==1
+    // fallback admission (~line 66936 pre-rework), which the team lead
+    // proved is DEAD on the production decode path -- the decode-fused
+    // RESTORE-T1 pair-GLU block dispatches and returns before reaching it.
+    g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
+    if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
+        moe_decode_route_census_maybe_print();
+    }
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
     // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
@@ -64667,6 +64684,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
     const ggml_tensor * ids = dst->src[2];
     GGML_TENSOR_BINARY_OP_LOCALS
+    if (ne12 == 1) {
+        // llama.cpp-1tjn (B3 rework census v2, temporary): decode share of
+        // mul_mat_id_calls.
+        g_moe_decode_route_census.ne12_eq1_calls.fetch_add(1, std::memory_order_relaxed);
+    }
     const void * src0_host_storage = ggml_sycl_host_data(src0);
     const void * src1_host_storage = ggml_sycl_host_data(src1);
     const char * src1_device_base  = static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
@@ -66361,6 +66383,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             const bool host_resident_gate =
                                 ggml_sycl_is_host_resident_weight(pair.gate_weight, ctx.stream());
                             sycl::event gate_table_event;
+                            // llama.cpp-1tjn (B3 rework census v2, temporary).
+                            g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
+                                1, std::memory_order_relaxed);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.gate_weight, ids, pair_layout,
                                                                &gate_table_event, moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -66390,6 +66415,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             const bool host_resident_up =
                                 ggml_sycl_is_host_resident_weight(pair.up_weight, ctx.stream());
                             sycl::event up_table_event;
+                            // llama.cpp-1tjn (B3 rework census v2, temporary).
+                            g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
+                                1, std::memory_order_relaxed);
                             if (ggml_sycl_update_moe_ptr_table(ctx, pair.up_weight, ids, pair_layout, &up_table_event,
                                                                moe_ptr_table_coverage::FULL_TABLE,
                                                                /*ids_host_override=*/nullptr,
@@ -66635,6 +66663,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 const bool host_resident_down =
                                     ggml_sycl_is_host_resident_weight(pair.down_weight, ctx.stream());
                                 sycl::event down_table_event;
+                                // llama.cpp-1tjn (B3 rework census v2, temporary).
+                                g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.fetch_add(
+                                    1, std::memory_order_relaxed);
                                 if (ggml_sycl_update_moe_ptr_table(ctx, pair.down_weight, ids, down_layout,
                                                                    &down_table_event,
                                                                    moe_ptr_table_coverage::FULL_TABLE,
@@ -66941,12 +66972,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // slices here before the non-materializing retained resolver runs.
     ggml_sycl::moe_resolved_batch_result retained_decode_batch_result;
     if (ne12 == 1) {
-        // llama.cpp-1tjn (B3 rework census, temporary): the UNCONDITIONAL
-        // per-token decode admission -- fires once per ne12==1 mul_mat_id
-        // dispatch, no cache/memoization guarding it. Also the print trigger
-        // for the whole census (see moe_decode_route_census_maybe_print).
+        // llama.cpp-1tjn (B3 rework census v2, temporary): proven DEAD on the
+        // production decode path by the team lead (the decode-fused
+        // RESTORE-T1 pair-GLU block dispatches and returns before reaching
+        // here) -- kept as a counter so the census can confirm it stays
+        // near zero, but no longer the print trigger; see the entry counter
+        // at ggml_sycl_mul_mat_id's top instead.
         g_moe_decode_route_census.decode_admission_calls.fetch_add(1, std::memory_order_relaxed);
-        moe_decode_route_census_maybe_print();
         ctx.moe_graphs_disabled_once = true;
         int        published_kind      = -1;
         bool       published_stable    = false;
