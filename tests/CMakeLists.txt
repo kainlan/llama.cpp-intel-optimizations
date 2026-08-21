@@ -340,6 +340,27 @@ llama_build_and_test(test-archs-table.cpp)
 llama_build_and_test(test-sycl-moe-mmvq-tables.cpp)
 set_tests_properties(test-sycl-moe-mmvq-tables PROPERTIES LABELS "sycl;moe;source;hostonly")
 
+# MoE route-table stamp: pure invalidation-decision logic (perf-recovery epic,
+# track B, llama.cpp-s6ac). No device or oneDNN dependency in the tested
+# portion -- see ggml-sycl/moe-route-table.hpp. The header's only backend
+# include is mem-handle.hpp, which pulls in <sycl/sycl.hpp>, so (unlike
+# test-sycl-moe-mmvq-tables.cpp above) this target needs the SYCL include dir
+# and -fsycl even though the tested logic itself touches no device -- mirrors
+# test-unified-cache-unpin-event's minimal-dependency pattern below, but links
+# no backend library since the header's inline function is self-contained.
+llama_build_and_test(test-sycl-route-table-stamp.cpp)
+set_tests_properties(test-sycl-route-table-stamp PROPERTIES LABELS "sycl;moe;route-table")
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    target_include_directories(test-sycl-route-table-stamp PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-route-table-stamp PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-route-table-stamp PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-route-table-stamp PRIVATE "-fsycl")
+        target_link_options(test-sycl-route-table-stamp PRIVATE "-fsycl")
+    endif()
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
