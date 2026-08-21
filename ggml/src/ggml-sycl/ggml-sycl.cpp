@@ -64511,6 +64511,32 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
     }
 }
 
+// llama.cpp-1tjn (Option T follow-up, perf-recovery track B, 2026-08-21): the
+// PP oneDNN-batched route steering (three call sites below) may claim an
+// MXFP4 gate/up/down op away from its default executor only when that op's
+// PLANNED layout is actually GGML_LAYOUT_SOA -- what the batched executor's
+// fused lambda and its per-expert staging fallback both consume. Under
+// Option T, gate/up stay XMX_TILED-planned even when the policy is selected
+// (only down still plans SOA); a layout-blind claim here steered gate/up
+// into the legacy per-expert staging path, which dequants an XMX_TILED
+// weight pointer with SOA-shaped math and silently produced garbage weights
+// -- the GPT-OSS chat gate degraded from "1, 2, 3, 4, 5" to "We can. The
+// function..." with rc=0 and a VALID-stamped log (wrong tokens, not a
+// crash). This is the single shared predicate all three sites must use
+// instead of testing the route policy alone.
+static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
+    if (!weight || weight->type != GGML_TYPE_MXFP4 || !ggml_sycl_moe_pp_onednn_batched_route_selected()) {
+        return false;
+    }
+    const moe_tensor_type role = moe_classify_tensor(weight->name ? weight->name : "");
+    if (role != MOE_TENSOR_GATE && role != MOE_TENSOR_UP && role != MOE_TENSOR_DOWN) {
+        return false;
+    }
+    layout_mode planned_layout = GGML_LAYOUT_AOS;
+    return ggml_sycl_moe_tensor_plan_primary_layout(weight, device, &planned_layout) &&
+           planned_layout == GGML_LAYOUT_SOA;
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
@@ -64951,7 +64977,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // the retained unfused flow and reaches the batched executor
     // (try_pp_mxfp4_soa_onednn_f16_batched) below. Decode (ne12 == 1) is
     // untouched -- the batched route is PP-only.
-    const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_route_selected();
+    // llama.cpp-1tjn (Option T follow-up): must decline ONLY when this op is
+    // actually claimed (SOA-planned) -- under Option T gate/up stay
+    // XMX_TILED-planned even with the policy selected, and the fused tiled
+    // executor here is their CORRECT path, not the batched one.
+    const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     if (cpu_tg_candidate && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         fprintf(stderr,
                 "[MOE-PP-FUSION-GATE] tensor=%s ne12=%lld xmx_moe_forced=%d pp_onednn_batched_route=%d "
@@ -66128,12 +66158,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // primaries satisfy the batched route. Decode (ne12 == 1) is
                 // untouched -- MMVQ remains the decode route for SOA-planned
                 // weights.
-                const moe_tensor_type probe_moe_kind = moe_classify_tensor(src0->name);
-                const bool            pp_onednn_batched_claims_op =
-                    ne12 > 1 && src0->type == GGML_TYPE_MXFP4 &&
-                    (probe_moe_kind == MOE_TENSOR_GATE || probe_moe_kind == MOE_TENSOR_UP ||
-                     probe_moe_kind == MOE_TENSOR_DOWN) &&
-                    ggml_sycl_moe_pp_onednn_batched_route_selected();
+                // llama.cpp-1tjn (Option T follow-up): claim only when this
+                // op's PLANNED layout is actually SOA -- under Option T
+                // gate/up plan XMX_TILED even with the policy selected, and
+                // must stay on their normal (tiled) route, not fall through
+                // to the batched executor's SOA-only staging fallback.
+                const bool pp_onednn_batched_claims_op =
+                    ne12 > 1 && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
                 if (pp_onednn_batched_claims_op && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> pp_batched_probe_skip_log{ 0 };
                     if (pp_batched_probe_skip_log.fetch_add(1, std::memory_order_relaxed) < 96) {
@@ -67425,12 +67456,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Plans with host-resident experts keep hybrid via plan_hybrid regardless
     // (the batched executor requires every active expert local anyway and
     // rejects into its staging fallback otherwise).
-    const moe_tensor_type prompt_route_moe_kind = src0 ? moe_classify_tensor(src0->name) : MOE_TENSOR_UNKNOWN;
-    const bool            pp_onednn_batched_route_claims_prompt =
-        prompt_batch && src0 && src0->type == GGML_TYPE_MXFP4 &&
-        (prompt_route_moe_kind == MOE_TENSOR_GATE || prompt_route_moe_kind == MOE_TENSOR_UP ||
-         prompt_route_moe_kind == MOE_TENSOR_DOWN) &&
-        ggml_sycl_moe_pp_onednn_batched_route_selected();
+    // llama.cpp-1tjn (Option T follow-up): claim only when this op's PLANNED
+    // layout is actually SOA -- under Option T gate/up plan XMX_TILED even
+    // with the policy selected and must keep their normal prompt route.
+    const bool pp_onednn_batched_route_claims_prompt =
+        prompt_batch && ggml_sycl_moe_pp_onednn_batched_claims_tensor(src0, ctx.device);
     const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&
                                             !exact_layout_override && !pp_onednn_batched_route_claims_prompt;
     const bool selected_hybrid_route = has_placement_plan ?
