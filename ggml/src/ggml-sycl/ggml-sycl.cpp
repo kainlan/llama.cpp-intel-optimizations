@@ -64553,7 +64553,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // v2 census proved decode dispatch is already decision-free (route
     // resolution is a one-time startup cost, not a per-token one). Stays in
     // scope for the whole function body; only accumulated for ne12==1.
-    const auto t_mul_mat_id_entry = std::chrono::steady_clock::now();
+    // llama.cpp-1tjn (spec-review fix): gate collection itself, not just the
+    // print -- default env must pay zero clock reads/fetch_adds for this.
+    const bool b3_segment_timing_enabled = moe_decode_route_census_enabled();
+    const auto t_mul_mat_id_entry =
+        b3_segment_timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
     // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
@@ -66326,8 +66330,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // llama.cpp-1tjn (B3 rework census v3, temporary): S1 = entry through
     // ids host-available (the ggml_sycl_copy_ids_to_host block above, plus
     // the g_moe_layer_ids_cache reuse check and everything preceding it).
-    const auto t_s1_ids_ready = std::chrono::steady_clock::now();
-    if (ne12 == 1) {
+    if (b3_segment_timing_enabled && ne12 == 1) {
+        const auto t_s1_ids_ready = std::chrono::steady_clock::now();
         g_moe_decode_route_census.s1_ids_ns.fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t_s1_ids_ready - t_mul_mat_id_entry).count(),
             std::memory_order_relaxed);
@@ -66363,8 +66367,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // llama.cpp-1tjn (B3 rework census v3, temporary): S2 start -- RESTORE-T1
         // admission work (pointer-table build/query for gate/up/down) up to
         // just before the fused GLU dispatch call.
-        const auto t_s2_block_entry = std::chrono::steady_clock::now();
-        auto       decode_pair_it   = g_moe_gate_up_pairs.find(blk_layer_id);
+        const auto t_s2_block_entry =
+            b3_segment_timing_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto decode_pair_it = g_moe_gate_up_pairs.find(blk_layer_id);
         if (decode_pair_it != g_moe_gate_up_pairs.end()) {
             const moe_gate_up_pair & pair = decode_pair_it->second;
             const bool               decode_pair_topology_ok =
@@ -66719,14 +66724,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         ggml_sycl_find_tensor_storage_handle(pair.down_dst, ctx.device, &decode_down_storage) &&
                         decode_down_storage.handle.has_stable_owner_identity();
 
-                    sycl::event glu_event;
-                    bool        glu_event_set = false;
+                    sycl::event                           glu_event;
+                    bool                                  glu_event_set = false;
                     // llama.cpp-1tjn (B3 rework census v3, temporary): S2 end / S3 start.
-                    const auto  t_s2_end      = std::chrono::steady_clock::now();
-                    g_moe_decode_route_census.s2_admission_ns.fetch_add(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_s2_end - t_s2_block_entry).count(),
-                        std::memory_order_relaxed);
-                    g_moe_decode_route_census.s2_admission_count.fetch_add(1, std::memory_order_relaxed);
+                    std::chrono::steady_clock::time_point t_s2_end{};
+                    if (b3_segment_timing_enabled) {
+                        t_s2_end = std::chrono::steady_clock::now();
+                        g_moe_decode_route_census.s2_admission_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_s2_end - t_s2_block_entry).count(),
+                            std::memory_order_relaxed);
+                        g_moe_decode_route_census.s2_admission_count.fetch_add(1, std::memory_order_relaxed);
+                    }
                     const bool ok_glu = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                         ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_full_table, up_full_table,
                         ids_device, gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
@@ -66738,12 +66746,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pair_ids_host_count_arg, &glu_event, &glu_event_set,
                         /*write_recorder=*/nullptr, ptr_table_build_deps);
                     // llama.cpp-1tjn (B3 rework census v3, temporary): S3 end / S4 start.
-                    const auto t_s3_end = std::chrono::steady_clock::now();
-                    g_moe_decode_route_census.s3_dispatch_ns.fetch_add(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_s3_end - t_s2_end).count(),
-                        std::memory_order_relaxed);
-                    g_moe_decode_route_census.s3_dispatch_count.fetch_add(1, std::memory_order_relaxed);
-                    t_s3_end_for_s4 = t_s3_end;
+                    if (b3_segment_timing_enabled) {
+                        const auto t_s3_end = std::chrono::steady_clock::now();
+                        g_moe_decode_route_census.s3_dispatch_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(t_s3_end - t_s2_end).count(),
+                            std::memory_order_relaxed);
+                        g_moe_decode_route_census.s3_dispatch_count.fetch_add(1, std::memory_order_relaxed);
+                        t_s3_end_for_s4 = t_s3_end;
+                    }
                     if (ok_glu) {
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device);
                         if (pair.gate_biased) {
@@ -66906,11 +66916,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // after the fused GLU dispatch call (including the down-projection
         // admission/dispatch that follows it in this same block) until
         // return.
-        g_moe_decode_route_census.s4_tail_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_s3_end_for_s4)
-                .count(),
-            std::memory_order_relaxed);
-        g_moe_decode_route_census.s4_tail_count.fetch_add(1, std::memory_order_relaxed);
+        if (b3_segment_timing_enabled) {
+            g_moe_decode_route_census.s4_tail_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_s3_end_for_s4)
+                    .count(),
+                std::memory_order_relaxed);
+            g_moe_decode_route_census.s4_tail_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return;
     }
 
