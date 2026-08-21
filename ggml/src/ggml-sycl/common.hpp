@@ -1152,16 +1152,26 @@ static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const 
         return d;
     }
 
-    // llama.cpp-dboi: the oneDNN-batched MoE PP executor consumes SOA expert
-    // primaries; when its route policy is selected, hold the single planned
-    // layout at SOA here rather than promoting to XMX_TILED. tiled_eligible
-    // stays true above -- the hardware could run tiled, the policy declined it.
-    if (ggml_sycl_moe_pp_onednn_batched_route_selected()) {
-        d.layout = GGML_LAYOUT_SOA;
-        d.reason = "pp-onednn-batched-route-policy";
-        return d;
-    }
-
+    // llama.cpp-1tjn (Option T, perf-recovery track B, 2026-08-21): this
+    // chokepoint is a single per-weight, planning-time decision shared by PP
+    // and decode ("one layout per weight") -- it has no caller/ne12 identity
+    // to scope a demotion to PP only. The llama.cpp-dboi policy used to hold
+    // gate/up on SOA here whenever its route policy was selected, so the PP
+    // batched executor could consume SOA primaries; measured 2026-08-21, that
+    // left decode's XMX_TILED-only DPAS kernel structurally unreachable
+    // (used_xmx_tiled_dpas, mmvq.cpp) -- gate/up+GLU regressed from 12.26 to
+    // 18.3+ ms/token. The one SOA-native alternative (used_direct_xmx,
+    // mmvq.cpp, wired via moe_layer_direct_xmx_check_role in ggml-sycl.cpp)
+    // was measured as a 2x regression on its own (25.8 ms/token) -- dead by
+    // measurement, not a fix. Gate/up therefore returns to the default
+    // XMX_TILED materialization unconditionally; the policy no longer touches
+    // this decision. The policy predicate itself (ggml_sycl_moe_pp_onednn_
+    // batched_route_selected()) remains live for PP dispatch steering and the
+    // unified-cache down-i8 early-out (down stays SOA under the policy --
+    // deliberate, its decode delta is ~1 ms/token, tracked separately). The
+    // PP-batched executor temporarily loses its SOA gate/up primaries until
+    // track C's tiled-to-WOQ repack lands; that regression window is accepted
+    // and tracked there, not reopened here.
     d.layout         = GGML_LAYOUT_XMX_TILED;
     d.reason         = "xmx-tiled-capability-shape-residency";
     d.tiled_selected = true;
