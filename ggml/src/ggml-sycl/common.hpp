@@ -1061,6 +1061,33 @@ static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(co
     return d;
 }
 
+// llama.cpp-dboi: first-class route policy for the oneDNN-batched MoE PP
+// executor (try_pp_mxfp4_soa_onednn_f16_batched, ggml-sycl.cpp). When selected,
+// three things follow from this one predicate: (a) the layout chokepoint below
+// keeps MXFP4 MoE weights on SOA instead of promoting to XMX_TILED, so the
+// single planned layout is one the batched executor can consume (the
+// graph-layout selector's XMX_TILED completeness probes then fail on their own
+// and demote to SOA without a second policy site); (b) the fused pair-GLU PP
+// executor declines admission so dispatch reaches the batched call site; (c)
+// the batched executor itself is enabled. GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED
+// overrides (0 = off, nonzero = on); unset selects the built-in default below,
+// currently OFF pending the interleaved per-card A/B ruling (llama.cpp-dboi).
+// When that ruling lands, the default arm is where a per-card table goes
+// (thread device identity through the caller at that point).
+static inline bool ggml_sycl_moe_pp_onednn_batched_route_selected() {
+    static const int env_state = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED");
+        if (env == nullptr) {
+            return -1;
+        }
+        return std::atoi(env) != 0 ? 1 : 0;
+    }();
+    if (env_state >= 0) {
+        return env_state == 1;
+    }
+    return false;
+}
+
 static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,
                                                                           int64_t                 in_dim,
                                                                           int64_t                 out_dim,
@@ -1121,6 +1148,16 @@ static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const 
     if (!tiled_kernel_validated) {
         d.layout = GGML_LAYOUT_SOA;
         d.reason = "xmx-tiled-not-validated-shared-soa";
+        return d;
+    }
+
+    // llama.cpp-dboi: the oneDNN-batched MoE PP executor consumes SOA expert
+    // primaries; when its route policy is selected, hold the single planned
+    // layout at SOA here rather than promoting to XMX_TILED. tiled_eligible
+    // stays true above -- the hardware could run tiled, the policy declined it.
+    if (ggml_sycl_moe_pp_onednn_batched_route_selected()) {
+        d.layout = GGML_LAYOUT_SOA;
+        d.reason = "pp-onednn-batched-route-policy";
         return d;
     }
 

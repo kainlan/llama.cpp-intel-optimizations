@@ -64645,11 +64645,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
     }();
     const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
+    // llama.cpp-dboi: when the oneDNN-batched MoE PP route is selected, the
+    // fused pair-GLU fast path declines PP admission so dispatch continues to
+    // the retained unfused flow and reaches the batched executor
+    // (try_pp_mxfp4_soa_onednn_f16_batched) below. Decode (ne12 == 1) is
+    // untouched -- the batched route is PP-only.
+    const bool pp_onednn_batched_route = ggml_sycl_moe_pp_onednn_batched_route_selected();
     if (cpu_tg_candidate && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-        fprintf(stderr, "[MOE-PP-FUSION-GATE] tensor=%s ne12=%lld xmx_moe_forced=%d admit_attempt=%d\n", src0->name,
-                (long long) ne12, xmx_moe_forced ? 1 : 0, (ne12 != 1 && !xmx_moe_forced) ? 1 : 0);
+        fprintf(stderr,
+                "[MOE-PP-FUSION-GATE] tensor=%s ne12=%lld xmx_moe_forced=%d pp_onednn_batched_route=%d "
+                "admit_attempt=%d\n",
+                src0->name, (long long) ne12, xmx_moe_forced ? 1 : 0, pp_onednn_batched_route ? 1 : 0,
+                (ne12 != 1 && !xmx_moe_forced && !pp_onednn_batched_route) ? 1 : 0);
     }
-    if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced) {
+    if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced && !pp_onednn_batched_route) {
         const auto & roles   = retained_prompt_roles_result.bundle;
         const int    layer   = src0->name ? parse_layer_id_from_name(src0->name) : -1;
         auto         pair_it = g_moe_gate_up_pairs.find(layer);
@@ -65808,7 +65817,32 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
                 }
-                if (!prompt_down_has_planned_specialized_layout) {
+                // llama.cpp-dboi: at PP under the oneDNN-batched route policy,
+                // MXFP4 gate/up/down must fall past the per-row MMVQ probes
+                // (the try-soa probe would otherwise consume the op here at
+                // ~53 t/s pp512) so dispatch reaches the batched oneDNN
+                // executor below. Down is claimed too: leaving it on the
+                // per-row route capped the whole pass at ~155 t/s, and its I8
+                // planning upgrade is disabled under this policy so its SOA
+                // primaries satisfy the batched route. Decode (ne12 == 1) is
+                // untouched -- MMVQ remains the decode route for SOA-planned
+                // weights.
+                const moe_tensor_type probe_moe_kind = moe_classify_tensor(src0->name);
+                const bool            pp_onednn_batched_claims_op =
+                    ne12 > 1 && src0->type == GGML_TYPE_MXFP4 &&
+                    (probe_moe_kind == MOE_TENSOR_GATE || probe_moe_kind == MOE_TENSOR_UP ||
+                     probe_moe_kind == MOE_TENSOR_DOWN) &&
+                    ggml_sycl_moe_pp_onednn_batched_route_selected();
+                if (pp_onednn_batched_claims_op && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    static std::atomic<int> pp_batched_probe_skip_log{ 0 };
+                    if (pp_batched_probe_skip_log.fetch_add(1, std::memory_order_relaxed) < 96) {
+                        fprintf(stderr,
+                                "[MOE-PP-PROBE] tensor=%s device=%d stage=skip-legacy-probes "
+                                "reason=pp-onednn-batched-route-policy\n",
+                                src0 && src0->name ? src0->name : "?", ctx.device);
+                    }
+                }
+                if (!prompt_down_has_planned_specialized_layout && !pp_onednn_batched_claims_op) {
                     GGML_SYCL_DEBUG("[MoE] About to try COALESCED layout\n");
                     if (!skip_coalesced_probe && try_mmvq_layout_with_trace(GGML_LAYOUT_COALESCED, "try-coalesced")) {
                         GGML_SYCL_DEBUG("[MoE] GPU-side MMVQ (coalesced) dispatch successful for type %d\n",
@@ -66960,8 +66994,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool planner_needs_decode_route = has_placement_plan &&
                                             g_moe_multi_gpu_active.load(std::memory_order_acquire) &&
                                             (plan_has_cpu_experts || plan_has_secondary_experts);
-    const bool planner_needs_prompt_route =
-        has_placement_plan && placement_planned_moe && prompt_batch && !exact_layout_override;
+    // llama.cpp-dboi: the oneDNN-batched PP executor lives in the retained
+    // (non-hybrid) dispatch world below; when its route policy claims an MXFP4
+    // gate/up prompt op, prompt routing must not select the hybrid per-entry
+    // world, whose single-kernel MMVQ dispatch would consume the op first.
+    // Plans with host-resident experts keep hybrid via plan_hybrid regardless
+    // (the batched executor requires every active expert local anyway and
+    // rejects into its staging fallback otherwise).
+    const moe_tensor_type prompt_route_moe_kind = src0 ? moe_classify_tensor(src0->name) : MOE_TENSOR_UNKNOWN;
+    const bool            pp_onednn_batched_route_claims_prompt =
+        prompt_batch && src0 && src0->type == GGML_TYPE_MXFP4 &&
+        (prompt_route_moe_kind == MOE_TENSOR_GATE || prompt_route_moe_kind == MOE_TENSOR_UP ||
+         prompt_route_moe_kind == MOE_TENSOR_DOWN) &&
+        ggml_sycl_moe_pp_onednn_batched_route_selected();
+    const bool planner_needs_prompt_route = has_placement_plan && placement_planned_moe && prompt_batch &&
+                                            !exact_layout_override && !pp_onednn_batched_route_claims_prompt;
     const bool selected_hybrid_route = has_placement_plan ?
                                            (plan_hybrid || planner_needs_decode_route || planner_needs_prompt_route) :
                                            moe_hybrid_active;
@@ -69985,10 +70032,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
         auto try_pp_mxfp4_soa_onednn_f16_batched = [&]() -> bool {
 #if GGML_SYCL_DNNL
-            static const bool pp_mxfp4_soa_f16_batched_env_enabled = []() {
-                const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED");
-                return env && std::atoi(env) != 0;
-            }();
+            // llama.cpp-dboi: enablement comes from the shared route policy
+            // (env override + built-in default), the same predicate that made
+            // the planner keep SOA and the fused pair-GLU PP path decline.
+            const bool        pp_mxfp4_soa_f16_batched_env_enabled = ggml_sycl_moe_pp_onednn_batched_route_selected();
             static const bool pp_mxfp4_soa_f16_batched_trace = []() {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE");
                 return env && std::atoi(env) != 0;
@@ -70089,6 +70136,48 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return reject_batched("dims-overflow");
             }
 
+            // llama.cpp-dboi: one rectangular GEMM padded to the busiest expert
+            // wastes ~5x compute on GPT-OSS routing (one hot expert takes ~510
+            // of 512 tokens each layer while the rest average ~70; measured
+            // ONEDNN_VERBOSE: 615 ms/pass at n=~510 x batch=~21 for 2048 real
+            // rows). Sort experts by row count and split into groups wherever
+            // the next expert has under half the group head's rows, then issue
+            // one strided batch per group padded only to that group's head --
+            // slot n padded to a multiple of 64 so primitive shapes recur
+            // across layers and passes instead of JITting per distinct count.
+            std::sort(active_experts.begin(), active_experts.end(),
+                      [](const pp_onednn_batched_expert & a, const pp_onednn_batched_expert & b) {
+                          return (a.row_end - a.row_begin) > (b.row_end - b.row_begin);
+                      });
+            const auto align_rows_64 = [](size_t rows) -> size_t {
+                return (rows + 63) & ~static_cast<size_t>(63);
+            };
+            const size_t max_rows_padded = align_rows_64(max_rows_per_expert);
+
+            struct pp_gemm_group {
+                size_t begin  = 0;
+                size_t end    = 0;
+                size_t n_rows = 0;
+            };
+            std::vector<pp_gemm_group> gemm_groups;
+            {
+                size_t begin     = 0;
+                size_t head_rows = active_experts.front().row_end - active_experts.front().row_begin;
+                for (size_t i = 1; i <= active_experts.size(); ++i) {
+                    const size_t rows_i =
+                        i < active_experts.size() ? active_experts[i].row_end - active_experts[i].row_begin : 0;
+                    if (i == active_experts.size() || rows_i * 2 < head_rows) {
+                        pp_gemm_group group;
+                        group.begin  = begin;
+                        group.end    = i;
+                        group.n_rows = std::min(align_rows_64(head_rows), max_rows_padded);
+                        gemm_groups.push_back(group);
+                        begin     = i;
+                        head_rows = rows_i;
+                    }
+                }
+            }
+
             auto checked_mul = [](size_t a, size_t b, size_t & out) -> bool {
                 if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
                     return false;
@@ -70107,8 +70196,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             size_t       act_bytes          = 0;
             size_t       out_bytes          = 0;
             if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00), weight_elems) ||
-                !checked_mul(max_rows_per_expert, static_cast<size_t>(ne10), act_slot_elems) ||
-                !checked_mul(max_rows_per_expert, static_cast<size_t>(ne0), out_slot_elems) ||
+                !checked_mul(max_rows_padded, static_cast<size_t>(ne10), act_slot_elems) ||
+                !checked_mul(max_rows_padded, static_cast<size_t>(ne0), out_slot_elems) ||
                 !checked_mul(weight_elems, active_count, total_weight_elems) ||
                 !checked_mul(act_slot_elems, active_count, total_act_elems) ||
                 !checked_mul(out_slot_elems, active_count, total_out_elems) ||
@@ -70272,18 +70361,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // on the GEMM's own completion event so every later submission on
             // this in-order queue -- the dst-scatter loop and the done marker --
             // observes it.
-            sycl::event ev_gemm;
+            std::vector<sycl::event> gemm_events;
+            gemm_events.reserve(gemm_groups.size());
             try {
                 const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
-                ev_gemm                   = DnnlGemmWrapper::gemm_batch_strided(
-                    ctx,
-                    /* trans_a = */ true,
-                    /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(max_rows_per_expert),
-                    static_cast<int>(ne00), 1.0f, batched_weights, DnnlGemmWrapper::to_dt<sycl::half>(),
-                    static_cast<int>(ne00), static_cast<int64_t>(weight_elems), batched_acts,
-                    DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10), static_cast<int64_t>(act_slot_elems),
-                    0.0f, batched_out, DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                    static_cast<int64_t>(out_slot_elems), static_cast<int>(active_count), ctx.stream(), { deps_in });
+                for (const pp_gemm_group & group : gemm_groups) {
+                    gemm_events.push_back(DnnlGemmWrapper::gemm_batch_strided(
+                        ctx,
+                        /* trans_a = */ true,
+                        /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(group.n_rows),
+                        static_cast<int>(ne00), 1.0f, batched_weights + group.begin * weight_elems,
+                        DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne00),
+                        static_cast<int64_t>(weight_elems), batched_acts + group.begin * act_slot_elems,
+                        DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10),
+                        static_cast<int64_t>(act_slot_elems), 0.0f, batched_out + group.begin * out_slot_elems,
+                        DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0), static_cast<int64_t>(out_slot_elems),
+                        static_cast<int>(group.end - group.begin), ctx.stream(), { deps_in }));
+                }
             } catch (const std::exception & e) {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
@@ -70295,7 +70389,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 batched_scratch_claim.finish_or_release();
                 return false;
             }
-            stream->ext_oneapi_submit_barrier({ ev_gemm });
+            stream->ext_oneapi_submit_barrier(gemm_events);
 
             const bool batched_compare = [] {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE");

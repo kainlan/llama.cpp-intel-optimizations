@@ -14844,6 +14844,31 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
     output_slot_bytes     = admitted.output_slot_bytes;
     ring_depth            = admitted.ring_depth;
 
+    // llama.cpp-dboi: reserve is called once per PP MoE dispatch, so an
+    // existing adequate ring must satisfy the call WITHOUT allocating. The
+    // allocate-then-compare flow below is only for growth: reaching it on
+    // every dispatch means transiently holding a second full ring, which the
+    // RUNTIME zone (sized for exactly one) cannot fit -- the first dispatch
+    // reserved, every later one failed, and the route silently fell back.
+    {
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        if (pp_moe_onednn_ring_depth_ >= ring_depth && pp_moe_onednn_weight_slot_size_ >= weight_slot_bytes &&
+            pp_moe_onednn_activation_slot_size_ >= activation_slot_bytes &&
+            pp_moe_onednn_output_slot_size_ >= output_slot_bytes && pp_moe_onednn_scratch_slots_.size() >= ring_depth) {
+            bool slots_ok = true;
+            for (uint32_t i = 0; i < ring_depth; ++i) {
+                const pp_moe_onednn_scratch_slot & slot = pp_moe_onednn_scratch_slots_[i];
+                if (!slot.weight || !slot.activation || !slot.output) {
+                    slots_ok = false;
+                    break;
+                }
+            }
+            if (slots_ok) {
+                return true;
+            }
+        }
+    }
+
     auto release_slots = [&](std::vector<pp_moe_onednn_scratch_slot> & slots) {
         size_t released_direct = 0;
         for (auto & slot : slots) {
@@ -22493,6 +22518,15 @@ static size_t maybe_upgrade_moe_down_layouts_to_i8(placement_plan & plan,
                                                    int              n_experts,
                                                    bool             static_i8_executor_supported = true) {
     constexpr size_t k_layout_upgrade_guard = 64ull * 1024ull * 1024ull;
+
+    // llama.cpp-dboi: under the oneDNN-batched MoE PP route policy, down flows
+    // through the same batched f16 executor as gate/up, which consumes SOA
+    // primaries -- an I8 upgrade would starve that route back onto the per-row
+    // MMVQ path (measured: down alone caps pp512 at ~155 t/s). One layout per
+    // weight: down stays SOA when the policy is selected.
+    if (ggml_sycl_moe_pp_onednn_batched_route_selected()) {
+        return 0;
+    }
 
     // Default prompt processing still consumes SOA down weights, but single-
     // device plans can materialize the selected prompt experts transiently.
