@@ -676,23 +676,26 @@ class DnnlGemmWrapper {
         key.batch_size = batch_size;
         key.variant    = 1;  // gemm_batch_strided variant
 
-        // Set up dimensions based on transpose flags
-        // oneDNN matmul: C = A * B where A is (batch, M, K), B is (batch, K, N), C is (batch, M, N)
-        int a_rows = trans_a ? k : m;
-        int a_cols = trans_a ? m : k;
-        int b_rows = trans_b ? n : k;
-        int b_cols = trans_b ? k : n;
-
-        dnnl::memory::dims a_dims = { batch_size, a_rows, a_cols };
-        dnnl::memory::dims b_dims = { batch_size, b_rows, b_cols };
+        // oneDNN matmul: C = A * B where A is (batch, M, K), B is (batch, K, N),
+        // C is (batch, M, N). The logical dims are fixed; BLAS-style trans_a/
+        // trans_b describe how the operand is STORED (column-major with leading
+        // dimension ld*, trans meaning the stored matrix is the logical one
+        // transposed), so the trans flag flips which logical dim gets stride 1.
+        //
+        // llama.cpp-dboi: the previous encoding swapped the DIMS for a
+        // transposed operand while keeping the {1, ld} strides, which hands
+        // oneDNN a column-major read of the buffer under relabeled M/K -- for
+        // square operands (GPT-OSS gate/up, 2880x2880) that builds fine and
+        // silently computes with the weight matrix transposed; non-square
+        // shapes would have failed primitive creation instead.
+        dnnl::memory::dims a_dims = { batch_size, m, k };
+        dnnl::memory::dims b_dims = { batch_size, k, n };
         dnnl::memory::dims c_dims = { batch_size, m, n };
 
-        // Strides: oneDNN expects {batch_stride, row_stride, col_stride}
-        // For column-major (like MKL): row_stride = 1, col_stride = lda
-        // For row-major: row_stride = lda, col_stride = 1
-        // MKL uses column-major, so we need to transpose the operation
-        dnnl::memory::dims a_strides = { stride_a, 1, lda };
-        dnnl::memory::dims b_strides = { stride_b, 1, ldb };
+        dnnl::memory::dims a_strides =
+            trans_a ? dnnl::memory::dims{ stride_a, lda, 1 } : dnnl::memory::dims{ stride_a, 1, lda };
+        dnnl::memory::dims b_strides =
+            trans_b ? dnnl::memory::dims{ stride_b, ldb, 1 } : dnnl::memory::dims{ stride_b, 1, ldb };
         dnnl::memory::dims c_strides = { stride_c, 1, ldc };
 
         const auto a_md = dnnl::memory::desc(a_dims, at, a_strides);
@@ -748,19 +751,26 @@ class DnnlGemmWrapper {
         }
 
         // Use cached primitive - only memory binding and execute (graph-compatible)
-        auto a_mem          = dnnl::memory(cached->a_md, eng, const_cast<void *>(a));
-        auto b_mem          = dnnl::memory(cached->b_md, eng, const_cast<void *>(b));
-        auto c_mem          = dnnl::memory(cached->c_md, eng, c);
-        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
-        if (scratchpad_mem.get(true) == nullptr && cached->scratchpad_md.get_size() > 0) {
-            throw std::runtime_error("oneDNN scratchpad allocation failed");
-        }
+        auto a_mem = dnnl::memory(cached->a_md, eng, const_cast<void *>(a));
+        auto b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b));
+        auto c_mem = dnnl::memory(cached->c_md, eng, c);
 
         std::unordered_map<int, dnnl::memory> args;
         args.insert({ DNNL_ARG_SRC, a_mem });
         args.insert({ DNNL_ARG_WEIGHTS, b_mem });
         args.insert({ DNNL_ARG_DST, c_mem });
-        args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+        // llama.cpp-dboi: a zero-size scratchpad desc makes get_scratchpad_mem()
+        // return a default-constructed dnnl::memory, and passing that
+        // uninitialized object as an arg makes sycl_interop::execute throw
+        // "object is not initialized". Guard the insert on the size, exactly
+        // as the gemm (variant 0) branches above already do.
+        if (cached->scratchpad_md.get_size() > 0) {
+            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+            if (scratchpad_mem.get(true) == nullptr) {
+                throw std::runtime_error("oneDNN scratchpad allocation failed");
+            }
+            args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+        }
 
         return dnnl::sycl_interop::execute(cached->primitive, stream, args, deps);
     }
