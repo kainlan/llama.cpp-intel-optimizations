@@ -66581,6 +66581,65 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const char * xmx_tiled_grouped_pp_reason = xmx_tiled_grouped_pp_reason_fn();
                 const bool   xmx_tiled_grouped_eligible  = strcmp(xmx_tiled_grouped_pp_reason, "eligible") == 0;
 
+                // llama.cpp-1tjn (B3 real fix, team-lead diagnosis 2026-08-21):
+                // baseline (79ae63559) computed a real direct_xmx_eligible at
+                // this call site via moe_layer_direct_xmx_check_role() -- see
+                // its ggml-sycl.cpp:60841-60862/61318-61321. The abecb785d
+                // deletion of try_gpu_moe_pair (and this RESTORE-T1 block's
+                // later restoration of the caller-side wiring) replaced that
+                // real computation with a hardcoded false, orphaning the
+                // check (still compiled at moe_layer_direct_xmx_check_role
+                // above; zero call sites existed before this one). The
+                // MXFP4 MoE layout chokepoint (ggml_sycl_select_mxfp4_moe_
+                // layout, common.hpp) is a single per-weight, planning-time
+                // decision shared by PP and decode ("one layout per weight");
+                // under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED it holds gate/up
+                // on GGML_LAYOUT_SOA instead of promoting to XMX_TILED, which
+                // makes decode's XMX_TILED-only kernel (used_xmx_tiled_dpas,
+                // mmvq.cpp) structurally unreachable. used_direct_xmx
+                // (mmvq.cpp, gated on weight_layout==GGML_LAYOUT_SOA) is the
+                // one DPAS-class kernel that does NOT require a tiled
+                // materialization -- it is admissible for a SOA-stored
+                // weight. Restored EXACTLY as baseline gated it (same opt-in
+                // envs, no new policy-on special case): this does not change
+                // behavior when GGML_SYCL_DIRECT_XMX_MOE_PROBE and
+                // GGML_SYCL_MOE_DIRECT_XMX_GLU/aggressive-partial-tg are all
+                // unset, matching baseline's own default-env behavior.
+                static const int direct_xmx_probe_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_DIRECT_XMX_MOE_PROBE");
+                    return env ? std::atoi(env) : 0;
+                }();
+                static const int direct_xmx_glu_env_enabled = [] {
+                    const char * env = std::getenv("GGML_SYCL_MOE_DIRECT_XMX_GLU");
+                    if (env) {
+                        return std::atoi(env);
+                    }
+                    return moe_aggressive_partial_tg_env_enabled() ? 1 : 0;
+                }();
+                const bool direct_xmx_probe    = direct_xmx_probe_enabled != 0 || direct_xmx_glu_env_enabled != 0;
+                bool       direct_xmx_eligible = false;
+                if (direct_xmx_probe && full_gpu_cover && pair_layout == GGML_LAYOUT_SOA) {
+                    moe_layer_decode_role_plan gate_role{};
+                    gate_role.weight                    = pair.gate_weight;
+                    gate_role.full_table_static_handles = true;
+                    moe_layer_decode_role_plan up_role{};
+                    up_role.weight                    = pair.up_weight;
+                    up_role.full_table_static_handles = true;
+                    const auto gate_decision          = moe_layer_direct_xmx_check_role(
+                        gate_role, ctx.device, static_cast<size_t>(gate_up_dispatch_entries), pair_layout);
+                    const auto up_decision = moe_layer_direct_xmx_check_role(
+                        up_role, ctx.device, static_cast<size_t>(gate_up_dispatch_entries), pair_layout);
+                    direct_xmx_eligible = gate_decision.eligible && up_decision.eligible;
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        fprintf(stderr,
+                                "[MOE-DIRECT-XMX-DECODE] tensor=%s layer=%d device=%d layout=%s gate_reason=%s "
+                                "up_reason=%s eligible=%d\n",
+                                pair.gate_weight->name ? pair.gate_weight->name : "?", blk_layer_id, ctx.device,
+                                ggml_sycl_layout_mode_name(pair_layout), gate_decision.reason, up_decision.reason,
+                                direct_xmx_eligible ? 1 : 0);
+                    }
+                }
+
                 const bool use_device_grouped_moe_decode =
                     (moe_grouped_decode_candidate_env_enabled() || aggressive_partial_tg_xmx_route) &&
                     xmx_tiled_grouped_eligible && full_gpu_cover && ids_device != nullptr && ids_device_nb0 > 0 &&
@@ -66632,7 +66691,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     sycl::event glu_event;
                     bool        glu_event_set = false;
                     // llama.cpp-1tjn (B3 rework census v3, temporary): S2 end / S3 start.
-                    const auto t_s2_end = std::chrono::steady_clock::now();
+                    const auto  t_s2_end      = std::chrono::steady_clock::now();
                     g_moe_decode_route_census.s2_admission_ns.fetch_add(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(t_s2_end - t_s2_block_entry).count(),
                         std::memory_order_relaxed);
@@ -66643,9 +66702,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(gate_up_dispatch_entries), n_ids_pair,
                         ids_device_nb0, ids_device_nb1, pair.glu_op, ggml_get_op_params_f32(pair.glu_dst, 2),
                         ggml_get_op_params_f32(pair.glu_dst, 3), pair_layout,
-                        decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr,
-                        /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible, gate_materialize_tmp,
-                        up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg, &glu_event, &glu_event_set,
+                        decode_q8_handles_ok ? &decode_glu_storage.handle : nullptr, direct_xmx_eligible,
+                        xmx_tiled_grouped_eligible, gate_materialize_tmp, up_materialize_tmp, pair_ids_host_arg,
+                        pair_ids_host_count_arg, &glu_event, &glu_event_set,
                         /*write_recorder=*/nullptr, ptr_table_build_deps);
                     // llama.cpp-1tjn (B3 rework census v3, temporary): S3 end / S4 start.
                     const auto t_s3_end = std::chrono::steady_clock::now();
