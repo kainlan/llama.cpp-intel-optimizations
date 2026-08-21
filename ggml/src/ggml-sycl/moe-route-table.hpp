@@ -6,10 +6,34 @@
 // semantics during inference). Invalidation releases the leases.
 #include "mem-handle.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
 namespace ggml_sycl {
+
+// The "plan side" generation for route-table invalidation (perf-recovery
+// track B, llama.cpp-1tjn). placement_plan (unified-cache.hpp) carries no
+// generation counter of its own -- a MID_LOAD_REPLAN republishes the SAME
+// plan snapshot object via ggml_sycl_republish_current_plan(), so its
+// identity does not change even though reclaim_weight_entries() resets the
+// cache's actual weight materialization underneath it. moe_expert_storage_
+// generation (common.hpp) tracks per-tensor storage rewrites but is not
+// itself touched by MID_LOAD_REPLAN's reclaim either. This counter is bumped
+// explicitly by unified_cache::reclaim_weight_entries() for MID_LOAD_REPLAN
+// so a cached route table is always invalidated across a replan.
+inline std::atomic<uint64_t> & moe_route_table_replan_epoch() {
+    static std::atomic<uint64_t> epoch{ 1 };
+    return epoch;
+}
+
+inline uint64_t moe_route_table_bump_replan_epoch() {
+    return moe_route_table_replan_epoch().fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+inline uint64_t moe_route_table_current_replan_epoch() {
+    return moe_route_table_replan_epoch().load(std::memory_order_relaxed);
+}
 
 struct moe_route_table_stamp {
     uint64_t plan_generation           = 0;

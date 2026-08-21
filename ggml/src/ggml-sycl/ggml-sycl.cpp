@@ -52101,6 +52101,128 @@ static bool ggml_sycl_release_moe_expert_layout_subset(const ggml_tensor *      
                                                        const std::vector<uint8_t> & needed,
                                                        bool                         release_selected);
 
+// perf-recovery track B (llama.cpp-1tjn): per-device MoE route table cache.
+// ggml_sycl_resolve_moe_expert_route() is a per-op device-state probe; the
+// decode/PP pointer-table build below used to re-run it for every needed
+// expert on every call, which B1's diagnosis
+// (artifacts/perf-recovery/B1-decode-diagnosis.md) measured as the dominant
+// decode-regression cost. These two helpers consult/populate a per-(tensor,
+// device) table (ggml_tensor_extra_gpu::moe_route_tables) stamped with the
+// (plan_generation, expert_storage_generation) pair from moe-route-table.hpp
+// so a route already resolved this generation is never re-resolved.
+//
+// HARD RULE preserved: a lookup miss (table absent/stale/layout-mismatched)
+// changes NOTHING about the caller's existing resolution logic -- it simply
+// does not short-circuit it. A resolve failure is never converted into an
+// abort or a skipped dispatch by these helpers.
+static bool ggml_sycl_moe_route_table_debug_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_ROUTE_TABLE_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_moe_route_table_lookup(const ggml_tensor * src0,
+                                             int                 device,
+                                             int64_t             expert_id,
+                                             int64_t             n_experts,
+                                             layout_mode         layout,
+                                             moe_expert_route *  out) {
+    if (!src0 || !out || device < 0 || device >= GGML_SYCL_MAX_DEVICES || expert_id < 0 || expert_id >= n_experts) {
+        return false;
+    }
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if (!extra) {
+        return false;
+    }
+    ggml_sycl::moe_route_table & table       = extra->moe_route_tables[device];
+    const uint64_t               plan_gen    = ggml_sycl::moe_route_table_current_replan_epoch();
+    const uint64_t               storage_gen = extra->moe_expert_storage_generation;
+    if (!ggml_sycl::moe_route_table_current(table.stamp, plan_gen, storage_gen)) {
+        // Stale/never-built: drop it eagerly rather than let a later store()
+        // mix entries from two different generations.
+        if (table.stamp.valid) {
+            table.invalidate();
+        }
+        return false;
+    }
+    if (table.experts.size() != static_cast<size_t>(n_experts)) {
+        return false;
+    }
+    const ggml_sycl::moe_route_entry & cached = table.experts[static_cast<size_t>(expert_id)];
+    if (!cached.ptr || cached.layout != static_cast<int>(layout)) {
+        return false;
+    }
+    const auto resolved = cached.lease.resolve(device);
+    if (!resolved.ptr || resolved.layout != layout) {
+        return false;
+    }
+    moe_expert_route route{};
+    route.kind                     = static_cast<moe_expert_route_kind>(cached.residency);
+    route.ptr                      = resolved.ptr;
+    route.owning_device            = device;
+    route.planned_device           = device;
+    route.plan_found               = true;
+    route.planned_device_residency = true;
+    route.planned_layout           = layout;
+    route.requested_layout         = layout;
+    route.actual_layout            = layout;
+    route.tier                     = ggml_sycl::expert_resolve_tier::DEVICE_VRAM;
+    route.reason                   = ggml_sycl::expert_resolve_reason::FOUND;
+    route.has_ready_event          = false;  // only settled routes are ever cached, see store() below
+    route.lease                    = cached.lease;
+    *out                           = std::move(route);
+    return true;
+}
+
+static void ggml_sycl_moe_route_table_store(const ggml_tensor *      src0,
+                                            int                      device,
+                                            int64_t                  expert_id,
+                                            int64_t                  n_experts,
+                                            layout_mode              layout,
+                                            const moe_expert_route & route) {
+    if (!src0 || device < 0 || device >= GGML_SYCL_MAX_DEVICES || expert_id < 0 || expert_id >= n_experts ||
+        !route.ptr || route.kind != moe_expert_route_kind::LOCAL_DEVICE) {
+        return;
+    }
+    // A route with a pending completion event is mid-upload; this table only
+    // stores the mem_handle lease, not the sycl::event, so caching it would
+    // strand dispatch without a real wait on the in-flight write. Skip -- it
+    // will resolve (and cache) cleanly once settled on a later call.
+    if (route.has_ready_event) {
+        return;
+    }
+    auto * extra = static_cast<ggml_tensor_extra_gpu *>(const_cast<ggml_tensor *>(src0)->extra);
+    if (!extra) {
+        return;
+    }
+    ggml_sycl::moe_route_table & table       = extra->moe_route_tables[device];
+    const uint64_t               plan_gen    = ggml_sycl::moe_route_table_current_replan_epoch();
+    const uint64_t               storage_gen = extra->moe_expert_storage_generation;
+    if (!ggml_sycl::moe_route_table_current(table.stamp, plan_gen, storage_gen)) {
+        table.invalidate();
+        table.stamp.valid                     = true;
+        table.stamp.plan_generation           = plan_gen;
+        table.stamp.expert_storage_generation = storage_gen;
+        table.experts.assign(static_cast<size_t>(n_experts), ggml_sycl::moe_route_entry{});
+        if (ggml_sycl_moe_route_table_debug_enabled()) {
+            fprintf(stderr, "[MOE-ROUTE-TABLE] build tensor=%s device=%d generation=%llu/%llu experts=%lld\n",
+                    src0->name ? src0->name : "?", device, (unsigned long long) plan_gen,
+                    (unsigned long long) storage_gen, (long long) n_experts);
+        }
+    }
+    if (table.experts.size() != static_cast<size_t>(n_experts)) {
+        return;
+    }
+    ggml_sycl::moe_route_entry & entry = table.experts[static_cast<size_t>(expert_id)];
+    entry.ptr                          = route.ptr;
+    entry.lease                        = route.lease;
+    entry.layout                       = static_cast<int>(layout);
+    entry.residency                    = static_cast<int>(route.kind);
+    entry.has_ready_event              = false;
+}
+
 bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
                                     const ggml_tensor *          src0,
                                     const ggml_tensor *          ids,
@@ -52442,11 +52564,18 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         std::vector<resolved_slot> slots;
         slots.reserve(static_cast<size_t>(n_experts));
         for (int64_t e = 0; e < n_experts; ++e) {
-            moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout,
-                                                                        /*allow_materialize=*/false);
-            if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
-                route.actual_layout != layout) {
-                return false;
+            // perf-recovery track B (llama.cpp-1tjn): same route-table
+            // consult as the plan_active per-expert loop below -- see its
+            // comment for the invariant this preserves.
+            moe_expert_route route{};
+            if (!ggml_sycl_moe_route_table_lookup(src0, device, e, n_experts, layout, &route)) {
+                route = ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout,
+                                                           /*allow_materialize=*/false);
+                if (route.kind != moe_expert_route_kind::LOCAL_DEVICE || route.ptr == nullptr ||
+                    route.actual_layout != layout) {
+                    return false;
+                }
+                ggml_sycl_moe_route_table_store(src0, device, e, n_experts, layout, route);
             }
             slots.push_back({ e, std::move(route) });
         }
@@ -52543,10 +52672,20 @@ bool ggml_sycl_update_moe_ptr_table(ggml_backend_sycl_context &  ctx,
         }
         stats_needed++;
         if (plan_active && !exact_layout_required) {
+            // perf-recovery track B (llama.cpp-1tjn): a route this call needs
+            // may already have been resolved (and cached) by an earlier call
+            // within the same (plan_generation, expert_storage_generation)
+            // pair -- consume it instead of re-running the resolver.
+            moe_expert_route route_table_hit{};
+            if (ggml_sycl_moe_route_table_lookup(src0, device, e, n_experts, layout, &route_table_hit)) {
+                install_table_route(e, route_table_hit, "route-table-hit");
+                continue;
+            }
             moe_expert_route route = ggml_sycl_resolve_moe_expert_route(src0, device, static_cast<int>(e), layout,
                                                                         /*allow_materialize=*/
                                                                         allow_planned_phase_materialize);
             if (route.kind == moe_expert_route_kind::LOCAL_DEVICE && route.ptr && route.actual_layout == layout) {
+                ggml_sycl_moe_route_table_store(src0, device, e, n_experts, layout, route);
                 install_table_route(e, route, "plan-route");
                 continue;
             }

@@ -10078,6 +10078,18 @@ void unified_cache::reset_model_weight_entries(weight_reclaim_mode mode) {
 }
 
 size_t unified_cache::reclaim_weight_entries(weight_reclaim_mode mode, uint32_t slot) {
+    // perf-recovery track B (llama.cpp-1tjn): a MID_LOAD_REPLAN resets this
+    // model's own weight materialization state (see the MID_LOAD_REPLAN
+    // comment at the S1-PRELOAD call site in ggml-sycl.cpp) without going
+    // through lifecycle_publish_placement_plan() -- ggml_sycl_republish_
+    // current_plan() re-stores the SAME plan snapshot, so its version does
+    // not change. Bump the route-table replan epoch here explicitly so any
+    // cached MoE route table is invalidated across the replan; otherwise a
+    // decode/PP dispatch could consume routes pointing at storage this call
+    // is about to reclaim.
+    if (mode == weight_reclaim_mode::MID_LOAD_REPLAN) {
+        ggml_sycl::moe_route_table_bump_replan_epoch();
+    }
     // Model load is a quiescent boundary for inference. Drain cache queues so
     // direct-entry metadata cannot be cleared while an S1 copy/reorder from the
     // previous model is still in flight.

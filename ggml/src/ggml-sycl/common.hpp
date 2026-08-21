@@ -22,6 +22,7 @@
 #include "mem-ops.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-layer-plan.hpp"
+#include "moe-route-table.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "sycl-kernel-profiler.hpp"
@@ -3870,6 +3871,11 @@ struct ggml_tensor_extra_gpu {
     uint64_t                           moe_planned_layout_generation[GGML_SYCL_MAX_DEVICES][2][2]      = {};
     ggml_layout_mode                   moe_planned_layout_cache[GGML_SYCL_MAX_DEVICES][2][2]           = {};
     bool                               moe_planned_layout_valid[GGML_SYCL_MAX_DEVICES][2][2]           = {};
+    // Per-device cached MoE expert route table (perf-recovery epic, track B,
+    // llama.cpp-1tjn). Built once per (plan_generation, expert_storage_generation)
+    // pair and consumed read-only by decode dispatch instead of re-resolving
+    // every expert's route per token; see moe-route-table.hpp.
+    ggml_sycl::moe_route_table         moe_route_tables[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_handles[GGML_SYCL_MAX_DEVICES];
     std::vector<void *>                moe_expert_ptr_payload[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
