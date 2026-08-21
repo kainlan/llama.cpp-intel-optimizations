@@ -22,6 +22,9 @@ struct moe_route_entry {
     mem_handle lease;
     int        layout          = 0;  // layout_mode as int to keep this header light
     int        residency       = 0;  // moe_expert_route_kind as int
+    // Hot-path cache of the cache-entry readiness bit: populated by B3 at
+    // table build so decode/PP dispatch can check readiness without a
+    // debug_info() call per dispatch.
     bool       has_ready_event = false;
 };
 
@@ -35,11 +38,11 @@ struct moe_route_table {
     }
 };
 
-}  // namespace ggml_sycl
-
-static inline bool ggml_sycl_moe_route_table_current(const ggml_sycl::moe_route_table_stamp & stamp,
-                                                     uint64_t                                 plan_generation,
-                                                     uint64_t expert_storage_generation) {
+static inline bool moe_route_table_current(const moe_route_table_stamp & stamp,
+                                           uint64_t                      plan_generation,
+                                           uint64_t                      expert_storage_generation) {
     return stamp.valid && stamp.plan_generation == plan_generation &&
            stamp.expert_storage_generation == expert_storage_generation;
 }
+
+}  // namespace ggml_sycl
