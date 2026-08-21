@@ -1321,6 +1321,97 @@ void dequantize_row_mxfp4_soa_to_fp16_rowmajor(const void *    src,
                          });
 }
 
+// SOA MXFP4 -> WOQ (weight-only-quantized) repack: de-interleaves the intra-
+// block j/j+16 nibble packing into SEQUENTIAL nibble order and transposes the
+// per-expert row-major source into oneDNN's {K,N} nibble / {K/QK_MXFP4,N}
+// e8m0-scale layout (perf-recovery epic, track C; nibble order + scale layout
+// confirmed by the C1 spike, llama.cpp-4m9p comment c-a5by). 4-bit->4-bit: the
+// nibble VALUES are the raw e2m1 codes, unchanged -- only their position moves.
+//
+// Source (SOA, per expert; the inverse of what dequantize_tile_mxfp4_soa_rowmajor
+// above decodes): qs plane is nblocks*(QK_MXFP4/2) bytes, nblocks = nrows *
+// blocks_per_row, block_i = row * blocks_per_row + block; within a block's
+// QK_MXFP4/2 bytes, byte j holds element j (low nibble) and element j+QK_MXFP4/2
+// (high nibble). The e8m0 plane follows: nblocks bytes at qs + nblocks*(QK_MXFP4/2).
+//
+// Destination: nibbles for weights {K,N} strides {N,1} -- element index
+// el = k*N + n, dst byte el/2, low nibble if el even else high (K = blocks_per_row
+// * QK_MXFP4, N = nrows). Scales {K/QK_MXFP4,N} strides {N,1}:
+// dst_scales[(k/QK_MXFP4)*N + n] = src_e[n*blocks_per_row + k/QK_MXFP4].
+static void repack_mxfp4_soa_to_woq_nibbles_kernel(const uint8_t * __restrict__ qs,
+                                                   uint8_t * __restrict__ dst_nibbles,
+                                                   int                      blocks_per_row,
+                                                   int                      N,
+                                                   int64_t                  total_dst_bytes,
+                                                   const sycl::nd_item<3> & item) {
+    const int64_t db = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (db >= total_dst_bytes) {
+        return;
+    }
+
+    auto src_nibble = [=](int64_t el) -> uint8_t {
+        const int64_t k       = el / N;
+        const int64_t n       = el - k * N;
+        const int64_t b       = k / QK_MXFP4;
+        const int64_t k_local = k - b * QK_MXFP4;
+        const int64_t block_i = n * blocks_per_row + b;
+        const bool    lo      = k_local < QK_MXFP4 / 2;
+        const uint8_t byte    = qs[block_i * (QK_MXFP4 / 2) + (lo ? k_local : k_local - QK_MXFP4 / 2)];
+        return lo ? (byte & 0xf) : (byte >> 4);
+    };
+
+    const uint8_t lo_nib = src_nibble(db * 2);
+    const uint8_t hi_nib = src_nibble(db * 2 + 1);
+    dst_nibbles[db]      = (uint8_t) (lo_nib | (hi_nib << 4));
+}
+
+static void repack_mxfp4_soa_to_woq_scales_kernel(const uint8_t * __restrict__ e,
+                                                  uint8_t * __restrict__ dst_scales,
+                                                  int                      blocks_per_row,
+                                                  int                      N,
+                                                  int64_t                  total_entries,
+                                                  const sycl::nd_item<3> & item) {
+    const int64_t idx = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (idx >= total_entries) {
+        return;
+    }
+    const int64_t kg = idx / N;
+    const int64_t n  = idx - kg * N;
+    dst_scales[idx]  = e[n * blocks_per_row + kg];
+}
+
+void repack_mxfp4_soa_to_woq(const void *    src,
+                             uint8_t *       dst_nibbles,
+                             uint8_t *       dst_scales,
+                             int             blocks_per_row,
+                             int             nrows,
+                             dpct::queue_ptr stream) {
+    const int64_t   nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
+    const uint8_t * qs      = static_cast<const uint8_t *>(src);
+    const uint8_t * e       = qs + nblocks * (QK_MXFP4 / 2);
+
+    const int64_t K = static_cast<int64_t>(blocks_per_row) * QK_MXFP4;
+    const int64_t N = nrows;
+
+    constexpr int WG_SIZE = 256;
+
+    const int64_t total_nibble_bytes = (K * N) / 2;
+    const int64_t n_wgs_nibbles      = (total_nibble_bytes + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs_nibbles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_soa_to_woq_nibbles_kernel(qs, dst_nibbles, blocks_per_row, nrows, total_nibble_bytes, item);
+        });
+
+    const int64_t total_scale_entries = nblocks;  // blocks_per_row * N
+    const int64_t n_wgs_scales        = (total_scale_entries + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs_scales * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+                         [=](sycl::nd_item<3> item) {
+                             repack_mxfp4_soa_to_woq_scales_kernel(e, dst_scales, blocks_per_row, nrows,
+                                                                   total_scale_entries, item);
+                         });
+}
+
 // Host function to launch Q4_0 Coalesced to SoA conversion
 void reorder_q4_0_coalesced_to_soa_sycl(const void *    src,
                                         void *          dst,  // SoA format: [all qs bytes][all d values]

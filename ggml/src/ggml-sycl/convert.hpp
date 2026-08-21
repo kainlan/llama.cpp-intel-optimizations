@@ -186,6 +186,19 @@ void dequantize_row_mxfp4_soa_to_fp16_rowmajor(
     int nrows,
     dpct::queue_ptr stream);
 
+// Repack MXFP4 SOA -> WOQ: de-interleave the intra-block j/j+16 nibble
+// packing into sequential nibble order and transpose expert-row-major into
+// oneDNN's {K,N} nibble / {K/QK_MXFP4,N} e8m0-scale layout (for the oneDNN
+// f4_e2m1 grouped-scale WOQ matmul path; see convert.cpp for the exact index
+// derivation). K = blocks_per_row * QK_MXFP4, N = nrows.
+void repack_mxfp4_soa_to_woq(
+    const void * src,
+    uint8_t * dst_nibbles,
+    uint8_t * dst_scales,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,
