@@ -59,4 +59,45 @@ expect_status 3 "level_zero:0,1 selector must not derive a card" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" \
         --meminfo "$T/meminfo" --pgrep-cmd false --max-wait 1 -- true
 
+# --- Task A2: run + verdict stamping ---
+
+# --log captures stdout+stderr behind a VALID header on a clean run.
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+         --max-wait 1 --log "$T/run.log" -- sh -c "echo bench-output" || fail=1
+head -1 "$T/run.log" | grep -q "bench-guard: VALID" || { echo "FAIL: VALID stamp missing"; fail=1; }
+grep -q "bench-output" "$T/run.log" || { echo "FAIL: output not captured"; fail=1; }
+
+# A wrapped command that grows Shmem (rewrites the fake meminfo file mid-run)
+# must stamp SUSPECT, even though the command itself succeeds.
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+         --log "$T/run2.log" -- sh -c "printf 'MemAvailable: 1 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
+head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must stamp SUSPECT"; fail=1; }
+
+# Exit-code mirroring: bench-guard's own exit code must equal the wrapped
+# command's, in BOTH the --log and no-log paths -- never the verdict.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+         --max-wait 1 --log "$T/run3.log" -- sh -c "exit 7" || rc=$?
+[ "$rc" -eq 7 ] || { echo "FAIL: --log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
+
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+         --max-wait 1 -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 7 ] || { echo "FAIL: no-log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
+
+# --budget must parse and default the timeout without breaking a clean run.
+mk_tree 0 0; mk_meminfo 3000000
+expect_status 0 "clean host must run with --budget set" -- \
+    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+             --max-wait 1 --budget 5 -- true
+
+# A fixture tree missing act_freq must refuse with a clear message, not die
+# on cat's raw (unguarded) failure under `set -e` (A1-review FYI fix).
+mk_tree 0 0; rm -f "$T/sys/class/drm/card9/device/tile0/gt0/freq0/act_freq"; mk_meminfo 3000000
+expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false"
+
 [ "$fail" -eq 0 ] && echo "OK: all preflight refusals" || exit 1
