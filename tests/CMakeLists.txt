@@ -497,6 +497,19 @@ if (NOT WIN32)
 endif()
 
 if (NOT WIN32)
+    # bench-guard preflight/postflight unit tests (perf-recovery epic, track A,
+    # llama.cpp-r780): refuses measurement on a throttled/tenant-occupied/
+    # Shmem-elevated host and stamps every archived log VALID/SUSPECT. Pure
+    # bash against a fake sysfs/meminfo tree via overridable --sysfs-card/
+    # --meminfo/--pgrep-cmd/--journalctl-cmd roots -- no GPU, safe at any
+    # parallelism. See docs/backend/sycl-perf-baselines.md "Measurement
+    # protocol" for the mandate this enforces.
+    add_test(NAME test-bench-guard
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh)
+    set_tests_properties(test-bench-guard PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
+endif()
+
+if (NOT WIN32)
     llama_test_cmd(
         bash
         NAME test-sycl-build-oneccl-discovery

@@ -16,6 +16,38 @@ is correct.
 
 ---
 
+## Measurement protocol (mandatory since 2026-08-21)
+
+**Every benchmark or correctness-gate run goes through `scripts/bench-guard.sh`**,
+not the raw binary. The guard refuses to run (exit 3) on a corrupted host, and on
+a clean host it stamps the archived `--log` with a `VALID`/`SUSPECT` verdict as
+its first line. Tests: `tests/test-bench-guard.sh` (also `ctest -R
+'^test-bench-guard$'`).
+
+Three preflight refusal classes, checked before any command runs:
+
+- **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
+  polled up to `--max-wait` (default 360 s) under
+  `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
+  derived **live** from the PCI device symlink (`readlink -f
+  /sys/class/drm/card*/device`) against `0000:03:00.0` (B70) or `0000:07:00.0`
+  (B50) — never a static `cardN` index; DRM numbering moves across boots.
+- **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
+  process.
+- **Shmem ceiling** — `Shmem` in `/proc/meminfo` above 10 GB (the TTM-shmem OOM
+  signature this repo has hit repeatedly).
+
+**A number whose log does not start with `# bench-guard: VALID` is not a
+baseline and must not be cited** — cite the SUSPECT reason instead, or re-run.
+
+Evidence (2026-08-21): PL2 throttling alone decayed identical-binary readings
+2–5× with a clean kernel log — HEAD default pp512 121.2 → 22.9, baseline-worktree
+pp512 908.9 → 456. Separately, two 16-hour-stale hung `llama-cli` tenants
+depressed every reading taken alongside them *and* masked a real B70 defect
+(`llama.cpp-o3h1`) until the tenants were found and killed.
+
+---
+
 ## How these numbers were taken (read before adding any)
 
 Each rule below cost a round of discarded measurements.
