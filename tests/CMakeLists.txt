@@ -537,9 +537,13 @@ if (NOT WIN32)
     # --meminfo/--pgrep-cmd/--journalctl-cmd roots -- no GPU, safe at any
     # parallelism. See docs/backend/sycl-perf-baselines.md "Measurement
     # protocol" for the mandate this enforces.
-    add_test(NAME test-bench-guard
-        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh)
-    set_tests_properties(test-bench-guard PROPERTIES LABELS "main" SKIP_RETURN_CODE 77)
+    llama_test_cmd(
+        bash
+        NAME test-bench-guard
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh
+    )
+    set_tests_properties(test-bench-guard PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 if (NOT WIN32)

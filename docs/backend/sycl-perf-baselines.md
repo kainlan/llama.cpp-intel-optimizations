@@ -24,18 +24,20 @@ a clean host it stamps the archived `--log` with a `VALID`/`SUSPECT` verdict as
 its first line. Tests: `tests/test-bench-guard.sh` (also `ctest -R
 '^test-bench-guard$'`).
 
-Three preflight refusal classes, checked before any command runs:
+Three preflight refusal classes, checked in the order the script runs them
+(tenants and Shmem are single checks; the throttle/act_freq check is a poll
+loop, which is why it runs last):
 
+- **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
+  process.
+- **Shmem ceiling** — `Shmem` in `/proc/meminfo` above 10 GB (the TTM-shmem OOM
+  signature this repo has hit repeatedly).
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
   derived **live** from the PCI device symlink (`readlink -f
   /sys/class/drm/card*/device`) against `0000:03:00.0` (B70) or `0000:07:00.0`
   (B50) — never a static `cardN` index; DRM numbering moves across boots.
-- **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
-  process.
-- **Shmem ceiling** — `Shmem` in `/proc/meminfo` above 10 GB (the TTM-shmem OOM
-  signature this repo has hit repeatedly).
 
 **A number whose log does not start with `# bench-guard: VALID` is not a
 baseline and must not be cited** — cite the SUSPECT reason instead, or re-run.
