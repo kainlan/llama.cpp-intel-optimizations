@@ -364,6 +364,39 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
+# f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
+# recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-
+# stamp above, this one calls real oneDNN entry points (primitive_desc,
+# sycl_interop::make_engine/make_stream, prim.execute), so it needs actual
+# DNNL::dnnl symbols, not just headers. That imported target is created by
+# ggml/src/ggml-sycl/CMakeLists.txt's find_package(DNNL), which is directory-
+# scoped to that subtree and not visible from here; re-issuing find_package
+# (DNNL) in this directory is the standard fix -- the search itself is
+# cached, so the second call is cheap, and it creates the target locally so
+# it can be linked here. Exit codes: 0 = supported & numerics match (rel err
+# <= 2e-2), 42 = primitive creation refused (documented RED outcome), 1 =
+# wrong numerics, 77 = no GPU (inherited SKIP_RETURN_CODE from
+# llama_build_and_test).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-onednn-woq-mxfp4.cpp)
+    set_tests_properties(test-onednn-woq-mxfp4 PROPERTIES LABELS "sycl;onednn;woq;mxfp4;tdd")
+    target_include_directories(test-onednn-woq-mxfp4 PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-onednn-woq-mxfp4 PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-onednn-woq-mxfp4 PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-onednn-woq-mxfp4 PRIVATE "-fsycl")
+        target_link_options(test-onednn-woq-mxfp4 PRIVATE "-fsycl")
+    endif()
+    find_package(DNNL QUIET)
+    if (TARGET DNNL::dnnl)
+        target_link_libraries(test-onednn-woq-mxfp4 PRIVATE DNNL::dnnl)
+    else()
+        message(WARNING "test-onednn-woq-mxfp4: DNNL::dnnl not found in this directory scope; the target will fail to link")
+    endif()
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
