@@ -63611,8 +63611,12 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
                                               const ggml_sycl::mem_handle & target_host, size_t target_offset,
                                               size_t src_offset, size_t bytes) {
         if (!ctx.src1_handle.valid()) {
-            GGML_ABORT("[MOE-ROUTE] secondary dispatch missing smart src1 handle tensor=%s device=%d",
-                       ctx.src0 && ctx.src0->name ? ctx.src0->name : "?", primary_device);
+            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                GGML_LOG_WARN(
+                    "[MOE-ROUTE] secondary dispatch missing smart src1 handle tensor=%s device=%d; refusing route\n",
+                    ctx.src0 && ctx.src0->name ? ctx.src0->name : "?", primary_device);
+            }
+            throw ggml_sycl_fallback_error("MUL_MAT_ID secondary dispatch missing smart src1 handle");
         }
         if (target_host.valid()) {
             ggml_sycl::mem_copy(target_host, target_offset, ctx.src1_handle, src_offset, bytes, *target_queue);
@@ -63857,8 +63861,14 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
                     ggml_sycl::mem_copy(act_staging_target_alloc[0].as_mem_handle(), 0, ctx.shared_act_handle,
                                         ctx.shared_act_offset, needed_act, *target_queue);
                 } else {
-                    GGML_ABORT("[MOE-ROUTE] secondary dispatch shared activation missing smart mem_handle tensor=%s",
-                               ctx.src0 && ctx.src0->name ? ctx.src0->name : "?");
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] secondary dispatch shared activation missing smart mem_handle tensor=%s; "
+                            "refusing route\n",
+                            ctx.src0 && ctx.src0->name ? ctx.src0->name : "?");
+                    }
+                    throw ggml_sycl_fallback_error(
+                        "MUL_MAT_ID secondary dispatch shared activation missing smart mem_handle");
                 }
             }
         } else if (chunk_shared_activation) {
@@ -67313,8 +67323,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     ggml_sycl_tensor_storage_handle src1_storage{};
                     if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
                         !src1_storage.handle.valid()) {
-                        GGML_ABORT("[MOE-ROUTE] shared activation missing smart src1 handle tensor=%s device=%d",
-                                   src1 && src1->name ? src1->name : "?", ctx.device);
+                        if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                            GGML_LOG_WARN(
+                                "[MOE-ROUTE] shared activation missing smart src1 handle tensor=%s device=%d; "
+                                "refusing route\n",
+                                src1 && src1->name ? src1->name : "?", ctx.device);
+                        }
+                        throw ggml_sycl_fallback_error("MUL_MAT_ID shared activation missing smart src1 handle");
                     }
                     shared_act_host = s_act_staging.as<float>();
                     act_d2h_event   = ggml_sycl::mem_copy_async(shared_act_handle, 0, src1_storage.handle,
@@ -67396,8 +67411,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
                     !src1_storage.handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d",
-                               src1 && src1->name ? src1->name : "?", ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d; refusing route\n",
+                            src1 && src1->name ? src1->name : "?", ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID CPU dispatch missing smart src1 handle");
                 }
                 ggml_sycl::mem_handle act_handle;
                 ggml_sycl::mem_handle out_handle;
@@ -67409,11 +67428,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     out_handle = std::move(out_owner);
                 }
                 if (!act_handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] CPU dispatch activation staging missing smart handle device=%d",
-                               ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] CPU dispatch activation staging missing smart handle device=%d; "
+                            "refusing route\n",
+                            ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID CPU dispatch activation staging missing smart handle");
                 }
                 if (!out_handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] CPU dispatch output staging missing smart handle device=%d", ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] CPU dispatch output staging missing smart handle device=%d; refusing route\n",
+                            ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID CPU dispatch output staging missing smart handle");
                 }
 
                 // D2H copy activations for each expert dispatch.
@@ -67602,8 +67631,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_tensor_storage_handle dst_storage{};
                 if (!ggml_sycl_find_tensor_storage_handle(dst, ctx.device, &dst_storage) ||
                     !dst_storage.handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] CPU dispatch missing smart dst handle tensor=%s device=%d",
-                               dst && dst->name ? dst->name : "?", ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] CPU dispatch missing smart dst handle tensor=%s device=%d; refusing route\n",
+                            dst && dst->name ? dst->name : "?", ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID CPU dispatch missing smart dst handle");
                 }
 
                 // Build scatter entries. Raw dst pointers are kept only as
@@ -68814,15 +68847,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
                     !src1_storage.handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d",
-                               src1 && src1->name ? src1->name : "?", ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d; refusing route\n",
+                            src1 && src1->name ? src1->name : "?", ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID planner CPU dispatch missing smart src1 handle");
                 }
                 ggml_sycl::mem_handle act_handle    = std::move(act_owner);
                 ggml_sycl::mem_handle out_handle    = std::move(out_owner);
                 ggml_sycl::mem_handle weight_handle = weight_pinned ? std::move(weight_owner) : ggml_sycl::mem_handle{};
                 if (!out_handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] planner CPU dispatch output staging missing smart handle device=%d",
-                               ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] planner CPU dispatch output staging missing smart handle device=%d; "
+                            "refusing route\n",
+                            ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error(
+                        "MUL_MAT_ID planner CPU dispatch output staging missing smart handle");
                 }
 
                 std::vector<sycl::event> copy_events;
@@ -68853,9 +68896,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                           &resolve_reason) &&
                         entry_weight_ptr && ggml_sycl::ggml_sycl_is_device_expert_ptr(entry_weight_ptr)) {
                         if (!entry.lease.valid()) {
-                            GGML_ABORT(
-                                "[MOE-ROUTE] CPU dispatch device expert copy missing smart handle tensor=%s expert=%d",
-                                src0 && src0->name ? src0->name : "?", entry.expert_id);
+                            if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                                GGML_LOG_WARN(
+                                    "[MOE-ROUTE] CPU dispatch device expert copy missing smart handle tensor=%s "
+                                    "expert=%d; refusing route\n",
+                                    src0 && src0->name ? src0->name : "?", entry.expert_id);
+                            }
+                            throw ggml_sycl_fallback_error(
+                                "MUL_MAT_ID CPU dispatch device expert copy missing smart handle");
                         }
                         copy_events.push_back(ggml_sycl::mem_copy_async(weight_handle, ci * expert_size, entry.lease, 0,
                                                                         expert_size, *stream));
@@ -68866,8 +68914,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl_tensor_storage_handle dst_storage{};
                 if (!ggml_sycl_find_tensor_storage_handle(dst, ctx.device, &dst_storage) ||
                     !dst_storage.handle.valid()) {
-                    GGML_ABORT("[MOE-ROUTE] planner CPU dispatch missing smart dst handle tensor=%s device=%d",
-                               dst && dst->name ? dst->name : "?", ctx.device);
+                    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                        GGML_LOG_WARN(
+                            "[MOE-ROUTE] planner CPU dispatch missing smart dst handle tensor=%s device=%d; "
+                            "refusing route\n",
+                            dst && dst->name ? dst->name : "?", ctx.device);
+                    }
+                    throw ggml_sycl_fallback_error("MUL_MAT_ID planner CPU dispatch missing smart dst handle");
                 }
 
                 // Build tasks into a local vector; ownership transfers into
@@ -69658,8 +69711,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         return;
                     }
                 }
-                GGML_ABORT("[MOE-ROUTE] PP CPU island missing smart %s handle tensor=%s device=%d", role,
-                           t && t->name ? t->name : "?", ctx.device);
+                if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+                    GGML_LOG_WARN(
+                        "[MOE-ROUTE] PP CPU island missing smart %s handle tensor=%s device=%d; refusing route\n", role,
+                        t && t->name ? t->name : "?", ctx.device);
+                }
+                throw ggml_sycl_fallback_error("MUL_MAT_ID PP CPU island missing smart handle");
             };
             ensure_island_storage(src1, &src1_storage, "src1");
             ensure_island_storage(dst, &dst_storage, "dst");
