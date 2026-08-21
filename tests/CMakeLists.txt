@@ -345,12 +345,15 @@ set_tests_properties(test-sycl-moe-mmvq-tables PROPERTIES LABELS "sycl;moe;sourc
 # portion -- see ggml-sycl/moe-route-table.hpp. The header's only backend
 # include is mem-handle.hpp, which pulls in <sycl/sycl.hpp>, so (unlike
 # test-sycl-moe-mmvq-tables.cpp above) this target needs the SYCL include dir
-# and -fsycl even though the tested logic itself touches no device -- mirrors
-# test-unified-cache-unpin-event's minimal-dependency pattern below, but links
-# no backend library since the header's inline function is self-contained.
-llama_build_and_test(test-sycl-route-table-stamp.cpp)
-set_tests_properties(test-sycl-route-table-stamp PROPERTIES LABELS "sycl;moe;route-table")
+# and -fsycl even though the tested logic itself touches no device. The WHOLE
+# registration is gated -- not just the extra include/compile wiring -- so the
+# target and its ctest entry simply don't exist on a GGML_SYCL=OFF or
+# GGML_BACKEND_DL=ON configure; mirrors test-unified-cache-unpin-event's
+# pattern below, but links no backend library since the header's inline
+# function is self-contained.
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-route-table-stamp.cpp)
+    set_tests_properties(test-sycl-route-table-stamp PROPERTIES LABELS "sycl;moe;route-table")
     target_include_directories(test-sycl-route-table-stamp PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     if (TARGET IntelSYCL::SYCL_CXX)
         target_link_libraries(test-sycl-route-table-stamp PRIVATE IntelSYCL::SYCL_CXX)
