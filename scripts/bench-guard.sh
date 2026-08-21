@@ -5,7 +5,7 @@
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
 # already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
-# --pgrep-cmd) so the logic is testable without hardware.
+# --pgrep-cmd, --journalctl-cmd) so the logic is testable without hardware.
 #
 # On a clean host: runs the wrapped command under `timeout -k 15 <budget>`
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
@@ -33,15 +33,16 @@ SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" MAX_WAIT=360 PCI="" SELECTOR="$
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
-LOG="" BUDGET=900
+LOG="" BUDGET=900 JOURNALCTL_CMD=""
 while [ $# -gt 0 ]; do case "$1" in
-    --sysfs-card) SYSFS_CARD="$2"; shift 2;;
-    --meminfo)    MEMINFO="$2";    shift 2;;
-    --pgrep-cmd)  PGREP_CMD="$2";  shift 2;;
-    --max-wait)   MAX_WAIT="$2";   shift 2;;
-    --pci)        PCI="$2";        shift 2;;
-    --log)        LOG="$2";        shift 2;;
-    --budget)     BUDGET="$2";     shift 2;;
+    --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
+    --meminfo)         MEMINFO="$2";        shift 2;;
+    --pgrep-cmd)       PGREP_CMD="$2";      shift 2;;
+    --max-wait)        MAX_WAIT="$2";       shift 2;;
+    --pci)             PCI="$2";            shift 2;;
+    --log)             LOG="$2";            shift 2;;
+    --budget)          BUDGET="$2";         shift 2;;
+    --journalctl-cmd)  JOURNALCTL_CMD="$2"; shift 2;;
     --) shift; break;;
     *) echo "bench-guard: unknown arg $1" >&2; exit 2;;
 esac; done
@@ -101,6 +102,7 @@ pre_thr="$st"
 rc=0
 if [ -n "$LOG" ]; then
     tmp_out="$(mktemp)"
+    trap 'rm -f "$tmp_out"' EXIT
     timeout -k 15 "$BUDGET" "$@" >"$tmp_out" 2>&1 || rc=$?
 else
     timeout -k 15 "$BUDGET" "$@" || rc=$?
@@ -123,18 +125,21 @@ if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
 fi
 # journalctl legitimately finds nothing (grep rc=1) on a clean run -- that's
 # inside an `if` condition, which `set -e` already exempts from tripping.
-if journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null | grep -qiE 'GT reset|guc_id|CAT error'; then
+kernel_log() {
+    if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null; fi
+}
+if kernel_log | grep -qiE 'GT reset|guc_id|CAT error'; then
     verdict="SUSPECT"
     reasons="$reasons kernel-gpu-fault"
 fi
 
+verdict_line="$verdict${reasons:+:$reasons}"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict${reasons:+:$reasons} pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem=${pre_shmem}kB post_shmem=${post_shmem}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem=${pre_shmem}kB post_shmem=${post_shmem}kB cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
-    rm -f "$tmp_out"
 else
-    echo "bench-guard: $verdict${reasons:+:$reasons}" >&2
+    echo "bench-guard: $verdict_line" >&2
 fi
 exit "$rc"

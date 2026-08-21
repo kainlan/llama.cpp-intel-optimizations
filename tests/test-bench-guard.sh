@@ -100,4 +100,21 @@ expect_status 0 "clean host must run with --budget set" -- \
 mk_tree 0 0; rm -f "$T/sys/class/drm/card9/device/tile0/gt0/freq0/act_freq"; mk_meminfo 3000000
 expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false"
 
+# --journalctl-cmd is fakeable like every other probe: a fake command that
+# emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+         --journalctl-cmd "echo kernel: xe 0000:03:00.0: GT reset triggered" \
+         --log "$T/run4.log" -- true || fail=1
+head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line must stamp SUSPECT"; fail=1; }
+
+# Timeout kill: a wrapped command that outlives --budget must be killed
+# (rc 124, mirrored by the guard) and stamped SUSPECT with the reason.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+         --budget 1 --log "$T/run5.log" -- sh -c "sleep 5" || rc=$?
+[ "$rc" -eq 124 ] || { echo "FAIL: timeout-killed command must exit 124 (got $rc)"; fail=1; }
+head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout kill must stamp SUSPECT with timeout-killed:rc=124"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "OK: all preflight refusals" || exit 1
