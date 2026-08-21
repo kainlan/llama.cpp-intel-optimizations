@@ -4990,6 +4990,20 @@ struct moe_decode_route_census {
     std::atomic<uint64_t> decode_admission_calls{
         0
     };  // v1's suspect site: the UNCONDITIONAL ne12==1 ggml_sycl_build_moe_resolved_batch call, proven dead by lead
+    // v3 (team-lead pivot): segment-timing accumulators for the decode path,
+    // ns totals + call counts so the print function can compute per-call
+    // averages. S1=ids-available, S2=RESTORE-T1 admission (ptr-table
+    // build/query), S3=the fused GLU dispatch call itself, S4=everything
+    // after dispatch (including the down-projection admission/dispatch)
+    // until return.
+    std::atomic<uint64_t> s1_ids_ns{ 0 };
+    std::atomic<uint64_t> s1_ids_count{ 0 };
+    std::atomic<uint64_t> s2_admission_ns{ 0 };
+    std::atomic<uint64_t> s2_admission_count{ 0 };
+    std::atomic<uint64_t> s3_dispatch_ns{ 0 };
+    std::atomic<uint64_t> s3_dispatch_count{ 0 };
+    std::atomic<uint64_t> s4_tail_ns{ 0 };
+    std::atomic<uint64_t> s4_tail_count{ 0 };
 };
 
 static moe_decode_route_census g_moe_decode_route_census;
@@ -5000,6 +5014,10 @@ static bool moe_decode_route_census_enabled() {
         return env != nullptr && std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+static double moe_decode_route_census_avg_us(uint64_t ns, uint64_t count) {
+    return count == 0 ? 0.0 : (static_cast<double>(ns) / 1000.0) / static_cast<double>(count);
 }
 
 // Called from ggml_sycl_mul_mat_id's entry, gated by the caller to fire
@@ -5016,7 +5034,9 @@ static void moe_decode_route_census_maybe_print() {
         "[MOE-ROUTE-CENSUS] mul_mat_id_calls=%llu ne12_eq1_calls=%llu raw_resolve_calls=%llu "
         "ptr_table_entry_calls=%llu ptr_table_plan_branch_entries=%llu ptr_table_route_table_hits=%llu "
         "ptr_table_route_table_stored=%llu pair_glu_block_entered=%llu pair_glu_topology_ok=%llu "
-        "pair_glu_full_gpu_cover=%llu pair_glu_ptr_table_rebuild_attempts=%llu decode_admission_calls=%llu\n",
+        "pair_glu_full_gpu_cover=%llu pair_glu_ptr_table_rebuild_attempts=%llu decode_admission_calls=%llu "
+        "s1_ids_avg_us=%.2f(n=%llu) s2_admission_avg_us=%.2f(n=%llu) s3_dispatch_avg_us=%.2f(n=%llu) "
+        "s4_tail_avg_us=%.2f(n=%llu)\n",
         (unsigned long long) g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.ne12_eq1_calls.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.raw_resolve_calls.load(std::memory_order_relaxed),
@@ -5029,7 +5049,19 @@ static void moe_decode_route_census_maybe_print() {
         (unsigned long long) g_moe_decode_route_census.pair_glu_full_gpu_cover.load(std::memory_order_relaxed),
         (unsigned long long) g_moe_decode_route_census.pair_glu_ptr_table_rebuild_attempts.load(
             std::memory_order_relaxed),
-        (unsigned long long) g_moe_decode_route_census.decode_admission_calls.load(std::memory_order_relaxed));
+        (unsigned long long) g_moe_decode_route_census.decode_admission_calls.load(std::memory_order_relaxed),
+        moe_decode_route_census_avg_us(g_moe_decode_route_census.s1_ids_ns.load(std::memory_order_relaxed),
+                                       g_moe_decode_route_census.s1_ids_count.load(std::memory_order_relaxed)),
+        (unsigned long long) g_moe_decode_route_census.s1_ids_count.load(std::memory_order_relaxed),
+        moe_decode_route_census_avg_us(g_moe_decode_route_census.s2_admission_ns.load(std::memory_order_relaxed),
+                                       g_moe_decode_route_census.s2_admission_count.load(std::memory_order_relaxed)),
+        (unsigned long long) g_moe_decode_route_census.s2_admission_count.load(std::memory_order_relaxed),
+        moe_decode_route_census_avg_us(g_moe_decode_route_census.s3_dispatch_ns.load(std::memory_order_relaxed),
+                                       g_moe_decode_route_census.s3_dispatch_count.load(std::memory_order_relaxed)),
+        (unsigned long long) g_moe_decode_route_census.s3_dispatch_count.load(std::memory_order_relaxed),
+        moe_decode_route_census_avg_us(g_moe_decode_route_census.s4_tail_ns.load(std::memory_order_relaxed),
+                                       g_moe_decode_route_census.s4_tail_count.load(std::memory_order_relaxed)),
+        (unsigned long long) g_moe_decode_route_census.s4_tail_count.load(std::memory_order_relaxed));
 }
 
 namespace ggml_sycl {
@@ -64490,6 +64522,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
         moe_decode_route_census_maybe_print();
     }
+    // llama.cpp-1tjn (B3 rework census v3, temporary): segment-timing
+    // markers S1-S4 for the decode path, per the team lead's pivot after the
+    // v2 census proved decode dispatch is already decision-free (route
+    // resolution is a one-time startup cost, not a per-token one). Stays in
+    // scope for the whole function body; only accumulated for ne12==1.
+    const auto t_mul_mat_id_entry = std::chrono::steady_clock::now();
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
     // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
@@ -66254,6 +66292,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
     pp_phase_log("ids-ready", GGML_LAYOUT_AOS, ids_host.size());
+    // llama.cpp-1tjn (B3 rework census v3, temporary): S1 = entry through
+    // ids host-available (the ggml_sycl_copy_ids_to_host block above, plus
+    // the g_moe_layer_ids_cache reuse check and everything preceding it).
+    const auto t_s1_ids_ready = std::chrono::steady_clock::now();
+    if (ne12 == 1) {
+        g_moe_decode_route_census.s1_ids_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_s1_ids_ready - t_mul_mat_id_entry).count(),
+            std::memory_order_relaxed);
+        g_moe_decode_route_census.s1_ids_count.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // ---- llama.cpp-haqk / llama.cpp-unpj RESTORE-T1 ------------------------
     // abecb785d ("fix(sycl): make retained prompt fusion transactional",
@@ -66273,11 +66321,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // T2/T3) -- this block only ever engages when the CURRENT node is the
     // GATE half of a decode-shaped pair.
     bool decode_pair_glu_dispatched = false;
+    // llama.cpp-1tjn (B3 rework census v3, temporary): S3-end timestamp,
+    // hoisted to this scope so the S4 measurement at the dispatched-return
+    // check below (outside the nested admission blocks) can read it.
+    auto t_s3_end_for_s4 = std::chrono::steady_clock::time_point{};
     if (ne12 == 1 && !g_ggml_sycl_graph_recording && !xmx_moe_forced && src0->type == GGML_TYPE_MXFP4 &&
         blk_layer_id >= 0 && is_gate_subop) {
         // llama.cpp-1tjn (B3 rework census, temporary): outer RESTORE-T1 gate true.
         g_moe_decode_route_census.pair_glu_block_entered.fetch_add(1, std::memory_order_relaxed);
-        auto decode_pair_it = g_moe_gate_up_pairs.find(blk_layer_id);
+        // llama.cpp-1tjn (B3 rework census v3, temporary): S2 start -- RESTORE-T1
+        // admission work (pointer-table build/query for gate/up/down) up to
+        // just before the fused GLU dispatch call.
+        const auto t_s2_block_entry = std::chrono::steady_clock::now();
+        auto       decode_pair_it   = g_moe_gate_up_pairs.find(blk_layer_id);
         if (decode_pair_it != g_moe_gate_up_pairs.end()) {
             const moe_gate_up_pair & pair = decode_pair_it->second;
             const bool               decode_pair_topology_ok =
@@ -66575,7 +66631,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                     sycl::event glu_event;
                     bool        glu_event_set = false;
-                    const bool  ok_glu        = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
+                    // llama.cpp-1tjn (B3 rework census v3, temporary): S2 end / S3 start.
+                    const auto t_s2_end = std::chrono::steady_clock::now();
+                    g_moe_decode_route_census.s2_admission_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_s2_end - t_s2_block_entry).count(),
+                        std::memory_order_relaxed);
+                    g_moe_decode_route_census.s2_admission_count.fetch_add(1, std::memory_order_relaxed);
+                    const bool ok_glu = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
                         ctx, pair.gate_weight, pair.up_weight, src1, pair.glu_dst, gate_full_table, up_full_table,
                         ids_device, gate_bias_ptr, up_bias_ptr, pair.gate_bias ? pair.gate_bias->nb[1] : 0,
                         pair.up_bias ? pair.up_bias->nb[1] : 0, static_cast<int>(gate_up_dispatch_entries), n_ids_pair,
@@ -66585,6 +66647,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         /*direct_xmx_eligible=*/false, xmx_tiled_grouped_eligible, gate_materialize_tmp,
                         up_materialize_tmp, pair_ids_host_arg, pair_ids_host_count_arg, &glu_event, &glu_event_set,
                         /*write_recorder=*/nullptr, ptr_table_build_deps);
+                    // llama.cpp-1tjn (B3 rework census v3, temporary): S3 end / S4 start.
+                    const auto t_s3_end = std::chrono::steady_clock::now();
+                    g_moe_decode_route_census.s3_dispatch_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(t_s3_end - t_s2_end).count(),
+                        std::memory_order_relaxed);
+                    g_moe_decode_route_census.s3_dispatch_count.fetch_add(1, std::memory_order_relaxed);
+                    t_s3_end_for_s4 = t_s3_end;
                     if (ok_glu) {
                         ggml_sycl_moe_precomputed_skip_insert(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device);
                         if (pair.gate_biased) {
@@ -66743,6 +66812,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
     if (decode_pair_glu_dispatched) {
+        // llama.cpp-1tjn (B3 rework census v3, temporary): S4 = everything
+        // after the fused GLU dispatch call (including the down-projection
+        // admission/dispatch that follows it in this same block) until
+        // return.
+        g_moe_decode_route_census.s4_tail_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_s3_end_for_s4)
+                .count(),
+            std::memory_order_relaxed);
+        g_moe_decode_route_census.s4_tail_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
