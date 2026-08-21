@@ -64263,6 +64263,35 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
     init_moe_debug();
+    // llama.cpp-fwhv (B1): TEMPORARY host-time probe over this function --
+    // total CPU-side dispatch cost per MUL_MAT_ID call, all exits included via
+    // the destructor. Enabled by GGML_SYCL_MOE_PROLOGUE_TIMING=1; removed by
+    // task B5 (llama.cpp-rty8).
+    struct b1_mmid_host_timer {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        static bool enabled() {
+            static const bool e = [] {
+                const char * v = std::getenv("GGML_SYCL_MOE_PROLOGUE_TIMING");
+                return v && std::atoi(v) != 0;
+            }();
+            return e;
+        }
+        ~b1_mmid_host_timer() {
+            if (!enabled()) {
+                return;
+            }
+            static std::atomic<uint64_t> ns_total{ 0 };
+            static std::atomic<uint64_t> calls{ 0 };
+            const uint64_t ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            const uint64_t t = ns_total.fetch_add(ns, std::memory_order_relaxed) + ns;
+            const uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (c % 720 == 0) {
+                fprintf(stderr, "[B1-MMID-HOST] calls=%llu total_ms=%.1f avg_us=%.1f\n", (unsigned long long) c,
+                        t / 1e6, t / 1e3 / (double) c);
+            }
+        }
+    } b1_mmid_host_timer_instance;
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
