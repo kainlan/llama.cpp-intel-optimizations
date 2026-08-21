@@ -12,15 +12,29 @@
 #include <vector>
 using dt = dnnl::memory::data_type;
 
+// Deliberately HALVED vs. ggml's own kvalues_mxfp4 (ggml-common.h:1126:
+// { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 }), paired below
+// with an un-halved e8m0_to_f32. The product is algebraically identical to
+// ggml's doubled-int table paired with its own e8m0_to_fp32_half (which
+// halves the decoded scale to compensate) -- so a literal element-by-element
+// comparison against ggml's table would show a difference despite both
+// factorizations producing the same dequantized weight.
 static const float kvalues_mxfp4[16] = { 0, .5f, 1, 1.5f, 2, 3, 4, 6, -0, -.5f, -1, -1.5f, -2, -3, -4, -6 };
 
+// Mirrors ggml_e8m0_to_fp32 (ggml-impl.h:439-473), including its e==0
+// special case: the exponent field alone can't represent 2^-127 (bits would
+// be 0, i.e. positive zero), so e==0 is defined as the denormal bit pattern
+// 0x00400000 (0.5 * 2^-126 = 2^-127) rather than falling through to the
+// general `e << 23` formula. Current test data never selects e==0 (scales
+// start at 124), so this doesn't move today's verdict, but C2's repack test
+// inherits this reference and could exercise it.
 static float e8m0_to_f32(uint8_t e) {
     union {
         uint32_t u;
         float    f;
     } v;
 
-    v.u = (uint32_t) e << 23;
+    v.u = (e == 0) ? 0x00400000u : ((uint32_t) e << 23);
     return v.f;
 }
 
@@ -123,6 +137,15 @@ int main() {
         sycl::free(s_dev, q);
         sycl::free(c_dev, q);
         return 0;
+    } catch (const dnnl::error & e) {
+        // A dnnl::error thrown anywhere past primitive_desc creation (memory
+        // construction, prim.execute, ...) is a driver/runtime-side failure,
+        // not the "unsupported" verdict the inner try/catch above reports.
+        // Without this handler it propagates out of main uncaught -> std::
+        // terminate, which on future hardware would look like a harness bug
+        // rather than a clean, distinguishable verdict.
+        std::printf("VERDICT: dnnl error outside primitive creation (%s)\n", e.what());
+        return 43;
     } catch (const sycl::exception & e) {
         std::printf("SKIP: no SYCL GPU (%s)\n", e.what());
         return 77;
