@@ -622,28 +622,35 @@ class DnnlGemmWrapper {
   public:
     // Strided batch GEMM - C[i] = alpha * A[i] * B[i] + beta * C[i]
     // Matches dpct::gemm_batch interface for strided buffers
-    static void gemm_batch_strided(ggml_backend_sycl_context & ctx,
-                                   bool                        trans_a,
-                                   bool                        trans_b,
-                                   int                         m,
-                                   int                         n,
-                                   int                         k,
-                                   float                       alpha,
-                                   const void *                a,
-                                   dt                          at,
-                                   int                         lda,
-                                   int64_t                     stride_a,
-                                   const void *                b,
-                                   dt                          bt,
-                                   int                         ldb,
-                                   int64_t                     stride_b,
-                                   float                       beta,
-                                   void *                      c,
-                                   dt                          ct,
-                                   int                         ldc,
-                                   int64_t                     stride_c,
-                                   int                         batch_size,
-                                   const queue_ptr &           q) {
+    //
+    // `deps` are SYCL events the GEMM must wait on before executing (e.g. the
+    // dequant/activation staging that fills `a`/`b`). The returned event fires
+    // when the GEMM completes, so callers on the same in-order queue can chain
+    // dependent submissions onto it (e.g. via cgh.depends_on(...) or a barrier)
+    // instead of relying on in-order-queue ordering with an async primitive.
+    static sycl::event gemm_batch_strided(ggml_backend_sycl_context &      ctx,
+                                          bool                             trans_a,
+                                          bool                             trans_b,
+                                          int                              m,
+                                          int                              n,
+                                          int                              k,
+                                          float                            alpha,
+                                          const void *                     a,
+                                          dt                               at,
+                                          int                              lda,
+                                          int64_t                          stride_a,
+                                          const void *                     b,
+                                          dt                               bt,
+                                          int                              ldb,
+                                          int64_t                          stride_b,
+                                          float                            beta,
+                                          void *                           c,
+                                          dt                               ct,
+                                          int                              ldc,
+                                          int64_t                          stride_c,
+                                          int                              batch_size,
+                                          const queue_ptr &                q,
+                                          const std::vector<sycl::event> & deps = {}) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         auto                        stream = ctx.stream_dnnl(q);
         auto                        eng    = ctx.engine_dnnl(q);
@@ -737,8 +744,7 @@ class DnnlGemmWrapper {
             if (scratchpad_md.get_size() > 0) {
                 args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
-            matmul_prim.execute(stream, args);
-            return;
+            return dnnl::sycl_interop::execute(matmul_prim, stream, args, deps);
         }
 
         // Use cached primitive - only memory binding and execute (graph-compatible)
@@ -756,7 +762,7 @@ class DnnlGemmWrapper {
         args.insert({ DNNL_ARG_DST, c_mem });
         args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
 
-        cached->primitive.execute(stream, args);
+        return dnnl::sycl_interop::execute(cached->primitive, stream, args, deps);
     }
 
     // Pointer array batch GEMM - C[i] = alpha * A[i] * B[i] + beta * C[i]

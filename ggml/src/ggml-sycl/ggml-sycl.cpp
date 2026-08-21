@@ -70204,8 +70204,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 });
             }
 
+            // The batched oneDNN primitive's execution is not reliably ordered
+            // with the wrapped in-order SYCL queue by submission order alone
+            // (llama.cpp-dboi -- empirically bisected: async scatter+tail
+            // hangs/aborts without explicit event chaining, a host wait right
+            // after the GEMM cures it, sync-only-first-dispatch does not). Fix
+            // with explicit events instead of a host wait: capture a barrier
+            // over everything queued so far (the per-expert dequant + activation
+            // copies above) as the GEMM's input dependency, then barrier again
+            // on the GEMM's own completion event so every later submission on
+            // this in-order queue -- the dst-scatter loop and the done marker --
+            // observes it.
+            sycl::event ev_gemm;
             try {
-                DnnlGemmWrapper::gemm_batch_strided(
+                const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                ev_gemm                   = DnnlGemmWrapper::gemm_batch_strided(
                     ctx,
                     /* trans_a = */ true,
                     /* trans_b = */ false, static_cast<int>(ne01), static_cast<int>(max_rows_per_expert),
@@ -70213,7 +70226,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     static_cast<int>(ne00), static_cast<int64_t>(weight_elems), batched_acts,
                     DnnlGemmWrapper::to_dt<sycl::half>(), static_cast<int>(ne10), static_cast<int64_t>(act_slot_elems),
                     0.0f, batched_out, DnnlGemmWrapper::to_dt<float>(), static_cast<int>(ne0),
-                    static_cast<int64_t>(out_slot_elems), static_cast<int>(active_count), ctx.stream());
+                    static_cast<int64_t>(out_slot_elems), static_cast<int>(active_count), ctx.stream(), { deps_in });
             } catch (const std::exception & e) {
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> gemm_fail_log{ 0 };
@@ -70225,6 +70238,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 batched_scratch_claim.finish_or_release();
                 return false;
             }
+            stream->ext_oneapi_submit_barrier({ ev_gemm });
 
             const bool batched_compare = [] {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE");
