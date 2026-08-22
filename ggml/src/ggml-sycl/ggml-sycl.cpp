@@ -53436,12 +53436,23 @@ static bool ggml_sycl_moe_tensor_plan_primary_layout(const ggml_tensor * src0, i
         return false;
     }
 
-    const std::string tensor_name(src0->name);
-    bool              have_layout = false;
-    layout_mode       planned     = GGML_LAYOUT_AOS;
+    // llama.cpp-1tjn (Option T quality review): parse layer_id/role from the
+    // tensor name ONCE and use the 3-arg lookup_expert_placement() overload
+    // in the loop -- the 2-arg (tensor_name, expert_id) overload re-parses
+    // both from the name string on EVERY call, so a caller looping n_experts
+    // times (as this one does, and as ggml_sycl_moe_pp_onednn_batched_claims_
+    // tensor does through this shared helper, up to 3x per dispatch) paid
+    // O(n_experts) repeated strstr/strcmp classification for an identical
+    // answer every time. This helper is shared by several callers (see
+    // ggml_sycl_moe_phase_target_layout and others below), so fixing it here
+    // benefits all of them.
+    const int                           layer_id    = ggml_sycl::expert_layer_from_tensor_name(src0->name);
+    const ggml_sycl::expert_tensor_role role        = ggml_sycl::expert_tensor_role_from_tensor_name(src0->name);
+    bool                                have_layout = false;
+    layout_mode                         planned     = GGML_LAYOUT_AOS;
     for (int64_t e = 0; e < n_experts; ++e) {
         const auto placement =
-            (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tensor_name, static_cast<int>(e));
+            (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(layer_id, static_cast<int>(e), role);
         if (!placement.found() || !placement.on_device || placement.target_device != device) {
             return false;
         }
@@ -66617,6 +66628,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 const char * xmx_tiled_grouped_pp_reason = xmx_tiled_grouped_pp_reason_fn();
                 const bool   xmx_tiled_grouped_eligible  = strcmp(xmx_tiled_grouped_pp_reason, "eligible") == 0;
 
+                // Measured 2026-08-21: enabling this path is a ~2x decode regression
+                // (25.8 vs 12.26 ms/token gate/up) -- kept as parity documentation, not
+                // a speedup; see docs/backend/sycl-env-vars.md and llama.cpp-d0bp c-kobw.
                 // llama.cpp-1tjn (B3 real fix, team-lead diagnosis 2026-08-21):
                 // baseline (79ae63559) computed a real direct_xmx_eligible at
                 // this call site via moe_layer_direct_xmx_check_role() -- see
