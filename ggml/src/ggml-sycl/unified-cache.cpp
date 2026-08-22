@@ -18871,25 +18871,24 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // cap entirely.
     if (device_total_vram > 0) {
         const size_t caller_reserved_headroom = arena_caller_reserved_headroom(device_total_vram, budget_bytes);
-        size_t       external_headroom        = arena_default_external_headroom(device_total_vram, budget_bytes);
+        const size_t default_headroom         = arena_default_external_headroom(device_total_vram, budget_bytes);
         const char * headroom_env             = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB");
-        if (headroom_env != nullptr) {
-            // Explicit override wins verbatim over every default below.
-            external_headroom = ggml_sycl_vram_external_headroom_bytes(device_total_vram,
-                                                                       /*onednn_pipeline_planned=*/false, headroom_env);
-        } else {
-            // The inventory publish (ggml-sycl.cpp: populate_inventory_globals,
-            // its "Phase A" doc comment) always runs before the FIRST call into
-            // this function for a given model load, so this reads the real plan,
-            // not a stale pre-plan zero (llama.cpp-seno, per llama.cpp-dp5i
-            // c-gkai's D2 spec). Floor, not replacement: arena_default_external_headroom's
-            // proportional/safe-cap logic (tested by test-sycl-layout-choice.cpp)
-            // is left exactly as-is; this only raises the result when the
-            // batched oneDNN MoE PP pipeline is planned on this device.
-            const bool onednn_pipeline_planned = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id) > 0;
-            external_headroom                  = std::max(external_headroom, ggml_sycl_vram_external_headroom_bytes(
-                                                                device_total_vram, onednn_pipeline_planned, nullptr));
-        }
+        // The first backend-init arena is built at unified_cache construction,
+        // before any model inventory exists -- planned bytes read 0 there, so
+        // onednn_pipeline_planned is pipeline-off for that early reserve. The
+        // arena is REBUILT after planning ("[VRAM-ARENA] Rebuilding unused
+        // early arena for planned zones", this file's ensure_planned_arena_zones())
+        // once the real plan (including pp_moe_onednn scratch) is known; that
+        // rebuild is the reservation that actually matters for inference
+        // (llama.cpp-seno, per llama.cpp-dp5i c-gkai's D2 spec).
+        const bool   onednn_pipeline_planned  = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id) > 0;
+        // Composed as a pure function (not inlined here) so the composition --
+        // env override wins verbatim only when it parses > 0; otherwise treated
+        // as unset and floored at max(default_headroom, pipeline-aware floor),
+        // never silently dropped below either -- is itself unit-tested
+        // (test-sycl-vram-headroom.cpp; spec-review finding 1, llama.cpp-seno).
+        const size_t external_headroom        = ggml_sycl_vram_external_headroom_effective(
+            device_total_vram, default_headroom, onednn_pipeline_planned, headroom_env);
         GGML_LOG_INFO(
             "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
             "oneDNN=%.0f MB scratch=%.0f MB\n",

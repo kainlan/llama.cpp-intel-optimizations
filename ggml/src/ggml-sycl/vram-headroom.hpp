@@ -59,4 +59,34 @@ inline size_t ggml_sycl_vram_external_headroom_bytes(size_t       total_vram_byt
     return std::max(k_plain_floor, total_vram_bytes * 4 / 100);
 }
 
+// Composes the caller's pre-existing default headroom (arena_reserve()'s
+// arena_default_external_headroom() result) with the pipeline-aware floor
+// above, honoring an explicit env override. This is the wiring arena_reserve()
+// actually applies -- extracted as its own pure function (rather than left
+// inline at the call site) so the composition itself is unit-testable, not
+// just ggml_sycl_vram_external_headroom_bytes() in isolation.
+//
+// A POSITIVE override wins verbatim, even when lower than either the default
+// or the floor -- an operator is allowed to deliberately lower headroom, not
+// just raise it. A zero/negative/unparsable override (or no override at all)
+// is treated as UNSET and falls through to max(default_headroom, floor):
+// discarding default_headroom or hardcoding onednn_pipeline_planned=false on
+// an unparsable override would silently drop below both the pre-existing
+// default and the pipeline floor on GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB
+// values like "0", "-5", "abc", or "" -- reintroducing the error-40 class
+// this fix exists for (llama.cpp-seno spec-review finding 1).
+inline size_t ggml_sycl_vram_external_headroom_effective(size_t       total_vram_bytes,
+                                                         size_t       default_headroom,
+                                                         bool         onednn_pipeline_planned,
+                                                         const char * env_override) {
+    if (env_override != nullptr) {
+        const long parsed = std::strtol(env_override, nullptr, 10);
+        if (parsed > 0) {
+            return static_cast<size_t>(parsed) * 1024ull * 1024ull;
+        }
+    }
+    return std::max(default_headroom, ggml_sycl_vram_external_headroom_bytes(total_vram_bytes, onednn_pipeline_planned,
+                                                                             /*env_override=*/nullptr));
+}
+
 }  // namespace ggml_sycl

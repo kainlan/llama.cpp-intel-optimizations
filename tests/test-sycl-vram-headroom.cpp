@@ -4,6 +4,7 @@
 // llama.cpp-seno; spec: llama.cpp-dp5i c-ni04/c-gkai).
 #include "ggml-sycl/vram-headroom.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #define CHECK(cond, msg)                      \
     do {                                      \
@@ -87,6 +88,51 @@ int main() {
     CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_bytes(b70_total, true, nullptr) >=
               ggml_sycl::ggml_sycl_vram_external_headroom_bytes(b50_total, true, nullptr),
           "headroom must not decrease as total VRAM grows (pipeline on)");
+
+    // ggml_sycl_vram_external_headroom_effective(): the arena_reserve() call-
+    // site wiring itself, as a pure function (llama.cpp-seno spec-review
+    // finding 1). A legacy default_headroom that has already been capped down
+    // (e.g. the exact 630 MB c-gkai proved insufficient) must not be silently
+    // discarded by a garbage/unset env value -- the composition must still
+    // apply the pipeline-aware floor on top of it.
+    const size_t legacy_default = 630ull * mib;
+
+    // Garbage env + pipeline-on must equal the composed
+    // max(default_headroom, pipeline_floor) -- NOT the bare pipeline-off
+    // ggml_sycl_vram_external_headroom_bytes() result (652 MiB) that the
+    // pre-fix wiring silently fell back to.
+    const size_t composed_pipeline_on =
+        std::max(legacy_default, ggml_sycl::ggml_sycl_vram_external_headroom_bytes(b50_total, true, nullptr));
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, legacy_default, true, "not-a-number") ==
+              composed_pipeline_on,
+          "garbage env + pipeline-on must equal the composed default, not collapse to a smaller bare floor");
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, legacy_default, true, "0") ==
+              composed_pipeline_on,
+          "a zero env override must compose exactly like an unset one, not collapse to a smaller bare floor");
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, legacy_default, true, "-5") ==
+              composed_pipeline_on,
+          "a negative env override must compose exactly like an unset one, not collapse to a smaller bare floor");
+
+    // Unset (nullptr) must compose identically to a garbage/zero/negative
+    // override -- both are "no real override", and both must floor at
+    // max(default_headroom, pipeline-aware floor).
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, legacy_default, true, nullptr) ==
+              composed_pipeline_on,
+          "unset env must equal the same composed default as a garbage override");
+
+    // A positive override wins verbatim -- even LOWER than both
+    // default_headroom and the pipeline floor. An operator is allowed to
+    // deliberately lower headroom, not just raise it.
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, legacy_default, true, "300") == 300ull * mib,
+          "a positive env override must win verbatim, even when lower than both the default and the floor");
+
+    // Unset, pipeline off, with a default_headroom that already exceeds the
+    // pipeline-off floor: the composition must honor default_headroom (the
+    // max, not the floor alone).
+    const size_t large_default = 2000ull * mib;
+    CHECK(ggml_sycl::ggml_sycl_vram_external_headroom_effective(b50_total, large_default, false, nullptr) ==
+              large_default,
+          "unset override must preserve a default_headroom that already exceeds the pipeline-off floor");
 
     std::printf("OK: VRAM external headroom semantics\n");
     return 0;
