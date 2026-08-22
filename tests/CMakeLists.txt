@@ -535,10 +535,12 @@ if (Python3_Interpreter_FOUND)
     #
     # llama_test_cmd rather than llama_test_pytest: this is a plain script
     # with top-level checks, not pytest test_ functions (see
-    # llama_test_pytest's own doc comment above; matches the sibling
-    # test-sycl-pp-moe-scratch-source.py's own registration pattern in
-    # ggml/src/ggml-sycl/CMakeLists.txt). Host-only -- reads two source
-    # files as text, builds nothing, touches no device.
+    # llama_test_pytest's own doc comment above; matches
+    # test-sycl-zone-reset-audit-source's own llama_test_cmd registration
+    # further below in this file -- test-sycl-pp-moe-scratch-source.py is
+    # NOT a llama_test_cmd precedent, it is registered via a bare add_test
+    # in ggml/src/ggml-sycl/CMakeLists.txt instead). Host-only -- reads two
+    # source files as text, builds nothing, touches no device.
     llama_test_cmd(
         ${Python3_EXECUTABLE}
         NAME test-sycl-woq-slot-formula-source

@@ -71266,17 +71266,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         constexpr double kCompareAbsScaleFrac = 0.05;
                         const double     rel_to_tensor_max    = max_abs / std::max(1.0, max_cpu_abs);
                         const bool       compare_failed = nan_count > 0 || (rel_at_max_abs > kCompareRelThreshold &&
-                                                                       rel_to_tensor_max > kCompareAbsScaleFrac);
+                                                                      rel_to_tensor_max > kCompareAbsScaleFrac);
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s role=%s expert=%d rows=%zu "
                                 "active=%zu max_rows=%zu max_abs=%.8g rel_at_max_abs=%.8g rel_to_max=%.8g row=%zu "
                                 "col=%zu gpu=%.8g cpu=%.8g max_cpu_abs=%.8g nan_count=%zu status=%s\n",
                                 src0 && src0->name ? src0->name : "?", moe_tensor_type_name(pp_role), expert.expert_id,
                                 rows, active_count, max_rows_per_expert, max_abs, rel_at_max_abs, rel_to_tensor_max,
-                                max_row, max_col, static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
+                                max_row, max_col,
+                                static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
                                 static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]), max_cpu_abs,
                                 nan_count, compare_failed ? "FAIL" : "PASS");
-                    } else {
+                    } else if (readback_ok) {
+                        // llama.cpp-sr83 (quality re-review, advisory A1):
+                        // only print "failed=weight-host" when the readback
+                        // actually succeeded and weight_base/rows was the
+                        // real reason nothing ran -- readback_ok==false
+                        // already printed "failed=copy" above with the real
+                        // exception; printing this too would misattribute
+                        // the cause.
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s expert=%d rows=%zu "
                                 "failed=weight-host\n",
