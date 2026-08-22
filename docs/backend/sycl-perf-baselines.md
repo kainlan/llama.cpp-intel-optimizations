@@ -152,6 +152,12 @@ cards' WOQ arms sit at ~half their baselines (systemic, not card-specific;
 oneDNN GEMMs are only ~15 % of PP wall) — attribution tracked in
 `llama.cpp-alt6`.
 
+D3 (same session, same protocol) adds the B70 HEAD-default row —
+**399.63 ± 0.68 / 39.36 ± 0.19** — and derives the Track E B70 flip
+thresholds from the baseline-worktree references: **pp512 ≥ 1351.5 AND
+tg128 ≥ 48.5** (ref×0.95 / ref×0.98; see
+`artifacts/perf-recovery/D3-b70-baseline.md`).
+
 **Why row A pools 21 runs across three designs.** Its runs come from a sequential
 block (5), the interleaved A/B's default arm (6), and a thermal probe (10). All
 21 are the *same configuration* on the same build with the same free VRAM, so
