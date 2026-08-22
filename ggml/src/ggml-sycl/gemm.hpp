@@ -822,8 +822,12 @@ class DnnlGemmWrapper {
     // Uses fixed tiny probe dims, independent of any real GEMM shape --
     // primitive_desc creation either accepts the (f4_e2m1, e8m0) dtype/attr
     // combination for this engine or it doesn't; that answer does not depend
-    // on m/n/k. group_size is chosen to equal probe_k so the tiny shape
-    // always satisfies the real path's `k % group_size == 0` requirement.
+    // on m/n. group_size is QK_MXFP4 (32, ggml-sycl.cpp) -- the exact value
+    // the real WOQ-MXFP4 route uses, not an arbitrary probe-only choice: the
+    // probe has to ask the exact question the route asks, since a build that
+    // accepts one group_size but refuses another would otherwise make the
+    // probe wrong in whichever direction. probe_k=64 keeps `k % group_size
+    // == 0` (two groups).
     //
     // Result is cached per device, keyed the same way exec_mutex(q) keys its
     // per-GPU mutexes (device id from the queue, clamped into
@@ -850,20 +854,28 @@ class DnnlGemmWrapper {
             return cached > 0;
         }
 
-        auto eng = ctx.engine_dnnl(q);
-
-        constexpr int64_t probe_m          = 8;
-        constexpr int64_t probe_k          = 64;
-        constexpr int64_t probe_n          = 128;
-        constexpr int64_t probe_group_size = probe_k;
-
-        const dnnl::memory::desc   a_md({ probe_m, probe_k }, dt::f16, { probe_k, 1 });
-        const dnnl::memory::desc   b_md({ probe_k, probe_n }, dt::f4_e2m1, { probe_n, 1 });
-        const dnnl::memory::desc   c_md({ probe_m, probe_n }, dt::f32, { probe_n, 1 });
-        const dnnl::primitive_attr attr = woq_mxfp4_2d_attr(probe_group_size);
-
+        // llama.cpp-t9x5 (spec review fix 1): everything that can throw a
+        // dnnl::error for an unsupported (f4_e2m1, e8m0) combination --
+        // engine_dnnl, the memory::desc constructions, and
+        // woq_mxfp4_2d_attr's set_scales/set_fpmath_mode C-API calls -- must
+        // live INSIDE the try. dtype/attr validation happens at those
+        // construction points, not only at primitive_desc creation, so
+        // leaving any of this outside the try let the exact failure the
+        // probe exists to convert to `false` escape uncaught.
         bool supported = false;
         try {
+            auto eng = ctx.engine_dnnl(q);
+
+            constexpr int64_t probe_m          = 8;
+            constexpr int64_t probe_k          = 64;
+            constexpr int64_t probe_n          = 128;
+            constexpr int64_t probe_group_size = 32;  // QK_MXFP4
+
+            const dnnl::memory::desc   a_md({ probe_m, probe_k }, dt::f16, { probe_k, 1 });
+            const dnnl::memory::desc   b_md({ probe_k, probe_n }, dt::f4_e2m1, { probe_n, 1 });
+            const dnnl::memory::desc   c_md({ probe_m, probe_n }, dt::f32, { probe_n, 1 });
+            const dnnl::primitive_attr attr = woq_mxfp4_2d_attr(probe_group_size);
+
             dnnl::matmul::primitive_desc probe_pd(eng, a_md, b_md, c_md, attr);
             (void) probe_pd;
             supported = true;
