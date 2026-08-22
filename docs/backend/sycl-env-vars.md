@@ -506,9 +506,18 @@ SYCL device ordinal, captured once at graph-compute entry alongside the reset
 below — attributes a multi-device capture to the right card on both line
 families. The buckets:
 
-- `tiled_repack`/`soa_repack` — `repack_mxfp4_xmx_tiled_to_woq` /
-  `repack_mxfp4_soa_to_woq` (`convert.cpp`), one begin/end marker bracket per
-  active expert per dispatch.
+- `tiled_repack`/`soa_repack` — the batched repack kernels
+  `repack_mxfp4_xmx_tiled_to_woq_batched` / `repack_mxfp4_soa_to_woq_batched`
+  (`convert.cpp`), one begin/end marker bracket per **tensor-dispatch** since
+  llama.cpp-1lon (`c6ecc70aa`) — the whole active-expert set is one kernel
+  launch, so the `/calls` count reads ~46 tiled + ~23 soa per GPT-OSS eval.
+  Before 1lon the per-slot kernels ran one launch (and one bracket) per active
+  expert per dispatch, so pre-1lon captures (e.g. the `892eb5d7d` baselines)
+  read ~1064/~532 calls per eval instead — the counts are not comparable
+  across that commit, only the ms figures are. The per-slot form still exists
+  as a fallback, taken only when a dispatch has more than 128 active expert
+  slots (unreached by any shipped MXFP4 model); on that path the bracket is
+  again per-slot.
 - `woq_gemm` — `DnnlGemmWrapper::woq_gemm_batch_mxfp4` (the `GGML_SYCL_MOE_PP_WOQ`
   arm). ⚠️ **Timing is a begin/end marker bracket around the whole GEMM `try{}`
   block, NOT `gemm_events`' own profiling info** (fix cycle F1, confirmed on
@@ -570,6 +579,19 @@ whether a tensor's WOQ repack re-runs more than once per graph eval
 printed for tensor names in sorted (deterministic) order so two captures of
 the identical eval never diff spuriously on ordering alone, capped at the
 first 96 distinct tensor names with a truncation line if more were seen.
+
+⚠️ **Semantics changed at llama.cpp-1lon (`c6ecc70aa`).** `repacks` counts
+marker brackets, and the batched repack kernels bracket once per
+tensor-dispatch — so on the batched path `repacks_per_dispatch` reads **1.00
+by construction** and no longer measures the active-expert count. Pre-1lon
+captures counted one repack per active expert slot, so the `892eb5d7d`
+baselines read mean 23.33 (min 15, max 32 = the active-slot distribution);
+do not compare that figure across the commit, and do not read a post-1lon
+1.00 as "one active expert". A value above 1.00 today is only reachable via
+the >128-active-slot per-slot fallback. The question this line family was
+built for — does a tensor's repack re-run every eval instead of once per
+weight — is still answered by `dispatches` and the repack ms buckets, which
+kept their meaning.
 
 #### What `other` does and does not mean
 
