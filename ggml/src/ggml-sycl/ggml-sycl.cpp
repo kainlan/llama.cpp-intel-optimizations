@@ -71134,11 +71134,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             task.N           = static_cast<int>(ne0);
                             ggml_sycl_cpu_expert_mul_mat(task);
                         }
-                        double max_abs   = 0.0;
-                        double max_rel   = 0.0;
-                        size_t max_row   = 0;
-                        size_t max_col   = 0;
-                        size_t nan_count = 0;
+                        double max_abs     = 0.0;
+                        double max_rel     = 0.0;
+                        double max_cpu_abs = 0.0;
+                        size_t max_row     = 0;
+                        size_t max_col     = 0;
+                        size_t nan_count   = 0;
                         for (size_t r = 0; r < rows; ++r) {
                             for (size_t c = 0; c < static_cast<size_t>(ne0); ++c) {
                                 const size_t idx = r * static_cast<size_t>(ne0) + c;
@@ -71154,6 +71155,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     ++nan_count;
                                     continue;
                                 }
+                                max_cpu_abs       = std::max(max_cpu_abs, std::fabs(static_cast<double>(cpu[idx])));
                                 const double diff = std::fabs(static_cast<double>(gpu[idx]) - cpu[idx]);
                                 if (diff > max_abs) {
                                     max_abs = diff;
@@ -71163,16 +71165,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 }
                             }
                         }
-                        const bool compare_failed = nan_count > 0;
+                        // llama.cpp-sr83 (fix cycle 2, defect from the round-1
+                        // status field -- team-lead evidence 2026-08-22): a
+                        // naive single per-element-relative-error threshold
+                        // false-FAILs the legacy f16 arm's legitimate
+                        // near-cancellation outliers (a tiny |cpu[idx]|
+                        // denominator inflates max_rel even though the
+                        // absolute error is negligible against the tensor's
+                        // real scale -- measured: abs err 1.21 at |cpu|=0.589
+                        // amid a tensor of ~50-500-magnitude values). Dual
+                        // criterion instead: FAIL only when the error is
+                        // large by BOTH measures -- the naive per-element
+                        // max_rel AND max_abs normalized against this
+                        // tensor's own max magnitude (max_cpu_abs). Either
+                        // measure alone passing is enough to PASS, so a
+                        // near-cancellation element (small max_cpu_abs-
+                        // relative error, large max_rel) still passes, while
+                        // a genuine failure -- large by both measures, as
+                        // the unproven 3-D WOQ path's wrong numerics were
+                        // (max_rel 0.989, error ~99% of the tensor's own
+                        // scale) -- still fails. Thresholds are a first
+                        // calibration against the 2026-08-22 hardware
+                        // evidence (WOQ 2-D proven-good ceiling: max_rel
+                        // <=0.0258; the 3-D failure's error was ~1-2 orders
+                        // of magnitude past either threshold), not a
+                        // universally tuned constant -- revisit if a
+                        // borderline case misclassifies.
+                        constexpr double kCompareRelThreshold = 0.05;
+                        constexpr double kCompareAbsScaleFrac = 0.05;
+                        const double     rel_to_tensor_max    = max_abs / std::max(1.0, max_cpu_abs);
+                        const bool       compare_failed       = nan_count > 0 || (max_rel > kCompareRelThreshold &&
+                                                                      rel_to_tensor_max > kCompareAbsScaleFrac);
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s role=%s expert=%d rows=%zu "
-                                "active=%zu max_rows=%zu max_abs=%.8g max_rel=%.8g row=%zu col=%zu gpu=%.8g "
-                                "cpu=%.8g nan_count=%zu status=%s\n",
+                                "active=%zu max_rows=%zu max_abs=%.8g max_rel=%.8g rel_to_max=%.8g row=%zu "
+                                "col=%zu gpu=%.8g cpu=%.8g max_cpu_abs=%.8g nan_count=%zu status=%s\n",
                                 src0 && src0->name ? src0->name : "?", moe_tensor_type_name(pp_role), expert.expert_id,
-                                rows, active_count, max_rows_per_expert, max_abs, max_rel, max_row, max_col,
-                                static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
-                                static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]), nan_count,
-                                compare_failed ? "FAIL" : "PASS");
+                                rows, active_count, max_rows_per_expert, max_abs, max_rel, rel_to_tensor_max, max_row,
+                                max_col, static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
+                                static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]), max_cpu_abs,
+                                nan_count, compare_failed ? "FAIL" : "PASS");
                     } else {
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s expert=%d rows=%zu "

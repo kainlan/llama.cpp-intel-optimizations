@@ -887,18 +887,24 @@ class DnnlGemmWrapper {
         // supported; this only gates how many times the print fires).
         static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> arm_print_latch;
 
-        // llama.cpp-sr83 (fix cycle, team-lead request 2026-08-22): forces
-        // the 2-D per-batch-element fallback without recompiling, so the
-        // 3-D grouped-batch scale mask (unvalidated on hardware -- see the
-        // comment on this function) can be isolated as a discriminating
-        // experiment: 2-D clean -> the defect is in the 3-D mask/dims
-        // encoding; 2-D also wrong -> suspect the executor's scratch
-        // offsets/strides or repack contract instead. Does NOT poison
-        // tri_state -- an opt-out run must not overwrite the real
-        // capability cache for the default-env run that follows it.
+        // llama.cpp-sr83 (fix cycle 2, team-lead hardware verdict
+        // 2026-08-22): DEFAULT FLIPPED. The discriminating experiment this
+        // env was added for is decisive and reproducible on hardware (B70):
+        // the batch-dim-grouped 3-D scale mask (mask 7, group_dims
+        // {1,group_size,1}) is ACCEPTED by oneDNN but produces wrong
+        // numerics (down role, blk.0 gpu=-5.21 vs cpu=-484.47, NaN cascade
+        // by blk.1) -- deterministic and card-independent. The 2-D
+        // per-batch-element loop (C1's exact proven non-batched recipe) is
+        // clean on the SAME hardware: all roles, all blocks, max_rel <=
+        // 0.0258, zero NaNs. Correctness-by-default: the proven recipe now
+        // ships as the default, and the unproven 3-D encoding is opt-IN via
+        // GGML_SYCL_MOE_PP_WOQ_3D=1 for whoever picks up the follow-up
+        // encoding-rework task. Does NOT poison tri_state -- an opt-in run
+        // must not overwrite the real capability cache for the next
+        // default-env run.
         static const bool pp_woq_3d_enabled = []() {
             const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ_3D");
-            return env == nullptr || std::atoi(env) != 0;
+            return env != nullptr && std::atoi(env) != 0;
         }();
 
         const dnnl::memory::desc b_md_3d({ batch_size, k, n }, dt::f4_e2m1, { stride_b, n, 1 });
