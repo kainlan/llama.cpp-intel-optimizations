@@ -813,35 +813,49 @@ class DnnlGemmWrapper {
     }
 
     // Per-device capability probe for the WOQ-MXFP4 (f4_e2m1 nibbles + e8m0
-    // grouped scales) GEMM path -- same philosophy as tiled_kernel_validated:
-    // the ATTEMPT to build C1's exact proven 2-D primitive_desc recipe
-    // (woq_mxfp4_2d_attr, above) IS the capability query. Any dnnl::error
-    // thrown during primitive_desc construction means "not supported on this
-    // device's oneDNN build" and is caught here, never propagated.
+    // grouped scales) GEMM path, following the same philosophy the C1 spike
+    // (llama.cpp-4m9p) established for this GEMM family: the ATTEMPT to
+    // build C1's exact proven 2-D primitive_desc recipe (woq_mxfp4_2d_attr,
+    // above) IS the capability query. Any dnnl::error thrown during that
+    // attempt means "not supported on this device's oneDNN build" and is
+    // caught here, never propagated.
     //
-    // Uses fixed tiny probe dims, independent of any real GEMM shape --
-    // primitive_desc creation either accepts the (f4_e2m1, e8m0) dtype/attr
-    // combination for this engine or it doesn't; that answer does not depend
-    // on m/n. group_size is QK_MXFP4 (32, ggml-sycl.cpp) -- the exact value
-    // the real WOQ-MXFP4 route uses, not an arbitrary probe-only choice: the
-    // probe has to ask the exact question the route asks, since a build that
-    // accepts one group_size but refuses another would otherwise make the
-    // probe wrong in whichever direction. probe_k=64 keeps `k % group_size
-    // == 0` (two groups).
+    // Uses fixed tiny probe dims per the epic plan (docs/plans/2026-08-21-
+    // gptoss-perf-recovery-epic.md, Task E1: probe_m=8, probe_n=128),
+    // independent of any real GEMM shape -- primitive_desc creation either
+    // accepts the (f4_e2m1, e8m0) dtype/attr combination for this engine or
+    // it doesn't; that answer does not depend on m/n. group_size is
+    // QK_MXFP4 -- the exact value the real WOQ-MXFP4 route uses, not an
+    // arbitrary probe-only choice: the probe has to ask the exact question
+    // the route asks, since a build that accepts one group_size but refuses
+    // another would otherwise make the probe wrong in whichever direction.
+    // probe_k=64 keeps `k % group_size == 0` (two groups). The dtype pair
+    // probed (f16 activations x f4_e2m1 weights -> f32 output) matches
+    // exactly what the shipped WOQ-MXFP4 caller passes -- the probe answers
+    // for that specific combination, not WOQ-MXFP4 in the abstract.
     //
     // Result is cached per device, keyed the same way exec_mutex(q) keys its
     // per-GPU mutexes (device id from the queue, clamped into
     // GGML_SYCL_MAX_DEVICES) and using the same tri-state atomic idiom
-    // woq_gemm_batch_mxfp4 uses for its own per-device arm cache above:
-    // 0 = not yet probed, 1 = supported, -1 = unsupported. Once set, later
-    // calls return the cached answer without touching oneDNN again -- zero
-    // cost after the first call per device.
+    // woq_gemm_batch_mxfp4 uses for its own per-device arm cache below --
+    // but the two caches answer DIFFERENT questions: this cache's -1 means
+    // the WOQ-MXFP4 route is unavailable on the device at all, while
+    // woq_gemm_batch_mxfp4's `tri_state` -1 means only its opt-in 3-D
+    // grouped-batch arm is unavailable (its 2-D per-batch fallback still
+    // runs). 0 = not yet probed, 1 = supported, -1 = unsupported. Once set,
+    // later calls return the cached answer without touching oneDNN again --
+    // zero cost after the first call per device.
+    //
+    // Precondition: must NOT be called with exec_mutex(q) already held --
+    // the lock below is non-recursive, so a caller already holding it would
+    // deadlock on itself.
     static bool woq_mxfp4_supported(ggml_backend_sycl_context & ctx, const queue_ptr & q) {
-        static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> supported_cache;
-        const int                                                  dev_id =
-            std::min(ggml_sycl_get_device_id_from_queue(*q), static_cast<int>(supported_cache.size()) - 1);
+        static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> woq_mxfp4_supported_cache;
 
-        int cached = supported_cache[dev_id].load(std::memory_order_acquire);
+        const int dev_id =
+            std::min(ggml_sycl_get_device_id_from_queue(*q), static_cast<int>(woq_mxfp4_supported_cache.size()) - 1);
+
+        int cached = woq_mxfp4_supported_cache[dev_id].load(std::memory_order_acquire);
         if (cached != 0) {
             return cached > 0;
         }
@@ -849,7 +863,7 @@ class DnnlGemmWrapper {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         // Re-check under the lock: another thread may have already probed
         // this device while we were waiting.
-        cached = supported_cache[dev_id].load(std::memory_order_acquire);
+        cached = woq_mxfp4_supported_cache[dev_id].load(std::memory_order_acquire);
         if (cached != 0) {
             return cached > 0;
         }
@@ -869,7 +883,7 @@ class DnnlGemmWrapper {
             constexpr int64_t probe_m          = 8;
             constexpr int64_t probe_k          = 64;
             constexpr int64_t probe_n          = 128;
-            constexpr int64_t probe_group_size = 32;  // QK_MXFP4
+            constexpr int64_t probe_group_size = QK_MXFP4;
 
             const dnnl::memory::desc   a_md({ probe_m, probe_k }, dt::f16, { probe_k, 1 });
             const dnnl::memory::desc   b_md({ probe_k, probe_n }, dt::f4_e2m1, { probe_n, 1 });
@@ -879,13 +893,37 @@ class DnnlGemmWrapper {
             dnnl::matmul::primitive_desc probe_pd(eng, a_md, b_md, c_md, attr);
             (void) probe_pd;
             supported = true;
+            // N3 (spec review): a once-per-device POSITIVE control -- without
+            // this, "supported" and "never probed" are indistinguishable in
+            // the log. No separate arm_print_latch is needed here (unlike
+            // woq_gemm_batch_mxfp4's below): this try body itself only ever
+            // runs once per device, gated by the double-checked cache read
+            // above, so this line cannot double-print.
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4] capability probe accepted device=%d\n", dev_id);
+            }
         } catch (const dnnl::error & e) {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4] capability probe refused: %s\n", e.what());
             }
+        } catch (const std::exception & e) {
+            // llama.cpp-t9x5 (spec review fix 4): engine_dnnl() and the
+            // memory::desc/attr constructions above can also throw non-dnnl
+            // exceptions (e.g. std::bad_alloc, std::system_error). The
+            // contract this function makes to every caller is "you get a
+            // bool" -- any construction failure means "not supported", never
+            // an escaping exception.
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4] capability probe refused (non-dnnl exception): %s\n",
+                             e.what());
+            }
+        } catch (...) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4] capability probe refused (unknown exception)\n");
+            }
         }
 
-        supported_cache[dev_id].store(supported ? 1 : -1, std::memory_order_release);
+        woq_mxfp4_supported_cache[dev_id].store(supported ? 1 : -1, std::memory_order_release);
         return supported;
     }
 
