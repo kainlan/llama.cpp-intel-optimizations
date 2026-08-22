@@ -64642,10 +64642,15 @@ static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::even
 
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
-// (see mxfp4_pp_profile_record_graph_total below), not a fixed per-model
+// (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
 // dispatch-count cadence like MXFP4_TG_PROFILE's 72 -- this instrument does
 // not need to know the model's layer count.
 struct mxfp4_pp_batched_profile_accum {
+    // llama.cpp-6405 (quality review F-D): captured once per eval, at the
+    // same graph-entry reset point as everything else (see
+    // ggml_backend_sycl_graph_compute) -- printed on both line families so a
+    // capture from a multi-device run can be attributed to the right card.
+    int                                      device             = -1;
     // Components 1/2: WOQ repack kernels (tiled->WOQ / SOA->WOQ), one
     // begin/end bracket per active expert per dispatch.
     double                                   tiled_repack_us    = 0.0;
@@ -64670,7 +64675,7 @@ struct mxfp4_pp_batched_profile_accum {
     double                                   stage_us           = 0.0;
     int64_t                                  stage_calls        = 0;
     // Component 5 input: this eval's whole graph_compute device span --
-    // recorded once by mxfp4_pp_profile_record_graph_total, not accumulated
+    // recorded once by mxfp4_pp_batched_profile_record_graph_total, not accumulated
     // per-dispatch like the components above.
     double                                   graph_total_us     = 0.0;
     bool                                     graph_total_set    = false;
@@ -64704,11 +64709,11 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     // or overlapping device time), not something to hide by flooring at 0.
     const double other_us     = p.graph_total_us - accounted_us;
     GGML_LOG_WARN(
-        "[MXFP4-PP-BATCHED-PROFILE] dispatches=%lld graph_total=%.3f ms accounted=%.3f ms other=%.3f ms "
+        "[MXFP4-PP-BATCHED-PROFILE] device=%d dispatches=%lld graph_total=%.3f ms accounted=%.3f ms other=%.3f ms "
         "tiled_repack=%.3f ms/%lld soa_repack=%.3f ms/%lld "
         "woq_gemm=%.3f ms/%lld(2d=%lld,3d_requested=%lld) f16_gemm=%.3f ms/%lld "
         "stage=%.3f ms/%lld graph_total_measured=%d read_failures=%lld\n",
-        (long long) p.dispatch_evals, p.graph_total_us / 1000.0, accounted_us / 1000.0, other_us / 1000.0,
+        p.device, (long long) p.dispatch_evals, p.graph_total_us / 1000.0, accounted_us / 1000.0, other_us / 1000.0,
         p.tiled_repack_us / 1000.0, (long long) p.tiled_repack_calls, p.soa_repack_us / 1000.0,
         (long long) p.soa_repack_calls, p.woq_gemm_us / 1000.0, (long long) p.woq_gemm_calls,
         (long long) p.woq_gemm_2d_calls, (long long) p.woq_gemm_3d_calls, p.f16_gemm_us / 1000.0,
@@ -64726,18 +64731,21 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     }
     std::sort(tensor_names.begin(), tensor_names.end());
 
-    size_t printed = 0;
+    constexpr size_t max_printed_tensors = 96;
+    size_t           printed             = 0;
     for (const std::string & name : tensor_names) {
-        if (printed >= 96) {
-            GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-TENSOR] truncated at 96 of %zu tensors\n", tensor_names.size());
+        if (printed >= max_printed_tensors) {
+            GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-TENSOR] device=%d truncated at %zu of %zu tensors\n", p.device,
+                          max_printed_tensors, tensor_names.size());
             break;
         }
         const auto    dispatch_it = p.dispatch_calls_by_tensor.find(name);
         const int64_t dispatches  = dispatch_it != p.dispatch_calls_by_tensor.end() ? dispatch_it->second : 0;
         const int64_t repacks     = p.repack_calls_by_tensor.at(name);
         GGML_LOG_WARN(
-            "[MXFP4-PP-BATCHED-PROFILE-TENSOR] tensor=%s dispatches=%lld repacks=%lld repacks_per_dispatch=%.2f\n",
-            name.c_str(), (long long) dispatches, (long long) repacks,
+            "[MXFP4-PP-BATCHED-PROFILE-TENSOR] device=%d tensor=%s dispatches=%lld repacks=%lld "
+            "repacks_per_dispatch=%.2f\n",
+            p.device, name.c_str(), (long long) dispatches, (long long) repacks,
             dispatches > 0 ? static_cast<double>(repacks) / static_cast<double>(dispatches) : 0.0);
         ++printed;
     }
@@ -64751,7 +64759,7 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
 // component totals against it; otherwise (e.g. a decode graph, or a dense
 // model with no MXFP4 MoE tensors) there is nothing to attribute, so it
 // resets quietly rather than emitting an all-zero line every graph.
-static void mxfp4_pp_profile_record_graph_total(double graph_us) {
+static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
     auto & p = g_mxfp4_pp_batched_profile;
     // llama.cpp-6405 fix cycle (F2): a failed span read (graph_us < 0.0) used
     // to still set graph_total_set = true, so the summary line printed
@@ -71222,12 +71230,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const bool               pp_profile = mxfp4_pp_batched_profile_enabled();
             std::vector<sycl::event> pp_profile_repack_begin;
             std::vector<sycl::event> pp_profile_repack_end;
-            std::vector<bool>        pp_profile_repack_tiled;
             std::vector<sycl::event> pp_profile_stage_events;
             if (pp_profile) {
                 pp_profile_repack_begin.reserve(active_experts.size());
                 pp_profile_repack_end.reserve(active_experts.size());
-                pp_profile_repack_tiled.reserve(active_experts.size());
                 pp_profile_stage_events.reserve(active_experts.size() * 2);
             }
 
@@ -71258,7 +71264,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     if (pp_profile) {
                         pp_profile_repack_end.push_back(
                             ggml_sycl_submit_marker<class mxfp4_pp_profile_repack_end_marker>(*stream));
-                        pp_profile_repack_tiled.push_back(experts_are_tiled);
                     }
                 } else {
                     dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, batched_weights + slot * weight_elems,
@@ -71310,8 +71315,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // instead (mxfp4_pp_event_span_us): gemm_events is still read
             // below, but only for its per-group COUNT (the 2-D/3-D label
             // split), never its timestamps.
-            sycl::event gemm_profile_begin;
-            sycl::event gemm_profile_end;
+            //
+            // llama.cpp-6405 (quality review A2): the GEMM calls below depend
+            // explicitly on {deps_in}, NOT on gemm_profile_begin -- the marker
+            // is ordered after deps_in only by this in-order queue's
+            // submission order, not by an explicit dependency edge. That
+            // matters here specifically because this file already documents
+            // (llama.cpp-dboi, the comment above) that the batched oneDNN
+            // primitive's execution is NOT reliably ordered with this queue
+            // by submission order alone. If that same effect ever applies to
+            // the marker/GEMM pair, gemm_profile_begin's recorded device
+            // start could land AFTER the real GEMM kernels have already
+            // begun, making the measured span an UNDERCOUNT of the true GEMM
+            // time -- the missing slice would silently land in "other", not
+            // get lost outright.
+            //
+            // llama.cpp-6405 (quality review A1): std::optional, not a
+            // default-constructed sycl::event, so "zero cost when unset"
+            // stays literally true -- neither marker is even constructed
+            // unless pp_profile is true. Both are only ever read at the
+            // pp_profile-guarded accumulation point below, where they are
+            // always set (this try block either completes successfully with
+            // both markers submitted, or throws/returns before that point is
+            // reached at all).
+            std::optional<sycl::event> gemm_profile_begin;
+            std::optional<sycl::event> gemm_profile_end;
             try {
                 const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
                 if (pp_profile) {
@@ -71582,7 +71610,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // collection empty) when the flag is off.
             if (pp_profile) {
                 stream->wait();
-                auto & profile = g_mxfp4_pp_batched_profile;
+                auto &    profile      = g_mxfp4_pp_batched_profile;
                 // llama.cpp-6405 fix cycle (F2): mxfp4_pp_event_span_us/
                 // _duration_us return -1.0 on a failed profiling query (bad
                 // event, query threw). Summing that unconditionally poisoned
@@ -71591,6 +71619,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // (the operation itself did happen), and tally the failure
                 // separately -- read_failures in the summary line is the
                 // "distrust this line" signal.
+                // llama.cpp-6405 (quality review F-A/F-B): a single dispatch
+                // repacks either ALL-tiled or ALL-SOA -- experts_are_tiled is
+                // a per-dispatch constant, not a per-expert choice (see its
+                // computation above), so a per-index pp_profile_repack_tiled
+                // vector was redundant bookkeeping. Bind the destination
+                // fields once, outside the loop, instead of branching on the
+                // same condition twice per iteration.
+                double &  repack_us    = experts_are_tiled ? profile.tiled_repack_us : profile.soa_repack_us;
+                int64_t & repack_calls = experts_are_tiled ? profile.tiled_repack_calls : profile.soa_repack_calls;
                 for (size_t i = 0; i < pp_profile_repack_begin.size(); ++i) {
                     // Note: this span is bracketed by the begin/end MARKER
                     // events themselves (two single_task no-op launches), so
@@ -71600,16 +71637,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const double us = mxfp4_pp_event_span_us(pp_profile_repack_begin[i], pp_profile_repack_end[i]);
                     if (us < 0.0) {
                         ++profile.read_failures;
-                    } else if (pp_profile_repack_tiled[i]) {
-                        profile.tiled_repack_us += us;
                     } else {
-                        profile.soa_repack_us += us;
+                        repack_us += us;
                     }
-                    if (pp_profile_repack_tiled[i]) {
-                        ++profile.tiled_repack_calls;
-                    } else {
-                        ++profile.soa_repack_calls;
-                    }
+                    ++repack_calls;
                 }
                 for (const sycl::event & ev : pp_profile_stage_events) {
                     const double us = mxfp4_pp_event_duration_us(ev);
@@ -71628,7 +71659,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // per-group timing source on the shipped 2-D arm.
                 // gemm_events is still read here for its per-group COUNT
                 // (the 2-D/3-D label split).
-                const double gemm_span_us = mxfp4_pp_event_span_us(gemm_profile_begin, gemm_profile_end);
+                const double gemm_span_us = mxfp4_pp_event_span_us(*gemm_profile_begin, *gemm_profile_end);
                 if (gemm_span_us < 0.0) {
                     ++profile.read_failures;
                 } else if (pp_woq_enabled) {
@@ -71636,17 +71667,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 } else {
                     profile.f16_gemm_us += gemm_span_us;
                 }
-                for (size_t i = 0; i < gemm_events.size(); ++i) {
-                    if (pp_woq_enabled) {
-                        ++profile.woq_gemm_calls;
-                        if (mxfp4_pp_woq_3d_requested()) {
-                            ++profile.woq_gemm_3d_calls;
-                        } else {
-                            ++profile.woq_gemm_2d_calls;
-                        }
+                // llama.cpp-6405 (quality review F-C): every group in
+                // gemm_events shares the SAME pp_woq_enabled/requested-arm
+                // for this dispatch (both are per-dispatch constants), so the
+                // per-group counts are arithmetic on gemm_events.size(), not
+                // a loop; mxfp4_pp_woq_3d_requested() is hoisted out of any
+                // loop for the same reason.
+                const auto gemm_group_count = static_cast<int64_t>(gemm_events.size());
+                if (pp_woq_enabled) {
+                    profile.woq_gemm_calls += gemm_group_count;
+                    if (mxfp4_pp_woq_3d_requested()) {
+                        profile.woq_gemm_3d_calls += gemm_group_count;
                     } else {
-                        ++profile.f16_gemm_calls;
+                        profile.woq_gemm_2d_calls += gemm_group_count;
                     }
+                } else {
+                    profile.f16_gemm_calls += gemm_group_count;
                 }
                 const std::string profile_tensor_name = src0 && src0->name ? src0->name : "?";
                 // pp_profile_repack_begin.size() is the exact count of WOQ
@@ -96093,24 +96129,40 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             auto *        profile_ctx    = static_cast<ggml_backend_sycl_context *>(backend->context);
             sycl::queue * profile_stream = profile_ctx->stream();
             if (profile_stream) {
-                // llama.cpp-6405 fix cycle (F3): reset HERE, at entry, not
-                // just after a successful eval via
-                // mxfp4_pp_profile_record_graph_total's print-and-reset. An
-                // eval that throws before reaching that call (the
-                // fallback_error recovery path below) used to leave its
-                // already-accumulated dispatches sitting in the global
-                // accumulator, where they silently merged into the NEXT
-                // eval's line -- inflating dispatches/repack counts/
-                // repacks_per_dispatch, the headline numbers, on the eval
-                // that actually printed. Host-side only, zero device work
-                // added to the recovery path.
-                g_mxfp4_pp_batched_profile = mxfp4_pp_batched_profile_accum{};
+                // llama.cpp-6405 fix cycle (F3, F-K): this entry reset is now
+                // the PRIMARY mechanism keeping the accumulator clean between
+                // evals in general, not just a defense against the thrown-eval
+                // case below -- print-and-reset's own reset at the end of a
+                // normal eval is what keeps two back-to-back SUCCESSFUL evals
+                // from bleeding into each other, but it is this reset that
+                // guarantees a clean start regardless of how the PREVIOUS
+                // graph_compute call ended: printed normally, threw (the
+                // fallback_error recovery path below, which used to leave its
+                // already-accumulated dispatches sitting in the accumulator,
+                // silently merging into the NEXT eval's line and inflating
+                // dispatches/repack counts/repacks_per_dispatch), or (per the
+                // graph-replay note in the env-vars doc) silently returned
+                // with dispatch_evals still 0. Host-side only, zero device
+                // work added to the recovery path.
+                g_mxfp4_pp_batched_profile        = mxfp4_pp_batched_profile_accum{};
+                g_mxfp4_pp_batched_profile.device = profile_ctx->device;  // F-D
                 sycl::event begin_ev =
                     ggml_sycl_submit_marker<class mxfp4_pp_profile_graph_begin_marker>(*profile_stream);
                 const ggml_status status = ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
                 sycl::event end_ev = ggml_sycl_submit_marker<class mxfp4_pp_profile_graph_end_marker>(*profile_stream);
+                // llama.cpp-6405 (quality review F-F): this .wait() is itself
+                // part of the "other inflates" story documented in the
+                // env-vars doc -- it forces every bit of the graph's tail
+                // work to actually complete on the device before this
+                // function returns, which an UNPROFILED graph_compute call
+                // does not do (pure-GPU decode can legitimately return with
+                // kernels still in flight; see the SYCL Memory Ownership
+                // section of CLAUDE.md). A profiled run therefore measures a
+                // graph_total that can be longer than what an unprofiled run
+                // would have waited for at this exact point, and that extra
+                // wait time has nowhere to land but "other".
                 end_ev.wait();
-                mxfp4_pp_profile_record_graph_total(mxfp4_pp_event_span_us(begin_ev, end_ev));
+                mxfp4_pp_batched_profile_record_graph_total(mxfp4_pp_event_span_us(begin_ev, end_ev));
                 return status;
             }
         }
