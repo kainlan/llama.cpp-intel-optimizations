@@ -64581,6 +64581,7 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
     if (planned_layout == GGML_LAYOUT_SOA) {
         return true;
     }
+#if GGML_SYCL_DNNL
     // Down never plans XMX_TILED, so this cannot widen its route -- only
     // gate/up, which is exactly what repack_mxfp4_xmx_tiled_to_woq covers,
     // and only when the WOQ arm that owns that repack is actually enabled --
@@ -64590,6 +64591,18 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
         return false;
     }
     return planned_layout == GGML_LAYOUT_XMX_TILED && (role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP);
+#else
+    // llama.cpp-sr83 (spec-review finding B, 2026-08-22): the batched
+    // executor's whole XMX_TILED arm (WOQ repack + GEMM, and everything
+    // else in try_pp_mxfp4_soa_onednn_f16_batched) only exists under
+    // GGML_SYCL_DNNL -- in a non-DNNL build the lambda's #else arm is a
+    // bare `return false;` with no fail-closed throw, so claiming a tiled
+    // op here would fall through to the tiled-illiterate per-expert
+    // staging path (llama.cpp-71hx silent-garbage hazard). Never claim
+    // XMX_TILED in that configuration; down (SOA) already returned above
+    // and is unaffected.
+    return false;
+#endif
 }
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
