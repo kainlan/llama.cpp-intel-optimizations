@@ -130,6 +130,28 @@ Free VRAM was identical on all 32 runs (32602 MiB / 16250 MiB), 32 independent
 holder sweeps were clean, and the kernel log showed **no GT resets or GPU hangs**
 before, during, or after.
 
+### Policy-route PP snapshot (perf-recovery epic, C4 — 2026-08-22)
+
+**Measured at HEAD `79b55ceb`** (C3 complete: WOQ batched PP executor, 2-D arm
+default), `-p 512 -n 128 -r 2` via `scripts/bench-guard.sh`, all VALID, host
+under permanent ambient load (not quiet-host baselines — the A/B structure is
+the evidence; full matrix and ONEDNN_VERBOSE share analysis in
+`artifacts/perf-recovery/C4-pp-validation.md`):
+
+| Device | Arm | PP512 | TG128 |
+|---|---|---:|---:|
+| B70 | baseline worktree `79ae63559`, default | 1422.61 ± 57.08 | 49.47 ± 0.14 |
+| B70 | HEAD `GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=1` (WOQ) | 750.36 ± 5.94 | 39.73 ± 0.06 |
+| B70 | HEAD policy + `GGML_SYCL_MOE_PP_WOQ=0` (f16) | 424.41 ± 0.38 | 40.48 ± 0.17 |
+| B50 | baseline worktree `79ae63559`, default | 906.42 ± 6.61 | 36.35 ± 0.08 |
+| B50 | HEAD `GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=1` (WOQ) | 426.80 ± 3.69 | 32.02 ± 0.07 |
+| B50 | HEAD policy + `GGML_SYCL_MOE_PP_WOQ=0` (f16) | error 40, `llama.cpp-rtf1` | — |
+
+These are **snapshot rows, not gates** — gate against rows A–D above. Both
+cards' WOQ arms sit at ~half their baselines (systemic, not card-specific;
+oneDNN GEMMs are only ~15 % of PP wall) — attribution tracked in
+`llama.cpp-alt6`.
+
 **Why row A pools 21 runs across three designs.** Its runs come from a sequential
 block (5), the interleaved A/B's default arm (6), and a thermal probe (10). All
 21 are the *same configuration* on the same build with the same free VRAM, so
