@@ -21,6 +21,7 @@
 #include "model-lifecycle.hpp"
 #include "moe-resolved-batch.hpp"
 #include "sycl-timeline.hpp"
+#include "vram-headroom.hpp"
 #include "zone-sizing.hpp"
 
 #include <algorithm>
@@ -18871,11 +18872,23 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     if (device_total_vram > 0) {
         const size_t caller_reserved_headroom = arena_caller_reserved_headroom(device_total_vram, budget_bytes);
         size_t       external_headroom        = arena_default_external_headroom(device_total_vram, budget_bytes);
-        if (const char * env = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB")) {
-            const long parsed = std::strtol(env, nullptr, 10);
-            if (parsed > 0) {
-                external_headroom = static_cast<size_t>(parsed) * 1024ull * 1024ull;
-            }
+        const char * headroom_env             = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB");
+        if (headroom_env != nullptr) {
+            // Explicit override wins verbatim over every default below.
+            external_headroom = ggml_sycl_vram_external_headroom_bytes(device_total_vram,
+                                                                       /*onednn_pipeline_planned=*/false, headroom_env);
+        } else {
+            // The inventory publish (ggml-sycl.cpp: populate_inventory_globals,
+            // its "Phase A" doc comment) always runs before the FIRST call into
+            // this function for a given model load, so this reads the real plan,
+            // not a stale pre-plan zero (llama.cpp-seno, per llama.cpp-dp5i
+            // c-gkai's D2 spec). Floor, not replacement: arena_default_external_headroom's
+            // proportional/safe-cap logic (tested by test-sycl-layout-choice.cpp)
+            // is left exactly as-is; this only raises the result when the
+            // batched oneDNN MoE PP pipeline is planned on this device.
+            const bool onednn_pipeline_planned = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id) > 0;
+            external_headroom                  = std::max(external_headroom, ggml_sycl_vram_external_headroom_bytes(
+                                                                device_total_vram, onednn_pipeline_planned, nullptr));
         }
         GGML_LOG_INFO(
             "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
@@ -18916,16 +18929,22 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     // device %d, falling back to per-entry allocation").
     constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
 
-    // Use a single chunk when it is within the runtime's advertised raw
-    // per-allocation cap.  The safe cap above is intentionally not used here:
-    // it is a chunk-sizing margin, not a reason to manufacture N-chunk arenas
-    // on devices that can legally allocate one contiguous arena.
-    const bool try_single_chunk = max_alloc_size == 0 || alloc_size <= max_alloc_size;
+    // Use a single chunk only when it is within the runtime's SAFE per-chunk
+    // cap, not merely the raw advertised limit. A size in the raw..safe window
+    // (max_alloc_size < alloc_size <= per_chunk_cap's raw component) allocates
+    // one near-raw chunk that leaves the driver without command-buffer/kernel
+    // working memory -- proven on a clean B70 (32.6 GB, ~31 GB free): the
+    // budget-driven alloc_size landed in exactly that window and produced a
+    // deterministic [MUL_MAT_ID-FAIL] error 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
+    // at the first heavy MoE dispatch, not at reserve (llama.cpp-dp5i c-ni04,
+    // falsified and confirmed in c-gkai; fix: llama.cpp-seno). Sizes that used
+    // to admit a single near-raw chunk now go N-chunk instead.
+    const bool try_single_chunk = max_alloc_size == 0 || alloc_size <= per_chunk_cap;
     if (!try_single_chunk) {
         GGML_LOG_INFO(
-            "[VRAM-ARENA] Arena %.1f MB exceeds raw per-allocation cap %.1f MB "
-            "(safe chunk cap %.1f MB); using N-chunk arena\n",
-            alloc_size / (1024.0 * 1024.0), max_alloc_size / (1024.0 * 1024.0), per_chunk_cap / (1024.0 * 1024.0));
+            "[VRAM-ARENA] Arena %.1f MB exceeds safe per-allocation cap %.1f MB "
+            "(raw cap %.1f MB); using N-chunk arena\n",
+            alloc_size / (1024.0 * 1024.0), per_chunk_cap / (1024.0 * 1024.0), max_alloc_size / (1024.0 * 1024.0));
     }
     if (try_single_chunk) {
         const size_t tail_bytes = onednn_bytes + runtime_bytes + scratch_bytes;

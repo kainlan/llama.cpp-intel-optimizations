@@ -364,6 +364,20 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# VRAM external headroom: pure default/floor arithmetic for the arena's
+# driver-reserved headroom (perf-recovery epic, track D, llama.cpp-seno). No
+# device or oneDNN dependency -- ggml-sycl/vram-headroom.hpp includes only
+# <algorithm>/<cstddef>/<cstdlib>, not even mem-handle.hpp, so unlike
+# test-sycl-route-table-stamp above this target needs neither the SYCL
+# include dir nor -fsycl. Still registered under the same guard, adjacent to
+# test-sycl-route-table-stamp, for consistency with the rest of this epic's
+# SYCL-labelled test family.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-vram-headroom.cpp)
+    set_tests_properties(test-sycl-vram-headroom PROPERTIES LABELS "sycl;vram-arena;headroom")
+    target_include_directories(test-sycl-vram-headroom PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # WOQ-MXFP4 capability spike: does this device's oneDNN build a matmul with
 # f16 src, f4_e2m1 weights, and e8m0 grouped-{32,1} scales directly (perf-
 # recovery epic, track C gate, llama.cpp-4m9p)? Unlike test-sycl-route-table-
