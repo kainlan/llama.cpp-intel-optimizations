@@ -881,10 +881,30 @@ class DnnlGemmWrapper {
         static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> tri_state;
         const int dev_id = std::min(ggml_sycl_get_device_id_from_queue(*q), static_cast<int>(tri_state.size()) - 1);
 
+        // Once-per-device latch for the arm-identity print below (separate
+        // from tri_state, which caches the CAPABILITY answer and stays
+        // consulted -- and re-satisfied -- on every call once known
+        // supported; this only gates how many times the print fires).
+        static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> arm_print_latch;
+
+        // llama.cpp-sr83 (fix cycle, team-lead request 2026-08-22): forces
+        // the 2-D per-batch-element fallback without recompiling, so the
+        // 3-D grouped-batch scale mask (unvalidated on hardware -- see the
+        // comment on this function) can be isolated as a discriminating
+        // experiment: 2-D clean -> the defect is in the 3-D mask/dims
+        // encoding; 2-D also wrong -> suspect the executor's scratch
+        // offsets/strides or repack contract instead. Does NOT poison
+        // tri_state -- an opt-out run must not overwrite the real
+        // capability cache for the default-env run that follows it.
+        static const bool pp_woq_3d_enabled = []() {
+            const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ_3D");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+
         const dnnl::memory::desc b_md_3d({ batch_size, k, n }, dt::f4_e2m1, { stride_b, n, 1 });
         const dnnl::memory::desc s_md_3d({ batch_size, groups, n }, dt::e8m0, { stride_scales, n, 1 });
 
-        if (tri_state[dev_id].load(std::memory_order_acquire) >= 0) {
+        if (pp_woq_3d_enabled && tri_state[dev_id].load(std::memory_order_acquire) >= 0) {
             dnnl::primitive_attr attr3d;
             attr3d.set_scratchpad_mode(dnnl::scratchpad_mode::user);
             const int          mask3d       = (1 << 0) | (1 << 1) | (1 << 2);
@@ -920,6 +940,9 @@ class DnnlGemmWrapper {
             const DnnlCachedPrimitive * cached3d = cache.get_or_create(key3d, eng, a_md, b_md_3d, c_md, attr3d);
             if (cached3d) {
                 tri_state[dev_id].store(1, std::memory_order_release);
+                if (g_ggml_sycl_debug && arm_print_latch[dev_id].exchange(1, std::memory_order_relaxed) == 0) {
+                    std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4-BATCH] device=%d arm=3D\n", dev_id);
+                }
                 auto b_mem = dnnl::memory(b_md_3d, eng, const_cast<void *>(b_nibbles));
                 auto s_mem = dnnl::memory(s_md_3d, eng, const_cast<void *>(b_scales));
 
@@ -987,6 +1010,9 @@ class DnnlGemmWrapper {
         const DnnlCachedPrimitive * cached2d = cache.get_or_create(key2d, eng, a_md_2d, b_md_2d, c_md_2d, attr2d);
         if (!cached2d) {
             throw std::runtime_error("woq_gemm_batch_mxfp4: 2-D fallback primitive creation failed");
+        }
+        if (g_ggml_sycl_debug && arm_print_latch[dev_id].exchange(1, std::memory_order_relaxed) == 0) {
+            std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4-BATCH] device=%d arm=2D-loop\n", dev_id);
         }
 
         std::vector<sycl::event> per_batch_events;

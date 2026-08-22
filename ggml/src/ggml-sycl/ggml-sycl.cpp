@@ -64545,6 +64545,27 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 // layout), so the fail-closed contract in the lambda (reject rather than
 // fall through to the SOA-only staging fallback on an XMX_TILED refusal)
 // still holds per-op, not per-expert.
+// llama.cpp-sr83 (fix cycle, 2026-08-22): single source of truth for whether
+// the batched executor's WOQ arm is enabled, shared between the claims
+// predicate below and the executor lambda itself (ggml-sycl.cpp search
+// try_pp_mxfp4_soa_onednn_f16_batched) -- previously each read the
+// GGML_SYCL_MOE_PP_WOQ env independently, and only the executor's copy
+// gated the tiled-dequant refusal (defect 1 fix), so the claims predicate
+// kept claiming XMX_TILED gate/up even when WOQ=0 had no tiled dequant to
+// serve it. The executor's fail-closed contract then turned that into a
+// thrown ggml_sycl_fallback_error on every gate/up dispatch -- caught at
+// the graph-compute boundary (ggml-sycl.cpp:95587) as GGML_STATUS_FAILED,
+// not a silent corruption but not a working opt-out either. Gating the
+// CLAIM itself is the real fix: with WOQ=0, gate/up simply are not steered
+// here, so they keep running through whatever route handled them before C3.
+static bool ggml_sycl_moe_pp_woq_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
     if (!weight || weight->type != GGML_TYPE_MXFP4 || !ggml_sycl_moe_pp_onednn_batched_route_selected()) {
         return false;
@@ -64561,7 +64582,13 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
         return true;
     }
     // Down never plans XMX_TILED, so this cannot widen its route -- only
-    // gate/up, which is exactly what repack_mxfp4_xmx_tiled_to_woq covers.
+    // gate/up, which is exactly what repack_mxfp4_xmx_tiled_to_woq covers,
+    // and only when the WOQ arm that owns that repack is actually enabled --
+    // the f16 arm has no tiled-aware dequant (see ggml_sycl_moe_pp_woq_enabled
+    // above).
+    if (!ggml_sycl_moe_pp_woq_enabled()) {
+        return false;
+    }
     return planned_layout == GGML_LAYOUT_XMX_TILED && (role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP);
 }
 
@@ -70521,10 +70548,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // (repack_mxfp4_xmx_tiled_to_woq), so it must be admitted as a
         // candidate the same as SOA. Down never plans XMX_TILED, so this
         // does not widen its route -- ggml_sycl_moe_pp_onednn_batched_claims_tensor
-        // enforces the same GATE/UP-only restriction independently.
+        // enforces the same GATE/UP-only restriction independently. Also
+        // gated on ggml_sycl_moe_pp_woq_enabled() (fix cycle, defect 1):
+        // the f16 arm has no tiled-aware dequant, and this candidate check
+        // must stay consistent with the claims predicate the other three
+        // call sites use, or this lambda could be entered for an op the
+        // outer dispatch did not actually steer here for.
         const bool pp_mxfp4_soa_or_tiled_route =
             route_layout == GGML_LAYOUT_SOA ||
-            (route_layout == GGML_LAYOUT_XMX_TILED && (pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP));
+            (route_layout == GGML_LAYOUT_XMX_TILED && (pp_role == MOE_TENSOR_GATE || pp_role == MOE_TENSOR_UP) &&
+             ggml_sycl_moe_pp_woq_enabled());
         const bool pp_mxfp4_soa_f16_candidate = pp_mxfp4_soa_f16_env_enabled && src0->type == GGML_TYPE_MXFP4 &&
                                                 pp_mxfp4_soa_or_tiled_route && src1->type == GGML_TYPE_F32 &&
                                                 dst->type == GGML_TYPE_F32;
@@ -70734,10 +70767,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // oneDNN's WOQ matmul the quantized weights directly, deleting
             // the f16 dequant. =0 keeps the pre-C3 f16-dequant arm (also the
             // fallback path if the WOQ oneDNN primitive ever regresses).
-            static const bool pp_woq_enabled = []() {
-                const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ");
-                return env == nullptr || std::atoi(env) != 0;
-            }();
+            // Reads through the shared helper (fix cycle, defect 1) so this
+            // stays in lockstep with the claims predicate and the candidate
+            // gate above -- a local copy here previously let WOQ=0 keep
+            // reaching this lambda for tiled ops even after the predicate
+            // was taught the same restriction, which is exactly the
+            // divergence that produced the original bug.
+            const bool    pp_woq_enabled    = ggml_sycl_moe_pp_woq_enabled();
             const bool    experts_are_tiled = route_layout == GGML_LAYOUT_XMX_TILED;
             const int     blocks_per_row    = static_cast<int>(ne00 / QK_MXFP4);
             const auto &  xmx_caps_for_tile = ggml_sycl_info().devices[ctx.device].xmx_caps;
@@ -70745,6 +70781,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                          static_cast<int64_t>(std::max(xmx_caps_for_tile.optimal_tiles_n, 0));
             if (experts_are_tiled && tile_n_total <= 0) {
                 return reject_batched("xmx-tile-caps-unavailable");
+            }
+            // llama.cpp-sr83 (fix cycle, defect 1 -- team-lead COMPARE evidence
+            // 2026-08-22): dequantize_row_mxfp4_soa_to_fp16_rowmajor (the f16
+            // arm's only dequant kernel) reads its SOA-shaped index math
+            // unconditionally, and there is no tiled-aware dequant-to-fp16
+            // counterpart (only repack_mxfp4_xmx_tiled_to_woq, which targets
+            // the WOQ arm's nibble+scale planes, not a dense fp16 row) --
+            // feeding it tiled-materialized bytes misreads e8m0 exponent
+            // bytes at the wrong offsets, including the OCP-MX reserved NaN
+            // exponent 0xFF, poisoning every output entry. The real fix is
+            // upstream: the claims predicate and the candidate gate above
+            // both now decline a tiled op when ggml_sycl_moe_pp_woq_enabled()
+            // is false, so this combination should never reach here in
+            // normal dispatch. This check is defense in depth for any other
+            // caller of this lambda; the fail-closed tiled_claimed_op
+            // contract turns a hit into a throw rather than a silent
+            // fall-through, exactly as intended.
+            if (experts_are_tiled && !pp_woq_enabled) {
+                return reject_batched("f16-arm-no-tiled-dequant");
             }
 
             const size_t active_count          = active_experts.size();
@@ -71079,13 +71134,26 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             task.N           = static_cast<int>(ne0);
                             ggml_sycl_cpu_expert_mul_mat(task);
                         }
-                        double max_abs = 0.0;
-                        double max_rel = 0.0;
-                        size_t max_row = 0;
-                        size_t max_col = 0;
+                        double max_abs   = 0.0;
+                        double max_rel   = 0.0;
+                        size_t max_row   = 0;
+                        size_t max_col   = 0;
+                        size_t nan_count = 0;
                         for (size_t r = 0; r < rows; ++r) {
                             for (size_t c = 0; c < static_cast<size_t>(ne0); ++c) {
-                                const size_t idx  = r * static_cast<size_t>(ne0) + c;
+                                const size_t idx = r * static_cast<size_t>(ne0) + c;
+                                // llama.cpp-sr83 (fix cycle, defect 2 -- team-
+                                // lead COMPARE evidence 2026-08-22): a NaN diff
+                                // fails every `diff > max_abs` comparison
+                                // below (NaN comparisons are always false), so
+                                // a NaN mismatch used to silently vanish from
+                                // max-tracking and print as a perfect pass
+                                // (max_abs=0/max_rel=0). Count NaNs explicitly
+                                // instead of letting them hide.
+                                if (std::isnan(static_cast<double>(gpu[idx])) || std::isnan(cpu[idx])) {
+                                    ++nan_count;
+                                    continue;
+                                }
                                 const double diff = std::fabs(static_cast<double>(gpu[idx]) - cpu[idx]);
                                 if (diff > max_abs) {
                                     max_abs = diff;
@@ -71095,14 +71163,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 }
                             }
                         }
+                        const bool compare_failed = nan_count > 0;
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s role=%s expert=%d rows=%zu "
                                 "active=%zu max_rows=%zu max_abs=%.8g max_rel=%.8g row=%zu col=%zu gpu=%.8g "
-                                "cpu=%.8g\n",
+                                "cpu=%.8g nan_count=%zu status=%s\n",
                                 src0 && src0->name ? src0->name : "?", moe_tensor_type_name(pp_role), expert.expert_id,
                                 rows, active_count, max_rows_per_expert, max_abs, max_rel, max_row, max_col,
                                 static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
-                                static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]));
+                                static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]), nan_count,
+                                compare_failed ? "FAIL" : "PASS");
                     } else {
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s expert=%d rows=%zu "
