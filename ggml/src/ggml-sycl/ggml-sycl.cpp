@@ -64640,6 +64640,21 @@ static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::even
     }
 }
 
+// llama.cpp-1lon: repack begin/end marker kernel-name tags, forward-declared
+// ONCE at namespace scope so every ggml_sycl_submit_marker<...> call site
+// below (the batched WOQ repack launch and its slot-capacity fallback loop)
+// references the SAME already-declared type by its plain name -- matching
+// the ggml_sycl_pool_scratch_release_marker precedent above. A SYCL kernel
+// name must be forward declarable at namespace scope (a local/block-scope
+// forward declaration is rejected: "kernel name should be forward
+// declarable at namespace scope"), and writing `class Foo` inline as the
+// template argument at MORE than one call site makes the SYCL integration-
+// header generator see two distinct kernel-name declarations and fail with
+// "redefinition of KernelInfo<Foo>" -- both were tried and hit exactly
+// those two errors before landing on this forward declaration.
+struct mxfp4_pp_profile_repack_begin_marker;
+struct mxfp4_pp_profile_repack_end_marker;
+
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
 // (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
@@ -71237,34 +71252,94 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 pp_profile_stage_events.reserve(active_experts.size() * 2);
             }
 
+            // llama.cpp-1lon: batch every active slot's tiled->WOQ or SOA->WOQ
+            // repack into ONE kernel launch (an added expert-slot grid
+            // dimension) instead of one launch per slot -- alt6's attribution
+            // found the per-slot form launch-bound at ~5% of bandwidth
+            // (mean 23.3 launches/dispatch, B50 605.6 ms/eval). Per-slot
+            // index math is unchanged (repack_mxfp4_*_to_woq_batched shares
+            // it verbatim, widened by item.get_group(1)); only the source
+            // pointer and destination slot offset vary across slots, so
+            // batching needs nothing beyond the fixed-capacity source-pointer
+            // table those functions already take as a kernel argument -- no
+            // new allocation, no H2D buffer upload. Submitted on `stream`
+            // (in-order queue) BEFORE the per-slot activation-copy loop below
+            // and before the later barrier that gates the GEMM on "everything
+            // queued so far", so ordering matches the pre-1lon per-slot form
+            // without a host wait. Event contract unchanged: still exactly
+            // one begin/end marker bracket per tensor-dispatch repack (this
+            // was already true per-dispatch even before batching, since the
+            // per-slot markers here were counted per active_experts.size()
+            // -- now the batched launch's own begin/end pair is the whole
+            // dispatch's repack bracket).
+            //
+            // Bounded by GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS -- falls back
+            // to the pre-1lon per-slot loop below on the chance a dispatch
+            // has more active slots than that (not reached by any shipped
+            // MXFP4 model; GPT-OSS 20B's max is 32).
+            const bool woq_repack_batched =
+                pp_woq_enabled && active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
+            if (woq_repack_batched) {
+                std::vector<const void *> repack_srcs;
+                repack_srcs.reserve(active_experts.size());
+                for (const pp_onednn_batched_expert & expert : active_experts) {
+                    repack_srcs.push_back(expert.ptr);
+                }
+                const int n_slots = static_cast<int>(active_experts.size());
+                // Repack timing brackets a begin/end marker pair rather than
+                // returning an event from repack_mxfp4_*_to_woq_batched
+                // directly -- those functions submit two kernels each
+                // (nibbles + scales) and are shared with
+                // tests/test-sycl-mxfp4-woq-*-repack.cpp, which is outside
+                // this task's file scope, so their signatures stay untouched.
+                if (pp_profile) {
+                    pp_profile_repack_begin.push_back(
+                        ggml_sycl_submit_marker<mxfp4_pp_profile_repack_begin_marker>(*stream));
+                }
+                if (experts_are_tiled) {
+                    repack_mxfp4_xmx_tiled_to_woq_batched(
+                        repack_srcs.data(), n_slots, batched_weight_bytes, weight_slot_bytes, woq_nibble_slot_bytes,
+                        blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream());
+                } else {
+                    repack_mxfp4_soa_to_woq_batched(repack_srcs.data(), n_slots, batched_weight_bytes,
+                                                    weight_slot_bytes, woq_nibble_slot_bytes, blocks_per_row,
+                                                    static_cast<int>(ne01), ctx.stream());
+                }
+                if (pp_profile) {
+                    pp_profile_repack_end.push_back(
+                        ggml_sycl_submit_marker<mxfp4_pp_profile_repack_end_marker>(*stream));
+                }
+            }
+
             for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                 const pp_onednn_batched_expert & expert = active_experts[slot];
                 const size_t                     rows   = expert.row_end - expert.row_begin;
                 if (pp_woq_enabled) {
-                    uint8_t * nibble_dst = batched_weight_bytes + slot * weight_slot_bytes;
-                    uint8_t * scale_dst  = nibble_dst + woq_nibble_slot_bytes;
-                    // Repack timing brackets a begin/end marker pair rather than
-                    // returning an event from repack_mxfp4_*_to_woq directly --
-                    // those functions submit two kernels each (nibbles + scales)
-                    // and are shared with tests/test-sycl-mxfp4-woq-*-repack.cpp,
-                    // which is outside this task's file scope, so their
-                    // signatures stay untouched.
-                    if (pp_profile) {
-                        pp_profile_repack_begin.push_back(
-                            ggml_sycl_submit_marker<class mxfp4_pp_profile_repack_begin_marker>(*stream));
+                    if (!woq_repack_batched) {
+                        // Fallback: this dispatch exceeded the batched
+                        // launch's slot capacity (see GGML_SYCL_MXFP4_WOQ_
+                        // REPACK_MAX_SLOTS above) -- repack this slot
+                        // individually, exactly as before llama.cpp-1lon.
+                        uint8_t * nibble_dst = batched_weight_bytes + slot * weight_slot_bytes;
+                        uint8_t * scale_dst  = nibble_dst + woq_nibble_slot_bytes;
+                        if (pp_profile) {
+                            pp_profile_repack_begin.push_back(
+                                ggml_sycl_submit_marker<mxfp4_pp_profile_repack_begin_marker>(*stream));
+                        }
+                        if (experts_are_tiled) {
+                            repack_mxfp4_xmx_tiled_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
+                                                          static_cast<int>(ne01), static_cast<int>(tile_n_total),
+                                                          ctx.stream());
+                        } else {
+                            repack_mxfp4_soa_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
+                                                    static_cast<int>(ne01), ctx.stream());
+                        }
+                        if (pp_profile) {
+                            pp_profile_repack_end.push_back(
+                                ggml_sycl_submit_marker<mxfp4_pp_profile_repack_end_marker>(*stream));
+                        }
                     }
-                    if (experts_are_tiled) {
-                        repack_mxfp4_xmx_tiled_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                      static_cast<int>(ne01), static_cast<int>(tile_n_total),
-                                                      ctx.stream());
-                    } else {
-                        repack_mxfp4_soa_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                static_cast<int>(ne01), ctx.stream());
-                    }
-                    if (pp_profile) {
-                        pp_profile_repack_end.push_back(
-                            ggml_sycl_submit_marker<class mxfp4_pp_profile_repack_end_marker>(*stream));
-                    }
+                    // else: already repacked in one batched launch above.
                 } else {
                     dequantize_row_mxfp4_soa_to_fp16_rowmajor(expert.ptr, batched_weights + slot * weight_elems,
                                                               blocks_per_row, static_cast<int>(ne01), ctx.stream());

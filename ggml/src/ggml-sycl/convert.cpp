@@ -1412,6 +1412,122 @@ void repack_mxfp4_soa_to_woq(const void *    src,
                          });
 }
 
+// Fixed-capacity table of per-slot source pointers for the batched repack
+// entry points below (llama.cpp-1lon). Captured BY VALUE into a SYCL kernel
+// lambda -- an array of device-copyable pointers embedded in the kernel's
+// argument block, the same mechanism that already carries a single pointer
+// per launch in the per-slot kernels above, just widened to carry
+// n_slots (<= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS) of them. This is not a
+// new device allocation or an H2D buffer upload: nothing beyond n_slots is
+// ever read (the launch's expert-slot grid dimension is sized to n_slots,
+// not to the table's capacity), and the table itself lives only as kernel
+// argument bytes for the lifetime of the launch.
+struct mxfp4_woq_repack_src_table {
+    const void * ptr[GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS];
+};
+
+// Batched SOA MXFP4 -> WOQ repack kernels: identical per-slot index math to
+// repack_mxfp4_soa_to_woq_{nibbles,scales}_kernel above, with an added
+// expert-slot grid dimension (item.get_group(1)) so one launch covers every
+// active slot. See repack_mxfp4_soa_to_woq_batched below for the shared
+// per-tensor-dispatch parameters this relies on.
+static void repack_mxfp4_soa_to_woq_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
+                                                           uint8_t * __restrict__ dst_weight_base,
+                                                           size_t                   weight_slot_bytes,
+                                                           int                      blocks_per_row,
+                                                           int                      N,
+                                                           int64_t                  total_dst_bytes,
+                                                           const sycl::nd_item<3> & item) {
+    const int64_t db = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (db >= total_dst_bytes) {
+        return;
+    }
+    const int       slot               = static_cast<int>(item.get_group(1));
+    const uint8_t * qs                 = static_cast<const uint8_t *>(srcs.ptr[slot]);
+    uint8_t * __restrict__ dst_nibbles = dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes;
+
+    auto src_nibble = [=](int64_t el) -> uint8_t {
+        const int64_t k       = el / N;
+        const int64_t n       = el - k * N;
+        const int64_t b       = k / QK_MXFP4;
+        const int64_t k_local = k - b * QK_MXFP4;
+        const int64_t block_i = n * blocks_per_row + b;
+        const bool    lo      = k_local < QK_MXFP4 / 2;
+        const uint8_t byte    = qs[block_i * (QK_MXFP4 / 2) + (lo ? k_local : k_local - QK_MXFP4 / 2)];
+        return lo ? (byte & 0xf) : (byte >> 4);
+    };
+
+    const uint8_t lo_nib = src_nibble(db * 2);
+    const uint8_t hi_nib = src_nibble(db * 2 + 1);
+    dst_nibbles[db]      = (uint8_t) (lo_nib | (hi_nib << 4));
+}
+
+static void repack_mxfp4_soa_to_woq_scales_batched_kernel(mxfp4_woq_repack_src_table srcs,
+                                                          uint8_t * __restrict__ dst_weight_base,
+                                                          size_t                   weight_slot_bytes,
+                                                          size_t                   woq_nibble_slot_bytes,
+                                                          int                      blocks_per_row,
+                                                          int                      N,
+                                                          int64_t                  nblocks,
+                                                          int64_t                  total_entries,
+                                                          const sycl::nd_item<3> & item) {
+    const int64_t idx = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (idx >= total_entries) {
+        return;
+    }
+    const int       slot = static_cast<int>(item.get_group(1));
+    const uint8_t * qs   = static_cast<const uint8_t *>(srcs.ptr[slot]);
+    const uint8_t * e    = qs + nblocks * (QK_MXFP4 / 2);
+    uint8_t * __restrict__ dst_scales =
+        dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes + woq_nibble_slot_bytes;
+
+    const int64_t kg = idx / N;
+    const int64_t n  = idx - kg * N;
+    dst_scales[idx]  = e[n * blocks_per_row + kg];
+}
+
+void repack_mxfp4_soa_to_woq_batched(const void * const * srcs,
+                                     int                  n_slots,
+                                     uint8_t *            dst_weight_base,
+                                     size_t               weight_slot_bytes,
+                                     size_t               woq_nibble_slot_bytes,
+                                     int                  blocks_per_row,
+                                     int                  nrows,
+                                     dpct::queue_ptr      stream) {
+    GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
+
+    mxfp4_woq_repack_src_table src_table{};
+    for (int i = 0; i < n_slots; ++i) {
+        src_table.ptr[i] = srcs[i];
+    }
+
+    const int64_t K       = static_cast<int64_t>(blocks_per_row) * QK_MXFP4;
+    const int64_t N       = nrows;
+    const int64_t nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
+
+    constexpr int WG_SIZE = 256;
+
+    const int64_t total_nibble_bytes = (K * N) / 2;
+    const int64_t n_wgs_nibbles      = (total_nibble_bytes + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, n_slots, n_wgs_nibbles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_soa_to_woq_nibbles_batched_kernel(src_table, dst_weight_base, weight_slot_bytes,
+                                                           blocks_per_row, static_cast<int>(N), total_nibble_bytes,
+                                                           item);
+        });
+
+    const int64_t total_scale_entries = nblocks;  // blocks_per_row * N
+    const int64_t n_wgs_scales        = (total_scale_entries + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, n_slots, n_wgs_scales * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_soa_to_woq_scales_batched_kernel(src_table, dst_weight_base, weight_slot_bytes,
+                                                          woq_nibble_slot_bytes, blocks_per_row, static_cast<int>(N),
+                                                          nblocks, total_scale_entries, item);
+        });
+}
+
 // XMX_TILED MXFP4 -> WOQ repack: inverts the tiled materializer's byte
 // layout into the SAME destination WOQ layout as repack_mxfp4_soa_to_woq
 // above (perf-recovery epic, track C2b Option T, llama.cpp-ntfx; nibble
@@ -1541,6 +1657,119 @@ void repack_mxfp4_xmx_tiled_to_woq(const void *    src_tiled,
         [=](sycl::nd_item<3> item) {
             repack_mxfp4_xmx_tiled_to_woq_scales_kernel(src, dst_scales, nrows, tile_n_total, n_tile_groups_n,
                                                         group_bytes, total_scale_entries, item);
+        });
+}
+
+// Batched XMX_TILED MXFP4 -> WOQ repack kernels: identical per-slot index
+// math to repack_mxfp4_xmx_tiled_to_woq_{nibbles,scales}_kernel above, with
+// an added expert-slot grid dimension (item.get_group(1)) so one launch
+// covers every active slot -- see repack_mxfp4_soa_to_woq_nibbles_batched_
+// kernel above for the shared source-table mechanism.
+static void repack_mxfp4_xmx_tiled_to_woq_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
+                                                                 uint8_t * __restrict__ dst_weight_base,
+                                                                 size_t                   weight_slot_bytes,
+                                                                 int                      N,
+                                                                 int                      tile_n_total,
+                                                                 int64_t                  n_tile_groups_n,
+                                                                 int64_t                  group_bytes,
+                                                                 int64_t                  total_dst_bytes,
+                                                                 const sycl::nd_item<3> & item) {
+    const int64_t db = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (db >= total_dst_bytes) {
+        return;
+    }
+    const int       slot               = static_cast<int>(item.get_group(1));
+    const uint8_t * src_tiled          = static_cast<const uint8_t *>(srcs.ptr[slot]);
+    uint8_t * __restrict__ dst_nibbles = dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes;
+
+    auto src_nibble = [=](int64_t el) -> uint8_t {
+        const int64_t k            = el / N;
+        const int64_t n            = el - k * N;
+        const int64_t k_block      = k / QK_MXFP4;
+        const int64_t k_local      = k - k_block * QK_MXFP4;
+        const int64_t tg_n         = n / tile_n_total;
+        const int64_t tn           = n - tg_n * tile_n_total;
+        const int64_t group_offset = (k_block * n_tile_groups_n + tg_n) * group_bytes;
+        const bool    lo           = k_local < QK_MXFP4 / 2;
+        const uint8_t byte =
+            src_tiled[group_offset + tile_n_total + tn * (QK_MXFP4 / 2) + (lo ? k_local : k_local - QK_MXFP4 / 2)];
+        return lo ? (byte & 0xf) : (byte >> 4);
+    };
+
+    const uint8_t lo_nib = src_nibble(db * 2);
+    const uint8_t hi_nib = src_nibble(db * 2 + 1);
+    dst_nibbles[db]      = (uint8_t) (lo_nib | (hi_nib << 4));
+}
+
+static void repack_mxfp4_xmx_tiled_to_woq_scales_batched_kernel(mxfp4_woq_repack_src_table srcs,
+                                                                uint8_t * __restrict__ dst_weight_base,
+                                                                size_t                   weight_slot_bytes,
+                                                                size_t                   woq_nibble_slot_bytes,
+                                                                int                      N,
+                                                                int                      tile_n_total,
+                                                                int64_t                  n_tile_groups_n,
+                                                                int64_t                  group_bytes,
+                                                                int64_t                  total_entries,
+                                                                const sycl::nd_item<3> & item) {
+    const int64_t idx = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (idx >= total_entries) {
+        return;
+    }
+    const int       slot      = static_cast<int>(item.get_group(1));
+    const uint8_t * src_tiled = static_cast<const uint8_t *>(srcs.ptr[slot]);
+    uint8_t * __restrict__ dst_scales =
+        dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes + woq_nibble_slot_bytes;
+
+    const int64_t k_block      = idx / N;
+    const int64_t n            = idx - k_block * N;
+    const int64_t tg_n         = n / tile_n_total;
+    const int64_t tn           = n - tg_n * tile_n_total;
+    const int64_t group_offset = (k_block * n_tile_groups_n + tg_n) * group_bytes;
+    dst_scales[idx]            = src_tiled[group_offset + tn];
+}
+
+void repack_mxfp4_xmx_tiled_to_woq_batched(const void * const * srcs,
+                                           int                  n_slots,
+                                           uint8_t *            dst_weight_base,
+                                           size_t               weight_slot_bytes,
+                                           size_t               woq_nibble_slot_bytes,
+                                           int                  blocks_per_row,
+                                           int                  nrows,
+                                           int                  tile_n_total,
+                                           dpct::queue_ptr      stream) {
+    GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
+
+    mxfp4_woq_repack_src_table src_table{};
+    for (int i = 0; i < n_slots; ++i) {
+        src_table.ptr[i] = srcs[i];
+    }
+
+    const int64_t K = static_cast<int64_t>(blocks_per_row) * QK_MXFP4;
+    const int64_t N = nrows;
+
+    const int64_t n_tile_groups_n = (N + tile_n_total - 1) / tile_n_total;
+    const int64_t group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
+
+    constexpr int WG_SIZE = 256;
+
+    const int64_t total_nibble_bytes = (K * N) / 2;
+    const int64_t n_wgs_nibbles      = (total_nibble_bytes + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, n_slots, n_wgs_nibbles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_xmx_tiled_to_woq_nibbles_batched_kernel(src_table, dst_weight_base, weight_slot_bytes,
+                                                                 static_cast<int>(N), tile_n_total, n_tile_groups_n,
+                                                                 group_bytes, total_nibble_bytes, item);
+        });
+
+    const int64_t total_scale_entries = static_cast<int64_t>(blocks_per_row) * N;
+    const int64_t n_wgs_scales        = (total_scale_entries + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, n_slots, n_wgs_scales * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_xmx_tiled_to_woq_scales_batched_kernel(
+                src_table, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes, static_cast<int>(N), tile_n_total,
+                n_tile_groups_n, group_bytes, total_scale_entries, item);
         });
 }
 

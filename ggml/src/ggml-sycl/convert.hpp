@@ -215,6 +215,62 @@ void repack_mxfp4_xmx_tiled_to_woq(
     int tile_n_total,
     dpct::queue_ptr stream);
 
+// Upper bound on expert slots batched into one WOQ repack launch by the
+// *_batched entry points below (llama.cpp-1lon). The per-slot source
+// pointers are passed as a fixed-capacity array captured BY VALUE into the
+// kernel lambda -- an ordinary SYCL kernel argument, not a new device
+// allocation or H2D buffer upload -- so this bounds that array's size, not
+// any allocation. GPT-OSS 20B (the only shipped MXFP4 MoE shape today) uses
+// at most 32 active slots per dispatch.
+//
+// Measured hard ceiling (Battlemage/bmg_g21, oneAPI 2026.1.1): the backend
+// compiler rejects a kernel once its TOTAL captured-argument size exceeds
+// 2048 bytes ("Total size of kernel arguments exceeds limit"); a 256-slot
+// table alone (256 * 8B = 2 KiB) already exceeds it once the destination
+// pointer/strides/shape scalars are added (measured 2084-2108 bytes,
+// depending on kernel). 128 slots (1 KiB) leaves ~1 KiB of headroom for
+// those scalars -- 4x GPT-OSS 20B's current max with margin to spare. The
+// ggml-sycl.cpp call site falls back to the pre-1lon per-slot repack loop
+// whenever a dispatch's active-slot count exceeds this, so correctness for
+// any larger MoE expert count is unaffected -- only the batching speedup is.
+constexpr int GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS = 128;
+
+// Batched SOA MXFP4 -> WOQ repack: repacks every active expert slot's
+// weights with ONE kernel launch (an added expert-slot grid dimension)
+// instead of repack_mxfp4_soa_to_woq's one launch per slot. Per-slot index
+// math is identical to the per-slot form; only the source pointer and the
+// destination slot offset vary across slots -- everything else
+// (blocks_per_row, nrows/N, weight_slot_bytes, woq_nibble_slot_bytes) is a
+// per-tensor-dispatch constant shared by every slot. `srcs` is an array of
+// `n_slots` per-expert source pointers (n_slots <= GGML_SYCL_MXFP4_WOQ_
+// REPACK_MAX_SLOTS); `dst_weight_base` is the batched WOQ scratch base
+// (slot s writes at dst_weight_base + s*weight_slot_bytes for nibbles, plus
+// woq_nibble_slot_bytes for scales -- same layout repack_mxfp4_soa_to_woq's
+// caller already builds per slot).
+void repack_mxfp4_soa_to_woq_batched(
+    const void * const * srcs,
+    int n_slots,
+    uint8_t * dst_weight_base,
+    size_t weight_slot_bytes,
+    size_t woq_nibble_slot_bytes,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
+// Batched XMX_TILED MXFP4 -> WOQ repack: same batching as
+// repack_mxfp4_soa_to_woq_batched above, for the tiled source layout (see
+// repack_mxfp4_xmx_tiled_to_woq for the per-slot index derivation).
+void repack_mxfp4_xmx_tiled_to_woq_batched(
+    const void * const * srcs,
+    int n_slots,
+    uint8_t * dst_weight_base,
+    size_t weight_slot_bytes,
+    size_t woq_nibble_slot_bytes,
+    int blocks_per_row,
+    int nrows,
+    int tile_n_total,
+    dpct::queue_ptr stream);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,

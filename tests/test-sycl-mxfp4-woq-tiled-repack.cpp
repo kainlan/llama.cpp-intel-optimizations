@@ -284,6 +284,95 @@ static int check_randomized(sycl::queue & q) {
                          expected_scales.size());
 }
 
+// ---------------------------------------------------------------------------
+// Check 3 (llama.cpp-1lon): repack_mxfp4_xmx_tiled_to_woq_batched -- ONE
+// launch covering every active expert slot via an added grid dimension --
+// must reproduce N sequential calls to the pre-1lon per-slot
+// repack_mxfp4_xmx_tiled_to_woq (already verified by checks 1/2 above)
+// byte-identically. Needs no independent reference (any random tiled-shaped
+// bytes work -- both kernels read the SAME input with the SAME index math,
+// so this is a self-consistency check between the new kernel and the
+// already-verified old one, not a re-derivation of the layout), written
+// into the SAME slot-strided destination layout ggml-sycl.cpp's batched PP
+// executor uses (nibble_dst = weight_base + slot*weight_slot_bytes,
+// scale_dst = nibble_dst + woq_nibble_slot_bytes).
+// ---------------------------------------------------------------------------
+static int check_batched_vs_per_slot(sycl::queue & q) {
+    constexpr int blocks_per_row    = 3;
+    constexpr int nrows             = 7;
+    constexpr int tile_n_total      = 4;
+    constexpr int n_slots           = 5;  // exercises the added expert-slot grid dim
+    const int64_t K                 = (int64_t) blocks_per_row * QK_MXFP4;
+    const int64_t N                 = nrows;
+    const int64_t n_tile_groups_k   = blocks_per_row;
+    const int64_t n_tile_groups_n   = (N + tile_n_total - 1) / tile_n_total;
+    const int64_t group_bytes       = (int64_t) tile_n_total * (1 + QK_MXFP4 / 2);
+    const int64_t total_tiled_bytes = n_tile_groups_k * n_tile_groups_n * group_bytes;
+
+    const size_t nibble_bytes      = (size_t) (K * N / 2);
+    const size_t scale_bytes       = (size_t) (blocks_per_row * N);
+    const size_t weight_slot_bytes = nibble_bytes + scale_bytes;
+
+    std::mt19937                       rng(45);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    std::vector<std::vector<uint8_t>> src_host(n_slots);
+    std::vector<uint8_t *>            src_dev(n_slots);
+    for (int s = 0; s < n_slots; ++s) {
+        src_host[s].resize((size_t) total_tiled_bytes);
+        for (auto & b : src_host[s]) {
+            b = (uint8_t) byte_dist(rng);
+        }
+        src_dev[s] = (uint8_t *) sycl::malloc_device((size_t) total_tiled_bytes, q);
+        q.memcpy(src_dev[s], src_host[s].data(), (size_t) total_tiled_bytes).wait();
+    }
+
+    uint8_t * ref_base     = (uint8_t *) sycl::malloc_device(weight_slot_bytes * n_slots, q);
+    uint8_t * batched_base = (uint8_t *) sycl::malloc_device(weight_slot_bytes * n_slots, q);
+
+    // Reference: n_slots sequential calls to the pre-1lon per-slot kernel,
+    // exactly mirroring the pre-1lon per-slot loop in ggml-sycl.cpp.
+    for (int s = 0; s < n_slots; ++s) {
+        uint8_t * nibble_dst = ref_base + (size_t) s * weight_slot_bytes;
+        uint8_t * scale_dst  = nibble_dst + nibble_bytes;
+        repack_mxfp4_xmx_tiled_to_woq(src_dev[s], nibble_dst, scale_dst, blocks_per_row, nrows, tile_n_total, &q);
+    }
+    q.wait();
+
+    // Batched: ONE launch covering every slot.
+    std::vector<const void *> srcs(src_dev.begin(), src_dev.end());
+    repack_mxfp4_xmx_tiled_to_woq_batched(srcs.data(), n_slots, batched_base, weight_slot_bytes, nibble_bytes,
+                                          blocks_per_row, nrows, tile_n_total, &q);
+    q.wait();
+
+    std::vector<uint8_t> got_ref(weight_slot_bytes * n_slots);
+    std::vector<uint8_t> got_batched(weight_slot_bytes * n_slots);
+    q.memcpy(got_ref.data(), ref_base, got_ref.size()).wait();
+    q.memcpy(got_batched.data(), batched_base, got_batched.size()).wait();
+
+    for (int s = 0; s < n_slots; ++s) {
+        sycl::free(src_dev[s], q);
+    }
+    sycl::free(ref_base, q);
+    sycl::free(batched_base, q);
+
+    if (std::memcmp(got_ref.data(), got_batched.data(), got_ref.size()) != 0) {
+        for (size_t i = 0; i < got_ref.size(); ++i) {
+            if (got_ref[i] != got_batched[i]) {
+                std::printf(
+                    "FAIL[batched-vs-per-slot]: mismatch at byte %zu (slot %zu): per_slot=0x%02x batched=0x%02x\n", i,
+                    i / weight_slot_bytes, got_ref[i], got_batched[i]);
+                return 1;
+            }
+        }
+    }
+    std::printf(
+        "OK[batched-vs-per-slot]: repack_mxfp4_xmx_tiled_to_woq_batched matches %d sequential "
+        "repack_mxfp4_xmx_tiled_to_woq calls (%zu bytes/slot)\n",
+        n_slots, weight_slot_bytes);
+    return 0;
+}
+
 int main() {
     try {
         sycl::queue q{ sycl::gpu_selector_v };
@@ -295,6 +384,10 @@ int main() {
             return rc;
         }
         rc = check_randomized(q);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = check_batched_vs_per_slot(q);
         if (rc != 0) {
             return rc;
         }
