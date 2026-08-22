@@ -199,6 +199,22 @@ void repack_mxfp4_soa_to_woq(
     int nrows,
     dpct::queue_ptr stream);
 
+// Repack MXFP4 XMX_TILED -> WOQ: inverts the tiled materializer's byte
+// layout (ggml_sycl::moe_tile_convert::reorder_mxfp4_to_xmx_tiled /
+// reorder_mxfp4_aos_to_xmx_tiled, moe-tile-convert.cpp) into the SAME
+// destination layout as repack_mxfp4_soa_to_woq above (see convert.cpp for
+// the exact index derivation). K = blocks_per_row * QK_MXFP4, N = nrows.
+// tile_n_total is the device's XMX tile width (caps.N * optimal_tiles_n),
+// passed by the caller -- not hardcoded here, since it is caps-dependent.
+void repack_mxfp4_xmx_tiled_to_woq(
+    const void * src_tiled,
+    uint8_t * dst_nibbles,
+    uint8_t * dst_scales,
+    int blocks_per_row,
+    int nrows,
+    int tile_n_total,
+    dpct::queue_ptr stream);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,

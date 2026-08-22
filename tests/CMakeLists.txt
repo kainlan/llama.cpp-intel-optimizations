@@ -423,6 +423,31 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 endif()
 
+# XMX_TILED MXFP4 -> WOQ repack kernel device test (perf-recovery epic, track
+# C2b Option T, llama.cpp-ntfx): the production repack_mxfp4_xmx_tiled_to_woq
+# (ggml-sycl/convert.cpp/.hpp) must invert the tiled materializer's byte
+# layout into the same WOQ destination format as repack_mxfp4_soa_to_woq
+# above, checked byte-for-byte against both a hand fixture and an
+# independent-writer randomized fixture. Same gated pattern as
+# test-sycl-mxfp4-woq-repack above (links the real ggml-sycl library).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-mxfp4-woq-tiled-repack.cpp)
+    set_tests_properties(test-sycl-mxfp4-woq-tiled-repack PROPERTIES LABELS "sycl;moe;mxfp4;woq;tdd")
+    target_include_directories(test-sycl-mxfp4-woq-tiled-repack PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-mxfp4-woq-tiled-repack PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-mxfp4-woq-tiled-repack PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-mxfp4-woq-tiled-repack PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-mxfp4-woq-tiled-repack PRIVATE "-fsycl")
+        target_link_options(test-sycl-mxfp4-woq-tiled-repack PRIVATE "-fsycl")
+    endif()
+    # Pin off the measurement card -- see test-sycl-mxfp4-woq-repack above.
+    set_tests_properties(test-sycl-mxfp4-woq-tiled-repack PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    )
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

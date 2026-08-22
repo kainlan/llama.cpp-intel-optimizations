@@ -1412,6 +1412,136 @@ void repack_mxfp4_soa_to_woq(const void *    src,
                          });
 }
 
+// XMX_TILED MXFP4 -> WOQ repack: inverts the tiled materializer's byte
+// layout into the SAME destination WOQ layout as repack_mxfp4_soa_to_woq
+// above (perf-recovery epic, track C2b Option T, llama.cpp-ntfx; nibble
+// order + scale layout confirmed by the C1 spike, llama.cpp-4m9p comment
+// c-a5by): sequential nibble order for weights {K,N} strides {N,1}, e8m0
+// scales {K/QK_MXFP4,N} strides {N,1}.
+//
+// Source (XMX_TILED, one weight matrix / expert-slot; k-tile-major
+// [tile_k_group][tile_n_group] -- moe-xmx-fused.hpp:118-153, written by
+// ggml_sycl::moe_tile_convert::reorder_mxfp4_to_xmx_tiled /
+// reorder_mxfp4_aos_to_xmx_tiled, moe-tile-convert.cpp:24-173, both of which
+// produce byte-identical output): the tile-group grid has n_tile_groups_k =
+// blocks_per_row groups along K (moe-xmx-fused.hpp:136-141:
+// tiles_k_per_group is always 1, i.e. one QK_MXFP4=32-element K-block per
+// group, so blocks_per_row IS the K-group count -- this function takes it
+// directly, the same convention as repack_mxfp4_soa_to_woq's parameter) and
+// n_tile_groups_n = ceil(nrows / tile_n_total) groups along N. Each tile
+// group is tile_n_total * (1 + QK_MXFP4/2) bytes (moe-tile-convert.cpp:52,
+// 131): tile_n_total scale bytes (one per output row, in row order) followed
+// by tile_n_total 16-byte quantized blocks (one per row, same order --
+// moe-tile-convert.cpp:70-99 verbatim-copies each row's source 16-byte
+// block into its slot, so the intra-block nibble packing is the SAME
+// j/j+16 interleave that dequantize_tile_mxfp4_soa_rowmajor above decodes:
+// byte j (j=0..15) holds element j in its low nibble, element j+16 in its
+// high nibble, for the block's QK_MXFP4=32 elements).
+//
+// Inverse map for destination element (k, n), k in [0,K), n in [0,N):
+//   k_block = k / QK_MXFP4;  k_local = k - k_block * QK_MXFP4
+//   tg_n = n / tile_n_total; tn = n - tg_n * tile_n_total
+//   n_tile_groups_n = ceil(N / tile_n_total)
+//   group_bytes  = tile_n_total * (1 + QK_MXFP4/2)
+//   group_offset = (k_block * n_tile_groups_n + tg_n) * group_bytes
+//   scale byte   = src_tiled[group_offset + tn]
+//   qs byte      = src_tiled[group_offset + tile_n_total + tn*(QK_MXFP4/2)
+//                             + (k_local < QK_MXFP4/2 ? k_local : k_local - QK_MXFP4/2)]
+//   nibble       = k_local < QK_MXFP4/2 ? (qs byte & 0xf) : (qs byte >> 4)
+//
+// Caps assumed by the current call site (device caps log): K=32, N=16,
+// GGML_SYCL_MXFP4_MOE_XMX_SG=32, optimal_tiles_n=1 -> tile_n_total=16. This
+// function does NOT hardcode those numbers -- blocks_per_row, nrows and
+// tile_n_total are taken as arguments derived from device caps at the call
+// site, since caps can differ across devices/builds.
+static void repack_mxfp4_xmx_tiled_to_woq_nibbles_kernel(const uint8_t * __restrict__ src_tiled,
+                                                         uint8_t * __restrict__ dst_nibbles,
+                                                         int                      N,
+                                                         int                      tile_n_total,
+                                                         int64_t                  n_tile_groups_n,
+                                                         int64_t                  group_bytes,
+                                                         int64_t                  total_dst_bytes,
+                                                         const sycl::nd_item<3> & item) {
+    const int64_t db = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (db >= total_dst_bytes) {
+        return;
+    }
+
+    auto src_nibble = [=](int64_t el) -> uint8_t {
+        const int64_t k            = el / N;
+        const int64_t n            = el - k * N;
+        const int64_t k_block      = k / QK_MXFP4;
+        const int64_t k_local      = k - k_block * QK_MXFP4;
+        const int64_t tg_n         = n / tile_n_total;
+        const int64_t tn           = n - tg_n * tile_n_total;
+        const int64_t group_offset = (k_block * n_tile_groups_n + tg_n) * group_bytes;
+        const bool    lo           = k_local < QK_MXFP4 / 2;
+        const uint8_t byte         = src_tiled[group_offset + tile_n_total + tn * (QK_MXFP4 / 2) +
+                                        (lo ? k_local : k_local - QK_MXFP4 / 2)];
+        return lo ? (byte & 0xf) : (byte >> 4);
+    };
+
+    const uint8_t lo_nib = src_nibble(db * 2);
+    const uint8_t hi_nib = src_nibble(db * 2 + 1);
+    dst_nibbles[db]      = (uint8_t) (lo_nib | (hi_nib << 4));
+}
+
+static void repack_mxfp4_xmx_tiled_to_woq_scales_kernel(const uint8_t * __restrict__ src_tiled,
+                                                        uint8_t * __restrict__ dst_scales,
+                                                        int                      N,
+                                                        int                      tile_n_total,
+                                                        int64_t                  n_tile_groups_n,
+                                                        int64_t                  group_bytes,
+                                                        int64_t                  total_entries,
+                                                        const sycl::nd_item<3> & item) {
+    const int64_t idx = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+    if (idx >= total_entries) {
+        return;
+    }
+    const int64_t k_block      = idx / N;
+    const int64_t n            = idx - k_block * N;
+    const int64_t tg_n         = n / tile_n_total;
+    const int64_t tn           = n - tg_n * tile_n_total;
+    const int64_t group_offset = (k_block * n_tile_groups_n + tg_n) * group_bytes;
+    dst_scales[idx]            = src_tiled[group_offset + tn];
+}
+
+void repack_mxfp4_xmx_tiled_to_woq(const void *    src_tiled,
+                                   uint8_t *       dst_nibbles,
+                                   uint8_t *       dst_scales,
+                                   int             blocks_per_row,
+                                   int             nrows,
+                                   int             tile_n_total,
+                                   dpct::queue_ptr stream) {
+    const uint8_t * src = static_cast<const uint8_t *>(src_tiled);
+
+    const int64_t K = static_cast<int64_t>(blocks_per_row) * QK_MXFP4;
+    const int64_t N = nrows;
+
+    const int64_t n_tile_groups_n = (N + tile_n_total - 1) / tile_n_total;
+    const int64_t group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
+
+    constexpr int WG_SIZE = 256;
+
+    const int64_t total_nibble_bytes = (K * N) / 2;
+    const int64_t n_wgs_nibbles      = (total_nibble_bytes + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs_nibbles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_xmx_tiled_to_woq_nibbles_kernel(src, dst_nibbles, nrows, tile_n_total, n_tile_groups_n,
+                                                         group_bytes, total_nibble_bytes, item);
+        });
+
+    const int64_t total_scale_entries = static_cast<int64_t>(blocks_per_row) * N;
+    const int64_t n_wgs_scales        = (total_scale_entries + WG_SIZE - 1) / WG_SIZE;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs_scales * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+        [=](sycl::nd_item<3> item) {
+            repack_mxfp4_xmx_tiled_to_woq_scales_kernel(src, dst_scales, nrows, tile_n_total, n_tile_groups_n,
+                                                        group_bytes, total_scale_entries, item);
+        });
+}
+
 // Host function to launch Q4_0 Coalesced to SoA conversion
 void reorder_q4_0_coalesced_to_soa_sycl(const void *    src,
                                         void *          dst,  // SoA format: [all qs bytes][all d values]
