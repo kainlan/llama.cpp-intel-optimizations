@@ -64680,6 +64680,13 @@ struct mxfp4_pp_batched_profile_accum {
     std::unordered_map<std::string, int64_t> repack_calls_by_tensor;
     std::unordered_map<std::string, int64_t> dispatch_calls_by_tensor;
     int64_t                                  dispatch_evals = 0;
+    // llama.cpp-6405 fix cycle (F2): count of failed profiling-info reads
+    // (mxfp4_pp_event_duration_us/_span_us returning -1.0) across every
+    // component this eval, including the graph-total span itself. Those
+    // reads are excluded from every *_us sum rather than polluting it with
+    // -1.0 -- this is the "distrust this line" counter; nonzero means some
+    // of the ms figures above are undercounts, not that the op failed.
+    int64_t                                  read_failures  = 0;
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
@@ -64700,26 +64707,38 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         "[MXFP4-PP-BATCHED-PROFILE] dispatches=%lld graph_total=%.3f ms accounted=%.3f ms other=%.3f ms "
         "tiled_repack=%.3f ms/%lld soa_repack=%.3f ms/%lld "
         "woq_gemm=%.3f ms/%lld(2d=%lld,3d_requested=%lld) f16_gemm=%.3f ms/%lld "
-        "stage=%.3f ms/%lld graph_total_measured=%d\n",
+        "stage=%.3f ms/%lld graph_total_measured=%d read_failures=%lld\n",
         (long long) p.dispatch_evals, p.graph_total_us / 1000.0, accounted_us / 1000.0, other_us / 1000.0,
         p.tiled_repack_us / 1000.0, (long long) p.tiled_repack_calls, p.soa_repack_us / 1000.0,
         (long long) p.soa_repack_calls, p.woq_gemm_us / 1000.0, (long long) p.woq_gemm_calls,
         (long long) p.woq_gemm_2d_calls, (long long) p.woq_gemm_3d_calls, p.f16_gemm_us / 1000.0,
-        (long long) p.f16_gemm_calls, p.stage_us / 1000.0, (long long) p.stage_calls, p.graph_total_set ? 1 : 0);
+        (long long) p.f16_gemm_calls, p.stage_us / 1000.0, (long long) p.stage_calls, p.graph_total_set ? 1 : 0,
+        (long long) p.read_failures);
+
+    // llama.cpp-6405 (reviewer nit): sort tensor names so the print order is
+    // deterministic across runs -- std::unordered_map's iteration order is
+    // not, which would otherwise make two captures of the identical eval
+    // diff spuriously on tensor-line ordering alone.
+    std::vector<std::string> tensor_names;
+    tensor_names.reserve(p.repack_calls_by_tensor.size());
+    for (const auto & kv : p.repack_calls_by_tensor) {
+        tensor_names.push_back(kv.first);
+    }
+    std::sort(tensor_names.begin(), tensor_names.end());
 
     size_t printed = 0;
-    for (const auto & kv : p.repack_calls_by_tensor) {
+    for (const std::string & name : tensor_names) {
         if (printed >= 96) {
-            GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-TENSOR] truncated at 96 of %zu tensors\n",
-                          p.repack_calls_by_tensor.size());
+            GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-TENSOR] truncated at 96 of %zu tensors\n", tensor_names.size());
             break;
         }
-        const auto    dispatch_it = p.dispatch_calls_by_tensor.find(kv.first);
+        const auto    dispatch_it = p.dispatch_calls_by_tensor.find(name);
         const int64_t dispatches  = dispatch_it != p.dispatch_calls_by_tensor.end() ? dispatch_it->second : 0;
+        const int64_t repacks     = p.repack_calls_by_tensor.at(name);
         GGML_LOG_WARN(
             "[MXFP4-PP-BATCHED-PROFILE-TENSOR] tensor=%s dispatches=%lld repacks=%lld repacks_per_dispatch=%.2f\n",
-            kv.first.c_str(), (long long) dispatches, (long long) kv.second,
-            dispatches > 0 ? static_cast<double>(kv.second) / static_cast<double>(dispatches) : 0.0);
+            name.c_str(), (long long) dispatches, (long long) repacks,
+            dispatches > 0 ? static_cast<double>(repacks) / static_cast<double>(dispatches) : 0.0);
         ++printed;
     }
 
@@ -64733,9 +64752,18 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
 // model with no MXFP4 MoE tensors) there is nothing to attribute, so it
 // resets quietly rather than emitting an all-zero line every graph.
 static void mxfp4_pp_profile_record_graph_total(double graph_us) {
-    auto & p          = g_mxfp4_pp_batched_profile;
-    p.graph_total_us  = graph_us;
-    p.graph_total_set = true;
+    auto & p = g_mxfp4_pp_batched_profile;
+    // llama.cpp-6405 fix cycle (F2): a failed span read (graph_us < 0.0) used
+    // to still set graph_total_set = true, so the summary line printed
+    // graph_total_measured=1 on the exact failure that field exists to flag
+    // (and graph_total_us stayed 0.0, silently). Route it through
+    // read_failures instead, same as every other component's failed read.
+    if (graph_us < 0.0) {
+        ++p.read_failures;
+    } else {
+        p.graph_total_us  = graph_us;
+        p.graph_total_set = true;
+    }
     if (p.dispatch_evals > 0) {
         mxfp4_pp_batched_profile_print_and_reset();
     } else {
@@ -71268,8 +71296,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // observes it.
             std::vector<sycl::event> gemm_events;
             gemm_events.reserve(gemm_groups.size());
+            // llama.cpp-6405 fix cycle (F1, BLOCKING -- confirmed on hardware:
+            // woq_gemm=0.000 ms/459-462 on both B70 and B50 profiling runs):
+            // gemm_events' own profiling info is NOT a valid timing source for
+            // the shipped 2-D WOQ arm. woq_gemm_batch_mxfp4's 2-D fallback
+            // (gemm.hpp) returns q->ext_oneapi_submit_barrier(per_batch_events)
+            // -- a barrier event whose command_start/command_end cover the
+            // (near-instant) barrier command itself, not the batched GEMM
+            // executes it merges. Reading gemm_events' timestamps therefore
+            // silently pushed the entire WOQ GEMM device time into "other",
+            // inverting the parent task's question. Bracket the whole try{}
+            // block with the same begin/end marker idiom used for repack
+            // instead (mxfp4_pp_event_span_us): gemm_events is still read
+            // below, but only for its per-group COUNT (the 2-D/3-D label
+            // split), never its timestamps.
+            sycl::event gemm_profile_begin;
+            sycl::event gemm_profile_end;
             try {
                 const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
+                if (pp_profile) {
+                    gemm_profile_begin = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_begin_marker>(*stream);
+                }
                 for (const pp_gemm_group & group : gemm_groups) {
                     if (pp_woq_enabled) {
                         gemm_events.push_back(DnnlGemmWrapper::woq_gemm_batch_mxfp4(
@@ -71324,6 +71371,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return false;
             }
             stream->ext_oneapi_submit_barrier(gemm_events);
+            if (pp_profile) {
+                gemm_profile_end = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_end_marker>(*stream);
+            }
 
             const bool batched_compare = [] {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE");
@@ -71533,24 +71583,61 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (pp_profile) {
                 stream->wait();
                 auto & profile = g_mxfp4_pp_batched_profile;
+                // llama.cpp-6405 fix cycle (F2): mxfp4_pp_event_span_us/
+                // _duration_us return -1.0 on a failed profiling query (bad
+                // event, query threw). Summing that unconditionally poisoned
+                // the ms totals with a stray -0.001 ms per failure and hid
+                // the failure entirely. Skip the sum, keep the CALL count
+                // (the operation itself did happen), and tally the failure
+                // separately -- read_failures in the summary line is the
+                // "distrust this line" signal.
                 for (size_t i = 0; i < pp_profile_repack_begin.size(); ++i) {
+                    // Note: this span is bracketed by the begin/end MARKER
+                    // events themselves (two single_task no-op launches), so
+                    // it includes their own (near-zero but nonzero) launch
+                    // overhead in addition to the two repack kernels -- not
+                    // purely repack device time.
                     const double us = mxfp4_pp_event_span_us(pp_profile_repack_begin[i], pp_profile_repack_end[i]);
-                    if (pp_profile_repack_tiled[i]) {
+                    if (us < 0.0) {
+                        ++profile.read_failures;
+                    } else if (pp_profile_repack_tiled[i]) {
                         profile.tiled_repack_us += us;
-                        ++profile.tiled_repack_calls;
                     } else {
                         profile.soa_repack_us += us;
+                    }
+                    if (pp_profile_repack_tiled[i]) {
+                        ++profile.tiled_repack_calls;
+                    } else {
                         ++profile.soa_repack_calls;
                     }
                 }
                 for (const sycl::event & ev : pp_profile_stage_events) {
-                    profile.stage_us += mxfp4_pp_event_duration_us(ev);
+                    const double us = mxfp4_pp_event_duration_us(ev);
+                    if (us < 0.0) {
+                        ++profile.read_failures;
+                    } else {
+                        profile.stage_us += us;
+                    }
                     ++profile.stage_calls;
                 }
-                for (const sycl::event & ev : gemm_events) {
-                    const double us = mxfp4_pp_event_duration_us(ev);
+                // F1: timing comes from the gemm_profile_begin/end bracket
+                // around the whole try{} block above (one combined span for
+                // every group in this dispatch), NOT from gemm_events' own
+                // profiling info -- see the comment at gemm_profile_begin's
+                // declaration for why gemm_events' timestamps are not a valid
+                // per-group timing source on the shipped 2-D arm.
+                // gemm_events is still read here for its per-group COUNT
+                // (the 2-D/3-D label split).
+                const double gemm_span_us = mxfp4_pp_event_span_us(gemm_profile_begin, gemm_profile_end);
+                if (gemm_span_us < 0.0) {
+                    ++profile.read_failures;
+                } else if (pp_woq_enabled) {
+                    profile.woq_gemm_us += gemm_span_us;
+                } else {
+                    profile.f16_gemm_us += gemm_span_us;
+                }
+                for (size_t i = 0; i < gemm_events.size(); ++i) {
                     if (pp_woq_enabled) {
-                        profile.woq_gemm_us += us;
                         ++profile.woq_gemm_calls;
                         if (mxfp4_pp_woq_3d_requested()) {
                             ++profile.woq_gemm_3d_calls;
@@ -71558,7 +71645,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             ++profile.woq_gemm_2d_calls;
                         }
                     } else {
-                        profile.f16_gemm_us += us;
                         ++profile.f16_gemm_calls;
                     }
                 }
@@ -96007,6 +96093,18 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             auto *        profile_ctx    = static_cast<ggml_backend_sycl_context *>(backend->context);
             sycl::queue * profile_stream = profile_ctx->stream();
             if (profile_stream) {
+                // llama.cpp-6405 fix cycle (F3): reset HERE, at entry, not
+                // just after a successful eval via
+                // mxfp4_pp_profile_record_graph_total's print-and-reset. An
+                // eval that throws before reaching that call (the
+                // fallback_error recovery path below) used to leave its
+                // already-accumulated dispatches sitting in the global
+                // accumulator, where they silently merged into the NEXT
+                // eval's line -- inflating dispatches/repack counts/
+                // repacks_per_dispatch, the headline numbers, on the eval
+                // that actually printed. Host-side only, zero device work
+                // added to the recovery path.
+                g_mxfp4_pp_batched_profile = mxfp4_pp_batched_profile_accum{};
                 sycl::event begin_ev =
                     ggml_sycl_submit_marker<class mxfp4_pp_profile_graph_begin_marker>(*profile_stream);
                 const ggml_status status = ggml_backend_sycl_graph_compute_unchecked(backend, cgraph);
