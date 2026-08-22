@@ -18850,9 +18850,11 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     size_t alloc_size = budget_bytes;
 
     // Per-chunk cap from the runtime/hardware.  The raw maxMemAllocSize is the
-    // API limit used for the initial single-chunk attempt.  The queried safe cap
-    // is used only for N-chunk piece sizing after single allocation is too large
-    // or actually fails.
+    // API's advertised limit; the queried safe cap (when known) is tighter and
+    // now governs BOTH the single-chunk admission decision below (see
+    // try_single_chunk) and N-chunk piece sizing -- a single chunk allocated
+    // near the raw limit leaves the driver without command-buffer/kernel
+    // working memory (llama.cpp-seno).
     size_t per_chunk_cap = max_alloc_size;
     if (safe_max_alloc_size > 0) {
         per_chunk_cap = per_chunk_cap > 0 ? std::min(per_chunk_cap, safe_max_alloc_size) : safe_max_alloc_size;
@@ -18887,8 +18889,8 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         // as unset and floored at max(default_headroom, pipeline-aware floor),
         // never silently dropped below either -- is itself unit-tested
         // (test-sycl-vram-headroom.cpp; spec-review finding 1, llama.cpp-seno).
-        const size_t external_headroom        = ggml_sycl_vram_external_headroom_effective(
-            device_total_vram, default_headroom, onednn_pipeline_planned, headroom_env);
+        const size_t external_headroom        = vram_external_headroom_effective(device_total_vram, default_headroom,
+                                                                                 onednn_pipeline_planned, headroom_env);
         GGML_LOG_INFO(
             "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
             "oneDNN=%.0f MB scratch=%.0f MB\n",
@@ -18929,15 +18931,17 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
     constexpr size_t k_min_shared_bytes = 16ull * 1024ull * 1024ull;  // 16 MB
 
     // Use a single chunk only when it is within the runtime's SAFE per-chunk
-    // cap, not merely the raw advertised limit. A size in the raw..safe window
-    // (max_alloc_size < alloc_size <= per_chunk_cap's raw component) allocates
-    // one near-raw chunk that leaves the driver without command-buffer/kernel
-    // working memory -- proven on a clean B70 (32.6 GB, ~31 GB free): the
-    // budget-driven alloc_size landed in exactly that window and produced a
-    // deterministic [MUL_MAT_ID-FAIL] error 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
-    // at the first heavy MoE dispatch, not at reserve (llama.cpp-dp5i c-ni04,
-    // falsified and confirmed in c-gkai; fix: llama.cpp-seno). Sizes that used
-    // to admit a single near-raw chunk now go N-chunk instead.
+    // cap (per_chunk_cap = min(max_alloc_size, safe_max_alloc_size) when a
+    // safe cap is known, else max_alloc_size itself) -- not merely the raw
+    // advertised limit. The window per_chunk_cap < alloc_size <= max_alloc_size
+    // used to be admitted here as a single near-raw chunk; that chunk left the
+    // driver without command-buffer/kernel working memory -- proven on a
+    // clean B70 (32.6 GB, ~31 GB free): the budget-driven alloc_size landed in
+    // exactly that window and produced a deterministic [MUL_MAT_ID-FAIL] error
+    // 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES) at the first heavy MoE dispatch,
+    // not at reserve (llama.cpp-dp5i c-ni04, falsified and confirmed in
+    // c-gkai; fix: llama.cpp-seno). That window now correctly goes N-chunk
+    // instead.
     const bool try_single_chunk = max_alloc_size == 0 || alloc_size <= per_chunk_cap;
     if (!try_single_chunk) {
         GGML_LOG_INFO(
