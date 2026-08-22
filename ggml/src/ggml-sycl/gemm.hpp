@@ -22,6 +22,7 @@
 #    include "dnnl_sycl.hpp"
 
 #    include <array>
+#    include <atomic>
 #    include <cstdio>
 #    include <mutex>
 #    include <unordered_map>
@@ -773,6 +774,249 @@ class DnnlGemmWrapper {
         }
 
         return dnnl::sycl_interop::execute(cached->primitive, stream, args, deps);
+    }
+
+    // Batched WoQ GEMM for MXFP4 weights (f4_e2m1 nibbles + e8m0 grouped
+    // scales) -- the batched-PP counterpart of woq_gemm_q4_0_impl, extended
+    // with a batch dimension the same way gemm_batch_strided extends gemm().
+    // Row-major native throughout, matching exactly what the repack kernels
+    // produce (convert.cpp: repack_mxfp4_soa_to_woq / _xmx_tiled_to_woq), so
+    // no transposition sits between repack output and this GEMM's operands.
+    // Unlike woq_gemm_q4_0_impl this uses FIXED memory descriptors rather
+    // than tag::any -- the C1 spike (llama.cpp-4m9p) proved f4_e2m1 accepts
+    // the plain strided layout directly, so there is no packed-layout
+    // reorder branch to carry here:
+    //   A (SRC)     = f16 activations   [batch, m, k]            strides {stride_a, k, 1}
+    //   B (WEIGHTS) = f4_e2m1 nibbles   [batch, k, n]             strides {stride_b, n, 1}
+    //   scales      = e8m0              [batch, k/group_size, n] strides {stride_scales, n, 1}
+    //   C (DST)     = f32 output        [batch, m, n]             strides {stride_c, n, 1}
+    // m = tokens (padded group rows), k = input features, n = output
+    // features. stride_a/stride_c are element strides (matches
+    // gemm_batch_strided's convention); stride_b/stride_scales are element
+    // strides in the SAME units the weight/scale memory descriptors use
+    // (nibble count k*n and scale count groups*n respectively -- oneDNN
+    // divides by elements-per-byte internally for the sub-byte f4_e2m1
+    // type, exactly as it already does for s4 in woq_gemm_q4_0_impl).
+    //
+    // The scale mask/group_dims are the C1 spike's exact proven 2-D recipe
+    // (mask 3, group_dims {group_size,1}) extended to the batch axis (mask
+    // 7, group_dims {1,group_size,1}) -- the batch-axis extension is
+    // unvalidated on hardware. If primitive creation with the 3-D mask
+    // refuses, this falls back to looping C1's proven 2-D primitive once per
+    // batch element and merging the per-element completion events into one
+    // returned barrier event. The per-device outcome is cached after the
+    // first call so steady-state dispatch never re-probes. See the C3
+    // tracker report (llama.cpp-sr83) for which arm exercised on hardware.
+    //
+    // `deps` are SYCL events this GEMM must wait on (repack + activation
+    // staging); the returned event fires on GEMM completion, matching
+    // gemm_batch_strided's deps-in/event-out contract.
+    static sycl::event woq_gemm_batch_mxfp4(ggml_backend_sycl_context &      ctx,
+                                            int                              m,
+                                            int                              n,
+                                            int                              k,
+                                            const void *                     a,
+                                            dt                               at,
+                                            int64_t                          stride_a,
+                                            const void *                     b_nibbles,
+                                            int64_t                          stride_b,
+                                            int64_t                          group_size,
+                                            const void *                     b_scales,
+                                            int64_t                          stride_scales,
+                                            void *                           c,
+                                            dt                               ct,
+                                            int64_t                          stride_c,
+                                            int                              batch_size,
+                                            const queue_ptr &                q,
+                                            const std::vector<sycl::event> & deps = {}) {
+        if (m <= 0 || n <= 0 || k <= 0 || batch_size <= 0 || group_size <= 0 || (k % group_size) != 0) {
+            throw std::runtime_error("woq_gemm_batch_mxfp4: invalid dims/group_size");
+        }
+        const int64_t elem_bytes = [](dt t) -> int64_t {
+            switch (t) {
+                case dt::f32:
+                    return 4;
+                case dt::f16:
+                    return 2;
+                default:
+                    return 0;
+            }
+        }(at);
+        const int64_t out_elem_bytes = [](dt t) -> int64_t {
+            switch (t) {
+                case dt::f32:
+                    return 4;
+                case dt::f16:
+                    return 2;
+                default:
+                    return 0;
+            }
+        }(ct);
+        if (elem_bytes == 0 || out_elem_bytes == 0 || (stride_b % 2) != 0) {
+            throw std::runtime_error("woq_gemm_batch_mxfp4: unsupported activation/output dtype or odd nibble stride");
+        }
+        const int64_t groups = k / group_size;
+
+        std::lock_guard<std::mutex> lock(exec_mutex(q));
+        auto                        stream = ctx.stream_dnnl(q);
+        auto                        eng    = ctx.engine_dnnl(q);
+        auto &                      cache  = get_dnnl_primitive_cache();
+
+        const dnnl::memory::desc a_md({ batch_size, m, k }, at, { stride_a, k, 1 });
+        const dnnl::memory::desc c_md({ batch_size, m, n }, ct, { stride_c, n, 1 });
+        auto                     a_mem = dnnl::memory(a_md, eng, const_cast<void *>(a));
+        auto                     c_mem = dnnl::memory(c_md, eng, c);
+
+        // Per-device cache of whether the batch-dim-grouped 3-D scale mask
+        // is accepted by this device's oneDNN build -- avoids re-probing
+        // primitive creation (which internally try/catches a dnnl::error)
+        // on every dispatch once the answer is known. Left default-
+        // constructed (no initializer): std::atomic has no copy/move
+        // constructor, so an IIFE-returned std::array<std::atomic<int>,N>
+        // does not compile -- a static-storage-duration array of atomics is
+        // zero-initialized before any dynamic initialization regardless, and
+        // std::atomic<int>'s defaulted default constructor does nothing
+        // beyond that, so this reliably starts at 0.
+        // 0 = unknown (try 3-D), 1 = supported, -1 = unsupported (2-D only).
+        static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> tri_state;
+        const int dev_id = std::min(ggml_sycl_get_device_id_from_queue(*q), static_cast<int>(tri_state.size()) - 1);
+
+        const dnnl::memory::desc b_md_3d({ batch_size, k, n }, dt::f4_e2m1, { stride_b, n, 1 });
+        const dnnl::memory::desc s_md_3d({ batch_size, groups, n }, dt::e8m0, { stride_scales, n, 1 });
+
+        if (tri_state[dev_id].load(std::memory_order_acquire) >= 0) {
+            dnnl::primitive_attr attr3d;
+            attr3d.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+            const int          mask3d       = (1 << 0) | (1 << 1) | (1 << 2);
+            dnnl::memory::dims group_dims3d = { 1, group_size, 1 };
+            attr3d.set_scales(DNNL_ARG_WEIGHTS, mask3d, group_dims3d, dt::e8m0);
+#    ifdef GGML_SYCL_F16
+            attr3d.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
+#    endif
+            DnnlPrimitiveKey key3d{};
+            key3d.m               = m;
+            key3d.n               = n;
+            key3d.k               = k;
+            key3d.batches_a       = batch_size;
+            key3d.batches_b       = batch_size;
+            key3d.at              = at;
+            key3d.bt              = dt::f4_e2m1;
+            key3d.ct              = ct;
+            key3d.stra0           = stride_a;
+            key3d.stra1           = k;
+            key3d.stra2           = 1;
+            key3d.strb0           = stride_b;
+            key3d.strb1           = n;
+            key3d.strb2           = 1;
+            key3d.strc0           = stride_c;
+            key3d.strc1           = n;
+            key3d.ldc             = n;
+            key3d.batch_size      = batch_size;
+            key3d.variant         = 3;  // woq_gemm_batch_mxfp4, 3-D grouped-batch scales
+            key3d.woq_group_size  = group_size;
+            key3d.woq_scales_mask = mask3d;
+            key3d.woq_zp_mask     = 0;
+
+            const DnnlCachedPrimitive * cached3d = cache.get_or_create(key3d, eng, a_md, b_md_3d, c_md, attr3d);
+            if (cached3d) {
+                tri_state[dev_id].store(1, std::memory_order_release);
+                auto b_mem = dnnl::memory(b_md_3d, eng, const_cast<void *>(b_nibbles));
+                auto s_mem = dnnl::memory(s_md_3d, eng, const_cast<void *>(b_scales));
+
+                std::unordered_map<int, dnnl::memory> args;
+                args.insert({ DNNL_ARG_SRC, a_mem });
+                args.insert({ DNNL_ARG_WEIGHTS, b_mem });
+                args.insert({ DNNL_ARG_DST, c_mem });
+                args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem });
+                if (cached3d->scratchpad_md.get_size() > 0) {
+                    auto scratchpad_mem = ctx.get_scratchpad_mem(cached3d->scratchpad_md, eng, q);
+                    if (scratchpad_mem.get(true) == nullptr) {
+                        throw std::runtime_error("oneDNN scratchpad allocation failed");
+                    }
+                    args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+                }
+                return dnnl::sycl_interop::execute(cached3d->primitive, stream, args, deps);
+            }
+            tri_state[dev_id].store(-1, std::memory_order_release);
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr,
+                             "[ONEDNN][WOQ-MXFP4-BATCH] 3-D grouped-batch scales refused on device=%d; "
+                             "falling back to per-batch 2-D primitives\n",
+                             dev_id);
+            }
+        }
+
+        // Fallback: C1's exact proven 2-D primitive (mask 3, group_dims
+        // {group_size,1}), one primitive shared across the loop (pointer
+        // offsets differ per batch element, shape does not), executed once
+        // per batch element and merged into a single returned event.
+        const dnnl::memory::desc a_md_2d({ m, k }, at, { k, 1 });
+        const dnnl::memory::desc b_md_2d({ k, n }, dt::f4_e2m1, { n, 1 });
+        const dnnl::memory::desc c_md_2d({ m, n }, ct, { n, 1 });
+        const dnnl::memory::desc s_md_2d({ groups, n }, dt::e8m0, { n, 1 });
+
+        dnnl::primitive_attr attr2d;
+        attr2d.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        const int          mask2d       = (1 << 0) | (1 << 1);
+        dnnl::memory::dims group_dims2d = { group_size, 1 };
+        attr2d.set_scales(DNNL_ARG_WEIGHTS, mask2d, group_dims2d, dt::e8m0);
+#    ifdef GGML_SYCL_F16
+        attr2d.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
+#    endif
+        DnnlPrimitiveKey key2d{};
+        key2d.m               = m;
+        key2d.n               = n;
+        key2d.k               = k;
+        key2d.batches_a       = 1;
+        key2d.batches_b       = 1;
+        key2d.at              = at;
+        key2d.bt              = dt::f4_e2m1;
+        key2d.ct              = ct;
+        key2d.stra0           = 1;
+        key2d.stra1           = k;
+        key2d.stra2           = static_cast<int64_t>(m) * k;
+        key2d.strb0           = 1;
+        key2d.strb1           = n;
+        key2d.strb2           = static_cast<int64_t>(k) * n;
+        key2d.ldc             = n;
+        key2d.variant         = 4;  // woq_gemm_batch_mxfp4, per-batch 2-D fallback
+        key2d.woq_group_size  = group_size;
+        key2d.woq_scales_mask = mask2d;
+        key2d.woq_zp_mask     = 0;
+
+        const DnnlCachedPrimitive * cached2d = cache.get_or_create(key2d, eng, a_md_2d, b_md_2d, c_md_2d, attr2d);
+        if (!cached2d) {
+            throw std::runtime_error("woq_gemm_batch_mxfp4: 2-D fallback primitive creation failed");
+        }
+
+        std::vector<sycl::event> per_batch_events;
+        per_batch_events.reserve(static_cast<size_t>(batch_size));
+        for (int b = 0; b < batch_size; ++b) {
+            const char *    a_b  = static_cast<const char *>(a) + static_cast<int64_t>(b) * stride_a * elem_bytes;
+            const uint8_t * bn_b = static_cast<const uint8_t *>(b_nibbles) + (static_cast<int64_t>(b) * stride_b) / 2;
+            const uint8_t * bs_b = static_cast<const uint8_t *>(b_scales) + static_cast<int64_t>(b) * stride_scales;
+            char *          c_b  = static_cast<char *>(c) + static_cast<int64_t>(b) * stride_c * out_elem_bytes;
+
+            auto a_mem_b = dnnl::memory(a_md_2d, eng, const_cast<char *>(a_b));
+            auto b_mem_b = dnnl::memory(b_md_2d, eng, const_cast<uint8_t *>(bn_b));
+            auto s_mem_b = dnnl::memory(s_md_2d, eng, const_cast<uint8_t *>(bs_b));
+            auto c_mem_b = dnnl::memory(c_md_2d, eng, c_b);
+
+            std::unordered_map<int, dnnl::memory> args;
+            args.insert({ DNNL_ARG_SRC, a_mem_b });
+            args.insert({ DNNL_ARG_WEIGHTS, b_mem_b });
+            args.insert({ DNNL_ARG_DST, c_mem_b });
+            args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem_b });
+            if (cached2d->scratchpad_md.get_size() > 0) {
+                auto scratchpad_mem = ctx.get_scratchpad_mem(cached2d->scratchpad_md, eng, q);
+                if (scratchpad_mem.get(true) == nullptr) {
+                    throw std::runtime_error("oneDNN scratchpad allocation failed");
+                }
+                args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+            }
+            per_batch_events.push_back(dnnl::sycl_interop::execute(cached2d->primitive, stream, args, deps));
+        }
+        return q->ext_oneapi_submit_barrier(per_batch_events);
     }
 
     // Pointer array batch GEMM - C[i] = alpha * A[i] * B[i] + beta * C[i]

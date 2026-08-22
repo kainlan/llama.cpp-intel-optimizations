@@ -28,6 +28,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -260,9 +261,26 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.n_ubatch                = 512;
     inventory.n_ctx                   = inventory.n_ubatch;
     if (hparams.n_expert > 0 && hparams.n_expert_used > 0) {
-        size_t max_weight_slot = 0;
-        size_t max_k           = 0;
-        size_t max_n           = 0;
+        // llama.cpp-sr83 (C3): the batched executor repacks straight to a
+        // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
+        // dequant (GGML_SYCL_MOE_PP_WOQ default ON, mirrors the same env
+        // read in ggml-sycl.cpp's try_pp_mxfp4_soa_onednn_f16_batched) --
+        // size the plan for whichever arm will actually run, or admission
+        // refuses every real dispatch (f2bdfbffe's fail-closed contract,
+        // cited below). The two arms are NOT summed: only one of them
+        // allocates at a time, and sizing for both would erase the ~4x VRAM
+        // win that is the entire point of C3.
+        static const bool pp_moe_pp_woq_enabled_at_plan = []() {
+            const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ");
+            return env == nullptr || std::atoi(env) != 0;
+        }();
+        // MXFP4's quantization block size (QK_MXFP4 in the SYCL backend's
+        // headers) -- not re-included here to avoid pulling ggml-common.h
+        // into this TU; grouped scales are one e8m0 byte per 32-element block.
+        constexpr size_t kMxfp4BlockSize = 32;
+        size_t           max_weight_slot = 0;
+        size_t           max_k           = 0;
+        size_t           max_n           = 0;
         for (const ggml_sycl_tensor_info & tensor : tensors) {
             if (!llama_model_sycl_is_moe_expert_weight(tensor)) {
                 continue;
@@ -270,11 +288,21 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             if (tensor.ne[0] <= 0 || tensor.ne[1] <= 0) {
                 continue;
             }
-            const size_t k  = static_cast<size_t>(tensor.ne[0]);
-            const size_t n  = static_cast<size_t>(tensor.ne[1]);
-            max_k           = std::max(max_k, k);
-            max_n           = std::max(max_n, n);
-            max_weight_slot = std::max(max_weight_slot, llama_model_sycl_align_up(k * n * sizeof(ggml_fp16_t), 256));
+            const size_t k = static_cast<size_t>(tensor.ne[0]);
+            const size_t n = static_cast<size_t>(tensor.ne[1]);
+            max_k          = std::max(max_k, k);
+            max_n          = std::max(max_n, n);
+            if (pp_moe_pp_woq_enabled_at_plan) {
+                // Must match try_pp_mxfp4_soa_onednn_f16_batched's WOQ-arm
+                // slot layout byte-for-byte: nibbles (k*n/2 bytes) then e8m0
+                // scales ((k/kMxfp4BlockSize)*n bytes), each 256-aligned.
+                const size_t nibble_bytes = llama_model_sycl_align_up(n * (k / 2), 256);
+                const size_t scale_bytes  = llama_model_sycl_align_up((k / kMxfp4BlockSize) * n, 256);
+                max_weight_slot           = std::max(max_weight_slot, nibble_bytes + scale_bytes);
+            } else {
+                max_weight_slot =
+                    std::max(max_weight_slot, llama_model_sycl_align_up(k * n * sizeof(ggml_fp16_t), 256));
+            }
         }
         if (max_weight_slot > 0 && max_k > 0 && max_n > 0) {
             constexpr uint32_t pp_moe_onednn_ring_depth     = 1;
@@ -285,9 +313,9 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             // so an under-sized plan now refuses every real dispatch instead of
             // silently growing the zone; moe-scratch-admission.hpp's own docstring
             // cites the exact GPT-OSS case this fixes). Size the weight slot for
-            // the worst case: every expert resident at once. ~n_expert x
-            // per-expert fp16 bytes -- 506 MB for GPT-OSS 20B -- a VRAM tradeoff
-            // measured on hardware before the executor's default is flipped on.
+            // the worst case: every expert resident at once -- ~n_expert x
+            // per-expert WOQ bytes by default (~130 MB for GPT-OSS 20B, vs the
+            // f16 arm's ~506 MB when GGML_SYCL_MOE_PP_WOQ=0 opts out).
             const size_t       per_expert_weight_slot_bytes = max_weight_slot;
             const size_t       worst_case_active_experts    = static_cast<size_t>(hparams.n_expert);
             inventory.pp_moe_onednn_weight_slot_bytes       = per_expert_weight_slot_bytes * worst_case_active_experts;
