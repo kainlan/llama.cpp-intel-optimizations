@@ -1449,11 +1449,13 @@ void repack_mxfp4_soa_to_woq(const void *    src,
 //                             + (k_local < QK_MXFP4/2 ? k_local : k_local - QK_MXFP4/2)]
 //   nibble       = k_local < QK_MXFP4/2 ? (qs byte & 0xf) : (qs byte >> 4)
 //
-// Caps assumed by the current call site (device caps log): K=32, N=16,
-// GGML_SYCL_MXFP4_MOE_XMX_SG=32, optimal_tiles_n=1 -> tile_n_total=16. This
-// function does NOT hardcode those numbers -- blocks_per_row, nrows and
-// tile_n_total are taken as arguments derived from device caps at the call
-// site, since caps can differ across devices/builds.
+// Caps assumed by the planned call site (batched WOQ PP executor, task C3 --
+// not yet landed; the device test is the only caller today) (device caps
+// log): caps.K=32, caps.N=16, GGML_SYCL_MXFP4_MOE_XMX_SG=32,
+// optimal_tiles_n=1 -> tile_n_total=16. This function does NOT hardcode
+// those numbers -- blocks_per_row, nrows and tile_n_total are taken as
+// arguments derived from device caps at the call site, since caps can
+// differ across devices/builds.
 static void repack_mxfp4_xmx_tiled_to_woq_nibbles_kernel(const uint8_t * __restrict__ src_tiled,
                                                          uint8_t * __restrict__ dst_nibbles,
                                                          int                      N,
