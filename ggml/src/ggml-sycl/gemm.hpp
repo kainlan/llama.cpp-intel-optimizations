@@ -438,6 +438,27 @@ class DnnlGemmWrapper {
     }
 
   private:
+    // The proven WOQ-MXFP4 (f4_e2m1 nibbles + e8m0 grouped scales) 2-D
+    // scale-mask/group_dims recipe -- C1's exact spike result (llama.cpp-4m9p),
+    // and (post-sr83) the correctness-verified default arm of
+    // woq_gemm_batch_mxfp4's fallback below. Factored out so there is ONE
+    // place that builds this attr set: both the real 2-D GEMM path and the
+    // E1 capability probe (woq_mxfp4_supported) call it, instead of carrying
+    // two copies that could silently drift apart. Behavior-preserving
+    // extraction only -- same mask, same group_dims shape, same fpmath call.
+    static constexpr int woq_mxfp4_2d_scale_mask = (1 << 0) | (1 << 1);
+
+    static dnnl::primitive_attr woq_mxfp4_2d_attr(int64_t group_size) {
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        dnnl::memory::dims group_dims = { group_size, 1 };
+        attr.set_scales(DNNL_ARG_WEIGHTS, woq_mxfp4_2d_scale_mask, group_dims, dt::e8m0);
+#    ifdef GGML_SYCL_F16
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
+#    endif
+        return attr;
+    }
+
     static bool woq_gemm_q4_0_impl(ggml_backend_sycl_context & ctx,
                                    int                         m,
                                    int                         n,
@@ -791,6 +812,71 @@ class DnnlGemmWrapper {
         return dnnl::sycl_interop::execute(cached->primitive, stream, args, deps);
     }
 
+    // Per-device capability probe for the WOQ-MXFP4 (f4_e2m1 nibbles + e8m0
+    // grouped scales) GEMM path -- same philosophy as tiled_kernel_validated:
+    // the ATTEMPT to build C1's exact proven 2-D primitive_desc recipe
+    // (woq_mxfp4_2d_attr, above) IS the capability query. Any dnnl::error
+    // thrown during primitive_desc construction means "not supported on this
+    // device's oneDNN build" and is caught here, never propagated.
+    //
+    // Uses fixed tiny probe dims, independent of any real GEMM shape --
+    // primitive_desc creation either accepts the (f4_e2m1, e8m0) dtype/attr
+    // combination for this engine or it doesn't; that answer does not depend
+    // on m/n/k. group_size is chosen to equal probe_k so the tiny shape
+    // always satisfies the real path's `k % group_size == 0` requirement.
+    //
+    // Result is cached per device, keyed the same way exec_mutex(q) keys its
+    // per-GPU mutexes (device id from the queue, clamped into
+    // GGML_SYCL_MAX_DEVICES) and using the same tri-state atomic idiom
+    // woq_gemm_batch_mxfp4 uses for its own per-device arm cache above:
+    // 0 = not yet probed, 1 = supported, -1 = unsupported. Once set, later
+    // calls return the cached answer without touching oneDNN again -- zero
+    // cost after the first call per device.
+    static bool woq_mxfp4_supported(ggml_backend_sycl_context & ctx, const queue_ptr & q) {
+        static std::array<std::atomic<int>, GGML_SYCL_MAX_DEVICES> supported_cache;
+        const int                                                  dev_id =
+            std::min(ggml_sycl_get_device_id_from_queue(*q), static_cast<int>(supported_cache.size()) - 1);
+
+        int cached = supported_cache[dev_id].load(std::memory_order_acquire);
+        if (cached != 0) {
+            return cached > 0;
+        }
+
+        std::lock_guard<std::mutex> lock(exec_mutex(q));
+        // Re-check under the lock: another thread may have already probed
+        // this device while we were waiting.
+        cached = supported_cache[dev_id].load(std::memory_order_acquire);
+        if (cached != 0) {
+            return cached > 0;
+        }
+
+        auto eng = ctx.engine_dnnl(q);
+
+        constexpr int64_t probe_m          = 8;
+        constexpr int64_t probe_k          = 64;
+        constexpr int64_t probe_n          = 128;
+        constexpr int64_t probe_group_size = probe_k;
+
+        const dnnl::memory::desc   a_md({ probe_m, probe_k }, dt::f16, { probe_k, 1 });
+        const dnnl::memory::desc   b_md({ probe_k, probe_n }, dt::f4_e2m1, { probe_n, 1 });
+        const dnnl::memory::desc   c_md({ probe_m, probe_n }, dt::f32, { probe_n, 1 });
+        const dnnl::primitive_attr attr = woq_mxfp4_2d_attr(probe_group_size);
+
+        bool supported = false;
+        try {
+            dnnl::matmul::primitive_desc probe_pd(eng, a_md, b_md, c_md, attr);
+            (void) probe_pd;
+            supported = true;
+        } catch (const dnnl::error & e) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4] capability probe refused: %s\n", e.what());
+            }
+        }
+
+        supported_cache[dev_id].store(supported ? 1 : -1, std::memory_order_release);
+        return supported;
+    }
+
     // Batched WoQ GEMM for MXFP4 weights (f4_e2m1 nibbles + e8m0 grouped
     // scales) -- the batched-PP counterpart of woq_gemm_q4_0_impl, extended
     // with a batch dimension the same way gemm_batch_strided extends gemm().
@@ -981,15 +1067,8 @@ class DnnlGemmWrapper {
         const dnnl::memory::desc c_md_2d({ m, n }, ct, { n, 1 });
         const dnnl::memory::desc s_md_2d({ groups, n }, dt::e8m0, { n, 1 });
 
-        dnnl::primitive_attr attr2d;
-        attr2d.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-        const int          mask2d       = (1 << 0) | (1 << 1);
-        dnnl::memory::dims group_dims2d = { group_size, 1 };
-        attr2d.set_scales(DNNL_ARG_WEIGHTS, mask2d, group_dims2d, dt::e8m0);
-#    ifdef GGML_SYCL_F16
-        attr2d.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
-#    endif
-        DnnlPrimitiveKey key2d{};
+        const dnnl::primitive_attr attr2d = woq_mxfp4_2d_attr(group_size);
+        DnnlPrimitiveKey           key2d{};
         key2d.m               = m;
         key2d.n               = n;
         key2d.k               = k;
@@ -1013,7 +1092,7 @@ class DnnlGemmWrapper {
         key2d.ldc             = n;
         key2d.variant         = 4;  // woq_gemm_batch_mxfp4, per-batch 2-D fallback
         key2d.woq_group_size  = group_size;
-        key2d.woq_scales_mask = mask2d;
+        key2d.woq_scales_mask = woq_mxfp4_2d_scale_mask;
         key2d.woq_zp_mask     = 0;
 
         const DnnlCachedPrimitive * cached2d = cache.get_or_create(key2d, eng, a_md_2d, b_md_2d, c_md_2d, attr2d);
