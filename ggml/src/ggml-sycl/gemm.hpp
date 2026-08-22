@@ -247,6 +247,21 @@ class DnnlGemmWrapper {
         }
     }
 
+    // Byte width of the dense (non-sub-byte) dtypes woq_gemm_batch_mxfp4's
+    // activation/output pointer arithmetic needs; 0 for anything else
+    // (callers treat that as "unsupported" and refuse). llama.cpp-sr83
+    // (quality review finding #9): was two identical local lambdas.
+    static constexpr int64_t dt_size_bytes(dt t) {
+        switch (t) {
+            case dt::f32:
+                return 4;
+            case dt::f16:
+                return 2;
+            default:
+                return 0;
+        }
+    }
+
     static void gemm(ggml_backend_sycl_context & ctx,
                      int                         m,
                      int                         n,
@@ -832,26 +847,8 @@ class DnnlGemmWrapper {
         if (m <= 0 || n <= 0 || k <= 0 || batch_size <= 0 || group_size <= 0 || (k % group_size) != 0) {
             throw std::runtime_error("woq_gemm_batch_mxfp4: invalid dims/group_size");
         }
-        const int64_t elem_bytes = [](dt t) -> int64_t {
-            switch (t) {
-                case dt::f32:
-                    return 4;
-                case dt::f16:
-                    return 2;
-                default:
-                    return 0;
-            }
-        }(at);
-        const int64_t out_elem_bytes = [](dt t) -> int64_t {
-            switch (t) {
-                case dt::f32:
-                    return 4;
-                case dt::f16:
-                    return 2;
-                default:
-                    return 0;
-            }
-        }(ct);
+        const int64_t elem_bytes     = dt_size_bytes(at);
+        const int64_t out_elem_bytes = dt_size_bytes(ct);
         if (elem_bytes == 0 || out_elem_bytes == 0 || (stride_b % 2) != 0) {
             throw std::runtime_error("woq_gemm_batch_mxfp4: unsupported activation/output dtype or odd nibble stride");
         }
@@ -1001,12 +998,18 @@ class DnnlGemmWrapper {
         key2d.at              = at;
         key2d.bt              = dt::f4_e2m1;
         key2d.ct              = ct;
+        // llama.cpp-sr83 (quality review finding #10): this primitive has no
+        // batch dimension at all (batches_a/batches_b are 1; a_md_2d/b_md_2d
+        // are plain 2-D descriptors), so there is no batch stride to record
+        // here -- stra2/strb2/stride_a/stride_b/stride_c stay at their
+        // zero-initialized default rather than holding a synthetic "total
+        // size" value. m/n/k already differentiate distinct shapes in this
+        // key; a non-stride number in a field named for a stride was noise,
+        // not a correctness requirement.
         key2d.stra0           = 1;
         key2d.stra1           = k;
-        key2d.stra2           = static_cast<int64_t>(m) * k;
         key2d.strb0           = 1;
         key2d.strb1           = n;
-        key2d.strb2           = static_cast<int64_t>(k) * n;
         key2d.ldc             = n;
         key2d.variant         = 4;  // woq_gemm_batch_mxfp4, per-batch 2-D fallback
         key2d.woq_group_size  = group_size;
@@ -1021,6 +1024,22 @@ class DnnlGemmWrapper {
             std::fprintf(stderr, "[ONEDNN][WOQ-MXFP4-BATCH] device=%d arm=2D-loop\n", dev_id);
         }
 
+        // llama.cpp-sr83 (quality review finding #1): every iteration binds
+        // DNNL_ARG_SCRATCHPAD to the SAME shared scratchpad buffer
+        // (ctx.get_scratchpad_mem returns cached2d's one pooled allocation,
+        // not a fresh one per call), so iteration b+1 reusing it before
+        // iteration b's execute() has completed is a real hazard, not a
+        // hypothetical one. Ordering = event edges, never submission order
+        // (owner ruling, no-host-waits-event-chain-everything) -- an
+        // in-order SYCL queue orders queue *submissions*, not oneDNN's
+        // internal scratchpad access, so relying on submission order alone
+        // is exactly the missing-edge pattern that ruling warns about. Chain
+        // explicitly: iteration 0 waits on the caller's `deps`, iteration
+        // b>0 waits on iteration b-1's own completion event. Free on an
+        // in-order queue (the chain only makes explicit an order the queue
+        // already provides for submission, while adding the correctness
+        // guarantee for oneDNN's internal scratchpad reuse that submission
+        // order alone does not).
         std::vector<sycl::event> per_batch_events;
         per_batch_events.reserve(static_cast<size_t>(batch_size));
         for (int b = 0; b < batch_size; ++b) {
@@ -1046,7 +1065,9 @@ class DnnlGemmWrapper {
                 }
                 args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
-            per_batch_events.push_back(dnnl::sycl_interop::execute(cached2d->primitive, stream, args, deps));
+            const std::vector<sycl::event> iter_deps =
+                (b == 0) ? deps : std::vector<sycl::event>{ per_batch_events.back() };
+            per_batch_events.push_back(dnnl::sycl_interop::execute(cached2d->primitive, stream, args, iter_deps));
         }
         return q->ext_oneapi_submit_barrier(per_batch_events);
     }

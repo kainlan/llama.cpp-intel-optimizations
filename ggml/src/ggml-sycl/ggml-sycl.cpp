@@ -64553,11 +64553,20 @@ static void dispatch_experts_secondary_gpu_impl(const std::vector<expert_dispatc
 // gated the tiled-dequant refusal (defect 1 fix), so the claims predicate
 // kept claiming XMX_TILED gate/up even when WOQ=0 had no tiled dequant to
 // serve it. The executor's fail-closed contract then turned that into a
-// thrown ggml_sycl_fallback_error on every gate/up dispatch -- caught at
-// the graph-compute boundary (ggml-sycl.cpp:95587) as GGML_STATUS_FAILED,
+// thrown ggml_sycl_fallback_error on every gate/up dispatch -- caught in
+// ggml_backend_sycl_graph_compute (quality review finding #5: an earlier
+// version of this comment cited a line number that later edits made
+// stale; the function name does not drift the same way) as GGML_STATUS_FAILED,
 // not a silent corruption but not a working opt-out either. Gating the
 // CLAIM itself is the real fix: with WOQ=0, gate/up simply are not steered
 // here, so they keep running through whatever route handled them before C3.
+// llama.cpp-sr83 (quality review finding #8): every call site of this
+// helper -- the claims predicate's XMX_TILED branch below, the candidate
+// gate inside try_pp_mxfp4_soa_onednn_f16_batched, and the lambda's own
+// pp_woq_enabled -- is already reachable only under GGML_SYCL_DNNL, so the
+// definition itself is scoped the same way for consistency (this is the
+// direction the finding B fix already took for the predicate's tail).
+#if GGML_SYCL_DNNL
 static bool ggml_sycl_moe_pp_woq_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ");
@@ -64565,6 +64574,7 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
     }();
     return enabled;
 }
+#endif
 
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
     if (!weight || weight->type != GGML_TYPE_MXFP4 || !ggml_sycl_moe_pp_onednn_batched_route_selected()) {
@@ -70807,10 +70817,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // upstream: the claims predicate and the candidate gate above
             // both now decline a tiled op when ggml_sycl_moe_pp_woq_enabled()
             // is false, so this combination should never reach here in
-            // normal dispatch. This check is defense in depth for any other
-            // caller of this lambda; the fail-closed tiled_claimed_op
-            // contract turns a hit into a throw rather than a silent
-            // fall-through, exactly as intended.
+            // normal dispatch -- this check is unreachable belt-and-braces
+            // for any other caller of this lambda.
+            //
+            // llama.cpp-sr83 (quality review finding #2, corrected 2026-08-22):
+            // an earlier version of this comment claimed the fail-closed
+            // tiled_claimed_op contract turns a hit here into a throw. That
+            // is false in exactly the configuration this check exists for:
+            // tiled_claimed_op is computed from the SAME
+            // ggml_sycl_moe_pp_onednn_batched_claims_tensor() call the
+            // claims predicate uses, which is now ALSO gated on
+            // ggml_sycl_moe_pp_woq_enabled() -- so whenever this branch's
+            // condition (experts_are_tiled && !pp_woq_enabled) is true,
+            // tiled_claimed_op is false too, and reject_batched() returns
+            // false silently rather than throwing. That is fine here
+            // specifically: the op was never truly claimed either, so a
+            // quiet fall-through to whatever route handled it before C3 is
+            // exactly right (the same shape WOQ=0 already produces via the
+            // predicate). Do not read this as evidence the throw path
+            // fires from this branch -- it does not.
             if (experts_are_tiled && !pp_woq_enabled) {
                 return reject_batched("f16-arm-no-tiled-dequant");
             }
@@ -71113,6 +71138,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     std::vector<float>               act(rows * static_cast<size_t>(ne10));
                     std::vector<sycl::half>          act_half(rows * static_cast<size_t>(ne10));
                     std::vector<float>               cpu(rows * static_cast<size_t>(ne0));
+                    // llama.cpp-sr83 (quality review finding #7): a copy
+                    // failure here used to fall through into the compare
+                    // loop below anyway, computing a diff against `gpu`'s
+                    // untouched zero-initialization (std::vector value-init)
+                    // rather than real device data -- printing a compare
+                    // line that means nothing, in the same failure family
+                    // the defect-2 NaN-blind fix closed (a broken read
+                    // masquerading as a real result). Gate the entire rest
+                    // of this compare_idx's work on the readback actually
+                    // having succeeded.
+                    bool                             readback_ok = true;
                     try {
                         ctx.stream()->wait_and_throw();
                         ggml_sycl_safe_memcpy_sync(*ctx.stream(), gpu.data(), batched_out, gpu.size() * sizeof(float));
@@ -71122,17 +71158,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             act[i] = static_cast<float>(act_half[i]);
                         }
                     } catch (const std::exception & e) {
+                        readback_ok = false;
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s expert=%d rows=%zu failed=copy "
                                 "err=%s\n",
                                 src0 && src0->name ? src0->name : "?", expert.expert_id, rows, e.what());
                     }
                     const void * weight_base =
-                        src0 && src0->name ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
-                    if (!weight_base) {
+                        (readback_ok && src0 && src0->name) ? ggml_sycl_cpu_dispatch_get_host_ptr(src0->name) : nullptr;
+                    if (readback_ok && !weight_base) {
                         weight_base = ggml_sycl_host_data(src0);
                     }
-                    if (weight_base && rows > 0) {
+                    if (readback_ok && weight_base && rows > 0) {
                         const char * expert_weight =
                             static_cast<const char *>(weight_base) +
                             static_cast<size_t>(expert.expert_id) * static_cast<size_t>(src0->nb[2]);
@@ -71147,12 +71184,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             task.N           = static_cast<int>(ne0);
                             ggml_sycl_cpu_expert_mul_mat(task);
                         }
-                        double max_abs     = 0.0;
-                        double max_rel     = 0.0;
-                        double max_cpu_abs = 0.0;
-                        size_t max_row     = 0;
-                        size_t max_col     = 0;
-                        size_t nan_count   = 0;
+                        double max_abs        = 0.0;
+                        double rel_at_max_abs = 0.0;
+                        double max_cpu_abs    = 0.0;
+                        size_t max_row        = 0;
+                        size_t max_col        = 0;
+                        size_t nan_count      = 0;
                         for (size_t r = 0; r < rows; ++r) {
                             for (size_t c = 0; c < static_cast<size_t>(ne0); ++c) {
                                 const size_t idx = r * static_cast<size_t>(ne0) + c;
@@ -71162,8 +71199,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // below (NaN comparisons are always false), so
                                 // a NaN mismatch used to silently vanish from
                                 // max-tracking and print as a perfect pass
-                                // (max_abs=0/max_rel=0). Count NaNs explicitly
-                                // instead of letting them hide.
+                                // (max_abs=0/rel_at_max_abs=0). Count NaNs
+                                // explicitly instead of letting them hide.
                                 if (std::isnan(static_cast<double>(gpu[idx])) || std::isnan(cpu[idx])) {
                                     ++nan_count;
                                     continue;
@@ -71171,10 +71208,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 max_cpu_abs       = std::max(max_cpu_abs, std::fabs(static_cast<double>(cpu[idx])));
                                 const double diff = std::fabs(static_cast<double>(gpu[idx]) - cpu[idx]);
                                 if (diff > max_abs) {
-                                    max_abs = diff;
-                                    max_rel = diff / std::max(1.0, std::fabs(static_cast<double>(cpu[idx])));
-                                    max_row = r;
-                                    max_col = c;
+                                    max_abs        = diff;
+                                    // llama.cpp-sr83 (quality review finding #6):
+                                    // this metric FLOORS its denominator at
+                                    // 1.0 -- for any |cpu[idx]| < 1 it is NOT
+                                    // a true relative ratio, it reports the
+                                    // absolute error nearly verbatim (diff /
+                                    // 1.0). The earlier comment below
+                                    // mischaracterized this as "a tiny
+                                    // denominator inflating the ratio"; the
+                                    // actual mechanism is the opposite -- the
+                                    // floor keeps the denominator from
+                                    // SHRINKING, so a legitimately small
+                                    // absolute error at a small |cpu[idx]|
+                                    // can still read as numerically "large"
+                                    // by this metric even though nothing was
+                                    // divided by something tiny. Renamed from
+                                    // max_rel to rel_at_max_abs to stop
+                                    // implying "the maximum relative error
+                                    // over the tensor" -- it is specifically
+                                    // this metric evaluated AT the
+                                    // max_abs-defining element, not a
+                                    // separately-tracked maximum of its own.
+                                    rel_at_max_abs = diff / std::max(1.0, std::fabs(static_cast<double>(cpu[idx])));
+                                    max_row        = r;
+                                    max_col        = c;
                                 }
                             }
                         }
@@ -71182,40 +71240,40 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // status field -- team-lead evidence 2026-08-22): a
                         // naive single per-element-relative-error threshold
                         // false-FAILs the legacy f16 arm's legitimate
-                        // near-cancellation outliers (a tiny |cpu[idx]|
-                        // denominator inflates max_rel even though the
-                        // absolute error is negligible against the tensor's
-                        // real scale -- measured: abs err 1.21 at |cpu|=0.589
-                        // amid a tensor of ~50-500-magnitude values). Dual
-                        // criterion instead: FAIL only when the error is
-                        // large by BOTH measures -- the naive per-element
-                        // max_rel AND max_abs normalized against this
-                        // tensor's own max magnitude (max_cpu_abs). Either
-                        // measure alone passing is enough to PASS, so a
-                        // near-cancellation element (small max_cpu_abs-
-                        // relative error, large max_rel) still passes, while
-                        // a genuine failure -- large by both measures, as
-                        // the unproven 3-D WOQ path's wrong numerics were
-                        // (max_rel 0.989, error ~99% of the tensor's own
-                        // scale) -- still fails. Thresholds are a first
+                        // near-cancellation outliers (measured: abs err 1.21
+                        // at |cpu|=0.589 amid a tensor of ~50-500-magnitude
+                        // values -- rel_at_max_abs floors its denominator at
+                        // 1.0, so this reports as ~1.21, not a genuine 205%
+                        // relative error). Dual criterion instead: FAIL only
+                        // when the error is large by BOTH measures -- the
+                        // floored per-element rel_at_max_abs AND max_abs
+                        // normalized against this tensor's own max magnitude
+                        // (max_cpu_abs). Either measure alone passing is
+                        // enough to PASS, so a near-cancellation element
+                        // (small max_cpu_abs-relative error, large
+                        // rel_at_max_abs) still passes, while a genuine
+                        // failure -- large by both measures, as the
+                        // unproven 3-D WOQ path's wrong numerics were
+                        // (rel_at_max_abs 0.989, error ~99% of the tensor's
+                        // own scale) -- still fails. Thresholds are a first
                         // calibration against the 2026-08-22 hardware
-                        // evidence (WOQ 2-D proven-good ceiling: max_rel
-                        // <=0.0258; the 3-D failure's error was ~1-2 orders
-                        // of magnitude past either threshold), not a
-                        // universally tuned constant -- revisit if a
-                        // borderline case misclassifies.
+                        // evidence (WOQ 2-D proven-good ceiling:
+                        // rel_at_max_abs <=0.0258; the 3-D failure's error
+                        // was ~1-2 orders of magnitude past either
+                        // threshold), not a universally tuned constant --
+                        // revisit if a borderline case misclassifies.
                         constexpr double kCompareRelThreshold = 0.05;
                         constexpr double kCompareAbsScaleFrac = 0.05;
                         const double     rel_to_tensor_max    = max_abs / std::max(1.0, max_cpu_abs);
-                        const bool       compare_failed       = nan_count > 0 || (max_rel > kCompareRelThreshold &&
-                                                                      rel_to_tensor_max > kCompareAbsScaleFrac);
+                        const bool       compare_failed = nan_count > 0 || (rel_at_max_abs > kCompareRelThreshold &&
+                                                                       rel_to_tensor_max > kCompareAbsScaleFrac);
                         fprintf(stderr,
                                 "[MOE-PP-ONEDNN-F16-BATCHED-COMPARE] tensor=%s role=%s expert=%d rows=%zu "
-                                "active=%zu max_rows=%zu max_abs=%.8g max_rel=%.8g rel_to_max=%.8g row=%zu "
+                                "active=%zu max_rows=%zu max_abs=%.8g rel_at_max_abs=%.8g rel_to_max=%.8g row=%zu "
                                 "col=%zu gpu=%.8g cpu=%.8g max_cpu_abs=%.8g nan_count=%zu status=%s\n",
                                 src0 && src0->name ? src0->name : "?", moe_tensor_type_name(pp_role), expert.expert_id,
-                                rows, active_count, max_rows_per_expert, max_abs, max_rel, rel_to_tensor_max, max_row,
-                                max_col, static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
+                                rows, active_count, max_rows_per_expert, max_abs, rel_at_max_abs, rel_to_tensor_max,
+                                max_row, max_col, static_cast<double>(gpu[max_row * static_cast<size_t>(ne0) + max_col]),
                                 static_cast<double>(cpu[max_row * static_cast<size_t>(ne0) + max_col]), max_cpu_abs,
                                 nan_count, compare_failed ? "FAIL" : "PASS");
                     } else {

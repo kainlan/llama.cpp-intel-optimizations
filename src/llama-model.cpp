@@ -270,7 +270,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         // cited below). The two arms are NOT summed: only one of them
         // allocates at a time, and sizing for both would erase the ~4x VRAM
         // win that is the entire point of C3.
-        static const bool pp_moe_pp_woq_enabled_at_plan = []() {
+        static const bool pp_woq_enabled_at_plan = []() {
             const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ");
             return env == nullptr || std::atoi(env) != 0;
         }();
@@ -292,7 +292,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             const size_t n = static_cast<size_t>(tensor.ne[1]);
             max_k          = std::max(max_k, k);
             max_n          = std::max(max_n, n);
-            if (pp_moe_pp_woq_enabled_at_plan) {
+            if (pp_woq_enabled_at_plan) {
                 // Must match try_pp_mxfp4_soa_onednn_f16_batched's WOQ-arm
                 // slot layout byte-for-byte: nibbles (k*n/2 bytes) then e8m0
                 // scales ((k/kMxfp4BlockSize)*n bytes), each 256-aligned.

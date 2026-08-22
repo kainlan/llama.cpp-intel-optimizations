@@ -528,6 +528,26 @@ if (Python3_Interpreter_FOUND)
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-device-uuid-source.py
         LABEL "sycl;api;source;host"
         TIMEOUT 30)
+    # WOQ scratch-slot byte formula must match between its two independent
+    # sites (plan-time src/llama-model.cpp, per-dispatch ggml-sycl.cpp) --
+    # they cannot share a helper, so this is the only thing keeping them
+    # from drifting apart. llama.cpp-sr83, quality review coverage gap (a).
+    #
+    # llama_test_cmd rather than llama_test_pytest: this is a plain script
+    # with top-level checks, not pytest test_ functions (see
+    # llama_test_pytest's own doc comment above; matches the sibling
+    # test-sycl-pp-moe-scratch-source.py's own registration pattern in
+    # ggml/src/ggml-sycl/CMakeLists.txt). Host-only -- reads two source
+    # files as text, builds nothing, touches no device.
+    llama_test_cmd(
+        ${Python3_EXECUTABLE}
+        NAME test-sycl-woq-slot-formula-source
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-woq-slot-formula-source.py
+    )
+    set_tests_properties(test-sycl-woq-slot-formula-source PROPERTIES
+        LABELS "sycl;moe;woq;source;hostonly"
+        TIMEOUT 30)
 endif()
 
 if (GGML_SYCL)
