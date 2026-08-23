@@ -65405,7 +65405,26 @@ static void mxfp4_pp_batched_profile_record_graph_total(double graph_us) {
         p.graph_total_us  = graph_us;
         p.graph_total_set = true;
     }
-    if (p.dispatch_evals > 0) {
+    // llama.cpp-iikr (print-path fix, deferred-readout restructure): this
+    // gate used to read p.dispatch_evals > 0 -- correct back when
+    // ggml_sycl_mul_mat_id incremented dispatch_evals synchronously, in the
+    // SAME per-dispatch block that used to wait+resolve. The deferred-
+    // readout restructure moved that increment into print_and_reset's own
+    // per-record loop (line ~65090) so it happens ONLY when print_and_reset
+    // runs -- but this unchanged gate was the thing deciding WHETHER to
+    // call print_and_reset, creating a circular dependency: dispatch_evals
+    // is always still 0 here (nothing else sets it), so every eval with
+    // real MoE dispatch activity took the else branch, silently wiping
+    // dispatch_records (and everything else) without ever printing.
+    // Confirmed on hardware (team-lead, B70, GGML_SYCL_MXFP4_PP_PROFILE=1):
+    // pp512 measured fine, zero profile output. Fixed by gating on
+    // dispatch_records instead -- it is populated synchronously in
+    // ggml_sycl_mul_mat_id (unaffected by the restructure, still pushed
+    // during graph execution, well before this function's own
+    // end_ev.wait()-gated call site) and its emptiness is exactly the
+    // "did any real MoE dispatch happen this eval" question this gate
+    // exists to answer.
+    if (!p.dispatch_records.empty()) {
         mxfp4_pp_batched_profile_print_and_reset();
     } else {
         p = mxfp4_pp_batched_profile_accum{};
