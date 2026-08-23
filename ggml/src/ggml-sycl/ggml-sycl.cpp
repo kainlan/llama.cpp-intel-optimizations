@@ -64655,6 +64655,91 @@ static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::even
 struct mxfp4_pp_profile_repack_begin_marker;
 struct mxfp4_pp_profile_repack_end_marker;
 
+// llama.cpp-iikr ("attribute other" phase): whole-node begin/end marker tags
+// for component 6 below, forward-declared once at namespace scope for the
+// same reason as the repack pair above -- ggml_sycl_compute_forward's
+// mxfp4_pp_node_bracket constructor/destructor each reference exactly one of
+// these by plain name, so the SYCL kernel-name type is declared exactly once
+// in source even though the constructor/destructor run once per graph node
+// at runtime.
+struct mxfp4_pp_profile_node_begin_marker;
+struct mxfp4_pp_profile_node_end_marker;
+
+// Component 6 ("attribute other"): classifies every graph node NOT already
+// covered by components 1-5 (the batched PP MoE executor's own repack/gemm/
+// stage brackets) so the top-level "other" residual in the print line below
+// shrinks to genuine inter-bracket gaps (host dispatch overhead, submission
+// latency) instead of swallowing whole unattributed op classes. Buckets per
+// owner spec (task comment on llama.cpp-iikr): attention/SDPA, norms, rope,
+// KV/cache ops, MoE routing (softmax/top-k/get_rows), and a residual
+// "misc" bucket for every remaining classified-but-unnamed op (ADD, CPY,
+// CONT, SCALE, GLU, ...) plus GGML_OP_MUL_MAT (dense, non-MoE matmul:
+// attention QKV/O projections, dense FFN). GGML_OP_MUL_MAT_ID is
+// deliberately NOT one of these classes -- see mxfp4_pp_node_bracket's
+// constructor, which excludes it entirely so its device time is never
+// double-counted against tiled_repack/soa_repack/woq_gemm/f16_gemm/stage.
+//
+// There is no distinct "quantize" bucket: GGML_OP list (ggml.h) has no
+// top-level quantize op -- Q8_1 activation quantization happens inside the
+// MUL_MAT/MUL_MAT_ID kernel bodies themselves, not as a separate graph node,
+// so it cannot be isolated at this per-node dispatch granularity. It lands
+// wherever its enclosing op lands (dense_matmul for MUL_MAT; already fully
+// covered by components 1-5 for MUL_MAT_ID).
+enum class mxfp4_pp_node_class : int {
+    ATTENTION = 0,  // GGML_OP_FLASH_ATTN_EXT (oneDNN SDPA -- fattn-onednn.cpp)
+    NORM,           // GGML_OP_NORM/RMS_NORM/RMS_NORM_BACK/GROUP_NORM/L2_NORM
+    ROPE,           // GGML_OP_ROPE/ROPE_BACK
+    KV_CACHE,       // GGML_OP_SET_ROWS/SET_ROWS_PAGED, or dst->name matching
+                    // the KV substring set below regardless of op type
+    ROUTING,        // GGML_OP_SOFT_MAX/SOFT_MAX_BACK/ARGSORT/TOP_K/GET_ROWS
+    DENSE_MATMUL,   // GGML_OP_MUL_MAT (non-MoE)
+    MISC,           // every other classified node (ADD, CPY, CONT, ...)
+    COUNT
+};
+
+static constexpr int mxfp4_pp_node_class_count = static_cast<int>(mxfp4_pp_node_class::COUNT);
+
+static mxfp4_pp_node_class mxfp4_pp_classify_node(const ggml_tensor * dst) {
+    // Local re-implementation of e2e-profile.cpp's tensor_name_is_kv idiom.
+    // Not shared across files on purpose: that helper lives in an anonymous
+    // namespace private to the (unrelated, TG/decode-focused) E2E_TG_PROFILE
+    // diagnostic; this component is self-contained in this file like
+    // components 1-5 above.
+    const char * name     = dst->name;
+    auto         contains = [&](const char * needle) {
+        return name && std::strstr(name, needle) != nullptr;
+    };
+    if (contains("cache_k") || contains("cache_v") || contains("kv") || contains("KQ_mask")) {
+        return mxfp4_pp_node_class::KV_CACHE;
+    }
+    switch (dst->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+            return mxfp4_pp_node_class::ATTENTION;
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_RMS_NORM_BACK:
+        case GGML_OP_GROUP_NORM:
+        case GGML_OP_L2_NORM:
+            return mxfp4_pp_node_class::NORM;
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+            return mxfp4_pp_node_class::ROPE;
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_SET_ROWS_PAGED:
+            return mxfp4_pp_node_class::KV_CACHE;
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_SOFT_MAX_BACK:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
+        case GGML_OP_GET_ROWS:
+            return mxfp4_pp_node_class::ROUTING;
+        case GGML_OP_MUL_MAT:
+            return mxfp4_pp_node_class::DENSE_MATMUL;
+        default:
+            return mxfp4_pp_node_class::MISC;
+    }
+}
+
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
 // (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
@@ -64707,32 +64792,140 @@ struct mxfp4_pp_batched_profile_accum {
     // -1.0 -- this is the "distrust this line" counter; nonzero means some
     // of the ms figures above are undercounts, not that the op failed.
     int64_t                                  read_failures  = 0;
+    // Component 6 (llama.cpp-iikr "attribute other" phase): raw (begin,end)
+    // marker-event pairs pushed by ggml_sycl_compute_forward's
+    // mxfp4_pp_node_bracket as each non-MUL_MAT_ID graph node dispatches,
+    // one pair per node, indexed by mxfp4_pp_node_class. Resolved into
+    // node_us/node_calls in mxfp4_pp_batched_profile_print_and_reset --
+    // same deferred-resolution pattern as pp_profile_repack_begin/end
+    // above: no per-op host wait, everything is read back once after this
+    // eval's graph_total end-marker has already been waited on.
+    std::vector<sycl::event>                 node_begin[mxfp4_pp_node_class_count];
+    std::vector<sycl::event>                 node_end[mxfp4_pp_node_class_count];
+    double                                   node_us[mxfp4_pp_node_class_count]    = {};
+    int64_t                                  node_calls[mxfp4_pp_node_class_count] = {};
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
 
+// Component 6's whole-node device bracket. Constructed once per
+// ggml_sycl_compute_forward() call, at a point AFTER CPU dispatch has been
+// ruled out (a CPU-dispatched op never touches ctx.stream(), so bracketing
+// it would only measure marker-submission latency, not real device time)
+// and BEFORE the four "early handled GPU route" checks (simple-consumer /
+// flash-attn / mul-mat-weight-owner / mul-mat-activation) and the main
+// switch -- so its destructor, firing on EVERY exit path from that point
+// forward (each early `return true`, the switch's own `return true`, and
+// the function-try-block's own exception unwind), covers the op's entire
+// device-visible dispatch regardless of which internal route handles it.
+// This is why GGML_OP_FLASH_ATTN_EXT classifies correctly as ATTENTION even
+// though its usual path is the early route and never reaches the switch's
+// own (fallback) FLASH_ATTN_EXT case.
+struct mxfp4_pp_node_bracket {
+    bool                active = false;
+    mxfp4_pp_node_class cls    = mxfp4_pp_node_class::MISC;
+    sycl::queue *       q      = nullptr;
+    sycl::event         begin_ev;
+
+    mxfp4_pp_node_bracket(sycl::queue * queue, const ggml_tensor * dst) {
+        if (!queue || !dst || dst->op == GGML_OP_MUL_MAT_ID || !mxfp4_pp_batched_profile_enabled()) {
+            return;
+        }
+        try {
+            cls      = mxfp4_pp_classify_node(dst);
+            q        = queue;
+            begin_ev = ggml_sycl_submit_marker<mxfp4_pp_profile_node_begin_marker>(*q);
+            active   = true;
+        } catch (...) {
+            // Marker submission failed (e.g. queue already faulted) -- leave
+            // `active` false so the destructor is a no-op, same fail-quiet
+            // posture as mxfp4_pp_event_duration_us above.
+            active = false;
+        }
+    }
+
+    mxfp4_pp_node_bracket(const mxfp4_pp_node_bracket &)             = delete;
+    mxfp4_pp_node_bracket & operator=(const mxfp4_pp_node_bracket &) = delete;
+
+    ~mxfp4_pp_node_bracket() {
+        if (!active) {
+            return;
+        }
+        try {
+            sycl::event  end_ev = ggml_sycl_submit_marker<mxfp4_pp_profile_node_end_marker>(*q);
+            auto &       p      = g_mxfp4_pp_batched_profile;
+            const size_t idx    = static_cast<size_t>(cls);
+            p.node_begin[idx].push_back(begin_ev);
+            p.node_end[idx].push_back(end_ev);
+        } catch (...) {
+            // Never let a destructor throw -- especially not while the
+            // function-try-block above is already unwinding an exception,
+            // where a second escaping exception calls std::terminate.
+        }
+    }
+};
+
 static void mxfp4_pp_batched_profile_print_and_reset() {
-    auto &       p            = g_mxfp4_pp_batched_profile;
-    const double accounted_us = p.tiled_repack_us + p.soa_repack_us + p.woq_gemm_us + p.f16_gemm_us + p.stage_us;
-    // "other" = graph_total minus components 1-4 (which for the WOQ arm
-    // already IS this eval's oneDNN GEMM exec total -- woq_gemm_us/f16_gemm_us
-    // above). oneDNN work elsewhere in the graph that this instrument does not
-    // track (e.g. attention SDPA -- see fattn-onednn.cpp, out of this
-    // instrument's file scope) is NOT separately isolated; it lands inside
-    // "other" alongside genuine host/dispatch-gap time. Printed unclamped and
-    // signed on purpose: a negative value is itself a signal (double-counted
-    // or overlapping device time), not something to hide by flooring at 0.
+    auto & p = g_mxfp4_pp_batched_profile;
+    // Resolve component 6's raw event pairs first so accounted_us below can
+    // include them -- same deferred-resolution posture as every other
+    // component: no host wait here, the eval's graph_total end-marker
+    // (mxfp4_pp_batched_profile_record_graph_total's caller) already waited
+    // on this stream before calling into this function.
+    for (int c = 0; c < mxfp4_pp_node_class_count; ++c) {
+        const size_t n = std::min(p.node_begin[c].size(), p.node_end[c].size());
+        for (size_t i = 0; i < n; ++i) {
+            const double us = mxfp4_pp_event_span_us(p.node_begin[c][i], p.node_end[c][i]);
+            if (us < 0.0) {
+                ++p.read_failures;
+                continue;
+            }
+            p.node_us[c] += us;
+            ++p.node_calls[c];
+        }
+    }
+    double node_total_us = 0.0;
+    for (int c = 0; c < mxfp4_pp_node_class_count; ++c) {
+        node_total_us += p.node_us[c];
+    }
+    const double accounted_us =
+        p.tiled_repack_us + p.soa_repack_us + p.woq_gemm_us + p.f16_gemm_us + p.stage_us + node_total_us;
+    // "other" = graph_total minus components 1-6 (llama.cpp-iikr: component 6
+    // above now brackets every remaining graph node individually -- attention
+    // SDPA, norms, rope, KV/cache writes, MoE routing softmax/top-k/get_rows,
+    // dense (non-MoE) matmul, and a "misc" catch-all -- so "other" should now
+    // read as genuine inter-bracket gaps (host dispatch overhead, submission
+    // latency between consecutive marker/kernel submissions) rather than a
+    // whole unattributed op class. Printed unclamped and signed on purpose: a
+    // negative value is itself a signal (double-counted or overlapping
+    // device time), not something to hide by flooring at 0.
     const double other_us     = p.graph_total_us - accounted_us;
     GGML_LOG_WARN(
         "[MXFP4-PP-BATCHED-PROFILE] device=%d dispatches=%lld graph_total=%.3f ms accounted=%.3f ms other=%.3f ms "
         "tiled_repack=%.3f ms/%lld soa_repack=%.3f ms/%lld "
         "woq_gemm=%.3f ms/%lld(2d=%lld,3d_requested=%lld) f16_gemm=%.3f ms/%lld "
-        "stage=%.3f ms/%lld graph_total_measured=%d read_failures=%lld\n",
+        "stage=%.3f ms/%lld attention=%.3f ms/%lld norm=%.3f ms/%lld rope=%.3f ms/%lld kv=%.3f ms/%lld "
+        "routing=%.3f ms/%lld dense_matmul=%.3f ms/%lld misc=%.3f ms/%lld "
+        "graph_total_measured=%d read_failures=%lld\n",
         p.device, (long long) p.dispatch_evals, p.graph_total_us / 1000.0, accounted_us / 1000.0, other_us / 1000.0,
         p.tiled_repack_us / 1000.0, (long long) p.tiled_repack_calls, p.soa_repack_us / 1000.0,
         (long long) p.soa_repack_calls, p.woq_gemm_us / 1000.0, (long long) p.woq_gemm_calls,
         (long long) p.woq_gemm_2d_calls, (long long) p.woq_gemm_3d_calls, p.f16_gemm_us / 1000.0,
-        (long long) p.f16_gemm_calls, p.stage_us / 1000.0, (long long) p.stage_calls, p.graph_total_set ? 1 : 0,
+        (long long) p.f16_gemm_calls, p.stage_us / 1000.0, (long long) p.stage_calls,
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::ATTENTION)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::ATTENTION)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::NORM)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::NORM)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::ROPE)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::ROPE)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::KV_CACHE)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::KV_CACHE)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::ROUTING)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::ROUTING)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::DENSE_MATMUL)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::DENSE_MATMUL)],
+        p.node_us[static_cast<int>(mxfp4_pp_node_class::MISC)] / 1000.0,
+        (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::MISC)], p.graph_total_set ? 1 : 0,
         (long long) p.read_failures);
 
     // llama.cpp-6405 (reviewer nit): sort tensor names so the print order is
@@ -74222,6 +74415,16 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             GGML_SYCL_DEBUG("[RETAINED] Safety flush: CPU op %s fell through to GPU\n", ggml_op_name(dst->op));
         }
     }
+    // llama.cpp-iikr ("attribute other" phase): component 6's whole-node
+    // device bracket -- see mxfp4_pp_node_bracket's own comment for why this
+    // exact insertion point (after CPU dispatch is ruled out, before the
+    // four early GPU routes and the main switch) gives correct coverage via
+    // RAII destructor-on-any-exit, including attention's early route and the
+    // exception-unwind path. GGML_SYCL_DNNL-gated because the whole
+    // MXFP4_PP_BATCHED_PROFILE apparatus it feeds is.
+#if GGML_SYCL_DNNL
+    mxfp4_pp_node_bracket mxfp4_pp_node_scope(ctx.stream(), dst);
+#endif
     if (dst->src[0] != nullptr && ggml_backend_buffer_is_sycl_split(dst->src[0]->buffer)) {
         ggml_sycl_set_peer_access(dst->src[1]->ne[1], ctx.device);
     }
