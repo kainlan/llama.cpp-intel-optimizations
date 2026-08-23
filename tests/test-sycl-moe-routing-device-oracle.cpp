@@ -46,16 +46,35 @@
 // registered add_executable-only, run manually, not part of the default
 // ctest sweep, since it needs GGML_SYCL_MOE_ROUTING_DEVICE semantics a
 // default ctest environment does not provide.
+//
+// ORDER CONTRACT (fix-cycle Part 2, verified by reading both
+// implementations, not assumed): ggml_argsort_top_k's DESC argsort is a
+// FULL sort on both backends -- CPU's std::sort with a strict `>`
+// comparator (ggml/src/ggml-cpu/ops.cpp:8362-8371,8399-8406) and SYCL's
+// bitonic sorting network (ggml-sycl.cpp:40046-40108, invoked from
+// argsort_f32_i32_sycl at ggml-sycl.cpp:40299-40342; for n_expert=32,
+// ncols_pad = next_power_of_2(32) = 32, so the padding branches never
+// trigger in this oracle's shape). Both are real, provably-correct full
+// sorts w.r.t. their own comparator: elements with genuinely DIFFERENT
+// values are GUARANTEED to land in strict descending order on EITHER
+// backend. Neither is a *stable* sort (std::sort and a bitonic network are
+// both unstable), so among EXACTLY TIED values the two backends' relative
+// order is unspecified and may legitimately differ -- this, and only this,
+// is what the pairing-invariant proof on `routing_result` above makes
+// benign. A same-side, non-tied ordering violation is NOT covered by that
+// slack and would indicate a real defect, not a contract gap.
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -181,6 +200,99 @@ static routing_result run_routing_graph(ggml_backend_t             backend,
     return result;
 }
 
+// llama.cpp-iikr Part 2 (two-arm restructure, team-lead's amended
+// semantics after the score evidence): a same-slot positional id
+// comparison is the wrong property to gate stage (ii) on, because the
+// ORDER CONTRACT above only promises a matching SET for a token with
+// tied boundary scores -- team-lead's hardware runs additionally showed
+// the slot-order difference can occur even between DISTINCT scores,
+// which the contract does not license, so slot order is not asserted as
+// a general property at all (see the tie-free STRICT arm below for the
+// one place it legitimately IS asserted). What the executor actually
+// needs (per-token, order-independent) is a MULTISET of (expert_id,
+// weight) pairs -- exactly what build_lora_mm_id's consumers read via
+// selected_experts (see the pairing-invariant proof above), so that is
+// the SEMANTIC arm and the actual gate for stage (ii).
+// llama.cpp-iikr fix cycle (team-lead's rerun, both cards): the FIRST
+// version of this tolerance used abs_tol=1e-6 as the effective ceiling
+// (rel_tol=1e-5 on O(0.3) weights is only ~3e-6), which is exactly the
+// classifier's own TIE(fp-noise) cutoff -- so genuine f16-device-vs-f32-CPU
+// softmax noise (measured 5-7.2e-6 absolute on O(0.3) weights, ~1.5-2e-5
+// RELATIVE) got tagged REAL-DIFF and failed tokens whose expert-id
+// SETS were already identical. rel_tol is now 5e-5 (comfortably above
+// the measured ~2e-5 relative noise), abs_tol stays as a floor for
+// near-zero weights where relative comparison alone is meaningless.
+static bool approx_equal(float a, float b, float rel_tol = 5e-5f, float abs_tol = 1e-6f) {
+    return std::fabs(a - b) <= abs_tol + rel_tol * std::max(std::fabs(a), std::fabs(b));
+}
+
+// Tie-free classification for the STRICT arm: a token's top-(k+1) boundary
+// is "tie-free" when every pair among its k+1 highest-ranked expert scores
+// is separated by more than kTieFreeGapAbs -- comfortably above the
+// ~2.8e-6 CPU-vs-device (f32 vs f16-influenced softmax) noise floor
+// team-lead measured on hardware, so a same-side slot swap at this gap
+// would indicate a real comparator/sort defect, not float noise. Only the
+// top k+1 values matter: values below that boundary can never affect
+// which experts land in the visible k-window or their relative order
+// within it.
+static constexpr float kTieFreeGapAbs = 1e-3f;
+
+static bool token_boundary_is_tie_free(const float * probs_row, int n_expert, int n_expert_used) {
+    std::vector<float> top(probs_row, probs_row + n_expert);
+    std::sort(top.begin(), top.end(), std::greater<float>());
+    const int window = std::min(n_expert, n_expert_used + 1);
+    for (int i = 0; i < window; ++i) {
+        for (int j = i + 1; j < window; ++j) {
+            if (std::fabs(top[i] - top[j]) < kTieFreeGapAbs) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Prints, for every expert id selected by EITHER side at `token`, both
+// sides' own score for that expert (0.0 formatted as such, not omitted,
+// when an id was never selected by one side -- its score is still a real,
+// readable number from that side's probs tensor) so a reader never has to
+// manually cross-reference two separate lines the way this fix cycle's
+// Part 1 report had to.
+static void print_token_mismatch(const char *                 arm,
+                                 int                          trial,
+                                 size_t                       token,
+                                 const std::vector<int32_t> & cpu_ids,
+                                 const std::vector<int32_t> & sycl_ids,
+                                 const std::vector<float> &   cpu_probs,
+                                 const std::vector<float> &   sycl_probs,
+                                 int                          n_expert) {
+    std::vector<int32_t> involved = cpu_ids;
+    involved.insert(involved.end(), sycl_ids.begin(), sycl_ids.end());
+    std::sort(involved.begin(), involved.end());
+    involved.erase(std::unique(involved.begin(), involved.end()), involved.end());
+
+    std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL(%s): trial %d token %zu cpu_ids=[", arm, trial, token);
+    for (size_t i = 0; i < cpu_ids.size(); ++i) {
+        std::fprintf(stderr, "%s%d", i ? "," : "", cpu_ids[i]);
+    }
+    std::fprintf(stderr, "] sycl_ids=[");
+    for (size_t i = 0; i < sycl_ids.size(); ++i) {
+        std::fprintf(stderr, "%s%d", i ? "," : "", sycl_ids[i]);
+    }
+    std::fprintf(stderr, "]\n");
+    for (int32_t id : involved) {
+        const float  cs    = cpu_probs[token * static_cast<size_t>(n_expert) + id];
+        const float  ss    = sycl_probs[token * static_cast<size_t>(n_expert) + id];
+        const float  delta = cs - ss;
+        // Retagged against the SAME tolerance the semantic/strict arms
+        // gate on (approx_equal), not an independent fixed cutoff -- a
+        // fixed cutoff here previously disagreed with the arms' own pass/
+        // fail decision and mislabeled real tolerance-noise as REAL-DIFF.
+        const char * tag   = (delta == 0.0f) ? "TIE(exact)" : approx_equal(cs, ss) ? "TIE(fp-noise)" : "REAL-DIFF";
+        std::fprintf(stderr, "[MOE-ROUTING-ORACLE]   expert %d: cpu_score=%.9f sycl_score=%.9f delta=%.9e %s\n", id, cs,
+                     ss, delta, tag);
+    }
+}
+
 int main() {
     // GPT-OSS 20B's confirmed MoE shape: 32 experts, top-4 selected per
     // token (see the file header comment for the citation). hidden_dim and
@@ -214,8 +326,31 @@ int main() {
     std::mt19937                          rng(0xC0FFEE);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
-    int mismatches = 0;
     int trials_run = 0;
+
+    // SEMANTIC arm (team-lead's GATE for stage (ii)): per-token
+    // (expert_id, weight) MULTISET equality, order-independent -- the
+    // property build_lora_mm_id's consumers actually rely on. Split into
+    // two counters, not one: id_mismatch_tokens (the expert-id SET itself
+    // differs -- a real routing bug, wrong tokens would go to wrong
+    // experts) is the number stage (ii) is gated on;
+    // weight_only_mismatch_tokens (same id set, a weight fell outside
+    // approx_equal's tolerance) is diagnostic -- it means the tolerance
+    // itself may need another look, not that routing selected wrong
+    // experts. Conflating them into one count made the load-bearing zero
+    // (id_mismatch_tokens == 0) unreadable from the summary line alone.
+    int semantic_total_tokens       = 0;
+    int id_mismatch_tokens          = 0;
+    int weight_only_mismatch_tokens = 0;
+
+    // STRICT arm: on tokens whose top-(k+1) boundary is provably tie-free
+    // (see token_boundary_is_tie_free), the order contract above DOES
+    // guarantee matching slot order -- so this arm additionally asserts
+    // exact positional id equality, scoped to only those qualifying
+    // tokens. A failure here, unlike the semantic arm, points at a real
+    // sort/comparator defect rather than a benign tie-break difference.
+    int strict_qualified_tokens = 0;
+    int strict_fail_tokens      = 0;
 
     for (int trial = 0; trial < n_trials; ++trial) {
         std::vector<float> weight_data(static_cast<size_t>(hidden_dim) * n_expert);
@@ -243,55 +378,72 @@ int main() {
             ggml_backend_free(cpu_backend);
             return 77;
         }
-        if (cpu.ids.size() != sycl.ids.size()) {
-            std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL: trial %d size mismatch cpu=%zu sycl=%zu\n", trial,
-                         cpu.ids.size(), sycl.ids.size());
-            ++mismatches;
+        if (cpu.ids.size() != sycl.ids.size() || cpu.probs.size() != sycl.probs.size()) {
+            std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL: trial %d size mismatch\n", trial);
+            ++id_mismatch_tokens;
+            ++semantic_total_tokens;
             ++trials_run;
             continue;
         }
 
-        // llama.cpp-iikr fix-cycle Part 1 (team-lead, tie-break diagnosis):
-        // on a mismatch, print each side's OWN softmax score for the expert
-        // IT selected at that (token, slot) -- not the other side's score
-        // for the same expert, which would not exist as a comparable
-        // quantity if the two sides picked different experts. Equal scores
-        // (within float noise) at a mismatched slot mean the two sides had
-        // a genuine tie and legitimately broke it differently (CPU argsort
-        // is stable, the device sort is not) -- benign, per the pairing
-        // proof cited on `routing_result` above. Different scores would
-        // mean the device chain picked a strictly worse candidate: a real,
-        // blocking selection bug, not a tie artifact.
-        bool trial_ok = true;
-        for (size_t i = 0; i < cpu.ids.size(); ++i) {
-            if (cpu.ids[i] != sycl.ids[i]) {
-                const size_t  token       = i / static_cast<size_t>(n_expert_used);
-                const int32_t cpu_expert  = cpu.ids[i];
-                const int32_t sycl_expert = sycl.ids[i];
-                const float   cpu_score   = (cpu_expert >= 0 && cpu_expert < n_expert) ?
-                                                cpu.probs[token * static_cast<size_t>(n_expert) + cpu_expert] :
-                                                -1.0f;
-                const float   sycl_score  = (sycl_expert >= 0 && sycl_expert < n_expert) ?
-                                                sycl.probs[token * static_cast<size_t>(n_expert) + sycl_expert] :
-                                                -1.0f;
-                const float   score_delta = cpu_score - sycl_score;
-                std::fprintf(stderr,
-                             "[MOE-ROUTING-ORACLE] FAIL: trial %d index %zu (token %zu, slot %zu): "
-                             "cpu=%d (score=%.9f) sycl=%d (score=%.9f) delta=%.9e %s\n",
-                             trial, i, token, i % static_cast<size_t>(n_expert_used), cpu_expert, cpu_score,
-                             sycl_expert, sycl_score, score_delta,
-                             (score_delta == 0.0f)            ? "TIE(exact)" :
-                             (std::fabs(score_delta) < 1e-6f) ? "TIE(fp-noise)" :
-                                                                "REAL-DIFF");
-                trial_ok = false;
+        bool trial_semantic_ok = true;
+        bool trial_strict_ok   = true;
+
+        for (int token = 0; token < n_tokens; ++token) {
+            const size_t base = static_cast<size_t>(token) * static_cast<size_t>(n_expert_used);
+
+            std::vector<int32_t> cpu_slot(cpu.ids.begin() + base, cpu.ids.begin() + base + n_expert_used);
+            std::vector<int32_t> sycl_slot(sycl.ids.begin() + base, sycl.ids.begin() + base + n_expert_used);
+
+            std::vector<int32_t> cpu_set  = cpu_slot;
+            std::vector<int32_t> sycl_set = sycl_slot;
+            std::sort(cpu_set.begin(), cpu_set.end());
+            std::sort(sycl_set.begin(), sycl_set.end());
+
+            ++semantic_total_tokens;
+            const bool sets_equal = (cpu_set == sycl_set);
+            bool       weights_ok = sets_equal;
+            if (sets_equal) {
+                for (int32_t id : cpu_set) {
+                    const float cs = cpu.probs[static_cast<size_t>(token) * n_expert + id];
+                    const float ss = sycl.probs[static_cast<size_t>(token) * n_expert + id];
+                    if (!approx_equal(cs, ss)) {
+                        weights_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!sets_equal) {
+                ++id_mismatch_tokens;
+                trial_semantic_ok = false;
+                print_token_mismatch("semantic/id-mismatch", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
+                                     n_expert);
+            } else if (!weights_ok) {
+                ++weight_only_mismatch_tokens;
+                trial_semantic_ok = false;
+                print_token_mismatch("semantic/weight-only", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
+                                     n_expert);
+            }
+
+            const float * cpu_row = cpu.probs.data() + static_cast<size_t>(token) * n_expert;
+            if (token_boundary_is_tie_free(cpu_row, n_expert, n_expert_used)) {
+                ++strict_qualified_tokens;
+                const bool strict_ok = sets_equal && weights_ok && (cpu_slot == sycl_slot);
+                if (!strict_ok) {
+                    ++strict_fail_tokens;
+                    trial_strict_ok = false;
+                    print_token_mismatch("strict/tie-free", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
+                                         n_expert);
+                }
             }
         }
-        if (!trial_ok) {
-            ++mismatches;
-        }
+
         ++trials_run;
-        std::fprintf(stderr, "[MOE-ROUTING-ORACLE] trial %d: %s (n_expert=%d n_expert_used=%d n_tokens=%d)\n", trial,
-                     trial_ok ? "PASS" : "FAIL", n_expert, n_expert_used, n_tokens);
+        std::fprintf(stderr,
+                     "[MOE-ROUTING-ORACLE] trial %d: semantic=%s strict=%s (n_expert=%d n_expert_used=%d "
+                     "n_tokens=%d)\n",
+                     trial, trial_semantic_ok ? "PASS" : "FAIL", trial_strict_ok ? "PASS" : "FAIL", n_expert,
+                     n_expert_used, n_tokens);
     }
 
     ggml_backend_free(sycl_backend);
@@ -301,12 +453,33 @@ int main() {
         std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: zero trials ran -- this run proves nothing\n");
         return 77;
     }
-    if (mismatches > 0) {
-        std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL: %d/%d trials mismatched (n_expert=%d n_expert_used=%d)\n",
-                     mismatches, trials_run, n_expert, n_expert_used);
+
+    // GATE LINE for stage (ii): read id_mismatch_tokens off this line
+    // directly -- it must be 0 for the semantic arm to be GREEN.
+    // weight_only_mismatch_tokens is diagnostic (tolerance calibration),
+    // not a routing-correctness signal, and is reported separately rather
+    // than folded into the same count.
+    std::fprintf(stderr,
+                 "[MOE-ROUTING-ORACLE] SUMMARY: id_mismatch_tokens=%d/%d (GATES stage (ii) -- must be 0) "
+                 "weight_only_mismatch_tokens=%d/%d (diagnostic, tolerance-calibration signal) "
+                 "strict_fail_tokens=%d/%d tie-free-qualified (indicts the sort kernels, not the executor)\n",
+                 id_mismatch_tokens, semantic_total_tokens, weight_only_mismatch_tokens, semantic_total_tokens,
+                 strict_fail_tokens, strict_qualified_tokens);
+
+    // The SEMANTIC arm's id_mismatch_tokens is the actual gate for stage
+    // (ii). weight_only_mismatch_tokens and strict_fail_tokens still fail
+    // this run's exit code (both indicate something needs attention --
+    // tolerance calibration or a real sort defect, respectively) but are
+    // NOT what stage (ii)'s go/no-go reads; see the SUMMARY line above for
+    // the load-bearing number specifically.
+    if (id_mismatch_tokens > 0 || weight_only_mismatch_tokens > 0 || strict_fail_tokens > 0) {
+        std::fprintf(stderr,
+                     "[MOE-ROUTING-ORACLE] FAIL: id_mismatch_tokens=%d weight_only_mismatch_tokens=%d "
+                     "strict_fail_tokens=%d (n_expert=%d n_expert_used=%d)\n",
+                     id_mismatch_tokens, weight_only_mismatch_tokens, strict_fail_tokens, n_expert, n_expert_used);
         return 1;
     }
-    std::fprintf(stderr, "[MOE-ROUTING-ORACLE] PASS: %d/%d trials exact-matched (n_expert=%d n_expert_used=%d)\n",
+    std::fprintf(stderr, "[MOE-ROUTING-ORACLE] PASS: %d/%d trials, both arms clean (n_expert=%d n_expert_used=%d)\n",
                  trials_run, trials_run, n_expert, n_expert_used);
     return 0;
 }
