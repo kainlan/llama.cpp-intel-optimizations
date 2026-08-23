@@ -64860,6 +64860,31 @@ struct mxfp4_pp_batched_profile_accum {
     double                                   gap_max_us                            = 0.0;
     double                                   gap_total_us                          = 0.0;
     std::vector<mxfp4_pp_gap_top_entry>      gap_top10;
+    // llama.cpp-iikr (host-stall attribution cycle): HOST WALL-CLOCK spans
+    // inside ggml_sycl_mul_mat_id's batched-PP-oneDNN path, from routing
+    // output to the end of GEMM submission. Host chrono is deliberately
+    // correct here -- see this cycle's own instrumentation site comment for
+    // why this differs from the host-chrono/backpressure trap the rest of
+    // this file's device-timing components exist to avoid: these six spans
+    // measure HOST time (readback wait, expert grouping, route resolution,
+    // oneDNN primitive submission), not an attempt to infer device
+    // behavior from the host clock. Accumulated directly (not via events),
+    // once per ggml_sycl_mul_mat_id call that reaches each checkpoint --
+    // an early return/throw before a checkpoint simply leaves that
+    // dispatch's contribution to that phase unaccounted, same posture as
+    // every other component's read-failure handling.
+    double                                   host_readback_us        = 0.0;
+    int64_t                                  host_readback_calls     = 0;
+    double                                   host_ptrtable_us        = 0.0;
+    int64_t                                  host_ptrtable_calls     = 0;
+    double                                   host_routeresolve_us    = 0.0;
+    int64_t                                  host_routeresolve_calls = 0;
+    double                                   host_grouping_us        = 0.0;
+    int64_t                                  host_grouping_calls     = 0;
+    double                                   host_repackstage_us     = 0.0;
+    int64_t                                  host_repackstage_calls  = 0;
+    double                                   host_submission_us      = 0.0;
+    int64_t                                  host_submission_calls   = 0;
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
@@ -65056,6 +65081,18 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
             "next_name=%s\n",
             p.device, r + 1, e.gap_us, e.prev_op, e.prev_name.c_str(), e.next_op, e.next_name.c_str());
     }
+
+    // llama.cpp-iikr (host-stall attribution cycle): the six HOST wall-clock
+    // phases inside ggml_sycl_mul_mat_id's batched-PP-oneDNN path, entry
+    // through end of GEMM submission -- see the field comments above and the
+    // instrumentation site itself for the exact checkpoint boundaries.
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST] device=%d readback=%.3f ms/%lld ptrtable=%.3f ms/%lld "
+        "routeresolve=%.3f ms/%lld grouping=%.3f ms/%lld repackstage=%.3f ms/%lld submission=%.3f ms/%lld\n",
+        p.device, p.host_readback_us / 1000.0, (long long) p.host_readback_calls, p.host_ptrtable_us / 1000.0,
+        (long long) p.host_ptrtable_calls, p.host_routeresolve_us / 1000.0, (long long) p.host_routeresolve_calls,
+        p.host_grouping_us / 1000.0, (long long) p.host_grouping_calls, p.host_repackstage_us / 1000.0,
+        (long long) p.host_repackstage_calls, p.host_submission_us / 1000.0, (long long) p.host_submission_calls);
 
     // llama.cpp-6405 (reviewer nit): sort tensor names so the print order is
     // deterministic across runs -- std::unordered_map's iteration order is
@@ -66860,6 +66897,37 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const int64_t        n_ids  = ids->ne[0];
     std::vector<int32_t> ids_host = ne12 != 1 ? prompt_ids_snapshot : std::vector<int32_t>{};
 
+    // llama.cpp-iikr (host-stall attribution cycle): running host wall-clock
+    // for the six MXFP4-PP-BATCHED-PROFILE-HOST phases below. Same running-
+    // clock idiom as pp_phase_log's own pp_phase_last a few lines down
+    // (mark-then-diff-from-last-mark), but a SEPARATE clock: pp_phase_log
+    // only advances pp_phase_last when GGML_SYCL_MOE_PP_PHASE_TRACE is on,
+    // this one only when GGML_SYCL_MXFP4_PP_PROFILE is on -- the two env
+    // gates are independent, so sharing one clock would silently stop this
+    // one advancing whenever the other's gate differs.
+    // #if-guarded because mxfp4_pp_batched_profile_enabled()/
+    // g_mxfp4_pp_batched_profile are only declared under GGML_SYCL_DNNL
+    // (see the component-6 block above); host_phase_profile/host_phase_clock
+    // are referenced only from further #if GGML_SYCL_DNNL-guarded call sites
+    // below, so declaration and every use disappear together when the
+    // backend is built without oneDNN.
+#if GGML_SYCL_DNNL
+    const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
+    auto       host_phase_clock   = std::chrono::high_resolution_clock::now();
+    const auto host_phase_mark    = [&](double mxfp4_pp_batched_profile_accum::* total_field,
+                                     int64_t mxfp4_pp_batched_profile_accum::* calls_field) {
+        if (!host_phase_profile) {
+            return;
+        }
+        const auto   now   = std::chrono::high_resolution_clock::now();
+        const double delta = std::chrono::duration<double, std::micro>(now - host_phase_clock).count();
+        host_phase_clock   = now;
+        auto & p           = g_mxfp4_pp_batched_profile;
+        p.*total_field += delta;
+        ++(p.*calls_field);
+    };
+#endif
+
     // Task 1E: Batch IDs D2H across GATE/UP/DOWN sub-ops.
     // Within a MoE block, GATE/UP/DOWN share the same expert IDs.
     // Copy D2H once at GATE and reuse for UP and DOWN.
@@ -66946,6 +67014,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
     pp_phase_log("ids-ready", GGML_LAYOUT_AOS, ids_host.size());
+#if GGML_SYCL_DNNL
+    // host-stall attribution cycle, phase 1/6: for the PP-batched path
+    // (ne12 != 1) ids_host above came from prompt_ids_snapshot -- no D2H
+    // readback at all -- so this phase is expected to read ~0 for PP; a
+    // nonzero reading would itself be a finding (unexpected readback cost).
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_readback_us,
+                    &mxfp4_pp_batched_profile_accum::host_readback_calls);
+#endif
     // llama.cpp-1tjn (B3 rework census v3, temporary): S1 = entry through
     // ids host-available (the ggml_sycl_copy_ids_to_host block above, plus
     // the g_moe_layer_ids_cache reuse check and everything preceding it).
@@ -68147,6 +68223,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         return true;
     };
     pp_phase_log("pointer-table-ready", route_layout, ids_host.size());
+#if GGML_SYCL_DNNL
+    // host-stall attribution cycle, phase 2/6: layout selection + expert
+    // pointer-table build/reuse (use_active_expert_ptr_payload /
+    // refresh_expert_ptrs_payload_host, defined just above this point).
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_ptrtable_us,
+                    &mxfp4_pp_batched_profile_accum::host_ptrtable_calls);
+#endif
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
         fprintf(stderr, "[MOE-STAGE] tensor=%s stage=after-pointer-table device=%d planned_pp=%d\n",
                 src0 && src0->name ? src0->name : "?", ctx.device, planned_pp_handle_routing ? 1 : 0);
@@ -71227,6 +71310,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return trace_batched_skip(reason, expert_id);
             };
 
+            // host-stall attribution cycle, phase 3/6: everything from
+            // pointer-table-ready through reaching (and being accepted by)
+            // this specific batched-PP-oneDNN candidate arm -- route
+            // diagnostics, popularity pre-staging triggers, row-mapping
+            // build+H2D-submit, and any OTHER candidate arm evaluated and
+            // rejected before this one. A broad bucket by construction: if
+            // it reads large, that is itself the finding (there is real
+            // cost upstream of expert grouping that this cycle has not yet
+            // broken down further).
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_routeresolve_us,
+                            &mxfp4_pp_batched_profile_accum::host_routeresolve_calls);
+
             std::vector<pp_onednn_batched_expert> active_experts;
             std::vector<sycl::event>              ready_events;
             active_experts.reserve(static_cast<size_t>(n_as));
@@ -71318,6 +71413,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     }
                 }
             }
+            // host-stall attribution cycle, phase 4/6: active_experts
+            // reserve+build+sort (llama.cpp-dboi's bimodal-routing sort)
+            // plus the gemm_groups build above -- pure host CPU work, no
+            // device interaction, bounded by the active expert count
+            // (~32 for GPT-OSS 20B).
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_grouping_us,
+                            &mxfp4_pp_batched_profile_accum::host_grouping_calls);
 
             auto checked_mul = [](size_t a, size_t b, size_t & out) -> bool {
                 if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
@@ -71752,6 +71854,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // reached at all).
             std::optional<sycl::event> gemm_profile_begin;
             std::optional<sycl::event> gemm_profile_end;
+            // host-stall attribution cycle, phase 5/6: repack/activation-
+            // stage kernel dispatch (components 1/2/4's own device-event
+            // markers cover their DEVICE time; this is that dispatch's HOST
+            // submission cost, not previously measured) plus any other prep
+            // between grouping and here.
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_repackstage_us,
+                            &mxfp4_pp_batched_profile_accum::host_repackstage_calls);
             try {
                 const sycl::event deps_in = stream->ext_oneapi_submit_barrier();
                 if (pp_profile) {
@@ -71814,6 +71923,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             if (pp_profile) {
                 gemm_profile_end = ggml_sycl_submit_marker<class mxfp4_pp_profile_gemm_end_marker>(*stream);
             }
+            // host-stall attribution cycle, phase 6/6: the GEMM dispatch
+            // try{} block above -- per-group oneDNN primitive lookup-or-
+            // create (cache.get_or_create, gemm.hpp) plus, on the 2-D
+            // fallback arm, one dnnl::memory/args-map construction and
+            // dnnl::sycl_interop::execute() call PER EXPERT IN THE GROUP
+            // (gemm.hpp:1174-1210) -- ends here, matching the SAME span the
+            // existing gemm_profile_begin/end DEVICE markers bracket, so
+            // this HOST wall-clock number is directly comparable against
+            // woq_gemm_us (device) for the identical span. Submitted
+            // ONLY when gemm.hpp's cache.get_or_create/execute() calls are
+            // NOT wrapped in their own try/catch that could leave this
+            // point unreached without going through the catch block above
+            // (which returns/throws before this line, so this mark
+            // correctly does not fire on a failed dispatch).
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_submission_us,
+                            &mxfp4_pp_batched_profile_accum::host_submission_calls);
 
             const bool batched_compare = [] {
                 const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE");
