@@ -64784,6 +64784,21 @@ struct mxfp4_pp_gap_top_entry {
     std::string  next_name;
 };
 
+// One INTRA-WINDOW idle-hole sample (llama.cpp-iikr intra-window idle
+// cycle): the device-time gap between two consecutive device-work
+// intervals inside ONE ggml_sycl_mul_mat_id dispatch (as opposed to the
+// gap-histogram above, which measures gaps BETWEEN whole graph nodes,
+// i.e. crossing dispatch/node boundaries). prev_label/next_label are
+// symbolic names for what bounds the hole -- "repack[N]", "stage[N]", or
+// "gemm_block" (the whole GEMM dispatch as ONE opaque interval: see the
+// instrumentation site for why gemm_events' own per-group timestamps are
+// a documented-unreliable barrier artifact and cannot be sub-divided).
+struct mxfp4_pp_idle_gap_sample {
+    double      gap_us;
+    std::string prev_label;
+    std::string next_label;
+};
+
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
 // (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
@@ -64885,6 +64900,18 @@ struct mxfp4_pp_batched_profile_accum {
     int64_t                                  host_repackstage_calls  = 0;
     double                                   host_submission_us      = 0.0;
     int64_t                                  host_submission_calls   = 0;
+    // llama.cpp-iikr (intra-window idle cycle): raw idle-hole samples,
+    // accumulated across every dispatch this eval (one push per detected
+    // gap within a dispatch's sorted repack/stage/gemm-block intervals).
+    // Resolved into count/p50/p95/max/top-N in print_and_reset, same
+    // pattern as the gap-histogram's gap_top10 above.
+    std::vector<mxfp4_pp_idle_gap_sample>    idle_gap_samples;
+    int64_t                                  idle_count    = 0;
+    double                                   idle_total_us = 0.0;
+    double                                   idle_p50_us   = 0.0;
+    double                                   idle_p95_us   = 0.0;
+    double                                   idle_max_us   = 0.0;
+    std::vector<mxfp4_pp_idle_gap_sample>    idle_top10;
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
@@ -65019,6 +65046,37 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
                 mxfp4_pp_gap_top_entry{ ranked[r].us, prev.op_name, prev.tensor_name, next.op_name, next.tensor_name });
         }
     }
+
+    // llama.cpp-iikr (intra-window idle cycle): resolve idle_gap_samples
+    // (pushed directly by ggml_sycl_mul_mat_id, one dispatch window at a
+    // time, already computed post-stream-wait -- see that call site) into
+    // count/p50/p95/max/top-10, same percentile/ranking pattern as the
+    // gap-histogram above, just over a different sample population.
+    p.idle_count = static_cast<int64_t>(p.idle_gap_samples.size());
+    if (!p.idle_gap_samples.empty()) {
+        std::vector<double> idle_values;
+        idle_values.reserve(p.idle_gap_samples.size());
+        for (const auto & s : p.idle_gap_samples) {
+            idle_values.push_back(s.gap_us);
+            p.idle_total_us += s.gap_us;
+        }
+        std::sort(idle_values.begin(), idle_values.end());
+        const auto idle_pct = [&](double fraction) {
+            size_t idx = static_cast<size_t>(fraction * static_cast<double>(idle_values.size() - 1));
+            return idle_values[idx];
+        };
+        p.idle_p50_us = idle_pct(0.50);
+        p.idle_p95_us = idle_pct(0.95);
+        p.idle_max_us = idle_values.back();
+
+        std::vector<mxfp4_pp_idle_gap_sample> idle_ranked = p.idle_gap_samples;
+        std::sort(
+            idle_ranked.begin(), idle_ranked.end(),
+            [](const mxfp4_pp_idle_gap_sample & a, const mxfp4_pp_idle_gap_sample & b) { return a.gap_us > b.gap_us; });
+        const size_t idle_top_n = std::min<size_t>(10, idle_ranked.size());
+        p.idle_top10.assign(idle_ranked.begin(), idle_ranked.begin() + static_cast<ptrdiff_t>(idle_top_n));
+    }
+
     double node_total_us = 0.0;
     for (int c = 0; c < mxfp4_pp_node_class_count; ++c) {
         node_total_us += p.node_us[c];
@@ -65093,6 +65151,28 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (long long) p.host_ptrtable_calls, p.host_routeresolve_us / 1000.0, (long long) p.host_routeresolve_calls,
         p.host_grouping_us / 1000.0, (long long) p.host_grouping_calls, p.host_repackstage_us / 1000.0,
         (long long) p.host_repackstage_calls, p.host_submission_us / 1000.0, (long long) p.host_submission_calls);
+
+    // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
+    // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
+    // a ~270-300 ms window hole) -- this line measures the remaining
+    // hypothesis, DEVICE idle time between this dispatch's own
+    // repack/stage/gemm-block intervals. NOTE the gemm dispatch is one
+    // OPAQUE interval here (gemm_profile_begin/end), not sub-divided per
+    // group or per expert-execute -- gemm_events' own per-group timestamps
+    // are a documented-unreliable barrier artifact (see the gemm_events
+    // declaration comment), so idle time INSIDE the gemm block is invisible
+    // to this instrument; only idle time AROUND it (before/after, relative
+    // to repack/stage) is measured. A small idle reading around a large
+    // remaining "other" would itself point at that blind spot.
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-IDLE] device=%d idle_count=%lld idle_total=%.3f ms idle_p50=%.3f us "
+        "idle_p95=%.3f us idle_max=%.3f us\n",
+        p.device, (long long) p.idle_count, p.idle_total_us / 1000.0, p.idle_p50_us, p.idle_p95_us, p.idle_max_us);
+    for (size_t r = 0; r < p.idle_top10.size(); ++r) {
+        const mxfp4_pp_idle_gap_sample & e = p.idle_top10[r];
+        GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-IDLE-TOP] device=%d rank=%zu idle=%.3f us prev=%s next=%s\n", p.device,
+                      r + 1, e.gap_us, e.prev_label.c_str(), e.next_label.c_str());
+    }
 
     // llama.cpp-6405 (reviewer nit): sort tensor names so the print order is
     // deterministic across runs -- std::unordered_map's iteration order is
@@ -72230,6 +72310,78 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     static_cast<int64_t>(pp_profile_repack_begin.size());
                 profile.dispatch_calls_by_tensor[profile_tensor_name] += 1;
                 ++profile.dispatch_evals;
+
+                // llama.cpp-iikr (intra-window idle cycle): sort THIS
+                // dispatch's own device-work intervals by command_start and
+                // record the gap before each one (relative to the running
+                // furthest-end-seen-so-far, so an overlap does not manufacture
+                // a spurious negative-then-positive pair) as an idle-hole
+                // sample. gemm is ONE opaque interval -- see the gemm_events
+                // declaration comment above for why its own per-group
+                // timestamps are a documented-unreliable barrier artifact and
+                // cannot be sub-divided; idle time INSIDE the gemm block is
+                // therefore invisible to this pass. A read failure here just
+                // drops that one interval from THIS pass's placement (already
+                // counted once against read_failures by the loops above) --
+                // it does not increment read_failures a second time.
+                struct idle_interval {
+                    uint64_t    start_ns;
+                    uint64_t    end_ns;
+                    std::string label;
+                };
+                std::vector<idle_interval> window_intervals;
+                window_intervals.reserve(pp_profile_repack_begin.size() + pp_profile_stage_events.size() + 1);
+                for (size_t i = 0; i < pp_profile_repack_begin.size() && i < pp_profile_repack_end.size(); ++i) {
+                    try {
+                        const uint64_t s =
+                            pp_profile_repack_begin[i].get_profiling_info<sycl::info::event_profiling::command_start>();
+                        const uint64_t e =
+                            pp_profile_repack_end[i].get_profiling_info<sycl::info::event_profiling::command_end>();
+                        if (e >= s) {
+                            window_intervals.push_back({ s, e, "repack[" + std::to_string(i) + "]" });
+                        }
+                    } catch (...) {
+                    }
+                }
+                for (size_t i = 0; i < pp_profile_stage_events.size(); ++i) {
+                    try {
+                        const uint64_t s =
+                            pp_profile_stage_events[i].get_profiling_info<sycl::info::event_profiling::command_start>();
+                        const uint64_t e =
+                            pp_profile_stage_events[i].get_profiling_info<sycl::info::event_profiling::command_end>();
+                        if (e >= s) {
+                            window_intervals.push_back({ s, e, "stage[" + std::to_string(i) + "]" });
+                        }
+                    } catch (...) {
+                    }
+                }
+                try {
+                    const uint64_t s =
+                        gemm_profile_begin->get_profiling_info<sycl::info::event_profiling::command_start>();
+                    const uint64_t e = gemm_profile_end->get_profiling_info<sycl::info::event_profiling::command_end>();
+                    if (e >= s) {
+                        window_intervals.push_back({ s, e, "gemm_block" });
+                    }
+                } catch (...) {
+                }
+                std::sort(window_intervals.begin(), window_intervals.end(),
+                          [](const idle_interval & a, const idle_interval & b) { return a.start_ns < b.start_ns; });
+                if (window_intervals.size() >= 2) {
+                    uint64_t    running_end   = window_intervals[0].end_ns;
+                    std::string running_label = window_intervals[0].label;
+                    for (size_t i = 1; i < window_intervals.size(); ++i) {
+                        const double gap_us =
+                            window_intervals[i].start_ns >= running_end ?
+                                static_cast<double>(window_intervals[i].start_ns - running_end) * 1e-3 :
+                                -static_cast<double>(running_end - window_intervals[i].start_ns) * 1e-3;
+                        profile.idle_gap_samples.push_back(
+                            mxfp4_pp_idle_gap_sample{ gap_us, running_label, window_intervals[i].label });
+                        if (window_intervals[i].end_ns > running_end) {
+                            running_end   = window_intervals[i].end_ns;
+                            running_label = window_intervals[i].label;
+                        }
+                    }
+                }
             }
 
             ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], route_layout, "pp_onednn_f16_batched",
