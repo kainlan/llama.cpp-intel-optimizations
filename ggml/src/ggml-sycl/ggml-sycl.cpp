@@ -74528,6 +74528,26 @@ static bool ggml_sycl_mul_mat_weight_resolves_to_host(const ggml_backend_sycl_co
     return false;
 }
 
+// llama.cpp-iikr (device-routing pivot, owner ruling on task llama.cpp-iikr,
+// 2026-08-23 -- see task comment c-cgta): opt-in bypass of the MoE
+// routing-subgraph CPU-forcing policy in should_dispatch_to_cpu() below.
+// Default OFF -- when unset, should_dispatch_to_cpu()'s existing
+// interception (the ggml_sycl_op_is_moe_routing_subgraph branch) is fully
+// intact and byte-identical to before this change, per the owner's
+// constraint #2. This is STAGE (i) of the design doc's fix (B): the policy
+// bypass and its correctness oracle. Stage (ii), wiring ggml_sycl_mul_mat_id
+// to actually consume device-computed ids via an event-chained D2H copy
+// instead of the current CPU-produced prompt_ids_snapshot, is deliberately
+// NOT part of this change -- enabling this flag alone only moves WHERE the
+// routing subgraph computes; nothing yet reads the result differently.
+static bool ggml_sycl_moe_routing_device_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_ROUTING_DEVICE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // Check if a tensor's operation should be dispatched to CPU based on
 // weight residency. For MUL_MAT, classifies the layer by querying the
 // unified cache for the weight tensor's location. For other ops (norm,
@@ -74577,6 +74597,47 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
         return n04bq_probe_ret(true, host_weight_reason ? host_weight_reason : "host-weight");
     }
     ggml_sycl_result_output_diag(ctx, dst, "after-host-weight-check", false, nullptr, cpu_offload_available);
+
+    // llama.cpp-iikr (device-routing pivot, stage i): opt-in bypass, checked
+    // BEFORE the existing routing-subgraph interception below so that
+    // interception remains fully intact -- unreached, not modified -- for
+    // every call where the gate is off.
+    //
+    // Deliberately narrower than ggml_sycl_op_is_moe_routing_subgraph()'s
+    // full op set (MUL_MAT/ADD/ARGSORT/TOP_K/GET_ROWS/SOFT_MAX): this stage
+    // only needs the nodes that PRODUCE the routing ids -- the router
+    // logits matmul, its softmax, and the argsort that selects experts
+    // (src/llama-graph.cpp:1902-1907, ggml_argsort_top_k() is ARGSORT +
+    // a VIEW, ggml.c:5385-5399 -- GPT-OSS never reaches a real GGML_OP_TOP_K
+    // node). GET_ROWS is excluded on purpose: it is also matched by the
+    // subgraph classifier for the SEPARATE "weights" gather
+    // (llama-graph.cpp:1918, shape [1, n_expert_used, n_tokens]) where
+    // token count sits in ne[2], not ne[1] -- a uniform ne[1] > 1 check
+    // would misclassify that node's decode case (ne[1] == n_expert_used,
+    // e.g. 4, which is > 1 regardless of token count) as PP-shaped. That
+    // gather also isn't part of routing (WHICH expert) at all, only of the
+    // downstream blending weight -- out of this stage's scope by the
+    // design doc's own definition of "ids". ADD (the DeepSeek-style
+    // expert-selection-bias node) is excluded for the same reason: GPT-OSS
+    // has no exp_probs_b, so it never reaches this path for this model, and
+    // its shape convention hasn't been checked.
+    //
+    // ne[1] > 1 IS the correct PP/decode discriminator for the three ops
+    // this stage does cover -- MUL_MAT (router logits, [n_expert,
+    // n_tokens]), SOFT_MAX (probs, same shape), and ARGSORT (full sort,
+    // same shape) -- all carry token count in ne[1], matching the same
+    // ne12/ne[1] > 1 convention ggml_sycl_mul_mat_id already uses. TG/decode
+    // is deliberately excluded per the design doc's own scoping rationale
+    // (c-ymuc: a single-token router matmul may already be faster on CPU
+    // than a device kernel launch; that tradeoff is unmeasured).
+    const bool is_routing_ids_producer =
+        dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_SOFT_MAX || dst->op == GGML_OP_ARGSORT;
+    if (ggml_sycl_moe_routing_device_enabled() && is_routing_ids_producer && dst->ne[1] > 1 &&
+        ggml_sycl_op_is_moe_routing_subgraph(dst)) {
+        g_last_dispatch_query  = dst;
+        g_last_dispatch_result = false;
+        return n04bq_probe_ret(false, "moe_routing_device_gate");
+    }
 
     if (ggml_sycl_planner_authoritative_residency_active(ctx.device) &&
         (ggml_sycl_op_is_moe_routing_subgraph(dst) || ggml_sycl_op_is_host_gate_activation_chain(dst, ctx.device))) {

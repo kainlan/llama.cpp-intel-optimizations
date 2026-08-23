@@ -500,6 +500,23 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# MoE routing device-vs-CPU correctness oracle (llama.cpp-iikr, device-
+# routing pivot stage i, owner ruling task comment c-cgta): a correctness
+# gate, not a throughput measurement, but registered add_executable-only
+# like the two SYCL benches above rather than via llama_build_and_test --
+# it needs GGML_SYCL_MOE_ROUTING_DEVICE semantics (set internally by the
+# test itself before any SYCL call, see the file header) and RED/GREEN
+# verification on real hardware by hand, not a default ctest sweep run.
+# Uses only the portable ggml-backend API (ggml_backend_cpu_init/
+# ggml_backend_sycl_init/ggml_backend_graph_compute) -- no raw SYCL/oneDNN
+# code in the test file itself, so it needs llama-common's link surface
+# (same as test-onednn-woq-mxfp4 above) but none of that test's
+# IntelSYCL::SYCL_CXX / -fsycl compile-flag handling.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-moe-routing-device-oracle test-sycl-moe-routing-device-oracle.cpp)
+    target_link_libraries(test-sycl-moe-routing-device-oracle PRIVATE llama-common)
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
