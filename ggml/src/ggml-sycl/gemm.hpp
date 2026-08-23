@@ -20,6 +20,7 @@
 
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"
+#    include "sycl-kernel-profiler.hpp"
 
 #    include <array>
 #    include <atomic>
@@ -1097,7 +1098,23 @@ class DnnlGemmWrapper {
                     }
                     args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
                 }
-                return dnnl::sycl_interop::execute(cached3d->primitive, stream, args, deps);
+                sycl::event exec_event = dnnl::sycl_interop::execute(cached3d->primitive, stream, args, deps);
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): the
+                // gap-cause classifier has zero coverage of this call today
+                // (static survey, task comment c-d92w) -- wrap it with the
+                // SAME device-timestamped profiler used across the rest of
+                // the backend. Record-only (the event is already captured),
+                // no-ops entirely when GGML_SYCL_KERNEL_PROFILE is unset.
+                if (ggml_sycl_kernel_profile_enabled()) {
+                    ggml_sycl_profile_label gemm_label{};
+                    gemm_label.name       = "mxfp4.pp.gemm.execute";
+                    gemm_label.category   = "mxfp4.pp.gemm";
+                    gemm_label.queue_kind = "compute";
+                    gemm_label.metadata   = "arm=3d";
+                    gemm_label.device     = ctx.device;
+                    ggml_sycl_kernel_profile_record_event(gemm_label, exec_event);
+                }
+                return exec_event;
             }
             tri_state[dev_id].store(-1, std::memory_order_release);
             if (g_ggml_sycl_debug) {
@@ -1196,7 +1213,33 @@ class DnnlGemmWrapper {
             }
             const std::vector<sycl::event> iter_deps =
                 (b == 0) ? deps : std::vector<sycl::event>{ per_batch_events.back() };
-            per_batch_events.push_back(dnnl::sycl_interop::execute(cached2d->primitive, stream, args, iter_deps));
+            sycl::event exec_event = dnnl::sycl_interop::execute(cached2d->primitive, stream, args, iter_deps);
+            // llama.cpp-iikr (sycl-kernel-profiler extension cycle): THIS is
+            // the required arm -- the per-expert-execute loop the static
+            // survey (task comment c-d92w) found completely dark to the
+            // gap-cause classifier, and the one team-lead's three suspects
+            // (queue occupancy of many small submissions, cross-engine
+            // dependency latency, host graph-walk overhead) most needed
+            // resolved. One event per batch element, matching the loop's
+            // own per-expert granularity -- deliberately NOT the merged
+            // barrier returned below, which times only the (near-instant)
+            // barrier command itself (see this function's own gemm_events
+            // caller-side comment in ggml-sycl.cpp for that exact trap).
+            // metadata is a local std::string whose .c_str() is safe here:
+            // ggml_sycl_kernel_profile_record_event synchronously copies it
+            // into an owned std::string (profile_key::metadata) before this
+            // call returns -- see snapshot_label in sycl-kernel-profiler.cpp.
+            if (ggml_sycl_kernel_profile_enabled()) {
+                ggml_sycl_profile_label gemm_label{};
+                gemm_label.name                  = "mxfp4.pp.gemm.execute";
+                gemm_label.category              = "mxfp4.pp.gemm";
+                gemm_label.queue_kind            = "compute";
+                const std::string batch_metadata = "arm=2d;batch_idx=" + std::to_string(b);
+                gemm_label.metadata              = batch_metadata.c_str();
+                gemm_label.device                = ctx.device;
+                ggml_sycl_kernel_profile_record_event(gemm_label, exec_event);
+            }
+            per_batch_events.push_back(exec_event);
         }
         return q->ext_oneapi_submit_barrier(per_batch_events);
     }

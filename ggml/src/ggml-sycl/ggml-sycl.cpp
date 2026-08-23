@@ -72014,11 +72014,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (experts_are_tiled) {
                     repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
                         repack_srcs.data(), n_slots, batched_weight_bytes, weight_slot_bytes, woq_nibble_slot_bytes,
-                        blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream());
+                        blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream(),
+                        ctx.device);
                 } else {
                     repack_mxfp4_soa_to_woq_coalesced_batched(repack_srcs.data(), n_slots, batched_weight_bytes,
                                                               weight_slot_bytes, woq_nibble_slot_bytes, blocks_per_row,
-                                                              static_cast<int>(ne01), ctx.stream());
+                                                              static_cast<int>(ne01), ctx.stream(), ctx.device);
                 }
                 if (pp_profile) {
                     pp_profile_repack_end.push_back(
@@ -72044,12 +72045,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // Coalesced form -- see the batched call site above
                         // for the fallback-gate rationale (llama.cpp-0vqt).
                         if (experts_are_tiled) {
-                            repack_mxfp4_xmx_tiled_to_woq_coalesced(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                                    static_cast<int>(ne01),
-                                                                    static_cast<int>(tile_n_total), ctx.stream());
+                            repack_mxfp4_xmx_tiled_to_woq_coalesced(
+                                expert.ptr, nibble_dst, scale_dst, blocks_per_row, static_cast<int>(ne01),
+                                static_cast<int>(tile_n_total), ctx.stream(), ctx.device);
                         } else {
                             repack_mxfp4_soa_to_woq_coalesced(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                              static_cast<int>(ne01), ctx.stream());
+                                                              static_cast<int>(ne01), ctx.stream(), ctx.device);
                         }
                         if (pp_profile) {
                             pp_profile_repack_end.push_back(
@@ -72072,11 +72073,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     cgh.parallel_for(
                         sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
                             k_copy_src1_to_contiguous_f16_mapped(src1_original, act_get, row_mapping_get, ne11, ne10,
-                                                                 nb11, nb12, dst_nb1_f16, item_ct1);
+                                                                    nb11, nb12, dst_nb1_f16, item_ct1);
                         });
                 });
                 if (pp_profile) {
                     pp_profile_stage_events.push_back(activation_copy_event);
+                }
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): the
+                // gap-cause classifier (scripts/parse-sycl-gap-causes.py) has
+                // zero coverage of the MoE dispatch window's own kernels --
+                // confirmed by static survey (task comment c-d92w) -- so wrap
+                // this stage kernel with the SAME device-timestamped profiler
+                // already used across mmvq.cpp/unified-kernel.cpp/softmax.cpp
+                // etc. Uses the already-captured event (no lambda
+                // restructuring): ggml_sycl_kernel_profile_record_event is
+                // the record-only half of ggml_sycl_profile_submit, exactly
+                // for this "I already have the event" case. No-ops entirely
+                // when GGML_SYCL_KERNEL_PROFILE is unset (its own internal
+                // gate) -- zero default-env behavior change.
+                if (ggml_sycl_kernel_profile_enabled()) {
+                    ggml_sycl_profile_label stage_label{};
+                    stage_label.name       = "mxfp4.pp.stage.act";
+                    stage_label.category   = "mxfp4.pp.stage";
+                    stage_label.queue_kind = "compute";
+                    stage_label.metadata   = "phase=activation_copy_in";
+                    stage_label.device     = ctx.device;
+                    stage_label.bytes      = rows * ne10 * sizeof(sycl::half);
+                    ggml_sycl_kernel_profile_record_event(stage_label, activation_copy_event);
                 }
             }
 
@@ -72410,6 +72433,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 });
                 if (pp_profile) {
                     pp_profile_stage_events.push_back(scatter_copy_event);
+                }
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): see
+                // the activation-copy site above for why/how.
+                if (ggml_sycl_kernel_profile_enabled()) {
+                    ggml_sycl_profile_label stage_label{};
+                    stage_label.name       = "mxfp4.pp.stage.scatter";
+                    stage_label.category   = "mxfp4.pp.stage";
+                    stage_label.queue_kind = "compute";
+                    stage_label.metadata   = "phase=output_scatter_out";
+                    stage_label.device     = ctx.device;
+                    stage_label.bytes      = rows * ne0 * sizeof(float);
+                    ggml_sycl_kernel_profile_record_event(stage_label, scatter_copy_event);
                 }
             }
 

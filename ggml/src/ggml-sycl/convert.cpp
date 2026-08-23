@@ -7,6 +7,7 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "presets.hpp"
+#include "sycl-kernel-profiler.hpp"
 
 #include <utility>
 #include <vector>
@@ -1708,12 +1709,19 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_kernel(const uint8_t * __re
 // Host entry point: falls back to repack_mxfp4_soa_to_woq byte-for-byte
 // when N % NBLK != 0 (see the file comment above) -- correctness holds for
 // any (blocks_per_row, nrows), the coalesced speedup is scoped to N%16==0.
+// llama.cpp-iikr (sycl-kernel-profiler extension cycle): `device` labels the
+// internal ggml_sycl_kernel_profile_record_event calls added below -- a
+// defaulted trailing parameter, so every existing caller (including
+// tests/test-sycl-mxfp4-woq-*-repack.cpp) compiles unchanged. See
+// convert.hpp's declaration comment for why this is a labeling parameter,
+// not a return-type/signature change.
 void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
                                        uint8_t *       dst_nibbles,
                                        uint8_t *       dst_scales,
                                        int             blocks_per_row,
                                        int             nrows,
-                                       dpct::queue_ptr stream) {
+                                       dpct::queue_ptr stream,
+                                       int             device) {
     constexpr int NBLK = MXFP4_WOQ_REPACK_COALESCED_NBLK;
     if (nrows % NBLK != 0) {
         repack_mxfp4_soa_to_woq(src, dst_nibbles, dst_scales, blocks_per_row, nrows, stream);
@@ -1748,7 +1756,7 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE_NIBBLES),
                                            sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
@@ -1757,17 +1765,35 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
                                                                               get_pointer(local_acc), item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.soa";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=nibbles;form=per_slot";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
+    }
 
-    const int64_t b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
-    stream->submit([&](sycl::handler & cgh) {
+    const int64_t b_tiles      = (blocks_per_row + NBLK - 1) / NBLK;
+    sycl::event   scales_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, b_tiles, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
             [=](sycl::nd_item<3> item) {
                 repack_mxfp4_soa_to_woq_coalesced_scales_kernel(e, dst_scales, blocks_per_row, N,
-                                                                get_pointer(local_acc), item);
+                                                                  get_pointer(local_acc), item);
             });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.soa";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=scales;form=per_slot";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, scales_event);
+    }
 }
 
 static void repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
@@ -1882,6 +1908,9 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(mxfp4_woq_re
 // index, matching the existing *_batched kernels' convention). Falls back
 // to repack_mxfp4_soa_to_woq_batched byte-for-byte on the same N%NBLK!=0
 // condition as the per-slot form above.
+// llama.cpp-iikr (sycl-kernel-profiler extension cycle): see
+// repack_mxfp4_soa_to_woq_coalesced's comment above -- same defaulted
+// labeling parameter, same reasoning.
 void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
                                                int                  n_slots,
                                                uint8_t *            dst_weight_base,
@@ -1889,7 +1918,8 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
                                                size_t               woq_nibble_slot_bytes,
                                                int                  blocks_per_row,
                                                int                  nrows,
-                                               dpct::queue_ptr      stream) {
+                                               dpct::queue_ptr      stream,
+                                               int                  device) {
     GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
 
     constexpr int NBLK = MXFP4_WOQ_REPACK_COALESCED_NBLK;
@@ -1926,7 +1956,7 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE_NIBBLES),
                                            sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
@@ -1936,18 +1966,36 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
                                  get_pointer(local_acc), item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.soa";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=nibbles;form=batched";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
+    }
 
-    const int64_t b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
-    stream->submit([&](sycl::handler & cgh) {
+    const int64_t b_tiles      = (blocks_per_row + NBLK - 1) / NBLK;
+    sycl::event   scales_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, n_slots, b_tiles * n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
             [=](sycl::nd_item<3> item) {
                 repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(src_table, dst_weight_base, weight_slot_bytes,
-                                                                        woq_nibble_slot_bytes, blocks_per_row, N,
-                                                                        nblocks, n_tiles, get_pointer(local_acc), item);
+                                                                          woq_nibble_slot_bytes, blocks_per_row, N,
+                                                                          nblocks, n_tiles, get_pointer(local_acc), item);
             });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.soa";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=scales;form=batched";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, scales_event);
+    }
 }
 
 // XMX_TILED MXFP4 -> WOQ repack: inverts the tiled materializer's byte
@@ -2305,13 +2353,17 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_kernel(const uint8_t 
 // Host entry point: falls back to repack_mxfp4_xmx_tiled_to_woq
 // byte-for-byte when the fast-path preconditions don't hold (see the file
 // comment above).
+// llama.cpp-iikr (sycl-kernel-profiler extension cycle): see
+// repack_mxfp4_soa_to_woq_coalesced's comment above -- same defaulted
+// labeling parameter, same reasoning.
 void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
                                              uint8_t *       dst_nibbles,
                                              uint8_t *       dst_scales,
                                              int             blocks_per_row,
                                              int             nrows,
                                              int             tile_n_total,
-                                             dpct::queue_ptr stream) {
+                                             dpct::queue_ptr stream,
+                                             int             device) {
     const int64_t N = nrows;
     // Iteration 3 (llama.cpp-0vqt) tightened this from tile_n_total % 4 ==
     // 0 to tile_n_total == 16 EXACTLY: the vectorized phase-2 write below
@@ -2341,7 +2393,7 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
     constexpr int   wg_nibbles      = 32;
     const int       row             = tile_n_total + 1;
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * wg_nibbles),
                                            sycl::range<3>(1, 1, wg_nibbles)),
@@ -2350,8 +2402,17 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
                                  src, dst_nibbles, N, tile_n_total, row, group_bytes, get_pointer(local_acc), item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.tiled";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=nibbles;form=per_slot";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
+    }
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event scales_event = stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * tile_n_total),
                                            sycl::range<3>(1, 1, tile_n_total)),
                          [=](sycl::nd_item<3> item) {
@@ -2359,6 +2420,15 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
                                                                                    group_bytes, item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.tiled";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=scales;form=per_slot";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, scales_event);
+    }
 }
 
 static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
@@ -2442,6 +2512,9 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_batched_kernel(mxfp4_
 // slot-in-dim1 convention as repack_mxfp4_soa_to_woq_coalesced_batched.
 // Falls back to repack_mxfp4_xmx_tiled_to_woq_batched byte-for-byte on the
 // same preconditions as the per-slot form above.
+// llama.cpp-iikr (sycl-kernel-profiler extension cycle): see
+// repack_mxfp4_soa_to_woq_coalesced's comment above -- same defaulted
+// labeling parameter, same reasoning.
 void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
                                                      int                  n_slots,
                                                      uint8_t *            dst_weight_base,
@@ -2450,7 +2523,8 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
                                                      int                  blocks_per_row,
                                                      int                  nrows,
                                                      int                  tile_n_total,
-                                                     dpct::queue_ptr      stream) {
+                                                     dpct::queue_ptr      stream,
+                                                     int                  device) {
     GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
 
     const int64_t N = nrows;
@@ -2480,7 +2554,7 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     constexpr int wg_nibbles      = 32;
     const int     row             = tile_n_total + 1;
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * wg_nibbles),
                                            sycl::range<3>(1, 1, wg_nibbles)),
@@ -2490,8 +2564,17 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
                                  group_bytes, get_pointer(local_acc), item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.tiled";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=nibbles;form=batched";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
+    }
 
-    stream->submit([&](sycl::handler & cgh) {
+    sycl::event scales_event = stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * tile_n_total),
                                            sycl::range<3>(1, 1, tile_n_total)),
                          [=](sycl::nd_item<3> item) {
@@ -2500,6 +2583,15 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
                                  n_tile_groups_n, group_bytes, item);
                          });
     });
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label label{};
+        label.name       = "mxfp4.pp.repack.tiled";
+        label.category   = "mxfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "phase=scales;form=batched";
+        label.device     = device;
+        ggml_sycl_kernel_profile_record_event(label, scales_event);
+    }
 }
 
 // Host function to launch Q4_0 Coalesced to SoA conversion

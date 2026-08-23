@@ -284,13 +284,24 @@ void repack_mxfp4_xmx_tiled_to_woq_batched(
 // 8-byte row and would zero-pad past a narrower row into the next n-tile
 // group's bytes), so the speedup is scoped but correctness is not. See
 // convert.cpp for the exact tiling derivation.
+// llama.cpp-iikr (sycl-kernel-profiler extension cycle): `device` is a
+// DEFAULTED trailing parameter (-1 = unknown/unset), added purely to label
+// the ggml_sycl_kernel_profile_record_event calls these four functions now
+// make internally when GGML_SYCL_KERNEL_PROFILE is set -- it does not
+// change these functions' return type or existing call sites (including
+// tests/test-sycl-mxfp4-woq-*-repack.cpp, which is out of this task's file
+// scope and compiles unchanged against the default). Deliberately NOT an
+// event-returning signature change -- see convert.cpp's definitions for why
+// that would be the wrong fix even if the scope allowed it (mirrors the
+// gemm_events barrier-timing trap in gemm.hpp/ggml-sycl.cpp).
 void repack_mxfp4_soa_to_woq_coalesced(
     const void * src,
     uint8_t * dst_nibbles,
     uint8_t * dst_scales,
     int blocks_per_row,
     int nrows,
-    dpct::queue_ptr stream);
+    dpct::queue_ptr stream,
+    int device = -1);
 
 void repack_mxfp4_soa_to_woq_coalesced_batched(
     const void * const * srcs,
@@ -300,7 +311,8 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(
     size_t woq_nibble_slot_bytes,
     int blocks_per_row,
     int nrows,
-    dpct::queue_ptr stream);
+    dpct::queue_ptr stream,
+    int device = -1);
 
 void repack_mxfp4_xmx_tiled_to_woq_coalesced(
     const void * src_tiled,
@@ -309,7 +321,8 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(
     int blocks_per_row,
     int nrows,
     int tile_n_total,
-    dpct::queue_ptr stream);
+    dpct::queue_ptr stream,
+    int device = -1);
 
 void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
     const void * const * srcs,
@@ -320,7 +333,8 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
     int blocks_per_row,
     int nrows,
     int tile_n_total,
-    dpct::queue_ptr stream);
+    dpct::queue_ptr stream,
+    int device = -1);
 
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
