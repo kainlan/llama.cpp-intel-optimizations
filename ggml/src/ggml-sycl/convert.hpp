@@ -271,6 +271,54 @@ void repack_mxfp4_xmx_tiled_to_woq_batched(
     int tile_n_total,
     dpct::queue_ptr stream);
 
+// Coalesced (SLM-tiled transpose) forms of the two repack functions above
+// (perf-recovery epic, track D, llama.cpp-0vqt): read/write in each
+// direction's native (coalesced) axis, bridged through workgroup-local
+// memory, instead of the byte-granularity scattered transpose the
+// functions above perform. Byte-for-byte identical output to their
+// non-coalesced counterparts in all cases -- each falls back to the
+// original kernel whenever its fast-path precondition doesn't hold (N %
+// 16 == 0 for the SOA forms; tile_n_total even and N % tile_n_total == 0
+// for the XMX_TILED forms), so the speedup is scoped but correctness is
+// not. See convert.cpp for the exact tiling derivation.
+void repack_mxfp4_soa_to_woq_coalesced(
+    const void * src,
+    uint8_t * dst_nibbles,
+    uint8_t * dst_scales,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
+void repack_mxfp4_soa_to_woq_coalesced_batched(
+    const void * const * srcs,
+    int n_slots,
+    uint8_t * dst_weight_base,
+    size_t weight_slot_bytes,
+    size_t woq_nibble_slot_bytes,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
+void repack_mxfp4_xmx_tiled_to_woq_coalesced(
+    const void * src_tiled,
+    uint8_t * dst_nibbles,
+    uint8_t * dst_scales,
+    int blocks_per_row,
+    int nrows,
+    int tile_n_total,
+    dpct::queue_ptr stream);
+
+void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
+    const void * const * srcs,
+    int n_slots,
+    uint8_t * dst_weight_base,
+    size_t weight_slot_bytes,
+    size_t woq_nibble_slot_bytes,
+    int blocks_per_row,
+    int nrows,
+    int tile_n_total,
+    dpct::queue_ptr stream);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,

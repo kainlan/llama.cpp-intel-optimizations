@@ -302,6 +302,198 @@ static int check_batched_vs_per_slot(sycl::queue & q) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Checks 4-6 (llama.cpp-0vqt): the coalesced (SLM-tiled) forms must be
+// byte-identical to the ORIGINAL kernels at every shape, not just the fast
+// path -- run_and_check_fn below is run_and_check parameterized over WHICH
+// repack entry point is under test, so the reference stays independent of
+// the kernel-under-test in exactly the way check_randomized's does.
+// ---------------------------------------------------------------------------
+static int run_and_check_fn(sycl::queue & q,
+                            const char *  label,
+                            void (*repack_fn)(const void *, uint8_t *, uint8_t *, int, int, dpct::queue_ptr),
+                            const uint8_t * src,
+                            size_t          src_bytes,
+                            int             blocks_per_row,
+                            int             nrows,
+                            const uint8_t * expected_nibbles,
+                            size_t          nibbles_bytes,
+                            const uint8_t * expected_scales,
+                            size_t          scales_bytes) {
+    uint8_t * src_dev   = (uint8_t *) sycl::malloc_device(src_bytes, q);
+    uint8_t * nib_dev   = (uint8_t *) sycl::malloc_device(nibbles_bytes, q);
+    uint8_t * scale_dev = (uint8_t *) sycl::malloc_device(scales_bytes, q);
+    q.memcpy(src_dev, src, src_bytes).wait();
+
+    repack_fn(src_dev, nib_dev, scale_dev, blocks_per_row, nrows, &q);
+    q.wait();
+
+    std::vector<uint8_t> got_nibbles(nibbles_bytes);
+    std::vector<uint8_t> got_scales(scales_bytes);
+    q.memcpy(got_nibbles.data(), nib_dev, nibbles_bytes).wait();
+    q.memcpy(got_scales.data(), scale_dev, scales_bytes).wait();
+
+    sycl::free(src_dev, q);
+    sycl::free(nib_dev, q);
+    sycl::free(scale_dev, q);
+
+    if (std::memcmp(got_nibbles.data(), expected_nibbles, nibbles_bytes) != 0) {
+        for (size_t i = 0; i < nibbles_bytes; ++i) {
+            if (got_nibbles[i] != expected_nibbles[i]) {
+                std::printf("FAIL[%s]: nibble-plane mismatch at byte %zu: got=0x%02x want=0x%02x\n", label, i,
+                            got_nibbles[i], expected_nibbles[i]);
+                return 1;
+            }
+        }
+    }
+    if (std::memcmp(got_scales.data(), expected_scales, scales_bytes) != 0) {
+        for (size_t i = 0; i < scales_bytes; ++i) {
+            if (got_scales[i] != expected_scales[i]) {
+                std::printf("FAIL[%s]: scale-plane mismatch at index %zu: got=0x%02x want=0x%02x\n", label, i,
+                            got_scales[i], expected_scales[i]);
+                return 1;
+            }
+        }
+    }
+    std::printf("OK[%s]: matches (%zu nibble bytes, %zu scale bytes)\n", label, nibbles_bytes, scales_bytes);
+    return 0;
+}
+
+// Randomized fixture, reference computed the same way check_randomized's is
+// (deliberately independent of the kernel under test), run through
+// repack_mxfp4_soa_to_woq_coalesced at a caller-supplied shape -- used both
+// for a fast-path shape (N % 16 == 0, the SLM-tiled kernels engage) and a
+// fallback shape (N % 16 != 0, repack_mxfp4_soa_to_woq_coalesced calls the
+// original kernel internally) so BOTH dispatch branches are proven correct,
+// not just "doesn't crash".
+static int check_coalesced_randomized(sycl::queue & q, const char * label, int blocks_per_row, int nrows) {
+    const int64_t K = (int64_t) blocks_per_row * QK_MXFP4;
+    const int64_t N = nrows;
+
+    const int64_t nblocks   = (int64_t) nrows * blocks_per_row;
+    const size_t  qs_bytes  = (size_t) nblocks * (QK_MXFP4 / 2);
+    const size_t  e_bytes   = (size_t) nblocks;
+    const size_t  src_bytes = qs_bytes + e_bytes;
+
+    std::vector<uint8_t>               src_host(src_bytes);
+    std::mt19937                       rng(142);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    for (size_t i = 0; i < src_bytes; ++i) {
+        src_host[i] = (uint8_t) byte_dist(rng);
+    }
+    const uint8_t * qs      = src_host.data();
+    const uint8_t * e_plane = qs + qs_bytes;
+
+    // CPU reference: mirrors the ORIGINAL kernel's index derivation (same
+    // formula as check_randomized above), independent of the coalesced
+    // kernel's own tiling arithmetic.
+    std::vector<uint8_t> ref_nibbles((size_t) (K * N / 2));
+    auto                 nib_at = [&](int64_t el) -> uint8_t {
+        const int64_t k       = el / N;
+        const int64_t n       = el - k * N;
+        const int64_t b       = k / QK_MXFP4;
+        const int64_t k_local = k - b * QK_MXFP4;
+        const int64_t block_i = n * blocks_per_row + b;
+        const bool    lo      = k_local < QK_MXFP4 / 2;
+        const uint8_t byte    = qs[block_i * (QK_MXFP4 / 2) + (lo ? k_local : k_local - QK_MXFP4 / 2)];
+        return lo ? (byte & 0xf) : (byte >> 4);
+    };
+    for (int64_t el = 0; el < K * N; el += 2) {
+        const uint8_t lo_nib = nib_at(el);
+        const uint8_t hi_nib = nib_at(el + 1);
+        ref_nibbles[el / 2]  = (uint8_t) (lo_nib | (hi_nib << 4));
+    }
+
+    std::vector<uint8_t> ref_scales((size_t) (blocks_per_row * N));
+    for (int64_t kg = 0; kg < blocks_per_row; ++kg) {
+        for (int64_t n = 0; n < N; ++n) {
+            ref_scales[(size_t) (kg * N + n)] = e_plane[(size_t) (n * blocks_per_row + kg)];
+        }
+    }
+
+    return run_and_check_fn(q, label, repack_mxfp4_soa_to_woq_coalesced, src_host.data(), src_bytes, blocks_per_row,
+                            nrows, ref_nibbles.data(), ref_nibbles.size(), ref_scales.data(), ref_scales.size());
+}
+
+// Check 6 (llama.cpp-0vqt): repack_mxfp4_soa_to_woq_coalesced_batched must
+// match n_slots sequential calls to repack_mxfp4_soa_to_woq_coalesced
+// (proven against the CPU reference above), at a fast-path shape (N % 16
+// == 0, so the batched SLM-tiled kernels -- not their fallback -- are what
+// gets cross-checked).
+static int check_coalesced_batched_vs_per_slot(sycl::queue & q) {
+    constexpr int blocks_per_row = 3;   // K = 96
+    constexpr int nrows          = 32;  // N = 32, multiple of 16 -- fast path
+    constexpr int n_slots        = 5;
+    const int64_t K              = (int64_t) blocks_per_row * QK_MXFP4;
+    const int64_t N              = nrows;
+
+    const int64_t nblocks   = (int64_t) nrows * blocks_per_row;
+    const size_t  qs_bytes  = (size_t) nblocks * (QK_MXFP4 / 2);
+    const size_t  e_bytes   = (size_t) nblocks;
+    const size_t  src_bytes = qs_bytes + e_bytes;
+
+    const size_t nibble_bytes      = (size_t) (K * N / 2);
+    const size_t scale_bytes       = (size_t) (blocks_per_row * N);
+    const size_t weight_slot_bytes = nibble_bytes + scale_bytes;
+
+    std::mt19937                       rng(146);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    std::vector<std::vector<uint8_t>> src_host(n_slots);
+    std::vector<uint8_t *>            src_dev(n_slots);
+    for (int s = 0; s < n_slots; ++s) {
+        src_host[s].resize(src_bytes);
+        for (auto & b : src_host[s]) {
+            b = (uint8_t) byte_dist(rng);
+        }
+        src_dev[s] = (uint8_t *) sycl::malloc_device(src_bytes, q);
+        q.memcpy(src_dev[s], src_host[s].data(), src_bytes).wait();
+    }
+
+    uint8_t * ref_base     = (uint8_t *) sycl::malloc_device(weight_slot_bytes * n_slots, q);
+    uint8_t * batched_base = (uint8_t *) sycl::malloc_device(weight_slot_bytes * n_slots, q);
+
+    for (int s = 0; s < n_slots; ++s) {
+        uint8_t * nibble_dst = ref_base + (size_t) s * weight_slot_bytes;
+        uint8_t * scale_dst  = nibble_dst + nibble_bytes;
+        repack_mxfp4_soa_to_woq_coalesced(src_dev[s], nibble_dst, scale_dst, blocks_per_row, nrows, &q);
+    }
+    q.wait();
+
+    std::vector<const void *> srcs(src_dev.begin(), src_dev.end());
+    repack_mxfp4_soa_to_woq_coalesced_batched(srcs.data(), n_slots, batched_base, weight_slot_bytes, nibble_bytes,
+                                              blocks_per_row, nrows, &q);
+    q.wait();
+
+    std::vector<uint8_t> got_ref(weight_slot_bytes * n_slots);
+    std::vector<uint8_t> got_batched(weight_slot_bytes * n_slots);
+    q.memcpy(got_ref.data(), ref_base, got_ref.size()).wait();
+    q.memcpy(got_batched.data(), batched_base, got_batched.size()).wait();
+
+    for (int s = 0; s < n_slots; ++s) {
+        sycl::free(src_dev[s], q);
+    }
+    sycl::free(ref_base, q);
+    sycl::free(batched_base, q);
+
+    if (std::memcmp(got_ref.data(), got_batched.data(), got_ref.size()) != 0) {
+        for (size_t i = 0; i < got_ref.size(); ++i) {
+            if (got_ref[i] != got_batched[i]) {
+                std::printf(
+                    "FAIL[coalesced-batched-vs-per-slot]: mismatch at byte %zu (slot %zu): per_slot=0x%02x "
+                    "batched=0x%02x\n",
+                    i, i / weight_slot_bytes, got_ref[i], got_batched[i]);
+                return 1;
+            }
+        }
+    }
+    std::printf(
+        "OK[coalesced-batched-vs-per-slot]: repack_mxfp4_soa_to_woq_coalesced_batched matches %d sequential "
+        "repack_mxfp4_soa_to_woq_coalesced calls (%zu bytes/slot)\n",
+        n_slots, weight_slot_bytes);
+    return 0;
+}
+
 int main() {
     try {
         sycl::queue q{ sycl::gpu_selector_v };
@@ -317,6 +509,25 @@ int main() {
             return rc;
         }
         rc = check_batched_vs_per_slot(q);
+        if (rc != 0) {
+            return rc;
+        }
+        // Coalesced (SLM-tiled) forms, llama.cpp-0vqt: fast path (N%16==0,
+        // real GPT-OSS gate/up/down shape included), then the fallback
+        // branch (N%16!=0), then the batched fast path.
+        rc = check_coalesced_randomized(q, "coalesced-fastpath", /*blocks_per_row=*/5, /*nrows=*/32);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = check_coalesced_randomized(q, "coalesced-fallback", /*blocks_per_row=*/5, /*nrows=*/11);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = check_coalesced_randomized(q, "coalesced-gptoss-shape", /*blocks_per_row=*/90, /*nrows=*/2880);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = check_coalesced_batched_vs_per_slot(q);
         if (rc != 0) {
             return rc;
         }

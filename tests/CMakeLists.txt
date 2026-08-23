@@ -462,6 +462,25 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 endif()
 
+# WOQ repack kernel microbench (perf-recovery epic, track D, llama.cpp-0vqt):
+# NOT a ctest -- it is a device-event throughput measurement, not a
+# correctness gate (that's test-sycl-mxfp4-woq-{,tiled-}repack above), so it
+# uses add_executable directly rather than llama_build_and_test. Build with
+# `./scripts/sycl-build.sh test-sycl-mxfp4-woq-repack-bench` and run manually
+# (see the file header for the full command, device selector required).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-mxfp4-woq-repack-bench test-sycl-mxfp4-woq-repack-bench.cpp)
+    target_include_directories(test-sycl-mxfp4-woq-repack-bench PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+    target_link_libraries(test-sycl-mxfp4-woq-repack-bench PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-mxfp4-woq-repack-bench PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-mxfp4-woq-repack-bench PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-mxfp4-woq-repack-bench PRIVATE "-fsycl")
+        target_link_options(test-sycl-mxfp4-woq-repack-bench PRIVATE "-fsycl")
+    endif()
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
