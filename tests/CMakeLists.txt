@@ -481,6 +481,25 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# Custom PP GEMM activation-format microbench (llama.cpp-iikr, stage 1):
+# same rationale as the repack bench above -- a device-event throughput
+# measurement, not a correctness gate, so add_executable directly. Build
+# with `./scripts/sycl-build.sh test-sycl-mxfp4-woq-gemm-bench` and run
+# manually (see the file header for the full command, device selector
+# required).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-mxfp4-woq-gemm-bench test-sycl-mxfp4-woq-gemm-bench.cpp)
+    target_include_directories(test-sycl-mxfp4-woq-gemm-bench PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/include)
+    target_link_libraries(test-sycl-mxfp4-woq-gemm-bench PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-mxfp4-woq-gemm-bench PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-mxfp4-woq-gemm-bench PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-mxfp4-woq-gemm-bench PRIVATE "-fsycl")
+        target_link_options(test-sycl-mxfp4-woq-gemm-bench PRIVATE "-fsycl")
+    endif()
+endif()
+
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
