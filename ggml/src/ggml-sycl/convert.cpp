@@ -1579,6 +1579,24 @@ void repack_mxfp4_soa_to_woq_batched(const void * const * srcs,
 // same N%NBLK==0 gate as nibbles, checked once for both planes).
 constexpr int MXFP4_WOQ_REPACK_COALESCED_NBLK = 16;
 
+// SLM row stride, padded by one element (perf-recovery epic, track D
+// iteration 2, llama.cpp-0vqt): a phase-1 subgroup at fixed n_local writes
+// local[j*NBLK+n_local] for j=0..15 -- consecutive lanes' addresses are
+// exactly NBLK bytes apart, which aliases every lane onto the SAME SLM bank
+// on any hardware whose bank count divides NBLK evenly (16 and 32 both
+// do), serializing what should be a single-cycle store. Padding the row to
+// NBLK+1 makes the stride coprime with those bank counts, eliminating the
+// systematic collision. Used by both the nibbles kernel's [32][ROW] layout
+// and the scales kernel's [TILE][ROW] layout (TILE == NBLK here).
+constexpr int MXFP4_WOQ_REPACK_COALESCED_ROW = MXFP4_WOQ_REPACK_COALESCED_NBLK + 1;
+
+// Phase 1 reads the source in ONE lane-per-n_local, four-aligned-uint32
+// vector loads instead of 16 lanes each doing a single scalar byte load:
+// block_i*(QK_MXFP4/2) is always 16-byte aligned (block_i*16), so each of
+// the four uint32 words is naturally 4-byte aligned. This cuts the memory
+// instruction count 16x-per-block and lets one lane pull the whole block in
+// a handful of wide transactions instead of leaning on cross-lane
+// coalescing of single-byte loads.
 static void repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(const uint8_t * __restrict__ qs,
                                                              uint8_t * __restrict__ dst_nibbles,
                                                              int     blocks_per_row,
@@ -1586,25 +1604,30 @@ static void repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(const uint8_t * __r
                                                              uint8_t * __restrict__ local,
                                                              const sycl::nd_item<3> & item) {
     constexpr int NBLK = MXFP4_WOQ_REPACK_COALESCED_NBLK;
+    constexpr int ROW  = MXFP4_WOQ_REPACK_COALESCED_ROW;
     const int     b    = static_cast<int>(item.get_group(1));
     const int64_t n0   = static_cast<int64_t>(item.get_group(2)) * NBLK;
     const int     lid  = static_cast<int>(item.get_local_id(2));
 
-    {
-        const int     n_local            = lid / 16;
-        const int     j                  = lid % 16;
-        const int64_t block_i            = (n0 + n_local) * blocks_per_row + b;
-        const uint8_t byte               = qs[block_i * (QK_MXFP4 / 2) + j];
-        local[j * NBLK + n_local]        = byte & 0xf;
-        local[(j + 16) * NBLK + n_local] = byte >> 4;
+    if (lid < NBLK) {
+        const int              n_local = lid;
+        const int64_t          block_i = (n0 + n_local) * blocks_per_row + b;
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(qs + block_i * (QK_MXFP4 / 2));
+        const uint32_t         w[4]    = { blk32[0], blk32[1], blk32[2], blk32[3] };
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t byte              = static_cast<uint8_t>(w[j >> 2] >> ((j & 3) * 8));
+            local[j * ROW + n_local]        = byte & 0xf;
+            local[(j + 16) * ROW + n_local] = byte >> 4;
+        }
     }
     item.barrier(sycl::access::fence_space::local_space);
     {
         const int     k_local                      = lid / (NBLK / 2);
         const int     n_pair                       = lid % (NBLK / 2);
         const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * NBLK + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * NBLK + 2 * n_pair + 1];
+        const uint8_t lo                           = local[k_local * ROW + 2 * n_pair];
+        const uint8_t hi                           = local[k_local * ROW + 2 * n_pair + 1];
         dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
     }
 }
@@ -1616,6 +1639,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_kernel(const uint8_t * __re
                                                             uint8_t * __restrict__ local,
                                                             const sycl::nd_item<3> & item) {
     constexpr int TILE = MXFP4_WOQ_REPACK_COALESCED_NBLK;
+    constexpr int ROW  = MXFP4_WOQ_REPACK_COALESCED_ROW;
     const int     b0   = static_cast<int>(item.get_group(1)) * TILE;
     const int64_t n0   = static_cast<int64_t>(item.get_group(2)) * TILE;
     const int     lid  = static_cast<int>(item.get_local_id(2));
@@ -1625,7 +1649,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_kernel(const uint8_t * __re
         const int b_local = lid % TILE;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            local[b_local * TILE + n_local] = e[(n0 + n_local) * blocks_per_row + b];
+            local[b_local * ROW + n_local] = e[(n0 + n_local) * blocks_per_row + b];
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
@@ -1634,7 +1658,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_kernel(const uint8_t * __re
         const int n_local = lid % TILE;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * TILE + n_local];
+            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * ROW + n_local];
         }
     }
 }
@@ -1662,8 +1686,10 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
     constexpr int WG_SIZE = 256;
     const int64_t n_tiles = N / NBLK;
 
+    constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
+
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * NBLK), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
             [=](sycl::nd_item<3> item) {
@@ -1674,7 +1700,7 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
 
     const int64_t b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * NBLK), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, b_tiles, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
             [=](sycl::nd_item<3> item) {
@@ -1693,6 +1719,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_r
                                                                      uint8_t * __restrict__ local,
                                                                      const sycl::nd_item<3> & item) {
     constexpr int NBLK     = MXFP4_WOQ_REPACK_COALESCED_NBLK;
+    constexpr int ROW      = MXFP4_WOQ_REPACK_COALESCED_ROW;
     const int     slot     = static_cast<int>(item.get_group(1));
     const int64_t tile_lin = static_cast<int64_t>(item.get_group(2));
     const int     b        = static_cast<int>(tile_lin / n_tiles);
@@ -1702,21 +1729,25 @@ static void repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_r
     const uint8_t * qs                 = static_cast<const uint8_t *>(srcs.ptr[slot]);
     uint8_t * __restrict__ dst_nibbles = dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes;
 
-    {
-        const int     n_local            = lid / 16;
-        const int     j                  = lid % 16;
-        const int64_t block_i            = (n0 + n_local) * blocks_per_row + b;
-        const uint8_t byte               = qs[block_i * (QK_MXFP4 / 2) + j];
-        local[j * NBLK + n_local]        = byte & 0xf;
-        local[(j + 16) * NBLK + n_local] = byte >> 4;
+    if (lid < NBLK) {
+        const int              n_local = lid;
+        const int64_t          block_i = (n0 + n_local) * blocks_per_row + b;
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(qs + block_i * (QK_MXFP4 / 2));
+        const uint32_t         w[4]    = { blk32[0], blk32[1], blk32[2], blk32[3] };
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t byte              = static_cast<uint8_t>(w[j >> 2] >> ((j & 3) * 8));
+            local[j * ROW + n_local]        = byte & 0xf;
+            local[(j + 16) * ROW + n_local] = byte >> 4;
+        }
     }
     item.barrier(sycl::access::fence_space::local_space);
     {
         const int     k_local                      = lid / (NBLK / 2);
         const int     n_pair                       = lid % (NBLK / 2);
         const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * NBLK + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * NBLK + 2 * n_pair + 1];
+        const uint8_t lo                           = local[k_local * ROW + 2 * n_pair];
+        const uint8_t hi                           = local[k_local * ROW + 2 * n_pair + 1];
         dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
     }
 }
@@ -1732,6 +1763,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(mxfp4_woq_re
                                                                     uint8_t * __restrict__ local,
                                                                     const sycl::nd_item<3> & item) {
     constexpr int TILE     = MXFP4_WOQ_REPACK_COALESCED_NBLK;
+    constexpr int ROW      = MXFP4_WOQ_REPACK_COALESCED_ROW;
     const int     slot     = static_cast<int>(item.get_group(1));
     const int64_t tile_lin = static_cast<int64_t>(item.get_group(2));
     const int     b0       = static_cast<int>(tile_lin / n_tiles) * TILE;
@@ -1748,7 +1780,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(mxfp4_woq_re
         const int b_local = lid % TILE;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            local[b_local * TILE + n_local] = e[(n0 + n_local) * blocks_per_row + b];
+            local[b_local * ROW + n_local] = e[(n0 + n_local) * blocks_per_row + b];
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
@@ -1757,7 +1789,7 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(mxfp4_woq_re
         const int n_local = lid % TILE;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * TILE + n_local];
+            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * ROW + n_local];
         }
     }
 }
@@ -1795,8 +1827,10 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
     constexpr int WG_SIZE = 256;
     const int64_t n_tiles = N / NBLK;
 
+    constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
+
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * NBLK), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE),
                                            sycl::range<3>(1, 1, WG_SIZE)),
                          [=](sycl::nd_item<3> item) {
@@ -1808,7 +1842,7 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
 
     const int64_t b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * NBLK), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
         cgh.parallel_for(
             sycl::nd_range<3>(sycl::range<3>(1, n_slots, b_tiles * n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
             [=](sycl::nd_item<3> item) {
@@ -2085,15 +2119,27 @@ void repack_mxfp4_xmx_tiled_to_woq_batched(const void * const * srcs,
 // destination row dst_scales[b*N+n0 .. +tile_n_total) are BOTH already
 // contiguous in n -- no transpose, no SLM, a direct per-element copy.
 //
-// Requires tile_n_total > 0, even (for the nibble-pair-packing math, same
-// reason as SOA's N-even requirement), and N % tile_n_total == 0 (every
-// tile group full, matching the doc's caps: tile_n_total=16, N=2880 ->
-// 180 exact groups). Falls back to the untiled kernel byte-for-byte
-// otherwise.
+// Requires tile_n_total > 0 and a multiple of 4 (even was sufficient for
+// the nibble-pair-packing math alone, but iteration 2's vectorized uint32
+// phase-1 reads additionally need every tile group's byte offset 4-byte
+// aligned -- see the host entry point below for the derivation), and
+// N % tile_n_total == 0 (every tile group full, matching the doc's caps:
+// tile_n_total=16, N=2880 -> 180 exact groups). Falls back to the untiled
+// kernel byte-for-byte otherwise.
+//
+// Iteration 2 (llama.cpp-0vqt, same two fixes as the SOA kernel above):
+// `row` pads the SLM row stride to tile_n_total+1 to avoid the phase-1
+// bank-conflict stride (passed in rather than a compile-time constant,
+// since tile_n_total is a runtime caps-dependent value here); phase 1
+// reads one lane's whole 16-byte block via four aligned uint32 words
+// instead of 16 scalar byte loads (the tile group's qs plane is one
+// contiguous run, so this is even more straightforwardly aligned than the
+// SOA case).
 static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(const uint8_t * __restrict__ src_tiled,
                                                                    uint8_t * __restrict__ dst_nibbles,
                                                                    int64_t N,
                                                                    int     tile_n_total,
+                                                                   int     row,
                                                                    int64_t group_bytes,
                                                                    uint8_t * __restrict__ local,
                                                                    const sycl::nd_item<3> & item) {
@@ -2103,12 +2149,17 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(const uint8_t
     const int     lid          = static_cast<int>(item.get_local_id(2));
     const int64_t group_offset = (static_cast<int64_t>(b) * (N / tile_n_total) + tgn) * group_bytes;
 
-    {
-        const int     n_local             = lid / 16;
-        const int     j                   = lid % 16;
-        const uint8_t byte                = src_tiled[group_offset + tile_n_total + n_local * (QK_MXFP4 / 2) + j];
-        local[j * tile_n_total + n_local] = byte & 0xf;
-        local[(j + 16) * tile_n_total + n_local] = byte >> 4;
+    if (lid < tile_n_total) {
+        const int              n_local = lid;
+        const int64_t          base    = group_offset + tile_n_total + static_cast<int64_t>(n_local) * (QK_MXFP4 / 2);
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(src_tiled + base);
+        const uint32_t         w[4]    = { blk32[0], blk32[1], blk32[2], blk32[3] };
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t byte              = static_cast<uint8_t>(w[j >> 2] >> ((j & 3) * 8));
+            local[j * row + n_local]        = byte & 0xf;
+            local[(j + 16) * row + n_local] = byte >> 4;
+        }
     }
     item.barrier(sycl::access::fence_space::local_space);
     {
@@ -2116,8 +2167,8 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(const uint8_t
         const int     k_local                      = lid / n_pair_count;
         const int     n_pair                       = lid % n_pair_count;
         const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * tile_n_total + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * tile_n_total + 2 * n_pair + 1];
+        const uint8_t lo                           = local[k_local * row + 2 * n_pair];
+        const uint8_t hi                           = local[k_local * row + 2 * n_pair + 1];
         dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
     }
 }
@@ -2148,7 +2199,12 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
                                              int             tile_n_total,
                                              dpct::queue_ptr stream) {
     const int64_t N = nrows;
-    if (tile_n_total <= 0 || tile_n_total % 2 != 0 || N % tile_n_total != 0) {
+    // tile_n_total % 4 == 0 (not just even) is required here: it guarantees
+    // group_bytes = tile_n_total*17 is itself a multiple of 4, so every tile
+    // group's byte offset (idx*group_bytes) is 4-byte aligned -- the nibbles
+    // kernel's phase 1 depends on that alignment for its uint32 vector
+    // reads. The doc's current caps value (tile_n_total=16) satisfies this.
+    if (tile_n_total <= 0 || tile_n_total % 4 != 0 || N % tile_n_total != 0) {
         repack_mxfp4_xmx_tiled_to_woq(src_tiled, dst_nibbles, dst_scales, blocks_per_row, nrows, tile_n_total, stream);
         return;
     }
@@ -2157,14 +2213,15 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
     const int64_t   n_tile_groups_n = N / tile_n_total;
     const int64_t   group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
     const int       wg_nibbles      = tile_n_total * 16;
+    const int       row             = tile_n_total + 1;
 
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * tile_n_total), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * wg_nibbles),
                                            sycl::range<3>(1, 1, wg_nibbles)),
                          [=](sycl::nd_item<3> item) {
                              repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(
-                                 src, dst_nibbles, N, tile_n_total, group_bytes, get_pointer(local_acc), item);
+                                 src, dst_nibbles, N, tile_n_total, row, group_bytes, get_pointer(local_acc), item);
                          });
     });
 
@@ -2183,6 +2240,7 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4
                                                                            size_t  weight_slot_bytes,
                                                                            int64_t N,
                                                                            int     tile_n_total,
+                                                                           int     row,
                                                                            int64_t n_tile_groups_n,
                                                                            int64_t group_bytes,
                                                                            uint8_t * __restrict__ local,
@@ -2198,12 +2256,17 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4
     uint8_t * __restrict__ dst_nibbles = dst_weight_base + static_cast<size_t>(slot) * weight_slot_bytes;
     const int64_t group_offset         = (static_cast<int64_t>(b) * n_tile_groups_n + tgn) * group_bytes;
 
-    {
-        const int     n_local             = lid / 16;
-        const int     j                   = lid % 16;
-        const uint8_t byte                = src_tiled[group_offset + tile_n_total + n_local * (QK_MXFP4 / 2) + j];
-        local[j * tile_n_total + n_local] = byte & 0xf;
-        local[(j + 16) * tile_n_total + n_local] = byte >> 4;
+    if (lid < tile_n_total) {
+        const int              n_local = lid;
+        const int64_t          base    = group_offset + tile_n_total + static_cast<int64_t>(n_local) * (QK_MXFP4 / 2);
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(src_tiled + base);
+        const uint32_t         w[4]    = { blk32[0], blk32[1], blk32[2], blk32[3] };
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t byte              = static_cast<uint8_t>(w[j >> 2] >> ((j & 3) * 8));
+            local[j * row + n_local]        = byte & 0xf;
+            local[(j + 16) * row + n_local] = byte >> 4;
+        }
     }
     item.barrier(sycl::access::fence_space::local_space);
     {
@@ -2211,8 +2274,8 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4
         const int     k_local                      = lid / n_pair_count;
         const int     n_pair                       = lid % n_pair_count;
         const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * tile_n_total + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * tile_n_total + 2 * n_pair + 1];
+        const uint8_t lo                           = local[k_local * row + 2 * n_pair];
+        const uint8_t hi                           = local[k_local * row + 2 * n_pair + 1];
         dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
     }
 }
@@ -2257,7 +2320,10 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
 
     const int64_t N = nrows;
-    if (tile_n_total <= 0 || tile_n_total % 2 != 0 || N % tile_n_total != 0) {
+    // See repack_mxfp4_xmx_tiled_to_woq_coalesced above for why %4 (not just
+    // even) is required here -- iteration 2's vectorized uint32 phase-1
+    // reads need every tile group's byte offset 4-byte aligned.
+    if (tile_n_total <= 0 || tile_n_total % 4 != 0 || N % tile_n_total != 0) {
         repack_mxfp4_xmx_tiled_to_woq_batched(srcs, n_slots, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes,
                                               blocks_per_row, nrows, tile_n_total, stream);
         return;
@@ -2271,14 +2337,15 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     const int64_t n_tile_groups_n = N / tile_n_total;
     const int64_t group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
     const int     wg_nibbles      = tile_n_total * 16;
+    const int     row             = tile_n_total + 1;
 
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * tile_n_total), cgh);
+        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * wg_nibbles),
                                            sycl::range<3>(1, 1, wg_nibbles)),
                          [=](sycl::nd_item<3> item) {
                              repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(
-                                 src_table, dst_weight_base, weight_slot_bytes, N, tile_n_total, n_tile_groups_n,
+                                 src_table, dst_weight_base, weight_slot_bytes, N, tile_n_total, row, n_tile_groups_n,
                                  group_bytes, get_pointer(local_acc), item);
                          });
     });
