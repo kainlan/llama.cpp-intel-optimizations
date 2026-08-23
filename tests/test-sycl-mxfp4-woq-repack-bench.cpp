@@ -95,6 +95,111 @@ static void report(const char * form, int n_slots, size_t total_bytes, const ben
         form, n_slots, total_bytes, r.mean_ms, r.min_ms, gbps_mean, gbps_min);
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic reference forms (iteration 3, llama.cpp-0vqt): the committed
+// coalesced SOA nibbles kernel (convert.cpp) still measures only ~20-25% of
+// peak bandwidth on both cards after iteration 2's SLM-padding + vectorized-
+// read fixes -- these forms isolate WHERE the loss is by measuring pieces of
+// that kernel's work in total isolation, at the SAME grid/tiling geometry
+// (one workgroup per (source block b, n-tile of DIAG_NBLK consecutive n's),
+// WG_SIZE=256, one lane per n_local doing 4x aligned uint32 reads in the
+// read phase) -- scoped to the NIBBLES plane only (94% of the real kernel's
+// total volume: 4,147,200 of 4,406,400 bytes/slot for the GPT-OSS shape),
+// since the scales plane uses a structurally different (b,n) 2D tile.
+//
+// DIAG_NBLK must track MXFP4_WOQ_REPACK_COALESCED_NBLK in convert.cpp (both
+// 16) -- this file is a separate translation unit and convert.cpp's
+// constant is TU-local, so it is duplicated here rather than shared.
+constexpr int DIAG_NBLK = 16;
+
+// (2) Read-only: identical phase-1 read pattern (one lane per n_local, four
+// aligned uint32 loads -- 16 contiguous bytes per lane) to the committed
+// kernel, but the loaded words are only XOR-accumulated into a single
+// global result via atomic (forces the compiler to keep the loads; the
+// write volume is 4 bytes total, not counted in this form's reported
+// bytes) -- no SLM, no destination write of real size.
+static void diag_read_only_kernel(const uint8_t * __restrict__ qs,
+                                  int     blocks_per_row,
+                                  int64_t N,
+                                  uint32_t * __restrict__ result,
+                                  const sycl::nd_item<3> & item) {
+    const int     b   = static_cast<int>(item.get_group(1));
+    const int64_t n0  = static_cast<int64_t>(item.get_group(2)) * DIAG_NBLK;
+    const int     lid = static_cast<int>(item.get_local_id(2));
+
+    if (lid < DIAG_NBLK) {
+        const int              n_local = lid;
+        const int64_t          block_i = (n0 + n_local) * blocks_per_row + b;
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(qs + block_i * (QK_MXFP4 / 2));
+        const uint32_t         acc     = blk32[0] ^ blk32[1] ^ blk32[2] ^ blk32[3];
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>
+            aref(*result);
+        aref.fetch_xor(acc);
+    }
+    (void) N;
+}
+
+// (3) Write-only: identical phase-2 coalesced global-write pattern (32
+// k_local x DIAG_NBLK/2 n_pair threads per tile, one byte per lane,
+// contiguous over n_pair for fixed k_local) to the committed kernel, but
+// writes a value synthesized from the thread index -- no source reads at
+// all.
+static void diag_write_only_kernel(uint8_t * __restrict__ dst_nibbles, int64_t N, const sycl::nd_item<3> & item) {
+    const int     b                            = static_cast<int>(item.get_group(1));
+    const int64_t n0                           = static_cast<int64_t>(item.get_group(2)) * DIAG_NBLK;
+    const int     lid                          = static_cast<int>(item.get_local_id(2));
+    const int     k_local                      = lid / (DIAG_NBLK / 2);
+    const int     n_pair                       = lid % (DIAG_NBLK / 2);
+    const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+    dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lid);
+}
+
+// (4) SLM round-trip, no transpose: reads the source block the SAME way as
+// phase 1 into a PADDED SLM buffer (row = DIAG_NBLK+1, matching the
+// committed kernel's bank-conflict fix -- isolates "cost of the SLM round
+// trip itself" from "cost of the transpose permutation", not from the
+// already-fixed bank-conflict pattern), then a straight (non-transposing)
+// coalesced readback and global write of the same byte count the real
+// kernel's nibble plane produces per tile.
+static void diag_slm_roundtrip_kernel(const uint8_t * __restrict__ qs,
+                                      uint8_t * __restrict__ dst,
+                                      int     blocks_per_row,
+                                      int64_t n_tiles,
+                                      uint8_t * __restrict__ local,  // [DIAG_NBLK][DIAG_NBLK+1], padded
+                                      const sycl::nd_item<3> & item) {
+    constexpr int ROW    = DIAG_NBLK + 1;
+    const int     b      = static_cast<int>(item.get_group(1));
+    const int64_t n_tile = static_cast<int64_t>(item.get_group(2));
+    const int64_t n0     = n_tile * DIAG_NBLK;
+    const int     lid    = static_cast<int>(item.get_local_id(2));
+
+    if (lid < DIAG_NBLK) {
+        const int              n_local = lid;
+        const int64_t          block_i = (n0 + n_local) * blocks_per_row + b;
+        const uint32_t * const blk32   = reinterpret_cast<const uint32_t *>(qs + block_i * (QK_MXFP4 / 2));
+        uint8_t * const        row_ptr = local + n_local * ROW;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t word = blk32[w];
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) {
+                row_ptr[w * 4 + byte] = static_cast<uint8_t>(word >> (byte * 8));
+            }
+        }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+
+    // Straight pass-through: thread lid = n_local*16+byteIdx reads back the
+    // SAME (n_local, byteIdx) slot it (or another lane) wrote -- no
+    // permutation, unlike the real kernel's transpose.
+    const int     n_local                  = lid / 16;
+    const int     byteIdx                  = lid % 16;
+    const uint8_t val                      = local[n_local * ROW + byteIdx];
+    const int64_t tile_lin                 = static_cast<int64_t>(b) * n_tiles + n_tile;
+    dst[tile_lin * (DIAG_NBLK * 16) + lid] = val;
+}
+
 int main() {
     try {
         sycl::queue q{ sycl::gpu_selector_v, sycl::property::queue::enable_profiling{} };
@@ -157,6 +262,42 @@ int main() {
         std::printf("[REPACK-BENCH] shape blocks_per_row=%d nrows=%d tile_n_total=%d n_slots=%d K=%lld N=%lld\n",
                     blocks_per_row, nrows, tile_n_total, n_slots, (long long) K, (long long) N);
 
+        // Iteration-3 diagnostic tile geometry, for the lead's per-DRAM-
+        // transaction burst-size check: DIAG_NBLK workgroups' n-axis width,
+        // WG_SIZE, and bytes moved per work-item in each phase of the
+        // committed coalesced SOA nibbles kernel (see the diag kernels'
+        // comments above -- these mirror it exactly).
+        {
+            const int64_t n_tiles_geom       = N / DIAG_NBLK;
+            const int     wg_size_geom       = 32 * (DIAG_NBLK / 2);  // == 256, matches phase 2's thread count
+            const int     read_bytes_per_wi  = 16;                    // 4x uint32, one lane per n_local
+            const int     write_bytes_per_wi = 1;                     // one packed nibble-pair byte per lane
+            std::printf(
+                "[REPACK-BENCH] geometry workgroups_per_slot=%lldx%lld(=b x n_tile) WG_SIZE=%d "
+                "phase1_active_lanes=%d read_bytes_per_WI=%d(one_burst, %d-byte-separated_across_lanes) "
+                "phase2_active_lanes=%d write_bytes_per_WI=%d\n",
+                (long long) blocks_per_row, (long long) n_tiles_geom, wg_size_geom, DIAG_NBLK, read_bytes_per_wi,
+                (int) (blocks_per_row * (QK_MXFP4 / 2)), wg_size_geom, write_bytes_per_wi);
+        }
+
+        const size_t  nibbles_read_bytes  = (size_t) n_slots * soa_qs_bytes;
+        const size_t  nibbles_write_bytes = (size_t) n_slots * nibble_bytes;
+        const int64_t diag_n_tiles        = N / DIAG_NBLK;
+
+        uint32_t * diag_result = (uint32_t *) sycl::malloc_device(sizeof(uint32_t), q);
+        q.memset(diag_result, 0, sizeof(uint32_t)).wait();
+
+        uint8_t * diag_dst =
+            (uint8_t *) sycl::malloc_device(nibble_bytes, q);  // reused across diag forms (single slot's worth)
+
+        // D2D memcpy reference: a single bulk copy moving the SAME combined
+        // (read+write) byte count as the read-only/write-only/slm-roundtrip
+        // forms below, across n_slots -- the practical upper bound for this
+        // metric on this card.
+        uint8_t * memcpy_src = (uint8_t *) sycl::malloc_device(nibbles_read_bytes, q);
+        uint8_t * memcpy_dst = (uint8_t *) sycl::malloc_device(nibbles_read_bytes, q);
+        q.memset(memcpy_src, 0xAB, nibbles_read_bytes).wait();  // touch every page; content is irrelevant to a copy
+
         // ---- SOA forms ----
         {
             auto work = [&](sycl::queue & qq) {
@@ -191,6 +332,65 @@ int main() {
                                                           nibble_bytes, blocks_per_row, nrows, &qq);
             };
             report("soa-coalesced-batched", n_slots, soa_total_bytes, run_bench(q, WARMUP, ITERS, work));
+        }
+
+        // ---- Diagnostic reference forms (iteration 3) -- see the kernel
+        // comments above. Scoped to the nibbles plane only (94% of the real
+        // kernel's volume); nibbles_read_bytes == nibbles_write_bytes here.
+        {
+            auto work = [&](sycl::queue & qq) {
+                qq.memcpy(memcpy_dst, memcpy_src, nibbles_read_bytes);
+            };
+            report("diag-d2d-memcpy", n_slots, nibbles_read_bytes + nibbles_write_bytes,
+                   run_bench(q, WARMUP, ITERS, work));
+        }
+        {
+            auto work = [&](sycl::queue & qq) {
+                for (int s = 0; s < n_slots; ++s) {
+                    const uint8_t * qs = soa_src[s];
+                    qq.submit([&](sycl::handler & cgh) {
+                        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, diag_n_tiles * 256),
+                                                           sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> item) {
+                                             diag_read_only_kernel(qs, blocks_per_row, N, diag_result, item);
+                                         });
+                    });
+                }
+            };
+            report("diag-read-only", n_slots, nibbles_read_bytes, run_bench(q, WARMUP, ITERS, work));
+        }
+        {
+            auto work = [&](sycl::queue & qq) {
+                for (int s = 0; s < n_slots; ++s) {
+                    (void) s;
+                    uint8_t * dd = diag_dst;
+                    qq.submit([&](sycl::handler & cgh) {
+                        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, diag_n_tiles * 256),
+                                                           sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> item) { diag_write_only_kernel(dd, N, item); });
+                    });
+                }
+            };
+            report("diag-write-only", n_slots, nibbles_write_bytes, run_bench(q, WARMUP, ITERS, work));
+        }
+        {
+            auto work = [&](sycl::queue & qq) {
+                for (int s = 0; s < n_slots; ++s) {
+                    const uint8_t * qs = soa_src[s];
+                    uint8_t *       dd = diag_dst;
+                    qq.submit([&](sycl::handler & cgh) {
+                        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(DIAG_NBLK * (DIAG_NBLK + 1)), cgh);
+                        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, diag_n_tiles * 256),
+                                                           sycl::range<3>(1, 1, 256)),
+                                         [=](sycl::nd_item<3> item) {
+                                             diag_slm_roundtrip_kernel(qs, dd, blocks_per_row, diag_n_tiles,
+                                                                       get_pointer(local_acc), item);
+                                         });
+                    });
+                }
+            };
+            report("diag-slm-roundtrip", n_slots, nibbles_read_bytes + nibbles_write_bytes,
+                   run_bench(q, WARMUP, ITERS, work));
         }
 
         // ---- XMX_TILED forms ----
@@ -235,6 +435,10 @@ int main() {
             sycl::free(xmx_src[s], q);
         }
         sycl::free(dst, q);
+        sycl::free(diag_result, q);
+        sycl::free(diag_dst, q);
+        sycl::free(memcpy_src, q);
+        sycl::free(memcpy_dst, q);
         return 0;
     } catch (const sycl::exception & ex) {
         std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
