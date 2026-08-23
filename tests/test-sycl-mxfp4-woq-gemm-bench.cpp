@@ -68,8 +68,12 @@
 #include "ggml-common.h"
 #include "ggml-sycl/common.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <optional>
 #include <random>
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -228,20 +232,10 @@ static inline int64_t xmx_tile_group_offset(int64_t b, int64_t n, int64_t n_tile
 // ---------------------------------------------------------------------------
 // Activation prep kernels (bracket-timed separately from the GEMM itself --
 // the design note's explicit instruction for the q8dp4a arm's quant cost).
-
 // f16 arm: matches k_copy_src1_to_contiguous_f16_mapped's OUTPUT format
-// exactly (plain row-major f16, K contiguous) -- this bench synthesizes
-// that format directly (random f16) rather than re-deriving the f32->f16
-// copy kernel, since this bench is scoped to the GEMM's own compute, not
-// the (already free, already-shipped) activation copy step.
-static void fill_random_f16_act(sycl::queue & q, sycl::half * act, int64_t m, int64_t k, std::mt19937 & rng) {
-    std::vector<sycl::half>               host(static_cast<size_t>(m * k));
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto & v : host) {
-        v = sycl::half(dist(rng));
-    }
-    q.memcpy(act, host.data(), host.size() * sizeof(sycl::half)).wait();
-}
+// exactly (plain row-major f16, K contiguous) -- generated and uploaded
+// directly in main() (its host copy is retained there for the CPU
+// reference oracle), rather than through a helper here.
 
 // q8dp4a arm quantization kernel: one work-group per row, block_q8_1 SOA
 // layout per row -- [90 blocks x 32 int8 qs][90 x half2(d,sum)] -- matching
@@ -738,9 +732,230 @@ static void report(const char * form, int64_t m, int64_t n, int64_t k, const ben
                 (long long) m, (long long) n, (long long) k, r.mean_ms, r.min_ms, gflops_mean);
 }
 
+// ---------------------------------------------------------------------------
+// CPU CORRECTNESS ORACLE (team-lead directive, task comment on llama.cpp-iikr
+// after the first jm run produced physically-impossible GFLOPs: the marker
+// queue was out-of-order with no dependency edges, so t1-t0 could measure
+// marker-to-marker latency with the kernel still in flight, AND no form
+// validated its own output -- a silently-failed launch (JIT failure, bad
+// launch config) would print a fantastic time instead of an error).
+//
+// This is a coarse SANITY gate, not a precision gate: it exists to catch
+// "the kernel did not compute the right thing at all" (wrong indexing,
+// uninitialized launch, garbage/stale output), not to characterize fine
+// numerical error. Host reference computed in double precision from the
+// SAME random host bytes uploaded to the device, using the identical
+// dequant formula as the device kernels (kvalues_mxfp4 LUT + the exact
+// sycl_e8m0_to_fp32_half bit-manipulation, reproduced here on host since
+// it's portable bit arithmetic, not SYCL-specific) -- one reference per
+// LAYOUT (not per arm): f16 arms compare against it directly (tight
+// tolerance -- they should match almost exactly, mod float accumulation
+// order); q8dp4a arms compare against the SAME full-precision reference
+// but with a looser tolerance, since Q8_1 quantization is a real, expected,
+// already-understood source of error that this gate must not misreport as
+// a bug.
+
+static float cpu_e8m0_to_fp32_half(uint8_t e) {
+    uint32_t bits;
+    if (e < 2) {
+        bits = 0x00200000u << e;
+    } else {
+        bits = static_cast<uint32_t>(e - 1) << 23;
+    }
+    float result;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+// out[row][col] for row in [0,max_m), col in [0,N), row-major stride N.
+static void cpu_reference_gemm_soa(const std::vector<sycl::half> & act,
+                                   const std::vector<uint8_t> &    w_soa,
+                                   std::vector<float> &            out,
+                                   int64_t                         max_m,
+                                   int64_t                         n,
+                                   int64_t                         k,
+                                   int                             blocks_per_row) {
+    const int64_t nblocks = n * blocks_per_row;
+    for (int64_t row = 0; row < max_m; ++row) {
+        for (int64_t col = 0; col < n; ++col) {
+            double acc = 0.0;
+            for (int b = 0; b < blocks_per_row; ++b) {
+                const int64_t      block_index = col * blocks_per_row + b;
+                const uint8_t *    qs          = w_soa.data() + block_index * 16;
+                const double       d           = cpu_e8m0_to_fp32_half(w_soa[nblocks * 16 + block_index]);
+                const sycl::half * act_blk     = act.data() + row * k + b * QK_MXFP4;
+                for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+                    const uint8_t byte = qs[j];
+                    acc += static_cast<double>(static_cast<float>(act_blk[j])) * (d * kvalues_mxfp4_local[byte & 0xf]);
+                    acc += static_cast<double>(static_cast<float>(act_blk[j + QK_MXFP4 / 2])) *
+                           (d * kvalues_mxfp4_local[byte >> 4]);
+                }
+            }
+            out[row * n + col] = static_cast<float>(acc);
+        }
+    }
+}
+
+static void cpu_reference_gemm_tiled(const std::vector<sycl::half> & act,
+                                     const std::vector<uint8_t> &    w_tiled,
+                                     std::vector<float> &            out,
+                                     int64_t                         max_m,
+                                     int64_t                         n,
+                                     int64_t                         k,
+                                     int                             blocks_per_row,
+                                     int64_t                         n_tile_groups_n,
+                                     int64_t                         tile_n_total) {
+    for (int64_t row = 0; row < max_m; ++row) {
+        for (int64_t col = 0; col < n; ++col) {
+            double acc = 0.0;
+            for (int b = 0; b < blocks_per_row; ++b) {
+                const int64_t      tg      = xmx_tile_group_offset(b, col, n_tile_groups_n, tile_n_total);
+                const int64_t      tn      = col % tile_n_total;
+                const double       d       = cpu_e8m0_to_fp32_half(w_tiled[tg + tn]);
+                const uint8_t *    qs      = w_tiled.data() + tg + tile_n_total + tn * 16;
+                const sycl::half * act_blk = act.data() + row * k + b * QK_MXFP4;
+                for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+                    const uint8_t byte = qs[j];
+                    acc += static_cast<double>(static_cast<float>(act_blk[j])) * (d * kvalues_mxfp4_local[byte & 0xf]);
+                    acc += static_cast<double>(static_cast<float>(act_blk[j + QK_MXFP4 / 2])) *
+                           (d * kvalues_mxfp4_local[byte >> 4]);
+                }
+            }
+            out[row * n + col] = static_cast<float>(acc);
+        }
+    }
+}
+
+// Runs `work` ONCE untimed, wait_and_throw's (surfaces async JIT/launch
+// failures instead of leaving stale output), copies the device `out` buffer
+// back, and compares against `ref`'s first (m x n) rows. Prints PASS/FAIL
+// with the observed error. Only calls report() -- i.e. only times it -- on
+// PASS; a FAIL form prints no timing, per the directive ("a FAIL form
+// prints no timing").
+template <typename F>
+static bool validate_and_report(sycl::queue &              q,
+                                const char *               form,
+                                int64_t                    m,
+                                int64_t                    n,
+                                int64_t                    k,
+                                float *                    dev_out,
+                                const std::vector<float> & ref,
+                                int64_t                    ref_stride,
+                                double                     rel_tol,
+                                int                        warmup,
+                                int                        iters,
+                                F &&                       work) {
+    work(q);
+    q.wait_and_throw();
+    std::vector<float> host_out(static_cast<size_t>(m * n));
+    q.memcpy(host_out.data(), dev_out, host_out.size() * sizeof(float)).wait_and_throw();
+
+    // NaN-SAFE max: FIX CYCLE #2 -- plain std::max(a, b), implemented as
+    // (a<b)?b:a, silently KEEPS `a` whenever `b` is NaN (NaN compares false
+    // against everything, so `a<NaN` is false). With max_abs_err/max_rel_err
+    // initialized to 0.0, a run where EVERY comparison is NaN (which random
+    // e8m0 bytes spanning the full uint8 range could produce -- see the fix
+    // above) would leave both trackers at their 0.0 initial value the whole
+    // loop, printing a false ORACLE=PASS with max_abs_err=0. `!(b <= a)` is
+    // true whenever b is NaN (NaN<=a is false, so !false=true), so this
+    // correctly latches NaN into the tracker instead of discarding it --
+    // and pass = (max_rel_err <= rel_tol) is then correctly false once
+    // max_rel_err is NaN, since NaN<=anything is false.
+    auto nan_safe_max = [](double a, double b) {
+        return !(b <= a) ? b : a;
+    };
+
+    double max_abs_err = 0.0;
+    double max_rel_err = 0.0;
+    for (int64_t row = 0; row < m; ++row) {
+        for (int64_t col = 0; col < n; ++col) {
+            const double got     = host_out[static_cast<size_t>(row * n + col)];
+            const double want    = ref[static_cast<size_t>(row * ref_stride + col)];
+            const double abs_err = std::fabs(got - want);
+            const double rel_err = abs_err / std::max(1e-6, std::fabs(want));
+            max_abs_err          = nan_safe_max(max_abs_err, abs_err);
+            max_rel_err          = nan_safe_max(max_rel_err, rel_err);
+        }
+    }
+    const bool pass = max_rel_err <= rel_tol;
+    std::printf("[GEMM-BENCH] form=%-24s m=%lld ORACLE=%s max_abs_err=%.6g max_rel_err=%.6g tol=%.4g\n", form,
+                (long long) m, pass ? "PASS" : "FAIL", max_abs_err, max_rel_err, rel_tol);
+    if (!pass) {
+        return false;
+    }
+    report(form, m, n, k, run_bench(q, warmup, iters, work));
+    return true;
+}
+
+// Coarse sanity tolerances (see the block comment above this section for
+// why these are sanity-level, not precision-level): f16 arms should match
+// the double-precision reference almost exactly (float accumulation order
+// differences only); q8dp4a arms carry real, expected Q8_1 quantization
+// error on top and need more room.
+constexpr double GEMM_ORACLE_TOL_F16 = 0.02;
+constexpr double GEMM_ORACLE_TOL_Q8  = 0.10;
+
 int main() {
+    // Queue construction failure (no SYCL GPU device) is a legitimate SKIP
+    // (rc=77) -- but nothing AFTER construction should share that catch: a
+    // sycl::exception raised later by wait_and_throw (a real launch/JIT
+    // failure, or the async_handler's rethrow) is a genuine bug, not the
+    // absence of a device, and must be reported as a distinct failure
+    // (rc=1) rather than misreported as the same benign "no GPU" skip.
+    std::optional<sycl::queue> q_opt;
     try {
-        sycl::queue q{ sycl::gpu_selector_v, sycl::property::queue::enable_profiling{} };
+        // in_order + an async_handler that rethrows: fixes the defect that
+        // produced physically-impossible GFLOPs on the first jm run (task
+        // comment on llama.cpp-iikr) -- an out-of-order queue submits the
+        // begin marker / work / end marker as three INDEPENDENT command
+        // groups with no dependency edge between them, so t1-t0 could
+        // measure marker-to-marker latency while the timed work was still
+        // in flight (or had failed to launch at all). in_order makes
+        // submission order a real ordering guarantee; the async_handler
+        // (paired with wait_and_throw calls below) surfaces a silently
+        // failed launch as a thrown, printed exception instead of stale
+        // output read back as if it were real.
+        auto async_handler = [](sycl::exception_list exceptions) {
+            for (const std::exception_ptr & e : exceptions) {
+                try {
+                    std::rethrow_exception(e);
+                } catch (const sycl::exception & ex) {
+                    std::fprintf(stderr, "[GEMM-BENCH] ASYNC SYCL EXCEPTION: %s\n", ex.what());
+                    std::exit(1);
+                }
+            }
+        };
+        q_opt.emplace(
+            sycl::gpu_selector_v, async_handler,
+            sycl::property_list{ sycl::property::queue::enable_profiling{}, sycl::property::queue::in_order{} });
+    } catch (const sycl::exception & ex) {
+        std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
+        return 77;
+    }
+    sycl::queue & q = *q_opt;
+
+    // Everything from here on is a real run against a real device: a
+    // sycl::exception past this point (from wait_and_throw, or the
+    // async_handler's rethrow) is a genuine failure and must be reported
+    // as one, not folded into the "no GPU" SKIP path above.
+    try {
+        // Diagnostic per the directive: print what this device actually
+        // supports, so an unsupported-shape refusal is visible in the log
+        // rather than inferred. sub_group_sizes is a standard, stable SYCL
+        // device query; DPC++ does not expose a stable joint_matrix
+        // supported-combination query in this version, so that capability
+        // is NOT introspected here -- instead, any actual capability
+        // mismatch at a jm kernel's launch now surfaces as a real thrown
+        // sycl::exception via the async_handler above (it did not before
+        // this fix), which is the property that actually matters.
+        {
+            const std::vector<size_t> sg_sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+            std::printf("[GEMM-BENCH] device sub_group_sizes=[");
+            for (size_t i = 0; i < sg_sizes.size(); ++i) {
+                std::printf("%s%zu", i ? "," : "", sg_sizes[i]);
+            }
+            std::printf("] name=\"%s\"\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+        }
 
         // GPT-OSS 20B expert shape -- see task llama.cpp-0vqt / llama.cpp-iikr
         // for the derivation (hidden_size == intermediate_size == 2880).
@@ -759,31 +974,136 @@ int main() {
         const size_t  tiled_bytes     = (size_t) (blocks_per_row * n_tile_groups_n * TILE_N_TOTAL * 17);
 
         std::mt19937                       rng(1729);
-        std::uniform_int_distribution<int> byte_dist(0, 255);
+        std::uniform_int_distribution<int> nibble_dist(0, 255);
+        // FIX CYCLE #2 (task comment on llama.cpp-iikr, second invalidation):
+        // scale (e8m0) bytes were previously drawn from the SAME flat
+        // uniform(0,255) as nibble bytes. e8m0=255 maps (via the "halved"
+        // convention, cpu_e8m0_to_fp32_half/sycl_e8m0_to_fp32_half) to a
+        // FINITE but ~1.7e38 scale -- close enough to float32's ~3.4e38 max
+        // that a handful of blocks per (row,col) dot product (blocks_per_row
+        // = 90 independent random draws) reliably overflowed the float32
+        // accumulator to +/-inf, and summing opposite-signed infs produced
+        // NaN. That NaN then poisoned validate_and_report's error tracking
+        // (see the NaN-safe rewrite below) -- this is what actually produced
+        // the impossible ORACLE=PASS max_abs_err=0 / ORACLE=FAIL max_abs_err=
+        // inf pairing, not a device/reference divergence. Real MXFP4 model
+        // weights have a bounded per-block exponent (nowhere near this
+        // literally-random range), so this was purely a synthetic-data
+        // artifact of the microbench, not a hardware or kernel defect.
+        // e in [100,160] keeps scales in roughly [2^-28, 2^32] -- worst case
+        // 2^32 * kvalue(12) * act(1) * blocks_per_row(90) ~= 4.3e12, many
+        // orders of magnitude below float32 overflow, with a wide realistic
+        // dynamic range still exercised.
+        std::uniform_int_distribution<int> scale_dist(100, 160);
 
-        auto fill_random_device = [&](size_t bytes) -> uint8_t * {
-            std::vector<uint8_t> host(bytes);
-            for (auto & b : host) {
-                b = (uint8_t) byte_dist(rng);
+        // Host copies are RETAINED (not discarded after upload) -- the CPU
+        // reference oracle below needs the exact same random bytes the
+        // device kernels read.
+        std::vector<uint8_t> host_w_soa(soa_bytes);
+        std::vector<uint8_t> host_w_tiled(tiled_bytes);
+        {
+            // SOA layout: [nblocks*16 nibble bytes][nblocks scale bytes].
+            for (int64_t i = 0; i < nblocks * 16; ++i) {
+                host_w_soa[static_cast<size_t>(i)] = (uint8_t) nibble_dist(rng);
             }
-            uint8_t * dev = (uint8_t *) sycl::malloc_device(bytes, q);
-            q.memcpy(dev, host.data(), bytes).wait();
+            for (int64_t i = 0; i < nblocks; ++i) {
+                host_w_soa[static_cast<size_t>(nblocks * 16 + i)] = (uint8_t) scale_dist(rng);
+            }
+            // XMX_TILED layout: n_groups tile groups, each
+            // [tile_n_total scale bytes][tile_n_total*16 nibble bytes] --
+            // see the layout geometry comment near xmx_tile_group_offset.
+            const int64_t n_groups        = (int64_t) blocks_per_row * n_tile_groups_n;
+            const int64_t bytes_per_group = TILE_N_TOTAL * 17;
+            for (int64_t g = 0; g < n_groups; ++g) {
+                uint8_t * grp = host_w_tiled.data() + g * bytes_per_group;
+                for (int i = 0; i < TILE_N_TOTAL; ++i) {
+                    grp[i] = (uint8_t) scale_dist(rng);
+                }
+                for (int i = 0; i < TILE_N_TOTAL * 16; ++i) {
+                    grp[TILE_N_TOTAL + i] = (uint8_t) nibble_dist(rng);
+                }
+            }
+        }
+        auto upload = [&](const std::vector<uint8_t> & host) -> uint8_t * {
+            uint8_t * dev = (uint8_t *) sycl::malloc_device(host.size(), q);
+            q.memcpy(dev, host.data(), host.size()).wait_and_throw();
             return dev;
         };
-
-        uint8_t * w_soa   = fill_random_device(soa_bytes);
-        uint8_t * w_tiled = fill_random_device(tiled_bytes);
+        uint8_t * w_soa   = upload(host_w_soa);
+        uint8_t * w_tiled = upload(host_w_tiled);
 
         std::printf(
             "[GEMM-BENCH] shape blocks_per_row=%d N=%lld K=%lld tile_n_total=%d soa_bytes=%zu tiled_bytes=%zu\n",
             blocks_per_row, (long long) N, (long long) K, TILE_N_TOTAL, soa_bytes, tiled_bytes);
 
-        const int64_t max_m   = 128;
-        sycl::half *  act_f16 = (sycl::half *) sycl::malloc_device(sizeof(sycl::half) * max_m * K, q);
-        fill_random_f16_act(q, act_f16, max_m, K, rng);
+        const int64_t           max_m   = 128;
+        sycl::half *            act_f16 = (sycl::half *) sycl::malloc_device(sizeof(sycl::half) * max_m * K, q);
+        std::vector<sycl::half> host_act_f16(static_cast<size_t>(max_m * K));
+        {
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            for (auto & v : host_act_f16) {
+                v = sycl::half(dist(rng));
+            }
+            q.memcpy(act_f16, host_act_f16.data(), host_act_f16.size() * sizeof(sycl::half)).wait_and_throw();
+        }
         const size_t q8_row_bytes = (size_t) (K + blocks_per_row * 4);
         int8_t *     act_q8       = (int8_t *) sycl::malloc_device(q8_row_bytes * max_m, q);
         float *      out          = (float *) sycl::malloc_device(sizeof(float) * max_m * N, q);
+
+        // CPU reference GEMMs, computed ONCE (double precision, from the
+        // exact host bytes above) for the FULL max_m=128 rows -- each real
+        // M in Ms below just compares against a PREFIX of these, since
+        // neither weight buffer depends on M and the activation buffer is
+        // shared across all M values too.
+        std::printf("[GEMM-BENCH] computing CPU reference GEMMs (max_m=%lld, this takes a few seconds)...\n",
+                    (long long) max_m);
+        std::vector<float> soa_ref(static_cast<size_t>(max_m * N));
+        std::vector<float> tiled_ref(static_cast<size_t>(max_m * N));
+        cpu_reference_gemm_soa(host_act_f16, host_w_soa, soa_ref, max_m, N, K, blocks_per_row);
+        cpu_reference_gemm_tiled(host_act_f16, host_w_tiled, tiled_ref, max_m, N, K, blocks_per_row, n_tile_groups_n,
+                                 TILE_N_TOTAL);
+        std::printf("[GEMM-BENCH] CPU reference GEMMs done.\n");
+
+        // POSITIVE CONTROL (team-lead directive, fix cycle #2, after the
+        // first oracle turned out vacuous): prove the oracle can actually
+        // DETECT a difference BEFORE trusting any PASS/FAIL verdict below.
+        // Perturbs one scale byte in a COPY of each weight buffer (XOR 0xFF
+        // -- a large, deliberate change, still inside a safe non-overflowing
+        // byte range), recomputes just row 0 of that layout's reference from
+        // the perturbed copy, and asserts it differs from the unperturbed
+        // reference at (0,0) by more than a token epsilon. Runs entirely on
+        // CPU -- no device work gates on this, but no device work is trusted
+        // if it fails either: a vacuous oracle here (max_abs_err silently
+        // stuck at 0.0, exactly the failure mode this whole cycle exists to
+        // catch) must abort loudly, not be discovered downstream again.
+        {
+            auto positive_control = [&](const char * layout_name, const std::vector<uint8_t> & host_w,
+                                        const std::vector<float> & original_ref, bool is_tiled) {
+                std::vector<uint8_t> perturbed = host_w;
+                perturbed[0] ^= 0xFF;  // first scale byte, first block/tile-group -- affects (row 0, col 0)
+                std::vector<float> control_ref(static_cast<size_t>(N));
+                if (is_tiled) {
+                    cpu_reference_gemm_tiled(host_act_f16, perturbed, control_ref, 1, N, K, blocks_per_row,
+                                             n_tile_groups_n, TILE_N_TOTAL);
+                } else {
+                    cpu_reference_gemm_soa(host_act_f16, perturbed, control_ref, 1, N, K, blocks_per_row);
+                }
+                const double diff =
+                    std::fabs(static_cast<double>(control_ref[0]) - static_cast<double>(original_ref[0]));
+                std::printf(
+                    "[GEMM-BENCH] positive control (%s): perturbed_ref[0]=%.6g original_ref[0]=%.6g diff=%.6g\n",
+                    layout_name, control_ref[0], original_ref[0], diff);
+                if (!(diff > 1e-6)) {
+                    std::fprintf(stderr,
+                                 "[GEMM-BENCH] FATAL: positive control (%s) found NO oracle sensitivity -- the CPU "
+                                 "reference oracle is vacuous. Refusing to trust any PASS/FAIL below.\n",
+                                 layout_name);
+                    std::exit(1);
+                }
+            };
+            positive_control("soa", host_w_soa, soa_ref, false);
+            positive_control("tiled", host_w_tiled, tiled_ref, true);
+        }
 
         for (int m : Ms) {
             // Activation quant step, timed separately -- q8dp4a arm's cost
@@ -796,7 +1116,7 @@ int main() {
             // Materialize the quantized activation once for the GEMM-only
             // timing loop below (mirrors production: quantize once, GEMM
             // many times against the same activation).
-            quantize_q8_1_rows(q, act_f16, act_q8, m, K, blocks_per_row).wait();
+            quantize_q8_1_rows(q, act_f16, act_q8, m, K, blocks_per_row).wait_and_throw();
 
             const int64_t n_tiles = (N + WG_SIZE - 1) / WG_SIZE;
 
@@ -812,7 +1132,7 @@ int main() {
                             });
                     });
                 };
-                report("soa-f16", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "soa-f16", m, N, K, out, soa_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS, work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -827,7 +1147,8 @@ int main() {
                             });
                     });
                 };
-                report("soa-q8dp4a-gemm-only", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "soa-q8dp4a-gemm-only", m, N, K, out, soa_ref, N, GEMM_ORACLE_TOL_Q8, WARMUP,
+                                    ITERS, work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -841,7 +1162,8 @@ int main() {
                             });
                     });
                 };
-                report("tiled-f16", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "tiled-f16", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS,
+                                    work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -857,7 +1179,8 @@ int main() {
                             });
                     });
                 };
-                report("tiled-q8dp4a-gemm-only", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "tiled-q8dp4a-gemm-only", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_Q8, WARMUP,
+                                    ITERS, work);
             }
 #if SYCL_XMX_JM_AVAILABLE
             // joint_matrix (DPAS) arms -- team-lead directive, task comment
@@ -881,7 +1204,8 @@ int main() {
                                          });
                     });
                 };
-                report("tiled-f16-jm", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "tiled-f16-jm", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS,
+                                    work);
             }
             {
                 const int64_t n_tiles_jm = N / XMX_JM_WG_SIZE;
@@ -903,7 +1227,8 @@ int main() {
                                          });
                     });
                 };
-                report("tiled-q8dp4a-jm-gemm-only", m, N, K, run_bench(q, WARMUP, ITERS, work));
+                validate_and_report(q, "tiled-q8dp4a-jm-gemm-only", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_Q8,
+                                    WARMUP, ITERS, work);
             }
 #endif
         }
@@ -915,7 +1240,7 @@ int main() {
         sycl::free(out, q);
         return 0;
     } catch (const sycl::exception & ex) {
-        std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return 77;
+        std::fprintf(stderr, "[GEMM-BENCH] FATAL SYCL EXCEPTION (device acquired, run failed): %s\n", ex.what());
+        return 1;
     }
 }
