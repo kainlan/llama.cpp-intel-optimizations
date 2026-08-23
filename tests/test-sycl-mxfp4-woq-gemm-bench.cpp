@@ -826,12 +826,116 @@ static void cpu_reference_gemm_tiled(const std::vector<sycl::half> & act,
     }
 }
 
+// Q8-AWARE references for the q8dp4a arms (FIX CYCLE #4, team-lead
+// directive after oracle-v3's live classification, task comment c-y140):
+// the q8dp4a forms were comparing against the FULL-PRECISION reference
+// above, which is the wrong oracle for them -- their activations are
+// genuinely, expectedly lossy (Q8_1 quantization), so a reference computed
+// from the unquantized f16 values necessarily disagrees even for a
+// perfectly correct kernel. `q8_data` is READ BACK FROM THE DEVICE after
+// quantize_q8_1_rows runs (not a shadow CPU requantization that could
+// subtly diverge from the device kernel's exact rounding) -- so this
+// validates only the GEMM math (dequant + dot + scale) given a common,
+// already-quantized input, which is the right thing to test. Math mirrors
+// gemm_soa_q8dp4a_kernel/gemm_tiled_q8dp4a_kernel exactly, but expressed
+// directly over raw bytes instead of dp4a's int32-packed-4-bytes form
+// (mathematically identical -- byte order within the int32 words dp4a
+// consumes matches flat array order on this little-endian target, so
+// there is no need to replicate the device's SPIR-V-only byte_level_permute
+// intrinsic on host): weight nibble low/high -> kvalues, multiplied by
+// the corresponding raw Q8_1 int8 byte, summed as a per-block integer,
+// then scaled by (weight e8m0) * (activation Q8_1 d) and accumulated in
+// double across blocks -- same per-block-scale-then-accumulate structure
+// the device kernels use, just double instead of float for a tighter
+// reference.
+static void cpu_reference_gemm_soa_q8(const std::vector<int8_t> &  q8_data,
+                                      int64_t                      row_bytes,
+                                      const std::vector<uint8_t> & w_soa,
+                                      std::vector<float> &         out,
+                                      int64_t                      max_m,
+                                      int64_t                      n,
+                                      int64_t                      k,
+                                      int                          blocks_per_row) {
+    const int64_t nblocks = n * blocks_per_row;
+    for (int64_t row = 0; row < max_m; ++row) {
+        const int8_t *     q8_row = q8_data.data() + row * row_bytes;
+        const sycl::half * ds_row = reinterpret_cast<const sycl::half *>(q8_row + k);
+        for (int64_t col = 0; col < n; ++col) {
+            double acc = 0.0;
+            for (int b = 0; b < blocks_per_row; ++b) {
+                const int64_t   block_index = col * blocks_per_row + b;
+                const uint8_t * qs          = w_soa.data() + block_index * 16;
+                const double    d           = cpu_e8m0_to_fp32_half(w_soa[nblocks * 16 + block_index]);
+                const double    d8          = static_cast<double>(ds_row[b * 2 + 0]);
+                const int8_t *  q8_blk      = q8_row + b * QK_MXFP4;
+                int64_t         sumi        = 0;
+                for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+                    const uint8_t byte = qs[j];
+                    sumi += static_cast<int64_t>(q8_blk[j]) * kvalues_mxfp4_local[byte & 0xf];
+                    sumi += static_cast<int64_t>(q8_blk[j + QK_MXFP4 / 2]) * kvalues_mxfp4_local[byte >> 4];
+                }
+                acc += d * d8 * static_cast<double>(sumi);
+            }
+            out[row * n + col] = static_cast<float>(acc);
+        }
+    }
+}
+
+static void cpu_reference_gemm_tiled_q8(const std::vector<int8_t> &  q8_data,
+                                        int64_t                      row_bytes,
+                                        const std::vector<uint8_t> & w_tiled,
+                                        std::vector<float> &         out,
+                                        int64_t                      max_m,
+                                        int64_t                      n,
+                                        int64_t                      k,
+                                        int                          blocks_per_row,
+                                        int64_t                      n_tile_groups_n,
+                                        int64_t                      tile_n_total) {
+    for (int64_t row = 0; row < max_m; ++row) {
+        const int8_t *     q8_row = q8_data.data() + row * row_bytes;
+        const sycl::half * ds_row = reinterpret_cast<const sycl::half *>(q8_row + k);
+        for (int64_t col = 0; col < n; ++col) {
+            double acc = 0.0;
+            for (int b = 0; b < blocks_per_row; ++b) {
+                const int64_t   tg     = xmx_tile_group_offset(b, col, n_tile_groups_n, tile_n_total);
+                const int64_t   tn     = col % tile_n_total;
+                const double    d      = cpu_e8m0_to_fp32_half(w_tiled[tg + tn]);
+                const double    d8     = static_cast<double>(ds_row[b * 2 + 0]);
+                const uint8_t * qs     = w_tiled.data() + tg + tile_n_total + tn * 16;
+                const int8_t *  q8_blk = q8_row + b * QK_MXFP4;
+                int64_t         sumi   = 0;
+                for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+                    const uint8_t byte = qs[j];
+                    sumi += static_cast<int64_t>(q8_blk[j]) * kvalues_mxfp4_local[byte & 0xf];
+                    sumi += static_cast<int64_t>(q8_blk[j + QK_MXFP4 / 2]) * kvalues_mxfp4_local[byte >> 4];
+                }
+                acc += d * d8 * static_cast<double>(sumi);
+            }
+            out[row * n + col] = static_cast<float>(acc);
+        }
+    }
+}
+
 // Runs `work` ONCE untimed, wait_and_throw's (surfaces async JIT/launch
 // failures instead of leaving stale output), copies the device `out` buffer
 // back, and compares against `ref`'s first (m x n) rows. Prints PASS/FAIL
 // with the observed error. Only calls report() -- i.e. only times it -- on
 // PASS; a FAIL form prints no timing, per the directive ("a FAIL form
 // prints no timing").
+//
+// FIX CYCLE #4 (team-lead directive after oracle-v3's live classification,
+// task comment c-y140): PASS now requires abs_tol OR rel_tol, not rel_tol
+// alone -- soa-f16 was failing on rel-err-on-near-zero-outputs (tiny
+// absolute error, e.g. 0.006-0.008, but a large RELATIVE error because the
+// reference value itself was close to zero for some (row,col) cells; a
+// pure-relative metric is exactly the wrong tool for that case, not a sign
+// of a kernel bug). `capture_out`, if non-null, receives a copy of
+// host_out regardless of pass/fail, so callers can cross-check two
+// independently-run forms' outputs against EACH OTHER (see the
+// tiled-q8dp4a vs tiled-q8dp4a-jm cross-check below) -- a corroborating
+// signal that is not itself a substitute for comparing against ref (per
+// repo memory: adjacent green results can manufacture corroboration), so
+// it is only ever printed alongside, never in place of, the oracle verdict.
 template <typename F>
 static bool validate_and_report(sycl::queue &              q,
                                 const char *               form,
@@ -841,14 +945,19 @@ static bool validate_and_report(sycl::queue &              q,
                                 float *                    dev_out,
                                 const std::vector<float> & ref,
                                 int64_t                    ref_stride,
+                                double                     abs_tol,
                                 double                     rel_tol,
                                 int                        warmup,
                                 int                        iters,
-                                F &&                       work) {
+                                F &&                       work,
+                                std::vector<float> *       capture_out = nullptr) {
     work(q);
     q.wait_and_throw();
     std::vector<float> host_out(static_cast<size_t>(m * n));
     q.memcpy(host_out.data(), dev_out, host_out.size() * sizeof(float)).wait_and_throw();
+    if (capture_out) {
+        *capture_out = host_out;
+    }
 
     // NaN-SAFE max: FIX CYCLE #2 -- plain std::max(a, b), implemented as
     // (a<b)?b:a, silently KEEPS `a` whenever `b` is NaN (NaN compares false
@@ -877,9 +986,13 @@ static bool validate_and_report(sycl::queue &              q,
             max_rel_err          = nan_safe_max(max_rel_err, rel_err);
         }
     }
-    const bool pass = max_rel_err <= rel_tol;
-    std::printf("[GEMM-BENCH] form=%-24s m=%lld ORACLE=%s max_abs_err=%.6g max_rel_err=%.6g tol=%.4g\n", form,
-                (long long) m, pass ? "PASS" : "FAIL", max_abs_err, max_rel_err, rel_tol);
+    // abs OR rel: a cell whose reference value is near zero can have a
+    // huge relative error from a tiny, benign absolute error -- rel_tol
+    // alone is the wrong metric for that cell, not evidence of a bug.
+    const bool pass = (max_abs_err <= abs_tol) || (max_rel_err <= rel_tol);
+    std::printf(
+        "[GEMM-BENCH] form=%-24s m=%lld ORACLE=%s max_abs_err=%.6g max_rel_err=%.6g abs_tol=%.4g rel_tol=%.4g\n", form,
+        (long long) m, pass ? "PASS" : "FAIL", max_abs_err, max_rel_err, abs_tol, rel_tol);
     if (!pass) {
         return false;
     }
@@ -890,10 +1003,24 @@ static bool validate_and_report(sycl::queue &              q,
 // Coarse sanity tolerances (see the block comment above this section for
 // why these are sanity-level, not precision-level): f16 arms should match
 // the double-precision reference almost exactly (float accumulation order
-// differences only); q8dp4a arms carry real, expected Q8_1 quantization
-// error on top and need more room.
+// differences only). GEMM_ORACLE_ABS_TOL covers the near-zero-output cells
+// where a pure-relative metric is the wrong tool (oracle-v3 finding,
+// task comment c-y140: soa-f16 abs err 0.006-0.008 but rel err 0.05-0.09 --
+// a metric artifact, not a kernel defect).
+//
+// FIX CYCLE #4: the q8dp4a arms now compare against a Q8-AWARE reference
+// (cpu_reference_gemm_{soa,tiled}_q8 below, computed from the SAME
+// quantized bytes read back from the device -- not a full-precision
+// reference), which removes the systematic Q8_1-quantization-vs-exactness
+// gap the old GEMM_ORACLE_TOL_Q8=0.10 existed to paper over. With the
+// right reference there is no more excusable error margin beyond ordinary
+// floating-point reordering, so q8dp4a arms now use the SAME tight
+// tolerances as the f16 arms -- a real bug in the q8dp4a kernels' math
+// would now actually be caught, which the old (wrong-reference, loose-
+// tolerance) combination could not do either way.
+constexpr double GEMM_ORACLE_ABS_TOL = 0.01;
 constexpr double GEMM_ORACLE_TOL_F16 = 0.02;
-constexpr double GEMM_ORACLE_TOL_Q8  = 0.10;
+constexpr double GEMM_ORACLE_TOL_Q8  = 0.02;
 
 int main() {
     // Queue construction failure (no SYCL GPU device) is a legitimate SKIP
@@ -1172,6 +1299,27 @@ int main() {
             // many times against the same activation).
             quantize_q8_1_rows(q, act_f16, act_q8, m, K, blocks_per_row).wait_and_throw();
 
+            // FIX CYCLE #4: read back the DEVICE's own quantized bytes for
+            // rows [0,m) and build this m's Q8-aware references from them
+            // (see cpu_reference_gemm_{soa,tiled}_q8 above for why this is
+            // the right oracle for the q8dp4a arms). Readback+reference
+            // cost here (~1e8-1e9 double-precision ops) is a diagnostic
+            // expense, not a hot path -- fine to pay once per m.
+            std::vector<int8_t> host_act_q8(static_cast<size_t>(m) * q8_row_bytes);
+            q.memcpy(host_act_q8.data(), act_q8, host_act_q8.size()).wait_and_throw();
+            std::vector<float> soa_ref_q8(static_cast<size_t>(m * N));
+            std::vector<float> tiled_ref_q8(static_cast<size_t>(m * N));
+            cpu_reference_gemm_soa_q8(host_act_q8, static_cast<int64_t>(q8_row_bytes), host_w_soa, soa_ref_q8, m, N, K,
+                                      blocks_per_row);
+            cpu_reference_gemm_tiled_q8(host_act_q8, static_cast<int64_t>(q8_row_bytes), host_w_tiled, tiled_ref_q8, m,
+                                        N, K, blocks_per_row, n_tile_groups_n, TILE_N_TOTAL);
+
+            // Populated by the plain and jm tiled-q8dp4a forms below for
+            // the cross-check (declared unconditionally since the plain
+            // form exists outside the SYCL_XMX_JM_AVAILABLE guard).
+            std::vector<float> tiled_q8dp4a_plain_out;
+            std::vector<float> tiled_q8dp4a_jm_out;
+
             const int64_t n_tiles = (N + WG_SIZE - 1) / WG_SIZE;
 
             {
@@ -1186,7 +1334,8 @@ int main() {
                             });
                     });
                 };
-                validate_and_report(q, "soa-f16", m, N, K, out, soa_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS, work);
+                validate_and_report(q, "soa-f16", m, N, K, out, soa_ref, N, GEMM_ORACLE_ABS_TOL, GEMM_ORACLE_TOL_F16,
+                                    WARMUP, ITERS, work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -1201,8 +1350,8 @@ int main() {
                             });
                     });
                 };
-                validate_and_report(q, "soa-q8dp4a-gemm-only", m, N, K, out, soa_ref, N, GEMM_ORACLE_TOL_Q8, WARMUP,
-                                    ITERS, work);
+                validate_and_report(q, "soa-q8dp4a-gemm-only", m, N, K, out, soa_ref_q8, N, GEMM_ORACLE_ABS_TOL,
+                                    GEMM_ORACLE_TOL_Q8, WARMUP, ITERS, work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -1216,8 +1365,8 @@ int main() {
                             });
                     });
                 };
-                validate_and_report(q, "tiled-f16", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS,
-                                    work);
+                validate_and_report(q, "tiled-f16", m, N, K, out, tiled_ref, N, GEMM_ORACLE_ABS_TOL,
+                                    GEMM_ORACLE_TOL_F16, WARMUP, ITERS, work);
             }
             {
                 auto work = [&](sycl::queue & qq) {
@@ -1233,8 +1382,14 @@ int main() {
                             });
                     });
                 };
-                validate_and_report(q, "tiled-q8dp4a-gemm-only", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_Q8, WARMUP,
-                                    ITERS, work);
+                // Captured for the plain-vs-jm cross-check below (team-lead
+                // ask, c-y140): the byte-identical error maxima team-lead
+                // observed between this form and tiled-q8dp4a-jm against
+                // the WRONG reference is corroborating, not conclusive on
+                // its own -- comparing their actual outputs directly is the
+                // stronger check, done once both forms have run.
+                validate_and_report(q, "tiled-q8dp4a-gemm-only", m, N, K, out, tiled_ref_q8, N, GEMM_ORACLE_ABS_TOL,
+                                    GEMM_ORACLE_TOL_Q8, WARMUP, ITERS, work, &tiled_q8dp4a_plain_out);
             }
 #if SYCL_XMX_JM_AVAILABLE
             // joint_matrix (DPAS) arms -- team-lead directive, task comment
@@ -1258,8 +1413,8 @@ int main() {
                                          });
                     });
                 };
-                validate_and_report(q, "tiled-f16-jm", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_F16, WARMUP, ITERS,
-                                    work);
+                validate_and_report(q, "tiled-f16-jm", m, N, K, out, tiled_ref, N, GEMM_ORACLE_ABS_TOL,
+                                    GEMM_ORACLE_TOL_F16, WARMUP, ITERS, work);
             }
             {
                 const int64_t n_tiles_jm = N / XMX_JM_WG_SIZE;
@@ -1281,8 +1436,29 @@ int main() {
                                          });
                     });
                 };
-                validate_and_report(q, "tiled-q8dp4a-jm-gemm-only", m, N, K, out, tiled_ref, N, GEMM_ORACLE_TOL_Q8,
-                                    WARMUP, ITERS, work);
+                validate_and_report(q, "tiled-q8dp4a-jm-gemm-only", m, N, K, out, tiled_ref_q8, N, GEMM_ORACLE_ABS_TOL,
+                                    GEMM_ORACLE_TOL_Q8, WARMUP, ITERS, work, &tiled_q8dp4a_jm_out);
+            }
+
+            // Cross-check (team-lead ask, c-y140): compare the plain and jm
+            // tiled-q8dp4a forms' ACTUAL outputs directly, not just their
+            // errors against the reference -- this is a stronger version of
+            // the byte-identical-error-maxima signature that first pointed
+            // at shared quantization error rather than independent bugs.
+            // Runs whenever both captured (i.e. both forms actually
+            // produced output, regardless of PASS/FAIL against the
+            // reference -- capture_out is filled unconditionally).
+            if (!tiled_q8dp4a_plain_out.empty() && !tiled_q8dp4a_jm_out.empty()) {
+                double max_cross_diff = 0.0;
+                for (size_t i = 0; i < tiled_q8dp4a_plain_out.size(); ++i) {
+                    const double d = std::fabs(static_cast<double>(tiled_q8dp4a_plain_out[i]) -
+                                               static_cast<double>(tiled_q8dp4a_jm_out[i]));
+                    if (d > max_cross_diff) {
+                        max_cross_diff = d;
+                    }
+                }
+                std::printf("[GEMM-BENCH] cross-check tiled-q8dp4a plain-vs-jm m=%d max_diff=%.6g (%s)\n", m,
+                            max_cross_diff, max_cross_diff < GEMM_ORACLE_ABS_TOL ? "AGREE" : "DISAGREE");
             }
 #endif
         }
