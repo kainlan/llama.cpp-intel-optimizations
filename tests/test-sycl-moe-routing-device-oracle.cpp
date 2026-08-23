@@ -86,6 +86,41 @@
 // kBoundaryMarginRel below for the qualifier, applied both to which
 // id-mismatches count toward the stage-(ii) gate and to which tokens the
 // STRICT arm treats as tie-free.
+//
+// RETRACTION (fix cycle round 5, team-lead's index audit -- confirmed, not
+// merely suspected): the "boundary flip" and "structural id-mismatch"
+// findings above (rounds 3-4, tokens 326/327 across four independent
+// hardware runs) were an ARTIFACT OF THIS TEST'S OWN READBACK, not a
+// property of the device chain. ggml_argsort_top_k's output is a VIEW
+// whose row stride is inherited from the FULL n_expert-wide argsort it
+// slices (ggml/src/ggml.c:5393-5396 never shrinks nb[1] to the narrower
+// logical width), and ggml_backend_tensor_get/set (ggml-backend.cpp:2956,
+// 2963) are a flat, stride-blind memcpy on both the CPU and SYCL
+// backends. build_routing_graph's earlier flat readback of `ids` therefore
+// walked bytes through the UNDERLYING 32-wide buffer rather than the
+// view's logical 4-wide rows: only the first 64 of 512 real tokens were
+// ever read, each one sliced into 8 fake "tokens" of 4 elements (ranks
+// [1-4], [5-8], ..., [29-32]). Fake token 327 was real token 40's ranks
+// 29-32 (near-zero, tail-of-sort scores -- matching the observed
+// ~0.0 hypothesis-line scores exactly); fake token 326 was the SAME real
+// token's ranks 25-28 (also near-zero, explaining the ~1.9e-11 boundary-
+// flip margin). This is also the full explanation for the 326/327
+// "adjacency" every prior round attributed to the device kernels or a
+// potential paired-token dispatch: consecutive fake indices are
+// consecutive rank-groups of ONE real token, not two adjacent real
+// tokens, and near-tail rank groups are exactly where near-zero-score
+// noise clusters. `rg.ids` is now wrapped in ggml_cont (build_routing_
+// graph below) to materialize a genuinely contiguous copy before the
+// flat readback, which is a fix to THIS TEST'S instrumentation, not to
+// any device or CPU kernel -- neither `probs` (never a view; its boundary
+// and weight-tolerance findings elsewhere in this file are unaffected)
+// nor the argsort/softmax device kernels themselves were ever
+// misbehaving. Every prior round's conclusion ABOUT WHICH TOKENS ARE
+// STRUCTURAL VS BOUNDARY-FLIP is retracted pending a rerun on the fixed
+// readback; the METHODOLOGY built in those rounds (the two-arm gate, the
+// relative-margin qualifier, the H1/H2 split) is not retracted -- it is
+// exactly the tooling needed to correctly classify whatever the fixed
+// readback now shows.
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -170,7 +205,29 @@ static routing_graph build_routing_graph(int n_expert, int n_expert_used, int hi
     ggml_set_name(rg.probs, "ffn_moe_probs");  // [n_expert, n_tokens]
     ggml_set_output(rg.probs);
 
-    rg.ids = ggml_argsort_top_k(rg.ctx, rg.probs, n_expert_used);  // [n_expert_used, n_tokens], I32
+    // llama.cpp-iikr fix cycle round 5 (team-lead's index audit): the
+    // view ggml_argsort_top_k returns keeps nb[1] INHERITED from the FULL
+    // n_expert-wide argsort it slices (ggml/src/ggml.c:5393-5396 passes
+    // `result->nb[1]` straight through to ggml_view_4d, never recomputed
+    // to n_expert_used*sizeof(int32_t) for the narrower logical shape) --
+    // so it is NOT contiguous. ggml_backend_tensor_get/set
+    // (ggml-backend.cpp:2956,2963, both backends) are a flat
+    // `memcpy(data, tensor->data + offset, size)` with NO stride
+    // awareness. A flat host-side readback sized for the VIEW's logical
+    // [n_expert_used, n_tokens] shape therefore walks `size` bytes through
+    // the UNDERLYING n_expert-wide buffer instead of the view's rows: for
+    // n_expert=32/n_expert_used=4/n_tokens=512 this reads only the first
+    // 64 REAL tokens' full 32-wide sorted rows, each one sliced into 8
+    // FAKE "tokens" of 4 elements -- so a printed "token 327" was actually
+    // real_token=327/8=40, rank_group=327%8=7 (ranks 29-32, the bottom of
+    // that token's sort, explaining the near-zero scores and the 326/327
+    // "adjacency" every prior round attributed to the device kernels: both
+    // fake indices are rank-groups of the SAME real token 40). ggml_cont
+    // forces a genuinely tightly-strided copy so the flat readback below
+    // is valid; this changes nothing about what the device/CPU argsort
+    // itself computed, only how this test reads the result back.
+    rg.ids = ggml_argsort_top_k(rg.ctx, rg.probs, n_expert_used);  // [n_expert_used, n_tokens], I32 (VIEW, strided)
+    rg.ids = ggml_cont(rg.ctx, rg.ids);                            // materialize contiguous for the flat readback
     ggml_set_name(rg.ids, "ffn_moe_topk");
     ggml_set_output(rg.ids);
 
