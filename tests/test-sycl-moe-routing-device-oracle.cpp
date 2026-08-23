@@ -63,6 +63,29 @@
 // is what the pairing-invariant proof on `routing_result` above makes
 // benign. A same-side, non-tied ordering violation is NOT covered by that
 // slack and would indicate a real defect, not a contract gap.
+//
+// WHY EXACT-ID-VS-CPU IS NOT THE CRITERION (fix cycle round 3, team-lead's
+// rerun after the tolerance fix): even with weight_only_mismatch_tokens at
+// 0/4096 (confirming the weight tolerance is now correctly calibrated),
+// id_mismatch_tokens read 2/4096 on BOTH cards, identically. Per-token
+// evidence (see token_boundary_relative_margin below) attributes these to
+// TOP-K BOUNDARY FLIPS: when the CPU-reference score margin between the
+// k-th (last-selected) and (k+1)-th (first-excluded) expert is smaller
+// than the cross-precision noise floor (~1e-5 relative, from f32-CPU vs
+// f16-influenced-device softmax), the two backends can legitimately
+// disagree about WHICH expert occupies the boundary slot -- this is not a
+// tie-break-ORDER question (that's the ORDER CONTRACT note above), it is
+// a tie-break-SET-MEMBERSHIP question, and it is unavoidable in principle:
+// any two implementations with different accumulation order will disagree
+// on some boundary token, on some data, at a small enough margin. A REAL
+// routing bug (indexing error, wrong expert, off-by-one) is not
+// margin-sensitive -- it produces mismatches regardless of how close the
+// boundary was, i.e. at LARGE margins. That is the discriminator: a
+// mismatch's CPU-side boundary margin, scaled by the top score, tells you
+// which case you are looking at. See token_boundary_relative_margin /
+// kBoundaryMarginRel below for the qualifier, applied both to which
+// id-mismatches count toward the stage-(ii) gate and to which tokens the
+// STRICT arm treats as tie-free.
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -75,6 +98,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -226,29 +250,44 @@ static bool approx_equal(float a, float b, float rel_tol = 5e-5f, float abs_tol 
     return std::fabs(a - b) <= abs_tol + rel_tol * std::max(std::fabs(a), std::fabs(b));
 }
 
-// Tie-free classification for the STRICT arm: a token's top-(k+1) boundary
-// is "tie-free" when every pair among its k+1 highest-ranked expert scores
-// is separated by more than kTieFreeGapAbs -- comfortably above the
-// ~2.8e-6 CPU-vs-device (f32 vs f16-influenced softmax) noise floor
-// team-lead measured on hardware, so a same-side slot swap at this gap
-// would indicate a real comparator/sort defect, not float noise. Only the
-// top k+1 values matter: values below that boundary can never affect
-// which experts land in the visible k-window or their relative order
-// within it.
-static constexpr float kTieFreeGapAbs = 1e-3f;
-
-static bool token_boundary_is_tie_free(const float * probs_row, int n_expert, int n_expert_used) {
+// Structural-vs-boundary-flip qualifier (fix cycle round 3, team-lead's
+// margin-based discriminator -- see the header comment's "WHY EXACT-ID-
+// VS-CPU IS NOT THE CRITERION" section). Returns the smallest ADJACENT gap
+// among the CPU-reference top-(k+1) ranked scores, scaled by the rank-0
+// (top) score -- adjacent gaps are sufficient (not just the k/(k+1)
+// boundary specifically): if every adjacent gap in a sorted run exceeds a
+// threshold, every non-adjacent pair's gap exceeds it too, by summation.
+// Scaling by the top score turns this into a RELATIVE margin, matching
+// the RELATIVE nature of f16-vs-f32 cross-precision noise (a fixed
+// absolute threshold was tried first and round-3 hardware evidence showed
+// it let at least one genuinely noise-scale boundary slip through as
+// "tie-free" -- a large top score can make an absolute gap look safely
+// wide while still being tiny relative to that token's own value scale).
+static float token_boundary_relative_margin(const float * probs_row, int n_expert, int n_expert_used) {
     std::vector<float> top(probs_row, probs_row + n_expert);
     std::sort(top.begin(), top.end(), std::greater<float>());
-    const int window = std::min(n_expert, n_expert_used + 1);
-    for (int i = 0; i < window; ++i) {
-        for (int j = i + 1; j < window; ++j) {
-            if (std::fabs(top[i] - top[j]) < kTieFreeGapAbs) {
-                return false;
-            }
-        }
+    const int   window    = std::min(n_expert, n_expert_used + 1);
+    const float top_score = top[0];
+    if (top_score <= 0.0f) {
+        return 0.0f;  // degenerate row (all-zero underflow) -- never treat as structural
     }
-    return true;
+    float min_gap = std::numeric_limits<float>::max();
+    for (int i = 0; i + 1 < window; ++i) {
+        min_gap = std::min(min_gap, top[i] - top[i + 1]);
+    }
+    return min_gap / top_score;
+}
+
+// team-lead-specified cutoff: comfortably above the observed ~1e-5
+// relative cross-precision noise. A margin above this is treated as
+// STRUCTURAL (a real bug would land here, at any margin, since it is not
+// noise-sensitive); at or below it, a mismatch is a BOUNDARY FLIP --
+// diagnostic, and expected to occur occasionally on random data by
+// construction, not something the gate can or should demand zero of.
+static constexpr float kBoundaryMarginRel = 5e-4f;
+
+static bool token_boundary_is_structural(const float * probs_row, int n_expert, int n_expert_used) {
+    return token_boundary_relative_margin(probs_row, n_expert, n_expert_used) > kBoundaryMarginRel;
 }
 
 // Prints, for every expert id selected by EITHER side at `token`, both
@@ -293,6 +332,28 @@ static void print_token_mismatch(const char *                 arm,
     }
 }
 
+// team-lead Part 1 of the round-3 fix cycle: for an id-mismatch token,
+// print the CPU-reference boundary itself -- the k-th (last selected) and
+// (k+1)-th (first excluded) ranked scores, their margin, and the relative
+// margin the structural/boundary-flip qualifier above is computed from --
+// so a reader can see directly whether a given mismatch sits at a
+// vanishing margin (expected noise) or a wide one (a real bug) without
+// re-deriving it from the raw probs.
+static void print_boundary_evidence(int trial, size_t token, const float * cpu_row, int n_expert, int n_expert_used) {
+    std::vector<float> top(cpu_row, cpu_row + n_expert);
+    std::sort(top.begin(), top.end(), std::greater<float>());
+    const int   k          = n_expert_used;
+    const float kth        = top[k - 1];
+    const float k_plus_1th = (k < n_expert) ? top[k] : 0.0f;
+    const float margin     = kth - k_plus_1th;
+    const float rel_margin = token_boundary_relative_margin(cpu_row, n_expert, n_expert_used);
+    std::fprintf(stderr,
+                 "[MOE-ROUTING-ORACLE]   boundary(trial %d token %zu): cpu rank-%d(last-selected)=%.9f "
+                 "rank-%d(first-excluded)=%.9f margin=%.9e rel_margin=%.9e (threshold=%.1e) -> %s\n",
+                 trial, token, k, kth, k + 1, k_plus_1th, margin, rel_margin, kBoundaryMarginRel,
+                 (rel_margin > kBoundaryMarginRel) ? "STRUCTURAL" : "BOUNDARY-FLIP(diagnostic)");
+}
+
 int main() {
     // GPT-OSS 20B's confirmed MoE shape: 32 experts, top-4 selected per
     // token (see the file header comment for the citation). hidden_dim and
@@ -330,25 +391,30 @@ int main() {
 
     // SEMANTIC arm (team-lead's GATE for stage (ii)): per-token
     // (expert_id, weight) MULTISET equality, order-independent -- the
-    // property build_lora_mm_id's consumers actually rely on. Split into
-    // two counters, not one: id_mismatch_tokens (the expert-id SET itself
-    // differs -- a real routing bug, wrong tokens would go to wrong
-    // experts) is the number stage (ii) is gated on;
-    // weight_only_mismatch_tokens (same id set, a weight fell outside
-    // approx_equal's tolerance) is diagnostic -- it means the tolerance
-    // itself may need another look, not that routing selected wrong
-    // experts. Conflating them into one count made the load-bearing zero
-    // (id_mismatch_tokens == 0) unreadable from the summary line alone.
+    // property build_lora_mm_id's consumers actually rely on. Three
+    // counters, not one: id_mismatch_tokens (the id SET differs AND the
+    // CPU-side boundary margin is STRUCTURAL, i.e. not noise-explicable --
+    // see token_boundary_is_structural) is the number stage (ii) is gated
+    // on; boundary_flip_tokens (id SET differs, but margin is at/below the
+    // noise floor) is diagnostic and EXPECTED to be nonzero on random data
+    // by construction -- it does not indict routing; weight_only_mismatch_
+    // tokens (same id set, a weight fell outside approx_equal's tolerance)
+    // is diagnostic likewise. Conflating any of these made the load-
+    // bearing zero (id_mismatch_tokens == 0) unreadable from the summary
+    // line alone.
     int semantic_total_tokens       = 0;
     int id_mismatch_tokens          = 0;
+    int boundary_flip_tokens        = 0;
     int weight_only_mismatch_tokens = 0;
 
-    // STRICT arm: on tokens whose top-(k+1) boundary is provably tie-free
-    // (see token_boundary_is_tie_free), the order contract above DOES
-    // guarantee matching slot order -- so this arm additionally asserts
-    // exact positional id equality, scoped to only those qualifying
-    // tokens. A failure here, unlike the semantic arm, points at a real
-    // sort/comparator defect rather than a benign tie-break difference.
+    // STRICT arm: on tokens whose top-(k+1) boundary margin is STRUCTURAL
+    // (token_boundary_is_structural -- the same relative-margin qualifier
+    // as the semantic arm's id-mismatch split, round 3), the order
+    // contract above DOES guarantee matching slot order -- so this arm
+    // additionally asserts exact positional id equality, scoped to only
+    // those qualifying tokens. A failure here, unlike the semantic arm,
+    // points at a real sort/comparator defect rather than a benign
+    // tie-break difference.
     int strict_qualified_tokens = 0;
     int strict_fail_tokens      = 0;
 
@@ -413,11 +479,20 @@ int main() {
                     }
                 }
             }
+            const float * cpu_row = cpu.probs.data() + static_cast<size_t>(token) * n_expert;
+
             if (!sets_equal) {
-                ++id_mismatch_tokens;
-                trial_semantic_ok = false;
-                print_token_mismatch("semantic/id-mismatch", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
-                                     n_expert);
+                trial_semantic_ok       = false;
+                const bool   structural = token_boundary_is_structural(cpu_row, n_expert, n_expert_used);
+                const char * arm =
+                    structural ? "semantic/id-mismatch-structural" : "semantic/id-mismatch-boundary-flip";
+                print_token_mismatch(arm, trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs, n_expert);
+                print_boundary_evidence(trial, token, cpu_row, n_expert, n_expert_used);
+                if (structural) {
+                    ++id_mismatch_tokens;
+                } else {
+                    ++boundary_flip_tokens;
+                }
             } else if (!weights_ok) {
                 ++weight_only_mismatch_tokens;
                 trial_semantic_ok = false;
@@ -425,15 +500,15 @@ int main() {
                                      n_expert);
             }
 
-            const float * cpu_row = cpu.probs.data() + static_cast<size_t>(token) * n_expert;
-            if (token_boundary_is_tie_free(cpu_row, n_expert, n_expert_used)) {
+            if (token_boundary_is_structural(cpu_row, n_expert, n_expert_used)) {
                 ++strict_qualified_tokens;
                 const bool strict_ok = sets_equal && weights_ok && (cpu_slot == sycl_slot);
                 if (!strict_ok) {
                     ++strict_fail_tokens;
                     trial_strict_ok = false;
-                    print_token_mismatch("strict/tie-free", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
+                    print_token_mismatch("strict/structural", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
                                          n_expert);
+                    print_boundary_evidence(trial, token, cpu_row, n_expert, n_expert_used);
                 }
             }
         }
@@ -456,30 +531,40 @@ int main() {
 
     // GATE LINE for stage (ii): read id_mismatch_tokens off this line
     // directly -- it must be 0 for the semantic arm to be GREEN.
-    // weight_only_mismatch_tokens is diagnostic (tolerance calibration),
-    // not a routing-correctness signal, and is reported separately rather
-    // than folded into the same count.
+    // boundary_flip_tokens (margin at/below the noise floor) and
+    // weight_only_mismatch_tokens (tolerance calibration) are diagnostic
+    // and reported separately so neither can hide inside the gate number,
+    // and boundary_flip_tokens is EXPECTED to be nonzero on random data --
+    // it is not folded into the pass/fail decision below at all.
     std::fprintf(stderr,
                  "[MOE-ROUTING-ORACLE] SUMMARY: id_mismatch_tokens=%d/%d (GATES stage (ii) -- must be 0) "
-                 "weight_only_mismatch_tokens=%d/%d (diagnostic, tolerance-calibration signal) "
-                 "strict_fail_tokens=%d/%d tie-free-qualified (indicts the sort kernels, not the executor)\n",
-                 id_mismatch_tokens, semantic_total_tokens, weight_only_mismatch_tokens, semantic_total_tokens,
-                 strict_fail_tokens, strict_qualified_tokens);
+                 "boundary_flip_tokens=%d/%d (diagnostic, EXPECTED nonzero on random data -- see the header "
+                 "comment's boundary-flip note) weight_only_mismatch_tokens=%d/%d (diagnostic, tolerance-"
+                 "calibration signal) strict_fail_tokens=%d/%d structural-qualified (indicts the sort "
+                 "kernels, not the executor)\n",
+                 id_mismatch_tokens, semantic_total_tokens, boundary_flip_tokens, semantic_total_tokens,
+                 weight_only_mismatch_tokens, semantic_total_tokens, strict_fail_tokens, strict_qualified_tokens);
 
     // The SEMANTIC arm's id_mismatch_tokens is the actual gate for stage
-    // (ii). weight_only_mismatch_tokens and strict_fail_tokens still fail
-    // this run's exit code (both indicate something needs attention --
-    // tolerance calibration or a real sort defect, respectively) but are
-    // NOT what stage (ii)'s go/no-go reads; see the SUMMARY line above for
-    // the load-bearing number specifically.
+    // (ii); boundary_flip_tokens never gates anything (see above -- it is
+    // the expected, unavoidable-in-principle output of comparing two
+    // different-precision references at a vanishing margin). weight_only_
+    // mismatch_tokens and strict_fail_tokens still fail this run's exit
+    // code (both indicate something needs attention -- tolerance
+    // calibration or a real sort defect, respectively) but are NOT what
+    // stage (ii)'s go/no-go reads; see the SUMMARY line above for the
+    // load-bearing number specifically.
     if (id_mismatch_tokens > 0 || weight_only_mismatch_tokens > 0 || strict_fail_tokens > 0) {
         std::fprintf(stderr,
                      "[MOE-ROUTING-ORACLE] FAIL: id_mismatch_tokens=%d weight_only_mismatch_tokens=%d "
-                     "strict_fail_tokens=%d (n_expert=%d n_expert_used=%d)\n",
-                     id_mismatch_tokens, weight_only_mismatch_tokens, strict_fail_tokens, n_expert, n_expert_used);
+                     "strict_fail_tokens=%d (boundary_flip_tokens=%d, non-gating) (n_expert=%d n_expert_used=%d)\n",
+                     id_mismatch_tokens, weight_only_mismatch_tokens, strict_fail_tokens, boundary_flip_tokens,
+                     n_expert, n_expert_used);
         return 1;
     }
-    std::fprintf(stderr, "[MOE-ROUTING-ORACLE] PASS: %d/%d trials, both arms clean (n_expert=%d n_expert_used=%d)\n",
-                 trials_run, trials_run, n_expert, n_expert_used);
+    std::fprintf(stderr,
+                 "[MOE-ROUTING-ORACLE] PASS: %d/%d trials, both arms clean (boundary_flip_tokens=%d, "
+                 "non-gating) (n_expert=%d n_expert_used=%d)\n",
+                 trials_run, trials_run, boundary_flip_tokens, n_expert, n_expert_used);
     return 0;
 }
