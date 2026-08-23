@@ -64640,6 +64640,24 @@ static double mxfp4_pp_event_span_us(const sycl::event & begin, const sycl::even
     }
 }
 
+// llama.cpp-iikr (gap-histogram cycle): device-time gap between one node's
+// END marker and the NEXT node's BEGIN marker, both already collected by
+// component 6's whole-node brackets -- no new marker submissions, per owner
+// instruction: "use the event timestamps you already collect ... rather
+// than adding new markers". Deliberately NOT mxfp4_pp_event_span_us: that
+// reads (begin.command_start, end.command_end) to span ACROSS one bracket;
+// this reads (prev_end.command_end, next_begin.command_start) to measure
+// the hole BETWEEN two brackets, so the two operands play opposite roles.
+static double mxfp4_pp_gap_us(const sycl::event & prev_end, const sycl::event & next_begin) {
+    try {
+        const uint64_t prev_end_ts   = prev_end.get_profiling_info<sycl::info::event_profiling::command_end>();
+        const uint64_t next_start_ts = next_begin.get_profiling_info<sycl::info::event_profiling::command_start>();
+        return next_start_ts >= prev_end_ts ? static_cast<double>(next_start_ts - prev_end_ts) * 1e-3 : -1.0;
+    } catch (...) {
+        return -1.0;
+    }
+}
+
 // llama.cpp-1lon: repack begin/end marker kernel-name tags, forward-declared
 // ONCE at namespace scope so every ggml_sycl_submit_marker<...> call site
 // below (the batched WOQ repack launch and its slot-capacity fallback loop)
@@ -64740,6 +64758,32 @@ static mxfp4_pp_node_class mxfp4_pp_classify_node(const ggml_tensor * dst) {
     }
 }
 
+// One bracketed graph node (llama.cpp-iikr "attribute other" phase), pushed
+// by mxfp4_pp_node_bracket's destructor in DISPATCH ORDER. op_name is a
+// ggml_op_name() return value -- a static string literal, safe to keep as a
+// bare pointer indefinitely. tensor_name is copied into an owned
+// std::string because dst->name's lifetime is only guaranteed for this
+// eval's graph, and this record is read back at print_and_reset time (same
+// eval, but best not to depend on exactly when relative to graph teardown).
+struct mxfp4_pp_node_record {
+    mxfp4_pp_node_class cls;
+    sycl::event         begin_ev;
+    sycl::event         end_ev;
+    const char *        op_name;
+    std::string         tensor_name;
+};
+
+// One entry in the gap-histogram's top-10 largest inter-node gaps
+// (llama.cpp-iikr gap-histogram cycle), annotated with both neighboring
+// nodes so the print line answers "a gap before/after WHAT".
+struct mxfp4_pp_gap_top_entry {
+    double       gap_us;
+    const char * prev_op;
+    std::string  prev_name;
+    const char * next_op;
+    std::string  next_name;
+};
+
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
 // (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
@@ -64792,18 +64836,30 @@ struct mxfp4_pp_batched_profile_accum {
     // -1.0 -- this is the "distrust this line" counter; nonzero means some
     // of the ms figures above are undercounts, not that the op failed.
     int64_t                                  read_failures  = 0;
-    // Component 6 (llama.cpp-iikr "attribute other" phase): raw (begin,end)
-    // marker-event pairs pushed by ggml_sycl_compute_forward's
-    // mxfp4_pp_node_bracket as each non-MUL_MAT_ID graph node dispatches,
-    // one pair per node, indexed by mxfp4_pp_node_class. Resolved into
-    // node_us/node_calls in mxfp4_pp_batched_profile_print_and_reset --
-    // same deferred-resolution pattern as pp_profile_repack_begin/end
-    // above: no per-op host wait, everything is read back once after this
-    // eval's graph_total end-marker has already been waited on.
-    std::vector<sycl::event>                 node_begin[mxfp4_pp_node_class_count];
-    std::vector<sycl::event>                 node_end[mxfp4_pp_node_class_count];
+    // Component 6 (llama.cpp-iikr "attribute other" phase): one record per
+    // non-MUL_MAT_ID graph node dispatched this eval, pushed by
+    // ggml_sycl_compute_forward's mxfp4_pp_node_bracket IN DISPATCH ORDER
+    // (a single ordered vector, not per-class buckets, precisely because the
+    // gap-histogram cycle below needs consecutive-record adjacency; per-class
+    // node_us/node_calls are still derived from it, just in one pass instead
+    // of being pre-bucketed). Resolved in mxfp4_pp_batched_profile_print_and_
+    // reset -- same deferred-resolution pattern as pp_profile_repack_begin/
+    // end above: no per-op host wait, everything is read back once after
+    // this eval's graph_total end-marker has already been waited on.
+    std::vector<mxfp4_pp_node_record>        node_records;
     double                                   node_us[mxfp4_pp_node_class_count]    = {};
     int64_t                                  node_calls[mxfp4_pp_node_class_count] = {};
+    // Gap histogram (llama.cpp-iikr gap-histogram cycle): inter-node device
+    // gaps derived from node_records' own begin/end events via
+    // mxfp4_pp_gap_us -- NOT new markers. Resolved fields only; the raw
+    // per-gap samples live in a local vector inside print_and_reset itself
+    // (they don't need to survive past that one pass).
+    int64_t                                  gap_count                             = 0;
+    double                                   gap_p50_us                            = 0.0;
+    double                                   gap_p95_us                            = 0.0;
+    double                                   gap_max_us                            = 0.0;
+    double                                   gap_total_us                          = 0.0;
+    std::vector<mxfp4_pp_gap_top_entry>      gap_top10;
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
@@ -64826,16 +64882,20 @@ struct mxfp4_pp_node_bracket {
     mxfp4_pp_node_class cls    = mxfp4_pp_node_class::MISC;
     sycl::queue *       q      = nullptr;
     sycl::event         begin_ev;
+    const char *        op_name = nullptr;
+    std::string         tensor_name;
 
     mxfp4_pp_node_bracket(sycl::queue * queue, const ggml_tensor * dst) {
         if (!queue || !dst || dst->op == GGML_OP_MUL_MAT_ID || !mxfp4_pp_batched_profile_enabled()) {
             return;
         }
         try {
-            cls      = mxfp4_pp_classify_node(dst);
-            q        = queue;
-            begin_ev = ggml_sycl_submit_marker<mxfp4_pp_profile_node_begin_marker>(*q);
-            active   = true;
+            cls         = mxfp4_pp_classify_node(dst);
+            q           = queue;
+            op_name     = ggml_op_name(dst->op);
+            tensor_name = dst->name ? dst->name : "";
+            begin_ev    = ggml_sycl_submit_marker<mxfp4_pp_profile_node_begin_marker>(*q);
+            active      = true;
         } catch (...) {
             // Marker submission failed (e.g. queue already faulted) -- leave
             // `active` false so the destructor is a no-op, same fail-quiet
@@ -64852,11 +64912,9 @@ struct mxfp4_pp_node_bracket {
             return;
         }
         try {
-            sycl::event  end_ev = ggml_sycl_submit_marker<mxfp4_pp_profile_node_end_marker>(*q);
-            auto &       p      = g_mxfp4_pp_batched_profile;
-            const size_t idx    = static_cast<size_t>(cls);
-            p.node_begin[idx].push_back(begin_ev);
-            p.node_end[idx].push_back(end_ev);
+            sycl::event end_ev = ggml_sycl_submit_marker<mxfp4_pp_profile_node_end_marker>(*q);
+            auto &      p      = g_mxfp4_pp_batched_profile;
+            p.node_records.push_back(mxfp4_pp_node_record{ cls, begin_ev, end_ev, op_name, std::move(tensor_name) });
         } catch (...) {
             // Never let a destructor throw -- especially not while the
             // function-try-block above is already unwinding an exception,
@@ -64867,21 +64925,73 @@ struct mxfp4_pp_node_bracket {
 
 static void mxfp4_pp_batched_profile_print_and_reset() {
     auto & p = g_mxfp4_pp_batched_profile;
-    // Resolve component 6's raw event pairs first so accounted_us below can
-    // include them -- same deferred-resolution posture as every other
+
+    // Resolve component 6's ordered node records first so accounted_us below
+    // can include them -- same deferred-resolution posture as every other
     // component: no host wait here, the eval's graph_total end-marker
     // (mxfp4_pp_batched_profile_record_graph_total's caller) already waited
-    // on this stream before calling into this function.
-    for (int c = 0; c < mxfp4_pp_node_class_count; ++c) {
-        const size_t n = std::min(p.node_begin[c].size(), p.node_end[c].size());
-        for (size_t i = 0; i < n; ++i) {
-            const double us = mxfp4_pp_event_span_us(p.node_begin[c][i], p.node_end[c][i]);
-            if (us < 0.0) {
+    // on this stream before calling into this function. This single pass
+    // over node_records does double duty: per-class span sums (as before)
+    // AND, llama.cpp-iikr gap-histogram cycle, the inter-node gap between
+    // consecutive records -- derived from the SAME begin/end events via
+    // mxfp4_pp_gap_us, no new marker submissions per owner instruction.
+    struct gap_sample {
+        double us;
+        size_t next_idx;  // index into p.node_records of the gap's NEXT record
+    };
+
+    std::vector<gap_sample> gap_samples;
+    if (p.node_records.size() >= 2) {
+        gap_samples.reserve(p.node_records.size() - 1);
+    }
+    for (size_t i = 0; i < p.node_records.size(); ++i) {
+        const mxfp4_pp_node_record & rec = p.node_records[i];
+        const double                 us  = mxfp4_pp_event_span_us(rec.begin_ev, rec.end_ev);
+        if (us < 0.0) {
+            ++p.read_failures;
+        } else {
+            p.node_us[static_cast<int>(rec.cls)] += us;
+            ++p.node_calls[static_cast<int>(rec.cls)];
+        }
+        if (i > 0) {
+            const double gap = mxfp4_pp_gap_us(p.node_records[i - 1].end_ev, rec.begin_ev);
+            if (gap < 0.0) {
                 ++p.read_failures;
-                continue;
+            } else {
+                gap_samples.push_back(gap_sample{ gap, i });
             }
-            p.node_us[c] += us;
-            ++p.node_calls[c];
+        }
+    }
+    p.gap_count = static_cast<int64_t>(gap_samples.size());
+    if (!gap_samples.empty()) {
+        std::vector<double> gap_values;
+        gap_values.reserve(gap_samples.size());
+        for (const auto & s : gap_samples) {
+            gap_values.push_back(s.us);
+            p.gap_total_us += s.us;
+        }
+        std::sort(gap_values.begin(), gap_values.end());
+        const auto pct = [&](double fraction) {
+            size_t idx = static_cast<size_t>(fraction * static_cast<double>(gap_values.size() - 1));
+            return gap_values[idx];
+        };
+        p.gap_p50_us = pct(0.50);
+        p.gap_p95_us = pct(0.95);
+        p.gap_max_us = gap_values.back();
+
+        // Top-10 largest gaps, each annotated with both neighboring nodes --
+        // sort a COPY by descending gap so gap_samples itself (indexed by
+        // node_records position) is untouched, matching this loop's own
+        // read-only use of node_records above.
+        std::vector<gap_sample> ranked = gap_samples;
+        std::sort(ranked.begin(), ranked.end(), [](const gap_sample & a, const gap_sample & b) { return a.us > b.us; });
+        const size_t top_n = std::min<size_t>(10, ranked.size());
+        p.gap_top10.reserve(top_n);
+        for (size_t r = 0; r < top_n; ++r) {
+            const mxfp4_pp_node_record & prev = p.node_records[ranked[r].next_idx - 1];
+            const mxfp4_pp_node_record & next = p.node_records[ranked[r].next_idx];
+            p.gap_top10.push_back(
+                mxfp4_pp_gap_top_entry{ ranked[r].us, prev.op_name, prev.tensor_name, next.op_name, next.tensor_name });
         }
     }
     double node_total_us = 0.0;
@@ -64927,6 +65037,25 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         p.node_us[static_cast<int>(mxfp4_pp_node_class::MISC)] / 1000.0,
         (long long) p.node_calls[static_cast<int>(mxfp4_pp_node_class::MISC)], p.graph_total_set ? 1 : 0,
         (long long) p.read_failures);
+
+    // llama.cpp-iikr (gap-histogram cycle): discriminates the two structural
+    // hypotheses for the residual "other" -- concentrated (few large gaps,
+    // e.g. per-MoE-dispatch oneDNN primitive setup) vs. uniform (many small
+    // gaps, e.g. per-submission overhead) -- which call for different fixes
+    // (caching/off-critical-path vs. fusion/graph-capture). gap_count is
+    // node_records.size()-1 when every read succeeds; fewer than that means
+    // some gap reads failed (see read_failures above).
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-GAP] device=%d gap_count=%lld gap_total=%.3f ms gap_p50=%.3f us gap_p95=%.3f us "
+        "gap_max=%.3f us\n",
+        p.device, (long long) p.gap_count, p.gap_total_us / 1000.0, p.gap_p50_us, p.gap_p95_us, p.gap_max_us);
+    for (size_t r = 0; r < p.gap_top10.size(); ++r) {
+        const mxfp4_pp_gap_top_entry & e = p.gap_top10[r];
+        GGML_LOG_WARN(
+            "[MXFP4-PP-BATCHED-PROFILE-GAP-TOP] device=%d rank=%zu gap=%.3f us prev_op=%s prev_name=%s next_op=%s "
+            "next_name=%s\n",
+            p.device, r + 1, e.gap_us, e.prev_op, e.prev_name.c_str(), e.next_op, e.next_name.c_str());
+    }
 
     // llama.cpp-6405 (reviewer nit): sort tensor names so the print order is
     // deterministic across runs -- std::unordered_map's iteration order is
