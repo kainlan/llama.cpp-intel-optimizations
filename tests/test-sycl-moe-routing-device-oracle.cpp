@@ -52,6 +52,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -73,7 +74,24 @@ struct routing_graph {
     ggml_cgraph *  gf     = nullptr;
     ggml_tensor *  weight = nullptr;
     ggml_tensor *  hidden = nullptr;
+    ggml_tensor *  probs  = nullptr;
     ggml_tensor *  ids    = nullptr;
+};
+
+// llama.cpp-iikr (fix cycle after team-lead's c-vr68-style FAIL 6/8 capture,
+// tie-break diagnosis): a mismatch alone does not say whether the device
+// chain is wrong or whether two experts genuinely tied and the CPU's
+// stable sort and the device's (unstable, bitonic) sort broke the tie
+// differently -- a benign, graph-level-invariant artifact per the pairing
+// proof in llama-graph.cpp (selected_experts feeds weights AND every
+// gate/up/down build_lora_mm_id call, so a same-score permutation cannot
+// separate a weight from its expert; the final combine is a commutative
+// ggml_add reduction, llama-graph.cpp:2121-2127). This struct carries BOTH
+// sides' probability for the disputed slot so the caller can tell those
+// two cases apart with evidence instead of assuming one.
+struct routing_result {
+    std::vector<int32_t> ids;    // [n_expert_used, n_tokens]
+    std::vector<float>   probs;  // [n_expert, n_tokens] -- softmax scores, one per (expert, token)
 };
 
 // Mirrors src/llama-graph.cpp's router subgraph for the no-expert-groups,
@@ -105,28 +123,38 @@ static routing_graph build_routing_graph(int n_expert, int n_expert_used, int hi
     ggml_tensor * logits = ggml_mul_mat(rg.ctx, rg.weight, rg.hidden);
     ggml_set_name(logits, "ffn_moe_logits");  // [n_expert, n_tokens]
 
-    ggml_tensor * probs = ggml_soft_max(rg.ctx, logits);
-    ggml_set_name(probs, "ffn_moe_probs");                      // [n_expert, n_tokens]
+    rg.probs = ggml_soft_max(rg.ctx, logits);
+    ggml_set_name(rg.probs, "ffn_moe_probs");  // [n_expert, n_tokens]
+    ggml_set_output(rg.probs);
 
-    rg.ids = ggml_argsort_top_k(rg.ctx, probs, n_expert_used);  // [n_expert_used, n_tokens], I32
+    rg.ids = ggml_argsort_top_k(rg.ctx, rg.probs, n_expert_used);  // [n_expert_used, n_tokens], I32
     ggml_set_name(rg.ids, "ffn_moe_topk");
     ggml_set_output(rg.ids);
 
     rg.gf = ggml_new_graph(rg.ctx);
+    // probs must also be in the forward-expand set -- it's an ancestor of
+    // ids so it would compute either way, but expanding it explicitly as
+    // an output makes ggml_backend_alloc_ctx_tensors keep it allocated
+    // (not treated as free-able intermediate storage) so tensor_get on it
+    // after compute is valid.
+    ggml_build_forward_expand(rg.gf, rg.probs);
     ggml_build_forward_expand(rg.gf, rg.ids);
     return rg;
 }
 
 // Runs `rg`'s graph on `backend` with `hidden_data`/`weight_data` as input,
-// returns the resulting ids tensor's I32 contents. Returns empty on any
-// failure (allocation, compute) rather than aborting, so the caller can
-// report a clean SKIP/FAIL instead of a crash.
-static std::vector<int32_t> run_routing_graph(ggml_backend_t             backend,
-                                              const routing_graph &      rg,
-                                              const std::vector<float> & weight_data,
-                                              const std::vector<float> & hidden_data,
-                                              int                        n_expert_used,
-                                              int                        n_tokens) {
+// returns the resulting ids AND probs tensors' contents (see routing_result
+// -- probs is needed to discriminate a tie-break artifact from a real
+// selection bug on mismatch). Returns an empty result on any failure
+// (allocation, compute) rather than aborting, so the caller can report a
+// clean SKIP/FAIL instead of a crash.
+static routing_result run_routing_graph(ggml_backend_t             backend,
+                                        const routing_graph &      rg,
+                                        const std::vector<float> & weight_data,
+                                        const std::vector<float> & hidden_data,
+                                        int                        n_expert,
+                                        int                        n_expert_used,
+                                        int                        n_tokens) {
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(rg.ctx, backend);
     if (!buffer) {
         std::fprintf(stderr, "[MOE-ROUTING-ORACLE] backend tensor allocation failed\n");
@@ -143,11 +171,14 @@ static std::vector<int32_t> run_routing_graph(ggml_backend_t             backend
         return {};
     }
 
-    std::vector<int32_t> ids(static_cast<size_t>(n_expert_used) * static_cast<size_t>(n_tokens));
-    ggml_backend_tensor_get(rg.ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+    routing_result result;
+    result.ids.resize(static_cast<size_t>(n_expert_used) * static_cast<size_t>(n_tokens));
+    ggml_backend_tensor_get(rg.ids, result.ids.data(), 0, result.ids.size() * sizeof(int32_t));
+    result.probs.resize(static_cast<size_t>(n_expert) * static_cast<size_t>(n_tokens));
+    ggml_backend_tensor_get(rg.probs, result.probs.data(), 0, result.probs.size() * sizeof(float));
 
     ggml_backend_buffer_free(buffer);
-    return ids;
+    return result;
 }
 
 int main() {
@@ -196,36 +227,62 @@ int main() {
             v = dist(rng);
         }
 
-        routing_graph        cpu_graph = build_routing_graph(n_expert, n_expert_used, hidden_dim, n_tokens);
-        std::vector<int32_t> cpu_ids =
-            run_routing_graph(cpu_backend, cpu_graph, weight_data, hidden_data, n_expert_used, n_tokens);
+        routing_graph  cpu_graph = build_routing_graph(n_expert, n_expert_used, hidden_dim, n_tokens);
+        routing_result cpu =
+            run_routing_graph(cpu_backend, cpu_graph, weight_data, hidden_data, n_expert, n_expert_used, n_tokens);
         ggml_free(cpu_graph.ctx);
 
-        routing_graph        sycl_graph = build_routing_graph(n_expert, n_expert_used, hidden_dim, n_tokens);
-        std::vector<int32_t> sycl_ids =
-            run_routing_graph(sycl_backend, sycl_graph, weight_data, hidden_data, n_expert_used, n_tokens);
+        routing_graph  sycl_graph = build_routing_graph(n_expert, n_expert_used, hidden_dim, n_tokens);
+        routing_result sycl =
+            run_routing_graph(sycl_backend, sycl_graph, weight_data, hidden_data, n_expert, n_expert_used, n_tokens);
         ggml_free(sycl_graph.ctx);
 
-        if (cpu_ids.empty() || sycl_ids.empty()) {
+        if (cpu.ids.empty() || sycl.ids.empty()) {
             std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: trial %d produced no data (compute failure)\n", trial);
             ggml_backend_free(sycl_backend);
             ggml_backend_free(cpu_backend);
             return 77;
         }
-        if (cpu_ids.size() != sycl_ids.size()) {
+        if (cpu.ids.size() != sycl.ids.size()) {
             std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL: trial %d size mismatch cpu=%zu sycl=%zu\n", trial,
-                         cpu_ids.size(), sycl_ids.size());
+                         cpu.ids.size(), sycl.ids.size());
             ++mismatches;
             ++trials_run;
             continue;
         }
 
+        // llama.cpp-iikr fix-cycle Part 1 (team-lead, tie-break diagnosis):
+        // on a mismatch, print each side's OWN softmax score for the expert
+        // IT selected at that (token, slot) -- not the other side's score
+        // for the same expert, which would not exist as a comparable
+        // quantity if the two sides picked different experts. Equal scores
+        // (within float noise) at a mismatched slot mean the two sides had
+        // a genuine tie and legitimately broke it differently (CPU argsort
+        // is stable, the device sort is not) -- benign, per the pairing
+        // proof cited on `routing_result` above. Different scores would
+        // mean the device chain picked a strictly worse candidate: a real,
+        // blocking selection bug, not a tie artifact.
         bool trial_ok = true;
-        for (size_t i = 0; i < cpu_ids.size(); ++i) {
-            if (cpu_ids[i] != sycl_ids[i]) {
+        for (size_t i = 0; i < cpu.ids.size(); ++i) {
+            if (cpu.ids[i] != sycl.ids[i]) {
+                const size_t  token       = i / static_cast<size_t>(n_expert_used);
+                const int32_t cpu_expert  = cpu.ids[i];
+                const int32_t sycl_expert = sycl.ids[i];
+                const float   cpu_score   = (cpu_expert >= 0 && cpu_expert < n_expert) ?
+                                                cpu.probs[token * static_cast<size_t>(n_expert) + cpu_expert] :
+                                                -1.0f;
+                const float   sycl_score  = (sycl_expert >= 0 && sycl_expert < n_expert) ?
+                                                sycl.probs[token * static_cast<size_t>(n_expert) + sycl_expert] :
+                                                -1.0f;
+                const float   score_delta = cpu_score - sycl_score;
                 std::fprintf(stderr,
-                             "[MOE-ROUTING-ORACLE] FAIL: trial %d index %zu (token %zu, slot %zu): cpu=%d sycl=%d\n",
-                             trial, i, i / n_expert_used, i % n_expert_used, cpu_ids[i], sycl_ids[i]);
+                             "[MOE-ROUTING-ORACLE] FAIL: trial %d index %zu (token %zu, slot %zu): "
+                             "cpu=%d (score=%.9f) sycl=%d (score=%.9f) delta=%.9e %s\n",
+                             trial, i, token, i % static_cast<size_t>(n_expert_used), cpu_expert, cpu_score,
+                             sycl_expert, sycl_score, score_delta,
+                             (score_delta == 0.0f)            ? "TIE(exact)" :
+                             (std::fabs(score_delta) < 1e-6f) ? "TIE(fp-noise)" :
+                                                                "REAL-DIFF");
                 trial_ok = false;
             }
         }
