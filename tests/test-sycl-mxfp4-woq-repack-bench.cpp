@@ -96,16 +96,21 @@ static void report(const char * form, int n_slots, size_t total_bytes, const ben
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic reference forms (iteration 3, llama.cpp-0vqt): the committed
-// coalesced SOA nibbles kernel (convert.cpp) still measures only ~20-25% of
-// peak bandwidth on both cards after iteration 2's SLM-padding + vectorized-
-// read fixes -- these forms isolate WHERE the loss is by measuring pieces of
-// that kernel's work in total isolation, at the SAME grid/tiling geometry
-// (one workgroup per (source block b, n-tile of DIAG_NBLK consecutive n's),
-// WG_SIZE=256, one lane per n_local doing 4x aligned uint32 reads in the
-// read phase) -- scoped to the NIBBLES plane only (94% of the real kernel's
-// total volume: 4,147,200 of 4,406,400 bytes/slot for the GPT-OSS shape),
-// since the scales plane uses a structurally different (b,n) 2D tile.
+// Diagnostic reference forms (iteration 3, llama.cpp-0vqt): written when the
+// committed coalesced SOA nibbles kernel (convert.cpp) still measured only
+// ~20-25% of peak bandwidth on both cards after iteration 2's SLM-padding +
+// vectorized-read fixes -- these forms isolate WHERE the loss is by
+// measuring pieces of that kernel's work in total isolation, at the SAME
+// WORKGROUP GRID as the committed kernel (one workgroup per (source block
+// b, n-tile of DIAG_NBLK consecutive n's)), with their OWN fixed WG_SIZE=256
+// (unchanged by this correction -- see the geometry printf below for the
+// committed kernel's own WG_SIZE, which iteration 3's write-vectorization
+// dropped to 32). Phase 1 (read) is one lane per n_local doing 4x aligned
+// uint32 reads, matching the committed kernel's read phase, which iteration
+// 3 did not touch -- scoped to the NIBBLES plane only (94% of the real
+// kernel's total volume: 4,147,200 of 4,406,400 bytes/slot for the GPT-OSS
+// shape), since the scales plane uses a structurally different (b,n) 2D
+// tile.
 //
 // DIAG_NBLK must track MXFP4_WOQ_REPACK_COALESCED_NBLK in convert.cpp (both
 // 16) -- this file is a separate translation unit and convert.cpp's
@@ -293,16 +298,21 @@ int main() {
         std::printf("[REPACK-BENCH] shape blocks_per_row=%d nrows=%d tile_n_total=%d n_slots=%d K=%lld N=%lld\n",
                     blocks_per_row, nrows, tile_n_total, n_slots, (long long) K, (long long) N);
 
-        // Iteration-3 diagnostic tile geometry, for the lead's per-DRAM-
-        // transaction burst-size check: DIAG_NBLK workgroups' n-axis width,
-        // WG_SIZE, and bytes moved per work-item in each phase of the
-        // committed coalesced SOA nibbles kernel (see the diag kernels'
-        // comments above -- these mirror it exactly).
+        // Committed-kernel tile geometry (quality-review R7, llama.cpp-0vqt:
+        // this used to describe iteration 2's structure -- WG_SIZE=256,
+        // 256 phase-2 lanes, 1 write byte/lane -- which iteration 3's
+        // write-vectorization superseded; corrected to match convert.cpp's
+        // committed repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel).
+        // read_bytes_per_WI is unchanged from iteration 2 (reads weren't
+        // touched by iteration 3); the diag-* forms above are standalone
+        // reference measurements at their OWN fixed geometry (DIAG_NBLK=16,
+        // WG_SIZE=256) and are not affected by this correction -- see N1
+        // (deferred) for reconciling the diag forms' geometry to match.
         {
             const int64_t n_tiles_geom       = N / DIAG_NBLK;
-            const int     wg_size_geom       = 32 * (DIAG_NBLK / 2);  // == 256, matches phase 2's thread count
-            const int     read_bytes_per_wi  = 16;                    // 4x uint32, one lane per n_local
-            const int     write_bytes_per_wi = 1;                     // one packed nibble-pair byte per lane
+            const int     wg_size_geom       = 32;  // committed kernel's WG_SIZE_NIBBLES (convert.cpp)
+            const int     read_bytes_per_wi  = 16;  // 4x uint32, one lane per n_local, 16 active lanes/WG (unchanged)
+            const int     write_bytes_per_wi = 8;   // one uint64 row per lane, 32 active lanes/WG (iteration 3)
             std::printf(
                 "[REPACK-BENCH] geometry workgroups_per_slot=%lldx%lld(=b x n_tile) WG_SIZE=%d "
                 "phase1_active_lanes=%d read_bytes_per_WI=%d(one_burst, %d-byte-separated_across_lanes) "

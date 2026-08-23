@@ -381,8 +381,13 @@ static ab_arm_result run_roleswap_arm(sycl::queue & q, dnnl::engine & eng, dnnl:
     return res;
 }
 
-// rc: 0 both arms supported + numerically clean (ratio is REPORTED, judged by
-// the reader); 44 stored-flat unsupported; 45 stored-flat wrong numerics.
+// rc (quality-review R5, llama.cpp-0vqt -- this map is stale, corrected to
+// match the actual return sites below): 0 = expected capability map
+// unchanged (row-major supported+correct, stored-layout forms remain
+// unusable); 45 = row-major itself regressed; 46 = a stored-layout form
+// started working (oneDNN/driver capability changed) -- see the
+// CAPABILITY TRIPWIRE block below for the full decision table. 44 never
+// occurs; it is not a valid return from this function.
 static int run_ab_case(sycl::queue & q, dnnl::engine & eng, dnnl::stream & stream) {
     // GPT-OSS gate/up expert shape: K = N = 2880 (blocks_per_row 90); M = 64
     // is the mean rows/expert at pp512 (512 tokens x 4 active / 32 experts).

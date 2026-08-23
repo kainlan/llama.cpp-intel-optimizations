@@ -1720,6 +1720,17 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
         return;
     }
 
+    // Quality-review R4 (llama.cpp-0vqt): the nibbles/scales kernels'
+    // vectorized uint64 stores (iteration 3) require both destination
+    // bases to be 8-byte aligned -- a misaligned base is UB that would
+    // silently corrupt adjacent bytes rather than fault, not something the
+    // prose-only alignment argument in the kernel comments can catch on
+    // its own. Production callers satisfy this via align_up_256 slot
+    // strides (ggml-sycl.cpp); this is the tripwire for any future caller
+    // that doesn't.
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_nibbles) % 8 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_scales) % 8 == 0);
+
     const int64_t   nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
     const uint8_t * qs      = static_cast<const uint8_t *>(src);
     const uint8_t * e       = qs + nblocks * (QK_MXFP4 / 2);
@@ -1887,6 +1898,18 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
                                         blocks_per_row, nrows, stream);
         return;
     }
+
+    // Quality-review R4 (llama.cpp-0vqt): the vectorized uint64 stores need
+    // the batch base AND every per-slot store address 8-byte aligned --
+    // the latter holds for any slot iff weight_slot_bytes (nibbles' slot
+    // stride) and woq_nibble_slot_bytes (the scales offset within a slot)
+    // are themselves 8-byte aligned, since slot*weight_slot_bytes and
+    // +woq_nibble_slot_bytes are then multiples of 8 regardless of slot.
+    // See the per-slot form above for why a misaligned base is
+    // silent-corruption UB, not a fault.
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_weight_base) % 8 == 0);
+    GGML_ASSERT(weight_slot_bytes % 8 == 0);
+    GGML_ASSERT(woq_nibble_slot_bytes % 8 == 0);
 
     mxfp4_woq_repack_src_table src_table{};
     for (int i = 0; i < n_slots; ++i) {
@@ -2303,6 +2326,12 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
         return;
     }
 
+    // Quality-review R4 (llama.cpp-0vqt): see repack_mxfp4_soa_to_woq_
+    // coalesced above for why -- same tripwire for the nibbles kernel's
+    // vectorized uint64 store base.
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_nibbles) % 8 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_scales) % 8 == 0);
+
     const uint8_t * src             = static_cast<const uint8_t *>(src_tiled);
     const int64_t   n_tile_groups_n = N / tile_n_total;
     const int64_t   group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
@@ -2432,6 +2461,13 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
                                               blocks_per_row, nrows, tile_n_total, stream);
         return;
     }
+
+    // Quality-review R4 (llama.cpp-0vqt): see repack_mxfp4_soa_to_woq_
+    // coalesced_batched above for why -- same tripwire for the batch base
+    // and the per-slot store strides.
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_weight_base) % 8 == 0);
+    GGML_ASSERT(weight_slot_bytes % 8 == 0);
+    GGML_ASSERT(woq_nibble_slot_bytes % 8 == 0);
 
     mxfp4_woq_repack_src_table src_table{};
     for (int i = 0; i < n_slots; ++i) {

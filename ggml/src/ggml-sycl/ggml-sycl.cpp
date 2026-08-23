@@ -71266,12 +71266,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // (in-order queue) BEFORE the per-slot activation-copy loop below
             // and before the later barrier that gates the GEMM on "everything
             // queued so far", so ordering matches the pre-1lon per-slot form
-            // without a host wait. Event contract unchanged: still exactly
-            // one begin/end marker bracket per tensor-dispatch repack (this
-            // was already true per-dispatch even before batching, since the
-            // per-slot markers here were counted per active_experts.size()
-            // -- now the batched launch's own begin/end pair is the whole
-            // dispatch's repack bracket).
+            // without a host wait. Event contract CHANGED at 1lon (spec
+            // review finding R2, llama.cpp-0vqt): pre-1lon, the per-slot
+            // repack loop emitted one begin/end marker bracket per ACTIVE
+            // SLOT (mean 23.3 brackets/dispatch); as of this batched launch
+            // it is exactly one bracket per TENSOR-DISPATCH (see e16dbd8f2).
+            // Profile `repack_calls`/`repacks_per_dispatch` counts from a
+            // pre-1lon capture are therefore NOT comparable to a post-1lon
+            // one -- see docs/backend/sycl-env-vars.md for the updated
+            // semantics.
             //
             // Bounded by GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS -- falls back
             // to the pre-1lon per-slot loop below on the chance a dispatch

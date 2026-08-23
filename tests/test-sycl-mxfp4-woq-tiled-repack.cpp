@@ -433,10 +433,15 @@ static int run_and_check_fn(sycl::queue & q,
 // Same logical-matrix / forward-writer / direct-encoding triangulation as
 // check_randomized above, parameterized over shape and run through
 // repack_mxfp4_xmx_tiled_to_woq_coalesced -- used for a fast-path shape
-// (tile_n_total even, N % tile_n_total == 0, including the real GPT-OSS
-// gate/up shape) and a fallback shape (N % tile_n_total != 0, exercising
-// the internal fallback to repack_mxfp4_xmx_tiled_to_woq), so both
-// dispatch branches are proven correct.
+// (quality-review R6, llama.cpp-0vqt: tile_n_total == 16 EXACTLY, per
+// iteration 3's tightened gate -- see main() below, "coalesced-fastpath"
+// and the real GPT-OSS gate/up shape) and a fallback shape ("coalesced-
+// fallback": tile_n_total=4 with N % tile_n_total == 0, isolating
+// tile_n_total != 16 as the sole trigger for the internal fallback to
+// repack_mxfp4_xmx_tiled_to_woq), so both dispatch branches are proven
+// correct. Note: no case currently exercises the OTHER fallback trigger,
+// N % tile_n_total != 0 (with tile_n_total == 16) -- only tile_n_total !=
+// 16 is covered.
 static int check_coalesced_randomized(sycl::queue & q,
                                       const char *  label,
                                       int           blocks_per_row,
