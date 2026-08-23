@@ -354,6 +354,85 @@ static void print_boundary_evidence(int trial, size_t token, const float * cpu_r
                  (rel_margin > kBoundaryMarginRel) ? "STRUCTURAL" : "BOUNDARY-FLIP(diagnostic)");
 }
 
+// team-lead's round-4 diagnostic split, after a genuine STRUCTURAL
+// id-mismatch (token 327, rel_margin ~1.93e-3, ~100x the noise threshold)
+// survived the boundary-margin qualifier -- this is not noise, and needs a
+// diagnosis before stage (ii). Two hypotheses split cleanly on the same
+// four numbers print_token_mismatch already prints for every id in the
+// union (cpu_score/sycl_score for cpu's pick and sycl's pick), so this
+// function states the verdict explicitly instead of leaving a reader to
+// cross-reference two lines by hand:
+//   H1 DEVICE SCORES WRONG: the device's OWN scores are internally
+//      consistent (it ranks its own pick above cpu's pick, by its own
+//      numbers) but at least one of those scores deviates from the CPU
+//      reference beyond approx_equal's tolerance -- the defect is
+//      upstream, in the device logits-matmul/softmax for this data
+//      pattern.
+//   H2 DEVICE SORT DISOBEYS ITS OWN SCORES: the device's OWN scores rank
+//      CPU's pick higher, yet it selected the other expert anyway -- the
+//      defect is in the device top-k/argsort compare or the id gather,
+//      independent of whether the scores themselves are correct.
+// These are mutually exclusive and jointly exhaustive over "sets differ":
+// device_internally_consistent is exactly the boolean that decides which
+// one applies.
+static void print_structural_hypothesis(int                          trial,
+                                        size_t                       token,
+                                        const std::vector<int32_t> & cpu_set,
+                                        const std::vector<int32_t> & sycl_set,
+                                        const std::vector<float> &   cpu_probs,
+                                        const std::vector<float> &   sycl_probs,
+                                        int                          n_expert) {
+    std::vector<int32_t> cpu_only;
+    std::vector<int32_t> sycl_only;
+    for (int32_t id : cpu_set) {
+        if (std::find(sycl_set.begin(), sycl_set.end(), id) == sycl_set.end()) {
+            cpu_only.push_back(id);
+        }
+    }
+    for (int32_t id : sycl_set) {
+        if (std::find(cpu_set.begin(), cpu_set.end(), id) == cpu_set.end()) {
+            sycl_only.push_back(id);
+        }
+    }
+    // Pair them positionally -- for the observed single-swap case this is
+    // the one (cpu_pick, sycl_pick) pair; a token with a larger symmetric
+    // difference gets one hypothesis line per pair, min-sized so no
+    // out-of-bounds access if the two sides differ in count.
+    const size_t n_pairs = std::min(cpu_only.size(), sycl_only.size());
+    for (size_t i = 0; i < n_pairs; ++i) {
+        const int32_t cpu_pick     = cpu_only[i];
+        const int32_t sycl_pick    = sycl_only[i];
+        const size_t  base         = token * static_cast<size_t>(n_expert);
+        const float   cs_cpu_pick  = cpu_probs[base + cpu_pick];
+        const float   ss_cpu_pick  = sycl_probs[base + cpu_pick];
+        const float   cs_sycl_pick = cpu_probs[base + sycl_pick];
+        const float   ss_sycl_pick = sycl_probs[base + sycl_pick];
+
+        const bool device_internally_consistent = ss_sycl_pick > ss_cpu_pick;
+        const bool device_score_deviates =
+            !approx_equal(cs_cpu_pick, ss_cpu_pick) || !approx_equal(cs_sycl_pick, ss_sycl_pick);
+
+        const char * verdict;
+        if (!device_internally_consistent) {
+            verdict =
+                "H2 DEVICE SORT DISOBEYS ITS OWN SCORES -- own score ranks cpu's pick higher, yet selected "
+                "sycl's pick; argsort/gather defect";
+        } else if (device_score_deviates) {
+            verdict =
+                "H1 DEVICE SCORES WRONG -- internally consistent selection, but a score deviates from CPU "
+                "beyond tolerance; upstream logits-matmul/softmax defect";
+        } else {
+            verdict =
+                "UNRESOLVED -- internally consistent AND within tolerance of CPU on both scores; re-examine, "
+                "this combination should not produce an id mismatch";
+        }
+        std::fprintf(stderr,
+                     "[MOE-ROUTING-ORACLE]   hypothesis(trial %d token %zu): cpu_pick=%d[cpu_score=%.9f "
+                     "sycl_score=%.9f] sycl_pick=%d[cpu_score=%.9f sycl_score=%.9f] -> %s\n",
+                     trial, token, cpu_pick, cs_cpu_pick, ss_cpu_pick, sycl_pick, cs_sycl_pick, ss_sycl_pick, verdict);
+    }
+}
+
 int main() {
     // GPT-OSS 20B's confirmed MoE shape: 32 experts, top-4 selected per
     // token (see the file header comment for the citation). hidden_dim and
@@ -490,6 +569,10 @@ int main() {
                 print_boundary_evidence(trial, token, cpu_row, n_expert, n_expert_used);
                 if (structural) {
                     ++id_mismatch_tokens;
+                    // team-lead's round-4 ask: this is not noise -- split
+                    // H1 (device scores wrong) from H2 (device sort
+                    // disobeys its own scores) with evidence, not a guess.
+                    print_structural_hypothesis(trial, token, cpu_set, sycl_set, cpu.probs, sycl.probs, n_expert);
                 } else {
                     ++boundary_flip_tokens;
                 }
@@ -509,6 +592,14 @@ int main() {
                     print_token_mismatch("strict/structural", trial, token, cpu_slot, sycl_slot, cpu.probs, sycl.probs,
                                          n_expert);
                     print_boundary_evidence(trial, token, cpu_row, n_expert, n_expert_used);
+                    // No print_structural_hypothesis call here: a token
+                    // failing the strict arm because its id SET differs is
+                    // the same token the semantic-arm branch above already
+                    // classified as id_mismatch_tokens and printed the
+                    // hypothesis for -- calling it twice would duplicate,
+                    // not add, evidence. A strict-only failure (sets_equal
+                    // but slot order differs) has no symmetric difference
+                    // to classify against H1/H2 in the first place.
                 }
             }
         }
