@@ -74,6 +74,28 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+// joint_matrix (DPAS) arms -- added stage-1 follow-up cycle (team-lead
+// directive, task comment c-0xub on llama.cpp-iikr): the plain-SYCL f16/
+// q8dp4a arms above are ~14x below the throughput oneDNN's woq_gemm
+// achieves (measured effective ~31/~16 TFLOPs on B70/B50 -- it is on the
+// XMX systolic arrays), so joint_matrix is the only candidate class that
+// can plausibly reach the bar. Same include-guard idiom as moe-xmx.hpp's
+// SYCL_XMX_MOE_AVAILABLE.
+#if __has_include(<sycl/ext/oneapi/matrix/matrix.hpp>)
+#    define SYCL_XMX_JM_AVAILABLE 1
+#    include <sycl/ext/oneapi/matrix/matrix.hpp>
+namespace sycl_xmx_bench = sycl::ext::oneapi::experimental::matrix;
+
+// joint_matrix_load/store require a decorated local-space pointer, not a
+// raw one -- same cast moe-xmx-fused.hpp's fused_xmx_moe_gemm_mxfp4_tiled
+// uses for its SLM operands.
+template <typename T> static inline auto as_local_ptr(T * p) {
+    return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p);
+}
+#else
+#    define SYCL_XMX_JM_AVAILABLE 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Local dequant table + LUT lookup, duplicated rather than pulling in
 // vecdotq.hpp's full dependency chain -- same precedent as
@@ -475,6 +497,240 @@ static void gemm_tiled_q8dp4a_kernel(const uint8_t * __restrict__ w_tiled,
     out[row * n + col] = acc;
 }
 
+#if SYCL_XMX_JM_AVAILABLE
+// ---------------------------------------------------------------------------
+// joint_matrix (DPAS) arms, tiled (XMX_TILED) layout only -- team-lead's
+// directive scopes this cycle to the tiled layout, where the existing
+// production DPAS precedent (mmvq.cpp's
+// mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl) and the dead-code
+// precedent (moe-xmx-fused.hpp's fused_xmx_moe_gemm_mxfp4_tiled) both live;
+// SOA joint_matrix arms are an easy follow-on with this same structure but
+// out of scope here.
+//
+// Tile shapes are NOT guessed -- both are copied from VERIFIED, ALREADY-
+// COMPILING production code in this repo, at the two different K depths
+// Intel's DPAS uses for the two element widths:
+//   f16:  XMX_TILE_M=8, XMX_TILE_N=16, XMX_TILE_K=16
+//         (ggml-sycl/unified-kernel.hpp:575-577 -- the SAME constants an
+//         existing production MXFP4-consuming (AOS) f16 joint_matrix GEMM
+//         in unified-kernel.cpp already uses successfully on this hardware)
+//   int8: XMX_M=8, XMX_N=16, XMX_K=32
+//         (ggml-sycl/moe-xmx-fused.hpp's MXFPXMXConfig -- the same constants
+//         GGML_SYCL_MXFP4_MOE_XMX_M/N/K in common.hpp use for the LIVE
+//         production mxfp4_pair_glu_xmx_tiled_grouped_packed_q8_m2_sycl
+//         kernel)
+// The load/mad/store call sequence (joint_matrix_load with an explicit
+// leading dimension for a [N][K]-flat SLM buffer as the B operand,
+// joint_matrix_mad into an accumulator, joint_matrix_store back to SLM for
+// scalar extraction rather than joint_matrix_apply) is copied verbatim in
+// shape from moe-xmx-fused.hpp's fused_xmx_moe_gemm_mxfp4_tiled (int8) and
+// unified-kernel.cpp's XMX MUL_MAT path (f16) -- both ALREADY COMPILE AND
+// RUN on this hardware today, which de-risks the API usage even though
+// neither one is doing what this bench asks of it (per-token M=1 GEMV for
+// the former; AOS-only for the latter). What's NEW here, and therefore NOT
+// covered by that precedent, is genuinely batching XMX_TILE_M=8 REAL rows
+// (both precedents above only ever have 1 real row in the M dimension) and
+// reading XMX_TILED (not AOS). Flagging this precisely so a wrong number
+// here is diagnosed as "the batching is new" rather than "the API is
+// unverified".
+constexpr int XMX_JM_M       = 8;                          // real M dim: both precedents use 8
+constexpr int XMX_JM_N       = 16;                         // == TILE_N_TOTAL above, by construction
+constexpr int XMX_JM_K_F16   = 16;
+constexpr int XMX_JM_K_I8    = 32;                         // == QK_MXFP4: one MXFP4 block per K-step
+constexpr int XMX_JM_SG      = 16;                         // sub-group size both precedents require
+constexpr int XMX_JM_NUM_SG  = 4;                          // sub-groups per WG == N-tiles per WG
+constexpr int XMX_JM_WG_SIZE = XMX_JM_NUM_SG * XMX_JM_SG;  // 64, matches WG_SIZE above
+
+// f16 arm: weight nibbles dequantized AND pre-scaled by the block's e8m0
+// factor while staging into SLM, so the joint_matrix accumulator can sum
+// RAW mad() results across the WHOLE K loop with no per-block reset --
+// unlike the int8 arm below, f16 has no per-row activation scale to apply
+// post-hoc, so baking the (single, per-column) weight scale into the SLM
+// tile before joint_matrix_load is both correct and simpler. Each MXFP4
+// block (32 elements) is fed as TWO K-steps of XMX_JM_K_F16=16 (low
+// nibbles -> elements 0..15, high nibbles -> elements 16..31, matching the
+// verified p/p+16 mapping documented above) into the SAME accumulator --
+// mathematically identical to scaling the two halves separately and
+// summing, since both halves of one block share the same scale.
+static void gemm_tiled_f16_jm_kernel(const uint8_t * __restrict__ w_tiled,
+                                     int64_t n_tile_groups_n,
+                                     int64_t tile_n_total,
+                                     const sycl::half * __restrict__ act,
+                                     float * __restrict__ out,
+                                     int64_t k,
+                                     int64_t n,
+                                     int     blocks_per_row,
+                                     sycl::half * __restrict__ slm_act,  // [XMX_JM_M][XMX_JM_K_F16], WG-shared
+                                     sycl::half * __restrict__ slm_w,    // [XMX_JM_NUM_SG][XMX_JM_N][XMX_JM_K_F16]
+                                     float * __restrict__ slm_out,       // [XMX_JM_NUM_SG][XMX_JM_M][XMX_JM_N]
+                                     const sycl::nd_item<2> & item) {
+    namespace jm        = sycl_xmx_bench;
+    const int64_t m0    = item.get_group(0) * XMX_JM_M;
+    const int64_t n_wg0 = item.get_group(1) * XMX_JM_WG_SIZE;
+    auto          sg    = item.get_sub_group();
+    const int     sg_id = static_cast<int>(sg.get_group_linear_id());
+    const int     lane  = static_cast<int>(sg.get_local_linear_id());
+    const int64_t n0    = n_wg0 + sg_id * XMX_JM_N;
+    // n0 is always a multiple of tile_n_total (== XMX_JM_N == 16 by
+    // construction: TILE_N_TOTAL==16 above), so this subgroup's 16-column
+    // span is EXACTLY one XMX_TILED tile group -- not one column of it.
+    // scales_ptr[col_local] / qs_ptr[col_local*16 + byte] index the WHOLE
+    // tile group below, one entry per column in this subgroup's span.
+
+    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, XMX_JM_M, XMX_JM_K_F16, jm::layout::row_major> mat_a;
+    jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, XMX_JM_K_F16, XMX_JM_N, jm::layout::col_major> mat_b;
+    jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, XMX_JM_M, XMX_JM_N>                       acc;
+    jm::joint_matrix_fill(sg, acc, 0.0f);
+
+    sycl::half * my_slm_w   = slm_w + sg_id * XMX_JM_N * XMX_JM_K_F16;
+    float *      my_slm_out = slm_out + sg_id * XMX_JM_M * XMX_JM_N;
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const int64_t   tg         = xmx_tile_group_offset(b, n0, n_tile_groups_n, tile_n_total);
+        const uint8_t * scales_ptr = w_tiled + tg;
+        const uint8_t * qs_ptr     = w_tiled + tg + tile_n_total;
+        for (int half = 0; half < 2; ++half) {
+            // Shared activation tile: staged once by the whole WG (every
+            // subgroup needs the same m0/K-range), not per subgroup.
+            for (int i = lane + sg_id * XMX_JM_SG; i < XMX_JM_M * XMX_JM_K_F16; i += XMX_JM_WG_SIZE) {
+                const int m_local = i / XMX_JM_K_F16;
+                const int k_local = i % XMX_JM_K_F16;
+                slm_act[i]        = act[(m0 + m_local) * k + b * QK_MXFP4 + half * XMX_JM_K_F16 + k_local];
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // Per-subgroup weight tile: ALL 16 columns of this subgroup's
+            // own tile group, each with its own e8m0 scale.
+            for (int lid = lane; lid < XMX_JM_N * XMX_JM_K_F16; lid += XMX_JM_SG) {
+                const int     col_local                      = lid / XMX_JM_K_F16;
+                const int     k_local                        = lid % XMX_JM_K_F16;
+                const float   d                              = sycl_e8m0_to_fp32_half(scales_ptr[col_local]);
+                const uint8_t byte                           = qs_ptr[col_local * 16 + k_local];
+                const int8_t  nib                            = half == 0 ? (byte & 0xf) : (byte >> 4);
+                my_slm_w[col_local * XMX_JM_K_F16 + k_local] = sycl::half(d * kvalues_mxfp4_local[nib]);
+            }
+            sycl::group_barrier(sg);
+
+            jm::joint_matrix_load(sg, mat_a, as_local_ptr(slm_act), XMX_JM_K_F16);
+            jm::joint_matrix_load(sg, mat_b, as_local_ptr(my_slm_w), XMX_JM_K_F16);
+            jm::joint_matrix_mad(sg, acc, mat_a, mat_b, acc);
+            // WG-scoped, not subgroup-scoped: slm_act is WG-SHARED and the
+            // next iteration's cooperative load (above) overwrites it --
+            // every subgroup must finish reading it via joint_matrix_load
+            // before any subgroup starts that overwrite, which a
+            // subgroup-only barrier cannot guarantee across subgroups.
+            item.barrier(sycl::access::fence_space::local_space);
+        }
+    }
+
+    jm::joint_matrix_store(sg, acc, as_local_ptr(my_slm_out), XMX_JM_N, jm::layout::row_major);
+    sycl::group_barrier(sg);
+    for (int i = lane; i < XMX_JM_M * XMX_JM_N; i += XMX_JM_SG) {
+        const int m_local                      = i / XMX_JM_N;
+        const int n_local                      = i % XMX_JM_N;
+        out[(m0 + m_local) * n + n0 + n_local] = my_slm_out[i];
+    }
+}
+
+// int8/dp4a-via-DPAS arm: mirrors moe-xmx-fused.hpp's
+// fused_xmx_moe_gemm_mxfp4_tiled block loop exactly (fresh accumulator per
+// MXFP4 block == one XMX_JM_K_I8=32 K-step, extract to SLM, apply BOTH the
+// per-row Q8_1 activation scale and the per-column weight scale, add into a
+// running float total, reset) -- generalized from that kernel's M=1-real-
+// row special case to XMX_JM_M=8 genuinely real rows, which needs the
+// per-row scale applied per matrix ELEMENT (not once for the whole tile,
+// as the M=1 precedent could get away with).
+static void gemm_tiled_q8dp4a_jm_kernel(const uint8_t * __restrict__ w_tiled,
+                                        int64_t n_tile_groups_n,
+                                        int64_t tile_n_total,
+                                        const int8_t * __restrict__ q8_act,  // per-row SOA: [90*32 qs][90*half2 ds]
+                                        float * __restrict__ out,
+                                        int64_t k,
+                                        int64_t n,
+                                        int     blocks_per_row,
+                                        int8_t * __restrict__ slm_act,   // [XMX_JM_M][XMX_JM_K_I8], WG-shared
+                                        float * __restrict__ slm_act_d,  // [XMX_JM_M], WG-shared, this block's scale
+                                        int8_t * __restrict__ slm_w,     // [XMX_JM_NUM_SG][XMX_JM_N][XMX_JM_K_I8]
+                                        int32_t * __restrict__ slm_raw,  // [XMX_JM_NUM_SG][XMX_JM_M][XMX_JM_N]
+                                        const sycl::nd_item<2> & item) {
+    namespace jm            = sycl_xmx_bench;
+    const int64_t m0        = item.get_group(0) * XMX_JM_M;
+    const int64_t n_wg0     = item.get_group(1) * XMX_JM_WG_SIZE;
+    auto          sg        = item.get_sub_group();
+    const int     sg_id     = static_cast<int>(sg.get_group_linear_id());
+    const int     lane      = static_cast<int>(sg.get_local_linear_id());
+    const int64_t n0        = n_wg0 + sg_id * XMX_JM_N;
+    // As in the f16 arm above: n0 is always tile_n_total-aligned (==
+    // XMX_JM_N==16), so this subgroup's span is exactly one XMX_TILED tile
+    // group -- scales_ptr/qs_ptr below are indexed per-column across the
+    // WHOLE group, not a single "my column".
+    const int64_t row_bytes = k + blocks_per_row * 4;
+
+    int8_t *  my_slm_w   = slm_w + sg_id * XMX_JM_N * XMX_JM_K_I8;
+    int32_t * my_slm_raw = slm_raw + sg_id * XMX_JM_M * XMX_JM_N;
+
+    // Zero this SUBGROUP's own (m0..m0+8, n0..n0+16) tile of the global out
+    // buffer, which doubles as the running float total across blocks
+    // (mirroring the scalar arms above). Must be SG-scoped (lane; += SG),
+    // not WG-flat (lane+sg_id*SG; += WG_SIZE) -- each subgroup's n0 differs,
+    // so a WG-flat distribution over a single-subgroup-sized range would
+    // leave 3/4 of each subgroup's own tile unzeroed.
+    for (int i = lane; i < XMX_JM_M * XMX_JM_N; i += XMX_JM_SG) {
+        const int m_local                      = i / XMX_JM_N;
+        const int n_local                      = i % XMX_JM_N;
+        out[(m0 + m_local) * n + n0 + n_local] = 0.0f;
+    }
+    sycl::group_barrier(sg);
+
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const int64_t   tg         = xmx_tile_group_offset(b, n0, n_tile_groups_n, tile_n_total);
+        const uint8_t * scales_ptr = w_tiled + tg;
+        const uint8_t * qs_ptr     = w_tiled + tg + tile_n_total;
+
+        for (int i = lane + sg_id * XMX_JM_SG; i < XMX_JM_M * XMX_JM_K_I8; i += XMX_JM_WG_SIZE) {
+            const int m_local = i / XMX_JM_K_I8;
+            const int k_local = i % XMX_JM_K_I8;
+            slm_act[i]        = q8_act[(m0 + m_local) * row_bytes + b * QK_MXFP4 + k_local];
+        }
+        for (int m_local = lane + sg_id * XMX_JM_SG; m_local < XMX_JM_M; m_local += XMX_JM_WG_SIZE) {
+            const sycl::half * ds = reinterpret_cast<const sycl::half *>(q8_act + (m0 + m_local) * row_bytes + k);
+            slm_act_d[m_local]    = static_cast<float>(ds[b * 2 + 0]);
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+
+        // Per-subgroup weight tile: ALL 16 columns of this subgroup's own
+        // tile group (each column's 16-byte qs block covers K=32 nibbles
+        // for THIS one MXFP4 block == exactly XMX_JM_K_I8).
+        for (int lid = lane; lid < XMX_JM_N * XMX_JM_K_I8; lid += XMX_JM_SG) {
+            const int     col_local                     = lid / XMX_JM_K_I8;
+            const int     k_local                       = lid % XMX_JM_K_I8;
+            const uint8_t byte                          = qs_ptr[col_local * 16 + (k_local & 0xf)];
+            const int8_t  nib                           = k_local < 16 ? (byte & 0xf) : (byte >> 4);
+            my_slm_w[col_local * XMX_JM_K_I8 + k_local] = kvalues_mxfp4_local[nib];
+        }
+        sycl::group_barrier(sg);
+
+        jm::joint_matrix<sycl::sub_group, int8_t, jm::use::a, XMX_JM_M, XMX_JM_K_I8, jm::layout::row_major> mat_a;
+        jm::joint_matrix<sycl::sub_group, int8_t, jm::use::b, XMX_JM_K_I8, XMX_JM_N, jm::layout::col_major> mat_b;
+        jm::joint_matrix<sycl::sub_group, int32_t, jm::use::accumulator, XMX_JM_M, XMX_JM_N>                acc;
+        jm::joint_matrix_fill(sg, acc, 0);
+        jm::joint_matrix_load(sg, mat_a, as_local_ptr(slm_act), XMX_JM_K_I8);
+        jm::joint_matrix_load(sg, mat_b, as_local_ptr(my_slm_w), XMX_JM_K_I8);
+        jm::joint_matrix_mad(sg, acc, mat_a, mat_b, acc);
+        jm::joint_matrix_store(sg, acc, as_local_ptr(my_slm_raw), XMX_JM_N, jm::layout::row_major);
+        sycl::group_barrier(sg);
+
+        for (int i = lane; i < XMX_JM_M * XMX_JM_N; i += XMX_JM_SG) {
+            const int   m_local = i / XMX_JM_N;
+            const int   n_local = i % XMX_JM_N;
+            const float d_col   = sycl_e8m0_to_fp32_half(scales_ptr[n_local]);
+            out[(m0 + m_local) * n + n0 + n_local] += static_cast<float>(my_slm_raw[i]) * slm_act_d[m_local] * d_col;
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+}
+#endif  // SYCL_XMX_JM_AVAILABLE
+
 static void report(const char * form, int64_t m, int64_t n, int64_t k, const bench_result & r) {
     const double flops       = 2.0 * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k);
     const double gflops_mean = (flops / 1.0e9) / (r.mean_ms / 1000.0);
@@ -603,6 +859,53 @@ int main() {
                 };
                 report("tiled-q8dp4a-gemm-only", m, N, K, run_bench(q, WARMUP, ITERS, work));
             }
+#if SYCL_XMX_JM_AVAILABLE
+            // joint_matrix (DPAS) arms -- team-lead directive, task comment
+            // c-0xub. m must be a multiple of XMX_JM_M=8; all three Ms above
+            // (32/64/128) are.
+            {
+                const int64_t n_tiles_jm = N / XMX_JM_WG_SIZE;  // 2880/64 = 45, exact
+                auto          work       = [&](sycl::queue & qq) {
+                    qq.submit([&](sycl::handler & cgh) {
+                        sycl::local_accessor<sycl::half, 1> slm_act(sycl::range<1>(XMX_JM_M * XMX_JM_K_F16), cgh);
+                        sycl::local_accessor<sycl::half, 1> slm_w(
+                            sycl::range<1>(XMX_JM_NUM_SG * XMX_JM_N * XMX_JM_K_F16), cgh);
+                        sycl::local_accessor<float, 1> slm_out(sycl::range<1>(XMX_JM_NUM_SG * XMX_JM_M * XMX_JM_N),
+                                                                              cgh);
+                        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(m / XMX_JM_M, n_tiles_jm * XMX_JM_WG_SIZE),
+                                                                          sycl::range<2>(1, XMX_JM_WG_SIZE)),
+                                                        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_JM_SG)]] {
+                                             gemm_tiled_f16_jm_kernel(w_tiled, n_tile_groups_n, TILE_N_TOTAL, act_f16,
+                                                                                     out, K, N, blocks_per_row, get_pointer(slm_act),
+                                                                                     get_pointer(slm_w), get_pointer(slm_out), item);
+                                         });
+                    });
+                };
+                report("tiled-f16-jm", m, N, K, run_bench(q, WARMUP, ITERS, work));
+            }
+            {
+                const int64_t n_tiles_jm = N / XMX_JM_WG_SIZE;
+                auto          work       = [&](sycl::queue & qq) {
+                    qq.submit([&](sycl::handler & cgh) {
+                        sycl::local_accessor<int8_t, 1>  slm_act(sycl::range<1>(XMX_JM_M * XMX_JM_K_I8), cgh);
+                        sycl::local_accessor<float, 1>   slm_act_d(sycl::range<1>(XMX_JM_M), cgh);
+                        sycl::local_accessor<int8_t, 1>  slm_w(sycl::range<1>(XMX_JM_NUM_SG * XMX_JM_N * XMX_JM_K_I8),
+                                                                              cgh);
+                        sycl::local_accessor<int32_t, 1> slm_raw(sycl::range<1>(XMX_JM_NUM_SG * XMX_JM_M * XMX_JM_N),
+                                                                                cgh);
+                        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(m / XMX_JM_M, n_tiles_jm * XMX_JM_WG_SIZE),
+                                                                          sycl::range<2>(1, XMX_JM_WG_SIZE)),
+                                                        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(XMX_JM_SG)]] {
+                                             gemm_tiled_q8dp4a_jm_kernel(
+                                                 w_tiled, n_tile_groups_n, TILE_N_TOTAL, act_q8, out, K, N,
+                                                 blocks_per_row, get_pointer(slm_act), get_pointer(slm_act_d),
+                                                 get_pointer(slm_w), get_pointer(slm_raw), item);
+                                         });
+                    });
+                };
+                report("tiled-q8dp4a-jm-gemm-only", m, N, K, run_bench(q, WARMUP, ITERS, work));
+            }
+#endif
         }
 
         sycl::free(w_soa, q);
