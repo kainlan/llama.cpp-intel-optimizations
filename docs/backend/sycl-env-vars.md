@@ -507,10 +507,13 @@ below — attributes a multi-device capture to the right card on both line
 families. The buckets:
 
 - `tiled_repack`/`soa_repack` — the batched repack kernels
-  `repack_mxfp4_xmx_tiled_to_woq_batched` / `repack_mxfp4_soa_to_woq_batched`
-  (`convert.cpp`), one begin/end marker bracket per **tensor-dispatch** since
-  llama.cpp-1lon (`c6ecc70aa`) — the whole active-expert set is one kernel
-  launch, so the `/calls` count reads ~46 tiled + ~23 soa per GPT-OSS eval.
+  `repack_mxfp4_xmx_tiled_to_woq_coalesced_batched` /
+  `repack_mxfp4_soa_to_woq_coalesced_batched` (`convert.cpp`; the coalesced
+  forms since llama.cpp-0vqt `a89cfba79` — each falls back internally to its
+  pre-coalesced `_batched` sibling when its shape gate fails), one begin/end
+  marker bracket per **tensor-dispatch** since llama.cpp-1lon (`c6ecc70aa`)
+  — the whole active-expert set is one kernel launch, so the `/calls` count
+  reads ~46 tiled + ~23 soa per GPT-OSS eval.
   Before 1lon the per-slot kernels ran one launch (and one bracket) per active
   expert per dispatch, so pre-1lon captures (e.g. the `892eb5d7d` baselines)
   read ~1064/~532 calls per eval instead — the counts are not comparable
