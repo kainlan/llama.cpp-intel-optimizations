@@ -508,8 +508,11 @@ static int check_coalesced_randomized(sycl::queue & q,
 // coalesced (proven against the CPU reference above), at a fast-path shape.
 static int check_coalesced_batched_vs_per_slot(sycl::queue & q) {
     constexpr int blocks_per_row    = 3;
-    constexpr int nrows             = 12;  // N=12, multiple of tile_n_total=4 -- fast path
-    constexpr int tile_n_total      = 4;
+    constexpr int nrows             = 32;  // N=32, multiple of tile_n_total=16 -- fast path
+    // tile_n_total must be EXACTLY 16 (iteration 3, llama.cpp-0vqt) --
+    // the vectorized phase-2 write is only safe at that value, see
+    // repack_mxfp4_xmx_tiled_to_woq_coalesced's gate comment.
+    constexpr int tile_n_total      = 16;
     constexpr int n_slots           = 5;
     const int64_t K                 = (int64_t) blocks_per_row * QK_MXFP4;
     const int64_t N                 = nrows;
@@ -600,13 +603,21 @@ int main() {
             return rc;
         }
         // Coalesced (SLM-tiled) forms, llama.cpp-0vqt: fast path (including
-        // the real GPT-OSS gate/up shape), fallback branch, batched fast path.
-        rc = check_coalesced_randomized(q, "coalesced-fastpath", /*blocks_per_row=*/3, /*nrows=*/12,
-                                        /*tile_n_total=*/4);
+        // the real GPT-OSS gate/up shape), fallback branch, batched fast
+        // path. Iteration 3 tightened the fast-path gate to tile_n_total ==
+        // 16 EXACTLY (the vectorized write is only safe at that value), so
+        // the fast-path shape below now uses 16 (was 4, which now
+        // correctly falls back instead -- see "coalesced-fallback").
+        rc = check_coalesced_randomized(q, "coalesced-fastpath", /*blocks_per_row=*/3, /*nrows=*/32,
+                                        /*tile_n_total=*/16);
         if (rc != 0) {
             return rc;
         }
-        rc = check_coalesced_randomized(q, "coalesced-fallback", /*blocks_per_row=*/3, /*nrows=*/11,
+        // tile_n_total=4 with N%tile_n_total==0 isolates the NEW gate
+        // (tile_n_total != 16) as the sole reason this falls back, proving
+        // iteration 3's tightening didn't just get lucky on the old N%4!=0
+        // trigger.
+        rc = check_coalesced_randomized(q, "coalesced-fallback", /*blocks_per_row=*/3, /*nrows=*/12,
                                         /*tile_n_total=*/4);
         if (rc != 0) {
             return rc;

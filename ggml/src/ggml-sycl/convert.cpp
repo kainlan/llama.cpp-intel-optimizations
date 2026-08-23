@@ -1622,13 +1622,34 @@ static void repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(const uint8_t * __r
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int     k_local                      = lid / (NBLK / 2);
-        const int     n_pair                       = lid % (NBLK / 2);
-        const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * ROW + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * ROW + 2 * n_pair + 1];
-        dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
+    // Phase 2 (vectorized write, perf-recovery epic, track D iteration 3,
+    // llama.cpp-0vqt): the microbench isolated the 1-byte-per-lane global
+    // store above as the actual bottleneck -- not the strided read
+    // iteration 2 fixed -- costing ~80% of the kernel's device time on both
+    // cards; a diag-write-only-vectorized reference form confirmed a
+    // uint64-per-lane store recovers 4.8-5.7x. ONE lane per k_local
+    // (NBLK/2==8 lanes' worth of work folded into each) assembles the WHOLE
+    // row of NBLK/2 packed nibble-pair bytes in registers and issues a
+    // SINGLE uint64 store, instead of NBLK/2 lanes each doing one scalar
+    // byte store. Alignment: k*(N/2) and n0/2 are both always multiples of
+    // 8 given the N%16==0 fast-path gate (N/2 is then a multiple of 8, and
+    // n0/2=n_tile*(NBLK/2)=n_tile*8), so the store offset from dst_nibbles
+    // is always 8-byte aligned; the base pointer itself is assumed at
+    // least 8-byte aligned (true of every caller today -- device/cache
+    // allocations are never sub-8-byte aligned). Requires NBLK/2 == 8 for
+    // one uint64 to cover exactly one row (true for the committed NBLK=16).
+    if (lid < 32) {
+        const int     k_local = lid;
+        const int64_t k       = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+        uint64_t      word    = 0;
+#pragma unroll
+        for (int n_pair = 0; n_pair < NBLK / 2; ++n_pair) {
+            const uint8_t lo = local[k_local * ROW + 2 * n_pair];
+            const uint8_t hi = local[k_local * ROW + 2 * n_pair + 1];
+            word |= static_cast<uint64_t>(static_cast<uint8_t>(lo | (hi << 4))) << (n_pair * 8);
+        }
+        uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_nibbles + k * (N / 2) + n0 / 2);
+        *dst64                 = word;
     }
 }
 
@@ -1653,12 +1674,33 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_kernel(const uint8_t * __re
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int b_local = lid / TILE;
-        const int n_local = lid % TILE;
+    // Phase 2 (vectorized write, iteration 3, llama.cpp-0vqt -- same fix as
+    // the nibbles kernel above, applied here since the pattern is
+    // identical: many lanes each doing one scalar byte store): ONE lane
+    // per b_local writes its whole TILE-byte row as two uint64 stores
+    // instead of TILE lanes each doing one scalar byte store. Requires
+    // TILE % 8 == 0 (true for the committed TILE=16). Alignment: b*N and
+    // n0 are both always multiples of 8 given the N%16==0 fast-path gate
+    // (N itself a multiple of 8) and n0=n_tile*TILE=n_tile*16, so the row
+    // base from dst_scales is always 8-byte aligned; same base-pointer
+    // assumption as the nibbles kernel.
+    if (lid < TILE) {
+        const int b_local = lid;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * ROW + n_local];
+            uint64_t lo_word = 0;
+            uint64_t hi_word = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                lo_word |= static_cast<uint64_t>(local[b_local * ROW + i]) << (i * 8);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                hi_word |= static_cast<uint64_t>(local[b_local * ROW + 8 + i]) << (i * 8);
+            }
+            uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_scales + static_cast<int64_t>(b) * N + n0);
+            dst64[0]               = lo_word;
+            dst64[1]               = hi_word;
         }
     }
 }
@@ -1683,19 +1725,26 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
     const uint8_t * e       = qs + nblocks * (QK_MXFP4 / 2);
     const int64_t   N       = nrows;
 
-    constexpr int WG_SIZE = 256;
-    const int64_t n_tiles = N / NBLK;
+    // Nibbles WG_SIZE dropped 256 -> 32 in iteration 3 (llama.cpp-0vqt):
+    // phase 1 only ever used NBLK(=16) active lanes and phase 2 (after the
+    // write-vectorization above) only ever uses 32 -- 256 was oversized for
+    // both phases post-iteration-2, launching mostly-idle lanes. Scales
+    // keeps WG_SIZE=256 -- its phase 1 genuinely uses all 256 lanes (a
+    // TILE x TILE 2D tile, unchanged by this iteration).
+    constexpr int WG_SIZE_NIBBLES = 32;
+    constexpr int WG_SIZE         = 256;
+    const int64_t n_tiles         = N / NBLK;
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
-            [=](sycl::nd_item<3> item) {
-                repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(qs, dst_nibbles, blocks_per_row, N,
-                                                                 get_pointer(local_acc), item);
-            });
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE_NIBBLES),
+                                           sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
+                         [=](sycl::nd_item<3> item) {
+                             repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(qs, dst_nibbles, blocks_per_row, N,
+                                                                              get_pointer(local_acc), item);
+                         });
     });
 
     const int64_t b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
@@ -1742,13 +1791,21 @@ static void repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_r
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int     k_local                      = lid / (NBLK / 2);
-        const int     n_pair                       = lid % (NBLK / 2);
-        const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * ROW + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * ROW + 2 * n_pair + 1];
-        dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
+    // Phase 2 (vectorized write, iteration 3) -- see
+    // repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel above for the
+    // derivation; identical here.
+    if (lid < 32) {
+        const int     k_local = lid;
+        const int64_t k       = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+        uint64_t      word    = 0;
+#pragma unroll
+        for (int n_pair = 0; n_pair < NBLK / 2; ++n_pair) {
+            const uint8_t lo = local[k_local * ROW + 2 * n_pair];
+            const uint8_t hi = local[k_local * ROW + 2 * n_pair + 1];
+            word |= static_cast<uint64_t>(static_cast<uint8_t>(lo | (hi << 4))) << (n_pair * 8);
+        }
+        uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_nibbles + k * (N / 2) + n0 / 2);
+        *dst64                 = word;
     }
 }
 
@@ -1784,12 +1841,26 @@ static void repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(mxfp4_woq_re
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int b_local = lid / TILE;
-        const int n_local = lid % TILE;
+    // Phase 2 (vectorized write, iteration 3) -- see
+    // repack_mxfp4_soa_to_woq_coalesced_scales_kernel above for the
+    // derivation; identical here.
+    if (lid < TILE) {
+        const int b_local = lid;
         const int b       = b0 + b_local;
         if (b < blocks_per_row) {
-            dst_scales[static_cast<int64_t>(b) * N + n0 + n_local] = local[b_local * ROW + n_local];
+            uint64_t lo_word = 0;
+            uint64_t hi_word = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                lo_word |= static_cast<uint64_t>(local[b_local * ROW + i]) << (i * 8);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                hi_word |= static_cast<uint64_t>(local[b_local * ROW + 8 + i]) << (i * 8);
+            }
+            uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_scales + static_cast<int64_t>(b) * N + n0);
+            dst64[0]               = lo_word;
+            dst64[1]               = hi_word;
         }
     }
 }
@@ -1822,17 +1893,20 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
         src_table.ptr[i] = srcs[i];
     }
 
-    const int64_t N       = nrows;
-    const int64_t nblocks = static_cast<int64_t>(nrows) * blocks_per_row;
-    constexpr int WG_SIZE = 256;
-    const int64_t n_tiles = N / NBLK;
+    const int64_t N               = nrows;
+    const int64_t nblocks         = static_cast<int64_t>(nrows) * blocks_per_row;
+    // Nibbles WG_SIZE dropped 256 -> 32 in iteration 3 -- see
+    // repack_mxfp4_soa_to_woq_coalesced above for why; scales keeps 256.
+    constexpr int WG_SIZE_NIBBLES = 32;
+    constexpr int WG_SIZE         = 256;
+    const int64_t n_tiles         = N / NBLK;
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE),
-                                           sycl::range<3>(1, 1, WG_SIZE)),
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE_NIBBLES),
+                                           sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
                          [=](sycl::nd_item<3> item) {
                              repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(
                                  src_table, dst_weight_base, weight_slot_bytes, blocks_per_row, N, n_tiles,
@@ -2162,14 +2236,29 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(const uint8_t
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int     n_pair_count                 = tile_n_total / 2;
-        const int     k_local                      = lid / n_pair_count;
-        const int     n_pair                       = lid % n_pair_count;
-        const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * row + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * row + 2 * n_pair + 1];
-        dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
+    // Phase 2 (vectorized write, iteration 3, llama.cpp-0vqt) -- see
+    // repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel for the derivation.
+    // ONE lane per k_local packs the whole tile_n_total/2-byte row into a
+    // single uint64 store. SAFE ONLY because the host entry point below
+    // tightens the fast-path gate to tile_n_total == 16 EXACTLY (not just
+    // a multiple of 4, as iteration 2 allowed): with n_pair_count == 8, the
+    // store's 8 bytes exactly cover the row -- for any smaller
+    // tile_n_total the same store would still write a full 8 bytes and
+    // zero-pad past the row's real width into the NEXT n-tile group's
+    // bytes, corrupting data another workgroup owns. Do not widen the gate
+    // back to %4==0 without also bounding/masking this store.
+    if (lid < 32) {
+        const int     k_local      = lid;
+        const int64_t k            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+        const int     n_pair_count = tile_n_total / 2;
+        uint64_t      word         = 0;
+        for (int n_pair = 0; n_pair < n_pair_count; ++n_pair) {
+            const uint8_t lo = local[k_local * row + 2 * n_pair];
+            const uint8_t hi = local[k_local * row + 2 * n_pair + 1];
+            word |= static_cast<uint64_t>(static_cast<uint8_t>(lo | (hi << 4))) << (n_pair * 8);
+        }
+        uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_nibbles + k * (N / 2) + n0 / 2);
+        *dst64                 = word;
     }
 }
 
@@ -2199,12 +2288,15 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
                                              int             tile_n_total,
                                              dpct::queue_ptr stream) {
     const int64_t N = nrows;
-    // tile_n_total % 4 == 0 (not just even) is required here: it guarantees
-    // group_bytes = tile_n_total*17 is itself a multiple of 4, so every tile
-    // group's byte offset (idx*group_bytes) is 4-byte aligned -- the nibbles
-    // kernel's phase 1 depends on that alignment for its uint32 vector
-    // reads. The doc's current caps value (tile_n_total=16) satisfies this.
-    if (tile_n_total <= 0 || tile_n_total % 4 != 0 || N % tile_n_total != 0) {
+    // Iteration 3 (llama.cpp-0vqt) tightened this from tile_n_total % 4 ==
+    // 0 to tile_n_total == 16 EXACTLY: the vectorized phase-2 write below
+    // packs a fixed 8-byte (tile_n_total/2) row into one uint64 store, and
+    // that store is only safe when the row is EXACTLY 8 bytes wide --
+    // anything smaller would zero-pad past the real row into the next
+    // n-tile group's bytes (see the nibbles kernel's comment). The only
+    // value ever seen in practice (device caps: tile_n_total=16) is
+    // unaffected; any other value falls back to the untiled kernel.
+    if (tile_n_total != 16 || N % tile_n_total != 0) {
         repack_mxfp4_xmx_tiled_to_woq(src_tiled, dst_nibbles, dst_scales, blocks_per_row, nrows, tile_n_total, stream);
         return;
     }
@@ -2212,7 +2304,10 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
     const uint8_t * src             = static_cast<const uint8_t *>(src_tiled);
     const int64_t   n_tile_groups_n = N / tile_n_total;
     const int64_t   group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
-    const int       wg_nibbles      = tile_n_total * 16;
+    // wg_nibbles dropped from tile_n_total*16 (=256) to 32 in iteration 3 --
+    // see repack_mxfp4_soa_to_woq_coalesced for why (phase 1 only ever used
+    // tile_n_total(<=16) active lanes, phase 2 only ever uses 32 now).
+    constexpr int   wg_nibbles      = 32;
     const int       row             = tile_n_total + 1;
 
     stream->submit([&](sycl::handler & cgh) {
@@ -2269,14 +2364,22 @@ static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4
         }
     }
     item.barrier(sycl::access::fence_space::local_space);
-    {
-        const int     n_pair_count                 = tile_n_total / 2;
-        const int     k_local                      = lid / n_pair_count;
-        const int     n_pair                       = lid % n_pair_count;
-        const int64_t k                            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
-        const uint8_t lo                           = local[k_local * row + 2 * n_pair];
-        const uint8_t hi                           = local[k_local * row + 2 * n_pair + 1];
-        dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lo | (hi << 4));
+    // Phase 2 (vectorized write, iteration 3) -- see
+    // repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel above for the
+    // derivation and the tile_n_total==16-exactly safety requirement
+    // (enforced by the batched host entry point below).
+    if (lid < 32) {
+        const int     k_local      = lid;
+        const int64_t k            = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+        const int     n_pair_count = tile_n_total / 2;
+        uint64_t      word         = 0;
+        for (int n_pair = 0; n_pair < n_pair_count; ++n_pair) {
+            const uint8_t lo = local[k_local * row + 2 * n_pair];
+            const uint8_t hi = local[k_local * row + 2 * n_pair + 1];
+            word |= static_cast<uint64_t>(static_cast<uint8_t>(lo | (hi << 4))) << (n_pair * 8);
+        }
+        uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_nibbles + k * (N / 2) + n0 / 2);
+        *dst64                 = word;
     }
 }
 
@@ -2320,10 +2423,9 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     GGML_ASSERT(n_slots > 0 && n_slots <= GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
 
     const int64_t N = nrows;
-    // See repack_mxfp4_xmx_tiled_to_woq_coalesced above for why %4 (not just
-    // even) is required here -- iteration 2's vectorized uint32 phase-1
-    // reads need every tile group's byte offset 4-byte aligned.
-    if (tile_n_total <= 0 || tile_n_total % 4 != 0 || N % tile_n_total != 0) {
+    // See repack_mxfp4_xmx_tiled_to_woq_coalesced above for why tile_n_total
+    // must equal 16 EXACTLY (not just be a multiple of 4) as of iteration 3.
+    if (tile_n_total != 16 || N % tile_n_total != 0) {
         repack_mxfp4_xmx_tiled_to_woq_batched(srcs, n_slots, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes,
                                               blocks_per_row, nrows, tile_n_total, stream);
         return;
@@ -2336,7 +2438,8 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
 
     const int64_t n_tile_groups_n = N / tile_n_total;
     const int64_t group_bytes     = static_cast<int64_t>(tile_n_total) * (1 + QK_MXFP4 / 2);
-    const int     wg_nibbles      = tile_n_total * 16;
+    // wg_nibbles dropped to 32 in iteration 3 -- see the per-slot form above.
+    constexpr int wg_nibbles      = 32;
     const int     row             = tile_n_total + 1;
 
     stream->submit([&](sycl::handler & cgh) {
