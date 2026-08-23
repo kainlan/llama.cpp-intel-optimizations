@@ -64799,6 +64799,42 @@ struct mxfp4_pp_idle_gap_sample {
     std::string next_label;
 };
 
+// One device-work interval within a dispatch window, used only by the
+// idle-histogram computation below (mxfp4_pp_batched_profile_print_and_
+// reset) -- hoisted out of that computation's own loop body (llama.cpp-iikr
+// deferred-readout restructure moved it from a per-dispatch local struct
+// into a shared, named type since it is now built once per record in a
+// loop rather than once per dispatch inline).
+struct mxfp4_pp_device_interval {
+    uint64_t    start_ns;
+    uint64_t    end_ns;
+    std::string label;
+};
+
+// One MoE dispatch's raw device events and per-dispatch metadata, captured
+// by ggml_sycl_mul_mat_id WITHOUT waiting or reading any profiling info
+// (llama.cpp-iikr deferred-readout restructure: team-lead's capture,
+// c-yo2f, found the PREVIOUS per-dispatch `stream->wait()` was itself
+// responsible for most of the "concentrated ~4ms/dispatch" the gap
+// histogram had measured -- profiled vs unprofiled pp512 closed almost
+// exactly against dispatch_count * that wait's own cost). Every event here
+// is read back exactly once, in mxfp4_pp_batched_profile_print_and_reset,
+// after the SAME single graph-level end_ev.wait() component 6's
+// node-bracket and the gap histogram already rely on -- one wait per EVAL,
+// not one per DISPATCH.
+struct mxfp4_pp_dispatch_record {
+    std::string                tensor_name;
+    bool                       experts_are_tiled = false;
+    bool                       pp_woq_enabled    = false;
+    std::vector<sycl::event>   repack_begin;
+    std::vector<sycl::event>   repack_end;
+    std::vector<sycl::event>   stage_events;
+    std::optional<sycl::event> gemm_begin;
+    std::optional<sycl::event> gemm_end;
+    int64_t                    gemm_group_count  = 0;
+    bool                       gemm_3d_requested = false;
+};
+
 // Accumulates one graph_compute eval's worth of the batched PP MoE executor's
 // components. "Eval" boundary = one ggml_backend_sycl_graph_compute() call
 // (see mxfp4_pp_batched_profile_record_graph_total below), not a fixed per-model
@@ -64912,6 +64948,13 @@ struct mxfp4_pp_batched_profile_accum {
     double                                   idle_p95_us   = 0.0;
     double                                   idle_max_us   = 0.0;
     std::vector<mxfp4_pp_idle_gap_sample>    idle_top10;
+    // llama.cpp-iikr (deferred-readout restructure): one record per
+    // dispatch, pushed by ggml_sycl_mul_mat_id with NO wait and NO
+    // profiling-info read (see mxfp4_pp_dispatch_record's own comment).
+    // Consumed exactly once, in print_and_reset, which now does ALL of
+    // components 1-5's resolution AND the idle-histogram computation that
+    // used to run per-dispatch inline.
+    std::vector<mxfp4_pp_dispatch_record>    dispatch_records;
 };
 
 static thread_local mxfp4_pp_batched_profile_accum g_mxfp4_pp_batched_profile;
@@ -64977,6 +65020,142 @@ struct mxfp4_pp_node_bracket {
 
 static void mxfp4_pp_batched_profile_print_and_reset() {
     auto & p = g_mxfp4_pp_batched_profile;
+
+    // llama.cpp-iikr (deferred-readout restructure): resolve every
+    // dispatch's components 1-5 AND its idle-histogram contribution here,
+    // once per eval, after the SAME graph-level wait node_records/
+    // gap_samples below already rely on -- see mxfp4_pp_dispatch_record's
+    // push site (ggml_sycl_mul_mat_id) for why this moved off a
+    // per-dispatch stream->wait(). Runs FIRST in this function so
+    // tiled_repack_us/soa_repack_us/woq_gemm_us/f16_gemm_us/stage_us/
+    // idle_gap_samples are all populated before anything below reads them.
+    for (mxfp4_pp_dispatch_record & record : p.dispatch_records) {
+        double &  repack_us    = record.experts_are_tiled ? p.tiled_repack_us : p.soa_repack_us;
+        int64_t & repack_calls = record.experts_are_tiled ? p.tiled_repack_calls : p.soa_repack_calls;
+        for (size_t i = 0; i < record.repack_begin.size() && i < record.repack_end.size(); ++i) {
+            // Note: this span is bracketed by the begin/end MARKER events
+            // themselves (two single_task no-op launches), so it includes
+            // their own (near-zero but nonzero) launch overhead in addition
+            // to the two repack kernels -- not purely repack device time.
+            const double us = mxfp4_pp_event_span_us(record.repack_begin[i], record.repack_end[i]);
+            if (us < 0.0) {
+                ++p.read_failures;
+            } else {
+                repack_us += us;
+            }
+            ++repack_calls;
+        }
+        for (const sycl::event & ev : record.stage_events) {
+            const double us = mxfp4_pp_event_duration_us(ev);
+            if (us < 0.0) {
+                ++p.read_failures;
+            } else {
+                p.stage_us += us;
+            }
+            ++p.stage_calls;
+        }
+        // Timing comes from the gemm_begin/end bracket around the whole
+        // dispatch loop (one combined span for every group), NOT from
+        // gemm_events' own profiling info -- see mxfp4_pp_dispatch_record's
+        // declaration comment / the gemm_events declaration comment at the
+        // push site for why those per-group timestamps are a documented-
+        // unreliable barrier artifact on the shipped 2-D arm. gemm_
+        // group_count is still used here, for the 2-D/3-D label split.
+        if (record.gemm_begin.has_value() && record.gemm_end.has_value()) {
+            const double gemm_span_us = mxfp4_pp_event_span_us(*record.gemm_begin, *record.gemm_end);
+            if (gemm_span_us < 0.0) {
+                ++p.read_failures;
+            } else if (record.pp_woq_enabled) {
+                p.woq_gemm_us += gemm_span_us;
+            } else {
+                p.f16_gemm_us += gemm_span_us;
+            }
+        }
+        if (record.pp_woq_enabled) {
+            p.woq_gemm_calls += record.gemm_group_count;
+            if (record.gemm_3d_requested) {
+                p.woq_gemm_3d_calls += record.gemm_group_count;
+            } else {
+                p.woq_gemm_2d_calls += record.gemm_group_count;
+            }
+        } else {
+            p.f16_gemm_calls += record.gemm_group_count;
+        }
+        // record.repack_begin.size() is the exact count of WOQ repack calls
+        // this dispatch made (0 when pp_woq_enabled is false and the f16
+        // dequant arm ran instead) -- NOT an active-expert count, which
+        // would over-count on the f16 arm.
+        p.repack_calls_by_tensor[record.tensor_name] += static_cast<int64_t>(record.repack_begin.size());
+        p.dispatch_calls_by_tensor[record.tensor_name] += 1;
+        ++p.dispatch_evals;
+
+        // Intra-window idle histogram (llama.cpp-iikr intra-window idle
+        // cycle, moved here by the deferred-readout restructure): sort THIS
+        // dispatch's own device-work intervals by command_start and record
+        // the gap before each one (relative to the running furthest-end-
+        // seen-so-far, so an overlap does not manufacture a spurious
+        // negative-then-positive pair) as an idle-hole sample. gemm is ONE
+        // opaque interval -- see the comment above for why its own
+        // per-group timestamps cannot be used to sub-divide it; idle time
+        // INSIDE the gemm block is therefore invisible to this pass. A read
+        // failure here just drops that one interval from this pass's
+        // placement (already counted once against read_failures above) --
+        // it does not increment read_failures a second time.
+        std::vector<mxfp4_pp_device_interval> window_intervals;
+        window_intervals.reserve(record.repack_begin.size() + record.stage_events.size() + 1);
+        for (size_t i = 0; i < record.repack_begin.size() && i < record.repack_end.size(); ++i) {
+            try {
+                const uint64_t s =
+                    record.repack_begin[i].get_profiling_info<sycl::info::event_profiling::command_start>();
+                const uint64_t e = record.repack_end[i].get_profiling_info<sycl::info::event_profiling::command_end>();
+                if (e >= s) {
+                    window_intervals.push_back({ s, e, "repack[" + std::to_string(i) + "]" });
+                }
+            } catch (...) {
+            }
+        }
+        for (size_t i = 0; i < record.stage_events.size(); ++i) {
+            try {
+                const uint64_t s =
+                    record.stage_events[i].get_profiling_info<sycl::info::event_profiling::command_start>();
+                const uint64_t e =
+                    record.stage_events[i].get_profiling_info<sycl::info::event_profiling::command_end>();
+                if (e >= s) {
+                    window_intervals.push_back({ s, e, "stage[" + std::to_string(i) + "]" });
+                }
+            } catch (...) {
+            }
+        }
+        if (record.gemm_begin.has_value() && record.gemm_end.has_value()) {
+            try {
+                const uint64_t s = record.gemm_begin->get_profiling_info<sycl::info::event_profiling::command_start>();
+                const uint64_t e = record.gemm_end->get_profiling_info<sycl::info::event_profiling::command_end>();
+                if (e >= s) {
+                    window_intervals.push_back({ s, e, "gemm_block" });
+                }
+            } catch (...) {
+            }
+        }
+        std::sort(window_intervals.begin(), window_intervals.end(),
+                  [](const mxfp4_pp_device_interval & a, const mxfp4_pp_device_interval & b) {
+                      return a.start_ns < b.start_ns;
+                  });
+        if (window_intervals.size() >= 2) {
+            uint64_t    running_end   = window_intervals[0].end_ns;
+            std::string running_label = window_intervals[0].label;
+            for (size_t i = 1; i < window_intervals.size(); ++i) {
+                const double gap_us = window_intervals[i].start_ns >= running_end ?
+                                          static_cast<double>(window_intervals[i].start_ns - running_end) * 1e-3 :
+                                          -static_cast<double>(running_end - window_intervals[i].start_ns) * 1e-3;
+                p.idle_gap_samples.push_back(
+                    mxfp4_pp_idle_gap_sample{ gap_us, running_label, window_intervals[i].label });
+                if (window_intervals[i].end_ns > running_end) {
+                    running_end   = window_intervals[i].end_ns;
+                    running_label = window_intervals[i].label;
+                }
+            }
+        }
+    }
 
     // Resolve component 6's ordered node records first so accounted_us below
     // can include them -- same deferred-resolution posture as every other
@@ -72215,173 +72394,41 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
-            // llama.cpp-6405: everything above this point that belongs to
-            // components 1/2 (repack), 3 (GEMM, via the existing gemm_events
-            // vector) and 4 (activation/output staging) for THIS dispatch has
-            // now been submitted, so this is the one point per dispatch where
-            // all of it can be read back. A single stream->wait() covers every
-            // collected event -- deliberately one host wait per dispatch
-            // rather than one per event, matching the "This diagnostic
-            // inserts host waits" contract mmvq.cpp's PP/TG profile variants
-            // already carry, and skipped entirely (pp_profile false, every
-            // collection empty) when the flag is off.
+            // llama.cpp-iikr (deferred-readout restructure): everything
+            // above this point that belongs to components 1/2 (repack), 3
+            // (GEMM, via gemm_events) and 4 (activation/output staging) for
+            // THIS dispatch has now been submitted. This USED TO be the one
+            // point per dispatch where a stream->wait() made it all safe to
+            // read, and it read it right here -- but team-lead's capture
+            // (c-yo2f) found that per-dispatch wait was itself responsible
+            // for most of the "concentrated ~4ms/dispatch" the gap
+            // histogram had measured: profiled pp512 (866) vs unprofiled
+            // (1101) on B70 closed almost exactly against dispatch_count *
+            // that wait's own cost. Fixed by not waiting or reading here at
+            // all: just move the raw events and this dispatch's metadata
+            // into a per-eval record (mxfp4_pp_dispatch_record). Every read
+            // (components 1-5's resolution, the idle-histogram computation)
+            // moves to mxfp4_pp_batched_profile_print_and_reset, deferred to
+            // the SAME single graph-level end_ev.wait() component 6's
+            // node-bracket and the gap histogram already relied on before
+            // this cycle -- one wait per EVAL, not one per DISPATCH.
             if (pp_profile) {
-                stream->wait();
-                auto &    profile      = g_mxfp4_pp_batched_profile;
-                // llama.cpp-6405 fix cycle (F2): mxfp4_pp_event_span_us/
-                // _duration_us return -1.0 on a failed profiling query (bad
-                // event, query threw). Summing that unconditionally poisoned
-                // the ms totals with a stray -0.001 ms per failure and hid
-                // the failure entirely. Skip the sum, keep the CALL count
-                // (the operation itself did happen), and tally the failure
-                // separately -- read_failures in the summary line is the
-                // "distrust this line" signal.
-                // llama.cpp-6405 (quality review F-A/F-B): a single dispatch
-                // repacks either ALL-tiled or ALL-SOA -- experts_are_tiled is
-                // a per-dispatch constant, not a per-expert choice (see its
-                // computation above), so a per-index pp_profile_repack_tiled
-                // vector was redundant bookkeeping. Bind the destination
-                // fields once, outside the loop, instead of branching on the
-                // same condition twice per iteration.
-                double &  repack_us    = experts_are_tiled ? profile.tiled_repack_us : profile.soa_repack_us;
-                int64_t & repack_calls = experts_are_tiled ? profile.tiled_repack_calls : profile.soa_repack_calls;
-                for (size_t i = 0; i < pp_profile_repack_begin.size(); ++i) {
-                    // Note: this span is bracketed by the begin/end MARKER
-                    // events themselves (two single_task no-op launches), so
-                    // it includes their own (near-zero but nonzero) launch
-                    // overhead in addition to the two repack kernels -- not
-                    // purely repack device time.
-                    const double us = mxfp4_pp_event_span_us(pp_profile_repack_begin[i], pp_profile_repack_end[i]);
-                    if (us < 0.0) {
-                        ++profile.read_failures;
-                    } else {
-                        repack_us += us;
-                    }
-                    ++repack_calls;
-                }
-                for (const sycl::event & ev : pp_profile_stage_events) {
-                    const double us = mxfp4_pp_event_duration_us(ev);
-                    if (us < 0.0) {
-                        ++profile.read_failures;
-                    } else {
-                        profile.stage_us += us;
-                    }
-                    ++profile.stage_calls;
-                }
-                // F1: timing comes from the gemm_profile_begin/end bracket
-                // around the whole try{} block above (one combined span for
-                // every group in this dispatch), NOT from gemm_events' own
-                // profiling info -- see the comment at gemm_profile_begin's
-                // declaration for why gemm_events' timestamps are not a valid
-                // per-group timing source on the shipped 2-D arm.
-                // gemm_events is still read here for its per-group COUNT
-                // (the 2-D/3-D label split).
-                const double gemm_span_us = mxfp4_pp_event_span_us(*gemm_profile_begin, *gemm_profile_end);
-                if (gemm_span_us < 0.0) {
-                    ++profile.read_failures;
-                } else if (pp_woq_enabled) {
-                    profile.woq_gemm_us += gemm_span_us;
-                } else {
-                    profile.f16_gemm_us += gemm_span_us;
-                }
-                // llama.cpp-6405 (quality review F-C): every group in
-                // gemm_events shares the SAME pp_woq_enabled/requested-arm
-                // for this dispatch (both are per-dispatch constants), so the
-                // per-group counts are arithmetic on gemm_events.size(), not
-                // a loop; mxfp4_pp_woq_3d_requested() is hoisted out of any
-                // loop for the same reason.
-                const auto gemm_group_count = static_cast<int64_t>(gemm_events.size());
-                if (pp_woq_enabled) {
-                    profile.woq_gemm_calls += gemm_group_count;
-                    if (mxfp4_pp_woq_3d_requested()) {
-                        profile.woq_gemm_3d_calls += gemm_group_count;
-                    } else {
-                        profile.woq_gemm_2d_calls += gemm_group_count;
-                    }
-                } else {
-                    profile.f16_gemm_calls += gemm_group_count;
-                }
-                const std::string profile_tensor_name = src0 && src0->name ? src0->name : "?";
-                // pp_profile_repack_begin.size() is the exact count of WOQ
-                // repack calls this dispatch made (0 when pp_woq_enabled is
-                // false and the f16 dequant arm ran instead) -- NOT
-                // active_experts.size(), which would over-count on the f16 arm.
-                profile.repack_calls_by_tensor[profile_tensor_name] +=
-                    static_cast<int64_t>(pp_profile_repack_begin.size());
-                profile.dispatch_calls_by_tensor[profile_tensor_name] += 1;
-                ++profile.dispatch_evals;
-
-                // llama.cpp-iikr (intra-window idle cycle): sort THIS
-                // dispatch's own device-work intervals by command_start and
-                // record the gap before each one (relative to the running
-                // furthest-end-seen-so-far, so an overlap does not manufacture
-                // a spurious negative-then-positive pair) as an idle-hole
-                // sample. gemm is ONE opaque interval -- see the gemm_events
-                // declaration comment above for why its own per-group
-                // timestamps are a documented-unreliable barrier artifact and
-                // cannot be sub-divided; idle time INSIDE the gemm block is
-                // therefore invisible to this pass. A read failure here just
-                // drops that one interval from THIS pass's placement (already
-                // counted once against read_failures by the loops above) --
-                // it does not increment read_failures a second time.
-                struct idle_interval {
-                    uint64_t    start_ns;
-                    uint64_t    end_ns;
-                    std::string label;
-                };
-                std::vector<idle_interval> window_intervals;
-                window_intervals.reserve(pp_profile_repack_begin.size() + pp_profile_stage_events.size() + 1);
-                for (size_t i = 0; i < pp_profile_repack_begin.size() && i < pp_profile_repack_end.size(); ++i) {
-                    try {
-                        const uint64_t s =
-                            pp_profile_repack_begin[i].get_profiling_info<sycl::info::event_profiling::command_start>();
-                        const uint64_t e =
-                            pp_profile_repack_end[i].get_profiling_info<sycl::info::event_profiling::command_end>();
-                        if (e >= s) {
-                            window_intervals.push_back({ s, e, "repack[" + std::to_string(i) + "]" });
-                        }
-                    } catch (...) {
-                    }
-                }
-                for (size_t i = 0; i < pp_profile_stage_events.size(); ++i) {
-                    try {
-                        const uint64_t s =
-                            pp_profile_stage_events[i].get_profiling_info<sycl::info::event_profiling::command_start>();
-                        const uint64_t e =
-                            pp_profile_stage_events[i].get_profiling_info<sycl::info::event_profiling::command_end>();
-                        if (e >= s) {
-                            window_intervals.push_back({ s, e, "stage[" + std::to_string(i) + "]" });
-                        }
-                    } catch (...) {
-                    }
-                }
-                try {
-                    const uint64_t s =
-                        gemm_profile_begin->get_profiling_info<sycl::info::event_profiling::command_start>();
-                    const uint64_t e = gemm_profile_end->get_profiling_info<sycl::info::event_profiling::command_end>();
-                    if (e >= s) {
-                        window_intervals.push_back({ s, e, "gemm_block" });
-                    }
-                } catch (...) {
-                }
-                std::sort(window_intervals.begin(), window_intervals.end(),
-                          [](const idle_interval & a, const idle_interval & b) { return a.start_ns < b.start_ns; });
-                if (window_intervals.size() >= 2) {
-                    uint64_t    running_end   = window_intervals[0].end_ns;
-                    std::string running_label = window_intervals[0].label;
-                    for (size_t i = 1; i < window_intervals.size(); ++i) {
-                        const double gap_us =
-                            window_intervals[i].start_ns >= running_end ?
-                                static_cast<double>(window_intervals[i].start_ns - running_end) * 1e-3 :
-                                -static_cast<double>(running_end - window_intervals[i].start_ns) * 1e-3;
-                        profile.idle_gap_samples.push_back(
-                            mxfp4_pp_idle_gap_sample{ gap_us, running_label, window_intervals[i].label });
-                        if (window_intervals[i].end_ns > running_end) {
-                            running_end   = window_intervals[i].end_ns;
-                            running_label = window_intervals[i].label;
-                        }
-                    }
-                }
+                mxfp4_pp_dispatch_record record;
+                record.tensor_name       = src0 && src0->name ? src0->name : "?";
+                record.experts_are_tiled = experts_are_tiled;
+                record.pp_woq_enabled    = pp_woq_enabled;
+                record.repack_begin      = std::move(pp_profile_repack_begin);
+                record.repack_end        = std::move(pp_profile_repack_end);
+                record.stage_events      = std::move(pp_profile_stage_events);
+                record.gemm_begin        = gemm_profile_begin;
+                record.gemm_end          = gemm_profile_end;
+                // gemm_events.size() and mxfp4_pp_woq_3d_requested() are
+                // synchronous host-side reads (a vector size and an env-
+                // cached bool), not profiling-info queries -- safe to
+                // capture immediately, same as before this restructure.
+                record.gemm_group_count  = static_cast<int64_t>(gemm_events.size());
+                record.gemm_3d_requested = mxfp4_pp_woq_3d_requested();
+                g_mxfp4_pp_batched_profile.dispatch_records.push_back(std::move(record));
             }
 
             ggml_sycl_moe_row_agg_log_routed(src0, ctx.device, n_ids, ids->ne[1], route_layout, "pp_onednn_f16_batched",
