@@ -278,9 +278,12 @@ void repack_mxfp4_xmx_tiled_to_woq_batched(
 // functions above perform. Byte-for-byte identical output to their
 // non-coalesced counterparts in all cases -- each falls back to the
 // original kernel whenever its fast-path precondition doesn't hold (N %
-// 16 == 0 for the SOA forms; tile_n_total even and N % tile_n_total == 0
-// for the XMX_TILED forms), so the speedup is scoped but correctness is
-// not. See convert.cpp for the exact tiling derivation.
+// 16 == 0 for the SOA forms; tile_n_total == 16 EXACTLY and N %
+// tile_n_total == 0 for the XMX_TILED forms -- tightened from "even" in
+// iteration 3, since the write phase's uint64 store always writes a full
+// 8-byte row and would zero-pad past a narrower row into the next n-tile
+// group's bytes), so the speedup is scoped but correctness is not. See
+// convert.cpp for the exact tiling derivation.
 void repack_mxfp4_soa_to_woq_coalesced(
     const void * src,
     uint8_t * dst_nibbles,

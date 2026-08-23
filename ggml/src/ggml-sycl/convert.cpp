@@ -2193,13 +2193,15 @@ void repack_mxfp4_xmx_tiled_to_woq_batched(const void * const * srcs,
 // destination row dst_scales[b*N+n0 .. +tile_n_total) are BOTH already
 // contiguous in n -- no transpose, no SLM, a direct per-element copy.
 //
-// Requires tile_n_total > 0 and a multiple of 4 (even was sufficient for
-// the nibble-pair-packing math alone, but iteration 2's vectorized uint32
-// phase-1 reads additionally need every tile group's byte offset 4-byte
-// aligned -- see the host entry point below for the derivation), and
-// N % tile_n_total == 0 (every tile group full, matching the doc's caps:
-// tile_n_total=16, N=2880 -> 180 exact groups). Falls back to the untiled
-// kernel byte-for-byte otherwise.
+// Requires tile_n_total == 16 EXACTLY (even was sufficient for the
+// nibble-pair-packing math alone, and iteration 2's vectorized uint32
+// phase-1 reads only needed a multiple of 4 for 4-byte alignment; iteration
+// 3 tightened this further to 16 exactly, since the write phase's uint64
+// store always writes a full 8-byte row and would zero-pad past a
+// narrower row into the next n-tile group's bytes -- see the host entry
+// point below for the derivation), and N % tile_n_total == 0 (every tile
+// group full, matching the doc's caps: tile_n_total=16, N=2880 -> 180
+// exact groups). Falls back to the untiled kernel byte-for-byte otherwise.
 //
 // Iteration 2 (llama.cpp-0vqt, same two fixes as the SOA kernel above):
 // `row` pads the SLM row stride to tile_n_total+1 to avoid the phase-1
