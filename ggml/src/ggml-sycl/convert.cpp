@@ -1756,44 +1756,47 @@ void repack_mxfp4_soa_to_woq_coalesced(const void *    src,
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
-    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE_NIBBLES),
-                                           sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(qs, dst_nibbles, blocks_per_row, N,
-                                                                              get_pointer(local_acc), item);
-                         });
+    // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final micro-
+    // cycle): ggml_sycl_profile_submit (host submit-span recording), not
+    // record-event -- see convert.hpp's declaration comment / the
+    // activation-copy site in ggml-sycl.cpp for why (team-lead's c-vr68
+    // capture, no_submit_span).
+    ggml_sycl_profile_label nibbles_label{};
+    nibbles_label.name       = "mxfp4.pp.repack.soa";
+    nibbles_label.category   = "mxfp4.pp.repack";
+    nibbles_label.queue_kind = "compute";
+    nibbles_label.metadata   = "phase=nibbles;form=per_slot";
+    nibbles_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, nibbles_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tiles * WG_SIZE_NIBBLES),
+                                               sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
+                             [=](sycl::nd_item<3> item) {
+                                 repack_mxfp4_soa_to_woq_coalesced_nibbles_kernel(qs, dst_nibbles, blocks_per_row, N,
+                                                                                  get_pointer(local_acc), item);
+                             });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.soa";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=nibbles;form=per_slot";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
-    }
 
-    const int64_t b_tiles      = (blocks_per_row + NBLK - 1) / NBLK;
-    sycl::event   scales_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, b_tiles, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
-            [=](sycl::nd_item<3> item) {
-                repack_mxfp4_soa_to_woq_coalesced_scales_kernel(e, dst_scales, blocks_per_row, N,
-                                                                  get_pointer(local_acc), item);
-            });
+    const int64_t           b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
+    ggml_sycl_profile_label scales_label{};
+    scales_label.name       = "mxfp4.pp.repack.soa";
+    scales_label.category   = "mxfp4.pp.repack";
+    scales_label.queue_kind = "compute";
+    scales_label.metadata   = "phase=scales;form=per_slot";
+    scales_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, scales_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, b_tiles, n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+                [=](sycl::nd_item<3> item) {
+                    repack_mxfp4_soa_to_woq_coalesced_scales_kernel(e, dst_scales, blocks_per_row, N,
+                                                                    get_pointer(local_acc), item);
+                });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.soa";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=scales;form=per_slot";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, scales_event);
-    }
 }
 
 static void repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
@@ -1956,46 +1959,47 @@ void repack_mxfp4_soa_to_woq_coalesced_batched(const void * const * srcs,
 
     constexpr int ROW = MXFP4_WOQ_REPACK_COALESCED_ROW;
 
-    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE_NIBBLES),
-                                           sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(
-                                 src_table, dst_weight_base, weight_slot_bytes, blocks_per_row, N, n_tiles,
-                                 get_pointer(local_acc), item);
-                         });
+    // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final micro-
+    // cycle): see repack_mxfp4_soa_to_woq_coalesced above for why this is
+    // ggml_sycl_profile_submit, not record-event.
+    ggml_sycl_profile_label nibbles_label{};
+    nibbles_label.name       = "mxfp4.pp.repack.soa";
+    nibbles_label.category   = "mxfp4.pp.repack";
+    nibbles_label.queue_kind = "compute";
+    nibbles_label.metadata   = "phase=nibbles;form=batched";
+    nibbles_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, nibbles_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * ROW), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tiles * WG_SIZE_NIBBLES),
+                                               sycl::range<3>(1, 1, WG_SIZE_NIBBLES)),
+                             [=](sycl::nd_item<3> item) {
+                                 repack_mxfp4_soa_to_woq_coalesced_nibbles_batched_kernel(
+                                     src_table, dst_weight_base, weight_slot_bytes, blocks_per_row, N, n_tiles,
+                                     get_pointer(local_acc), item);
+                             });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.soa";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=nibbles;form=batched";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
-    }
 
-    const int64_t b_tiles      = (blocks_per_row + NBLK - 1) / NBLK;
-    sycl::event   scales_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>(1, n_slots, b_tiles * n_tiles * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
-            [=](sycl::nd_item<3> item) {
-                repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(src_table, dst_weight_base, weight_slot_bytes,
-                                                                          woq_nibble_slot_bytes, blocks_per_row, N,
-                                                                          nblocks, n_tiles, get_pointer(local_acc), item);
-            });
+    const int64_t           b_tiles = (blocks_per_row + NBLK - 1) / NBLK;
+    ggml_sycl_profile_label scales_label{};
+    scales_label.name       = "mxfp4.pp.repack.soa";
+    scales_label.category   = "mxfp4.pp.repack";
+    scales_label.queue_kind = "compute";
+    scales_label.metadata   = "phase=scales;form=batched";
+    scales_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, scales_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(NBLK * ROW), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, b_tiles * n_tiles * WG_SIZE),
+                                               sycl::range<3>(1, 1, WG_SIZE)),
+                             [=](sycl::nd_item<3> item) {
+                                 repack_mxfp4_soa_to_woq_coalesced_scales_batched_kernel(
+                                     src_table, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes,
+                                     blocks_per_row, N, nblocks, n_tiles, get_pointer(local_acc), item);
+                             });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.soa";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=scales;form=batched";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, scales_event);
-    }
 }
 
 // XMX_TILED MXFP4 -> WOQ repack: inverts the tiled materializer's byte
@@ -2393,42 +2397,43 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced(const void *    src_tiled,
     constexpr int   wg_nibbles      = 32;
     const int       row             = tile_n_total + 1;
 
-    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * wg_nibbles),
-                                           sycl::range<3>(1, 1, wg_nibbles)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(
-                                 src, dst_nibbles, N, tile_n_total, row, group_bytes, get_pointer(local_acc), item);
-                         });
+    // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final micro-
+    // cycle): see repack_mxfp4_soa_to_woq_coalesced above for why this is
+    // ggml_sycl_profile_submit, not record-event.
+    ggml_sycl_profile_label nibbles_label{};
+    nibbles_label.name       = "mxfp4.pp.repack.tiled";
+    nibbles_label.category   = "mxfp4.pp.repack";
+    nibbles_label.queue_kind = "compute";
+    nibbles_label.metadata   = "phase=nibbles;form=per_slot";
+    nibbles_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, nibbles_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * wg_nibbles),
+                                               sycl::range<3>(1, 1, wg_nibbles)),
+                             [=](sycl::nd_item<3> item) {
+                                 repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_kernel(
+                                     src, dst_nibbles, N, tile_n_total, row, group_bytes, get_pointer(local_acc), item);
+                             });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.tiled";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=nibbles;form=per_slot";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
-    }
 
-    sycl::event scales_event = stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * tile_n_total),
-                                           sycl::range<3>(1, 1, tile_n_total)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_kernel(src, dst_scales, N, tile_n_total,
-                                                                                   group_bytes, item);
-                         });
+    ggml_sycl_profile_label scales_label{};
+    scales_label.name       = "mxfp4.pp.repack.tiled";
+    scales_label.category   = "mxfp4.pp.repack";
+    scales_label.queue_kind = "compute";
+    scales_label.metadata   = "phase=scales;form=per_slot";
+    scales_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, scales_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, n_tile_groups_n * tile_n_total),
+                                               sycl::range<3>(1, 1, tile_n_total)),
+                             [=](sycl::nd_item<3> item) {
+                                 repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_kernel(src, dst_scales, N, tile_n_total,
+                                                                                       group_bytes, item);
+                             });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.tiled";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=scales;form=per_slot";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, scales_event);
-    }
 }
 
 static void repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(mxfp4_woq_repack_src_table srcs,
@@ -2554,44 +2559,47 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     constexpr int wg_nibbles      = 32;
     const int     row             = tile_n_total + 1;
 
-    sycl::event nibbles_event = stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * wg_nibbles),
-                                           sycl::range<3>(1, 1, wg_nibbles)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(
-                                 src_table, dst_weight_base, weight_slot_bytes, N, tile_n_total, row, n_tile_groups_n,
-                                 group_bytes, get_pointer(local_acc), item);
-                         });
+    // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final micro-
+    // cycle): see repack_mxfp4_soa_to_woq_coalesced above for why this is
+    // ggml_sycl_profile_submit, not record-event.
+    ggml_sycl_profile_label nibbles_label{};
+    nibbles_label.name       = "mxfp4.pp.repack.tiled";
+    nibbles_label.category   = "mxfp4.pp.repack";
+    nibbles_label.queue_kind = "compute";
+    nibbles_label.metadata   = "phase=nibbles;form=batched";
+    nibbles_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, nibbles_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<uint8_t, 1> local_acc(sycl::range<1>(32 * row), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * wg_nibbles),
+                                  sycl::range<3>(1, 1, wg_nibbles)),
+                [=](sycl::nd_item<3> item) {
+                    repack_mxfp4_xmx_tiled_to_woq_coalesced_nibbles_batched_kernel(
+                        src_table, dst_weight_base, weight_slot_bytes, N, tile_n_total, row, n_tile_groups_n,
+                        group_bytes, get_pointer(local_acc), item);
+                });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.tiled";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=nibbles;form=batched";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, nibbles_event);
-    }
 
-    sycl::event scales_event = stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * tile_n_total),
-                                           sycl::range<3>(1, 1, tile_n_total)),
-                         [=](sycl::nd_item<3> item) {
-                             repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_batched_kernel(
-                                 src_table, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes, N, tile_n_total,
-                                 n_tile_groups_n, group_bytes, item);
-                         });
+    ggml_sycl_profile_label scales_label{};
+    scales_label.name       = "mxfp4.pp.repack.tiled";
+    scales_label.category   = "mxfp4.pp.repack";
+    scales_label.queue_kind = "compute";
+    scales_label.metadata   = "phase=scales;form=batched";
+    scales_label.device     = device;
+    (void) ggml_sycl_profile_submit(*stream, scales_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, n_slots, blocks_per_row * n_tile_groups_n * tile_n_total),
+                                  sycl::range<3>(1, 1, tile_n_total)),
+                [=](sycl::nd_item<3> item) {
+                    repack_mxfp4_xmx_tiled_to_woq_coalesced_scales_batched_kernel(
+                        src_table, dst_weight_base, weight_slot_bytes, woq_nibble_slot_bytes, N, tile_n_total,
+                        n_tile_groups_n, group_bytes, item);
+                });
+        });
     });
-    if (ggml_sycl_kernel_profile_enabled()) {
-        ggml_sycl_profile_label label{};
-        label.name       = "mxfp4.pp.repack.tiled";
-        label.category   = "mxfp4.pp.repack";
-        label.queue_kind = "compute";
-        label.metadata   = "phase=scales;form=batched";
-        label.device     = device;
-        ggml_sycl_kernel_profile_record_event(label, scales_event);
-    }
 }
 
 // Host function to launch Q4_0 Coalesced to SoA conversion

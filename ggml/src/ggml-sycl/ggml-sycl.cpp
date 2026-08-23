@@ -72063,43 +72063,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                               blocks_per_row, static_cast<int>(ne01), ctx.stream());
                 }
 
-                sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne10));
-                sycl::range<3> grid_dims(1, 1, rows);
-                sycl::event    activation_copy_event = stream->submit([&](sycl::handler & cgh) {
-                    cgh.depends_on(row_mappings_ready);
-                    char * __restrict act_get = reinterpret_cast<char *>(batched_acts + slot * act_slot_elems);
-                    mmid_row_mapping * __restrict row_mapping_get = dev_row_mappings.get() + expert.row_begin;
-                    const size_t dst_nb1_f16                      = src1_contiguous_f16_row_bytes;
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_src1_to_contiguous_f16_mapped(src1_original, act_get, row_mapping_get, ne11, ne10,
-                                                                    nb11, nb12, dst_nb1_f16, item_ct1);
+                sycl::range<3>          block_dims(1, 1, pp_copy_work_group_size(ne10));
+                sycl::range<3>          grid_dims(1, 1, rows);
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final
+                // micro-cycle): switched from record-event to the
+                // ggml_sycl_profile_submit FORM -- team-lead's full-coverage
+                // capture (c-vr68) found 890/934 ms landed in the classifier's
+                // no_submit_span instrument-artifact cause because record-
+                // event captures device timestamps but no HOST submit span,
+                // so the parser can't tell host-late from submitted-early-
+                // and-queued. ggml_sycl_profile_submit brackets the actual
+                // submit() call with host chrono, resolving that split into
+                // host_overlap / submit_pipelined_ahead / truly_idle. Label
+                // construction is unconditional (cheap POD-field assignment,
+                // matching every other call site's convention, e.g.
+                // softmax.cpp) -- ggml_sycl_profile_submit_impl itself is the
+                // thing gated on GGML_SYCL_KERNEL_PROFILE, and skips all
+                // chrono/recording work when it's off.
+                ggml_sycl_profile_label stage_label{};
+                stage_label.name       = "mxfp4.pp.stage.act";
+                stage_label.category   = "mxfp4.pp.stage";
+                stage_label.queue_kind = "compute";
+                stage_label.metadata   = "phase=activation_copy_in";
+                stage_label.device     = ctx.device;
+                stage_label.bytes      = rows * ne10 * sizeof(sycl::half);
+                sycl::event activation_copy_event =
+                    ggml_sycl_profile_submit(*stream, stage_label, [&](sycl::queue & profiled_queue) {
+                        return profiled_queue.submit([&](sycl::handler & cgh) {
+                            cgh.depends_on(row_mappings_ready);
+                            char * __restrict act_get = reinterpret_cast<char *>(batched_acts + slot * act_slot_elems);
+                            mmid_row_mapping * __restrict row_mapping_get = dev_row_mappings.get() + expert.row_begin;
+                            const size_t dst_nb1_f16                      = src1_contiguous_f16_row_bytes;
+                            cgh.parallel_for(
+                                sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+                                    k_copy_src1_to_contiguous_f16_mapped(src1_original, act_get, row_mapping_get, ne11,
+                                                                         ne10, nb11, nb12, dst_nb1_f16, item_ct1);
+                                });
                         });
-                });
+                    });
                 if (pp_profile) {
                     pp_profile_stage_events.push_back(activation_copy_event);
-                }
-                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): the
-                // gap-cause classifier (scripts/parse-sycl-gap-causes.py) has
-                // zero coverage of the MoE dispatch window's own kernels --
-                // confirmed by static survey (task comment c-d92w) -- so wrap
-                // this stage kernel with the SAME device-timestamped profiler
-                // already used across mmvq.cpp/unified-kernel.cpp/softmax.cpp
-                // etc. Uses the already-captured event (no lambda
-                // restructuring): ggml_sycl_kernel_profile_record_event is
-                // the record-only half of ggml_sycl_profile_submit, exactly
-                // for this "I already have the event" case. No-ops entirely
-                // when GGML_SYCL_KERNEL_PROFILE is unset (its own internal
-                // gate) -- zero default-env behavior change.
-                if (ggml_sycl_kernel_profile_enabled()) {
-                    ggml_sycl_profile_label stage_label{};
-                    stage_label.name       = "mxfp4.pp.stage.act";
-                    stage_label.category   = "mxfp4.pp.stage";
-                    stage_label.queue_kind = "compute";
-                    stage_label.metadata   = "phase=activation_copy_in";
-                    stage_label.device     = ctx.device;
-                    stage_label.bytes      = rows * ne10 * sizeof(sycl::half);
-                    ggml_sycl_kernel_profile_record_event(stage_label, activation_copy_event);
                 }
             }
 
@@ -72420,31 +72423,35 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 append_pp_log_entries(pp_local_entries_for_log, expert.row_begin, expert.row_end, expert.expert_id,
                                       expert.ptr, ctx.device, route_layout, &expert.lease);
 
-                sycl::range<3> block_dims(1, 1, pp_copy_work_group_size(ne0));
-                sycl::range<3> grid_dims(1, 1, rows);
-                sycl::event    scatter_copy_event = stream->submit([&](sycl::handler & cgh) {
-                    const char * __restrict out_get =
-                        reinterpret_cast<const char *>(batched_out + slot * out_slot_elems);
-                    const mmid_row_mapping * __restrict row_mapping_get = dev_row_mappings.get() + expert.row_begin;
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_dst_from_contiguous(dst_original, out_get, row_mapping_get, ne0, nb1, nb2, item_ct1);
+                sycl::range<3>          block_dims(1, 1, pp_copy_work_group_size(ne0));
+                sycl::range<3>          grid_dims(1, 1, rows);
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final
+                // micro-cycle): see the activation-copy site above for why
+                // this is now ggml_sycl_profile_submit instead of record-
+                // event.
+                ggml_sycl_profile_label stage_label{};
+                stage_label.name       = "mxfp4.pp.stage.scatter";
+                stage_label.category   = "mxfp4.pp.stage";
+                stage_label.queue_kind = "compute";
+                stage_label.metadata   = "phase=output_scatter_out";
+                stage_label.device     = ctx.device;
+                stage_label.bytes      = rows * ne0 * sizeof(float);
+                sycl::event scatter_copy_event =
+                    ggml_sycl_profile_submit(*stream, stage_label, [&](sycl::queue & profiled_queue) {
+                        return profiled_queue.submit([&](sycl::handler & cgh) {
+                            const char * __restrict out_get =
+                                reinterpret_cast<const char *>(batched_out + slot * out_slot_elems);
+                            const mmid_row_mapping * __restrict row_mapping_get =
+                                dev_row_mappings.get() + expert.row_begin;
+                            cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                                             [=](sycl::nd_item<3> item_ct1) {
+                                                 k_copy_dst_from_contiguous(dst_original, out_get, row_mapping_get, ne0,
+                                                                            nb1, nb2, item_ct1);
+                                             });
                         });
-                });
+                    });
                 if (pp_profile) {
                     pp_profile_stage_events.push_back(scatter_copy_event);
-                }
-                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): see
-                // the activation-copy site above for why/how.
-                if (ggml_sycl_kernel_profile_enabled()) {
-                    ggml_sycl_profile_label stage_label{};
-                    stage_label.name       = "mxfp4.pp.stage.scatter";
-                    stage_label.category   = "mxfp4.pp.stage";
-                    stage_label.queue_kind = "compute";
-                    stage_label.metadata   = "phase=output_scatter_out";
-                    stage_label.device     = ctx.device;
-                    stage_label.bytes      = rows * ne0 * sizeof(float);
-                    ggml_sycl_kernel_profile_record_event(stage_label, scatter_copy_event);
                 }
             }
 

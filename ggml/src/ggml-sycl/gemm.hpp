@@ -1098,23 +1098,27 @@ class DnnlGemmWrapper {
                     }
                     args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
                 }
-                sycl::event exec_event = dnnl::sycl_interop::execute(cached3d->primitive, stream, args, deps);
-                // llama.cpp-iikr (sycl-kernel-profiler extension cycle): the
-                // gap-cause classifier has zero coverage of this call today
-                // (static survey, task comment c-d92w) -- wrap it with the
-                // SAME device-timestamped profiler used across the rest of
-                // the backend. Record-only (the event is already captured),
-                // no-ops entirely when GGML_SYCL_KERNEL_PROFILE is unset.
-                if (ggml_sycl_kernel_profile_enabled()) {
-                    ggml_sycl_profile_label gemm_label{};
-                    gemm_label.name       = "mxfp4.pp.gemm.execute";
-                    gemm_label.category   = "mxfp4.pp.gemm";
-                    gemm_label.queue_kind = "compute";
-                    gemm_label.metadata   = "arm=3d";
-                    gemm_label.device     = ctx.device;
-                    ggml_sycl_kernel_profile_record_event(gemm_label, exec_event);
-                }
-                return exec_event;
+                // llama.cpp-iikr (sycl-kernel-profiler extension cycle, final
+                // micro-cycle): switched from record-event to
+                // ggml_sycl_profile_submit so the classifier gets a HOST
+                // submit span, not just the device timestamps -- see the
+                // 2-D fallback arm below for the full rationale (team-lead's
+                // c-vr68 capture, no_submit_span). dnnl::sycl_interop::
+                // execute() doesn't need the sycl::queue& submit_fn hands
+                // it (it uses the dnnl::stream captured above instead), so
+                // the lambda ignores that parameter and closes over
+                // `stream`/`args`/`deps` -- *q is passed only to give
+                // ggml_sycl_profile_submit a real queue to bracket with host
+                // chrono.
+                ggml_sycl_profile_label gemm_label{};
+                gemm_label.name       = "mxfp4.pp.gemm.execute";
+                gemm_label.category   = "mxfp4.pp.gemm";
+                gemm_label.queue_kind = "compute";
+                gemm_label.metadata   = "arm=3d";
+                gemm_label.device     = ctx.device;
+                return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+                    return dnnl::sycl_interop::execute(cached3d->primitive, stream, args, deps);
+                });
             }
             tri_state[dev_id].store(-1, std::memory_order_release);
             if (g_ggml_sycl_debug) {
@@ -1213,7 +1217,6 @@ class DnnlGemmWrapper {
             }
             const std::vector<sycl::event> iter_deps =
                 (b == 0) ? deps : std::vector<sycl::event>{ per_batch_events.back() };
-            sycl::event exec_event = dnnl::sycl_interop::execute(cached2d->primitive, stream, args, iter_deps);
             // llama.cpp-iikr (sycl-kernel-profiler extension cycle): THIS is
             // the required arm -- the per-expert-execute loop the static
             // survey (task comment c-d92w) found completely dark to the
@@ -1225,20 +1228,32 @@ class DnnlGemmWrapper {
             // barrier returned below, which times only the (near-instant)
             // barrier command itself (see this function's own gemm_events
             // caller-side comment in ggml-sycl.cpp for that exact trap).
-            // metadata is a local std::string whose .c_str() is safe here:
-            // ggml_sycl_kernel_profile_record_event synchronously copies it
-            // into an owned std::string (profile_key::metadata) before this
-            // call returns -- see snapshot_label in sycl-kernel-profiler.cpp.
-            if (ggml_sycl_kernel_profile_enabled()) {
-                ggml_sycl_profile_label gemm_label{};
-                gemm_label.name                  = "mxfp4.pp.gemm.execute";
-                gemm_label.category              = "mxfp4.pp.gemm";
-                gemm_label.queue_kind            = "compute";
-                const std::string batch_metadata = "arm=2d;batch_idx=" + std::to_string(b);
-                gemm_label.metadata              = batch_metadata.c_str();
-                gemm_label.device                = ctx.device;
-                ggml_sycl_kernel_profile_record_event(gemm_label, exec_event);
-            }
+            // Final micro-cycle: switched to ggml_sycl_profile_submit (host
+            // submit-span recording, not just record-event's device-only
+            // timestamps) -- team-lead's full-coverage capture (c-vr68)
+            // found 890/934 ms landed in the classifier's no_submit_span
+            // instrument-artifact cause specifically because the record-
+            // event form this arm used before captured no host submit span,
+            // so the parser could not tell host-late from submitted-early-
+            // and-queued. batch_metadata is a local std::string kept alive
+            // for the whole ggml_sycl_profile_submit call (a single full
+            // expression) -- ggml_sycl_kernel_profile_record_event, called
+            // from inside it, synchronously copies .c_str() into an owned
+            // std::string (profile_key::metadata) before returning, so this
+            // remains safe -- see snapshot_label in sycl-kernel-profiler.cpp.
+            // The lambda ignores the sycl::queue& submit_fn hands it for the
+            // same reason as the 3-D arm above (dnnl::sycl_interop::execute
+            // uses the captured dnnl::stream, not a raw sycl::queue).
+            ggml_sycl_profile_label gemm_label{};
+            gemm_label.name                  = "mxfp4.pp.gemm.execute";
+            gemm_label.category              = "mxfp4.pp.gemm";
+            gemm_label.queue_kind            = "compute";
+            const std::string batch_metadata = "arm=2d;batch_idx=" + std::to_string(b);
+            gemm_label.metadata              = batch_metadata.c_str();
+            gemm_label.device                = ctx.device;
+            sycl::event exec_event           = ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+                return dnnl::sycl_interop::execute(cached2d->primitive, stream, args, iter_deps);
+            });
             per_batch_events.push_back(exec_event);
         }
         return q->ext_oneapi_submit_barrier(per_batch_events);
