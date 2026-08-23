@@ -71296,14 +71296,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     pp_profile_repack_begin.push_back(
                         ggml_sycl_submit_marker<mxfp4_pp_profile_repack_begin_marker>(*stream));
                 }
+                // Coalesced (SLM-tiled, vectorized-write) forms as of the
+                // perf-recovery epic's track D (llama.cpp-0vqt): byte-for-
+                // byte identical output to the *_batched functions above --
+                // each coalesced entry point falls back to the corresponding
+                // pre-0vqt kernel internally on its own shape gate (SOA:
+                // nrows%16==0; XMX_TILED: tile_n_total==16 exactly), so no
+                // new condition is needed at this call site. Iteration 3
+                // measured 4.8-5.7x over the pre-0vqt batched kernels'
+                // effective bandwidth on both cards (task comments c-swol,
+                // and the iter3 acceptance run).
                 if (experts_are_tiled) {
-                    repack_mxfp4_xmx_tiled_to_woq_batched(
+                    repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
                         repack_srcs.data(), n_slots, batched_weight_bytes, weight_slot_bytes, woq_nibble_slot_bytes,
                         blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream());
                 } else {
-                    repack_mxfp4_soa_to_woq_batched(repack_srcs.data(), n_slots, batched_weight_bytes,
-                                                    weight_slot_bytes, woq_nibble_slot_bytes, blocks_per_row,
-                                                    static_cast<int>(ne01), ctx.stream());
+                    repack_mxfp4_soa_to_woq_coalesced_batched(repack_srcs.data(), n_slots, batched_weight_bytes,
+                                                              weight_slot_bytes, woq_nibble_slot_bytes, blocks_per_row,
+                                                              static_cast<int>(ne01), ctx.stream());
                 }
                 if (pp_profile) {
                     pp_profile_repack_end.push_back(
@@ -71326,13 +71336,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             pp_profile_repack_begin.push_back(
                                 ggml_sycl_submit_marker<mxfp4_pp_profile_repack_begin_marker>(*stream));
                         }
+                        // Coalesced form -- see the batched call site above
+                        // for the fallback-gate rationale (llama.cpp-0vqt).
                         if (experts_are_tiled) {
-                            repack_mxfp4_xmx_tiled_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                          static_cast<int>(ne01), static_cast<int>(tile_n_total),
-                                                          ctx.stream());
+                            repack_mxfp4_xmx_tiled_to_woq_coalesced(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
+                                                                    static_cast<int>(ne01),
+                                                                    static_cast<int>(tile_n_total), ctx.stream());
                         } else {
-                            repack_mxfp4_soa_to_woq(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
-                                                    static_cast<int>(ne01), ctx.stream());
+                            repack_mxfp4_soa_to_woq_coalesced(expert.ptr, nibble_dst, scale_dst, blocks_per_row,
+                                                              static_cast<int>(ne01), ctx.stream());
                         }
                         if (pp_profile) {
                             pp_profile_repack_end.push_back(
