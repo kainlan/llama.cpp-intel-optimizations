@@ -155,6 +155,37 @@ static void diag_write_only_kernel(uint8_t * __restrict__ dst_nibbles, int64_t N
     dst_nibbles[k * (N / 2) + n0 / 2 + n_pair] = static_cast<uint8_t>(lid);
 }
 
+// (5) Write-only, VECTORIZED (confirmation step before touching the real
+// kernel -- the lead's diagnostics found the write-only form alone sits at
+// ~80% of the full kernel's time on both cards, so the 1-byte-per-lane
+// destination store, not the strided read, is the suspected limiter): same
+// destination coverage as diag_write_only_kernel above, but each lane
+// assembles the WHOLE row of DIAG_NBLK/2 contiguous dst bytes for one
+// k_local (8 bytes for DIAG_NBLK=16) in a register and issues a SINGLE
+// uint64 store, instead of DIAG_NBLK/2 lanes each doing one scalar byte
+// store. Alignment: k*(N/2) is always a multiple of 8 (N/2=1440 for the
+// GPT-OSS shape, itself a multiple of 8) and n0/2 = n_tile*(DIAG_NBLK/2) is
+// always a multiple of 8 too (DIAG_NBLK/2=8) -- both terms 8-byte aligned
+// for any k, n_tile.
+static void diag_write_only_vectorized_kernel(uint8_t * __restrict__ dst_nibbles,
+                                              int64_t                  N,
+                                              const sycl::nd_item<3> & item) {
+    constexpr int ROW_BYTES = DIAG_NBLK / 2;  // 8 for DIAG_NBLK=16
+    const int     b         = static_cast<int>(item.get_group(1));
+    const int64_t n0        = static_cast<int64_t>(item.get_group(2)) * DIAG_NBLK;
+    const int     k_local   = static_cast<int>(item.get_local_id(2));  // one lane per k_local, 0..31
+    const int64_t k         = static_cast<int64_t>(b) * QK_MXFP4 + k_local;
+
+    uint64_t word = 0;
+#pragma unroll
+    for (int i = 0; i < ROW_BYTES; ++i) {
+        const uint8_t v = static_cast<uint8_t>(k_local + i);  // synthesized, same spirit as diag_write_only_kernel
+        word |= static_cast<uint64_t>(v) << (i * 8);
+    }
+    uint64_t * const dst64 = reinterpret_cast<uint64_t *>(dst_nibbles + k * (N / 2) + n0 / 2);
+    *dst64                 = word;
+}
+
 // (4) SLM round-trip, no transpose: reads the source block the SAME way as
 // phase 1 into a PADDED SLM buffer (row = DIAG_NBLK+1, matching the
 // committed kernel's bank-conflict fix -- isolates "cost of the SLM round
@@ -372,6 +403,21 @@ int main() {
                 }
             };
             report("diag-write-only", n_slots, nibbles_write_bytes, run_bench(q, WARMUP, ITERS, work));
+        }
+        {
+            auto work = [&](sycl::queue & qq) {
+                for (int s = 0; s < n_slots; ++s) {
+                    (void) s;
+                    uint8_t * dd = diag_dst;
+                    qq.submit([&](sycl::handler & cgh) {
+                        cgh.parallel_for(
+                            sycl::nd_range<3>(sycl::range<3>(1, blocks_per_row, diag_n_tiles * 32),
+                                              sycl::range<3>(1, 1, 32)),
+                            [=](sycl::nd_item<3> item) { diag_write_only_vectorized_kernel(dd, N, item); });
+                    });
+                }
+            };
+            report("diag-write-only-vec", n_slots, nibbles_write_bytes, run_bench(q, WARMUP, ITERS, work));
         }
         {
             auto work = [&](sycl::queue & qq) {
