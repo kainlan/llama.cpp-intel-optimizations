@@ -65210,6 +65210,16 @@ struct mxfp4_pp_batched_profile_accum {
     int64_t                                  admit_cache_misses         = 0;
     int64_t                                  admit_publish_aos_count    = 0;
     int64_t                                  admit_publish_nonaos_count = 0;
+    // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): classifies every
+    // dispatch by whether sweep_a/sweep_b (host_admit_sweep_a_us/
+    // host_admit_sweep_b_us above) actually ran this call or were skipped in
+    // favor of reading src0's layout straight off the layer's admission-
+    // cache entry (populated by whichever sibling dispatched first this
+    // eval). `swept` dominating on a triad-heavy graph would mean the reuse
+    // probe is declining more than expected and is worth a follow-up
+    // capture, same posture as fastpath_rebuild_reused/_built above.
+    int64_t                                  sweep_layout_reused_count     = 0;
+    int64_t                                  sweep_layout_swept_count      = 0;
     double                                   host_routeeval_us       = 0.0;
     int64_t                                  host_routeeval_calls    = 0;
     double                                   host_fastpath_us        = 0.0;
@@ -65717,7 +65727,8 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         "[MXFP4-PP-BATCHED-PROFILE-HOST4] device=%d admit_idswait=%.3f ms/%lld admit_sweep_a=%.3f ms/%lld "
         "admit_sweep_b=%.3f ms/%lld admit_publish=%.3f ms/%lld admit_lookup=%.3f ms/%lld admit_resolve=%.3f ms/%lld "
         "admit_snapshot=%.3f ms/%lld admit_cache_hits=%lld admit_cache_misses=%lld admit_publish_aos=%lld "
-        "admit_publish_nonaos=%lld admit_probe_entries=%llu admit_resolve_fastpath=%llu admit_resolve_fallback=%llu\n",
+        "admit_publish_nonaos=%lld admit_probe_entries=%llu admit_resolve_fastpath=%llu admit_resolve_fallback=%llu "
+        "sweep_layout_reused=%lld sweep_layout_swept=%lld\n",
         p.device, p.host_admit_idswait_us / 1000.0, (long long) p.host_admit_idswait_calls,
         p.host_admit_sweep_a_us / 1000.0, (long long) p.host_admit_sweep_a_calls, p.host_admit_sweep_b_us / 1000.0,
         (long long) p.host_admit_sweep_b_calls, p.host_admit_publish_us / 1000.0,
@@ -65726,7 +65737,8 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (long long) p.host_admit_snapshot_calls, (long long) p.admit_cache_hits, (long long) p.admit_cache_misses,
         (long long) p.admit_publish_aos_count, (long long) p.admit_publish_nonaos_count,
         (unsigned long long) admit_probe_entries, (unsigned long long) admit_resolve_fastpath,
-        (unsigned long long) admit_resolve_fallback);
+        (unsigned long long) admit_resolve_fallback, (long long) p.sweep_layout_reused_count,
+        (long long) p.sweep_layout_swept_count);
     GGML_LOG_WARN(
         "[MXFP4-PP-BATCHED-PROFILE-HOST5] device=%d resolve_inner=%.3f ms/%lld resolve_outer=%.3f ms/%lld "
         "resolve_memo_hit=%.3f ms/%lld fastpath_rebuild=%.3f ms/%lld fastpath_rebuild_reused=%lld "
@@ -66272,29 +66284,107 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
         }
 #endif
-        const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
-        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
-        // FIRST 32-expert sweep -- select_moe_planned_graph_layout reaches
-        // planned_layout_complete -> probe_moe_planned_layout, which loops
-        // every expert. adjust_layout_for_tensor is a cheap layout-mode
-        // transform, folded into this same bracket rather than given its
-        // own (it is not a sweep).
-        retained_prompt_layout =
-            has_override ? override_layout :
-                           ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, prompt_host_weights, ne12);
-        retained_prompt_layout       = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
+        // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1): sweep_a/
+        // sweep_b below are two independent 32-expert layout-validation
+        // sweeps FOR SRC0 SPECIFICALLY. When src0 is one of the layer's 3
+        // sibling weights and whichever of gate/up/down dispatched first
+        // this eval already populated a non-rejected admission-cache entry
+        // for (ids, device), that entry's matching role already carries
+        // src0's own actual_layout() -- computed by role_layout() inside
+        // this same cache-populate call, same recipe (select_moe_planned_
+        // graph_layout -> adjust_layout_for_tensor -> moe_layout_for_
+        // selected_rows) sweep_a/sweep_b run below. Reading it is a
+        // read-only probe of the SAME map/key the promptadmit block below
+        // independently looks up again -- that second lookup is untouched
+        // and still runs exactly as before; this only lets a repeat
+        // dispatch of an already-cached layer skip the two sweeps
+        // entirely. The cached value cannot go stale mid-eval: nothing in
+        // graph_compute's own op dispatch writes a MoE weight tensor (the
+        // generation-counter bump lives exclusively in
+        // ggml_backend_sycl_buffer_{set,cpy,memset}_tensor/buffer_clear --
+        // ggml tensor-I/O entry points invoked from OUTSIDE graph
+        // execution, e.g. model load or an explicit backend write, never
+        // from inside a running graph-compute pass), and unified-cache
+        // eviction/replan is guarded off for the duration of one
+        // (`unified_cache_set_graph_compute_active`).
+        layout_mode reused_sweep_layout       = GGML_LAYOUT_AOS;
+        bool        reused_sweep_layout_found = false;
+        if (!has_override) {
+            const int  early_prompt_layer = src0->name ? parse_layer_id_from_name(src0->name) : -1;
+            const auto early_pair_it      = g_moe_gate_up_pairs.find(early_prompt_layer);
+            if (early_pair_it != g_moe_gate_up_pairs.end()) {
+                const moe_gate_up_pair & early_pair = early_pair_it->second;
+                if (early_pair.gate_weight && early_pair.up_weight && early_pair.down_weight && early_pair.ids == ids &&
+                    (src0 == early_pair.gate_weight || src0 == early_pair.up_weight ||
+                     src0 == early_pair.down_weight) &&
+                    ggml_sycl_moe_admit_cache_enabled()) {
+                    ggml_backend_sycl_context::moe_ids_cache_key early_key{};
+                    if (ggml_sycl_make_context_moe_ids_content_cache_key(ids, ctx.device, &early_key)) {
+                        const auto early_it = g_moe_prompt_admission_cache.find(early_key);
+                        if (early_it != g_moe_prompt_admission_cache.end() && early_it->second.valid &&
+                            early_it->second.ids_hash == ggml_sycl_hash_ids(prompt_ids_snapshot) &&
+                            early_it->second.retained_prompt_roles_result) {
+                            const auto & early_roles = early_it->second.retained_prompt_roles_result.bundle;
+                            const ggml_sycl::moe_retained_role_batch * early_role = nullptr;
+                            if (src0 == early_roles.gate.weight_identity) {
+                                early_role = &early_roles.gate;
+                            } else if (src0 == early_roles.up.weight_identity) {
+                                early_role = &early_roles.up;
+                            } else if (src0 == early_roles.down.weight_identity) {
+                                early_role = &early_roles.down;
+                            }
+                            if (early_role && !early_role->batch.operands.empty()) {
+                                reused_sweep_layout       = early_role->batch.operands.front().actual_layout();
+                                reused_sweep_layout_found = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (reused_sweep_layout_found) {
+            retained_prompt_layout = reused_sweep_layout;
 #if GGML_SYCL_DNNL
-        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_a_us,
-                        &mxfp4_pp_batched_profile_accum::host_admit_sweep_a_calls);
+            if (host_phase_profile) {
+                ++g_mxfp4_pp_batched_profile.sweep_layout_reused_count;
+            }
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_a_us,
+                            &mxfp4_pp_batched_profile_accum::host_admit_sweep_a_calls);
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_b_us,
+                            &mxfp4_pp_batched_profile_accum::host_admit_sweep_b_calls);
 #endif
-        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
-        // SECOND, INDEPENDENT 32-expert sweep -- moe_layout_for_selected_rows
-        // runs its own probe_moe_planned_layout loop, distinct from sweep_a's.
-        retained_prompt_layout       = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, retained_prompt_layout,
-                                                                              prompt_ids_snapshot.size(), has_override, ne12);
+        } else {
 #if GGML_SYCL_DNNL
-        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_b_us,
-                        &mxfp4_pp_batched_profile_accum::host_admit_sweep_b_calls);
+            if (host_phase_profile) {
+                ++g_mxfp4_pp_batched_profile.sweep_layout_swept_count;
+            }
+#endif
+            const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+            // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
+            // FIRST 32-expert sweep -- select_moe_planned_graph_layout reaches
+            // planned_layout_complete -> probe_moe_planned_layout, which loops
+            // every expert. adjust_layout_for_tensor is a cheap layout-mode
+            // transform, folded into this same bracket rather than given its
+            // own (it is not a sweep).
+            retained_prompt_layout =
+                has_override ? override_layout :
+                               ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, prompt_host_weights, ne12);
+            retained_prompt_layout = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
+#if GGML_SYCL_DNNL
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_a_us,
+                            &mxfp4_pp_batched_profile_accum::host_admit_sweep_a_calls);
+#endif
+            // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
+            // SECOND, INDEPENDENT 32-expert sweep -- moe_layout_for_selected_rows
+            // runs its own probe_moe_planned_layout loop, distinct from sweep_a's.
+            retained_prompt_layout = ggml_sycl_moe_layout_for_selected_rows(
+                src0, ctx.device, retained_prompt_layout, prompt_ids_snapshot.size(), has_override, ne12);
+#if GGML_SYCL_DNNL
+            host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_b_us,
+                            &mxfp4_pp_batched_profile_accum::host_admit_sweep_b_calls);
+#endif
+        }
+#if GGML_SYCL_DNNL
         if (host_phase_profile) {
             if (retained_prompt_layout == GGML_LAYOUT_AOS) {
                 ++g_mxfp4_pp_batched_profile.admit_publish_aos_count;
