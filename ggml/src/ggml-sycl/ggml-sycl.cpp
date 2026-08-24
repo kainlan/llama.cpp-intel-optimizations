@@ -65071,8 +65071,34 @@ struct mxfp4_pp_batched_profile_accum {
     // leaves that dispatch's contribution to it unaccounted.
     double                                   host_entry_us           = 0.0;
     int64_t                                  host_entry_calls        = 0;
-    double                                   host_promptadmit_us     = 0.0;
-    int64_t                                  host_promptadmit_calls  = 0;
+    // llama.cpp-iikr (promptadmit-cache follow-up): team-lead's hardware
+    // battery on the resolver-call cache found promptadmit dropped only
+    // 133.6 -> 110.1 ms/eval, not to the pre-registered ~45 -- the 9-calls-
+    // where-3-suffice resolver calls were correctly identified but were
+    // only ~17% of the block's cost. The single host_promptadmit_us mark
+    // is replaced by four sequential sub-marks over the block's own
+    // top-level code order (same bisection method as the prologue split
+    // above): idswait (ids D2H cache fetch/refresh, including the first-
+    // consumer device wait), layout (retained_prompt_layout resolution +
+    // canonical-publish + its log call), lookup (layer/pair lookup + the
+    // admission-cache key build and hit/hash check), resolve (the cache-
+    // miss path: the three build_moe_resolved_batch calls, align, and
+    // cache populate). print_and_reset sums all four for the aggregate
+    // "promptadmit=" figure so it stays comparable to the 133.6/110.1
+    // baseline while also printing each sub-phase. admit_cache_hits/
+    // misses count how often the admission cache actually short-circuits
+    // the resolve sub-phase, to settle engagement rate independently of
+    // the sub-phase timings.
+    double                                   host_admit_idswait_us    = 0.0;
+    int64_t                                  host_admit_idswait_calls = 0;
+    double                                   host_admit_layout_us     = 0.0;
+    int64_t                                  host_admit_layout_calls  = 0;
+    double                                   host_admit_lookup_us     = 0.0;
+    int64_t                                  host_admit_lookup_calls  = 0;
+    double                                   host_admit_resolve_us    = 0.0;
+    int64_t                                  host_admit_resolve_calls = 0;
+    int64_t                                  admit_cache_hits         = 0;
+    int64_t                                  admit_cache_misses       = 0;
     double                                   host_routeeval_us       = 0.0;
     int64_t                                  host_routeeval_calls    = 0;
     double                                   host_fastpath_us        = 0.0;
@@ -65493,7 +65519,15 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     // total across 1596 iterations on hardware -- negligible.)
     const double  gemm_2d_args_map_us    = ggml_sycl_gemm_profile::args_map_ns_accum().exchange(0) / 1000.0;
     const int64_t gemm_2d_args_map_calls = ggml_sycl_gemm_profile::args_map_calls_accum().exchange(0);
-    const double  phases_sum_us = p.host_entry_us + p.host_promptadmit_us + p.host_routeeval_us + p.host_fastpath_us +
+    // promptadmit_us/calls are derived (not separately accumulated) -- the
+    // sum of the four sub-marks below is, by construction of the shared
+    // running host_phase_clock, exactly what the single host_promptadmit_us
+    // mark used to measure. Same posture as unphased_us just below: a
+    // print-time-only quantity.
+    const double  promptadmit_us =
+        p.host_admit_idswait_us + p.host_admit_layout_us + p.host_admit_lookup_us + p.host_admit_resolve_us;
+    const int64_t promptadmit_calls = p.host_admit_idswait_calls;
+    const double  phases_sum_us     = p.host_entry_us + promptadmit_us + p.host_routeeval_us + p.host_fastpath_us +
                                  p.host_prologue_us + p.host_readback_us + p.host_ptrtable_us + p.host_routeresolve_us +
                                  p.host_grouping_us + p.host_repackstage_us + p.host_submission_us;
     const double unphased_us = p.host_whole_us - phases_sum_us;
@@ -65506,9 +65540,16 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     GGML_LOG_WARN(
         "[MXFP4-PP-BATCHED-PROFILE-HOST3] device=%d entry=%.3f ms/%lld promptadmit=%.3f ms/%lld "
         "routeeval=%.3f ms/%lld fastpath=%.3f ms/%lld\n",
-        p.device, p.host_entry_us / 1000.0, (long long) p.host_entry_calls, p.host_promptadmit_us / 1000.0,
-        (long long) p.host_promptadmit_calls, p.host_routeeval_us / 1000.0, (long long) p.host_routeeval_calls,
+        p.device, p.host_entry_us / 1000.0, (long long) p.host_entry_calls, promptadmit_us / 1000.0,
+        (long long) promptadmit_calls, p.host_routeeval_us / 1000.0, (long long) p.host_routeeval_calls,
         p.host_fastpath_us / 1000.0, (long long) p.host_fastpath_calls);
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST4] device=%d admit_idswait=%.3f ms/%lld admit_layout=%.3f ms/%lld "
+        "admit_lookup=%.3f ms/%lld admit_resolve=%.3f ms/%lld admit_cache_hits=%lld admit_cache_misses=%lld\n",
+        p.device, p.host_admit_idswait_us / 1000.0, (long long) p.host_admit_idswait_calls,
+        p.host_admit_layout_us / 1000.0, (long long) p.host_admit_layout_calls, p.host_admit_lookup_us / 1000.0,
+        (long long) p.host_admit_lookup_calls, p.host_admit_resolve_us / 1000.0, (long long) p.host_admit_resolve_calls,
+        (long long) p.admit_cache_hits, (long long) p.admit_cache_misses);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
@@ -65957,6 +65998,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, prompt_ids_entry)) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID prompt expert ID admission failed");
         }
+#if GGML_SYCL_DNNL
+        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_idswait_us,
+                        &mxfp4_pp_batched_profile_accum::host_admit_idswait_calls);
+#endif
         prompt_ids_snapshot            = prompt_ids_entry.host_ids;
         const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
         retained_prompt_layout =
@@ -65976,6 +66021,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         ggml_sycl_moe_log_canonical_publish_pre_admission(g_moe_prompt_canonical_publish_diagnostics,
                                                           "MOE-PROMPT-CANONICAL", src0, prompt_canonical_published,
                                                           prompt_published_kind, prompt_published_stable);
+#if GGML_SYCL_DNNL
+        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_layout_us,
+                        &mxfp4_pp_batched_profile_accum::host_admit_layout_calls);
+#endif
         // retained_prompt_batch_result's build (and the retained_prompt_groups
         // population that depends on it) is deferred past the fused gate/up/
         // GLU/down dispatch below -- see the comment at its new site, just
@@ -66021,6 +66070,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         if (current_hash == admit_it->second.ids_hash) {
                             retained_prompt_roles_result = admit_it->second.retained_prompt_roles_result;
                             admit_cache_hit              = true;
+                            ++g_mxfp4_pp_batched_profile.admit_cache_hits;
                         } else {
                             GGML_LOG_ERROR(
                                 "%s: MOE prompt admission cache stale-read detected (ids_hash "
@@ -66030,7 +66080,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
                     }
                 }
+#if GGML_SYCL_DNNL
+                host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_lookup_us,
+                                &mxfp4_pp_batched_profile_accum::host_admit_lookup_calls);
+#endif
                 if (!admit_cache_hit) {
+                    ++g_mxfp4_pp_batched_profile.admit_cache_misses;
                     auto role_layout = [&](const ggml_tensor * weight) {
                         const bool  host = ggml_sycl_is_host_resident_weight(weight, ctx.stream());
                         layout_mode layout =
@@ -66069,8 +66124,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
     }
 #if GGML_SYCL_DNNL
-    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_promptadmit_us,
-                    &mxfp4_pp_batched_profile_accum::host_promptadmit_calls);
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_us,
+                    &mxfp4_pp_batched_profile_accum::host_admit_resolve_calls);
 #endif
     auto retained_prompt_route_from_operand =
         [&](const ggml_sycl::moe_resolved_operand * selected) -> moe_expert_route {
