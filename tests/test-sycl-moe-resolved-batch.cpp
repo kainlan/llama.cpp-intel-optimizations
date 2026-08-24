@@ -555,14 +555,43 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     CHECK(!layout_miss && layout_miss.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
 
     // Same expert ID with a changed stable identity is not groupable.
-    int32_t repeated_ids[] = { 5, 5 };
-    int     identity       = 50;
-    auto    drift          = ggml_sycl::build_moe_resolved_batch(repeated_ids, 2, 2, 0, [&](int32_t) {
+    // llama.cpp-iikr (memo_hit fix, design note c-2cc8, team-lead's full-rigor
+    // classification -- same species as the :461 fixture fixed in 390d4f376):
+    // this used to rely on build_moe_resolved_batch calling its resolver once
+    // per OCCURRENCE, so the two occurrences of expert 5 would each get a
+    // fresh `identity++` and a genuinely different lease identity. That
+    // premise died with f4aca4f26 (llama.cpp-e3xj, predates this session) --
+    // repeats of one expert now always share the first occurrence's
+    // identical resolved lease by construction, so POINTER_MISMATCH is
+    // unreachable via build_moe_resolved_batch's own output. Same fix:
+    // bypass the memoization by resolving each operand through its own
+    // build_moe_resolved_batch call (genuinely independent identities,
+    // verified below), then hand-assemble a batch make_moe_batch_local_view
+    // still correctly refuses.
+    const int32_t single_drift_id[] = { 5 };
+    int           drift_identity    = 50;
+    auto          drift_first       = ggml_sycl::build_moe_resolved_batch(single_drift_id, 1, 1, 0, [&](int32_t) {
         return route_for(&primary, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS,
-                                     identity++);
+                                        drift_identity++);
     });
-    CHECK(drift);
-    auto drift_view = ggml_sycl::make_moe_batch_local_view(drift.batch, GGML_LAYOUT_AOS);
+    auto          drift_second      = ggml_sycl::build_moe_resolved_batch(single_drift_id, 1, 1, 0, [&](int32_t) {
+        return route_for(&primary, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_AOS, GGML_LAYOUT_AOS,
+                                       drift_identity++);
+    });
+    CHECK(drift_first && drift_second);
+    CHECK(!drift_first.batch.operands[0].lease().stable_identity_equal(drift_second.batch.operands[0].lease()));
+
+    ggml_sycl::moe_resolved_batch drift_batch;
+    drift_batch.submit_device   = 0;
+    drift_batch.slots_per_token = 2;
+    drift_batch.expert_ids      = { 5, 5 };
+    drift_batch.operands.push_back(drift_first.batch.operands[0]);
+    drift_batch.operands.push_back(drift_second.batch.operands[0]);
+    drift_batch.operands[1].occurrence  = 1;
+    drift_batch.operands[1].token_index = 0;
+    drift_batch.operands[1].slot_index  = 1;
+
+    auto drift_view = ggml_sycl::make_moe_batch_local_view(drift_batch, GGML_LAYOUT_AOS);
     CHECK(!drift_view && drift_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
     return true;
 }
