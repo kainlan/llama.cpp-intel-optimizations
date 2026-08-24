@@ -74632,6 +74632,35 @@ static bool should_dispatch_to_cpu(ggml_backend_sycl_context & ctx, const ggml_t
     // than a device kernel launch; that tradeoff is unmeasured).
     const bool is_routing_ids_producer =
         dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_SOFT_MAX || dst->op == GGML_OP_ARGSORT;
+    // llama.cpp-iikr (fix cycle after team-lead's full-pipeline battery:
+    // correctness green, but the routing device-event count stayed at 74/74
+    // gate-ON vs gate-OFF -- the bypass below is provably unreached or its
+    // condition is provably false for the real graph, and static reading
+    // alone hasn't found which. Opt-in, zero-effect-by-default trace: prints
+    // every boolean in the gate's condition SEPARATELY (not short-circuited)
+    // for every MUL_MAT/SOFT_MAX/ARGSORT node this function is ever called
+    // on, so the actual blocking condition is visible directly instead of
+    // guessed from a fourth round of static analysis.
+    if (is_routing_ids_producer) {
+        static const bool trace_enabled = [] {
+            const char * env = std::getenv("GGML_SYCL_MOE_ROUTING_DEVICE_TRACE");
+            return env && std::atoi(env) != 0;
+        }();
+        if (trace_enabled) {
+            static std::atomic<int> trace_count{ 0 };
+            const int               idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+            if (idx < 256) {
+                const bool gate_enabled = ggml_sycl_moe_routing_device_enabled();
+                const bool ne1_ok       = dst->ne[1] > 1;
+                const bool hint_match   = ggml_sycl_op_is_moe_routing_subgraph(dst);
+                fprintf(stderr,
+                        "[MOE-ROUTING-DEVICE-TRACE] idx=%d dst=%s op=%s ne1=%lld gate_enabled=%d ne1_ok=%d "
+                        "hint_match=%d src0=%s\n",
+                        idx, dst->name ? dst->name : "?", ggml_op_name(dst->op), (long long) dst->ne[1], gate_enabled,
+                        ne1_ok, hint_match, (dst->src[0] && dst->src[0]->name) ? dst->src[0]->name : "?");
+            }
+        }
+    }
     if (ggml_sycl_moe_routing_device_enabled() && is_routing_ids_producer && dst->ne[1] > 1 &&
         ggml_sycl_op_is_moe_routing_subgraph(dst)) {
         g_last_dispatch_query  = dst;
