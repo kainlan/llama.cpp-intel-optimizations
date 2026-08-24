@@ -25271,8 +25271,8 @@ bool test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle lease) 
     const int32_t                   ids[] = { 6 };
     const moe_resolved_batch_result result =
         build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return normalized; });
-    return result && result.batch.operands.size() == 1 && result.batch.operands[0].planned_device == 1 &&
-           result.batch.operands[0].owning_device == 0;
+    return result && result.batch.operands.size() == 1 && result.batch.operands[0].planned_device() == 1 &&
+           result.batch.operands[0].owning_device() == 0;
 }
 
 }  // namespace ggml_sycl
@@ -50801,7 +50801,7 @@ static ggml_sycl::moe_retained_pointer_table ggml_sycl_upload_moe_retained_ptr_t
     result.has_ready_event = event_set;
     result.role_leases.reserve(batch.operands.size());
     for (const auto & operand : batch.operands) {
-        result.role_leases.push_back(operand.lease);
+        result.role_leases.push_back(operand.lease());
     }
     return result;
 }
@@ -50814,7 +50814,7 @@ static void ggml_sycl_retain_moe_terminal_bundle(ggml_sycl::moe_retained_termina
     retained.reserve(terminal.retained_handle_count());
     for (const auto * role : { &terminal.roles.gate, &terminal.roles.up, &terminal.roles.down }) {
         for (const auto & operand : role->batch.operands) {
-            retained.push_back(operand.lease);
+            retained.push_back(operand.lease());
         }
     }
     for (auto & table : terminal.tables) {
@@ -60540,11 +60540,12 @@ static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(const ggml
     // handles that prove that exact base+expert-stride address contract.
     for (const auto & operand : batch.operands) {
         if (operand.expert_id < 0 || operand.expert_id >= src0->ne[2] ||
-            operand.residency != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE || operand.actual_layout != layout) {
+            operand.residency() != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
+            operand.actual_layout() != layout) {
             validation.reason = "non-local-or-layout";
             return validation;
         }
-        const auto resolved = operand.lease.resolve(batch.submit_device);
+        const auto resolved = operand.lease().resolve(batch.submit_device);
         if (!resolved.ptr) {
             validation.reason = "stale-handle";
             return validation;
@@ -60556,9 +60557,9 @@ static fused_moe_route_validation ggml_sycl_validate_fused_moe_routes(const ggml
             return validation;
         }
         validation.contiguous_base = candidate_base;
-        validation.leases.push_back(operand.lease);
-        if (operand.has_ready_event) {
-            validation.ready_events.push_back(operand.ready_event);
+        validation.leases.push_back(operand.lease());
+        if (operand.has_ready_event()) {
+            validation.ready_events.push_back(operand.ready_event());
         }
     }
     validation.ok     = validation.contiguous_base != nullptr;
@@ -61796,7 +61797,7 @@ static bool try_xmx_sorted_moe(ggml_backend_sycl_context &           ctx,
         std::vector<ggml_sycl::mem_handle> retained;
         retained.reserve(batch.operands.size());
         for (const auto & operand : batch.operands) {
-            retained.push_back(operand.lease);
+            retained.push_back(operand.lease());
         }
         ggml_sycl::retain_handles_until_event(std::move(retained), stream->ext_oneapi_submit_barrier());
         GGML_SYCL_DEBUG("[XMX MoE] XMX sorted kernel completed\n");
@@ -66397,22 +66398,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         }
         moe_expert_route route{};
         route.requested_layout = retained_prompt_layout;
-        const auto resolved    = selected->lease.resolve();
-        if (!resolved.ptr || resolved.layout != selected->actual_layout) {
+        const auto resolved    = selected->lease().resolve();
+        if (!resolved.ptr || resolved.layout != selected->actual_layout()) {
             throw ggml_sycl_fallback_error("MUL_MAT_ID selected prompt occurrence became unresolved");
         }
         route.ptr                      = resolved.ptr;
-        route.owning_device            = selected->owning_device;
-        route.planned_device           = selected->planned_device;
-        route.plan_found               = selected->plan_found;
-        route.planned_device_residency = selected->planned_device >= 0;
-        route.planned_layout           = selected->actual_layout;
-        route.actual_layout            = selected->actual_layout;
+        route.owning_device            = selected->owning_device();
+        route.planned_device           = selected->planned_device();
+        route.plan_found               = selected->plan_found();
+        route.planned_device_residency = selected->planned_device() >= 0;
+        route.planned_layout           = selected->actual_layout();
+        route.actual_layout            = selected->actual_layout();
         route.reason                   = ggml_sycl::expert_resolve_reason::FOUND;
-        route.lease                    = selected->lease;
-        route.has_ready_event          = selected->has_ready_event;
-        route.ready_event              = selected->ready_event;
-        switch (selected->residency) {
+        route.lease                    = selected->lease();
+        route.has_ready_event          = selected->has_ready_event();
+        route.ready_event              = selected->ready_event();
+        switch (selected->residency()) {
             case ggml_sycl::moe_batch_residency::PRIMARY_DEVICE:
                 route.kind = moe_expert_route_kind::LOCAL_DEVICE;
                 route.tier = ggml_sycl::expert_resolve_tier::DEVICE_VRAM;
@@ -66481,9 +66482,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const auto & gate  = roles.gate.batch;
         const auto & up    = roles.up.batch;
         const auto & down  = roles.down.batch;
-        if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout) ||
-            !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout) ||
-            !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout)) {
+        if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout()) ||
+            !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout()) ||
+            !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout())) {
             return false;
         }
         const auto supports_role = [&](const ggml_sycl::moe_retained_role_batch & role) {
@@ -66494,12 +66495,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             const auto &               operand = batch.operands.front();
             const moe_route_capability cap     = ggml_sycl_moe_query_route_capability(
-                weight->type, operand.actual_layout, moe_route_phase::PROMPT, weight->ne[0], weight->ne[1],
-                batch.operands.size(), operand.owning_device, moe_layer_route_residency::DEVICE, ctx.device);
+                weight->type, operand.actual_layout(), moe_route_phase::PROMPT, weight->ne[0], weight->ne[1],
+                batch.operands.size(), operand.owning_device(), moe_layer_route_residency::DEVICE, ctx.device);
             return cap.supported && cap.local_device;
         };
         return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
-               roles.gate.batch.operands.front().actual_layout == roles.up.batch.operands.front().actual_layout;
+               roles.gate.batch.operands.front().actual_layout() == roles.up.batch.operands.front().actual_layout();
     }();
     // Only the proven MXFP4 all-primary path is eligible. In particular this
     // excludes the direct Q1/NVFP4 device gate, role bias owners, and every
@@ -66583,12 +66584,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 (pair.glu_op == GGML_GLU_OP_SWIGLU || pair.glu_op == GGML_GLU_OP_SWIGLU_OAI) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.up_dst, ctx.device) &&
                 !ggml_sycl_moe_precomputed_skip_contains(g_moe_precomputed_mmid_skip, pair.down_dst, ctx.device);
-            const layout_mode gate_layout = roles.gate.batch.operands.front().actual_layout;
-            const layout_mode up_layout   = roles.up.batch.operands.front().actual_layout;
-            const layout_mode down_layout = roles.down.batch.operands.front().actual_layout;
-            const auto all_layout = [](const ggml_sycl::moe_retained_role_batch & role, layout_mode expected) {
+            const layout_mode gate_layout = roles.gate.batch.operands.front().actual_layout();
+            const layout_mode up_layout   = roles.up.batch.operands.front().actual_layout();
+            const layout_mode down_layout = roles.down.batch.operands.front().actual_layout();
+            const auto        all_layout  = [](const ggml_sycl::moe_retained_role_batch & role, layout_mode expected) {
                 return std::all_of(role.batch.operands.begin(), role.batch.operands.end(),
-                                   [expected](const auto & operand) { return operand.actual_layout == expected; });
+                                           [expected](const auto & operand) { return operand.actual_layout() == expected; });
             };
             // This is the exact production executor intersection, not the wider
             // retained-cache capability set. Gate/up consumes SOA or (opt-in,
@@ -66728,7 +66729,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                              const ggml_sycl::moe_retained_pointer_table & table) {
                             fused::RetainedRoleView view;
                             view.present         = true;
-                            view.handle_identity = identity(role.batch.operands.front().lease);
+                            view.handle_identity = identity(role.batch.operands.front().lease());
                             view.table_identity  = identity(table.table_handle);
                             // Readiness is bound to the retained table owner; its
                             // upload event and all role leases travel together.
@@ -66752,13 +66753,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                     lease_identity = memo->second.first;
                                     residency      = memo->second.second;
                                 } else {
-                                    lease_identity = identity(operand.lease);
+                                    lease_identity = identity(operand.lease());
                                     residency      = fused::OccurrenceResidency::unavailable;
-                                    if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
+                                    if (operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
                                         residency = fused::OccurrenceResidency::local;
-                                    } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
+                                    } else if (operand.residency() ==
+                                               ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
                                         residency = fused::OccurrenceResidency::secondary;
-                                    } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
+                                    } else if (operand.residency() == ggml_sycl::moe_batch_residency::HOST) {
                                         residency = fused::OccurrenceResidency::host;
                                     }
                                     expert_identity.emplace(operand.expert_id,
@@ -66766,7 +66768,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 }
                                 view.occurrences.push_back(
                                     { operand.expert_id, operand.occurrence, operand.token_index, operand.slot_index,
-                                      lease_identity, static_cast<std::int64_t>(operand.actual_layout), residency });
+                                      lease_identity, static_cast<std::int64_t>(operand.actual_layout()), residency });
                             }
                             return view;
                         };
@@ -66883,7 +66885,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 auto role_handles = [](const ggml_sycl::moe_retained_role_batch & role) {
                                     std::vector<ggml_sycl::mem_handle> out;
                                     out.reserve(role.batch.operands.size());
-                                    for (const auto & operand : role.batch.operands) out.push_back(operand.lease);
+                                    for (const auto & operand : role.batch.operands) {
+                                        out.push_back(operand.lease());
+                                    }
                                     return out;
                                 };
                                 auto table_handles = [](const ggml_sycl::moe_retained_pointer_table & table) {
@@ -67087,9 +67091,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             const auto * selected = retained_prompt_groups[expert];
             if (selected &&
-                (!selected->lease.stable_identity_equal(operand.lease) || selected->residency != operand.residency ||
-                 selected->owning_device != operand.owning_device ||
-                 selected->actual_layout != operand.actual_layout)) {
+                (!selected->lease().stable_identity_equal(operand.lease()) ||
+                 selected->residency() != operand.residency() || selected->owning_device() != operand.owning_device() ||
+                 selected->actual_layout() != operand.actual_layout())) {
                 throw ggml_sycl_fallback_error(
                     "MUL_MAT_ID repeated prompt expert has conflicting retained occurrences");
             }
@@ -67240,8 +67244,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
                 const ggml_sycl::moe_resolved_operand * operand = prompt_batch.occurrence(iid1, id);
                 if (!operand || operand->expert_id != eid ||
-                    operand->residency != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
-                    operand->actual_layout != route_layout) {
+                    operand->residency() != ggml_sycl::moe_batch_residency::PRIMARY_DEVICE ||
+                    operand->actual_layout() != route_layout) {
                     return false;
                 }
 
@@ -67293,7 +67297,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             std::vector<ggml_sycl::mem_handle> retained;
             retained.reserve(prompt_batch.operands.size());
             for (const auto & operand : prompt_batch.operands) {
-                retained.push_back(operand.lease);
+                retained.push_back(operand.lease());
             }
             ggml_sycl::retain_handles_until_event(std::move(retained), ctx.stream()->ext_oneapi_submit_barrier());
             record_moe_gpu_path("smart_i8_grouped_down", route_layout, total_entries);
@@ -67499,13 +67503,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     size_t host_count        = 0;
                     size_t unavailable_count = 0;
                     for (const auto & operand : retained_prompt_batch_result.batch.operands) {
-                        if (operand.actual_layout != layout) {
+                        if (operand.actual_layout() != layout) {
                             unavailable_count++;
-                        } else if (operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
+                        } else if (operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE) {
                             local_count++;
-                        } else if (operand.residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
+                        } else if (operand.residency() == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE) {
                             secondary_count++;
-                        } else if (operand.residency == ggml_sycl::moe_batch_residency::HOST) {
+                        } else if (operand.residency() == ggml_sycl::moe_batch_residency::HOST) {
                             host_count++;
                         } else {
                             unavailable_count++;
@@ -67609,7 +67613,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 std::vector<ggml_sycl::mem_handle> retained;
                 retained.reserve(retained_prompt_batch_result.batch.operands.size());
                 for (const auto & operand : retained_prompt_batch_result.batch.operands) {
-                    retained.push_back(operand.lease);
+                    retained.push_back(operand.lease());
                 }
                 ggml_sycl::retain_handles_until_event(std::move(retained), ctx.stream()->ext_oneapi_submit_barrier());
             }
@@ -68807,8 +68811,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const auto & decode = retained_decode_batch_result.batch;
         bool all_primary = !decode.operands.empty();
         for (const auto & operand : decode.operands) {
-            all_primary = all_primary && operand.residency == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE &&
-                          operand.owning_device == ctx.device && operand.actual_layout == GGML_LAYOUT_AOS;
+            all_primary = all_primary && operand.residency() == ggml_sycl::moe_batch_residency::PRIMARY_DEVICE &&
+                          operand.owning_device() == ctx.device && operand.actual_layout() == GGML_LAYOUT_AOS;
         }
         const auto exec = ggml_sycl_take_execution_state_snapshot(&ctx);
         ggml_sycl::lifecycle::ModelToken root{};
@@ -68828,8 +68832,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             bool canonical = table_ptr != nullptr && retained_table.valid();
             for (size_t i = 0; canonical && i < decode.operands.size(); ++i) {
                 auto binding = ggml_sycl::moe::canonical_allocation_integration::bind(
-                    decode.operands[i].lease, static_cast<uint64_t>(GGML_LAYOUT_AOS) + 1,
-                    static_cast<uint32_t>(i));
+                    decode.operands[i].lease(), static_cast<uint64_t>(GGML_LAYOUT_AOS) + 1, static_cast<uint32_t>(i));
                 canonical = binding.has_value();
                 if (binding) {
                     table_entries.push_back(binding->owner);
@@ -68849,11 +68852,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // The direct recipe and exact queue capability were proven together
             // during canonical batch admission. Preserve that immutable authority;
             // do not re-query the registry after normalization.
-            auto queue_cap = decode.operands.front().recipe_queue_capability;
+            auto          queue_cap   = decode.operands.front().recipe_queue_capability();
             for (const auto & operand : decode.operands) {
-                if (!operand.recipe_queue_capability.valid() ||
-                    operand.recipe_queue_capability.cookie() != queue_cap.cookie() ||
-                    operand.recipe_queue_capability.owner_device() != queue_cap.owner_device()) {
+                if (!operand.recipe_queue_capability().valid() ||
+                    operand.recipe_queue_capability().cookie() != queue_cap.cookie() ||
+                    operand.recipe_queue_capability().owner_device() != queue_cap.owner_device()) {
                     queue_cap = {};
                     break;
                 }
@@ -69906,25 +69909,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                int64_t id, moe_route_phase phase, size_t rows,
                                                retained_decode_partition_stats & stats) {
                 const bool queue_available =
-                    operand.residency != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
-                    (operand.owning_device >= 0 && operand.owning_device < n_gpu_devs &&
-                     ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device));
+                    operand.residency() != ggml_sycl::moe_batch_residency::SECONDARY_DEVICE ||
+                    (operand.owning_device() >= 0 && operand.owning_device() < n_gpu_devs &&
+                     ggml_sycl::ggml_sycl_ensure_moe_secondary_queues_for_plan(operand.owning_device()));
                 // Admission already retained the exact capability-derived recipe
                 // and bound its signature to this lease. Never fabricate a second
                 // argument-less capability query at fallback/partition time.
                 (void) phase;
                 (void) rows;
-                const auto choice = ggml_sycl::choose_moe_batch_executor(
-                    operand, ctx.device, queue_available, operand.recipe.workspace.total_bytes);
+                const auto choice = ggml_sycl::choose_moe_batch_executor(operand, ctx.device, queue_available,
+                                                                         operand.recipe().workspace.total_bytes);
                 if (!choice) {
                     GGML_LOG_ERROR(
                         "[MOE-DECODE-REFUSAL] tensor=%s occurrence=%zu expert=%d owner=%d reason=%s "
                         "type=%s layout=%s kernel=%s capability=%s queue_ready=%d\n",
-                        src0->name ? src0->name : "?", operand.occurrence, operand.expert_id, operand.owning_device,
+                        src0->name ? src0->name : "?", operand.occurrence, operand.expert_id, operand.owning_device(),
                         ggml_sycl::moe_batch_reject_reason_name(choice.reject), ggml_type_name(src0->type),
-                        ggml_sycl_layout_mode_name(operand.actual_layout),
-                        ggml_sycl::moe_route_kernel_name(operand.recipe.kernel),
-                        operand.recipe_reason ? operand.recipe_reason : "retained-recipe-reason-unavailable",
+                        ggml_sycl_layout_mode_name(operand.actual_layout()),
+                        ggml_sycl::moe_route_kernel_name(operand.recipe().kernel),
+                        operand.recipe_reason() ? operand.recipe_reason() : "retained-recipe-reason-unavailable",
                         queue_available ? 1 : 0);
                     return choice;
                 }
@@ -69932,10 +69935,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 expert_dispatch_entry entry = ggml_sycl_make_expert_dispatch_entry(
                     iid1, id, operand.expert_id,
                     choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU ? ggml_sycl::mem_handle::HOST_DEVICE :
-                                                                                 operand.owning_device,
-                    operand.actual_layout, operand.lease, /*allow_cpu_fallback=*/false);
-                entry.has_ready_event          = operand.has_ready_event;
-                entry.ready_event              = operand.ready_event;
+                                                                                 operand.owning_device(),
+                    operand.actual_layout(), operand.lease(), /*allow_cpu_fallback=*/false);
+                entry.has_ready_event        = operand.has_ready_event();
+                entry.ready_event            = operand.ready_event();
                 entry.admitted_recipe_ticket = ggml_sycl::make_moe_admitted_recipe_ticket(operand);
                 if (choice.executor == ggml_sycl::moe_batch_executor::HOST_CPU) {
                     cpu_entries.push_back(std::move(entry));
@@ -69944,8 +69947,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     gpu_entries.push_back(std::move(entry));
                     stats.device_counts[static_cast<size_t>(ctx.device)]++;
                 } else {
-                    per_gpu_entries[operand.owning_device].push_back(std::move(entry));
-                    stats.device_counts[static_cast<size_t>(operand.owning_device)]++;
+                    per_gpu_entries[operand.owning_device()].push_back(std::move(entry));
+                    stats.device_counts[static_cast<size_t>(operand.owning_device())]++;
                 }
                 return choice;
             };

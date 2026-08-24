@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -360,25 +361,80 @@ struct moe_batch_route {
     friend bool                      test_moe_resolved_batch_accepts_actual_planned_alternate(mem_handle);
 };
 
+// llama.cpp-iikr (memo_hit fix, design note c-2cc8, approved): everything
+// here except the 4 genuinely per-OCCURRENCE fields on moe_resolved_operand
+// itself (expert_id/occurrence/token_index/slot_index) is invariant across
+// every occurrence of the SAME expert within one build_moe_resolved_batch()
+// call -- residency/device/layout/lease/recipe are all resolved once per
+// unique expert_id and were previously being deep-copied onto every REPEAT
+// occurrence's own moe_resolved_operand (measured: 279,432 such copies/eval,
+// 69ms, HOST5 resolve_memo_hit -- each copy included a mem_handle, whose own
+// copy constructor bumps its target entry's refcount under a lock,
+// mem-handle.hpp:278-284, plus a sycl::event, another refcounted resource).
+struct moe_resolved_operand_canonical {
+    moe_batch_residency       residency        = moe_batch_residency::UNAVAILABLE;
+    int                       owning_device    = -1;
+    int                       planned_device   = -2;
+    bool                      plan_found       = false;
+    ggml_layout_mode          requested_layout = GGML_LAYOUT_AOS;
+    ggml_layout_mode          actual_layout    = GGML_LAYOUT_AOS;
+    size_t                    byte_offset      = 0;
+    bool                      has_ready_event  = false;
+    sycl::event               ready_event;
+    mem_handle                lease;
+    moe_execution_recipe      recipe;
+    moe_mmid_queue_capability recipe_queue_capability;
+    const char *              recipe_reason             = "recipe-unavailable";
+    size_t                    admitted_recipe_signature = 0;
+};
+
+// Every occurrence of one expert within a call shares ONE
+// moe_resolved_operand_canonical via `canonical` -- built once per unique
+// expert_id (build_moe_resolved_batch's first-occurrence path), copied only
+// as a shared_ptr (one atomic refcount increment) onto every repeat
+// occurrence instead of the whole payload. `canonical` is set unconditionally
+// by construction (build_moe_resolved_batch never pushes an operand without
+// it); the accessor methods below dereference it without a null check,
+// mirroring how a default-constructed mem_handle/sycl::event/etc. was always
+// safe to read as "empty" in the pre-restructuring struct -- the invariant
+// moves from "every field has a safe default" to "canonical is always set",
+// not from "safe" to "unsafe".
 struct moe_resolved_operand {
-    int32_t              expert_id        = -1;
-    size_t               occurrence       = 0;
-    size_t               token_index      = 0;
-    size_t               slot_index       = 0;
-    moe_batch_residency  residency        = moe_batch_residency::UNAVAILABLE;
-    int                  owning_device    = -1;
-    int                  planned_device   = -2;
-    bool                 plan_found       = false;
-    ggml_layout_mode     requested_layout = GGML_LAYOUT_AOS;
-    ggml_layout_mode     actual_layout    = GGML_LAYOUT_AOS;
-    size_t               byte_offset      = 0;
-    bool                 has_ready_event  = false;
-    sycl::event          ready_event;
-    mem_handle           lease;
-    moe_execution_recipe           recipe;
-    moe_mmid_queue_capability      recipe_queue_capability;
-    const char *                   recipe_reason = "recipe-unavailable";
-    size_t                         admitted_recipe_signature = 0;
+    int32_t                                               expert_id   = -1;
+    size_t                                                occurrence  = 0;
+    size_t                                                token_index = 0;
+    size_t                                                slot_index  = 0;
+    std::shared_ptr<const moe_resolved_operand_canonical> canonical;
+
+    const moe_resolved_operand_canonical & c() const { return *canonical; }
+
+    moe_batch_residency residency() const { return c().residency; }
+
+    int owning_device() const { return c().owning_device; }
+
+    int planned_device() const { return c().planned_device; }
+
+    bool plan_found() const { return c().plan_found; }
+
+    ggml_layout_mode requested_layout() const { return c().requested_layout; }
+
+    ggml_layout_mode actual_layout() const { return c().actual_layout; }
+
+    size_t byte_offset() const { return c().byte_offset; }
+
+    bool has_ready_event() const { return c().has_ready_event; }
+
+    const sycl::event & ready_event() const { return c().ready_event; }
+
+    const mem_handle & lease() const { return c().lease; }
+
+    const moe_execution_recipe & recipe() const { return c().recipe; }
+
+    const moe_mmid_queue_capability & recipe_queue_capability() const { return c().recipe_queue_capability; }
+
+    const char * recipe_reason() const { return c().recipe_reason; }
+
+    size_t admitted_recipe_signature() const { return c().admitted_recipe_signature; }
 };
 
 // Opaque execution authority created only from an admitted operand. Runtime
@@ -399,10 +455,10 @@ class moe_admitted_recipe_ticket {
 
 inline moe_admitted_recipe_ticket make_moe_admitted_recipe_ticket(const moe_resolved_operand & operand) {
     moe_admitted_recipe_ticket ticket;
-    if (operand.recipe.valid &&
-        operand.admitted_recipe_signature == moe_admitted_recipe_signature(operand.recipe, operand.lease)) {
-        ticket.recipe_    = operand.recipe;
-        ticket.signature_ = operand.admitted_recipe_signature;
+    if (operand.recipe().valid &&
+        operand.admitted_recipe_signature() == moe_admitted_recipe_signature(operand.recipe(), operand.lease())) {
+        ticket.recipe_    = operand.recipe();
+        ticket.signature_ = operand.admitted_recipe_signature();
         ticket.valid_     = true;
     }
     return ticket;
@@ -460,24 +516,24 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
     for (const moe_resolved_operand & operand : batch.operands) {
         const auto [existing, inserted] = expert_slots.emplace(operand.expert_id, out.expert_ids.size());
         if (!inserted) {
-            if (!out.leases[existing->second].stable_identity_equal(operand.lease)) {
+            if (!out.leases[existing->second].stable_identity_equal(operand.lease())) {
                 out.reject     = moe_batch_reject_reason::POINTER_MISMATCH;
                 out.occurrence = operand.occurrence;
                 return out;
             }
-            if (operand.has_ready_event) {
-                out.ready_events.push_back(operand.ready_event);
+            if (operand.has_ready_event()) {
+                out.ready_events.push_back(operand.ready_event());
             }
             continue;
         }
-        if (operand.residency != moe_batch_residency::PRIMARY_DEVICE || operand.owning_device != batch.submit_device ||
-            operand.actual_layout != layout) {
-            out.reject     = operand.actual_layout != layout ? moe_batch_reject_reason::LAYOUT_MISMATCH :
-                                                               moe_batch_reject_reason::WRONG_DEVICE;
+        if (operand.residency() != moe_batch_residency::PRIMARY_DEVICE ||
+            operand.owning_device() != batch.submit_device || operand.actual_layout() != layout) {
+            out.reject     = operand.actual_layout() != layout ? moe_batch_reject_reason::LAYOUT_MISMATCH :
+                                                                 moe_batch_reject_reason::WRONG_DEVICE;
             out.occurrence = operand.occurrence;
             return out;
         }
-        resolved_ptr resolved = operand.lease.resolve(batch.submit_device);
+        resolved_ptr resolved = operand.lease().resolve(batch.submit_device);
         if (!resolved.ptr) {
             out.reject     = moe_batch_reject_reason::STALE_HANDLE;
             out.occurrence = operand.occurrence;
@@ -491,9 +547,9 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
         }
         out.expert_ids.push_back(operand.expert_id);
         out.expert_ptrs.push_back(resolved.ptr);
-        out.leases.push_back(operand.lease);
-        if (operand.has_ready_event) {
-            out.ready_events.push_back(operand.ready_event);
+        out.leases.push_back(operand.lease());
+        if (operand.has_ready_event()) {
+            out.ready_events.push_back(operand.ready_event());
         }
     }
     return out;
@@ -650,9 +706,9 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
     size_t                       reserved_workspace_bytes,
     const moe_admitted_workspace_bundle * workspace_bundle = nullptr) {
     moe_batch_executor_choice out;
-    const bool direct_q1_nvfp4 = operand.recipe.kind != moe_batch_executor::HOST_CPU &&
-                                 (operand.recipe.request.type == GGML_TYPE_Q1_0 ||
-                                  operand.recipe.request.type == GGML_TYPE_NVFP4);
+    const bool                direct_q1_nvfp4 =
+        operand.recipe().kind != moe_batch_executor::HOST_CPU &&
+        (operand.recipe().request.type == GGML_TYPE_Q1_0 || operand.recipe().request.type == GGML_TYPE_NVFP4);
     if (direct_q1_nvfp4) {
         // Production capability remains closed until all four B70 oracle cases
         // pass. A matching bundle is necessary but not sufficient to advertise.
@@ -666,12 +722,12 @@ inline moe_batch_executor_choice choose_moe_batch_executor(
         out.reject = moe_batch_reject_reason::CAPABILITY_UNSUPPORTED;
         return out;
     }
-    if (!validate_moe_execution_recipe(operand.recipe, operand.admitted_recipe_signature, operand.lease,
-                                       operand.residency, submit_device, owning_queue_available,
+    if (!validate_moe_execution_recipe(operand.recipe(), operand.admitted_recipe_signature(), operand.lease(),
+                                       operand.residency(), submit_device, owning_queue_available,
                                        reserved_workspace_bytes, &out.reject)) {
         return out;
     }
-    out.executor = operand.recipe.kind;
+    out.executor = operand.recipe().kind;
     return out;
 }
 
@@ -919,27 +975,29 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             canonical_leases.push_back(route.lease);
         }
 
-        moe_resolved_operand operand;
-        operand.expert_id        = expert_id;
-        operand.occurrence       = i;
-        operand.token_index      = i / slots_per_token;
-        operand.slot_index       = i % slots_per_token;
-        operand.residency        = route.residency;
-        operand.owning_device    = route.owning_device;
-        operand.planned_device   = route.planned_device;
-        operand.plan_found       = route.plan_found;
-        operand.requested_layout = route.requested_layout;
-        operand.actual_layout    = route.actual_layout;
-        operand.byte_offset      = route.byte_offset;
-        operand.has_ready_event  = route.has_ready_event;
+        // llama.cpp-iikr (memo_hit fix): built ONCE per unique expert_id here
+        // and shared (via `operand.canonical`) by every repeat occurrence's
+        // own moe_resolved_operand -- see moe_resolved_operand_canonical's
+        // own comment for why. This is exactly the same per-field population
+        // the pre-restructuring code did directly onto `operand`; only the
+        // destination changed.
+        auto canonical_entry              = std::make_shared<moe_resolved_operand_canonical>();
+        canonical_entry->residency        = route.residency;
+        canonical_entry->owning_device    = route.owning_device;
+        canonical_entry->planned_device   = route.planned_device;
+        canonical_entry->plan_found       = route.plan_found;
+        canonical_entry->requested_layout = route.requested_layout;
+        canonical_entry->actual_layout    = route.actual_layout;
+        canonical_entry->byte_offset      = route.byte_offset;
+        canonical_entry->has_ready_event  = route.has_ready_event;
         if (route.has_ready_event) {
-            operand.ready_event = route.ready_event;
+            canonical_entry->ready_event = route.ready_event;
         }
-        operand.lease                     = route.lease;
-        operand.recipe                    = route.recipe;
-        operand.recipe_queue_capability   = route.recipe_queue_capability;
-        operand.recipe_reason             = route.recipe_reason;
-        operand.admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease);
+        canonical_entry->lease                     = route.lease;
+        canonical_entry->recipe                    = route.recipe;
+        canonical_entry->recipe_queue_capability   = route.recipe_queue_capability;
+        canonical_entry->recipe_reason             = route.recipe_reason;
+        canonical_entry->admitted_recipe_signature = moe_admitted_recipe_signature(route.recipe, route.lease);
         if (!route.recipe.valid) {
             out.reject        = moe_batch_reject_reason::RECIPE_MISSING;
             out.occurrence    = i;
@@ -949,6 +1007,13 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             out.batch.operands.clear();
             return out;
         }
+
+        moe_resolved_operand operand;
+        operand.expert_id   = expert_id;
+        operand.occurrence  = i;
+        operand.token_index = i / slots_per_token;
+        operand.slot_index  = i % slots_per_token;
+        operand.canonical   = std::move(canonical_entry);
         expert_first_index.emplace(expert_id, out.batch.operands.size());
         out.batch.operands.push_back(std::move(operand));
     }
