@@ -65204,6 +65204,39 @@ struct mxfp4_pp_batched_profile_accum {
     int64_t                                  host_admit_lookup_calls    = 0;
     double                                   host_admit_resolve_us      = 0.0;
     int64_t                                  host_admit_resolve_calls   = 0;
+    // llama.cpp-iikr (B50 residual-pool cycle, mechanism 2, instrument-only):
+    // bisects host_admit_resolve_us's cache-MISS body -- the only body it
+    // ever has non-trivial content, since on a hit this whole `if
+    // (!admit_cache_hit)` block never executes and host_admit_resolve_us
+    // itself nets ~0 -- into the 4 sequential sub-phases team-lead named:
+    // `layout` (the 3x role_layout() calls -- gate/up/down, each its own
+    // select_moe_planned_graph_layout + moe_layout_for_selected_rows sweep
+    // pair, same recipe as sweep_a/sweep_b above but for the OTHER two
+    // roles too), `batch` (the 3x ggml_sycl_build_moe_resolved_batch()
+    // calls -- overlaps HOST5's resolve_inner/resolve_outer/
+    // resolve_memo_hit, which measure INSIDE this call; this is the
+    // superset including loop/call overhead outside those), `align`
+    // (align_moe_retained_role_batches(), expected cheap -- an O(operand
+    // count) comparison loop, no allocation), `populate` (the cache-entry
+    // construction plus, as of d14b5bdd6, the ggml_sycl_moe_
+    // validate_retained_role_bundle() call moved here from routeeval --
+    // this bucket is where that call's cost now lands). These 4 marks use
+    // the SAME running host_phase_clock as every other mark in this
+    // function, so on the common (successful) path they sum EXACTLY to
+    // host_admit_resolve_us, same partition guarantee as promptadmit's six
+    // top-level phases above. A failed resolve (gate/up/down not all
+    // valid) skips the align/populate marks; that near-zero
+    // condition-check overhead is attributed to host_admit_resolve_us
+    // itself rather than a sub-phase -- acceptable slop on a path GPT-OSS
+    // routing does not normally take.
+    double                                   host_admit_resolve_layout_us      = 0.0;
+    int64_t                                  host_admit_resolve_layout_calls   = 0;
+    double                                   host_admit_resolve_batch_us       = 0.0;
+    int64_t                                  host_admit_resolve_batch_calls    = 0;
+    double                                   host_admit_resolve_align_us       = 0.0;
+    int64_t                                  host_admit_resolve_align_calls    = 0;
+    double                                   host_admit_resolve_populate_us    = 0.0;
+    int64_t                                  host_admit_resolve_populate_calls = 0;
     double                                   host_admit_snapshot_us     = 0.0;
     int64_t                                  host_admit_snapshot_calls  = 0;
     int64_t                                  admit_cache_hits           = 0;
@@ -65747,6 +65780,13 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (long long) resolve_outer_calls, resolve_memo_hit_us / 1000.0, (long long) resolve_memo_hit_calls,
         p.host_fastpath_rebuild_us / 1000.0, (long long) p.host_fastpath_rebuild_calls,
         (long long) p.fastpath_rebuild_reused_count, (long long) p.fastpath_rebuild_built_count);
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST6] device=%d admit_resolve_layout=%.3f ms/%lld admit_resolve_batch=%.3f "
+        "ms/%lld admit_resolve_align=%.3f ms/%lld admit_resolve_populate=%.3f ms/%lld\n",
+        p.device, p.host_admit_resolve_layout_us / 1000.0, (long long) p.host_admit_resolve_layout_calls,
+        p.host_admit_resolve_batch_us / 1000.0, (long long) p.host_admit_resolve_batch_calls,
+        p.host_admit_resolve_align_us / 1000.0, (long long) p.host_admit_resolve_align_calls,
+        p.host_admit_resolve_populate_us / 1000.0, (long long) p.host_admit_resolve_populate_calls);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
@@ -66504,7 +66544,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     const layout_mode gate_layout = role_layout(pair.gate_weight);
                     const layout_mode up_layout   = role_layout(pair.up_weight);
                     const layout_mode down_layout = role_layout(pair.down_weight);
-                    auto              gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+#if GGML_SYCL_DNNL
+                    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_layout_us,
+                                    &mxfp4_pp_batched_profile_accum::host_admit_resolve_layout_calls);
+#endif
+                    auto gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                         pair.gate_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                         static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false);
                     auto up_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
@@ -66513,6 +66557,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     auto down_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
                         pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                         static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false);
+#if GGML_SYCL_DNNL
+                    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_batch_us,
+                                    &mxfp4_pp_batched_profile_accum::host_admit_resolve_batch_calls);
+#endif
                     if (gate_result && up_result && down_result) {
                         // llama.cpp-iikr (promptadmit remainder cycle): built
                         // once here, then MOVED (never copied) into its final
@@ -66526,6 +66574,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
                             { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
                             { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
+#if GGML_SYCL_DNNL
+                        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_align_us,
+                                        &mxfp4_pp_batched_profile_accum::host_admit_resolve_align_calls);
+#endif
                         if (admit_key_ok) {
                             moe_prompt_admission_cache_entry & new_entry = g_moe_prompt_admission_cache[admit_key];
                             new_entry.valid                              = true;
@@ -66572,6 +66624,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ggml_sycl_moe_validate_retained_role_bundle(
                                     retained_prompt_roles_result_uncached_storage.bundle, ctx.device);
                         }
+#if GGML_SYCL_DNNL
+                        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_populate_us,
+                                        &mxfp4_pp_batched_profile_accum::host_admit_resolve_populate_calls);
+#endif
                     }
                 }
             }
