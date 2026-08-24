@@ -65214,6 +65214,22 @@ struct mxfp4_pp_batched_profile_accum {
     int64_t                                  host_routeeval_calls    = 0;
     double                                   host_fastpath_us        = 0.0;
     int64_t                                  host_fastpath_calls     = 0;
+    // llama.cpp-iikr (B50 residual-pool cycle, design finding 2): a targeted,
+    // OVERLAPPING sub-bracket around exactly the retained_prompt_batch_result
+    // resolve/reuse decision, narrower than host_fastpath_us above (which
+    // also covers unrelated work between this call site and the next mark).
+    // Added so the cost of this one call site is measured directly instead
+    // of inferred from call-count parity with promptadmit's own resolve --
+    // same posture as host_admit_snapshot_us: this OVERLAPS host_fastpath_us
+    // and must not be added into phases_sum_us. reused/built classify each
+    // call by which arm executed: reused = the triad-recognized cheap copy
+    // of an already-admitted role batch, built = the independent
+    // ggml_sycl_build_moe_resolved_batch fallback (no triad match, or the
+    // matching role's layout disagreed with this tensor's own).
+    double                                   host_fastpath_rebuild_us      = 0.0;
+    int64_t                                  host_fastpath_rebuild_calls   = 0;
+    int64_t                                  fastpath_rebuild_reused_count = 0;
+    int64_t                                  fastpath_rebuild_built_count  = 0;
     double                                   host_prologue_us        = 0.0;
     int64_t                                  host_prologue_calls     = 0;
     // llama.cpp-iikr (intra-window idle cycle): raw idle-hole samples,
@@ -65713,9 +65729,12 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (unsigned long long) admit_resolve_fallback);
     GGML_LOG_WARN(
         "[MXFP4-PP-BATCHED-PROFILE-HOST5] device=%d resolve_inner=%.3f ms/%lld resolve_outer=%.3f ms/%lld "
-        "resolve_memo_hit=%.3f ms/%lld\n",
+        "resolve_memo_hit=%.3f ms/%lld fastpath_rebuild=%.3f ms/%lld fastpath_rebuild_reused=%lld "
+        "fastpath_rebuild_built=%lld\n",
         p.device, resolve_inner_us / 1000.0, (long long) resolve_inner_calls, resolve_outer_us / 1000.0,
-        (long long) resolve_outer_calls, resolve_memo_hit_us / 1000.0, (long long) resolve_memo_hit_calls);
+        (long long) resolve_outer_calls, resolve_memo_hit_us / 1000.0, (long long) resolve_memo_hit_calls,
+        p.host_fastpath_rebuild_us / 1000.0, (long long) p.host_fastpath_rebuild_calls,
+        (long long) p.fastpath_rebuild_reused_count, (long long) p.fastpath_rebuild_built_count);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
@@ -67136,9 +67155,75 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     &mxfp4_pp_batched_profile_accum::host_routeeval_calls);
 #endif
     if (ne12 != 1) {
-        retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-            src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
-            retained_prompt_layout, /*allow_materialize=*/false);
+#if GGML_SYCL_DNNL
+        const auto fastpath_rebuild_t0 = std::chrono::high_resolution_clock::now();
+#endif
+        // llama.cpp-iikr (B50 residual-pool cycle, design finding 2): when
+        // src0 is one of the 3 sibling weights promptadmit already resolved
+        // into retained_prompt_roles_result's bundle for this exact ids
+        // snapshot, that role's batch IS this call's answer -- same weight,
+        // same prompt_ids_snapshot, same ids->ne[0], and the same layout
+        // recipe (ggml_sycl_select_moe_planned_graph_layout ->
+        // adjust_layout_for_tensor -> moe_layout_for_selected_rows) that
+        // computed retained_prompt_layout just above and role_layout()
+        // computed for this weight when the bundle was built -- see
+        // ggml_sycl_select_moe_planned_graph_layout's own per-tensor
+        // memoization (generation-counter invalidated, not dispatch-order
+        // dependent), which is why the two agree by construction. The
+        // layout-equality check below turns that agreement into a checked
+        // invariant rather than a bare assumption, and reuse simply does not
+        // apply when it fails. Reusing is a moe_resolved_batch COPY (cheap:
+        // operands are shared_ptr-backed since the canonical-payload
+        // restructuring) in place of the full independent resolve
+        // (mem_handle::resolve mutex, recipe lookup, string ops) that
+        // ggml_sycl_build_moe_resolved_batch would otherwise repeat.
+        // g_moe_gate_up_pairs is a topology-scan result, not a structural
+        // guarantee every MoE tensor belongs to a recognized triad, so the
+        // independent build remains the fallback whenever src0 is not one of
+        // the 3 roles, the bundle was never populated or was rejected, or
+        // the matching role's operands are empty/disagree on layout.
+        const ggml_sycl::moe_retained_role_batch * reuse_role = nullptr;
+        if (retained_prompt_roles_result && *retained_prompt_roles_result) {
+            const auto & roles = retained_prompt_roles_result->bundle;
+            if (src0 == roles.gate.weight_identity) {
+                reuse_role = &roles.gate;
+            } else if (src0 == roles.up.weight_identity) {
+                reuse_role = &roles.up;
+            } else if (src0 == roles.down.weight_identity) {
+                reuse_role = &roles.down;
+            }
+            if (reuse_role && (reuse_role->batch.operands.empty() ||
+                               reuse_role->batch.operands.front().actual_layout() != retained_prompt_layout)) {
+                reuse_role = nullptr;
+            }
+        }
+        if (reuse_role) {
+            retained_prompt_batch_result.batch  = reuse_role->batch;
+            retained_prompt_batch_result.reject = ggml_sycl::moe_batch_reject_reason::NONE;
+#if GGML_SYCL_DNNL
+            if (host_phase_profile) {
+                ++g_mxfp4_pp_batched_profile.fastpath_rebuild_reused_count;
+            }
+#endif
+        } else {
+            retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                static_cast<size_t>(ids->ne[0]), retained_prompt_layout, /*allow_materialize=*/false);
+#if GGML_SYCL_DNNL
+            if (host_phase_profile) {
+                ++g_mxfp4_pp_batched_profile.fastpath_rebuild_built_count;
+            }
+#endif
+        }
+#if GGML_SYCL_DNNL
+        if (host_phase_profile) {
+            g_mxfp4_pp_batched_profile.host_fastpath_rebuild_us +=
+                std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() -
+                                                          fastpath_rebuild_t0)
+                    .count();
+            ++g_mxfp4_pp_batched_profile.host_fastpath_rebuild_calls;
+        }
+#endif
         if (!retained_prompt_batch_result) {
             GGML_LOG_ERROR(
                 "[MOE-PROMPT-REFUSAL] tensor=%s occurrence=%zu expert=%d reason=%s source_reason=%d recipe_reason=%s\n",
