@@ -11667,6 +11667,19 @@ static void ggml_sycl_release_graph_leases_for_owner(ggml_sycl::lifecycle::Model
 // regardless of whether the code path ran. A raw fputs+fflush bypasses that
 // callback entirely, the same way zone_audit_emit's lines survived while
 // plain WARN calls did not.
+// llama.cpp-iikr (promptadmit remainder cycle, teardown-leak fix): forward
+// declared -- defined much later in this TU (~line 16855), next to
+// g_moe_prompt_admission_cache/g_moe_ids_d2h_cache themselves. See the call
+// site in ggml_sycl_release_model_slot_resources below for why a model-
+// teardown site needs it: g_moe_prompt_admission_cache is thread_local, not
+// owner/model-scoped, so nothing at load or replan boundaries touches it on
+// its own -- only the graph-compute-boundary calls to this same function do,
+// and if a model is torn down without one more graph-compute call happening
+// first, its cache entries (and the mem_handle leases inside them) simply
+// never get released, exactly like ggml_sycl_release_graph_leases_for_owner()
+// exists to prevent for the OTHER MoE caches just above.
+static void ggml_sycl_moe_ids_cache_new_graph();
+
 static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
     char    buf[512];
     va_list ap;
@@ -11686,6 +11699,29 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // reports them as leaked. The release is owner-targeted (canonical §12.4):
     // a backend still rooted on another live model keeps its graph.
     ggml_sycl_release_graph_leases_for_owner(owner);
+    // llama.cpp-iikr (promptadmit remainder cycle): same reasoning as the
+    // line above, for a cache that call doesn't reach.
+    // g_moe_prompt_admission_cache is thread_local and NOT owner-tracked (it
+    // has no ModelToken/slot association at all -- keyed only on tensor+
+    // device), so it is never touched by ownership-scoped releases; only the
+    // 3 graph-compute-boundary calls to ggml_sycl_moe_ids_cache_new_graph()
+    // (plus the MID_LOAD_REPLAN defensive site) ever clear it. If this
+    // model's LAST inference call is its last graph-compute boundary and no
+    // further one ever runs before teardown, its cache entries -- and the
+    // mem_handle leases inside them -- outlive the model that owns the
+    // weights they lease, exactly the "owner is gone" leak case the SYCL
+    // Memory Ownership contract's cleanup rule exists to catch. Confirmed on
+    // hardware: a single-eval llama-bench run showed
+    // "reclaim_weight_entries(model-teardown) ... leased=1596 ... leaked=1596"
+    // with the admission cache enabled and ZERO such entries with
+    // GGML_SYCL_MOE_ADMIT_CACHE=0 -- same run, same model, cache identity is
+    // the only variable. Clearing here, before the reclaim scan below (same
+    // ordering as the graph-lease release above), closes it: this is a
+    // thread-local, not per-owner, clear (same caveat as the earlier
+    // MID_LOAD_REPLAN site's own comment), correct here because model
+    // teardown -- like MID_LOAD_REPLAN -- runs on the same thread that owns
+    // this cache's contents, not from an arbitrary other thread.
+    ggml_sycl_moe_ids_cache_new_graph();
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
     ggml_sycl_erase_weight_identities_for_owner(owner);
@@ -65581,6 +65617,20 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     // total across 1596 iterations on hardware -- negligible.)
     const double  gemm_2d_args_map_us    = ggml_sycl_gemm_profile::args_map_ns_accum().exchange(0) / 1000.0;
     const int64_t gemm_2d_args_map_calls = ggml_sycl_gemm_profile::args_map_calls_accum().exchange(0);
+    // llama.cpp-iikr (promptadmit remainder cycle): team-lead's discriminating
+    // question for admit_resolve's post-copy-fix remainder -- inner (per-
+    // unique-expert resolver call) vs outer (per-operand stamping, ids-
+    // dependent) time inside build_moe_resolved_batch. Declared in
+    // moe-resolved-batch.hpp for the same reason gemm_2d_args_map is declared
+    // in gemm.hpp -- see that namespace's comment there.
+    const double  resolve_inner_us =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::inner_resolve_ns_accum().exchange(0) / 1000.0;
+    const int64_t resolve_inner_calls =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::inner_resolve_calls_accum().exchange(0);
+    const double resolve_outer_us =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().exchange(0) / 1000.0;
+    const int64_t resolve_outer_calls =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::outer_stamp_calls_accum().exchange(0);
     // promptadmit_us/calls are derived (not separately accumulated) -- the
     // sum of the six sub-marks below is, by construction of the shared
     // running host_phase_clock, exactly what the single host_promptadmit_us
@@ -65636,6 +65686,9 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (long long) p.admit_publish_aos_count, (long long) p.admit_publish_nonaos_count,
         (unsigned long long) admit_probe_entries, (unsigned long long) admit_resolve_fastpath,
         (unsigned long long) admit_resolve_fallback);
+    GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-HOST5] device=%d resolve_inner=%.3f ms/%lld resolve_outer=%.3f ms/%lld\n",
+                  p.device, resolve_inner_us / 1000.0, (long long) resolve_inner_calls, resolve_outer_us / 1000.0,
+                  (long long) resolve_outer_calls);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs

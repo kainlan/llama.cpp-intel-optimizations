@@ -10,6 +10,8 @@
 #include "moe-mmid-workspace.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
@@ -749,6 +751,48 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
 
 }  // namespace detail
 
+// llama.cpp-iikr (promptadmit remainder cycle): team-lead's discriminating
+// question for the admit_resolve remainder (44 ms/23 misses = 1.9 ms/miss,
+// after the by-value-copy fix landed) -- does that cost live in the INNER
+// per-unique-expert resolver call (resolver(expert_id) below, ~32 calls/role
+// at most, memoized so each unique expert pays it once) or in the OUTER
+// per-operand work that runs once per TOKEN OCCURRENCE (up to ~2048
+// operands/role for a 512-token prompt: the memo-hit fast copy path for
+// repeats, plus the occurrence/token_index/slot_index stamping this file's
+// own build_moe_resolved_batch comment already identifies as the ids-
+// dependent part, see lines 771/792-794/825-827 below)? Declared here, not
+// in ggml-sycl.cpp's mxfp4_pp_batched_profile_accum, for the same reason as
+// ggml_sycl_gemm_profile in gemm.hpp: this header is included before that
+// struct is defined in the same translation unit. Unconditional measurement
+// (two cheap chrono reads per UNIQUE EXPERT, not per operand -- see the
+// running-clock placement in the loop below, which brackets the resolver()
+// call itself as INNER and attributes every other iteration's time,
+// including every memo-hit repeat, to OUTER via the same shared clock) so
+// this header carries no dependency on ggml-sycl.cpp's profiling-enabled
+// check; ggml-sycl.cpp's print_and_reset drains these via exchange(0) and
+// folds them into its own report only when ITS OWN gate is on.
+namespace ggml_sycl_resolve_batch_profile {
+inline std::atomic<int64_t> & inner_resolve_ns_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<int64_t> & inner_resolve_calls_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<int64_t> & outer_stamp_ns_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<int64_t> & outer_stamp_calls_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+}  // namespace ggml_sycl_resolve_batch_profile
+
 // Every occurrence is resolved and produces one operand with its original
 // token and slot.  Retained handles may be canonicalized only by stable owner
 // identity; expert IDs and raw pointers are never identity keys.
@@ -783,6 +827,14 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
     std::unordered_map<int32_t, size_t> expert_first_index;
     expert_first_index.reserve(count);
 
+    // llama.cpp-iikr (promptadmit remainder cycle): running clock, same idiom
+    // as ggml-sycl.cpp's own host_phase_mark -- a shared timestamp reset at
+    // every mark, so consecutive marks partition elapsed time rather than
+    // re-measuring from a fixed origin. Marked at RESOLVER-CALL boundaries
+    // (up to ~32/role, memoized), not per operand (up to ~2048/role) -- the
+    // latter would make the measurement's own chrono overhead comparable to
+    // what it is trying to measure.
+    auto resolve_batch_loop_clock = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < count; ++i) {
         const int32_t expert_id = out.batch.expert_ids[i];
 
@@ -796,7 +848,23 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             continue;
         }
 
-        moe_batch_route               route  = resolver(expert_id);
+        {
+            const auto now = std::chrono::high_resolution_clock::now();
+            ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
+                std::memory_order_relaxed);
+            ggml_sycl_resolve_batch_profile::outer_stamp_calls_accum().fetch_add(1, std::memory_order_relaxed);
+            resolve_batch_loop_clock = now;
+        }
+        moe_batch_route route = resolver(expert_id);
+        {
+            const auto now = std::chrono::high_resolution_clock::now();
+            ggml_sycl_resolve_batch_profile::inner_resolve_ns_accum().fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
+                std::memory_order_relaxed);
+            ggml_sycl_resolve_batch_profile::inner_resolve_calls_accum().fetch_add(1, std::memory_order_relaxed);
+            resolve_batch_loop_clock = now;
+        }
         const moe_batch_reject_reason reject = detail::validate_moe_batch_route(route, submit_device);
         if (reject != moe_batch_reject_reason::NONE) {
             out.reject        = reject;
@@ -852,6 +920,18 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
         }
         expert_first_index.emplace(expert_id, out.batch.operands.size());
         out.batch.operands.push_back(std::move(operand));
+    }
+    // Final mark: attributes the tail -- any memo-hit iterations after the
+    // last resolver call, through loop end -- to OUTER. An early return
+    // above (reject/RECIPE_MISSING) skips this, same posture as every other
+    // phase mark in this codebase: an early exit before a mark leaves that
+    // call's contribution to it unaccounted.
+    {
+        const auto now = std::chrono::high_resolution_clock::now();
+        ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
+            std::memory_order_relaxed);
+        ggml_sycl_resolve_batch_profile::outer_stamp_calls_accum().fetch_add(1, std::memory_order_relaxed);
     }
     return out;
 }
