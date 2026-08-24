@@ -596,6 +596,131 @@ built for — does a tensor's repack re-run every eval instead of once per
 weight — is still answered by `dispatches` and the repack ms buckets, which
 kept their meaning.
 
+#### Host-side phase breakdown (`HOST`/`HOST2`–`HOST5`)
+
+⚠️ **Known doc gap, flagged rather than backfilled from memory: this
+subsection covers the `[MXFP4-PP-BATCHED-PROFILE-HOST]` through `-HOST5`
+lines added across ~8 commits of the same investigation
+(`llama.cpp-iikr`, the "unphased-host-time" → "promptadmit remainder" →
+"B50 residual-pool" cycles) that produced the device-event lines above.
+Everything below is accurate to the source as of this writing, but this
+family has not yet accumulated the multi-round hardware-caveat depth the
+`other`/graph-replay/host-waits sections above have — those were found by
+repeated hardware captures over time; this is a from-the-source writeup.
+Treat a claim here as unverified-on-hardware unless it cites a measured
+figure, and correct this section the first time a capture contradicts it.**
+
+Unlike the lines above (SYCL device-event profiling, `command_start`/
+`command_end`), these are **host CPU wall-clock** phases — a running
+`std::chrono::high_resolution_clock`, reset at each mark (`host_phase_mark`
+in `ggml_sycl_mul_mat_id`), so consecutive marks partition elapsed HOST
+dispatch time rather than measuring device execution. All five lines share
+the `GGML_SYCL_MXFP4_PP_PROFILE` gate and print once per eval, same as
+`[MXFP4-PP-BATCHED-PROFILE]` above.
+
+```
+[MXFP4-PP-BATCHED-PROFILE-HOST] device=<N> readback=<ms>/<calls> ptrtable=<ms>/<calls> routeresolve=<ms>/<calls> grouping=<ms>/<calls> repackstage=<ms>/<calls> submission=<ms>/<calls>
+[MXFP4-PP-BATCHED-PROFILE-HOST2] device=<N> whole=<ms>/<calls> prologue=<ms>/<calls> unphased=<ms> gemm_2d_args_map=<ms>/<calls>
+[MXFP4-PP-BATCHED-PROFILE-HOST3] device=<N> entry=<ms>/<calls> promptadmit=<ms>/<calls> routeeval=<ms>/<calls> fastpath=<ms>/<calls>
+[MXFP4-PP-BATCHED-PROFILE-HOST4] device=<N> admit_idswait=<ms>/<calls> admit_sweep_a=<ms>/<calls> admit_sweep_b=<ms>/<calls> admit_publish=<ms>/<calls> admit_lookup=<ms>/<calls> admit_resolve=<ms>/<calls> admit_snapshot=<ms>/<calls> admit_cache_hits=<N> admit_cache_misses=<N> admit_publish_aos=<N> admit_publish_nonaos=<N> admit_probe_entries=<N> admit_resolve_fastpath=<N> admit_resolve_fallback=<N>
+[MXFP4-PP-BATCHED-PROFILE-HOST5] device=<N> resolve_inner=<ms>/<calls> resolve_outer=<ms>/<calls> resolve_memo_hit=<ms>/<calls>
+```
+
+(each wrapped here for readability; every real line is one line.)
+
+**HOST** — the original six phases inside the batched-executor loop itself:
+`readback` (device→host ids readback), `ptrtable` (expert pointer table
+build/upload), `routeresolve` (per-expert route resolution inside the
+dispatch loop), `grouping` (expert grouping for the batched kernel calls),
+`repackstage` (repack-kernel staging), `submission` (kernel submission
+itself).
+
+**HOST2** — `whole` brackets `ggml_sycl_mul_mat_id`'s entire body (RAII,
+every exit path, success or throw). `prologue` here is narrower than its
+name once suggested: the marks run sequentially `entry` →
+`promptadmit` → `routeeval` → `fastpath` → `prologue` → HOST's own
+`readback` (first of the original six), so by the time `prologue`'s own
+mark fires it only covers the small tail segment between the end of
+`fastpath` and the start of `readback` — HOST3's four sub-marks are
+separate, EARLIER segments in that same sequential chain, not contained
+inside `prologue`. (The name is a holdover: before that five-way
+bisection, "prologue" meant the whole undifferentiated gap from function
+entry to the first of the six original phases; HOST3 split most of that
+gap out from under it, leaving `prologue` as just the final slice.)
+`unphased` is derived at print time (`whole` minus every phase-mark
+total: HOST's six + HOST3's four + HOST2's own `prologue`) — a print-
+time-only quantity, not separately accumulated; large `unphased` is the
+signal to bisect further, not a target in itself. `gemm_2d_args_map` is a
+*different* instrument folded in here:
+`gemm.hpp`'s own `ggml_sycl_gemm_profile` accumulator (declared in that
+header, not this struct, since `gemm.hpp` is included earlier in this TU),
+timing the WOQ 2-D fallback's per-iteration `std::unordered_map<int,
+dnnl::memory>` construction — measured negligible on hardware (0.252 ms
+total across 1596 iterations, one full cycle's finding, not re-verified
+since).
+
+**HOST3** — the four sequential marks that precede HOST2's own `prologue`
+mark in the same chain (see HOST2 above for the ordering), covering most
+of what "prologue" originally meant before this split, in the function's
+own top-level code order: `entry` (function entry through weight/id/ne
+setup), `promptadmit`
+(the `ne12 != 1` prompt-admission block — itself further split by HOST4,
+see below; `promptadmit` here is DERIVED as the sum of HOST4's six
+sub-phases, not separately accumulated, so it stays comparable across the
+several cycles that narrowed it: 133.6 → 20.5 ms/eval as of `bbc8c3352`,
+the most recent captured commit at the time of this writing — a further
+drop is expected once the routeeval caching fix (`d14b5bdd6`, see
+`routeeval` just below) is captured, but that number is not yet measured),
+`routeeval` (retained-route lambda definitions and, as of `d14b5bdd6`, a
+single cached read of the fused-fast-path admissibility check that used
+to be recomputed 3x per layer — see that commit's message for the full
+attribution), `fastpath` (the planner-fastpath booleans through the
+batched-oneDNN route-probe chain).
+
+**HOST4** — bisects `promptadmit` into six sequential sub-phases in that
+block's own code order: `admit_idswait` (ids D2H cache fetch/refresh,
+including the first-consumer device wait), `admit_sweep_a`/`admit_sweep_b`
+(the two independent per-dispatch 32-expert layout-validation sweeps the
+analyst read `c-nq1u` named — `select_moe_planned_graph_layout` and
+`moe_layout_for_selected_rows` respectively), `admit_publish`
+(`publish_mmid_canonical_aos_experts`, AOS-route-only — see
+`admit_publish_aos`/`admit_publish_nonaos` below for whether it ever
+actually runs), `admit_lookup` (the promptadmit admission-cache key build
+and hit/hash check), `admit_resolve` (the cache-miss path: the three
+`build_moe_resolved_batch` calls — see HOST5 for this one's own further
+split). `admit_snapshot` is **not part of the six-phase partition** —
+it separately, additionally times the ids-snapshot copy plus the two
+`ids_hash` call sites via their own before/after timestamps (they are not
+adjacent in source, so they cannot share one running-clock mark the way
+the six phases do); it overlaps whichever of the six phases contains each
+site and must not be summed into `promptadmit`.
+`admit_cache_hits`/`admit_cache_misses` count the promptadmit admission
+cache's own hit rate. `admit_publish_aos`/`admit_publish_nonaos` classify
+every dispatch by `retained_prompt_layout`'s final value right before the
+`admit_publish` call — `aos=0` across an eval means the AOS-gated body
+never ran and `admit_publish` should read near-zero too, corroborating
+each other. `admit_probe_entries`/`admit_resolve_fastpath`/
+`admit_resolve_fallback` are **any-caller totals**, not scoped to just the
+two promptadmit sweeps — they come from thread_local counters declared
+next to `ggml_sycl_probe_moe_planned_layout` and
+`ggml_sycl_resolve_moe_expert_route` themselves (declared far earlier in
+this TU than this struct, same "declared at the call site" split as
+`gemm_2d_args_map`), so they total every call across the whole profiled
+pipeline for that eval while profiling is on, matching the existing
+`g_moe_decode_route_census` precedent for the same function ("...entries
+(any caller)").
+
+**HOST5** — bisects `admit_resolve`'s `build_moe_resolved_batch` calls
+into `resolve_inner` (the per-unique-expert `resolver()` call itself) and
+`resolve_outer` (loop overhead plus full field-stamping for a genuinely
+new expert), further splitting `resolve_outer` into `resolve_memo_hit`
+(the repeat-token-occurrence branch specifically) once a capture found
+`resolve_outer` dominating `resolve_inner` 12:1 and `resolve_memo_hit`
+dominating in turn — see `moe-resolved-batch.hpp`'s own
+`ggml_sycl_resolve_batch_profile` namespace comment for the full
+attribution chain (69.0 ms/eval, 279,432 copies, before `ba987da15`'s
+canonical-payload fix).
+
 #### What `other` does and does not mean
 
 `other` is not a pure "everything this instrument doesn't track" bucket —
