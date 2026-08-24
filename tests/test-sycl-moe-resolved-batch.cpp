@@ -136,7 +136,20 @@ static bool test_host_primary_secondary_mixed_and_occurrences() {
         return route_for(&host, -1, ggml_sycl::moe_batch_residency::HOST, GGML_LAYOUT_SOA, GGML_LAYOUT_AOS, 3);
     });
     CHECK(result);
-    CHECK(calls == 4);  // repeated occurrences resolve independently and remain semantic entries
+    // llama.cpp-iikr (memo_hit fix, design note c-2cc8): was `calls == 4`,
+    // encoding a per-OCCURRENCE resolver-call contract this expectation
+    // never actually matched production -- 0c24bd91f (llama.cpp-e3xj, an
+    // earlier, unrelated commit) already deduped resolver calls to once per
+    // UNIQUE expert_id, which this test's own resolver lambda's ++calls
+    // should have caught at the time. ids={1,2,1,3} has 3 unique experts
+    // (1, 2, 3), so 3 calls is correct: the resolver's production signature
+    // (ggml_sycl_resolve_moe_expert_route_for_dispatch, ggml-sycl.cpp) takes
+    // (weight, device, expert_id, layout) with no occurrence/token_index/
+    // slot_index parameter at all -- it is structurally incapable of having
+    // a per-occurrence side effect a repeat could depend on, so calling it
+    // once per unique expert and sharing the result (this fix's whole
+    // point) is unconditionally correct, not merely permitted by this test.
+    CHECK(calls == 3);
     CHECK(result.batch.expert_ids == std::vector<int32_t>({ 1, 2, 1, 3 }));
     CHECK(result.batch.operands.size() == 4);
     CHECK(result.batch.operands[0].occurrence == 0 && result.batch.operands[2].occurrence == 2);
@@ -789,7 +802,12 @@ static bool test_decode_admission_is_route_mode_independent() {
                          13);
     });
     CHECK(all_local_plan);
-    CHECK(planned_calls == 2);
+    // llama.cpp-iikr (memo_hit fix, design note c-2cc8): was `planned_calls
+    // == 2` -- same superseded per-occurrence contract as the calls==3 fix
+    // above (0c24bd91f/llama.cpp-e3xj). ids={2,2} is 1 unique expert, so the
+    // resolver is called once, not twice; the batch itself still admits
+    // both occurrences (checked immediately below).
+    CHECK(planned_calls == 1);
     CHECK(all_local_plan.batch.operands.size() == 2);
     for (const auto & operand : all_local_plan.batch.operands) {
         auto choice = ggml_sycl::choose_moe_batch_executor(operand, 0, true, 0);
@@ -806,7 +824,8 @@ static bool test_decode_admission_is_route_mode_independent() {
         return route;
     });
     CHECK(no_plan);
-    CHECK(unplanned_calls == 2);
+    // Same fix as planned_calls above: 1 unique expert, 1 resolver call.
+    CHECK(unplanned_calls == 1);
     CHECK(no_plan.batch.expert_ids == std::vector<int32_t>({ 2, 2 }));
     return true;
 }
