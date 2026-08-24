@@ -5016,6 +5016,29 @@ static bool moe_decode_route_census_enabled() {
     return enabled;
 }
 
+// llama.cpp-iikr (promptadmit remainder cycle, converging with the
+// independent analyst read c-nq1u): the analyst's #1 finding asks for two
+// entry/branch counters deep inside the PP-batched layout-validation sweep
+// -- ggml_sycl_probe_moe_planned_layout()'s own entry count, and the
+// fast-path (registered-handle route) vs canonical-key-fallback branch
+// split inside ggml_sycl_resolve_moe_expert_route(). Both call sites are
+// far above where MXFP4_PP_BATCHED_PROFILE's own accumulator struct and
+// mxfp4_pp_batched_profile_enabled() are declared later in this TU, so
+// (same "declared where the call site is, consumed later" pattern gemm.hpp
+// already uses for its own accumulator) these live here as their own
+// small thread_local counters, gated by a forward-declared reference to
+// the same enabled() gate everything else in this instrument uses -- one
+// knob, not a second env-var read. mxfp4_pp_batched_profile_print_and_reset()
+// reads and resets them into the HOST4 line alongside the timing brackets
+// around these same two functions' CALL SITES in ggml_sycl_mul_mat_id.
+static bool mxfp4_pp_batched_profile_enabled();
+
+static thread_local uint64_t g_mxfp4_pp_admit_probe_entries = 0;  // ggml_sycl_probe_moe_planned_layout() entries
+static thread_local uint64_t g_mxfp4_pp_admit_resolve_fastpath =
+    0;  // ggml_sycl_resolve_moe_expert_route(): registered-handle fast-path hit
+static thread_local uint64_t g_mxfp4_pp_admit_resolve_fallback =
+    0;  // ...canonical-key cache->resolve_expert() fallback entered
+
 static double moe_decode_route_census_avg_us(uint64_t ns, uint64_t count) {
     return count == 0 ? 0.0 : (static_cast<double>(ns) / 1000.0) / static_cast<double>(count);
 }
@@ -6022,11 +6045,21 @@ static moe_expert_route ggml_sycl_resolve_moe_expert_route(const ggml_tensor * s
         if (ggml_sycl_try_moe_storage_handle_route(src0, extra, current_device, expert_id, layout, device_planned,
                                                    host_only, current_device_planned_alternate, route)) {
             ggml_sycl_log_moe_layout_route(src0, current_device, expert_id, route);
+            if (mxfp4_pp_batched_profile_enabled()) {
+                ++g_mxfp4_pp_admit_resolve_fastpath;
+            }
             return route;
         }
         if (route.reason != expert_resolve_reason::FOUND && route.reason != expert_resolve_reason::NOT_FOUND) {
             last_reason = route.reason;
         }
+    }
+    // llama.cpp-iikr (promptadmit remainder cycle): the fast-path loop above
+    // found no registered handle for any requested layout -- this call is
+    // about to fall through into the canonical-key cache->resolve_expert()
+    // path below (analyst-flagged as the possibly-lock-touching slow path).
+    if (mxfp4_pp_batched_profile_enabled()) {
+        ++g_mxfp4_pp_admit_resolve_fallback;
     }
 
     // Registered allocation-time handles do not depend on GGUF key recovery.
@@ -25828,6 +25861,9 @@ static moe_planned_layout_probe ggml_sycl_probe_moe_planned_layout(const ggml_te
                                                                    int                 device,
                                                                    layout_mode         layout) {
     moe_planned_layout_probe probe{};
+    if (mxfp4_pp_batched_profile_enabled()) {
+        ++g_mxfp4_pp_admit_probe_entries;
+    }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (ggml_sycl::test_get_moe_planned_layout_probe_override(src0, device, layout, &probe.local, &probe.secondary,
                                                               &probe.host, &probe.missing)) {
@@ -65075,30 +65111,56 @@ struct mxfp4_pp_batched_profile_accum {
     // battery on the resolver-call cache found promptadmit dropped only
     // 133.6 -> 110.1 ms/eval, not to the pre-registered ~45 -- the 9-calls-
     // where-3-suffice resolver calls were correctly identified but were
-    // only ~17% of the block's cost. The single host_promptadmit_us mark
-    // is replaced by four sequential sub-marks over the block's own
-    // top-level code order (same bisection method as the prologue split
-    // above): idswait (ids D2H cache fetch/refresh, including the first-
-    // consumer device wait), layout (retained_prompt_layout resolution +
-    // canonical-publish + its log call), lookup (layer/pair lookup + the
-    // admission-cache key build and hit/hash check), resolve (the cache-
-    // miss path: the three build_moe_resolved_batch calls, align, and
-    // cache populate). print_and_reset sums all four for the aggregate
-    // "promptadmit=" figure so it stays comparable to the 133.6/110.1
-    // baseline while also printing each sub-phase. admit_cache_hits/
-    // misses count how often the admission cache actually short-circuits
-    // the resolve sub-phase, to settle engagement rate independently of
-    // the sub-phase timings.
-    double                                   host_admit_idswait_us    = 0.0;
-    int64_t                                  host_admit_idswait_calls = 0;
-    double                                   host_admit_layout_us     = 0.0;
-    int64_t                                  host_admit_layout_calls  = 0;
-    double                                   host_admit_lookup_us     = 0.0;
-    int64_t                                  host_admit_lookup_calls  = 0;
-    double                                   host_admit_resolve_us    = 0.0;
-    int64_t                                  host_admit_resolve_calls = 0;
-    int64_t                                  admit_cache_hits         = 0;
-    int64_t                                  admit_cache_misses       = 0;
+    // only ~17% of the block's cost. Re-targeted (promptadmit remainder
+    // cycle) at the independent analyst's ranked read (task comment
+    // c-nq1u) instead of the block's own blind top-level structure:
+    // idswait (ids D2H cache fetch/refresh, including the first-consumer
+    // device wait, unchanged from the prior cycle), sweep_a (the
+    // select_moe_planned_graph_layout + adjust_layout_for_tensor call --
+    // analyst finding #1's FIRST 32-expert sweep, reached through
+    // planned_layout_complete/probe_moe_planned_layout), sweep_b (the
+    // moe_layout_for_selected_rows call -- #1's SECOND, independent
+    // 32-expert sweep), publish (publish_mmid_canonical_aos_experts + its
+    // log call -- analyst finding #2, AOS-gated), lookup (layer/pair
+    // lookup + the admission-cache key build and hit/hash check), resolve
+    // (the cache-miss path: the three build_moe_resolved_batch calls,
+    // align, and cache populate). print_and_reset sums all six for the
+    // aggregate "promptadmit=" figure so it stays comparable to the
+    // 133.6/110.1 baseline while HOST4 prints each sub-phase individually.
+    // host_admit_snapshot_us is a SEPARATE, ADDITIONAL bucket (analyst
+    // finding #3): the prompt_ids_snapshot copy and the two ids_hash call
+    // sites are not adjacent to each other in source (the copy precedes
+    // sweep_a; the hash calls are inside lookup/resolve), so they cannot
+    // share one running-clock mark boundary the way the six phases above
+    // do -- each is individually bracketed with its own before/after
+    // timestamp and summed here instead. Like gemm_2d_args_map below, this
+    // OVERLAPS the six-phase partition (their windows already contain
+    // these sites' time) and must NOT be added into phases_sum_us.
+    // admit_cache_hits/misses count how often the admission cache actually
+    // short-circuits the resolve sub-phase. admit_publish_aos_count/
+    // admit_publish_nonaos_count classify every dispatch reaching the
+    // publish call by retained_prompt_layout, to settle analyst finding
+    // #2's open question -- whether the AOS-gated expensive body inside
+    // publish_mmid_canonical_aos_experts even runs for GPT-OSS PP -- as an
+    // aggregate count rather than a per-dispatch log line.
+    double                                   host_admit_idswait_us      = 0.0;
+    int64_t                                  host_admit_idswait_calls   = 0;
+    double                                   host_admit_sweep_a_us      = 0.0;
+    int64_t                                  host_admit_sweep_a_calls   = 0;
+    double                                   host_admit_sweep_b_us      = 0.0;
+    int64_t                                  host_admit_sweep_b_calls   = 0;
+    double                                   host_admit_publish_us      = 0.0;
+    int64_t                                  host_admit_publish_calls   = 0;
+    double                                   host_admit_lookup_us       = 0.0;
+    int64_t                                  host_admit_lookup_calls    = 0;
+    double                                   host_admit_resolve_us      = 0.0;
+    int64_t                                  host_admit_resolve_calls   = 0;
+    double                                   host_admit_snapshot_us     = 0.0;
+    int64_t                                  host_admit_snapshot_calls  = 0;
+    int64_t                                  admit_cache_hits           = 0;
+    int64_t                                  admit_cache_misses         = 0;
+    int64_t                                  admit_publish_aos_count    = 0;
+    int64_t                                  admit_publish_nonaos_count = 0;
     double                                   host_routeeval_us       = 0.0;
     int64_t                                  host_routeeval_calls    = 0;
     double                                   host_fastpath_us        = 0.0;
@@ -65520,12 +65582,14 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
     const double  gemm_2d_args_map_us    = ggml_sycl_gemm_profile::args_map_ns_accum().exchange(0) / 1000.0;
     const int64_t gemm_2d_args_map_calls = ggml_sycl_gemm_profile::args_map_calls_accum().exchange(0);
     // promptadmit_us/calls are derived (not separately accumulated) -- the
-    // sum of the four sub-marks below is, by construction of the shared
+    // sum of the six sub-marks below is, by construction of the shared
     // running host_phase_clock, exactly what the single host_promptadmit_us
-    // mark used to measure. Same posture as unphased_us just below: a
-    // print-time-only quantity.
-    const double  promptadmit_us =
-        p.host_admit_idswait_us + p.host_admit_layout_us + p.host_admit_lookup_us + p.host_admit_resolve_us;
+    // mark used to measure before the analyst re-target. Same posture as
+    // unphased_us just below: a print-time-only quantity. host_admit_
+    // snapshot_us is DELIBERATELY excluded -- it overlaps these six
+    // windows rather than partitioning them (see its field comment).
+    const double  promptadmit_us         = p.host_admit_idswait_us + p.host_admit_sweep_a_us + p.host_admit_sweep_b_us +
+                                  p.host_admit_publish_us + p.host_admit_lookup_us + p.host_admit_resolve_us;
     const int64_t promptadmit_calls = p.host_admit_idswait_calls;
     const double  phases_sum_us     = p.host_entry_us + promptadmit_us + p.host_routeeval_us + p.host_fastpath_us +
                                  p.host_prologue_us + p.host_readback_us + p.host_ptrtable_us + p.host_routeresolve_us +
@@ -65543,13 +65607,35 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         p.device, p.host_entry_us / 1000.0, (long long) p.host_entry_calls, promptadmit_us / 1000.0,
         (long long) promptadmit_calls, p.host_routeeval_us / 1000.0, (long long) p.host_routeeval_calls,
         p.host_fastpath_us / 1000.0, (long long) p.host_fastpath_calls);
+    // llama.cpp-iikr (promptadmit remainder cycle): admit_probe_entries/
+    // admit_resolve_fastpath/admit_resolve_fallback come from the early,
+    // separately-declared thread_local counters near
+    // ggml_sycl_resolve_moe_expert_route's own definition (read-and-reset
+    // here, same "declared where the call site is" split as gemm_2d_args_map
+    // above) -- ANY-CALLER totals across the whole profiled MXFP4-PP pipeline
+    // while profiling is enabled, not scoped to just the two promptadmit
+    // sweeps, matching the existing g_moe_decode_route_census precedent for
+    // this same function ("...entries (any caller)").
+    const uint64_t admit_probe_entries    = g_mxfp4_pp_admit_probe_entries;
+    const uint64_t admit_resolve_fastpath = g_mxfp4_pp_admit_resolve_fastpath;
+    const uint64_t admit_resolve_fallback = g_mxfp4_pp_admit_resolve_fallback;
+    g_mxfp4_pp_admit_probe_entries        = 0;
+    g_mxfp4_pp_admit_resolve_fastpath     = 0;
+    g_mxfp4_pp_admit_resolve_fallback     = 0;
     GGML_LOG_WARN(
-        "[MXFP4-PP-BATCHED-PROFILE-HOST4] device=%d admit_idswait=%.3f ms/%lld admit_layout=%.3f ms/%lld "
-        "admit_lookup=%.3f ms/%lld admit_resolve=%.3f ms/%lld admit_cache_hits=%lld admit_cache_misses=%lld\n",
+        "[MXFP4-PP-BATCHED-PROFILE-HOST4] device=%d admit_idswait=%.3f ms/%lld admit_sweep_a=%.3f ms/%lld "
+        "admit_sweep_b=%.3f ms/%lld admit_publish=%.3f ms/%lld admit_lookup=%.3f ms/%lld admit_resolve=%.3f ms/%lld "
+        "admit_snapshot=%.3f ms/%lld admit_cache_hits=%lld admit_cache_misses=%lld admit_publish_aos=%lld "
+        "admit_publish_nonaos=%lld admit_probe_entries=%llu admit_resolve_fastpath=%llu admit_resolve_fallback=%llu\n",
         p.device, p.host_admit_idswait_us / 1000.0, (long long) p.host_admit_idswait_calls,
-        p.host_admit_layout_us / 1000.0, (long long) p.host_admit_layout_calls, p.host_admit_lookup_us / 1000.0,
-        (long long) p.host_admit_lookup_calls, p.host_admit_resolve_us / 1000.0, (long long) p.host_admit_resolve_calls,
-        (long long) p.admit_cache_hits, (long long) p.admit_cache_misses);
+        p.host_admit_sweep_a_us / 1000.0, (long long) p.host_admit_sweep_a_calls, p.host_admit_sweep_b_us / 1000.0,
+        (long long) p.host_admit_sweep_b_calls, p.host_admit_publish_us / 1000.0,
+        (long long) p.host_admit_publish_calls, p.host_admit_lookup_us / 1000.0, (long long) p.host_admit_lookup_calls,
+        p.host_admit_resolve_us / 1000.0, (long long) p.host_admit_resolve_calls, p.host_admit_snapshot_us / 1000.0,
+        (long long) p.host_admit_snapshot_calls, (long long) p.admit_cache_hits, (long long) p.admit_cache_misses,
+        (long long) p.admit_publish_aos_count, (long long) p.admit_publish_nonaos_count,
+        (unsigned long long) admit_probe_entries, (unsigned long long) admit_resolve_fastpath,
+        (unsigned long long) admit_resolve_fallback);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
@@ -66001,19 +66087,65 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #if GGML_SYCL_DNNL
         host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_idswait_us,
                         &mxfp4_pp_batched_profile_accum::host_admit_idswait_calls);
+        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #3 --
+        // this copy is bucketed together with the two ids_hash call sites
+        // below (host_admit_snapshot_us), even though they are not adjacent
+        // in source; see that field's own comment for why this needs its
+        // own before/after timestamp instead of a shared running-clock mark.
+        const auto admit_snapshot_copy_t0 = std::chrono::high_resolution_clock::now();
 #endif
         prompt_ids_snapshot            = prompt_ids_entry.host_ids;
+#if GGML_SYCL_DNNL
+        if (host_phase_profile) {
+            g_mxfp4_pp_batched_profile.host_admit_snapshot_us +=
+                std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() -
+                                                          admit_snapshot_copy_t0)
+                    .count();
+            ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
+        }
+#endif
         const bool prompt_host_weights = ggml_sycl_is_host_resident_weight(src0, ctx.stream());
+        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
+        // FIRST 32-expert sweep -- select_moe_planned_graph_layout reaches
+        // planned_layout_complete -> probe_moe_planned_layout, which loops
+        // every expert. adjust_layout_for_tensor is a cheap layout-mode
+        // transform, folded into this same bracket rather than given its
+        // own (it is not a sweep).
         retained_prompt_layout =
             has_override ? override_layout :
                            ggml_sycl_select_moe_planned_graph_layout(src0, ctx.device, prompt_host_weights, ne12);
         retained_prompt_layout       = ggml_sycl_adjust_layout_for_tensor(src0, retained_prompt_layout, ctx.device);
+#if GGML_SYCL_DNNL
+        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_a_us,
+                        &mxfp4_pp_batched_profile_accum::host_admit_sweep_a_calls);
+#endif
+        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #1's
+        // SECOND, INDEPENDENT 32-expert sweep -- moe_layout_for_selected_rows
+        // runs its own probe_moe_planned_layout loop, distinct from sweep_a's.
         retained_prompt_layout       = ggml_sycl_moe_layout_for_selected_rows(src0, ctx.device, retained_prompt_layout,
                                                                               prompt_ids_snapshot.size(), has_override, ne12);
+#if GGML_SYCL_DNNL
+        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_sweep_b_us,
+                        &mxfp4_pp_batched_profile_accum::host_admit_sweep_b_calls);
+        if (host_phase_profile) {
+            if (retained_prompt_layout == GGML_LAYOUT_AOS) {
+                ++g_mxfp4_pp_batched_profile.admit_publish_aos_count;
+            } else {
+                ++g_mxfp4_pp_batched_profile.admit_publish_nonaos_count;
+            }
+        }
+#endif
         // Same publication the decode admission performs below: a backend
         // allocation that never went through model preload has no expert
         // storage records yet, so the retained resolver would refuse with
         // route_unavailable before it ever reaches a cache key.
+        // llama.cpp-iikr (promptadmit remainder cycle): analyst finding #2 --
+        // publish_mmid_canonical_aos_experts early-returns unless
+        // retained_prompt_layout == GGML_LAYOUT_AOS (see the counters just
+        // above, incremented on retained_prompt_layout's FINAL value right
+        // before this call). If GPT-OSS PP is never AOS, admit_publish_aos
+        // stays at 0 and this whole bracket should read near-zero too --
+        // the two figures corroborate each other.
         int        prompt_published_kind      = -1;
         bool       prompt_published_stable    = false;
         const bool prompt_canonical_published = ggml_sycl_publish_mmid_canonical_aos_experts(
@@ -66022,8 +66154,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                                           "MOE-PROMPT-CANONICAL", src0, prompt_canonical_published,
                                                           prompt_published_kind, prompt_published_stable);
 #if GGML_SYCL_DNNL
-        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_layout_us,
-                        &mxfp4_pp_batched_profile_accum::host_admit_layout_calls);
+        host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_publish_us,
+                        &mxfp4_pp_batched_profile_accum::host_admit_publish_calls);
 #endif
         // retained_prompt_batch_result's build (and the retained_prompt_groups
         // population that depends on it) is deferred past the fused gate/up/
@@ -66066,7 +66198,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // populated for a different prompt than the one this
                         // call is dispatching; treat it exactly like a miss
                         // rather than trusting stale data.
+#if GGML_SYCL_DNNL
+                        const auto admit_snapshot_hashcmp_t0 = std::chrono::high_resolution_clock::now();
+#endif
                         const uint64_t current_hash = ggml_sycl_hash_ids(prompt_ids_snapshot);
+#if GGML_SYCL_DNNL
+                        if (host_phase_profile) {
+                            g_mxfp4_pp_batched_profile.host_admit_snapshot_us +=
+                                std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() -
+                                                                          admit_snapshot_hashcmp_t0)
+                                    .count();
+                            ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
+                        }
+#endif
                         if (current_hash == admit_it->second.ids_hash) {
                             retained_prompt_roles_result = admit_it->second.retained_prompt_roles_result;
                             admit_cache_hit              = true;
@@ -66115,8 +66259,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         if (admit_key_ok) {
                             moe_prompt_admission_cache_entry & new_entry = g_moe_prompt_admission_cache[admit_key];
                             new_entry.valid                              = true;
-                            new_entry.ids_hash                           = ggml_sycl_hash_ids(prompt_ids_snapshot);
-                            new_entry.retained_prompt_roles_result       = retained_prompt_roles_result;
+#if GGML_SYCL_DNNL
+                            const auto admit_snapshot_hashpop_t0 = std::chrono::high_resolution_clock::now();
+#endif
+                            new_entry.ids_hash = ggml_sycl_hash_ids(prompt_ids_snapshot);
+#if GGML_SYCL_DNNL
+                            if (host_phase_profile) {
+                                g_mxfp4_pp_batched_profile.host_admit_snapshot_us +=
+                                    std::chrono::duration<double, std::micro>(
+                                        std::chrono::high_resolution_clock::now() - admit_snapshot_hashpop_t0)
+                                        .count();
+                                ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
+                            }
+#endif
+                            new_entry.retained_prompt_roles_result = retained_prompt_roles_result;
                         }
                     }
                 }
