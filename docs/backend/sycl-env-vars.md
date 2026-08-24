@@ -600,7 +600,7 @@ kept their meaning.
 
 ⚠️ **Known doc gap, flagged rather than backfilled from memory: this
 subsection covers the `[MXFP4-PP-BATCHED-PROFILE-HOST]` through `-HOST5`
-lines added across ~8 commits of the same investigation
+lines added across ~9 commits of the same investigation
 (`llama.cpp-iikr`, the "unphased-host-time" → "promptadmit remainder" →
 "B50 residual-pool" cycles) that produced the device-event lines above.
 Everything below is accurate to the source as of this writing, but this
@@ -623,7 +623,7 @@ the `GGML_SYCL_MXFP4_PP_PROFILE` gate and print once per eval, same as
 [MXFP4-PP-BATCHED-PROFILE-HOST2] device=<N> whole=<ms>/<calls> prologue=<ms>/<calls> unphased=<ms> gemm_2d_args_map=<ms>/<calls>
 [MXFP4-PP-BATCHED-PROFILE-HOST3] device=<N> entry=<ms>/<calls> promptadmit=<ms>/<calls> routeeval=<ms>/<calls> fastpath=<ms>/<calls>
 [MXFP4-PP-BATCHED-PROFILE-HOST4] device=<N> admit_idswait=<ms>/<calls> admit_sweep_a=<ms>/<calls> admit_sweep_b=<ms>/<calls> admit_publish=<ms>/<calls> admit_lookup=<ms>/<calls> admit_resolve=<ms>/<calls> admit_snapshot=<ms>/<calls> admit_cache_hits=<N> admit_cache_misses=<N> admit_publish_aos=<N> admit_publish_nonaos=<N> admit_probe_entries=<N> admit_resolve_fastpath=<N> admit_resolve_fallback=<N>
-[MXFP4-PP-BATCHED-PROFILE-HOST5] device=<N> resolve_inner=<ms>/<calls> resolve_outer=<ms>/<calls> resolve_memo_hit=<ms>/<calls>
+[MXFP4-PP-BATCHED-PROFILE-HOST5] device=<N> resolve_inner=<ms>/<calls> resolve_outer=<ms>/<calls> resolve_memo_hit=<ms>/<calls> fastpath_rebuild=<ms>/<calls> fastpath_rebuild_reused=<N> fastpath_rebuild_built=<N>
 ```
 
 (each wrapped here for readability; every real line is one line.)
@@ -720,6 +720,22 @@ dominating in turn — see `moe-resolved-batch.hpp`'s own
 `ggml_sycl_resolve_batch_profile` namespace comment for the full
 attribution chain (69.0 ms/eval, 279,432 copies, before `ba987da15`'s
 canonical-payload fix).
+`fastpath_rebuild`/`fastpath_rebuild_reused`/`fastpath_rebuild_built`
+(`9573da32f`, design finding 2) are a SEPARATE, additional bracket around
+a different call site: `fastpath`'s own `ggml_sycl_build_moe_resolved_batch(
+src0, ...)` inside the `ne12 != 1` block, not `admit_resolve`'s three
+gate/up/down calls above. Like `admit_snapshot` in HOST4, this OVERLAPS
+`fastpath`'s window in HOST3 rather than partitioning it, and must not be
+summed into that total. `fastpath_rebuild_reused`/`_built` classify every
+call: `reused` took the cheap `moe_resolved_batch` copy of an
+already-admitted role (src0 matched one of the triad's 3 roles and its
+layout agreed), `built` fell through to the independent resolve (no triad
+match, an unpopulated/rejected bundle, or a layout disagreement). A
+`reused`-heavy split with `fastpath_rebuild_us` well below its pre-fix
+figure confirms the reuse path is actually engaging on hardware, not just
+compiling; `built`-heavy despite triad tensors in the graph would mean the
+layout-equality guard is declining more than expected and is worth a
+follow-up capture.
 
 #### What `other` does and does not mean
 
