@@ -555,6 +555,43 @@ inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch &
     return out;
 }
 
+// llama.cpp-iikr (B50 residual-pool cycle, HOST6 priority 2): boolean-only
+// sibling of make_moe_batch_local_view() for a caller that only needs "is
+// this batch admissible" and never consumes a resolved pointer table --
+// skips the per-unique-expert lease().resolve() call (and the 4 output
+// vectors) entirely, reading only the operand's already-verified
+// accessors. Safe ONLY when the caller runs this immediately after the
+// SAME batch's own build, with no queue submission or yield point in
+// between: build_moe_resolved_batch's resolver (detail::
+// validate_moe_batch_route) already ran a real lease().resolve() per
+// unique expert and confirmed residency/owning_device/actual_layout
+// consistency with it, and the unified cache's eviction guard for the
+// whole graph-compute pass means nothing can invalidate a lease in that
+// gap -- so re-reading the same cached fields here answers the identical
+// question a second resolve would, without paying for one. NOT a
+// substitute for make_moe_batch_local_view() at a call site temporally
+// distant from the build (e.g. actual dispatch-time pointer-table
+// construction), which still needs a live resolve.
+inline bool moe_batch_role_admissible(const moe_resolved_batch & batch, ggml_layout_mode layout) {
+    std::unordered_map<int32_t, size_t> expert_slots;
+    expert_slots.reserve(batch.operands.size());
+    for (size_t i = 0; i < batch.operands.size(); ++i) {
+        const moe_resolved_operand & operand = batch.operands[i];
+        const auto [existing, inserted]      = expert_slots.emplace(operand.expert_id, i);
+        if (!inserted) {
+            if (!batch.operands[existing->second].lease().stable_identity_equal(operand.lease())) {
+                return false;
+            }
+            continue;
+        }
+        if (operand.residency() != moe_batch_residency::PRIMARY_DEVICE ||
+            operand.owning_device() != batch.submit_device || operand.actual_layout() != layout) {
+            return false;
+        }
+    }
+    return true;
+}
+
 enum class moe_batch_role : uint8_t {
     GATE,
     UP,

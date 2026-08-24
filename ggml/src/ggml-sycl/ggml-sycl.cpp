@@ -65950,9 +65950,17 @@ static bool ggml_sycl_moe_validate_retained_role_bundle(const ggml_sycl::moe_ret
     const auto & gate = roles.gate.batch;
     const auto & up   = roles.up.batch;
     const auto & down = roles.down.batch;
-    if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout()) ||
-        !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout()) ||
-        !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout())) {
+    // llama.cpp-iikr (B50 residual-pool cycle, HOST6 priority 2): this call
+    // runs immediately after the SAME roles were built (align_moe_retained_
+    // role_batches, right above the cache-populate site that calls this
+    // function), so moe_batch_role_admissible's build-time-cached-fields
+    // check is safe here -- see that function's own comment. It answers the
+    // same admissibility question make_moe_batch_local_view would, without
+    // re-resolving every unique expert's lease a second time only to throw
+    // away the resolved pointer table this function never reads.
+    if (!ggml_sycl::moe_batch_role_admissible(gate, gate.operands.front().actual_layout()) ||
+        !ggml_sycl::moe_batch_role_admissible(up, up.operands.front().actual_layout()) ||
+        !ggml_sycl::moe_batch_role_admissible(down, down.operands.front().actual_layout())) {
         return false;
     }
     const auto supports_role = [&](const ggml_sycl::moe_retained_role_batch & role) {
