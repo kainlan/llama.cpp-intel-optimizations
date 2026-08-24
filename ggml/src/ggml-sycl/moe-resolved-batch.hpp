@@ -581,6 +581,16 @@ struct moe_retained_role_batch {
     moe_batch_role      role            = moe_batch_role::GATE;
     const ggml_tensor * weight_identity = nullptr;
     moe_resolved_batch  batch;
+    // llama.cpp-iikr (B50 residual-pool cycle, mechanism 1 fix): the LAYOUT
+    // role_layout() actually REQUESTED when building `batch` -- deliberately
+    // separate from any individual operand's `actual_layout()`. The two can
+    // legitimately diverge: ggml_sycl_resolve_moe_expert_route_for_dispatch
+    // has a genuine secondary-layout-fallback path, so one expert's resolved
+    // layout is not a reliable proxy for what was asked of the tensor as a
+    // whole. A consumer that needs "the layout this role was built at" (as
+    // opposed to "what a specific operand actually resolved to") must read
+    // this field, never `batch.operands.front().actual_layout()` or similar.
+    ggml_layout_mode    requested_layout = GGML_LAYOUT_AOS;
 };
 
 struct moe_retained_role_bundle {

@@ -66330,17 +66330,28 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         // sibling weights and whichever of gate/up/down dispatched first
         // this eval already populated a non-rejected admission-cache entry
         // for (ids, device), that entry's matching role already carries
-        // src0's own actual_layout() -- computed by role_layout() inside
-        // this same cache-populate call, same recipe (select_moe_planned_
-        // graph_layout -> adjust_layout_for_tensor -> moe_layout_for_
-        // selected_rows) sweep_a/sweep_b run below. Reading it is a
-        // read-only probe of the SAME map/key the promptadmit block below
-        // independently looks up again -- that second lookup is untouched
-        // and still runs exactly as before; this only lets a repeat
-        // dispatch of an already-cached layer skip the two sweeps
-        // entirely. The cached value cannot go stale mid-eval: nothing in
-        // graph_compute's own op dispatch writes a MoE weight tensor (the
-        // generation-counter bump lives exclusively in
+        // src0's own REQUESTED layout in `requested_layout` -- computed by
+        // role_layout() inside this same cache-populate call, the identical
+        // recipe (select_moe_planned_graph_layout -> adjust_layout_for_
+        // tensor -> moe_layout_for_selected_rows) sweep_a/sweep_b run below.
+        // ⚠ Read `requested_layout`, NEVER an operand's `actual_layout()` --
+        // a prior version of this probe did exactly that and it was wrong:
+        // ggml_sycl_resolve_moe_expert_route_for_dispatch has a genuine
+        // secondary-layout-fallback path, so one expert's ACTUAL resolved
+        // layout is not a reliable proxy for the tensor-level REQUESTED
+        // layout publish_mmid_canonical_aos_experts's AOS gate (right below)
+        // and Finding 2's fastpath both key off. That mistake made publish's
+        // expensive body fire on dispatches where it should have early-
+        // returned, ballooning admit_publish 0.72->25.15 ms/eval with no
+        // corresponding sweep-cost win to show for it -- see requested_
+        // layout's own field comment in moe-resolved-batch.hpp. Reading
+        // requested_layout is a read-only probe of the SAME map/key the
+        // promptadmit block below independently looks up again -- that
+        // second lookup is untouched and still runs exactly as before; this
+        // only lets a repeat dispatch of an already-cached layer skip the
+        // two sweeps entirely. The cached value cannot go stale mid-eval:
+        // nothing in graph_compute's own op dispatch writes a MoE weight
+        // tensor (the generation-counter bump lives exclusively in
         // ggml_backend_sycl_buffer_{set,cpy,memset}_tensor/buffer_clear --
         // ggml tensor-I/O entry points invoked from OUTSIDE graph
         // execution, e.g. model load or an explicit backend write, never
@@ -66373,8 +66384,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             } else if (src0 == early_roles.down.weight_identity) {
                                 early_role = &early_roles.down;
                             }
-                            if (early_role && !early_role->batch.operands.empty()) {
-                                reused_sweep_layout       = early_role->batch.operands.front().actual_layout();
+                            // llama.cpp-iikr (mechanism 1 fix, publish=25.15ms
+                            // anomaly): read the REQUESTED layout role_layout()
+                            // computed for this role, never an operand's
+                            // actual_layout() -- see requested_layout's own
+                            // field comment for why the two are not
+                            // interchangeable. A non-rejected bundle already
+                            // guarantees every role's operands are non-empty
+                            // (align_moe_retained_role_batches rejects on an
+                            // empty authority batch), so no emptiness check is
+                            // needed here.
+                            if (early_role) {
+                                reused_sweep_layout       = early_role->requested_layout;
                                 reused_sweep_layout_found = true;
                             }
                         }
@@ -66571,9 +66592,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // (the real resolver work) and this one move happen,
                         // never a second full deep copy on top of it.
                         ggml_sycl::moe_retained_role_bundle_result built = ggml_sycl::align_moe_retained_role_batches(
-                            { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
-                            { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
-                            { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
+                            { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch),
+                              gate_layout },
+                            { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch), up_layout },
+                            { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch),
+                              down_layout });
 #if GGML_SYCL_DNNL
                         host_phase_mark(&mxfp4_pp_batched_profile_accum::host_admit_resolve_align_us,
                                         &mxfp4_pp_batched_profile_accum::host_admit_resolve_align_calls);
