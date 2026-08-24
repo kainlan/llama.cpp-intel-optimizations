@@ -66058,10 +66058,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // Prompt IDs and routes are admitted exactly once, before any specialized
     // executor selection. Graph replay cannot retain these handles yet, so an
     // affected recording is failed and retried as direct execution.
-    std::vector<int32_t>                       prompt_ids_snapshot;
-    ggml_sycl::moe_resolved_batch_result       retained_prompt_batch_result;
-    ggml_sycl::moe_retained_role_bundle_result retained_prompt_roles_result;
-    layout_mode                                retained_prompt_layout = GGML_LAYOUT_AOS;
+    std::vector<int32_t>                               prompt_ids_snapshot;
+    ggml_sycl::moe_resolved_batch_result               retained_prompt_batch_result;
+    // llama.cpp-iikr (promptadmit remainder cycle, team-lead's reading 3(b)):
+    // was a plain value, assigned by COPY on every cache hit -- each copy
+    // deep-copies every moe_resolved_operand in every role's batch
+    // (n_tokens * n_expert_used operands, x3 roles), and each operand holds
+    // a mem_handle whose COPY constructor bumps its target entry's refcount
+    // under a lock (mem-handle.hpp:278-284's own comment: "a copy bumps the
+    // target entry's count... a move transfers ownership, net refcount
+    // unchanged"). Now a pointer: on a hit it aliases the CACHE ENTRY's own
+    // storage directly (no copy at all); on a miss it is move-assigned
+    // ONCE, either into the cache entry (admission cache path) or into
+    // retained_prompt_roles_result_uncached_storage (cache disabled/
+    // unavailable this dispatch) -- see the admission block below. This
+    // remains contract-compliant: g_moe_prompt_admission_cache's entries
+    // are stable for the whole graph-compute pass (std::unordered_map
+    // guarantees reference/pointer stability for existing elements across
+    // further insertions -- only iterators are invalidated by rehash), and
+    // every read of this pointer happens synchronously within this same
+    // call, never past it.
+    const ggml_sycl::moe_retained_role_bundle_result * retained_prompt_roles_result = nullptr;
+    ggml_sycl::moe_retained_role_bundle_result         retained_prompt_roles_result_uncached_storage;
+    layout_mode                                        retained_prompt_layout = GGML_LAYOUT_AOS;
 #if GGML_SYCL_DNNL
     host_phase_mark(&mxfp4_pp_batched_profile_accum::host_entry_us, &mxfp4_pp_batched_profile_accum::host_entry_calls);
 #endif
@@ -66212,7 +66231,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         }
 #endif
                         if (current_hash == admit_it->second.ids_hash) {
-                            retained_prompt_roles_result = admit_it->second.retained_prompt_roles_result;
+                            // No copy: alias the cache entry's own storage.
+                            // See retained_prompt_roles_result's declaration
+                            // comment for why this is safe.
+                            retained_prompt_roles_result = &admit_it->second.retained_prompt_roles_result;
                             admit_cache_hit              = true;
                             ++g_mxfp4_pp_batched_profile.admit_cache_hits;
                         } else {
@@ -66252,7 +66274,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
                         static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false);
                     if (gate_result && up_result && down_result) {
-                        retained_prompt_roles_result = ggml_sycl::align_moe_retained_role_batches(
+                        // llama.cpp-iikr (promptadmit remainder cycle): built
+                        // once here, then MOVED (never copied) into its final
+                        // resting place below -- either the cache entry (the
+                        // common case) or the uncached fallback storage. A
+                        // move transfers every mem_handle's ownership without
+                        // bumping its refcount; only the initial build above
+                        // (the real resolver work) and this one move happen,
+                        // never a second full deep copy on top of it.
+                        ggml_sycl::moe_retained_role_bundle_result built = ggml_sycl::align_moe_retained_role_batches(
                             { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
                             { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
                             { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
@@ -66272,7 +66302,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 ++g_mxfp4_pp_batched_profile.host_admit_snapshot_calls;
                             }
 #endif
-                            new_entry.retained_prompt_roles_result = retained_prompt_roles_result;
+                            new_entry.retained_prompt_roles_result = std::move(built);
+                            retained_prompt_roles_result           = &new_entry.retained_prompt_roles_result;
+                        } else {
+                            // Cache disabled (GGML_SYCL_MOE_ADMIT_CACHE=0) or
+                            // key-build failed for this one dispatch -- no
+                            // cache entry to alias, so keep `built` alive in
+                            // function-scope storage for the rest of this
+                            // call (see that variable's own declaration
+                            // comment).
+                            retained_prompt_roles_result_uncached_storage = std::move(built);
+                            retained_prompt_roles_result = &retained_prompt_roles_result_uncached_storage;
                         }
                     }
                 }
@@ -66360,10 +66400,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // role on the submit queue. Mixed/secondary/host bundles remain authoritative
     // for the unfused retained executor rather than leaking into this fast path.
     const bool prompt_pair_retained_roles_validated = [&]() {
-        if (!retained_prompt_roles_result || ne12 <= 1) {
+        // llama.cpp-iikr (promptadmit remainder cycle): now a pointer, so
+        // "not admitted" is two separate conditions that used to collapse
+        // into one operator bool() on the old value type -- never built
+        // (nullptr) OR built but rejected (!*ptr, e.g. ROLE_ALIGNMENT_
+        // MISMATCH from align_moe_retained_role_batches). Both must gate
+        // here; a non-null pointer to a REJECTED result must still read as
+        // not-admitted, exactly as the old value type's operator bool did.
+        if (!retained_prompt_roles_result || !*retained_prompt_roles_result || ne12 <= 1) {
             return false;
         }
-        const auto & roles = retained_prompt_roles_result.bundle;
+        const auto & roles = retained_prompt_roles_result->bundle;
         const auto & gate  = roles.gate.batch;
         const auto & up    = roles.up.batch;
         const auto & down  = roles.down.batch;
@@ -66394,10 +66441,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const bool prompt_pair_retained_roles_capable =
         prompt_pair_retained_roles_validated && src0->type == GGML_TYPE_MXFP4;
     const bool prompt_pair_current_node = [&]() {
-        if (!retained_prompt_roles_result) {
+        // Same two-condition gate as prompt_pair_retained_roles_validated
+        // above -- see its comment.
+        if (!retained_prompt_roles_result || !*retained_prompt_roles_result) {
             return false;
         }
-        const auto & roles = retained_prompt_roles_result.bundle;
+        const auto & roles = retained_prompt_roles_result->bundle;
         return src0 == roles.gate.weight_identity || src0 == roles.up.weight_identity;
     }();
     const bool cpu_tg_candidate = prompt_pair_retained_roles_capable && prompt_pair_current_node;
@@ -66419,7 +66468,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 (ne12 != 1 && !xmx_moe_forced && !pp_onednn_batched_route) ? 1 : 0);
     }
     if (cpu_tg_candidate && ne12 != 1 && !xmx_moe_forced && !pp_onednn_batched_route) {
-        const auto & roles   = retained_prompt_roles_result.bundle;
+        // cpu_tg_candidate being true already proves the pointer is both
+        // non-null and non-rejected (transitively, via
+        // prompt_pair_retained_roles_validated/prompt_pair_current_node
+        // above), so a bare dereference is safe here without repeating
+        // their guard.
+        const auto & roles   = retained_prompt_roles_result->bundle;
         const int    layer   = src0->name ? parse_layer_id_from_name(src0->name) : -1;
         auto         pair_it = g_moe_gate_up_pairs.find(layer);
         if (pair_it != g_moe_gate_up_pairs.end()) {
