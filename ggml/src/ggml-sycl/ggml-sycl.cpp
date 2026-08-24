@@ -65631,6 +65631,18 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         ggml_sycl::ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().exchange(0) / 1000.0;
     const int64_t resolve_outer_calls =
         ggml_sycl::ggml_sycl_resolve_batch_profile::outer_stamp_calls_accum().exchange(0);
+    // llama.cpp-iikr (outer-stamping remainder cycle): HOST5 found outer
+    // dominating inner 12:1 -- this splits outer further into the memo-HIT
+    // repeat-occurrence branch (copies the whole moe_resolved_operand,
+    // leading hypothesis for the dominant cost) vs everything else (loop
+    // overhead + full stamping for a genuinely new expert, resolve_outer_us
+    // itself, narrowed now that memo-hit iterations mark themselves
+    // separately). See ggml_sycl_resolve_batch_profile::memo_hit_ns_accum's
+    // own comment in moe-resolved-batch.hpp.
+    const double resolve_memo_hit_us =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::memo_hit_ns_accum().exchange(0) / 1000.0;
+    const int64_t resolve_memo_hit_calls =
+        ggml_sycl::ggml_sycl_resolve_batch_profile::memo_hit_calls_accum().exchange(0);
     // promptadmit_us/calls are derived (not separately accumulated) -- the
     // sum of the six sub-marks below is, by construction of the shared
     // running host_phase_clock, exactly what the single host_promptadmit_us
@@ -65686,9 +65698,11 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         (long long) p.admit_publish_aos_count, (long long) p.admit_publish_nonaos_count,
         (unsigned long long) admit_probe_entries, (unsigned long long) admit_resolve_fastpath,
         (unsigned long long) admit_resolve_fallback);
-    GGML_LOG_WARN("[MXFP4-PP-BATCHED-PROFILE-HOST5] device=%d resolve_inner=%.3f ms/%lld resolve_outer=%.3f ms/%lld\n",
-                  p.device, resolve_inner_us / 1000.0, (long long) resolve_inner_calls, resolve_outer_us / 1000.0,
-                  (long long) resolve_outer_calls);
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST5] device=%d resolve_inner=%.3f ms/%lld resolve_outer=%.3f ms/%lld "
+        "resolve_memo_hit=%.3f ms/%lld\n",
+        p.device, resolve_inner_us / 1000.0, (long long) resolve_inner_calls, resolve_outer_us / 1000.0,
+        (long long) resolve_outer_calls, resolve_memo_hit_us / 1000.0, (long long) resolve_memo_hit_calls);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs

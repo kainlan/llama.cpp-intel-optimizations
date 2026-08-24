@@ -791,6 +791,29 @@ inline std::atomic<int64_t> & outer_stamp_calls_accum() {
     static std::atomic<int64_t> v{ 0 };
     return v;
 }
+
+// llama.cpp-iikr (outer-stamping remainder cycle): outer_stamp_ns turned out
+// to dominate inner 12:1 (HOST5, c35ddbb71). It conflates two structurally
+// different things: loop overhead + full field stamping for a genuinely NEW
+// expert (~32/role, matches inner's own volume) vs. the memo-HIT branch for
+// every REPEAT token occurrence (~2000+/role for a typical prompt), which
+// copies the WHOLE moe_resolved_operand -- including its mem_handle lease
+// (a copy bumps the target entry's refcount under a lock, mem-handle.hpp:
+// 278-284) and its sycl::event -- just to overwrite 3 scalar fields
+// afterward. Split out here so the two are no longer lumped together: the
+// memo-hit branch now marks itself separately (right before its own
+// `continue`), so outer_stamp_ns naturally narrows to loop-overhead +
+// genuinely-new-expert stamping only, and memo_hit_ns isolates the repeat-
+// occurrence copy specifically -- the design note's leading hypothesis.
+inline std::atomic<int64_t> & memo_hit_ns_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<int64_t> & memo_hit_calls_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
 }  // namespace ggml_sycl_resolve_batch_profile
 
 // Every occurrence is resolved and produces one operand with its original
@@ -845,6 +868,14 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             operand.token_index          = i / slots_per_token;
             operand.slot_index           = i % slots_per_token;
             out.batch.operands.push_back(std::move(operand));
+            {
+                const auto now = std::chrono::high_resolution_clock::now();
+                ggml_sycl_resolve_batch_profile::memo_hit_ns_accum().fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
+                    std::memory_order_relaxed);
+                ggml_sycl_resolve_batch_profile::memo_hit_calls_accum().fetch_add(1, std::memory_order_relaxed);
+                resolve_batch_loop_clock = now;
+            }
             continue;
         }
 
