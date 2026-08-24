@@ -16420,6 +16420,18 @@ struct moe_prompt_admission_cache_entry {
     bool                                       valid    = false;
     uint64_t                                   ids_hash = 0;
     ggml_sycl::moe_retained_role_bundle_result retained_prompt_roles_result;
+    // llama.cpp-iikr (B50 residual-pool cycle, design finding 1): whether
+    // retained_prompt_roles_result passes the routeeval fused-fast-path
+    // admissibility check (ggml_sycl_moe_validate_retained_role_bundle,
+    // defined just above ggml_sycl_mul_mat_id). Computed once, at the same
+    // populate site that builds retained_prompt_roles_result itself, and
+    // shared across the layer's 3 sibling dispatches the same way that
+    // result already is -- same cache entry, same 4 invalidation sites,
+    // zero new invalidation surface. Meaningful only when
+    // retained_prompt_roles_result is itself non-rejected; left false
+    // otherwise (never computed, matching the original lambda's short-
+    // circuit on a rejected bundle).
+    bool                                       roles_validated = false;
 };
 
 static thread_local std::unordered_map<ggml_backend_sycl_context::moe_ids_cache_key,
@@ -65845,6 +65857,49 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * we
 #endif
 }
 
+// llama.cpp-iikr (B50 residual-pool cycle, design finding 1, team-lead GO):
+// extracted from routeeval's own prompt_pair_retained_roles_validated lambda
+// (ggml_sycl_mul_mat_id, further below) -- this is the exact same body,
+// unmodified. That lambda's only inputs were the admission-cache-shared
+// bundle (`roles`, i.e. retained_prompt_roles_result->bundle) and ctx.device
+// -- never anything role-specific (no src0, no per-dispatch state) -- so its
+// result is layer-constant, yet it used to be recomputed on every one of a
+// layer's 3 sibling dispatches (3x make_moe_batch_local_view, each scanning
+// up to ~2048 operands, plus 3x supports_role/capability-query calls). Moved
+// here so promptadmit can compute it ONCE at cache-populate time and store
+// it on the SAME admission-cache entry that already shares
+// retained_prompt_roles_result across the 3 siblings -- invalidation rides
+// the entry's existing 4 sites for free, no new invalidation surface.
+// Precondition (unchanged from the original lambda, not re-checked here):
+// caller must confirm the bundle is non-rejected (`*bundle_result` truthy)
+// before calling -- align_moe_retained_role_batches() guarantees a non-
+// rejected result has non-empty, authority-aligned operands for every role,
+// which is what makes the unchecked .front() calls below safe.
+static bool ggml_sycl_moe_validate_retained_role_bundle(const ggml_sycl::moe_retained_role_bundle & roles, int device) {
+    const auto & gate = roles.gate.batch;
+    const auto & up   = roles.up.batch;
+    const auto & down = roles.down.batch;
+    if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout()) ||
+        !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout()) ||
+        !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout())) {
+        return false;
+    }
+    const auto supports_role = [&](const ggml_sycl::moe_retained_role_batch & role) {
+        const ggml_tensor * weight = role.weight_identity;
+        const auto &        batch  = role.batch;
+        if (!weight || batch.operands.empty()) {
+            return false;
+        }
+        const auto &               operand = batch.operands.front();
+        const moe_route_capability cap     = ggml_sycl_moe_query_route_capability(
+            weight->type, operand.actual_layout(), moe_route_phase::PROMPT, weight->ne[0], weight->ne[1],
+            batch.operands.size(), operand.owning_device(), moe_layer_route_residency::DEVICE, device);
+        return cap.supported && cap.local_device;
+    };
+    return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
+           gate.operands.front().actual_layout() == up.operands.front().actual_layout();
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
@@ -66148,7 +66203,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // call, never past it.
     const ggml_sycl::moe_retained_role_bundle_result * retained_prompt_roles_result = nullptr;
     ggml_sycl::moe_retained_role_bundle_result         retained_prompt_roles_result_uncached_storage;
-    layout_mode                                        retained_prompt_layout = GGML_LAYOUT_AOS;
+    // llama.cpp-iikr (B50 residual-pool cycle, design finding 1): set
+    // alongside retained_prompt_roles_result in every one of promptadmit's
+    // three branches (cache hit / cache populate / uncached fallback) --
+    // see ggml_sycl_moe_validate_retained_role_bundle's own comment for why
+    // this is safe to compute once and share instead of recomputing per
+    // sibling dispatch. Routeeval reads this instead of recomputing.
+    bool                                               retained_prompt_roles_bundle_validated = false;
+    layout_mode                                        retained_prompt_layout                 = GGML_LAYOUT_AOS;
 #if GGML_SYCL_DNNL
     host_phase_mark(&mxfp4_pp_batched_profile_accum::host_entry_us, &mxfp4_pp_batched_profile_accum::host_entry_calls);
 #endif
@@ -66303,6 +66365,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                             // See retained_prompt_roles_result's declaration
                             // comment for why this is safe.
                             retained_prompt_roles_result = &admit_it->second.retained_prompt_roles_result;
+                            retained_prompt_roles_bundle_validated = admit_it->second.roles_validated;
                             admit_cache_hit              = true;
                             ++g_mxfp4_pp_batched_profile.admit_cache_hits;
                         } else {
@@ -66372,15 +66435,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
                             new_entry.retained_prompt_roles_result = std::move(built);
                             retained_prompt_roles_result           = &new_entry.retained_prompt_roles_result;
+                            // llama.cpp-iikr (B50 residual-pool cycle, design
+                            // finding 1): computed once, right here, and
+                            // shared via the same cache entry -- see
+                            // ggml_sycl_moe_validate_retained_role_bundle's
+                            // own comment. Guarded on the bundle itself being
+                            // non-rejected first, matching the original
+                            // lambda's short-circuit.
+                            new_entry.roles_validated              = new_entry.retained_prompt_roles_result &&
+                                                        ggml_sycl_moe_validate_retained_role_bundle(
+                                                            new_entry.retained_prompt_roles_result.bundle, ctx.device);
+                            retained_prompt_roles_bundle_validated = new_entry.roles_validated;
                         } else {
                             // Cache disabled (GGML_SYCL_MOE_ADMIT_CACHE=0) or
                             // key-build failed for this one dispatch -- no
                             // cache entry to alias, so keep `built` alive in
                             // function-scope storage for the rest of this
                             // call (see that variable's own declaration
-                            // comment).
+                            // comment). No cache entry to share the validated
+                            // flag through either, so it is simply
+                            // recomputed for this one dispatch -- matches
+                            // pre-fix behavior for this already-opt-out path.
                             retained_prompt_roles_result_uncached_storage = std::move(built);
                             retained_prompt_roles_result = &retained_prompt_roles_result_uncached_storage;
+                            retained_prompt_roles_bundle_validated =
+                                retained_prompt_roles_result_uncached_storage &&
+                                ggml_sycl_moe_validate_retained_role_bundle(
+                                    retained_prompt_roles_result_uncached_storage.bundle, ctx.device);
                         }
                     }
                 }
@@ -66467,41 +66548,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // are occurrence-aligned and the current kernel family can consume every
     // role on the submit queue. Mixed/secondary/host bundles remain authoritative
     // for the unfused retained executor rather than leaking into this fast path.
-    const bool prompt_pair_retained_roles_validated = [&]() {
-        // llama.cpp-iikr (promptadmit remainder cycle): now a pointer, so
-        // "not admitted" is two separate conditions that used to collapse
-        // into one operator bool() on the old value type -- never built
-        // (nullptr) OR built but rejected (!*ptr, e.g. ROLE_ALIGNMENT_
-        // MISMATCH from align_moe_retained_role_batches). Both must gate
-        // here; a non-null pointer to a REJECTED result must still read as
-        // not-admitted, exactly as the old value type's operator bool did.
-        if (!retained_prompt_roles_result || !*retained_prompt_roles_result || ne12 <= 1) {
-            return false;
-        }
-        const auto & roles = retained_prompt_roles_result->bundle;
-        const auto & gate  = roles.gate.batch;
-        const auto & up    = roles.up.batch;
-        const auto & down  = roles.down.batch;
-        if (!ggml_sycl::make_moe_batch_local_view(gate, gate.operands.front().actual_layout()) ||
-            !ggml_sycl::make_moe_batch_local_view(up, up.operands.front().actual_layout()) ||
-            !ggml_sycl::make_moe_batch_local_view(down, down.operands.front().actual_layout())) {
-            return false;
-        }
-        const auto supports_role = [&](const ggml_sycl::moe_retained_role_batch & role) {
-            const ggml_tensor * weight = role.weight_identity;
-            const auto &        batch  = role.batch;
-            if (!weight || batch.operands.empty()) {
-                return false;
-            }
-            const auto &               operand = batch.operands.front();
-            const moe_route_capability cap     = ggml_sycl_moe_query_route_capability(
-                weight->type, operand.actual_layout(), moe_route_phase::PROMPT, weight->ne[0], weight->ne[1],
-                batch.operands.size(), operand.owning_device(), moe_layer_route_residency::DEVICE, ctx.device);
-            return cap.supported && cap.local_device;
-        };
-        return supports_role(roles.gate) && supports_role(roles.up) && supports_role(roles.down) &&
-               roles.gate.batch.operands.front().actual_layout() == roles.up.batch.operands.front().actual_layout();
-    }();
+    // llama.cpp-iikr (B50 residual-pool cycle, design finding 1, team-lead
+    // GO): this used to be an immediately-invoked lambda recomputing the
+    // full validation (3x make_moe_batch_local_view + 3x supports_role)
+    // from scratch on every dispatch. Its inputs -- retained_prompt_roles_
+    // result's bundle and ctx.device -- are identical across a layer's 3
+    // sibling dispatches (the bundle is the same admission-cache-shared
+    // object), so the result is layer-constant. Now computed once, at
+    // promptadmit's cache-populate/uncached-fallback sites, and shared via
+    // retained_prompt_roles_bundle_validated -- see that variable's own
+    // declaration comment and ggml_sycl_moe_validate_retained_role_bundle's.
+    // The two guard conditions the old lambda checked before ever reaching
+    // the expensive part (null pointer, rejected bundle) are re-checked
+    // here rather than trusted from promptadmit, since ne12 itself is not
+    // part of the cached flag (see retained_prompt_roles_bundle_validated's
+    // own comment for why) and this must remain correct even on the
+    // uncached-fallback path where the flag was computed by a different
+    // code path than the hit path.
+    const bool prompt_pair_retained_roles_validated = retained_prompt_roles_result && *retained_prompt_roles_result &&
+                                                      ne12 > 1 && retained_prompt_roles_bundle_validated;
     // Only the proven MXFP4 all-primary path is eligible. In particular this
     // excludes the direct Q1/NVFP4 device gate, role bias owners, and every
     // host/secondary/mixed bundle. Those cases continue through the retained
