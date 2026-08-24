@@ -451,13 +451,49 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
     auto wrong_layout = ggml_sycl::make_moe_batch_local_view(result.batch, GGML_LAYOUT_AOS);
     CHECK(!wrong_layout && wrong_layout.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
 
-    int  identity    = 30;
-    auto conflicting = ggml_sycl::build_moe_resolved_batch(ids, 4, 2, 0, [&](int32_t id) {
-        return route_for(id == 3 ? &first : &second, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA,
-                         GGML_LAYOUT_SOA, identity++);
+    // llama.cpp-iikr (memo_hit fix, design note c-2cc8, team-lead's full-rigor
+    // classification): this used to construct the conflict by relying on
+    // build_moe_resolved_batch calling the resolver once per OCCURRENCE, so
+    // repeat occurrences of expert 3 would each get a fresh `identity++` and
+    // therefore a genuinely different lease identity. That premise died with
+    // f4aca4f26 (llama.cpp-e3xj, predates this session) -- its own comment on
+    // make_moe_batch_local_view explains why: build_moe_resolved_batch's
+    // memoized construction guarantees "a repeat can never diverge from its
+    // first occurrence's outcome", so ALL repeat occurrences of one expert
+    // share the identical resolved lease by construction, whether that
+    // sharing is a full-value copy (pre-canonical-restructure) or a shared
+    // canonical payload (ba987da15). POINTER_MISMATCH is therefore
+    // unreachable via build_moe_resolved_batch's own output -- but the guard
+    // itself must still refuse a batch that reaches it some OTHER way (an
+    // externally assembled or malformed moe_resolved_batch is always
+    // possible; moe_resolved_batch::operands is a plain public vector). Prove
+    // that by hand-assembling one: two INDEPENDENTLY resolved operands for
+    // the same expert_id, bypassing build_moe_resolved_batch's memoization
+    // entirely, so they genuinely have different lease identities.
+    int           identity       = 30;
+    const int32_t single_id[]    = { 3 };
+    auto          first_resolve  = ggml_sycl::build_moe_resolved_batch(single_id, 1, 1, 0, [&](int32_t) {
+        return route_for(&first, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA,
+                                   identity++);
     });
-    CHECK(conflicting);
-    auto conflict_view = ggml_sycl::make_moe_batch_local_view(conflicting.batch, GGML_LAYOUT_SOA);
+    auto          second_resolve = ggml_sycl::build_moe_resolved_batch(single_id, 1, 1, 0, [&](int32_t) {
+        return route_for(&first, 0, ggml_sycl::moe_batch_residency::PRIMARY_DEVICE, GGML_LAYOUT_SOA, GGML_LAYOUT_SOA,
+                                  identity++);
+    });
+    CHECK(first_resolve && second_resolve);
+    CHECK(!first_resolve.batch.operands[0].lease().stable_identity_equal(second_resolve.batch.operands[0].lease()));
+
+    ggml_sycl::moe_resolved_batch conflicting_batch;
+    conflicting_batch.submit_device   = 0;
+    conflicting_batch.slots_per_token = 2;
+    conflicting_batch.expert_ids      = { 3, 3 };
+    conflicting_batch.operands.push_back(first_resolve.batch.operands[0]);
+    conflicting_batch.operands.push_back(second_resolve.batch.operands[0]);
+    conflicting_batch.operands[1].occurrence  = 1;
+    conflicting_batch.operands[1].token_index = 0;
+    conflicting_batch.operands[1].slot_index  = 1;
+
+    auto conflict_view = ggml_sycl::make_moe_batch_local_view(conflicting_batch, GGML_LAYOUT_SOA);
     CHECK(!conflict_view && conflict_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
 
     // A stale same-size external/cache array cannot overwrite the admitted ID snapshot.
