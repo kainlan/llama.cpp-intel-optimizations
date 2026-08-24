@@ -24,12 +24,39 @@
 
 #    include <array>
 #    include <atomic>
+#    include <chrono>
 #    include <cstdio>
 #    include <mutex>
 #    include <unordered_map>
 #    include <utility>
 
 extern int g_ggml_sycl_debug;
+
+// llama.cpp-iikr (unphased-host-time cycle): team-lead's bisection target --
+// the WOQ 2-D fallback loop below (per-expert/per-batch-element) constructs a
+// fresh std::unordered_map<int, dnnl::memory> every iteration (sr83 quality
+// review flagged this as a heap allocation, never quantified). Declared here,
+// not in ggml-sycl.cpp's mxfp4_pp_batched_profile_accum, because this header
+// is included before that struct is defined in the same translation unit --
+// referencing it here would not compile. Unconditional measurement (two cheap
+// chrono calls per loop iteration, negligible next to a map construction) so
+// this header carries no dependency on ggml-sycl.cpp's profiling-enabled
+// check; ggml-sycl.cpp's print_and_reset drains these via exchange(0) and
+// folds them into its own report only when ITS OWN gate is on.
+namespace ggml_sycl_gemm_profile {
+// Nanoseconds, not microseconds-as-double: std::atomic<double>::fetch_add is
+// a C++20 addition and this TU does not build with it. An integral atomic
+// has no such restriction at any standard version this codebase targets.
+inline std::atomic<int64_t> & args_map_ns_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+
+inline std::atomic<int64_t> & args_map_calls_accum() {
+    static std::atomic<int64_t> v{ 0 };
+    return v;
+}
+}  // namespace ggml_sycl_gemm_profile
 
 // =============================================================================
 // oneDNN Primitive Cache
@@ -1203,6 +1230,12 @@ class DnnlGemmWrapper {
             auto s_mem_b = dnnl::memory(s_md_2d, eng, const_cast<uint8_t *>(bs_b));
             auto c_mem_b = dnnl::memory(c_md_2d, eng, c_b);
 
+            // llama.cpp-iikr (unphased-host-time cycle): bracket the fresh
+            // per-iteration map construction team-lead named as a bisection
+            // candidate -- see ggml_sycl_gemm_profile's declaration comment
+            // above for why this is unconditional and drained by exchange(0)
+            // rather than gated on ggml-sycl.cpp's profiling flag.
+            const auto                            args_map_t0 = std::chrono::high_resolution_clock::now();
             std::unordered_map<int, dnnl::memory> args;
             args.insert({ DNNL_ARG_SRC, a_mem_b });
             args.insert({ DNNL_ARG_WEIGHTS, b_mem_b });
@@ -1214,6 +1247,13 @@ class DnnlGemmWrapper {
                     throw std::runtime_error("oneDNN scratchpad allocation failed");
                 }
                 args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+            }
+            {
+                const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::high_resolution_clock::now() - args_map_t0)
+                                       .count();
+                ggml_sycl_gemm_profile::args_map_ns_accum().fetch_add(ns, std::memory_order_relaxed);
+                ggml_sycl_gemm_profile::args_map_calls_accum().fetch_add(1, std::memory_order_relaxed);
             }
             const std::vector<sycl::event> iter_deps =
                 (b == 0) ? deps : std::vector<sycl::event>{ per_batch_events.back() };

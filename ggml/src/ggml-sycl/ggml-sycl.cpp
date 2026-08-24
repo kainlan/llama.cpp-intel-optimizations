@@ -64936,6 +64936,22 @@ struct mxfp4_pp_batched_profile_accum {
     int64_t                                  host_repackstage_calls  = 0;
     double                                   host_submission_us      = 0.0;
     int64_t                                  host_submission_calls   = 0;
+    // llama.cpp-iikr (unphased-host-time cycle): team-lead's steady-eval gap
+    // classification found host_overlap covering ~3.2-3.4 ms/dispatch of
+    // device idle time while the six phases above sum to only ~0.5-0.6 ms/
+    // dispatch -- most of the covering compute_forward_node span is invisible
+    // to the six checkpoints. host_whole_us brackets the ENTIRE function
+    // (RAII, every exit path including throws) as the ground truth; host_
+    // prologue_us is a new seventh phase covering [function entry, the point
+    // where the six-phase clock used to start cold] -- previously-invisible
+    // time, not a re-measurement of any existing phase. unphased (whole minus
+    // prologue minus the six phases) is computed at print time, not stored,
+    // since it is a derived quantity with no accumulation semantics of its
+    // own.
+    double                                   host_whole_us           = 0.0;
+    int64_t                                  host_whole_calls        = 0;
+    double                                   host_prologue_us        = 0.0;
+    int64_t                                  host_prologue_calls     = 0;
     // llama.cpp-iikr (intra-window idle cycle): raw idle-hole samples,
     // accumulated across every dispatch this eval (one push per detected
     // gap within a dispatch's sorted repack/stage/gemm-block intervals).
@@ -65331,6 +65347,32 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         p.host_grouping_us / 1000.0, (long long) p.host_grouping_calls, p.host_repackstage_us / 1000.0,
         (long long) p.host_repackstage_calls, p.host_submission_us / 1000.0, (long long) p.host_submission_calls);
 
+    // llama.cpp-iikr (unphased-host-time cycle, team-lead's ask): whole
+    // brackets function entry-to-exit (RAII, every path); prologue is the
+    // new seventh phase covering entry to where the six-phase clock used to
+    // start cold; unphased is the residual after prologue AND the six
+    // phases above are subtracted from whole -- host work that happens
+    // inside the covering span but was invisible to every existing
+    // checkpoint. A big unphased number names something real to bisect
+    // further (see the gemm.hpp WOQ-2D-ARGS-MAP line below for the first
+    // such bisection); a small one clears host code broadly and points back
+    // at device-side or cross-engine causes. gemm_2d_args_map folds in
+    // gemm.hpp's own accumulator (declared there, not in this struct, since
+    // gemm.hpp is included before this struct is defined in this TU) --
+    // included in the unphased subtraction because it is host time that
+    // happens inside host_submission's own window, one layer down.
+    const double  gemm_2d_args_map_us    = ggml_sycl_gemm_profile::args_map_ns_accum().exchange(0) / 1000.0;
+    const int64_t gemm_2d_args_map_calls = ggml_sycl_gemm_profile::args_map_calls_accum().exchange(0);
+    const double phases_sum_us = p.host_prologue_us + p.host_readback_us + p.host_ptrtable_us + p.host_routeresolve_us +
+                                 p.host_grouping_us + p.host_repackstage_us + p.host_submission_us;
+    const double unphased_us = p.host_whole_us - phases_sum_us;
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST2] device=%d whole=%.3f ms/%lld prologue=%.3f ms/%lld unphased=%.3f ms "
+        "gemm_2d_args_map=%.3f ms/%lld\n",
+        p.device, p.host_whole_us / 1000.0, (long long) p.host_whole_calls, p.host_prologue_us / 1000.0,
+        (long long) p.host_prologue_calls, unphased_us / 1000.0, gemm_2d_args_map_us / 1000.0,
+        (long long) gemm_2d_args_map_calls);
+
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
     // a ~270-300 ms window hole) -- this line measures the remaining
@@ -65523,6 +65565,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
     } b1_mmid_host_timer_instance;
+#if GGML_SYCL_DNNL
+    // llama.cpp-iikr (unphased-host-time cycle): brackets the WHOLE function,
+    // entry to every exit (RAII -- return, throw, or the six-phase block's
+    // own early returns all destruct this normally), as the ground truth
+    // against which the six MXFP4-PP-BATCHED-PROFILE-HOST phases below are
+    // compared. t0 is captured here, at the true top of the function, so it
+    // can also seed host_phase_clock at its own declaration site below
+    // (turning what used to be an unmeasured gap before phase 1 into an
+    // explicit seventh "prologue" phase, not folded into readback).
+    struct mxfp4_pp_host_whole_span_guard {
+        std::chrono::high_resolution_clock::time_point t0     = std::chrono::high_resolution_clock::now();
+        bool                                           active = mxfp4_pp_batched_profile_enabled();
+
+        ~mxfp4_pp_host_whole_span_guard() {
+            if (!active) {
+                return;
+            }
+            const double us =
+                std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
+            auto & p = g_mxfp4_pp_batched_profile;
+            p.host_whole_us += us;
+            ++p.host_whole_calls;
+        }
+    } mxfp4_pp_host_whole_span;
+#endif
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -67191,7 +67258,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // backend is built without oneDNN.
 #if GGML_SYCL_DNNL
     const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
-    auto       host_phase_clock   = std::chrono::high_resolution_clock::now();
+    // llama.cpp-iikr (unphased-host-time cycle): seeded from the whole-span
+    // guard's own t0 (true function entry), not a fresh now() here -- this
+    // turns the previously-invisible gap between function entry and this
+    // point into the explicit "prologue" mark immediately below, instead of
+    // silently folding it into readback (phase 1)'s span the way a fresh
+    // now() would.
+    auto       host_phase_clock   = mxfp4_pp_host_whole_span.t0;
     const auto host_phase_mark    = [&](double mxfp4_pp_batched_profile_accum::* total_field,
                                      int64_t mxfp4_pp_batched_profile_accum::* calls_field) {
         if (!host_phase_profile) {
@@ -67204,6 +67277,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         p.*total_field += delta;
         ++(p.*calls_field);
     };
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_prologue_us,
+                    &mxfp4_pp_batched_profile_accum::host_prologue_calls);
 #endif
 
     // Task 1E: Batch IDs D2H across GATE/UP/DOWN sub-ops.
