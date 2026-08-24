@@ -74998,15 +74998,49 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         dt.cpu_check_us = dt.elapsed_us();
     }
     ggml_sycl_result_output_diag(ctx, dst, "compute-forward-entry", false, nullptr, ggml_sycl_cpu_offload_available());
-    if (!ggml_sycl_graph_dispatch_recording_active(&ctx) && should_dispatch_to_cpu(ctx, dst) &&
+    // llama.cpp-iikr (round 2 of the branch trace, team-lead's ask after
+    // round 1 showed all three bypass conditions true yet the CPU redirect
+    // still won): capture should_dispatch_to_cpu's ACTUAL return value at
+    // the REAL dispatch call site -- round 1's trace lived INSIDE the
+    // function and could only show that MY bypass's own condition
+    // evaluated true, not what the function's FINAL return value was for
+    // THIS call, nor which branch this caller actually took. Same env var,
+    // same self-validating shape: many lines expected for a normal run,
+    // filtered to MoE-routing-hinted nodes specifically so it doesn't flood.
+    const bool moe_routing_device_trace_enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_ROUTING_DEVICE_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    const bool moe_routing_branch_trace_this_node =
+        moe_routing_device_trace_enabled &&
+        (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_SOFT_MAX || dst->op == GGML_OP_ARGSORT) &&
+        ggml_sycl_op_is_moe_routing_subgraph(dst);
+    const bool dispatch_to_cpu_decision = should_dispatch_to_cpu(ctx, dst);
+    if (moe_routing_branch_trace_this_node) {
+        static std::atomic<int> branch_trace_count{ 0 };
+        const int               idx = branch_trace_count.fetch_add(1, std::memory_order_relaxed);
+        if (idx < 256) {
+            fprintf(stderr, "[MOE-ROUTING-DEVICE-TRACE-BRANCH] idx=%d dst=%s op=%s dispatch_to_cpu=%d\n", idx,
+                    dst->name ? dst->name : "?", ggml_op_name(dst->op), dispatch_to_cpu_decision ? 1 : 0);
+        }
+    }
+    if (!ggml_sycl_graph_dispatch_recording_active(&ctx) && dispatch_to_cpu_decision &&
         !(ggml_sycl_hybrid_dispatch_enabled() && should_force_gpu_dispatch(dst))) {
         if (ggml_sycl_compute_forward_cpu(ctx, dst)) {
+            if (moe_routing_branch_trace_this_node) {
+                fprintf(stderr, "[MOE-ROUTING-DEVICE-TRACE-BRANCH] dst=%s branch=CPU-SUCCESS\n",
+                        dst->name ? dst->name : "?");
+            }
             if (ggml_sycl::e2e_tg_profile_enabled()) {
                 ggml_sycl::e2e_tg_profile_record(ggml_sycl::e2e_tg_stage::CPU_DISPATCH, ggml_op_name(dst->op), 0.0, 0.0,
                                                  0, 1);
                 ggml_sycl::e2e_tg_profile_flush_if_ready(stderr);
             }
             return true;
+        }
+        if (moe_routing_branch_trace_this_node) {
+            fprintf(stderr, "[MOE-ROUTING-DEVICE-TRACE-BRANCH] dst=%s branch=CPU-FAILED-FALLTHROUGH\n",
+                    dst->name ? dst->name : "?");
         }
         GGML_SYCL_DEBUG("[CPU-FAIL] CPU dispatch failed for %s (%s), falling to GPU\n", dst->name ? dst->name : "?",
                         ggml_op_name(dst->op));
@@ -75018,6 +75052,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_cpu_retained_flush_all(ctx.device, ctx.stream());
             GGML_SYCL_DEBUG("[RETAINED] Safety flush: CPU op %s fell through to GPU\n", ggml_op_name(dst->op));
         }
+    } else if (moe_routing_branch_trace_this_node) {
+        fprintf(stderr, "[MOE-ROUTING-DEVICE-TRACE-BRANCH] dst=%s branch=GPU-DIRECT\n", dst->name ? dst->name : "?");
     }
     // llama.cpp-iikr ("attribute other" phase): component 6's whole-node
     // device bracket -- see mxfp4_pp_node_bracket's own comment for why this
