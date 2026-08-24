@@ -143,11 +143,11 @@ static bool test_host_primary_secondary_mixed_and_occurrences() {
     CHECK(result.batch.operands[1].token_index == 0 && result.batch.operands[1].slot_index == 1);
     CHECK(result.batch.operands[2].token_index == 1 && result.batch.operands[2].slot_index == 0);
     CHECK(result.batch.operands[3].token_index == 1 && result.batch.operands[3].slot_index == 1);
-    CHECK(result.batch.operands[0].requested_layout == GGML_LAYOUT_SOA);
-    CHECK(result.batch.operands[0].actual_layout == GGML_LAYOUT_XMX_TILED);
-    CHECK(result.batch.operands[1].residency == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE);
-    CHECK(result.batch.operands[3].residency == ggml_sycl::moe_batch_residency::HOST);
-    CHECK(result.batch.operands[0].lease.stable_identity_equal(result.batch.operands[2].lease));
+    CHECK(result.batch.operands[0].requested_layout() == GGML_LAYOUT_SOA);
+    CHECK(result.batch.operands[0].actual_layout() == GGML_LAYOUT_XMX_TILED);
+    CHECK(result.batch.operands[1].residency() == ggml_sycl::moe_batch_residency::SECONDARY_DEVICE);
+    CHECK(result.batch.operands[3].residency() == ggml_sycl::moe_batch_residency::HOST);
+    CHECK(result.batch.operands[0].lease().stable_identity_equal(result.batch.operands[2].lease()));
     return true;
 }
 
@@ -219,10 +219,10 @@ static bool test_identity_sharing_and_ready_event() {
     });
     CHECK(result);
     CHECK(result.batch.operands[0].expert_id == 4 && result.batch.operands[1].expert_id == 5);
-    CHECK(result.batch.operands[0].lease.stable_identity_equal(result.batch.operands[1].lease));
-    CHECK(result.batch.operands[0].has_ready_event && result.batch.operands[1].has_ready_event);
-    CHECK(result.batch.operands[0].lease.valid() && result.batch.operands[1].lease.valid());
-    CHECK(result.batch.operands[0].lease.resolve().ptr == &shared);
+    CHECK(result.batch.operands[0].lease().stable_identity_equal(result.batch.operands[1].lease()));
+    CHECK(result.batch.operands[0].has_ready_event() && result.batch.operands[1].has_ready_event());
+    CHECK(result.batch.operands[0].lease().valid() && result.batch.operands[1].lease().valid());
+    CHECK(result.batch.operands[0].lease().resolve().ptr == &shared);
 
     int  same_pointer = 5;
     int  identity     = 11;
@@ -231,8 +231,8 @@ static bool test_identity_sharing_and_ready_event() {
                              GGML_LAYOUT_AOS, identity++);
     });
     CHECK(distinct);
-    CHECK(!distinct.batch.operands[0].lease.stable_identity_equal(distinct.batch.operands[1].lease));
-    CHECK(distinct.batch.operands[0].lease.resolve().ptr == distinct.batch.operands[1].lease.resolve().ptr);
+    CHECK(!distinct.batch.operands[0].lease().stable_identity_equal(distinct.batch.operands[1].lease()));
+    CHECK(distinct.batch.operands[0].lease().resolve().ptr == distinct.batch.operands[1].lease().resolve().ptr);
     return true;
 }
 
@@ -338,7 +338,7 @@ static bool test_owned_direct_slice_route_acceptance() {
     const int32_t ids[] = { 1 };
     auto accepted = ggml_sycl::build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return route; });
     CHECK(accepted);
-    CHECK(accepted.batch.operands[0].lease.stable_identity_equal(slice));
+    CHECK(accepted.batch.operands[0].lease().stable_identity_equal(slice));
 
     int raw = 0;
     auto ownerless = ggml_sycl::mem_handle::from_direct(&raw, GGML_LAYOUT_AOS, false);
@@ -432,8 +432,8 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
     CHECK(view.expert_ids == std::vector<int32_t>({ 3, 4 }));
     CHECK(view.expert_ptrs == std::vector<void *>({ &first, &second }));
     CHECK(view.leases.size() == 2);
-    CHECK(view.leases[0].stable_identity_equal(result.batch.operands[0].lease));
-    CHECK(view.leases[1].stable_identity_equal(result.batch.operands[2].lease));
+    CHECK(view.leases[0].stable_identity_equal(result.batch.operands[0].lease()));
+    CHECK(view.leases[1].stable_identity_equal(result.batch.operands[2].lease()));
 
     auto wrong_layout = ggml_sycl::make_moe_batch_local_view(result.batch, GGML_LAYOUT_AOS);
     CHECK(!wrong_layout && wrong_layout.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
@@ -483,7 +483,7 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     CHECK(batch);
     CHECK(batch.batch.operands.size() == 3);
     for (const auto & operand : batch.batch.operands) {
-        CHECK(operand.has_ready_event);
+        CHECK(operand.has_ready_event());
     }
     // The all-local fast path rejects this mixed batch. The hybrid fallback must
     // still partition every exact occurrence instead of publishing an empty dst.
@@ -568,9 +568,9 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     CHECK(aligned);
     CHECK(aligned.bundle.retained_lease_count() == 12);
     CHECK(aligned.bundle.gate.weight_identity != aligned.bundle.up.weight_identity);
-    CHECK(aligned.bundle.gate.batch.operands[0].actual_layout == GGML_LAYOUT_SOA);
-    CHECK(aligned.bundle.up.batch.operands[0].actual_layout == GGML_LAYOUT_XMX_TILED);
-    CHECK(aligned.bundle.down.batch.operands[0].actual_layout == GGML_LAYOUT_AOS);
+    CHECK(aligned.bundle.gate.batch.operands[0].actual_layout() == GGML_LAYOUT_SOA);
+    CHECK(aligned.bundle.up.batch.operands[0].actual_layout() == GGML_LAYOUT_XMX_TILED);
+    CHECK(aligned.bundle.down.batch.operands[0].actual_layout() == GGML_LAYOUT_AOS);
 
     // Duplicate occurrences are valid, but any role-local ID/token/slot drift is not.
     auto drift_up                   = up.batch;
@@ -585,7 +585,7 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     ggml_sycl::moe_retained_pointer_table down_table;
     down_table.table_handle = weight_handle(&down_a, 0, GGML_LAYOUT_AOS, 180, true);
     for (const auto & operand : down.batch.operands) {
-        down_table.role_leases.push_back(operand.lease);
+        down_table.role_leases.push_back(operand.lease());
     }
     down_table.has_ready_event = true;
     CHECK(down_table.valid() && down_table.role_leases.size() == 4);
@@ -593,7 +593,7 @@ static bool test_retained_role_alignment_and_terminal_transaction() {
     ggml_sycl::moe_retained_terminal_bundle terminal;
     terminal.roles = aligned.bundle;
     terminal.tables.push_back(std::move(down_table));
-    terminal.intermediates.push_back(gate.batch.operands.front().lease);
+    terminal.intermediates.push_back(gate.batch.operands.front().lease());
     terminal.terminal_submitted = true;
     CHECK(terminal.retained_handle_count() == 18);
     return true;
@@ -622,17 +622,31 @@ static bool test_recipe_matrix_workspace_and_immutability() {
             auto          admitted = build_moe_resolved_batch(ids, 1, 1, 0, [&](int32_t) { return host; });
             CHECK(admitted);
             const auto & admitted_operand = admitted.batch.operands[0];
-            CHECK(admitted_operand.recipe_reason == host.recipe_reason);
-            CHECK(admitted_operand.admitted_recipe_signature ==
-                  moe_admitted_recipe_signature(admitted_operand.recipe, admitted_operand.lease));
+            CHECK(admitted_operand.recipe_reason() == host.recipe_reason);
+            CHECK(admitted_operand.admitted_recipe_signature() ==
+                  moe_admitted_recipe_signature(admitted_operand.recipe(), admitted_operand.lease()));
             CHECK(make_moe_admitted_recipe_ticket(admitted_operand).valid());
-            auto substituted_lease = admitted_operand;
-            substituted_lease.lease = weight_handle(&value, 0, GGML_LAYOUT_AOS, 990, false);
+            // llama.cpp-iikr (memo_hit fix, operand-representation migration):
+            // a plain `auto x = admitted_operand;` copy now shares the SAME
+            // canonical payload (that is the whole point of the fix -- see
+            // moe_resolved_operand_canonical's own comment). A test that wants
+            // an independently-mutable variant must clone the canonical value
+            // explicitly and attach a fresh shared_ptr, rather than mutate the
+            // copy's fields in place (which would either fail to compile,
+            // since the accessors return const references, or -- had they
+            // not -- would have silently corrupted admitted_operand's own
+            // shared payload).
+            auto substituted_lease           = admitted_operand;
+            auto substituted_lease_canonical = std::make_shared<moe_resolved_operand_canonical>(substituted_lease.c());
+            substituted_lease_canonical->lease = weight_handle(&value, 0, GGML_LAYOUT_AOS, 990, false);
+            substituted_lease.canonical        = substituted_lease_canonical;
             CHECK(!make_moe_admitted_recipe_ticket(substituted_lease).valid());
             CHECK(choose_moe_batch_executor(admitted_operand, 0, false, ws.total_bytes));
-            auto mutated = admitted.batch.operands[0];
-            mutated.recipe.request.rows++;
-            auto choice = choose_moe_batch_executor(mutated, 0, false, ws.total_bytes);
+            auto mutated           = admitted.batch.operands[0];
+            auto mutated_canonical = std::make_shared<moe_resolved_operand_canonical>(mutated.c());
+            mutated_canonical->recipe.request.rows++;
+            mutated.canonical = mutated_canonical;
+            auto choice       = choose_moe_batch_executor(mutated, 0, false, ws.total_bytes);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::RECIPE_MISMATCH);
             choice = choose_moe_batch_executor(admitted.batch.operands[0], 0, false, ws.total_bytes - 1);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::WORKSPACE_UNDERSIZED);
@@ -667,10 +681,12 @@ static bool test_recipe_matrix_workspace_and_immutability() {
                                                secondary.recipe.workspace.total_bytes);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
 
-            auto soa = device_batch.batch.operands[0];
-            soa.recipe.layout = GGML_LAYOUT_SOA;
-            soa.admitted_recipe_signature = moe_execution_recipe_signature(soa.recipe);
-            choice = choose_moe_batch_executor(soa, 0, true, soa.recipe.workspace.total_bytes);
+            auto soa                                 = device_batch.batch.operands[0];
+            auto soa_canonical                       = std::make_shared<moe_resolved_operand_canonical>(soa.c());
+            soa_canonical->recipe.layout             = GGML_LAYOUT_SOA;
+            soa_canonical->admitted_recipe_signature = moe_execution_recipe_signature(soa_canonical->recipe);
+            soa.canonical                            = soa_canonical;
+            choice = choose_moe_batch_executor(soa, 0, true, soa.recipe().workspace.total_bytes);
             CHECK(!choice && choice.reject == moe_batch_reject_reason::CAPABILITY_UNSUPPORTED);
         }
     }
@@ -709,9 +725,9 @@ static bool test_numerical_q1_nvfp4_host_executor() {
             void * aligned = std::align(route.recipe.workspace.alignment, bytes, raw, available);
             CHECK(aligned);
             cpu_moe_host_aos_task task;
-            task.recipe = admitted.batch.operands[0].recipe;
-            task.admitted_recipe_signature = admitted.batch.operands[0].admitted_recipe_signature;
-            task.weight_lease = admitted.batch.operands[0].lease;
+            task.recipe                    = admitted.batch.operands[0].recipe();
+            task.admitted_recipe_signature = admitted.batch.operands[0].admitted_recipe_signature();
+            task.weight_lease              = admitted.batch.operands[0].lease();
             task.activations = activations.data();
             task.output = output.data();
             task.workspace = aligned;
