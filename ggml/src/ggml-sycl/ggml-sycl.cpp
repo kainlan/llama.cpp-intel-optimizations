@@ -16318,6 +16318,75 @@ static bool ggml_sycl_refresh_moe_ids_cache(ggml_backend_sycl_context & ctx,
                                             const ggml_tensor *         ids,
                                             moe_ids_cache_entry &       entry);
 
+// llama.cpp-iikr (final attribution cycle): ggml_sycl_mul_mat_id's "multi-role
+// prompt admission" block (its own comment: "Multi-role prompt admission uses
+// the same immutable ID snapshot") recomputes the SAME 3-role resolved batch
+// on every one of a layer's 3 sibling MUL_MAT_ID dispatches (gate/up/down) --
+// measured 133.6 ms/70 dispatches (~1.9 ms/dispatch) of promptadmit, 9
+// ggml_sycl_build_moe_resolved_batch resolver calls per layer where 3
+// suffice. Same key type/construction and same graph-local lifetime as
+// g_moe_ids_d2h_cache directly above -- "same key" already means "same
+// layer, same graph-compute pass", so no new key-derivation logic is needed.
+// mem_handle's copy constructor bumps the target entry's lease refcount
+// (mem-handle.hpp:278-284), so storing moe_retained_role_bundle_result by
+// value here and copying it OUT to each of up to 3 dispatch-local variables
+// keeps every consumer's lease live independently, exactly the "retain the
+// handles, not raw pointers, for the lifetime of the queued work" contract
+// this was reviewed against -- not a new ownership pattern, the same one
+// moe_ids_cache_entry already uses for its own D2H buffer.
+// ids_hash guards against exactly the failure mode this cache exists to
+// avoid introducing: a stale entry read after its invalidation should have
+// fired but didn't. ggml_sycl_hash_ids (below) is computed over the SAME
+// prompt_ids_snapshot the cached result was built from and stored
+// alongside it; every cache HIT recomputes the current call's hash and
+// compares before trusting the cached value, falling back to a fresh
+// recompute on any mismatch rather than ever serving known-stale data.
+// This is a standing safety net (always active, not test-only) and is
+// also this cache's positive-control instrument: GGML_SYCL_MOE_ADMIT_
+// CACHE_SKIP_INVALIDATION_TEST (ggml_sycl_moe_ids_cache_new_graph, below)
+// exists solely to let a verification run force a genuine RED (skip
+// invalidation, confirm the mismatch fires and is logged) before trusting
+// this GREEN (invalidation on, mismatch never fires) on real hardware.
+struct moe_prompt_admission_cache_entry {
+    bool                                       valid    = false;
+    uint64_t                                   ids_hash = 0;
+    ggml_sycl::moe_retained_role_bundle_result retained_prompt_roles_result;
+};
+
+static thread_local std::unordered_map<ggml_backend_sycl_context::moe_ids_cache_key,
+                                       moe_prompt_admission_cache_entry,
+                                       ggml_backend_sycl_context::moe_ids_cache_key_hash>
+    g_moe_prompt_admission_cache;
+
+// Disable hatch matching this fork's load-bearing-opt-out idiom (default ON
+// within the batched arm the promptadmit block is scoped to). Set once,
+// cached: this is read from a hot per-dispatch path.
+static bool ggml_sycl_moe_admit_cache_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_ADMIT_CACHE");
+        return !env || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// TEST-ONLY. Not a performance knob -- setting this makes
+// ggml_sycl_moe_ids_cache_new_graph() skip clearing
+// g_moe_prompt_admission_cache specifically (g_moe_ids_d2h_cache still
+// clears normally), so a verification run spanning 2+ evals with different
+// prompts against the SAME reused graph/tensor allocations can deliberately
+// induce the stale-cache scenario the ids_hash check above exists to catch.
+// Confirm the mismatch fires (and is logged) with this ON before trusting
+// that it never fires with this OFF (the default, and the only supported
+// setting outside this one verification). Do not set this for anything
+// other than that one RED-proof run.
+static bool ggml_sycl_moe_admit_cache_skip_invalidation_test_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_ADMIT_CACHE_SKIP_INVALIDATION_TEST");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // ---------------------------------------------------------------------------
 // Per-layer IDs D2H cache for MoE sub-op batching (Task 1E).
 // Gate/Up/Down sub-ops within the same MoE block share the same expert IDs.
@@ -16757,6 +16826,20 @@ static void ggml_sycl_moe_ids_cache_new_graph() {
         entry.wait();
     }
     g_moe_ids_d2h_cache.clear();
+    // llama.cpp-iikr (final attribution cycle): g_moe_prompt_admission_cache
+    // shares this exact graph-local lifetime (same key type, same tensor-
+    // identity+device key), so it clears at the same boundary. No wait
+    // needed here -- unlike the ids cache's raw D2H buffer, this cache's
+    // entries hold mem_handle leases that release themselves correctly via
+    // their own destructors regardless of when the map's destructor runs.
+    // Skipped ONLY under the test-only hatch (see its own declaration
+    // comment) so a verification run can deliberately induce the stale-read
+    // the ids_hash check in moe_prompt_admission_cache_entry exists to
+    // catch -- g_moe_ids_d2h_cache above is NEVER skipped, so ids readback
+    // itself stays correct even during that verification run.
+    if (!ggml_sycl_moe_admit_cache_skip_invalidation_test_enabled()) {
+        g_moe_prompt_admission_cache.clear();
+    }
 }
 
 // Re-resolve a cached secondary route for the current sub-op's weight tensor.
@@ -30220,6 +30303,27 @@ static void ggml_sycl_preload_model_weights() {
             // ownership rule here would keep them and reintroduce the TLSF
             // fragmentation the comment above warns about (llama.cpp-0qlw).
             cache->reset_model_weight_entries(ggml_sycl::weight_reclaim_mode::MID_LOAD_REPLAN);
+            // llama.cpp-iikr (final attribution cycle, defensive 4th
+            // invalidation site): g_moe_prompt_admission_cache resolves
+            // weight placement (ggml_sycl_build_moe_resolved_batch reads
+            // the SAME weight-placement state reset_model_weight_entries
+            // just dropped above), so a replan invalidates it exactly like
+            // the weight entries. This site does NOT by itself protect a
+            // different thread's copy of this thread_local cache -- that is
+            // already structural: a thread_local cache starts empty per
+            // thread, so a different thread can never observe an entry this
+            // thread populated in the first place. What this site protects
+            // is THIS thread reusing its own stale entries after a replan
+            // it itself triggered, mid-load, before its next graph-compute
+            // boundary would otherwise clear them
+            // (ggml_sycl_moe_ids_cache_new_graph). Belt-and-suspenders: the
+            // 3 existing graph-boundary sites should already cover this in
+            // the ordinary case (MID_LOAD_REPLAN's own comment above frames
+            // it as happening during a model's OWN load, strictly before
+            // that model's first graph-compute/inference call), but the
+            // cost of this line is one call, and a missed invalidation here
+            // is silent stale-pointer corruption, not a crash.
+            g_moe_prompt_admission_cache.clear();
             if (global_plan != nullptr) {
                 ggml_sycl_republish_current_plan();
             }
@@ -65886,32 +65990,80 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         if (prompt_pair != g_moe_gate_up_pairs.end()) {
             const moe_gate_up_pair & pair = prompt_pair->second;
             if (pair.gate_weight && pair.up_weight && pair.down_weight && pair.ids == ids) {
-                auto role_layout = [&](const ggml_tensor * weight) {
-                    const bool  host   = ggml_sycl_is_host_resident_weight(weight, ctx.stream());
-                    layout_mode layout = has_override ?
-                                             override_layout :
-                                             ggml_sycl_select_moe_planned_graph_layout(weight, ctx.device, host, ne12);
-                    layout             = ggml_sycl_adjust_layout_for_tensor(weight, layout, ctx.device);
-                    return ggml_sycl_moe_layout_for_selected_rows(weight, ctx.device, layout,
-                                                                  prompt_ids_snapshot.size(), has_override, ne12);
-                };
-                const layout_mode gate_layout = role_layout(pair.gate_weight);
-                const layout_mode up_layout   = role_layout(pair.up_weight);
-                const layout_mode down_layout = role_layout(pair.down_weight);
-                auto              gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-                    pair.gate_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                    static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false);
-                auto up_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-                    pair.up_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                    static_cast<size_t>(ids->ne[0]), up_layout, /*allow_materialize=*/false);
-                auto down_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
-                    pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
-                    static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false);
-                if (gate_result && up_result && down_result) {
-                    retained_prompt_roles_result = ggml_sycl::align_moe_retained_role_batches(
-                        { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
-                        { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
-                        { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
+                // llama.cpp-iikr (final attribution cycle): this block
+                // produces the IDENTICAL retained_prompt_roles_result for
+                // all 3 sibling dispatches of one layer (gate/up/down) --
+                // the result depends only on (pair, ids), both fixed for the
+                // whole layer within this graph-compute pass, never on
+                // which specific role is being dispatched right now. Cache
+                // it the same way g_moe_ids_d2h_cache caches its own D2H
+                // buffer: first consumer this layer computes and stores,
+                // the other two just copy the mem_handle-bearing result out
+                // (see g_moe_prompt_admission_cache's own comment for why a
+                // copy here is correct, not merely convenient).
+                const bool                                   admit_cache_enabled = ggml_sycl_moe_admit_cache_enabled();
+                ggml_backend_sycl_context::moe_ids_cache_key admit_key{};
+                const bool                                   admit_key_ok = admit_cache_enabled &&
+                                          ggml_sycl_make_context_moe_ids_content_cache_key(ids, ctx.device, &admit_key);
+                bool admit_cache_hit = false;
+                if (admit_key_ok) {
+                    auto admit_it = g_moe_prompt_admission_cache.find(admit_key);
+                    if (admit_it != g_moe_prompt_admission_cache.end() && admit_it->second.valid) {
+                        // Staleness check: the key covers (ids tensor identity,
+                        // device), not the CONTENT of prompt_ids_snapshot for
+                        // this specific dispatch. ids_hash is the actual
+                        // correctness machinery -- see the struct's own
+                        // comment. A mismatch here means this entry was
+                        // populated for a different prompt than the one this
+                        // call is dispatching; treat it exactly like a miss
+                        // rather than trusting stale data.
+                        const uint64_t current_hash = ggml_sycl_hash_ids(prompt_ids_snapshot);
+                        if (current_hash == admit_it->second.ids_hash) {
+                            retained_prompt_roles_result = admit_it->second.retained_prompt_roles_result;
+                            admit_cache_hit              = true;
+                        } else {
+                            GGML_LOG_ERROR(
+                                "%s: MOE prompt admission cache stale-read detected (ids_hash "
+                                "mismatch, cached=%" PRIu64 " current=%" PRIu64
+                                ") -- falling back to recompute instead of using the stale entry\n",
+                                __func__, admit_it->second.ids_hash, current_hash);
+                        }
+                    }
+                }
+                if (!admit_cache_hit) {
+                    auto role_layout = [&](const ggml_tensor * weight) {
+                        const bool  host = ggml_sycl_is_host_resident_weight(weight, ctx.stream());
+                        layout_mode layout =
+                            has_override ? override_layout :
+                                           ggml_sycl_select_moe_planned_graph_layout(weight, ctx.device, host, ne12);
+                        layout = ggml_sycl_adjust_layout_for_tensor(weight, layout, ctx.device);
+                        return ggml_sycl_moe_layout_for_selected_rows(weight, ctx.device, layout,
+                                                                      prompt_ids_snapshot.size(), has_override, ne12);
+                    };
+                    const layout_mode gate_layout = role_layout(pair.gate_weight);
+                    const layout_mode up_layout   = role_layout(pair.up_weight);
+                    const layout_mode down_layout = role_layout(pair.down_weight);
+                    auto              gate_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                        pair.gate_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                        static_cast<size_t>(ids->ne[0]), gate_layout, /*allow_materialize=*/false);
+                    auto up_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                        pair.up_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                        static_cast<size_t>(ids->ne[0]), up_layout, /*allow_materialize=*/false);
+                    auto down_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
+                        pair.down_weight, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(),
+                        static_cast<size_t>(ids->ne[0]), down_layout, /*allow_materialize=*/false);
+                    if (gate_result && up_result && down_result) {
+                        retained_prompt_roles_result = ggml_sycl::align_moe_retained_role_batches(
+                            { ggml_sycl::moe_batch_role::GATE, pair.gate_weight, std::move(gate_result.batch) },
+                            { ggml_sycl::moe_batch_role::UP, pair.up_weight, std::move(up_result.batch) },
+                            { ggml_sycl::moe_batch_role::DOWN, pair.down_weight, std::move(down_result.batch) });
+                        if (admit_key_ok) {
+                            moe_prompt_admission_cache_entry & new_entry = g_moe_prompt_admission_cache[admit_key];
+                            new_entry.valid                              = true;
+                            new_entry.ids_hash                           = ggml_sycl_hash_ids(prompt_ids_snapshot);
+                            new_entry.retained_prompt_roles_result       = retained_prompt_roles_result;
+                        }
+                    }
                 }
             }
         }
