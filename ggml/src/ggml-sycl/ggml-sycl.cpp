@@ -64950,6 +64950,29 @@ struct mxfp4_pp_batched_profile_accum {
     // own.
     double                                   host_whole_us           = 0.0;
     int64_t                                  host_whole_calls        = 0;
+    // llama.cpp-iikr (final attribution cycle): the prologue turned out to
+    // BE the ~2.7-2.9 ms/dispatch unphased residual (189 of ~199 ms
+    // "other"), so it is bisected into five sequential sub-marks, following
+    // the function's own top-level code order (not nested lambda/branch
+    // internals): entry (function entry through the weight/id/ne setup),
+    // promptadmit (the `ne12 != 1` prompt-IDs/routes admission block --
+    // the D2H-ids-cache/canonical-publish code stage (ii) already made
+    // location-agnostic), routeeval (retained-route lambda definitions plus
+    // the cpu_tg_candidate/pp_onednn_batched_route booleans, including the
+    // mostly-skipped-for-batched cpu_tg fastpath block), fastpath (the
+    // planner-fastpath booleans through the large "GPU fast-paths block" --
+    // ends at that block's own end-of-block comment), and prologue (now
+    // just the final segment from there to phase 1, not the whole gap).
+    // Same posture as every phase: an early return/throw before a mark
+    // leaves that dispatch's contribution to it unaccounted.
+    double                                   host_entry_us           = 0.0;
+    int64_t                                  host_entry_calls        = 0;
+    double                                   host_promptadmit_us     = 0.0;
+    int64_t                                  host_promptadmit_calls  = 0;
+    double                                   host_routeeval_us       = 0.0;
+    int64_t                                  host_routeeval_calls    = 0;
+    double                                   host_fastpath_us        = 0.0;
+    int64_t                                  host_fastpath_calls     = 0;
     double                                   host_prologue_us        = 0.0;
     int64_t                                  host_prologue_calls     = 0;
     // llama.cpp-iikr (intra-window idle cycle): raw idle-hole samples,
@@ -65347,23 +65370,27 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         p.host_grouping_us / 1000.0, (long long) p.host_grouping_calls, p.host_repackstage_us / 1000.0,
         (long long) p.host_repackstage_calls, p.host_submission_us / 1000.0, (long long) p.host_submission_calls);
 
-    // llama.cpp-iikr (unphased-host-time cycle, team-lead's ask): whole
-    // brackets function entry-to-exit (RAII, every path); prologue is the
-    // new seventh phase covering entry to where the six-phase clock used to
-    // start cold; unphased is the residual after prologue AND the six
-    // phases above are subtracted from whole -- host work that happens
-    // inside the covering span but was invisible to every existing
-    // checkpoint. A big unphased number names something real to bisect
-    // further (see the gemm.hpp WOQ-2D-ARGS-MAP line below for the first
-    // such bisection); a small one clears host code broadly and points back
-    // at device-side or cross-engine causes. gemm_2d_args_map folds in
-    // gemm.hpp's own accumulator (declared there, not in this struct, since
-    // gemm.hpp is included before this struct is defined in this TU) --
-    // included in the unphased subtraction because it is host time that
-    // happens inside host_submission's own window, one layer down.
+    // llama.cpp-iikr (unphased-host-time cycle -> final attribution cycle):
+    // whole brackets function entry-to-exit (RAII, every path). The round
+    // that first landed this line found the prologue -- the gap between
+    // entry and where the six-phase clock used to start cold -- WAS the
+    // ~2.7-2.9 ms/dispatch residual (189 of ~199 ms/eval "other"), so it is
+    // now five sequential sub-marks in the function's own top-level code
+    // order (entry/promptadmit/routeeval/fastpath/prologue -- see the
+    // struct field comment above for what each spans and why those
+    // boundaries). unphased is whatever is left after ALL of those plus the
+    // six original phases are subtracted from whole -- between-mark slack,
+    // not a bisection target on its own unless it is still large.
+    // gemm_2d_args_map folds in gemm.hpp's own accumulator (declared there,
+    // not in this struct, since gemm.hpp is included before this struct is
+    // defined in this TU) -- included in the unphased subtraction because
+    // it is host time one layer inside host_submission's own window. (The
+    // prior cycle's suspicion here is closed: this line measured 0.252 ms
+    // total across 1596 iterations on hardware -- negligible.)
     const double  gemm_2d_args_map_us    = ggml_sycl_gemm_profile::args_map_ns_accum().exchange(0) / 1000.0;
     const int64_t gemm_2d_args_map_calls = ggml_sycl_gemm_profile::args_map_calls_accum().exchange(0);
-    const double phases_sum_us = p.host_prologue_us + p.host_readback_us + p.host_ptrtable_us + p.host_routeresolve_us +
+    const double  phases_sum_us = p.host_entry_us + p.host_promptadmit_us + p.host_routeeval_us + p.host_fastpath_us +
+                                 p.host_prologue_us + p.host_readback_us + p.host_ptrtable_us + p.host_routeresolve_us +
                                  p.host_grouping_us + p.host_repackstage_us + p.host_submission_us;
     const double unphased_us = p.host_whole_us - phases_sum_us;
     GGML_LOG_WARN(
@@ -65372,6 +65399,12 @@ static void mxfp4_pp_batched_profile_print_and_reset() {
         p.device, p.host_whole_us / 1000.0, (long long) p.host_whole_calls, p.host_prologue_us / 1000.0,
         (long long) p.host_prologue_calls, unphased_us / 1000.0, gemm_2d_args_map_us / 1000.0,
         (long long) gemm_2d_args_map_calls);
+    GGML_LOG_WARN(
+        "[MXFP4-PP-BATCHED-PROFILE-HOST3] device=%d entry=%.3f ms/%lld promptadmit=%.3f ms/%lld "
+        "routeeval=%.3f ms/%lld fastpath=%.3f ms/%lld\n",
+        p.device, p.host_entry_us / 1000.0, (long long) p.host_entry_calls, p.host_promptadmit_us / 1000.0,
+        (long long) p.host_promptadmit_calls, p.host_routeeval_us / 1000.0, (long long) p.host_routeeval_calls,
+        p.host_fastpath_us / 1000.0, (long long) p.host_fastpath_calls);
 
     // llama.cpp-iikr (intra-window idle cycle): the host phases above ruled
     // out host code as the ~4ms/dispatch stall (measured ~41-45 ms total vs
@@ -65571,9 +65604,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // own early returns all destruct this normally), as the ground truth
     // against which the six MXFP4-PP-BATCHED-PROFILE-HOST phases below are
     // compared. t0 is captured here, at the true top of the function, so it
-    // can also seed host_phase_clock at its own declaration site below
-    // (turning what used to be an unmeasured gap before phase 1 into an
-    // explicit seventh "prologue" phase, not folded into readback).
+    // can also seed host_phase_clock immediately below -- host_phase_clock/
+    // host_phase_mark used to be declared much later, right before phase 1,
+    // which meant nothing before that point could be marked at all. Moved
+    // here (final attribution cycle) so the five prologue sub-marks between
+    // here and the six original phases can all use the same lambda; the six
+    // phases' own call sites, further down the function, are unchanged --
+    // a `[&]`-capturing lambda works identically regardless of where in the
+    // function it was declared, as long as it is declared before first use
+    // and stays in scope, which it does for the rest of this function body.
     struct mxfp4_pp_host_whole_span_guard {
         std::chrono::high_resolution_clock::time_point t0     = std::chrono::high_resolution_clock::now();
         bool                                           active = mxfp4_pp_batched_profile_enabled();
@@ -65589,6 +65628,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             ++p.host_whole_calls;
         }
     } mxfp4_pp_host_whole_span;
+
+    const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
+    auto       host_phase_clock   = mxfp4_pp_host_whole_span.t0;
+    const auto host_phase_mark    = [&](double mxfp4_pp_batched_profile_accum::* total_field,
+                                     int64_t mxfp4_pp_batched_profile_accum::* calls_field) {
+        if (!host_phase_profile) {
+            return;
+        }
+        const auto   now   = std::chrono::high_resolution_clock::now();
+        const double delta = std::chrono::duration<double, std::micro>(now - host_phase_clock).count();
+        host_phase_clock   = now;
+        auto & p           = g_mxfp4_pp_batched_profile;
+        p.*total_field += delta;
+        ++(p.*calls_field);
+    };
 #endif
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -65777,6 +65831,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     ggml_sycl::moe_resolved_batch_result       retained_prompt_batch_result;
     ggml_sycl::moe_retained_role_bundle_result retained_prompt_roles_result;
     layout_mode                                retained_prompt_layout = GGML_LAYOUT_AOS;
+#if GGML_SYCL_DNNL
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_entry_us, &mxfp4_pp_batched_profile_accum::host_entry_calls);
+#endif
     if (ne12 != 1) {
         ctx.moe_graphs_disabled_once = true;
         if (g_ggml_sycl_graph_recording) {
@@ -65859,6 +65916,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
     }
+#if GGML_SYCL_DNNL
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_promptadmit_us,
+                    &mxfp4_pp_batched_profile_accum::host_promptadmit_calls);
+#endif
     auto retained_prompt_route_from_operand =
         [&](const ggml_sycl::moe_resolved_operand * selected) -> moe_expert_route {
         if (!selected) {
@@ -66517,6 +66578,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // retained_prompt_group_route_for_expert, and the unfused fallback further
     // below) is reached only past this point, so building here -- same inputs,
     // same admission gate -- is behavior-preserving whenever it does run.
+#if GGML_SYCL_DNNL
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_routeeval_us,
+                    &mxfp4_pp_batched_profile_accum::host_routeeval_calls);
+#endif
     if (ne12 != 1) {
         retained_prompt_batch_result = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
             src0, ctx.device, prompt_ids_snapshot.data(), prompt_ids_snapshot.size(), static_cast<size_t>(ids->ne[0]),
@@ -67222,6 +67287,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             "[MoE] MMVQ declined every attempted layout (reason is not necessarily layout-related; see the [MMVQ] "
             "trace), falling back to host routing\n");
     }  // end GPU fast-paths block
+#if GGML_SYCL_DNNL
+    host_phase_mark(&mxfp4_pp_batched_profile_accum::host_fastpath_us,
+                    &mxfp4_pp_batched_profile_accum::host_fastpath_calls);
+#endif
     GGML_SYCL_DEBUG("[MoE] GPU probe paths did not select type %d; resolving planner-owned MoE route\n", src0->type);
     // The planner-owned route below may select grouped local GPU PP, secondary GPU,
     // or actual host CPU entries.  Do not mark this boundary as "Host routing";
@@ -67255,28 +67324,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // (see the component-6 block above); host_phase_profile/host_phase_clock
     // are referenced only from further #if GGML_SYCL_DNNL-guarded call sites
     // below, so declaration and every use disappear together when the
-    // backend is built without oneDNN.
+    // backend is built without oneDNN. host_phase_clock/host_phase_mark
+    // themselves are declared earlier now (final attribution cycle, right
+    // after mxfp4_pp_host_whole_span) so the prologue sub-marks between
+    // there and here can share them -- this is just the "prologue" mark
+    // itself, now measuring only the final prologue segment (since the
+    // fastpath mark, not since function entry).
 #if GGML_SYCL_DNNL
-    const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
-    // llama.cpp-iikr (unphased-host-time cycle): seeded from the whole-span
-    // guard's own t0 (true function entry), not a fresh now() here -- this
-    // turns the previously-invisible gap between function entry and this
-    // point into the explicit "prologue" mark immediately below, instead of
-    // silently folding it into readback (phase 1)'s span the way a fresh
-    // now() would.
-    auto       host_phase_clock   = mxfp4_pp_host_whole_span.t0;
-    const auto host_phase_mark    = [&](double mxfp4_pp_batched_profile_accum::* total_field,
-                                     int64_t mxfp4_pp_batched_profile_accum::* calls_field) {
-        if (!host_phase_profile) {
-            return;
-        }
-        const auto   now   = std::chrono::high_resolution_clock::now();
-        const double delta = std::chrono::duration<double, std::micro>(now - host_phase_clock).count();
-        host_phase_clock   = now;
-        auto & p           = g_mxfp4_pp_batched_profile;
-        p.*total_field += delta;
-        ++(p.*calls_field);
-    };
     host_phase_mark(&mxfp4_pp_batched_profile_accum::host_prologue_us,
                     &mxfp4_pp_batched_profile_accum::host_prologue_calls);
 #endif
