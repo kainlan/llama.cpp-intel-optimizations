@@ -599,8 +599,8 @@ kept their meaning.
 #### Host-side phase breakdown (`HOST`/`HOST2`–`HOST5`)
 
 ⚠️ **Known doc gap, flagged rather than backfilled from memory: this
-subsection covers the `[MXFP4-PP-BATCHED-PROFILE-HOST]` through `-HOST5`
-lines added across ~9 commits of the same investigation
+subsection covers the `[MXFP4-PP-BATCHED-PROFILE-HOST]` through `-HOST6`
+lines added across ~11 commits of the same investigation
 (`llama.cpp-iikr`, the "unphased-host-time" → "promptadmit remainder" →
 "B50 residual-pool" cycles) that produced the device-event lines above.
 Everything below is accurate to the source as of this writing, but this
@@ -622,8 +622,9 @@ the `GGML_SYCL_MXFP4_PP_PROFILE` gate and print once per eval, same as
 [MXFP4-PP-BATCHED-PROFILE-HOST] device=<N> readback=<ms>/<calls> ptrtable=<ms>/<calls> routeresolve=<ms>/<calls> grouping=<ms>/<calls> repackstage=<ms>/<calls> submission=<ms>/<calls>
 [MXFP4-PP-BATCHED-PROFILE-HOST2] device=<N> whole=<ms>/<calls> prologue=<ms>/<calls> unphased=<ms> gemm_2d_args_map=<ms>/<calls>
 [MXFP4-PP-BATCHED-PROFILE-HOST3] device=<N> entry=<ms>/<calls> promptadmit=<ms>/<calls> routeeval=<ms>/<calls> fastpath=<ms>/<calls>
-[MXFP4-PP-BATCHED-PROFILE-HOST4] device=<N> admit_idswait=<ms>/<calls> admit_sweep_a=<ms>/<calls> admit_sweep_b=<ms>/<calls> admit_publish=<ms>/<calls> admit_lookup=<ms>/<calls> admit_resolve=<ms>/<calls> admit_snapshot=<ms>/<calls> admit_cache_hits=<N> admit_cache_misses=<N> admit_publish_aos=<N> admit_publish_nonaos=<N> admit_probe_entries=<N> admit_resolve_fastpath=<N> admit_resolve_fallback=<N>
+[MXFP4-PP-BATCHED-PROFILE-HOST4] device=<N> admit_idswait=<ms>/<calls> admit_sweep_a=<ms>/<calls> admit_sweep_b=<ms>/<calls> admit_publish=<ms>/<calls> admit_lookup=<ms>/<calls> admit_resolve=<ms>/<calls> admit_snapshot=<ms>/<calls> admit_cache_hits=<N> admit_cache_misses=<N> admit_publish_aos=<N> admit_publish_nonaos=<N> admit_probe_entries=<N> admit_resolve_fastpath=<N> admit_resolve_fallback=<N> sweep_layout_reused=<N> sweep_layout_swept=<N>
 [MXFP4-PP-BATCHED-PROFILE-HOST5] device=<N> resolve_inner=<ms>/<calls> resolve_outer=<ms>/<calls> resolve_memo_hit=<ms>/<calls> fastpath_rebuild=<ms>/<calls> fastpath_rebuild_reused=<N> fastpath_rebuild_built=<N>
+[MXFP4-PP-BATCHED-PROFILE-HOST6] device=<N> admit_resolve_layout=<ms>/<calls> admit_resolve_batch=<ms>/<calls> admit_resolve_align=<ms>/<calls> admit_resolve_populate=<ms>/<calls>
 ```
 
 (each wrapped here for readability; every real line is one line.)
@@ -709,6 +710,22 @@ this TU than this struct, same "declared at the call site" split as
 pipeline for that eval while profiling is on, matching the existing
 `g_moe_decode_route_census` precedent for the same function ("...entries
 (any caller)").
+`sweep_layout_reused`/`sweep_layout_swept` (`fcf1860a8`, mechanism 1) classify
+every dispatch by whether `sweep_a`/`sweep_b` above (the two-sweep computation
+of `retained_prompt_layout` for src0 specifically, at the TOP of the `ne12 !=
+1` block, before the triad-lookup below) actually ran or were skipped: a
+read-only, additive probe checks whether src0 is one of the layer's 3 sibling
+weights and the layer's admission-cache entry already carries a non-rejected
+bundle (populated by whichever sibling dispatched first this eval) — if so,
+`retained_prompt_layout` is read straight off that role's `actual_layout()`
+and both sweeps are skipped (`reused`); otherwise the full sweep runs as
+before (`swept`). This is a SEPARATE probe from the existing promptadmit
+cache lookup further down (which still runs unconditionally on every
+dispatch) — the two independently look up the same map by the same key, so a
+`reused` classification here does not change `admit_cache_hits`/`_misses`
+below it. `swept` dominating on a triad-heavy graph (expected only 1 of every
+3 sibling dispatches per layer, the layer's first) would mean the reuse probe
+is declining more than expected and is worth a follow-up capture.
 
 **HOST5** — bisects `admit_resolve`'s `build_moe_resolved_batch` calls
 into `resolve_inner` (the per-unique-expert `resolver()` call itself) and
@@ -736,6 +753,29 @@ figure confirms the reuse path is actually engaging on hardware, not just
 compiling; `built`-heavy despite triad tensors in the graph would mean the
 layout-equality guard is declining more than expected and is worth a
 follow-up capture.
+
+**HOST6** — bisects `admit_resolve`'s CACHE-MISS body (`1378fe65b`, mechanism
+2, instrument-only — added to characterize the pool, not yet acted on) into
+the 4 sequential sub-phases the cache-miss branch actually contains, in code
+order: `admit_resolve_layout` (the 3x `role_layout()` calls for gate/up/down
+— each its own `select_moe_planned_graph_layout`+`moe_layout_for_selected_rows`
+sweep pair, the SAME recipe HOST4's `sweep_a`/`sweep_b` run for src0 alone,
+here paid for all 3 roles since this is the layer's first dispatch),
+`admit_resolve_batch` (the 3x `ggml_sycl_build_moe_resolved_batch()` calls —
+OVERLAPS HOST5's `resolve_inner`/`resolve_outer`/`resolve_memo_hit`, which
+measure only what happens *inside* that call; this bracket is the superset
+including per-call/loop overhead outside those), `admit_resolve_align`
+(`align_moe_retained_role_batches()`, expected cheap — an O(operand count)
+comparison loop, no allocation), `admit_resolve_populate` (the cache-entry
+construction, including the `ggml_sycl_moe_validate_retained_role_bundle()`
+call `d14b5bdd6` moved here from routeeval). Same running `host_phase_clock`
+as every other mark in this function, so on the common (resolve-succeeds)
+path the four sum exactly to `admit_resolve` above — same partition guarantee
+`HOST4`'s six top-level phases already give the old single `promptadmit`
+figure. A failed resolve (gate/up/down not all admitted) skips the
+`admit_resolve_align`/`admit_resolve_populate` marks; that near-zero
+condition-check overhead lands in `admit_resolve` itself rather than a named
+sub-phase.
 
 #### What `other` does and does not mean
 
