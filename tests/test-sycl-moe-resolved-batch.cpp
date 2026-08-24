@@ -447,9 +447,15 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
     CHECK(view.leases.size() == 2);
     CHECK(view.leases[0].stable_identity_equal(result.batch.operands[0].lease()));
     CHECK(view.leases[1].stable_identity_equal(result.batch.operands[2].lease()));
+    // llama.cpp-iikr (spec review fix cycle, F3): moe_batch_role_admissible's
+    // one positive case -- same already-proven-admissible batch as `view`
+    // above, so a trivial "always returns false" defect in the new function
+    // would be caught here, not just by the reject-path extensions below.
+    CHECK(ggml_sycl::moe_batch_role_admissible(result.batch, GGML_LAYOUT_SOA));
 
     auto wrong_layout = ggml_sycl::make_moe_batch_local_view(result.batch, GGML_LAYOUT_AOS);
     CHECK(!wrong_layout && wrong_layout.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
+    CHECK(!ggml_sycl::moe_batch_role_admissible(result.batch, GGML_LAYOUT_AOS));
 
     // llama.cpp-iikr (memo_hit fix, design note c-2cc8, team-lead's full-rigor
     // classification): this used to construct the conflict by relying on
@@ -495,6 +501,12 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
 
     auto conflict_view = ggml_sycl::make_moe_batch_local_view(conflicting_batch, GGML_LAYOUT_SOA);
     CHECK(!conflict_view && conflict_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
+    // llama.cpp-iikr (spec review fix cycle, F3): moe_batch_role_admissible
+    // must refuse the identical genuinely-divergent-lease conflict
+    // make_moe_batch_local_view just refused above -- same positive control
+    // (line 484's stable_identity_equal check) already proves the two
+    // leases actually differ before this assertion.
+    CHECK(!ggml_sycl::moe_batch_role_admissible(conflicting_batch, GGML_LAYOUT_SOA));
 
     // A stale same-size external/cache array cannot overwrite the admitted ID snapshot.
     int32_t mutable_ids[] = { 6, 7 };
@@ -538,6 +550,10 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     // still partition every exact occurrence instead of publishing an empty dst.
     auto fast_reject = ggml_sycl::make_moe_batch_local_view(batch.batch, GGML_LAYOUT_AOS);
     CHECK(!fast_reject && fast_reject.reject == ggml_sycl::moe_batch_reject_reason::WRONG_DEVICE);
+    // llama.cpp-iikr (spec review fix cycle, F3): mixed primary/secondary/
+    // host batch -- moe_batch_role_admissible must refuse it too (secondary
+    // and host operands fail its residency-must-be-PRIMARY_DEVICE check).
+    CHECK(!ggml_sycl::moe_batch_role_admissible(batch.batch, GGML_LAYOUT_AOS));
     size_t primary_count = 0, secondary_count = 0, host_count = 0;
     for (size_t slot = 0; slot < 3; ++slot) {
         const auto * operand = batch.batch.occurrence(0, slot);
@@ -553,6 +569,9 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     // A selected local fast path must fail preflight when the admitted layout differs.
     auto layout_miss = ggml_sycl::make_moe_batch_local_view(batch.batch, GGML_LAYOUT_SOA);
     CHECK(!layout_miss && layout_miss.reject == ggml_sycl::moe_batch_reject_reason::LAYOUT_MISMATCH);
+    // llama.cpp-iikr (spec review fix cycle, F3): same admitted-layout
+    // mismatch, moe_batch_role_admissible side.
+    CHECK(!ggml_sycl::moe_batch_role_admissible(batch.batch, GGML_LAYOUT_SOA));
 
     // Same expert ID with a changed stable identity is not groupable.
     // llama.cpp-iikr (memo_hit fix, design note c-2cc8, team-lead's full-rigor
@@ -593,6 +612,11 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
 
     auto drift_view = ggml_sycl::make_moe_batch_local_view(drift_batch, GGML_LAYOUT_AOS);
     CHECK(!drift_view && drift_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
+    // llama.cpp-iikr (spec review fix cycle, F3): same species as the
+    // conflict_view fixture above, moe_batch_role_admissible side -- the
+    // positive control at line 582 already proves the two leases genuinely
+    // differ before this assertion.
+    CHECK(!ggml_sycl::moe_batch_role_admissible(drift_batch, GGML_LAYOUT_AOS));
     return true;
 }
 

@@ -67369,8 +67369,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             } else if (src0 == roles.down.weight_identity) {
                 reuse_role = &roles.down;
             }
-            if (reuse_role && (reuse_role->batch.operands.empty() ||
-                               reuse_role->batch.operands.front().actual_layout() != retained_prompt_layout)) {
+            // llama.cpp-iikr (spec review fix cycle, F4): compare against
+            // requested_layout, not an operand's actual_layout() -- the
+            // exact conflation ab38287d5 eliminated at mechanism 1's own
+            // reuse probe (see that field's comment in moe-resolved-batch.hpp
+            // for why the two are not interchangeable: actual_layout() is a
+            // per-expert resolver OUTPUT that can legitimately diverge from
+            // the tensor-level layout this role was actually built at).
+            if (reuse_role &&
+                (reuse_role->batch.operands.empty() || reuse_role->requested_layout != retained_prompt_layout)) {
                 reuse_role = nullptr;
             }
         }
@@ -75958,8 +75965,17 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         moe_routing_device_trace_enabled &&
         (dst->op == GGML_OP_MUL_MAT || dst->op == GGML_OP_SOFT_MAX || dst->op == GGML_OP_ARGSORT) &&
         ggml_sycl_op_is_moe_routing_subgraph(dst);
-    const bool dispatch_to_cpu_decision = should_dispatch_to_cpu(ctx, dst);
+    // llama.cpp-iikr (spec review fix cycle, F1): should_dispatch_to_cpu()
+    // used to be hoisted out of the short-circuit below into an
+    // unconditional call on this line, so it ran for every node during
+    // ordinary graph recording too (side effects: g_last_dispatch memo,
+    // lazy g_layer_on_cpu classification, diagnostics budget) -- the
+    // dispatch-site call is restored to its original short-circuited form
+    // just below, and the trace gets its OWN call, gated behind
+    // moe_routing_branch_trace_this_node so it only ever fires when the
+    // opt-in trace env var is set and this node is MoE-routing-hinted.
     if (moe_routing_branch_trace_this_node) {
+        const bool              dispatch_to_cpu_decision = should_dispatch_to_cpu(ctx, dst);
         static std::atomic<int> branch_trace_count{ 0 };
         const int               idx = branch_trace_count.fetch_add(1, std::memory_order_relaxed);
         if (idx < 256) {
@@ -75967,7 +75983,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                     dst->name ? dst->name : "?", ggml_op_name(dst->op), dispatch_to_cpu_decision ? 1 : 0);
         }
     }
-    if (!ggml_sycl_graph_dispatch_recording_active(&ctx) && dispatch_to_cpu_decision &&
+    if (!ggml_sycl_graph_dispatch_recording_active(&ctx) && should_dispatch_to_cpu(ctx, dst) &&
         !(ggml_sycl_hybrid_dispatch_enabled() && should_force_gpu_dispatch(dst))) {
         if (ggml_sycl_compute_forward_cpu(ctx, dst)) {
             if (moe_routing_branch_trace_this_node) {

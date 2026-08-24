@@ -38,11 +38,18 @@ extern int g_ggml_sycl_debug;
 // review flagged this as a heap allocation, never quantified). Declared here,
 // not in ggml-sycl.cpp's mxfp4_pp_batched_profile_accum, because this header
 // is included before that struct is defined in the same translation unit --
-// referencing it here would not compile. Unconditional measurement (two cheap
-// chrono calls per loop iteration, negligible next to a map construction) so
-// this header carries no dependency on ggml-sycl.cpp's profiling-enabled
-// check; ggml-sycl.cpp's print_and_reset drains these via exchange(0) and
-// folds them into its own report only when ITS OWN gate is on.
+// referencing it here would not compile. ggml-sycl.cpp's print_and_reset
+// drains these via exchange(0) and folds them into its own report.
+// llama.cpp-iikr (spec review fix cycle, F2): the bracket at its call site
+// used to be unconditional -- two clock reads plus two atomic fetch_adds on
+// EVERY oneDNN 2-D GEMM execute, including the default (non-profiled) path
+// -- on the theory that this header had no dependency-free way to check
+// whether profiling was on. That's no longer true: sycl-kernel-profiler.hpp,
+// already included above, exposes ggml_sycl_kernel_profile_enabled() for
+// exactly this purpose (see ggml_sycl_profile_submit_impl's own use of it in
+// that header for the idiom this bracket now follows), so it is gated like
+// every other instrument in the family instead of carrying its own
+// independent no-gate rationale.
 namespace ggml_sycl_gemm_profile {
 // Nanoseconds, not microseconds-as-double: std::atomic<double>::fetch_add is
 // a C++20 addition and this TU does not build with it. An integral atomic
@@ -1230,12 +1237,14 @@ class DnnlGemmWrapper {
             auto s_mem_b = dnnl::memory(s_md_2d, eng, const_cast<uint8_t *>(bs_b));
             auto c_mem_b = dnnl::memory(c_md_2d, eng, c_b);
 
-            // llama.cpp-iikr (unphased-host-time cycle): bracket the fresh
+            // llama.cpp-iikr (spec review fix cycle, F2): bracket the fresh
             // per-iteration map construction team-lead named as a bisection
             // candidate -- see ggml_sycl_gemm_profile's declaration comment
-            // above for why this is unconditional and drained by exchange(0)
-            // rather than gated on ggml-sycl.cpp's profiling flag.
-            const auto                            args_map_t0 = std::chrono::high_resolution_clock::now();
+            // above for the gating rationale (updated from the original
+            // unconditional design).
+            const bool args_map_profile_enabled = ggml_sycl_kernel_profile_enabled();
+            const auto args_map_t0              = args_map_profile_enabled ? std::chrono::high_resolution_clock::now() :
+                                                                             std::chrono::high_resolution_clock::time_point{};
             std::unordered_map<int, dnnl::memory> args;
             args.insert({ DNNL_ARG_SRC, a_mem_b });
             args.insert({ DNNL_ARG_WEIGHTS, b_mem_b });
@@ -1248,7 +1257,7 @@ class DnnlGemmWrapper {
                 }
                 args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
-            {
+            if (args_map_profile_enabled) {
                 const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::high_resolution_clock::now() - args_map_t0)
                                        .count();
