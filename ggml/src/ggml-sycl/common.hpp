@@ -99,6 +99,20 @@ private:
 };
 
 bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const char * reason);
+
+// llama.cpp-o3h1: identifies the narrow class of SYCL/UR error codes that
+// mean "driver-internal kernel-submission resource exhaustion" -- the
+// trigger for ggml_sycl_compute_forward's CPU-fallback recovery path
+// (ggml-sycl.cpp): recompute the failing op via ggml_sycl_cpu_fallback_graph()
+// instead of aborting the process. Deliberately narrow (these two codes
+// only) so a genuine correctness or driver bug elsewhere is never silently
+// treated as "handled". Kept as its own pure, header-testable function --
+// not inlined at the catch site -- so the exact code set is unit-tested
+// without needing a live sycl::exception to construct.
+inline bool ggml_sycl_is_resource_exhaustion_error_code(int code) {
+    return code == 39 /* UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY */ || code == 40 /* UR_RESULT_ERROR_OUT_OF_RESOURCES */;
+}
+
 struct ggml_sycl_device_info;
 const ggml_sycl_device_info & ggml_sycl_info();
 

@@ -76688,6 +76688,78 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     if (g_ggml_sycl_graph_recording) {
         throw;
     }
+    // llama.cpp-o3h1: a narrow class of sycl::exception is a DRIVER-INTERNAL
+    // kernel-submission resource exhaustion (UR_RESULT_ERROR_OUT_OF_
+    // RESOURCES / UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY -- observed as error
+    // 40 on FLASH_ATTN_EXT/MUL_MAT_ID dispatch on a near-full device; design
+    // doc in ticket comment c-2195). No ggml-level allocation is at fault --
+    // unified_allocate_owner()'s own buffer requests already fail gracefully
+    // (return a structured error, never throw), so there is no allocation to
+    // retry here.
+    //
+    // DELIBERATELY NO RETRY before falling to CPU (owner/lead ruling on this
+    // ticket, c-qd5q/c-r0tn): this failure is not transient. Driver scratch
+    // exhaustion is a deterministic function of the kernel's spill/private
+    // memory requirements against remaining free VRAM -- an immediate
+    // resubmission faces the identical condition and fails identically, so a
+    // retry rung here would be dead code wearing a safety feature's name.
+    // (A bounded, single retry-after-drain was considered and rejected for
+    // exactly this reason, not for churn-avoidance.) The honest ladder is
+    // straight to CPU re-place, with a clean failure as the floor.
+    //
+    // What IS available and safe even mid-graph_compute is
+    // ggml_sycl_cpu_fallback_graph(): it stages this op's (and its
+    // ancestors') device-resident inputs to host and recomputes dst through
+    // ggml's ordinary CPU backend, so the current token still completes
+    // correctly instead of the whole process aborting. No mid-graph_compute
+    // weight eviction is attempted or needed here -- unified_cache::evict*
+    // correctly refuses while g_graph_compute_active is set (a live kernel
+    // may still dereference memory an eviction would free -> DEVICE_LOST),
+    // and this recovery path never touches that machinery. Kept narrow to
+    // these two specific error codes -- not a blanket catch -- so a genuine
+    // correctness or driver bug elsewhere still hits the unchanged exit(1)
+    // path below rather than being silently treated as "handled".
+    static thread_local bool in_resource_exhaustion_fallback = false;
+    if (ggml_sycl_is_resource_exhaustion_error_code(e.code().value()) && !in_resource_exhaustion_fallback) {
+        // CPU fallback is not neutral -- a fleet of silent fallbacks would
+        // masquerade as a healthy fast run and surface only as a later perf
+        // mystery. Log at WARN (visible at default verbosity; GGML_LOG_INFO
+        // is dropped there, see CLAUDE.md's log-level trap) with the op
+        // identity and the budget authority's numbers for this device so the
+        // pressure condition that triggered it is diagnosable from the log
+        // alone, not just "something recovered".
+        auto *       fallback_cache        = ggml_sycl::get_unified_cache_for_device(ctx.device);
+        const int    budget_pct_at_failure = fallback_cache ? fallback_cache->budget_pct() : -1;
+        const double budget_mb_at_failure  = fallback_cache ? fallback_cache->base_budget() / (1024.0 * 1024.0) : -1.0;
+        const double headroom_mb_at_failure =
+            fallback_cache ? fallback_cache->external_headroom() / (1024.0 * 1024.0) : -1.0;
+        GGML_LOG_WARN(
+            "[SYCL] kernel submission resource exhaustion on op=%s device=%d (%s) -- budget_pct=%d budget=%.1f MB "
+            "external_headroom=%.1f MB -- attempting CPU fallback instead of aborting\n",
+            ggml_op_name(dst->op), ctx.device, e.what(), budget_pct_at_failure, budget_mb_at_failure,
+            headroom_mb_at_failure);
+        // Guards against the (should-not-happen -- CPU compute touches no
+        // GPU queue) case of the fallback graph itself re-entering this same
+        // catch recursively; cheap defense-in-depth against an infinite loop.
+        in_resource_exhaustion_fallback = true;
+        bool recovered                  = false;
+        try {
+            recovered = ggml_sycl_cpu_fallback_graph(ctx, dst, "kernel submission resource exhaustion");
+        } catch (...) {
+            recovered = false;
+        }
+        in_resource_exhaustion_fallback = false;
+        if (recovered) {
+            GGML_LOG_WARN("[SYCL] op=%s device=%d recovered via CPU fallback after resource exhaustion\n",
+                          ggml_op_name(dst->op), ctx.device);
+            return true;
+        }
+        GGML_LOG_ERROR(
+            "[SYCL] CPU fallback also failed for op=%s device=%d after resource exhaustion; failing this graph "
+            "cleanly (no process abort)\n",
+            ggml_op_name(dst->op), ctx.device);
+        throw ggml_sycl_fallback_error("kernel submission resource exhaustion, CPU fallback also failed");
+    }
     std::cerr << e.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::cerr << "Error OP " << ggml_op_name(dst->op) << std::endl;
     ggml_sycl_dump_error_tensor_meta(dst);

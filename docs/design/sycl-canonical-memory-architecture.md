@@ -722,6 +722,38 @@ This contract does not govern:
 4. **Host-side ggml tensor `.data` allocation** — CPU tensors backed by normal
    `malloc` are not SYCL-managed and are outside this contract.
 
+5. **Driver-internal kernel-submission resource exhaustion** (llama.cpp-o3h1)
+   — the Level Zero / UR runtime allocates its own device-memory scratch
+   lazily at kernel creation/first submission (command-list state,
+   kernel-argument staging, spill/private memory sized from a kernel's
+   queried requirements × concurrent HW threads). This allocation happens
+   *inside* `sycl::queue::submit`/`parallel_for`, is never a ggml buffer, and
+   the unified cache cannot own, size as a zone, or route it through
+   `unified_alloc` — there is nothing to intercept before the driver commits
+   to it. The budget authority (§ single-authority design,
+   `docs/backend/sycl-memory-design.md`) reserves headroom *for* this need,
+   but reservation is not ownership, and no offline-chosen headroom constant
+   is provably sufficient against an unqueried, driver/version/workload-
+   dependent requirement.
+   **This failure mode is nonetheless a HANDLED state, not a crash.** When a
+   kernel submission throws `sycl::exception` with `UR_RESULT_ERROR_OUT_OF_
+   RESOURCES` (40) or `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (39) — narrowly,
+   not any other exception, so a genuine correctness or driver bug is never
+   silently masked — `ggml_sycl_compute_forward`'s catch block
+   (`ggml-sycl.cpp`) recomputes that one op via `ggml_sycl_cpu_fallback_graph`
+   (stages the op's device-resident ancestor tensors to host and runs it
+   through ggml's ordinary CPU backend) instead of aborting the process. If
+   that also fails, the graph fails cleanly via the existing
+   `ggml_sycl_fallback_error` → `ggml_backend_sycl_graph_compute` contract
+   (`GGML_STATUS_FAILED`, not `exit(1)`) rather than terminating the process.
+   No mid-`graph_compute` weight eviction is attempted as part of this
+   recovery: `unified_cache::evict`/`evict_one`/`evict_and_flush` correctly
+   refuse while `g_graph_compute_active` is set (freeing VRAM a live kernel
+   may still dereference via its expert pointer table is a DEVICE_LOST
+   hazard, not a resource-exhaustion fix) — this recovery path relies only on
+   host-staging inputs already resolvable from their current (possibly
+   device) locations, never on reclaiming device memory mid-dispatch.
+
 ---
 
 ## 9. Temporary Allowlists (Migration Inventory)

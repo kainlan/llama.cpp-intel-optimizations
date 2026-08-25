@@ -1232,10 +1232,20 @@ This closes the single-authority half of the design the failure required.
 The other half — making a still-insufficient budget a *handled* runtime
 state instead of a crash, since no offline-chosen headroom constant can be
 proven sufficient against an unqueried, driver/version/workload-dependent
-kernel-submission requirement — is `mem_handle`-internal allocation recovery
-and a narrow submission-time catch, tracked in the same ticket
-(`llama.cpp-o3h1`) as a second commit; see the canonical contract's §8 for
-that half once it lands.
+kernel-submission requirement — lands in the same ticket's second commit:
+investigation found the ggml-level evict/retry/tier-fallback machinery
+already substantially exists (`unified_cache::ensure_cached()`'s weight-cache
+eviction loop; `unified_alloc()`'s VRAM-pressure guard and zone-full
+fallthrough for `RUNTIME`/`SCRATCH`/`KV` requests — the exact path
+`FLASH_ATTN_EXT`/`MUL_MAT_ID` scratch buffers go through), correctly gated
+off during `graph_compute_impl` (evicting VRAM a live kernel may still
+reference is a `DEVICE_LOST` hazard, not a fix — see canonical contract §8.5).
+The genuinely missing piece was narrower: a driver-internal kernel-submission
+failure (§8.5) now triggers a per-op CPU-fallback recompute
+(`ggml_sycl_cpu_fallback_graph`) instead of aborting, falling through to the
+existing `ggml_sycl_fallback_error` → `GGML_STATUS_FAILED` clean-failure
+contract if that also fails. See canonical contract §8.5 for the full
+mechanism.
 
 ## Path-scoped zone sizing
 

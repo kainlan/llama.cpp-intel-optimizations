@@ -1738,8 +1738,42 @@ static bool run_vram_budget_authority_test() {
     return true;
 }
 
+// llama.cpp-o3h1 commit 2: ggml_sycl_is_resource_exhaustion_error_code()
+// (common.hpp) is the exact predicate that decides whether
+// ggml_sycl_compute_forward's catch block attempts the CPU-fallback recovery
+// (true) or falls through to the unchanged exit(1) path (false) -- pure
+// logic, no device needed, so every code that matters is exercised directly
+// rather than trusting the two-line inline check by inspection.
+static bool run_resource_exhaustion_error_code_test() {
+    // The two codes the recovery path must catch.
+    if (!ggml_sycl_is_resource_exhaustion_error_code(39)) {
+        printf("FAIL: error code 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY) should trigger CPU fallback\n");
+        return false;
+    }
+    if (!ggml_sycl_is_resource_exhaustion_error_code(40)) {
+        printf("FAIL: error code 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES) should trigger CPU fallback\n");
+        return false;
+    }
+    // Neighboring/unrelated codes must NOT trigger it -- this is the
+    // narrowness guarantee that keeps a genuine correctness or driver bug
+    // from being silently treated as "handled". 0 is the conventional
+    // "no error" sentinel and must never match.
+    const int must_not_match[] = { 0, 1, 38, 41, -1, 1000 };
+    for (int code : must_not_match) {
+        if (ggml_sycl_is_resource_exhaustion_error_code(code)) {
+            printf("FAIL: error code %d must NOT trigger CPU fallback (narrowness guarantee), but it did\n", code);
+            return false;
+        }
+    }
+    printf("PASS: resource-exhaustion error code predicate is narrow and exact\n");
+    return true;
+}
+
 int main() {
     if (!run_fused_gate_up_role_test()) {
+        return 1;
+    }
+    if (!run_resource_exhaustion_error_code_test()) {
         return 1;
     }
     if (!run_vram_budget_authority_test()) {
