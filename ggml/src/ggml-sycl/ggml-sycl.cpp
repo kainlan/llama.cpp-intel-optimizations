@@ -40116,6 +40116,114 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 #endif
 }
 
+// llama.cpp-o3h1 commit 3: shared clean-failure ladder for a driver-internal
+// kernel-submission resource-exhaustion exception, callable from ANY catch
+// site in the op-dispatch path -- not just ggml_sycl_compute_forward's own
+// top-level catch. Extracted after the forced-pressure exercise (ticket
+// comment c-aolj) proved commit 2's ladder incomplete: a SECOND, unguarded
+// catch inside ggml_sycl_mul_mat_id intercepted the identical exception
+// class before the top-level handler ever saw it and printed-then-hung in
+// teardown via std::exit(1) instead of failing cleanly. Every call site
+// below routes through this ONE implementation instead of a local copy.
+//
+// Call from WITHIN an active catch block (`catch (const sycl::exception &
+// e)` or `catch (const std::exception & e)` -- see the std::exception
+// overload below; sycl::exception derives from std::exception, so a broad
+// catch at a boundary must route through this too, not just a sycl::exception
+// -typed one). A bare `throw;` inside this function validly rethrows the
+// exception the CALLER is currently handling: rethrow is scoped to the
+// dynamic extent of the handler, not lexically to the immediate catch block,
+// so it works correctly across this function-call boundary.
+//
+// Returns:
+//   - true  : the op was recovered via CPU fallback. The op is complete;
+//             the caller should return (its own void/bool "success" idiom).
+//   - false : NOT a resource-exhaustion code (or the re-entrancy guard was
+//             already held). The caller MUST fall through to its own
+//             ORIGINAL, site-specific disposition for `e`, UNCHANGED --
+//             this function never alters behavior for a non-matching
+//             exception, so a genuine correctness/driver bug is never
+//             silently masked as "handled" (property preserved from commit
+//             2: non-matching exceptions keep their original paths
+//             bit-for-bit).
+// Never returns for the "matching but unrecoverable" case: throws
+// ggml_sycl_fallback_error, which every level between here and
+// ggml_backend_sycl_graph_compute()'s top-level handler passes straight
+// through un-swallowed (ggml_sycl_compute_forward already special-cases it
+// first via `catch (const ggml_sycl_fallback_error &) { throw; }`, ahead of
+// its own sycl::exception/std::exception catches).
+static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                                ggml_tensor *               dst,
+                                                                const sycl::exception &     e) {
+    if (g_ggml_sycl_graph_recording) {
+        // Graph recording can't run a CPU fallback graph mid-record; let the
+        // outer graph-recording handler gracefully disable graphs and fall
+        // back to direct execution instead (unchanged from commit 2).
+        throw;
+    }
+    if (!ggml_sycl_is_resource_exhaustion_error_code(e.code().value())) {
+        return false;
+    }
+    // Single re-entrancy guard shared by every call site (this function has
+    // exactly one instance regardless of how many places call it) -- defends
+    // against the CPU fallback graph itself somehow re-entering this same
+    // ladder recursively. Should not happen (CPU compute touches no GPU
+    // queue), but cheap insurance against an infinite loop.
+    static thread_local bool in_resource_exhaustion_fallback = false;
+    if (in_resource_exhaustion_fallback) {
+        return false;
+    }
+
+    auto *       fallback_cache        = ggml_sycl::get_unified_cache_for_device(ctx.device);
+    const int    budget_pct_at_failure = fallback_cache ? fallback_cache->budget_pct() : -1;
+    const double budget_mb_at_failure  = fallback_cache ? fallback_cache->base_budget() / (1024.0 * 1024.0) : -1.0;
+    const double headroom_mb_at_failure =
+        fallback_cache ? fallback_cache->external_headroom() / (1024.0 * 1024.0) : -1.0;
+    GGML_LOG_WARN(
+        "[SYCL] kernel submission resource exhaustion on op=%s device=%d (%s) -- budget_pct=%d budget=%.1f MB "
+        "external_headroom=%.1f MB -- attempting CPU fallback instead of aborting\n",
+        dst ? ggml_op_name(dst->op) : "(null)", ctx.device, e.what(), budget_pct_at_failure, budget_mb_at_failure,
+        headroom_mb_at_failure);
+
+    in_resource_exhaustion_fallback = true;
+    bool recovered                  = false;
+    try {
+        recovered = ggml_sycl_cpu_fallback_graph(ctx, dst, "kernel submission resource exhaustion");
+    } catch (...) {
+        recovered = false;
+    }
+    in_resource_exhaustion_fallback = false;
+
+    if (recovered) {
+        GGML_LOG_WARN("[SYCL] op=%s device=%d recovered via CPU fallback after resource exhaustion\n",
+                      dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
+        return true;
+    }
+    GGML_LOG_ERROR(
+        "[SYCL] CPU fallback also failed for op=%s device=%d after resource exhaustion; failing this graph "
+        "cleanly (no process abort)\n",
+        dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
+    throw ggml_sycl_fallback_error("kernel submission resource exhaustion, CPU fallback also failed");
+}
+
+// Overload for catch sites that (correctly, per commit 2 precedent in
+// ggml_sycl_mul_mat_batched_sycl) only catch the broader std::exception --
+// e.g. because the try block can also throw dnnl::error or std::bad_alloc.
+// sycl::exception is-a std::exception, so use RTTI to recover the derived
+// type; a non-sycl::exception (dnnl::error, std::bad_alloc, ...) is by
+// definition not this narrow driver-resource-exhaustion class, so it
+// returns false immediately and the caller's original disposition for it
+// is unchanged.
+static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                                ggml_tensor *               dst,
+                                                                const std::exception &      e) {
+    const sycl::exception * as_sycl_exc = dynamic_cast<const sycl::exception *>(&e);
+    if (!as_sycl_exc) {
+        return false;
+    }
+    return ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, *as_sycl_exc);
+}
+
 // TBD pool with virtual memory management
 // struct ggml_sycl_pool_vmm : public ggml_sycl_pool
 /// kernels
@@ -45740,6 +45848,9 @@ static void ggml_sycl_mul_mat_vec_p021(ggml_backend_sycl_context & ctx,
     ggml_mul_mat_p021_f16_f32_sycl(src0_ddq, src1_ddf, dst_ddf, ne00, ne01, ne02, ne12, main_stream);
 
 } catch (const sycl::exception & exc) {
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
+        return;
+    }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }
@@ -45779,6 +45890,9 @@ static void ggml_sycl_mul_mat_vec_nc(ggml_backend_sycl_context & ctx,
 
                                      channel_stride_x, channel_stride_y, main_stream);
 } catch (const sycl::exception & exc) {
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
+        return;
+    }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
 
     std::exit(1);
@@ -59545,6 +59659,14 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             try {
                 ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
             } catch (const std::exception & e) {
+                // ggml_sycl_mul_mat_batched_sycl deliberately re-throws
+                // sycl::exception "for callers that have eviction-retry
+                // logic" (see its own catch comment) -- this is that
+                // caller; give it the real ladder instead of an unconditional
+                // abort.
+                if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, e)) {
+                    return;
+                }
                 GGML_LOG_ERROR("[SYCL] oneDNN batched mul_mat failed: %s\n", e.what());
                 GGML_ABORT(
                     "[SYCL] batched F16 mul_mat failed — likely VRAM exhaustion. "
@@ -59577,7 +59699,18 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                     // multi-GPU VRAM should not demote PP attention work to a
                     // CPU graph just because oneDNN rejected a descriptor.
                     if (!ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst)) {
-                        // Scalar GPU fallback also failed — last resort diagnostics.
+                        // Scalar GPU fallback also failed. It swallows its own
+                        // exception internally (returns bool only), so the
+                        // only exception object available here is still `e`
+                        // from the batched_sycl attempt above -- reused as a
+                        // proxy for the scalar fallback's failure too, which
+                        // is reasonable: both ran back-to-back against the
+                        // same unchanged device memory-pressure condition, so
+                        // the root cause is the same driver-resource state.
+                        if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, e)) {
+                            return;
+                        }
+                        // Last resort diagnostics.
                         size_t free_vram = 0, total_vram = 0;
                         ggml_backend_sycl_get_device_memory(ctx.device, &free_vram, &total_vram);
                         fprintf(stderr,
@@ -74717,10 +74850,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         GGML_SYCL_DEBUG("[MOE-UNPIN] Layer %d: Unpinned routed experts\n", layer_id);
     }
 } catch (const sycl::exception & exc) {
-    // During graph recording, re-throw so the outer handler can
-    // gracefully disable graphs and fall back to direct execution.
-    if (g_ggml_sycl_graph_recording) {
-        throw;
+    // llama.cpp-o3h1 commit 3 (ticket c-aolj): this WAS the second,
+    // unguarded catch site that intercepted a driver-internal
+    // kernel-submission resource-exhaustion exception before commit 2's
+    // top-level handler in ggml_sycl_compute_forward ever saw it, then
+    // printed and hung in teardown via std::exit(1). The shared helper
+    // (rethrows during graph recording, same as before; runs the same
+    // CPU-fallback/clean-failure ladder as the top-level handler for the
+    // matching error codes; returns false unchanged for everything else)
+    // replaces the ad hoc graph-recording check that used to live here.
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
+        return;
     }
     const ggml_tensor * src0 = dst ? dst->src[0] : nullptr;
     const ggml_tensor * src1 = dst ? dst->src[1] : nullptr;
@@ -76683,82 +76823,21 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     ggml_sycl_dump_error_tensor_meta(dst);
     std::exit(1);
 } catch (sycl::exception & e) {
-    // During graph recording, re-throw so the outer handler can
-    // gracefully disable graphs and fall back to direct execution.
-    if (g_ggml_sycl_graph_recording) {
-        throw;
-    }
-    // llama.cpp-o3h1: a narrow class of sycl::exception is a DRIVER-INTERNAL
-    // kernel-submission resource exhaustion (UR_RESULT_ERROR_OUT_OF_
-    // RESOURCES / UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY -- observed as error
-    // 40 on FLASH_ATTN_EXT/MUL_MAT_ID dispatch on a near-full device; design
-    // doc in ticket comment c-2195). No ggml-level allocation is at fault --
-    // unified_allocate_owner()'s own buffer requests already fail gracefully
-    // (return a structured error, never throw), so there is no allocation to
-    // retry here.
-    //
-    // DELIBERATELY NO RETRY before falling to CPU (owner/lead ruling on this
-    // ticket, c-qd5q/c-r0tn): this failure is not transient. Driver scratch
-    // exhaustion is a deterministic function of the kernel's spill/private
-    // memory requirements against remaining free VRAM -- an immediate
-    // resubmission faces the identical condition and fails identically, so a
-    // retry rung here would be dead code wearing a safety feature's name.
-    // (A bounded, single retry-after-drain was considered and rejected for
-    // exactly this reason, not for churn-avoidance.) The honest ladder is
-    // straight to CPU re-place, with a clean failure as the floor.
-    //
-    // What IS available and safe even mid-graph_compute is
-    // ggml_sycl_cpu_fallback_graph(): it stages this op's (and its
-    // ancestors') device-resident inputs to host and recomputes dst through
-    // ggml's ordinary CPU backend, so the current token still completes
-    // correctly instead of the whole process aborting. No mid-graph_compute
-    // weight eviction is attempted or needed here -- unified_cache::evict*
-    // correctly refuses while g_graph_compute_active is set (a live kernel
-    // may still dereference memory an eviction would free -> DEVICE_LOST),
-    // and this recovery path never touches that machinery. Kept narrow to
-    // these two specific error codes -- not a blanket catch -- so a genuine
-    // correctness or driver bug elsewhere still hits the unchanged exit(1)
-    // path below rather than being silently treated as "handled".
-    static thread_local bool in_resource_exhaustion_fallback = false;
-    if (ggml_sycl_is_resource_exhaustion_error_code(e.code().value()) && !in_resource_exhaustion_fallback) {
-        // CPU fallback is not neutral -- a fleet of silent fallbacks would
-        // masquerade as a healthy fast run and surface only as a later perf
-        // mystery. Log at WARN (visible at default verbosity; GGML_LOG_INFO
-        // is dropped there, see CLAUDE.md's log-level trap) with the op
-        // identity and the budget authority's numbers for this device so the
-        // pressure condition that triggered it is diagnosable from the log
-        // alone, not just "something recovered".
-        auto *       fallback_cache        = ggml_sycl::get_unified_cache_for_device(ctx.device);
-        const int    budget_pct_at_failure = fallback_cache ? fallback_cache->budget_pct() : -1;
-        const double budget_mb_at_failure  = fallback_cache ? fallback_cache->base_budget() / (1024.0 * 1024.0) : -1.0;
-        const double headroom_mb_at_failure =
-            fallback_cache ? fallback_cache->external_headroom() / (1024.0 * 1024.0) : -1.0;
-        GGML_LOG_WARN(
-            "[SYCL] kernel submission resource exhaustion on op=%s device=%d (%s) -- budget_pct=%d budget=%.1f MB "
-            "external_headroom=%.1f MB -- attempting CPU fallback instead of aborting\n",
-            ggml_op_name(dst->op), ctx.device, e.what(), budget_pct_at_failure, budget_mb_at_failure,
-            headroom_mb_at_failure);
-        // Guards against the (should-not-happen -- CPU compute touches no
-        // GPU queue) case of the fallback graph itself re-entering this same
-        // catch recursively; cheap defense-in-depth against an infinite loop.
-        in_resource_exhaustion_fallback = true;
-        bool recovered                  = false;
-        try {
-            recovered = ggml_sycl_cpu_fallback_graph(ctx, dst, "kernel submission resource exhaustion");
-        } catch (...) {
-            recovered = false;
-        }
-        in_resource_exhaustion_fallback = false;
-        if (recovered) {
-            GGML_LOG_WARN("[SYCL] op=%s device=%d recovered via CPU fallback after resource exhaustion\n",
-                          ggml_op_name(dst->op), ctx.device);
-            return true;
-        }
-        GGML_LOG_ERROR(
-            "[SYCL] CPU fallback also failed for op=%s device=%d after resource exhaustion; failing this graph "
-            "cleanly (no process abort)\n",
-            ggml_op_name(dst->op), ctx.device);
-        throw ggml_sycl_fallback_error("kernel submission resource exhaustion, CPU fallback also failed");
+    // llama.cpp-o3h1 commit 3: this used to be the ONLY copy of the
+    // resource-exhaustion ladder (graph-recording rethrow, narrow error-code
+    // predicate, CPU-fallback-via-ggml_sycl_cpu_fallback_graph, clean failure
+    // via ggml_sycl_fallback_error) -- ticket c-aolj's forced-pressure
+    // exercise found a SECOND, unguarded catch site (ggml_sycl_mul_mat_id)
+    // that could intercept the identical exception class before this handler
+    // ever ran it. Rather than hand-copy the ladder to every such site, it
+    // is now the ONE shared ggml_sycl_try_dispatch_resource_exhaustion_fallback()
+    // (defined above ggml_sycl_cpu_fallback_graph); this handler is simply
+    // its first caller. See that function's comment for the full design
+    // rationale (originally documented inline here) and c-2195/c-qd5q/c-r0tn
+    // for the owner ruling this implements (no retry-before-CPU; straight to
+    // CPU re-place with clean failure as the floor).
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, e)) {
+        return true;
     }
     std::cerr << e.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::cerr << "Error OP " << ggml_op_name(dst->op) << std::endl;
