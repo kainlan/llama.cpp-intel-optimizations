@@ -1175,23 +1175,33 @@ static inline mxfp4_grouped_dpas_decision ggml_sycl_select_mxfp4_grouped_dpas(co
 // graph-layout selector's XMX_TILED completeness probes then fail on their own
 // and demote to SOA without a second policy site); (b) the fused pair-GLU PP
 // executor declines admission so dispatch reaches the batched call site; (c)
-// the batched executor itself is enabled. GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED
-// overrides (0 = off, nonzero = on); unset selects the built-in default below,
-// currently OFF pending the interleaved per-card A/B ruling (llama.cpp-dboi).
-// When that ruling lands, the default arm is where a per-card table goes
-// (thread device identity through the caller at that point).
+// the batched executor itself is enabled.
+//
+// llama.cpp-iikr: OWNER RULING (2026-08-25, ticket comment c-mnd7) FLIPPED
+// this to default-ON on BOTH cards. The interleaved per-card A/B this
+// comment used to say was pending is done: the o3h1 chain
+// (llama.cpp-o3h1, 9c16dc878..4f3b70d75) made a genuinely clean-host
+// certification possible for the first time, and on a clean host the
+// DEFAULT (non-batched) arm collapses to ~130 pp512 (B50) / ~515 (B70) --
+// the old ~894/~1415 baselines this decision used to compare against were
+// themselves measured with codescout's embedder secretly resident on the
+// B50 (the exact masking bug class o3h1 fixed, recurring one layer up;
+// default-route collapse filed separately as llama.cpp-9klr, P2, NOT
+// fixed by this flip). Against that same clean host, the batched arm
+// certifies B50 pp512=871.43±15.59 tg128=33.68±0.16 (best-ever tg) and
+// B70 pp512=1730.68±31.40 tg128=40.85±1.15 -- a 6.7x win over today's
+// actual (collapsed) default, on both cards, not just one. There is no
+// longer a per-card split to thread a device identity through.
+// GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0 opts out (matches this file's
+// other default-ON flags, e.g. ggml_sycl_onednn_pp_enabled() in
+// ggml-sycl.cpp); any other value, or the var unset, stays on the batched
+// route.
 static inline bool ggml_sycl_moe_pp_onednn_batched_route_selected() {
-    static const int env_state = [] {
+    static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED");
-        if (env == nullptr) {
-            return -1;
-        }
-        return std::atoi(env) != 0 ? 1 : 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
-    if (env_state >= 0) {
-        return env_state == 1;
-    }
-    return false;
+    return enabled;
 }
 
 static inline mxfp4_moe_layout_decision ggml_sycl_select_mxfp4_moe_layout(const XMXCapabilities & caps,

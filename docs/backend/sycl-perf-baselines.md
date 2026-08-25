@@ -107,6 +107,33 @@ Each rule below cost a round of discarded measurements.
 
 ## Current baselines — GPT-OSS 20B MXFP4, FA-on
 
+⚠️ **OWNER RULING 2026-08-25 (llama.cpp-iikr, ticket comment c-mnd7): the
+oneDNN-batched MoE PP arm (`GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED`) is now the
+DEFAULT on BOTH cards.** `=0` opts out; unset or any other value stays on the
+batched route (see `docs/backend/sycl-env-vars.md`'s row for the flag). The
+new gate, certified clean-host (o3h1 chain complete at `4f3b70d75`, zero
+co-resident tenants, PL2/status 0 pre AND post, bench-guard VALID):
+
+| Device | Arm | PP512 | TG128 |
+|---|---|---:|---:|
+| B50 (`level_zero:1`) | batched, default (this ruling) | **871.43 ± 15.59** | **33.68 ± 0.16** (best-ever tg) |
+| B70 (`level_zero:0`) | batched, default (this ruling) | **1730.68 ± 31.40** | **40.85 ± 1.15** |
+
+**The A–D table immediately below this note is KNOWN-STALE on a clean host
+and must not be gated against.** It measures the OLD default (non-batched)
+arm, which on a genuinely clean host (no co-resident GPU tenant) collapses to
+roughly ~130 PP512 (B50) / ~515 (B70) — a 6.7x-plus regression from the
+~894/~1415 this table shows. Those old numbers were never wrong measurements
+of what they measured; they were measured with codescout's OpenVINO embedder
+secretly resident on the B50 (`semantic.openvino_device=GPU.2`), the exact
+masking-bug class `llama.cpp-o3h1` fixed one layer down in the VRAM-budget
+authority, recurring here one layer up in which MoE PP arm looks fastest.
+This default-route collapse is real and is tracked separately as
+**`llama.cpp-9klr` (P2, open)** — it is NOT fixed by the batched-arm flip
+above, and the numbers below are not superseded so much as **invalidated**:
+do not use them as a regression gate for anything until `llama.cpp-9klr`
+re-measures the default arm clean and either fixes or re-documents it.
+
 **Measured 2026-07-24/25.** Build `ab7e79cb4` (`b12099`), branch
 `feature/sycl-b70-capability`, compute-runtime **26.27.39122.12**,
 `GGML_SYCL_F16=ON`. Command:
@@ -147,10 +174,16 @@ the evidence; full matrix and ONEDNN_VERBOSE share analysis in
 | B50 | HEAD `GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=1` (WOQ) | 426.80 ± 3.69 | 32.02 ± 0.07 |
 | B50 | HEAD policy + `GGML_SYCL_MOE_PP_WOQ=0` (f16) | error 40, `llama.cpp-rtf1` | — |
 
-These are **snapshot rows, not gates** — gate against rows A–D above. Both
-cards' WOQ arms sit at ~half their baselines (systemic, not card-specific;
-oneDNN GEMMs are only ~15 % of PP wall) — attribution tracked in
-`llama.cpp-alt6`.
+These are **snapshot rows, not gates**, and were superseded on 2026-08-25
+(llama.cpp-iikr) along with the rows they used to point at: gate the batched
+arm against the certified rows in the note at the top of this section
+(B50 871.43 ± 15.59 / 33.68 ± 0.16, B70 1730.68 ± 31.40 / 40.85 ± 1.15), not
+rows A–D (known-stale, see the same note) or the WOQ figures immediately
+above (750.36/426.80, from before the o3h1 chain's clean-host certification
+was even possible). Both cards' WOQ arms sitting at ~half their baselines
+here reflected the 2026-08-22 measurement's own conditions, not the current
+default; attribution tracked in `llama.cpp-alt6` if still relevant to
+re-derive against current numbers.
 
 D3 (same session, same protocol) adds the B70 HEAD-default row —
 **399.63 ± 0.68 / 39.36 ± 0.19** — and derives the Track E B70 flip
