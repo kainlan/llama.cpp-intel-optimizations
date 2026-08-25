@@ -283,9 +283,21 @@ static bool run_mxfp4_grouped_dpas_policy_test() {
         return false;
     }
 
-    const int32_t pp_counts[] = { 512, 512, 512, 512 };
+    // llama.cpp-e3xj (2026-08-17) raised the row-list tile default from 16 to
+    // 256 (limit = caps.N * tiles), so a fixture hardcoded against the old
+    // limit (4*512=2048 rows, limit 256) is now legitimately ACCEPTED instead
+    // of rejected -- this case silently regressed to exercising the wrong
+    // branch and nobody ran the binary to notice (llama.cpp-o3h1). Derive the
+    // fixture from the LIVE limit instead: four experts each carrying
+    // lim/4 + caps.N rows puts the total a full row tile past the limit
+    // regardless of the tile-count default or an env override, while each
+    // individual count still exceeds caps.N so the rejection is attributable
+    // to "kernel-row-limit" and not an earlier check (rows-per-expert/occupancy).
+    const size_t  pp_row_limit  = ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps);
+    const int32_t pp_per_expert = static_cast<int32_t>(pp_row_limit / 4 + caps.N);
+    const int32_t pp_counts[]   = { pp_per_expert, pp_per_expert, pp_per_expert, pp_per_expert };
     occupancy = ggml_sycl_select_mxfp4_grouped_dpas_occupancy(caps, pp_counts, sizeof(pp_counts) / sizeof(pp_counts[0]),
-                                                              ggml_sycl_mxfp4_grouped_dpas_row_list_limit(caps));
+                                                              pp_row_limit);
     if (occupancy.dispatch_ready || std::strcmp(occupancy.reason, "kernel-row-limit") != 0) {
         printf("FAIL: expected PP row-list kernel rejection, got ready=%d rows=%zu limit=%zu reason=%s\n",
                occupancy.dispatch_ready ? 1 : 0, occupancy.total_rows, occupancy.max_total_rows, occupancy.reason);
