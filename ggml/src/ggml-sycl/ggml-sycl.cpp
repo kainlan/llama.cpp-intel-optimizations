@@ -15074,60 +15074,48 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
                                          int &                       budget_pct_out,
                                          size_t &                    base_mem_out,
                                          size_t &                    free_mem_out) {
-    size_t free_mem = 0, total_mem = 0;
-    ggml_backend_sycl_get_device_memory(ctx->device, &free_mem, &total_mem);
-    const size_t raw_base_mem = total_mem > 0 ? total_mem : free_mem;
-    // Host-unified (integrated) GPUs report system RAM as "global memory" --
-    // see llama.cpp-403s and the matching adjustment in unified-cache.cpp's
-    // create_cache_for_device(), which is where the actual VRAM-arena malloc
-    // this budget feeds into happens. This call is safe here (unlike in that
-    // deadlock-sensitive path): placement-plan computation only runs during
-    // model load, well after ggml_sycl_info()'s static init has completed.
-    const bool   host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
-                              ggml_sycl_info().devices[ctx->device].host_unified_memory;
-    const size_t base_mem      = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
-    // llama.cpp-o3h1: this budget feeds weight_budget, which the placement
-    // planner uses to decide how much to pack into VRAM. unified_cache::
-    // arena_reserve() independently withholds its own external headroom
-    // (unified-cache.cpp's arena_default_external_headroom() maxed with the
-    // oneDNN batched-pipeline-aware floor from vram-headroom.hpp, typically
-    // ~1-2 GiB but uncapped on large devices where the pipeline-aware term
-    // dominates) from the same device before physically reserving the arena.
-    // Previously this was hardcoded to 0, so at GGML_SYCL_VRAM_BUDGET_PCT=100
-    // the planner was told it could fill ~the whole device while the arena
-    // silently withheld headroom on top -- over-packing the shared KV+WEIGHT
-    // zone and starving FLASH_ATTN_EXT/MUL_MAT_ID's runtime allocations at
-    // dispatch time (error 40, UR_RESULT_ERROR_OUT_OF_RESOURCES). Query the
-    // arena's MAXIMUM withholding for this device size (unified_cache_max_
-    // external_headroom(), which mirrors that same composition) so the
-    // planner never promises more than the arena will deliver. This headroom
-    // is subtracted at EVERY
-    // budget_pct, not just 100 -- e.g. on a ~15488 MB B50 it is ~1548 MB, so
-    // the post-fix default (pct=100: 15488-1548=13940 MB) lands almost
-    // exactly where the documented pct=90 workaround already sat
-    // (15488*0.9=13939 MB); pct=90 itself now nets a further ~1548 MB below
-    // that (more host offload, slower), which is expected and acceptable --
-    // the workaround's canonical env does not set pct, so it is unaffected.
-    const size_t base_headroom = ggml_sycl::unified_cache_max_external_headroom(base_mem);
-
-    int          budget_pct     = 100;
-    const char * env_budget_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
-    if (env_budget_pct) {
-        budget_pct = std::max(1, std::min(100, std::atoi(env_budget_pct)));
-    }
-
-    size_t vram_budget_base = static_cast<size_t>(base_mem * (static_cast<double>(budget_pct) / 100.0));
-    size_t vram_budget      = 0;
-    if (vram_budget_base > base_headroom) {
-        vram_budget = vram_budget_base - base_headroom;
-    }
-
     g_tiered_enabled.store(true, std::memory_order_relaxed);
 
-    vram_budget_out = vram_budget;
-    budget_pct_out  = budget_pct;
-    base_mem_out    = base_mem;
-    free_mem_out    = free_mem;
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(ctx->device, &free_mem, &total_mem);
+    free_mem_out = free_mem;
+
+    // llama.cpp-o3h1: read the published budget authority off this device's
+    // unified_cache instance instead of recomputing pct/headroom/base_mem
+    // independently. The cache is constructed before tensor-inventory/
+    // placement-plan computation ever runs ("Model loading creates caches
+    // before tensor/KV allocations"), so this is the normal path -- it makes
+    // the planner's promise (weight_budget, downstream) IDENTICAL to what the
+    // arena physically reserved, by construction, instead of two independent
+    // computations that can silently drift. That drift is not hypothetical:
+    // it is exactly what caused this ticket's RED battery item (ticket
+    // comment c-bema traces the arithmetic) -- the planner's OWN prior
+    // headroom subtraction here (unified_cache_max_external_headroom(),
+    // still used internally by the authority) never reached the site that
+    // actually governed arena_reserve()'s physical budget_bytes.
+    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+        vram_budget_out = cache->base_budget();
+        budget_pct_out  = cache->budget_pct();
+        base_mem_out    = cache->authority_base_mem();
+        return;
+    }
+
+    // Defensive fallback: no cache exists yet for this device. Should not
+    // happen on the normal model-load path (caches are constructed well
+    // before this function's caller runs); kept so an ordering assumption
+    // that is ever violated degrades to a fresh, still-single-authority
+    // computation instead of silently returning a zero budget.
+    GGML_LOG_WARN(
+        "[SYCL-BUDGET] Device %d has no unified_cache yet; computing the budget authority fresh instead of "
+        "reading a published value\n",
+        ctx->device);
+    const bool host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
+                              ggml_sycl_info().devices[ctx->device].host_unified_memory;
+    const ggml_sycl::vram_budget_authority authority = ggml_sycl::compute_vram_budget_authority(
+        host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0, /*default_pct=*/100);
+    vram_budget_out = authority.budget_bytes;
+    budget_pct_out  = authority.budget_pct;
+    base_mem_out    = authority.base_mem;
 }
 
 namespace ggml_sycl {
@@ -15252,7 +15240,24 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             }
             size_t dev_free = 0, dev_total = 0;
             ggml_backend_sycl_get_device_memory(d, &dev_free, &dev_total);
-            size_t       dev_budget  = static_cast<size_t>(dev_total * (static_cast<double>(budget_pct) / 100.0));
+            // llama.cpp-o3h1: this used to be a bare dev_total*pct/100 with NO
+            // headroom subtraction at all -- a fourth, more permissive budget
+            // formula for the multi-GPU path specifically, on top of the six
+            // single-GPU sites this ticket already consolidated. Read the
+            // per-device cache's published authority (already registered by
+            // the loop above via unified_cache_register_for_queue) instead of
+            // recomputing; fall back to a fresh authority call only if that
+            // device's cache is somehow not yet available.
+            size_t dev_budget;
+            if (ggml_sycl::unified_cache * dev_cache = ggml_sycl::get_unified_cache_for_device(d)) {
+                dev_budget = dev_cache->base_budget();
+            } else {
+                const bool dev_host_unified =
+                    (d >= 0 && d < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[d].host_unified_memory;
+                const ggml_sycl::vram_budget_authority dev_authority = ggml_sycl::compute_vram_budget_authority(
+                    dev_host_unified, dev_total, dev_free, /*free_vram_at_init_in=*/0, budget_pct);
+                dev_budget = dev_authority.budget_bytes;
+            }
             const double dense_score = ggml_sycl_dense_capability_score_for_device(d);
             budgets.push_back({ d, dev_budget, dev_total, dense_score, dense_score > 0.0 });
         }

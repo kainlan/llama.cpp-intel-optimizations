@@ -1103,6 +1103,77 @@ size_t unified_cache_max_external_headroom(size_t device_total_vram) {
                                             /*onednn_pipeline_planned=*/true, headroom_env);
 }
 
+// THE single source of truth for GGML_SYCL_VRAM_BUDGET_PCT and external-headroom
+// arithmetic (llama.cpp-o3h1, owner ruling: no more independently-drifting
+// budget computations). Before this, six sites computed a VRAM budget or
+// headroom independently -- compute_vram_budget_for_plan() (ggml-sycl.cpp),
+// this file's create_cache_for_device() budget block (the one that actually
+// fed arena_reserve()'s budget_bytes), arena_reserve()'s own external-headroom
+// composition, the multi-GPU dev_budget line (ggml-sycl.cpp, zero headroom),
+// and two diagnostic/introspection sites that disagreed on the default pct
+// (100 vs 90). Every one of those is now either a caller of this function
+// (declared in unified-cache.hpp so any TU can reach it) or a reader of the
+// published result on the live unified_cache instance
+// (unified_cache::budget_pct()/base_budget()/external_headroom()/
+// authority_base_mem()) -- the cache's own construction (this file's
+// create_cache_for_device()) IS such a caller, and is the primary one, but it
+// is no longer the ONLY one: any code that needs a budget before a device's
+// cache exists (or that intentionally wants a fresh recomputation) may call
+// this directly.
+//
+// Deliberately takes already-queried total_mem/free_mem/free_vram_at_init
+// rather than querying the device or ggml_sycl_info() itself: this keeps it
+// safe to call from create_cache_for_device(), which may run while
+// ggml_sycl_info() is still in static initialization (see that function's
+// query_device_memory_no_info() comment) -- a live re-query here would
+// reintroduce the exact reentrant-deadlock hazard that code was written to
+// avoid. Every caller remains responsible for sourcing those three values
+// safely for its own context.
+vram_budget_authority compute_vram_budget_authority(bool   host_unified,
+                                                    size_t total_mem_in,
+                                                    size_t free_mem_in,
+                                                    size_t free_vram_at_init_in,
+                                                    int    default_pct) {
+    vram_budget_authority result;
+
+    const size_t raw_base_mem = total_mem_in > 0 ? total_mem_in : free_mem_in;
+    result.base_mem           = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
+    result.free_mem           = free_mem_in;
+
+    // default_pct is the programmatic override (set_unified_cache_budget_pct(),
+    // g_unified_cache_budget_pct) -- effective only when no env var is set.
+    // GGML_SYCL_VRAM_BUDGET_PCT always wins over the programmatic default when
+    // present, matching this function's pre-authority behavior.
+    int          pct     = default_pct;
+    const char * env_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
+    if (env_pct) {
+        pct = std::atoi(env_pct);
+    }
+    result.budget_pct = std::max(1, std::min(100, pct));
+
+    size_t budget = static_cast<size_t>(result.base_mem * (static_cast<double>(result.budget_pct) / 100.0));
+
+    // Cap to the pre-probe free VRAM snapshot (not a post-probe live query --
+    // see create_cache_for_device()'s "IMPORTANT" comment on why the alloc
+    // probe's own freed-then-cached USM pool makes a live query read low).
+    const size_t clean_free = free_vram_at_init_in > 0 ? free_vram_at_init_in : free_mem_in;
+    if (clean_free > 0 && budget > clean_free) {
+        budget = clean_free;
+    }
+
+    // External headroom (driver/runtime working memory outside the unified
+    // cache: L0 command lists/queues, oneDNN JIT/kernel residency, graph and
+    // event bookkeeping, and first-submission kernel scratch -- the exact
+    // class of allocation llama.cpp-o3h1's design doc (c-2195) traced this
+    // ticket's crash to) is computed via the SAME composed formula
+    // arena_reserve() used to compute independently -- see
+    // unified_cache_max_external_headroom() above. Subtracted here, once, so
+    // budget_bytes already reflects it before any caller ever sees it.
+    result.external_headroom = unified_cache_max_external_headroom(result.base_mem);
+    result.budget_bytes      = budget > result.external_headroom ? budget - result.external_headroom : 0;
+    return result;
+}
+
 static uint32_t pp_moe_onednn_effective_ring_depth(uint32_t requested_ring_depth) {
     if (requested_ring_depth == 0) {
         return 0;
@@ -3019,11 +3090,17 @@ unified_cache::unified_cache(sycl::queue & queue,
                              size_t        budget_bytes,
                              size_t        staging_size,
                              size_t        dma_reserved_bytes,
-                             size_t        device_total_vram) :
+                             size_t        device_total_vram,
+                             int           budget_pct,
+                             size_t        external_headroom,
+                             size_t        authority_base_mem) :
     queue_(queue),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
     reserved_(0),
+    budget_pct_(budget_pct),
+    external_headroom_(external_headroom),
+    authority_base_mem_(authority_base_mem),
     device_total_vram_(device_total_vram),
     dma_reserved_bytes_(dma_reserved_bytes) {
     // Register atexit handler once to set shutdown flag before static destructors run
@@ -11296,10 +11373,12 @@ static unified_cache * create_cache_for_device(int                     device_id
     }
 
     // Auto-calculate budget if not set
-    size_t budget                = g_unified_cache_budget;
-    bool   budget_capped_to_free = false;
-    size_t detected_free_mem     = 0;
-    size_t detected_total_mem    = 0;
+    size_t budget              = g_unified_cache_budget;
+    int    resolved_budget_pct = 100;
+    size_t resolved_headroom   = 0;
+    size_t resolved_base_mem   = 0;
+    size_t detected_free_mem   = 0;
+    size_t detected_total_mem  = 0;
     if (budget == 0) {
         size_t free_mem = 0, total_mem = 0;
         if (hint && hint->total_mem > 0) {
@@ -11316,11 +11395,6 @@ static unified_cache * create_cache_for_device(int                     device_id
         detected_free_mem  = free_mem;
         detected_total_mem = total_mem;
 
-        size_t base_mem = (hint && hint->total_mem > 0) ? hint->total_mem : total_mem;
-        if (base_mem == 0) {
-            base_mem = total_mem > 0 ? total_mem : free_mem;
-        }
-
         // Host-unified (integrated) GPUs report system RAM as their
         // "global memory" -- taking a percentage of that for the VRAM arena
         // reservation below claims memory the host needs too (llama.cpp-403s:
@@ -11331,69 +11405,41 @@ static unified_cache * create_cache_for_device(int                     device_id
         // query_device_memory_no_info() comment above), so touching that
         // global here would risk the same reentrant deadlock it avoids.
         const bool host_unified = ggml_sycl_device_is_host_unified(queue.get_device());
-        base_mem                = ggml_sycl_vram_budget_base_mem(host_unified, base_mem);
 
-        int          pct     = g_unified_cache_budget_pct;
-        // Allow env var override for testing host fallback paths
-        const char * env_pct = getenv("GGML_SYCL_VRAM_BUDGET_PCT");
-        if (env_pct) {
-            pct = std::atoi(env_pct);
-            GGML_LOG_INFO("[UNIFIED-CACHE] Budget override via GGML_SYCL_VRAM_BUDGET_PCT=%d%%\n", pct);
-        }
-        if (pct < 1) {
-            pct = 1;
-        } else if (pct > 100) {
-            pct = 100;
-        }
+        // llama.cpp-o3h1: THE single budget/headroom authority. Used to be an
+        // independent inline computation here (pct parsing, base_mem
+        // derivation, free-VRAM capping, and a flat 576 MB "generic device
+        // slack" subtraction) that disagreed with arena_reserve()'s own
+        // separate headroom composition -- confirmed by exact log arithmetic
+        // (ticket comment c-bema) to be the actual governing site behind this
+        // ticket's RED battery item. Both computations now live in ONE place;
+        // see compute_vram_budget_authority() above.
+        const vram_budget_authority authority = compute_vram_budget_authority(
+            host_unified, total_mem, free_mem, hint ? hint->free_vram_at_init : 0, g_unified_cache_budget_pct);
+        resolved_budget_pct   = authority.budget_pct;
+        resolved_headroom     = authority.external_headroom;
+        resolved_base_mem     = authority.base_mem;
+        const size_t base_mem = authority.base_mem;
+        budget                = authority.budget_bytes;
 
-        budget = static_cast<size_t>(base_mem * (static_cast<double>(pct) / 100.0));
-
-        // Cap budget to actual free VRAM to account for system overhead
-        // (display compositor, driver structures, etc.).
-        //
-        // IMPORTANT: Use the pre-probe free VRAM snapshot, NOT the current
-        // get_memory_info() value.  The alloc probe at init does binary-search
-        // malloc_device/free cycles whose freed memory lingers in the L0 USM
-        // pool, making post-probe get_memory_info() report artificially low
-        // free_mem (e.g. 600 MB on a 12 GB GPU).  The pre-probe snapshot
-        // reflects the true available VRAM before our process consumed any.
-        size_t clean_free = (hint && hint->free_vram_at_init > 0) ? hint->free_vram_at_init : 0;
-        if (clean_free == 0) {
-            clean_free = free_mem;  // fallback to direct current query if pre-probe unavailable
-        }
-        if (clean_free > 0 && budget > clean_free) {
-            GGML_LOG_INFO(
-                "[UNIFIED-CACHE] Capping budget from %.1f MB to %.1f MB "
-                "(pre-probe free VRAM)\n",
-                budget / (1024.0f * 1024.0f), clean_free / (1024.0f * 1024.0f));
-            budget                = clean_free;
-            budget_capped_to_free = true;
-        }
-
-        // Reserve generic device slack outside the unified cache. This is not
-        // the PP pipeline budget; that is modeled explicitly in the placement
-        // plan and reserved inside the arena's RUNTIME zone. This coarse
-        // cushion covers other out-of-cache runtime consumers such as driver
-        // overhead, transient kernel temporaries, and allocations that still
-        // bypass zone management.
-        const size_t device_runtime_slack_headroom = arena_min_safe_external_headroom(base_mem);
-        if (budget > device_runtime_slack_headroom) {
-            budget -= device_runtime_slack_headroom;
-            GGML_LOG_INFO(
-                "[UNIFIED-CACHE] Generic device slack headroom: %.0f MB reserved "
-                "(weight budget=%.1f MB)\n",
-                device_runtime_slack_headroom / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
-        }
+        GGML_LOG_INFO(
+            "[UNIFIED-CACHE] Device %d budget authority: base=%.1f MB free=%.1f MB pct=%d%% "
+            "external_headroom=%.1f MB budget=%.1f MB\n",
+            device_id, base_mem / (1024.0 * 1024.0), free_mem / (1024.0 * 1024.0), resolved_budget_pct,
+            resolved_headroom / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
 
         // Leave additional headroom for KV cache and ggml compute buffers.
         // When the VRAM arena is active, KV allocates from the shared KV+weight
         // zone inside the arena, so no external headroom is needed — the planner
         // charges KV alongside weights in the shared budget.
         // When arena is NOT active, KV allocates via sycl::malloc_device outside
-        // the cache, so we must reserve headroom.
+        // the cache, so we must reserve headroom. This is a SEPARATE concern
+        // from the authority's external_headroom (driver/runtime submission
+        // slack, already subtracted above) -- it is about KV capacity outside
+        // the arena, not driver scratch, so it stays a distinct subtraction.
         if (!vram_arena_enabled()) {
             constexpr size_t kv_compute_headroom = 2048ull * 1024ull * 1024ull;
-            if (budget > kv_compute_headroom + device_runtime_slack_headroom) {
+            if (budget > kv_compute_headroom) {
                 budget -= kv_compute_headroom;
                 GGML_LOG_INFO("[UNIFIED-CACHE] KV+compute headroom: %.0f MB reserved\n",
                               kv_compute_headroom / (1024.0 * 1024.0));
@@ -11403,7 +11449,7 @@ static unified_cache * create_cache_for_device(int                     device_id
         const std::string desc = query_device_name_no_info(device_id, queue);
         GGML_LOG_INFO("[UNIFIED-CACHE] Device %d (%s): total=%.1f MB free=%.1f MB budget=%.1f MB (%d%%)\n", device_id,
                       desc.c_str(), base_mem / (1024.0f * 1024.0f), free_mem / (1024.0f * 1024.0f),
-                      budget / (1024.0f * 1024.0f), pct);
+                      budget / (1024.0f * 1024.0f), resolved_budget_pct);
     }
 
     const size_t staging_bytes       = resolve_host_staging_bytes();
@@ -11419,7 +11465,8 @@ static unified_cache * create_cache_for_device(int                     device_id
     }
     try {
         g_device_caches[device_id] =
-            std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor);
+            std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor,
+                                            resolved_budget_pct, resolved_headroom, resolved_base_mem);
         // Always baseline pre-existing runtime reservations so they don't
         // eat into the cache's weight budget.  Allocations that existed before
         // cache creation (DMA pre-reserve, probe residuals) are already
@@ -13853,11 +13900,11 @@ void unified_cache_log_budget_summary(int device) {
     const size_t avl   = cache.available();
 
     const size_t avail_for_wt = base > rt ? base - rt : 0;
-    int          budget_pct   = 90;
-    const char * env_pct      = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
-    if (env_pct) {
-        budget_pct = std::max(1, std::min(100, std::atoi(env_pct)));
-    }
+    // llama.cpp-o3h1: read the authority's resolved pct off the cache instance
+    // instead of re-parsing GGML_SYCL_VRAM_BUDGET_PCT independently here --
+    // this site used to default to 90 while the sites that actually govern
+    // allocation defaulted to 100, silently disagreeing about the same env var.
+    const int    budget_pct    = cache.budget_pct();
     // Compute model-exceeds-VRAM directly from model size vs available budget
     const size_t model_size    = ggml_sycl_get_model_size();
     size_t       moe_total_log = 0;
@@ -14008,14 +14055,6 @@ unified_budget_info unified_cache_get_budget_info(int device) {
         return info;  // Return zeroed struct for invalid device
     }
 
-    // Read budget percentage once, clamp to [1,100]
-    int          pct     = 90;
-    const char * env_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
-    if (env_pct) {
-        pct = std::max(1, std::min(100, std::atoi(env_pct)));
-    }
-    info.budget_pct = pct;
-
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
     info.total_vram = ggml_sycl_info().devices[device].total_vram;
@@ -14025,6 +14064,11 @@ unified_budget_info unified_cache_get_budget_info(int device) {
 
     auto * cache = get_unified_cache_for_device(device);
     if (cache) {
+        // llama.cpp-o3h1: read the authority's resolved pct off the cache
+        // instance -- this site used to re-parse GGML_SYCL_VRAM_BUDGET_PCT
+        // independently and default to 90, disagreeing with the sites that
+        // actually govern allocation (default 100).
+        info.budget_pct      = cache->budget_pct();
         info.budget_bytes    = unified_cache_total_managed(device);
         info.weight_bytes    = unified_cache_weight_bytes(device);
         info.runtime_bytes   = unified_cache_get_runtime_bytes(device);
@@ -14033,12 +14077,17 @@ unified_budget_info unified_cache_get_budget_info(int device) {
             info.budget_bytes > info.runtime_bytes ? info.budget_bytes - info.runtime_bytes : 0;
         info.total_available = unified_cache_total_available_bytes(device);
     } else {
-        // Cache not yet initialized — use raw calculation
-        info.budget_bytes     = static_cast<size_t>(info.total_vram * (static_cast<double>(pct) / 100.0));
-        const size_t headroom = std::max(size_t(256) << 20, info.total_vram / 10);
-        if (info.total_vram > headroom && info.budget_bytes > info.total_vram - headroom) {
-            info.budget_bytes = info.total_vram - headroom;
-        }
+        // Cache not yet initialized -- fall through to the same single
+        // authority every other site uses (previously an ad-hoc
+        // max(256 MB, total/10) headroom formula, a fifth independent
+        // computation on top of the six this ticket already consolidated).
+        const bool host_unified =
+            (device >= 0 && device < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[device].host_unified_memory;
+        const vram_budget_authority authority =
+            compute_vram_budget_authority(host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0,
+                                          /*default_pct=*/100);
+        info.budget_pct            = authority.budget_pct;
+        info.budget_bytes          = authority.budget_bytes;
         info.available_for_weights = info.budget_bytes;
         info.total_committed       = 0;
         info.total_available       = info.budget_bytes;
@@ -18887,65 +18936,37 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
         per_chunk_cap = per_chunk_cap > 0 ? std::min(per_chunk_cap, safe_max_alloc_size) : safe_max_alloc_size;
     }
 
-    // Cap upfront reservation so non-arena runtime allocations (driver state,
-    // kernel residency, graph/event state, and any code path not yet routed
-    // through a zone) still fit in residual VRAM.  The unified-cache public
-    // budget may already have subtracted slack before this function is called;
-    // do not subtract another proportional headroom on top of that.  RUNTIME,
-    // SCRATCH, and ONEDNN allocations are already modeled as arena zones, so
-    // this headroom must cover only memory still outside the unified cache.
-    // Caller passes total VRAM rather than us probing because this routine may
-    // run inside ggml_sycl_init() static init, where a memory query would
-    // reenter ggml_sycl_info() and deadlock.  Caller passes 0 to opt out of the
-    // cap entirely.
-    if (device_total_vram > 0) {
-        const size_t caller_reserved_headroom = arena_caller_reserved_headroom(device_total_vram, budget_bytes);
-        const size_t default_headroom         = arena_default_external_headroom(device_total_vram, budget_bytes);
-        const char * headroom_env             = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB");
-        // The first backend-init arena is built at unified_cache construction,
-        // before any model inventory exists -- planned bytes read 0 there, so
-        // onednn_pipeline_planned is pipeline-off for that early reserve. The
-        // arena is REBUILT after planning ("[VRAM-ARENA] Rebuilding unused
-        // early arena for planned zones", this file's ensure_planned_arena_zones())
-        // once the real plan (including pp_moe_onednn scratch) is known; that
-        // rebuild is the reservation that actually matters for inference
-        // (llama.cpp-seno, per llama.cpp-dp5i c-gkai's D2 spec).
-        const bool   onednn_pipeline_planned  = unified_cache_get_planned_pp_moe_onednn_scratch_bytes(dev_id) > 0;
-        // Composed as a pure function (not inlined here) so the composition --
-        // env override wins verbatim only when it parses > 0; otherwise treated
-        // as unset and floored at max(default_headroom, pipeline-aware floor),
-        // never silently dropped below either -- is itself unit-tested
-        // (test-sycl-vram-headroom.cpp; spec-review finding 1, llama.cpp-seno).
-        const size_t external_headroom        = vram_external_headroom_effective(device_total_vram, default_headroom,
-                                                                                 onednn_pipeline_planned, headroom_env);
-        GGML_LOG_INFO(
-            "[VRAM-ARENA] External headroom %.0f MB (caller-reserved %.0f MB); internal zones runtime=%.0f MB "
-            "oneDNN=%.0f MB scratch=%.0f MB\n",
-            external_headroom / (1024.0 * 1024.0), caller_reserved_headroom / (1024.0 * 1024.0),
-            runtime_bytes / (1024.0 * 1024.0), onednn_bytes / (1024.0 * 1024.0), scratch_bytes / (1024.0 * 1024.0));
-        if (device_total_vram > external_headroom) {
-            const size_t arena_cap = device_total_vram - external_headroom;
-            if (alloc_size > arena_cap) {
-                const size_t prev_alloc = alloc_size;
-                alloc_size              = arena_cap;
-                GGML_LOG_INFO(
-                    "[VRAM-ARENA] Capping arena at %.1f MB (was %.1f MB) to leave %.0f MB external headroom\n",
-                    alloc_size / (1024.0 * 1024.0), prev_alloc / (1024.0 * 1024.0),
-                    external_headroom / (1024.0 * 1024.0));
-            }
-        }
-    } else {
-        GGML_SYCL_DEBUG(
-            "[VRAM-ARENA] device_total_vram=0, skipping runtime-headroom cap "
-            "(arena reserved at full budget %.1f MB)\n",
-            alloc_size / (1024.0 * 1024.0));
+    // llama.cpp-o3h1: budget_bytes arrives HERE already fully headroom-adjusted
+    // by the single budget authority (compute_vram_budget_authority(),
+    // create_cache_for_device()) -- this function used to compute its OWN,
+    // separate external-headroom cap on top (arena_caller_reserved_headroom /
+    // arena_default_external_headroom / vram_external_headroom_effective),
+    // and that SECOND, independent computation is what actually caused this
+    // ticket's RED battery item: its caller-reserved-clamp collapsed headroom
+    // toward a small value whenever budget_bytes sat close to device_total_vram
+    // (confirmed by exact log arithmetic, ticket comment c-bema). A caller that
+    // has already subtracted the right amount should not have a second,
+    // independently-derived cap potentially disagreeing with it -- that is
+    // exactly the drift the single-authority design exists to eliminate.
+    //
+    // The only thing kept here is a passive sanity floor: alloc_size must never
+    // exceed the device's total VRAM outright (a caller bug, not a headroom
+    // policy question). This is a defensive assertion-like check, not a
+    // second authority -- it never re-derives what the "right" budget is.
+    if (device_total_vram > 0 && alloc_size > device_total_vram) {
+        GGML_LOG_WARN(
+            "[VRAM-ARENA] alloc_size %.1f MB exceeds device_total_vram %.1f MB -- caller's budget_bytes was not "
+            "headroom-adjusted; clamping to device total as a last resort\n",
+            alloc_size / (1024.0 * 1024.0), device_total_vram / (1024.0 * 1024.0));
+        alloc_size = device_total_vram;
     }
 
-    // Keep every zone base naturally aligned.  The headroom cap above can
-    // produce byte-granular arena sizes (for example total_vram - total_vram/6),
-    // and the tail zones are carved from the end of the arena.  If alloc_size is
-    // not rounded down first, RUNTIME/ONEDNN/SCRATCH suballocations inherit a
-    // misaligned base pointer even though each zone size is aligned.
+    // Keep every zone base naturally aligned.  budget_bytes (and therefore
+    // alloc_size) can arrive byte-granular from the budget authority's own
+    // percentage/headroom arithmetic, and the tail zones are carved from the
+    // end of the arena.  If alloc_size is not rounded down first,
+    // RUNTIME/ONEDNN/SCRATCH suballocations inherit a misaligned base pointer
+    // even though each zone size is aligned.
     constexpr size_t k_arena_size_alignment = 2ull * 1024ull * 1024ull;
     alloc_size                              = (alloc_size / k_arena_size_alignment) * k_arena_size_alignment;
 

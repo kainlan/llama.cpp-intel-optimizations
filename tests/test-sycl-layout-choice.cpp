@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #ifndef GGML_SYCL_WARP_SIZE
 #    define GGML_SYCL_WARP_SIZE 32
@@ -1574,8 +1575,174 @@ static bool run_fused_gate_up_role_test() {
     return true;
 }
 
+// llama.cpp-o3h1: unit coverage for compute_vram_budget_authority(), THE
+// single source of truth six previously-independent sites (placement
+// planning, arena_reserve()'s physical budget, arena_reserve()'s own since-
+// removed headroom composition, the multi-GPU dev_budget line, and two
+// diagnostic sites that disagreed on the default pct -- 100 vs 90) now all
+// either call directly or read published off a unified_cache instance.
+// Small helper: save/restore GGML_SYCL_VRAM_BUDGET_PCT around a scope so
+// these cases cannot leak env state into any other test in this binary
+// (main() later does its own unconditional setenv(..., 0) for
+// run_layout_choice_test(), which must still see an accurate "already set?"
+// signal).
+namespace {
+struct env_var_scope_guard {
+    std::string name;
+    bool        had_value;
+    std::string prior_value;
+
+    explicit env_var_scope_guard(const char * env_name) : name(env_name) {
+        const char * existing = std::getenv(env_name);
+        had_value             = existing != nullptr;
+        if (had_value) {
+            prior_value = existing;
+        }
+    }
+
+    ~env_var_scope_guard() {
+        if (had_value) {
+            setenv(name.c_str(), prior_value.c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+    }
+};
+}  // namespace
+
+static bool run_vram_budget_authority_test() {
+    constexpr size_t mib = 1024ull * 1024ull;
+
+    // Basic case, no env override: default_pct=100 is honored, base_mem
+    // passes through unchanged (host_unified=false), external_headroom
+    // equals unified_cache_max_external_headroom(base_mem) exactly (the
+    // authority must not invent a separate headroom formula), and
+    // budget_bytes = min(base_mem*pct, free_vram_at_init) - external_headroom.
+    {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
+
+        constexpr size_t total    = 16304ull * mib;
+        constexpr size_t free_now = 16250ull * mib;
+        const auto       authority =
+            ggml_sycl::compute_vram_budget_authority(/*host_unified=*/false, total, free_now,
+                                                     /*free_vram_at_init_in=*/free_now, /*default_pct=*/100);
+        if (authority.budget_pct != 100) {
+            printf("FAIL: authority should honor default_pct=100 when no env override is set, got %d\n",
+                   authority.budget_pct);
+            return false;
+        }
+        if (authority.base_mem != total) {
+            printf("FAIL: authority base_mem mismatch (host_unified=false should pass total through), got %zu\n",
+                   authority.base_mem);
+            return false;
+        }
+        const size_t expected_headroom = ggml_sycl::unified_cache_max_external_headroom(authority.base_mem);
+        if (authority.external_headroom != expected_headroom) {
+            printf(
+                "FAIL: authority external_headroom must equal unified_cache_max_external_headroom(base_mem) "
+                "exactly (no separate formula), got %zu expected %zu\n",
+                authority.external_headroom, expected_headroom);
+            return false;
+        }
+        const size_t expected_budget = free_now > expected_headroom ? free_now - expected_headroom : 0;
+        if (authority.budget_bytes != expected_budget) {
+            printf("FAIL: authority budget_bytes mismatch, got %zu expected %zu\n", authority.budget_bytes,
+                   expected_budget);
+            return false;
+        }
+    }
+
+    // default_pct is honored when no env var is set -- this is the
+    // g_unified_cache_budget_pct programmatic-override wiring (the public
+    // set_unified_cache_budget_pct() API); losing this would silently break
+    // that API since nothing else in create_cache_for_device() reads the
+    // global directly any more.
+    {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
+        const auto authority = ggml_sycl::compute_vram_budget_authority(false, 16304ull * mib, 16250ull * mib,
+                                                                        16250ull * mib, /*default_pct=*/42);
+        if (authority.budget_pct != 42) {
+            printf("FAIL: authority should honor a non-100 default_pct when env is unset, got %d expected 42\n",
+                   authority.budget_pct);
+            return false;
+        }
+    }
+
+    // GGML_SYCL_VRAM_BUDGET_PCT always wins over default_pct when set --
+    // matches every site's pre-authority behavior.
+    {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        setenv("GGML_SYCL_VRAM_BUDGET_PCT", "37", 1);
+        const auto authority = ggml_sycl::compute_vram_budget_authority(false, 16304ull * mib, 16250ull * mib,
+                                                                        16250ull * mib, /*default_pct=*/100);
+        if (authority.budget_pct != 37) {
+            printf("FAIL: env override should win over default_pct, got %d expected 37\n", authority.budget_pct);
+            return false;
+        }
+    }
+
+    // Out-of-range env values clamp to [1,100] rather than propagating.
+    {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        setenv("GGML_SYCL_VRAM_BUDGET_PCT", "500", 1);
+        const auto over =
+            ggml_sycl::compute_vram_budget_authority(false, 16304ull * mib, 16250ull * mib, 16250ull * mib, 100);
+        if (over.budget_pct != 100) {
+            printf("FAIL: pct=500 should clamp to 100, got %d\n", over.budget_pct);
+            return false;
+        }
+        setenv("GGML_SYCL_VRAM_BUDGET_PCT", "-5", 1);
+        const auto under =
+            ggml_sycl::compute_vram_budget_authority(false, 16304ull * mib, 16250ull * mib, 16250ull * mib, 100);
+        if (under.budget_pct != 1) {
+            printf("FAIL: pct=-5 should clamp to 1, got %d\n", under.budget_pct);
+            return false;
+        }
+    }
+
+    // free_vram_at_init caps the budget BEFORE headroom is subtracted (the
+    // "Capping budget from ... (pre-probe free VRAM)" step every site used to
+    // duplicate) -- a small free_vram_at_init must win over a large base_mem.
+    {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
+        constexpr size_t total      = 16304ull * mib;
+        constexpr size_t tight_free = 2000ull * mib;
+        const auto   authority = ggml_sycl::compute_vram_budget_authority(false, total, tight_free, tight_free, 100);
+        const size_t headroom  = ggml_sycl::unified_cache_max_external_headroom(total);
+        const size_t expected  = tight_free > headroom ? tight_free - headroom : 0;
+        if (authority.budget_bytes != expected) {
+            printf(
+                "FAIL: free_vram_at_init should cap the budget before headroom is subtracted, got %zu expected "
+                "%zu\n",
+                authority.budget_bytes, expected);
+            return false;
+        }
+    }
+
+    // total_mem_in=0 falls back to free_mem_in for base_mem, so a caller that
+    // could not determine total VRAM still gets a sane (not zero) budget.
+    {
+        const auto authority = ggml_sycl::compute_vram_budget_authority(false, /*total_mem_in=*/0,
+                                                                        /*free_mem_in=*/8000ull * mib, 0, 100);
+        if (authority.base_mem != 8000ull * mib) {
+            printf("FAIL: base_mem should fall back to free_mem_in when total_mem_in is 0, got %zu\n",
+                   authority.base_mem);
+            return false;
+        }
+    }
+
+    printf("PASS: VRAM budget authority arithmetic\n");
+    return true;
+}
+
 int main() {
     if (!run_fused_gate_up_role_test()) {
+        return 1;
+    }
+    if (!run_vram_budget_authority_test()) {
         return 1;
     }
     {

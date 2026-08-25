@@ -1175,6 +1175,68 @@ is blocked by `jwy4`. `{1q72, .15.13} → .15.12 → o6jx` is preserved. `jwy4`,
 census refresh. The fixed teardown order, H1-H14/G1-G7, fixtures, split
 mutations, and lock controls remain canonical.
 
+## The VRAM budget authority (llama.cpp-o3h1)
+
+`GGML_SYCL_VRAM_BUDGET_PCT` — how much of a device's VRAM the unified cache
+is allowed to claim — used to be parsed and turned into a byte budget
+independently at **six** different sites: the placement planner
+(`compute_vram_budget_for_plan`, `ggml-sycl.cpp`), the unified cache's own
+construction (`create_cache_for_device`, `unified-cache.cpp` — the one that
+actually fed `arena_reserve()`'s physical reservation size), `arena_reserve()`
+itself (a *second*, independent external-headroom computation layered on top
+of whatever budget its caller handed it), the multi-GPU placement path
+(`dev_budget`, with **no** headroom subtraction at all), and two
+diagnostic/introspection sites that defaulted the percentage to 90 while
+every allocation-governing site defaulted to 100. Nothing forced any of these
+to agree, and two of them provably didn't: a clean-device GPT-OSS run at the
+default `GGML_SYCL_VRAM_BUDGET_PCT=100` failed deterministically with
+`UR_RESULT_ERROR_OUT_OF_RESOURCES` inside `FLASH_ATTN_EXT`/`MUL_MAT_ID`
+dispatch, because the placement planner's promise (how much VRAM it told
+itself it could fill) and the arena's actual physical reservation (after its
+own, separately-computed external headroom) diverged by exactly the headroom
+amount the arena withheld — traced to exact log-line arithmetic on both
+sides. This is the same *disagreeing-independent-computations* disease as the
+`llama.cpp-ytr7` stale-literal bug, recurring at a larger scale.
+
+**The fix is structural, not a bigger constant.** `compute_vram_budget_authority()`
+(`unified-cache.cpp`, declared in `unified-cache.hpp`) is now the **only**
+function that parses `GGML_SYCL_VRAM_BUDGET_PCT`, derives the host-unified-
+adjusted device total, caps to pre-probe free VRAM, and computes the external
+headroom (via `unified_cache_max_external_headroom()`, itself a composition
+of the arena's own device-proportional term and the oneDNN batched-pipeline-
+aware floor from `vram-headroom.hpp`, conservatively assuming the pipeline
+*is* planned since this authority runs before that flag is decided for the
+current model). It returns a `vram_budget_authority` struct — `budget_pct`,
+`base_mem`, `free_mem`, `external_headroom`, `budget_bytes` — and
+`create_cache_for_device()` **publishes** that result onto the `unified_cache`
+instance it constructs (`budget_pct()`, `external_headroom()`,
+`authority_base_mem()` getters, alongside the pre-existing `base_budget()`).
+
+Every other site now either calls `compute_vram_budget_authority()` directly
+(only when no cache exists yet for the device in question — a defensive,
+WARN-logged fallback, not the normal path) or reads the published values off
+the live cache instance. Concretely: `arena_reserve()` no longer computes its
+own external headroom at all — `budget_bytes` arrives already fully
+headroom-adjusted by the authority, and a caller that already subtracted the
+right amount must not have a second, independently-derived cap that can
+disagree with it (that disagreement — `arena_reserve()`'s own
+caller-reserved-headroom clamp collapsing toward a small value whenever
+`budget_bytes` sat close to `device_total_vram` — is what actually produced
+the error-40 failure above). `arena_reserve()` keeps only a passive sanity
+floor (`alloc_size` may never exceed `device_total_vram` outright — a caller
+bug, not a headroom policy question) and its pre-existing, unrelated
+per-chunk-cap/N-chunk logic (a genuinely separate concern: the driver's
+single-allocation hardware ceiling, not external headroom).
+
+This closes the single-authority half of the design the failure required.
+The other half — making a still-insufficient budget a *handled* runtime
+state instead of a crash, since no offline-chosen headroom constant can be
+proven sufficient against an unqueried, driver/version/workload-dependent
+kernel-submission requirement — is `mem_handle`-internal allocation recovery
+and a narrow submission-time catch, tracked in the same ticket
+(`llama.cpp-o3h1`) as a second commit; see the canonical contract's §8 for
+that half once it lands.
+
 ## Path-scoped zone sizing
 
 `populate_host_zone_sizing` (`ggml/src/ggml-sycl/unified-cache.cpp`) once sized
