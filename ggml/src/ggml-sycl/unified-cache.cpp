@@ -1076,6 +1076,33 @@ size_t test_arena_external_headroom_bytes(size_t device_total_vram, size_t budge
     return arena_default_external_headroom(device_total_vram, budget_bytes);
 }
 
+size_t unified_cache_max_external_headroom(size_t device_total_vram) {
+    // Must mirror the FULL composition arena_reserve() applies (this file's
+    // arena_reserve(), which calls vram_external_headroom_effective() --
+    // NOT arena_default_external_headroom() alone), or callers that pre-
+    // reserve budget against this value can still under-estimate what the
+    // arena will withhold (llama.cpp-o3h1).
+    //
+    // budget_bytes=0 makes arena_caller_reserved_headroom() return the full
+    // device_total_vram, which is always >= arena_default_external_headroom's
+    // own <=2 GiB formula cap -- so the caller-reserve clamp inside it never
+    // binds and this sub-term evaluates to its unclamped (maximum) value.
+    const size_t default_headroom = arena_default_external_headroom(device_total_vram, /*budget_bytes=*/0);
+
+    // onednn_pipeline_planned is conservatively forced true: this function is
+    // called from compute_vram_budget_for_plan() (ggml-sycl.cpp) before
+    // compute_and_store_plan_for_inventory() has decided that flag for the
+    // current model, so it cannot be known here. The pipeline-planned branch
+    // of vram_external_headroom_bytes() (max(1 GiB, 6% of total), UNCAPPED)
+    // is always >= the pipeline-off branch (max(630 MB, 4% of total)), so
+    // this can only raise, never lower, the result relative to what
+    // arena_reserve() will actually apply once the real flag is known --
+    // conservative over-reservation, never under-reservation.
+    const char * headroom_env = std::getenv("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB");
+    return vram_external_headroom_effective(device_total_vram, default_headroom,
+                                            /*onednn_pipeline_planned=*/true, headroom_env);
+}
+
 static uint32_t pp_moe_onednn_effective_ring_depth(uint32_t requested_ring_depth) {
     if (requested_ring_depth == 0) {
         return 0;

@@ -15086,7 +15086,29 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
     const bool   host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
                               ggml_sycl_info().devices[ctx->device].host_unified_memory;
     const size_t base_mem      = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
-    const size_t base_headroom = 0;
+    // llama.cpp-o3h1: this budget feeds weight_budget, which the placement
+    // planner uses to decide how much to pack into VRAM. unified_cache::
+    // arena_reserve() independently withholds its own external headroom
+    // (unified-cache.cpp's arena_default_external_headroom() maxed with the
+    // oneDNN batched-pipeline-aware floor from vram-headroom.hpp, typically
+    // ~1-2 GiB but uncapped on large devices where the pipeline-aware term
+    // dominates) from the same device before physically reserving the arena.
+    // Previously this was hardcoded to 0, so at GGML_SYCL_VRAM_BUDGET_PCT=100
+    // the planner was told it could fill ~the whole device while the arena
+    // silently withheld headroom on top -- over-packing the shared KV+WEIGHT
+    // zone and starving FLASH_ATTN_EXT/MUL_MAT_ID's runtime allocations at
+    // dispatch time (error 40, UR_RESULT_ERROR_OUT_OF_RESOURCES). Query the
+    // arena's MAXIMUM withholding for this device size (unified_cache_max_
+    // external_headroom(), which mirrors that same composition) so the
+    // planner never promises more than the arena will deliver. This headroom
+    // is subtracted at EVERY
+    // budget_pct, not just 100 -- e.g. on a ~15488 MB B50 it is ~1548 MB, so
+    // the post-fix default (pct=100: 15488-1548=13940 MB) lands almost
+    // exactly where the documented pct=90 workaround already sat
+    // (15488*0.9=13939 MB); pct=90 itself now nets a further ~1548 MB below
+    // that (more host offload, slower), which is expected and acceptable --
+    // the workaround's canonical env does not set pct, so it is unaffected.
+    const size_t base_headroom = ggml_sycl::unified_cache_max_external_headroom(base_mem);
 
     int          budget_pct     = 100;
     const char * env_budget_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");

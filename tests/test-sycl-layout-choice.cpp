@@ -5,6 +5,7 @@
 #include "ggml-sycl.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+#include "ggml-sycl/vram-headroom.hpp"
 
 static XMXCapabilities test_mxfp4_caps() {
     XMXCapabilities caps{};
@@ -1119,6 +1121,69 @@ static bool run_regression_guard_policy_test() {
     }
     if (ggml_sycl::test_arena_external_headroom_bytes(0, b50_total) != 0) {
         printf("FAIL: zero VRAM total should opt out of arena headroom capping\n");
+        return false;
+    }
+
+    // llama.cpp-o3h1: unified_cache_max_external_headroom() must mirror the
+    // FULL composition unified_cache::arena_reserve() applies -- NOT just
+    // arena_default_external_headroom()'s own term, but that term maxed with
+    // the oneDNN batched-pipeline-aware floor from vram-headroom.hpp (queried
+    // with the pipeline conservatively assumed planned, since
+    // compute_vram_budget_for_plan() runs before that flag is decided for the
+    // current model). Derive "expected" from the same two component
+    // functions the implementation composes, rather than hand-rounded
+    // literals, so this test tracks the real formula.
+    const size_t b50_expected_max =
+        std::max(ggml_sycl::test_arena_external_headroom_bytes(b50_total, 0),
+                 ggml_sycl::vram_external_headroom_bytes(b50_total, /*onednn_pipeline_planned=*/true));
+    const size_t b50_max_headroom = ggml_sycl::unified_cache_max_external_headroom(b50_total);
+    if (b50_max_headroom != b50_expected_max) {
+        printf("FAIL: max external headroom should equal the composed default, got %zu expected %zu\n",
+               b50_max_headroom, b50_expected_max);
+        return false;
+    }
+
+    // Tiny device: the pipeline-aware 1 GiB floor (vram_external_headroom_bytes)
+    // dominates arena_default_external_headroom()'s own (smaller) safe floor.
+    constexpr size_t tiny_total = 4096ull * mib;  // 4 GiB
+    const size_t     tiny_expected =
+        std::max(ggml_sycl::test_arena_external_headroom_bytes(tiny_total, 0),
+                 ggml_sycl::vram_external_headroom_bytes(tiny_total, /*onednn_pipeline_planned=*/true));
+    const size_t tiny_headroom = ggml_sycl::unified_cache_max_external_headroom(tiny_total);
+    if (tiny_headroom != tiny_expected) {
+        printf("FAIL: tiny-device max headroom mismatch, got %zu expected %zu\n", tiny_headroom, tiny_expected);
+        return false;
+    }
+
+    // Huge device: the pipeline-aware 6% term is UNCAPPED and exceeds
+    // arena_default_external_headroom()'s 2 GiB cap -- the composition (not
+    // either term alone) is what must be tested here.
+    constexpr size_t huge_total = 65536ull * mib;  // 64 GiB
+    const size_t     huge_expected =
+        std::max(ggml_sycl::test_arena_external_headroom_bytes(huge_total, 0),
+                 ggml_sycl::vram_external_headroom_bytes(huge_total, /*onednn_pipeline_planned=*/true));
+    const size_t huge_headroom = ggml_sycl::unified_cache_max_external_headroom(huge_total);
+    if (huge_headroom != huge_expected) {
+        printf("FAIL: huge-device max headroom mismatch, got %zu expected %zu\n", huge_headroom, huge_expected);
+        return false;
+    }
+    if (huge_headroom <= 2048ull * mib) {
+        printf("FAIL: huge-device max headroom should exceed the 2 GiB cap via the pipeline-aware term, got %zu MiB\n",
+               huge_headroom / mib);
+        return false;
+    }
+
+    // Divergence: the max-headroom (budget_bytes=0, pipeline conservatively
+    // assumed) form must return a value at least as large as a caller-
+    // supplied-budget form whose caller-reserve clamp binds
+    // (b50_clamped_headroom above == the safe floor, well below the composed
+    // default). This is exactly the gap that starved FLASH_ATTN_EXT/
+    // MUL_MAT_ID at GGML_SYCL_VRAM_BUDGET_PCT=100 before this fix: the
+    // planner's budget computation must use the max form, not a
+    // budget-dependent one.
+    if (b50_max_headroom < b50_clamped_headroom) {
+        printf("FAIL: max external headroom (%zu) must be >= the caller-clamped headroom (%zu) for the same device\n",
+               b50_max_headroom, b50_clamped_headroom);
         return false;
     }
 

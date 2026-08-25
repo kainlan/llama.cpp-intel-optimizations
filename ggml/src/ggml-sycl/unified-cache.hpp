@@ -5241,6 +5241,28 @@ const weight_entry * unified_cache_lookup_weight(int device_id, ggml_sycl_cache_
 
 const weight_entry * unified_cache_lookup_expert(int device_id, ggml_sycl_cache_id key);
 
+// Maximum external headroom unified_cache::arena_reserve() will withhold for
+// a device with this much total VRAM, independent of any caller-supplied
+// budget (llama.cpp-o3h1). Mirrors the FULL composition arena_reserve()
+// applies -- arena_default_external_headroom()'s own term, maxed with the
+// oneDNN batched-pipeline-aware floor from vram-headroom.hpp, honoring the
+// GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB env override -- not just the
+// first term, which under-estimates on large devices where the pipeline-
+// aware 6% term (uncapped) exceeds the other term's 2 GiB cap. The pipeline
+// flag is conservatively assumed true (this function runs before that flag
+// is decided for the current model), which can only raise, never lower, the
+// result.
+//
+// The placement planner (compute_vram_budget_for_plan in ggml-sycl.cpp) must
+// query THIS before it has decided on a budget, not a budget-dependent form
+// -- feeding a not-yet-final budget into a budget-dependent headroom query
+// would make the budget depend on itself. Querying the arena's maximum
+// withholding keeps the planner's promise (weight_budget) consistent with
+// what arena_reserve() will actually reserve, so a high
+// GGML_SYCL_VRAM_BUDGET_PCT can no longer tell the planner it may pack
+// weights/experts closer to the device's edge than the arena leaves room for.
+size_t unified_cache_max_external_headroom(size_t device_total_vram);
+
 // === Raw allocation primitives (unified-cache.cpp owns all sycl::malloc/free calls) ===
 // These are the ONLY functions allowed to call sycl::malloc_device/host or sycl::free.
 // All other code must route through these or the higher-level unified_alloc/unified_cache_allocate.
