@@ -1244,8 +1244,23 @@ The genuinely missing piece was narrower: a driver-internal kernel-submission
 failure (§8.5) now triggers a per-op CPU-fallback recompute
 (`ggml_sycl_cpu_fallback_graph`) instead of aborting, falling through to the
 existing `ggml_sycl_fallback_error` → `GGML_STATUS_FAILED` clean-failure
-contract if that also fails. See canonical contract §8.5 for the full
-mechanism.
+contract if that also fails.
+
+**That is not quite the whole terminal story, though — commit 4's
+forced-pressure exercise (`6b5bfa8d6`, ticket comment c-s4na) found a third
+outcome.** On this driver, a failed kernel submission can leave the *device
+itself* hung (compute-runtime-internal behavior), and when it does, the CPU
+fallback's own device→host staging copy queues behind that wedge and never
+completes — so the "recompute via CPU" and "clean `GGML_STATUS_FAILED`"
+paths above are both unreached. What actually terminates that case is the
+pre-existing `[SYCL-WATCHDOG]` (`GGML_SYCL_OP_TIMEOUT_MS`), which performs
+its designed bounded exit rather than leaving the process hung indefinitely
+— the card was confirmed healthy afterward (no GT reset, no reboot), which
+is the guarantee that matters. This is unreachable at honest budgets (the
+authority above proves the condition doesn't arise by default); it is the
+terminal floor only under deliberately hostile pressure. See canonical
+contract §8.5 for the full three-outcome ladder — do not read this section
+alone as implying transparent in-process recovery is always reached.
 
 ## Path-scoped zone sizing
 

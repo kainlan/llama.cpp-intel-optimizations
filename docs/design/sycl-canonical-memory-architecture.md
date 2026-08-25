@@ -735,17 +735,60 @@ This contract does not govern:
    but reservation is not ownership, and no offline-chosen headroom constant
    is provably sufficient against an unqueried, driver/version/workload-
    dependent requirement.
-   **This failure mode is nonetheless a HANDLED state, not a crash.** When a
-   kernel submission throws `sycl::exception` with `UR_RESULT_ERROR_OUT_OF_
-   RESOURCES` (40) or `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (39) — narrowly,
-   not any other exception, so a genuine correctness or driver bug is never
-   silently masked — `ggml_sycl_compute_forward`'s catch block
-   (`ggml-sycl.cpp`) recomputes that one op via `ggml_sycl_cpu_fallback_graph`
-   (stages the op's device-resident ancestor tensors to host and runs it
-   through ggml's ordinary CPU backend) instead of aborting the process. If
-   that also fails, the graph fails cleanly via the existing
-   `ggml_sycl_fallback_error` → `ggml_backend_sycl_graph_compute` contract
-   (`GGML_STATUS_FAILED`, not `exit(1)`) rather than terminating the process.
+   **This failure mode is nonetheless a HANDLED state, not a silent crash —
+   but "handled" on this driver has a third outcome beyond transparent
+   recovery, discovered by the forced-pressure exercise that validated this
+   mechanism (llama.cpp-o3h1 commit 4, `6b5bfa8d6`; ticket comment c-s4na).
+   State the terminal ladder as it actually resolves, not as if in-process
+   recovery is always reached.** When a kernel submission throws
+   `sycl::exception` matching this narrow, driver-observed signature — the
+   `code().value()` pair (40/39) is *not* reliable for a Level Zero backend
+   exception (DPC++ maps it through `sycl::errc`, not the raw UR result), so
+   the real match is on `what()` text: the `UR_RESULT_ERROR_OUT_OF_RESOURCES`
+   / `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` names, or the plugin's own
+   `"error: 39 ("` / `"error: 40 ("` form (`ggml_sycl_is_resource_exhaustion_exception`,
+   `common.hpp`) — narrowly, not any other exception, so a genuine
+   correctness or driver bug is never silently masked —
+   `ggml_sycl_compute_forward`'s catch block (`ggml-sycl.cpp`, via the shared
+   `ggml_sycl_try_dispatch_resource_exhaustion_fallback` helper every
+   dispatch-path catch site routes through) attempts to recompute that one op
+   via `ggml_sycl_cpu_fallback_graph` (stages the op's device-resident
+   ancestor tensors to host and runs it through ggml's ordinary CPU backend)
+   instead of aborting the process. **On this driver, that attempt can itself
+   stall**: a failed kernel submission has been observed to leave the device
+   itself hung (compute-runtime-internal behavior, not a ggml/unified-cache
+   defect — worth an upstream report; related family compute-runtime#916,
+   #890, #697), so the fallback's own device→host staging copy queues behind
+   the wedged submission and never completes. The terminal ladder is
+   therefore:
+   - **Honest budgets** (the single VRAM budget authority, commit 1 above):
+     the condition is unreachable — proven at default env on both cards.
+   - **Hostile/forced budgets, device not wedged**: CPU fallback completes;
+     the op's result is correct, the graph continues, nothing is visible
+     beyond the WARN log.
+   - **Hostile/forced budgets, device wedged by the failed submission**: the
+     CPU fallback's staging copy cannot progress, so recovery is not
+     reached — but the pre-existing `[SYCL-WATCHDOG]` mechanism
+     (`GGML_SYCL_OP_TIMEOUT_MS`, already in the codebase for exactly this
+     class of stall) detects the lack of GPU progress and performs its
+     designed **bounded exit** (`_Exit(1)`), never an unbounded hang. The
+     card is left healthy for the next process — verified post-exercise
+     (Mistral gate PASS, normal load time) — which is the property that
+     matters: **no GT reset, no reboot required**, unlike the pre-o3h1
+     behavior this ticket was filed against (silent error-40 → raw
+     exception → `exit(1)`/indefinite hang → wedged card requiring reboot).
+   - If the CPU fallback attempt fails for a reason *other* than the device
+     being wedged, the graph still fails cleanly via the existing
+     `ggml_sycl_fallback_error` → `ggml_backend_sycl_graph_compute` contract
+     (`GGML_STATUS_FAILED`, not `exit(1)`).
+
+   Transparent in-process recovery for the device-wedged case is not
+   achievable while the driver hangs its own queue on a failed submission —
+   that is compute-runtime defect territory, not something this contract's
+   allocator/dispatch layer can paper over from userspace. Proactively
+   mirroring every input to host before every dispatch would sidestep it but
+   is not justified for a condition unreachable at honest budgets.
+
    No mid-`graph_compute` weight eviction is attempted as part of this
    recovery: `unified_cache::evict`/`evict_one`/`evict_and_flush` correctly
    refuse while `g_graph_compute_active` is set (freeing VRAM a live kernel
