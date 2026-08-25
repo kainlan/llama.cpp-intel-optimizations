@@ -10942,22 +10942,35 @@ unified_cache::dma_stream_result unified_cache::stream_dma(const cache_ptr_view 
 
             std::vector<sycl::event> kernel_deps{ copy_evt };
             sycl::event kernel_evt = slice_fn(queue_, staging.buffers[slot], cur, offset, ctx, kernel_deps);
-            result.terminal_event = kernel_evt;
-            result.event          = kernel_evt;
+            result.terminal_event  = kernel_evt;
+            result.event           = kernel_evt;
 
             buffer_events[slot]    = kernel_evt;
             buffer_has_event[slot] = true;
             all_events.push_back(kernel_evt);
         } catch (const std::exception & e) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] DMA stream submit failed after %zu slices: %s\n", slices, e.what());
-            if (src.location == cache_location::HOST_MMAP) result.mmap_direct_failed = true;
+            // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual,
+            // c-53u5): the exception object itself does not survive past
+            // this catch, so capture its text here -- this is the only
+            // classification signal mmq.cpp's !result.ok caller has left
+            // to work with (e.g. to route a driver resource-exhaustion
+            // failure through the shared fallback ladder instead of
+            // aborting).
+            result.failure_message = e.what();
+            if (src.location == cache_location::HOST_MMAP) {
+                result.mmap_direct_failed = true;
+            }
             // A terminal event covers only its dependency chain. On an
             // out-of-order queue another staging slot may still own unrelated
             // prior work, so partial failure must drain the exact DMA queue.
             // Caller/cache owners remain live until this unconditional drain
             // returns, including when wait_and_throw itself reports an error.
             if (result.submitted) {
-                try { queue_.wait_and_throw(); } catch (...) {}
+                try {
+                    queue_.wait_and_throw();
+                } catch (...) {
+                }
             }
             return result;
         } catch (...) {

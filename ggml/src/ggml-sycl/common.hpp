@@ -191,6 +191,19 @@ bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_conte
                                                          ggml_tensor *               dst,
                                                          const std::exception &      e);
 
+// llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+// third entry point for call sites where the original exception was
+// already fully consumed by an inner catch before this seam is reached
+// (unified_cache::stream_dma()'s MMQ DMA-streaming path, mmq.cpp -- see
+// its call site and the definition's own comment in ggml-sycl.cpp for the
+// full rationale, including why graph-recording handling differs here).
+// Classifies from a captured message string via
+// ggml_sycl_is_resource_exhaustion_message() instead of a live exception
+// object.
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message(ggml_backend_sycl_context & ctx,
+                                                                      ggml_tensor *               dst,
+                                                                      const char *                what_message);
+
 struct ggml_sycl_device_info;
 const ggml_sycl_device_info & ggml_sycl_info();
 

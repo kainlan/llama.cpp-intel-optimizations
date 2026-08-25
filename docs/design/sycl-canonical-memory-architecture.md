@@ -802,13 +802,42 @@ This contract does not govern:
    site). Fixed by making the shared helper externally linked so those
    separate translation units can call the one implementation, routing
    sites that have `ggml_backend_sycl_context`/`ggml_tensor` in scope
-   directly and hoisting the rest to rethrow up to a caller that does
-   (verified per-site, not assumed). `CHECK_TRY_ERROR` (`common.hpp`) — the
-   pervasive, pre-existing macro that converts a caught `std::exception`
-   into a `dpct::error_code` return value rather than printing and
-   terminating — is a structurally different, general-purpose mechanism
-   used at hundreds of call sites across the backend and is ruled out of
-   this census's scope, not merely unexamined.
+   directly and hoisting the rest to rethrow up to a caller that does.
+   `CHECK_TRY_ERROR` (`common.hpp`) — the pervasive, pre-existing macro that
+   converts a caught `std::exception` into a `dpct::error_code` return value
+   rather than printing and terminating — is a structurally different,
+   general-purpose mechanism used at hundreds of call sites across the
+   backend and is ruled out of this census's scope, not merely unexamined.
+
+   **The "verified per-site, not assumed" claim in commit 6 was itself
+   incomplete, and the spec re-review's own static trace is what found the
+   gap** (llama.cpp-o3h1 final fix cycle, same ticket comment c-53u5): the
+   16 hoisted per-quant-type MMQ launchers were verified against
+   `ggml_sycl_mmq_dispatch()` having a single caller (`ggml_sycl_op_mul_mat_q`,
+   the routed dispatch path) — but `ggml_sycl_mmq_dispatch()` actually has
+   **three** callers. The other two: `mmq_stream_slice()` inside
+   `unified_cache::stream_dma()`'s MMQ DMA-streaming path (`unified-cache.cpp`),
+   whose own `catch (const std::exception &)` converts the rethrow into a
+   `dma_stream_result` with `ok=false` rather than propagating it, so it
+   never reached `ggml_sycl_op_mul_mat_q`'s catch at all — a host-resident,
+   non-mmap MMQ weight view hitting resource exhaustion during streaming hit
+   `GGML_ABORT("MMQ streaming failed")` with no WARN and no ladder. Fixed by
+   capturing the caught exception's `what()` text into the result struct
+   (the exception object itself does not survive `stream_dma`'s catch) and
+   adding a third entry point,
+   `ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message()`
+   (`common.hpp`/`ggml-sycl.cpp`), that classifies from that captured text
+   instead of a live exception object — the same
+   `ggml_sycl_is_resource_exhaustion_message()` predicate commit 4
+   established as the real discriminator anyway. And `ggml_sycl_mmq_bench_launch()`
+   (the third caller, `tools/sycl-kernel-bench/benchmark_harness.hpp`'s
+   standalone kernel microbenchmark tool): no catch anywhere on this path,
+   left deliberately unrouted — it is a manual-run diagnostic with no
+   inference session or unattended process depending on it, where an
+   uncaught crash is more useful feedback than a silently "handled" CPU
+   fallback masking the condition being measured. This is why "verified,
+   not assumed" is not itself a substitute for tracing every caller of a
+   caller — the verification was real, just scoped one hop too shallow.
 
    No mid-`graph_compute` weight eviction is attempted as part of this
    recovery: `unified_cache::evict`/`evict_one`/`evict_and_flush` correctly

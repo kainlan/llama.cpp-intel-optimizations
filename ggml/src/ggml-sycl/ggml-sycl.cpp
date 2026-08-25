@@ -40159,6 +40159,59 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 // and cpy.cpp (1 site), separate translation units that need to link
 // against this ONE definition rather than each getting a copy. Declared
 // in common.hpp.
+//
+// llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual): the
+// recovery mechanics below (re-entrancy guard, WARN with budget-authority
+// numbers, ggml_sycl_cpu_fallback_graph, clean failure via
+// ggml_sycl_fallback_error) are shared with a THIRD entry point,
+// ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message()
+// below, extracted into ggml_sycl_run_resource_exhaustion_recovery() so
+// there is still only one copy of that logic, not three.
+static bool ggml_sycl_run_resource_exhaustion_recovery(ggml_backend_sycl_context & ctx,
+                                                       ggml_tensor *               dst,
+                                                       const char *                what_for_log) {
+    // Single re-entrancy guard shared by every call site (this function has
+    // exactly one instance regardless of how many places call it) -- defends
+    // against the CPU fallback graph itself somehow re-entering this same
+    // ladder recursively. Should not happen (CPU compute touches no GPU
+    // queue), but cheap insurance against an infinite loop.
+    static thread_local bool in_resource_exhaustion_fallback = false;
+    if (in_resource_exhaustion_fallback) {
+        return false;
+    }
+
+    auto *       fallback_cache        = ggml_sycl::get_unified_cache_for_device(ctx.device);
+    const int    budget_pct_at_failure = fallback_cache ? fallback_cache->budget_pct() : -1;
+    const double budget_mb_at_failure  = fallback_cache ? fallback_cache->base_budget() / (1024.0 * 1024.0) : -1.0;
+    const double headroom_mb_at_failure =
+        fallback_cache ? fallback_cache->external_headroom() / (1024.0 * 1024.0) : -1.0;
+    GGML_LOG_WARN(
+        "[SYCL] kernel submission resource exhaustion on op=%s device=%d (%s) -- budget_pct=%d budget=%.1f MB "
+        "external_headroom=%.1f MB -- attempting CPU fallback instead of aborting\n",
+        dst ? ggml_op_name(dst->op) : "(null)", ctx.device, what_for_log ? what_for_log : "(no message)",
+        budget_pct_at_failure, budget_mb_at_failure, headroom_mb_at_failure);
+
+    in_resource_exhaustion_fallback = true;
+    bool recovered                  = false;
+    try {
+        recovered = ggml_sycl_cpu_fallback_graph(ctx, dst, "kernel submission resource exhaustion");
+    } catch (...) {
+        recovered = false;
+    }
+    in_resource_exhaustion_fallback = false;
+
+    if (recovered) {
+        GGML_LOG_WARN("[SYCL] op=%s device=%d recovered via CPU fallback after resource exhaustion\n",
+                      dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
+        return true;
+    }
+    GGML_LOG_ERROR(
+        "[SYCL] CPU fallback also failed for op=%s device=%d after resource exhaustion; failing this graph "
+        "cleanly (no process abort)\n",
+        dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
+    throw ggml_sycl_fallback_error("kernel submission resource exhaustion, CPU fallback also failed");
+}
+
 bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
                                                          ggml_tensor *               dst,
                                                          const sycl::exception &     e) {
@@ -40184,46 +40237,7 @@ bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_conte
             dst ? ggml_op_name(dst->op) : "(null)", ctx.device, e.code().value(), e.code().category().name(), e.what());
         return false;
     }
-    // Single re-entrancy guard shared by every call site (this function has
-    // exactly one instance regardless of how many places call it) -- defends
-    // against the CPU fallback graph itself somehow re-entering this same
-    // ladder recursively. Should not happen (CPU compute touches no GPU
-    // queue), but cheap insurance against an infinite loop.
-    static thread_local bool in_resource_exhaustion_fallback = false;
-    if (in_resource_exhaustion_fallback) {
-        return false;
-    }
-
-    auto *       fallback_cache        = ggml_sycl::get_unified_cache_for_device(ctx.device);
-    const int    budget_pct_at_failure = fallback_cache ? fallback_cache->budget_pct() : -1;
-    const double budget_mb_at_failure  = fallback_cache ? fallback_cache->base_budget() / (1024.0 * 1024.0) : -1.0;
-    const double headroom_mb_at_failure =
-        fallback_cache ? fallback_cache->external_headroom() / (1024.0 * 1024.0) : -1.0;
-    GGML_LOG_WARN(
-        "[SYCL] kernel submission resource exhaustion on op=%s device=%d (%s) -- budget_pct=%d budget=%.1f MB "
-        "external_headroom=%.1f MB -- attempting CPU fallback instead of aborting\n",
-        dst ? ggml_op_name(dst->op) : "(null)", ctx.device, e.what(), budget_pct_at_failure, budget_mb_at_failure,
-        headroom_mb_at_failure);
-
-    in_resource_exhaustion_fallback = true;
-    bool recovered                  = false;
-    try {
-        recovered = ggml_sycl_cpu_fallback_graph(ctx, dst, "kernel submission resource exhaustion");
-    } catch (...) {
-        recovered = false;
-    }
-    in_resource_exhaustion_fallback = false;
-
-    if (recovered) {
-        GGML_LOG_WARN("[SYCL] op=%s device=%d recovered via CPU fallback after resource exhaustion\n",
-                      dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
-        return true;
-    }
-    GGML_LOG_ERROR(
-        "[SYCL] CPU fallback also failed for op=%s device=%d after resource exhaustion; failing this graph "
-        "cleanly (no process abort)\n",
-        dst ? ggml_op_name(dst->op) : "(null)", ctx.device);
-    throw ggml_sycl_fallback_error("kernel submission resource exhaustion, CPU fallback also failed");
+    return ggml_sycl_run_resource_exhaustion_recovery(ctx, dst, e.what());
 }
 
 // Overload for catch sites that (correctly, per commit 2 precedent in
@@ -40242,6 +40256,47 @@ bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_conte
         return false;
     }
     return ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, *as_sycl_exc);
+}
+
+// llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, ticket
+// comment c-53u5): the re-review's static trace found ggml_sycl_mmq_dispatch()
+// (mmq.cpp) has THREE callers, not the one the commit-6 launcher comments
+// claimed -- the routed dispatch path (fixed via the overloads above), the
+// MMQ DMA-streaming path (unified_cache::stream_dma(), unified-cache.cpp),
+// and the bench API. The streaming path's sole exception boundary is
+// stream_dma()'s own `catch (const std::exception & e)`, which converts
+// the exception into a `dma_stream_result` with `ok=false` and (now, this
+// fix cycle) `failure_message = e.what()` -- by the time mmq.cpp observes
+// `!result.ok`, the original exception object no longer exists to satisfy
+// either overload above. This entry point classifies from the captured
+// message text instead (ggml_sycl_is_resource_exhaustion_message(),
+// already the real discriminator per commit 4 -- code().value() was never
+// reliable for a Level Zero backend exception, so losing the live
+// exception object costs nothing here that commit 4 didn't already
+// establish is unavailable anyway).
+//
+// Graph-recording handling necessarily differs from the two overloads
+// above: there is no live exception here, so a bare `throw;` would call
+// std::terminate() (rethrow requires an exception currently being
+// handled, and this function is called from ordinary code -- mmq.cpp's
+// `if (!result.ok)` -- not from within a catch block). The safe
+// disposition without a live exception to hand back to the outer
+// graph-recording handler is to skip the (unsafe mid-record, same
+// rationale as the overloads above) CPU-fallback attempt and fail cleanly
+// via ggml_sycl_fallback_error directly --
+// ggml_backend_sycl_graph_compute's top-level handler treats that
+// identically regardless of recording state.
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message(ggml_backend_sycl_context & ctx,
+                                                                      ggml_tensor *               dst,
+                                                                      const char *                what_message) {
+    if (!ggml_sycl_is_resource_exhaustion_message(what_message)) {
+        return false;
+    }
+    if (g_ggml_sycl_graph_recording) {
+        throw ggml_sycl_fallback_error(
+            "kernel submission resource exhaustion during MMQ streaming, graph recording active");
+    }
+    return ggml_sycl_run_resource_exhaustion_recovery(ctx, dst, what_message);
 }
 
 // TBD pool with virtual memory management
@@ -98483,11 +98538,15 @@ static void ggml_backend_sycl_device_get_memory(ggml_backend_dev_t dev, size_t *
     if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
         *free = cache->base_budget();
     } else {
-        // Defensive fallback: no cache exists yet for this device (e.g.
-        // device enumeration/params-fit runs before any model load).
-        // Compute the same authority fresh rather than falling back to the
-        // old independent formula -- matches compute_vram_budget_for_plan's
-        // own fallback branch above.
+        // Fallback: no cache exists yet for this device -- the EXPECTED,
+        // ROUTINE case here (device enumeration/params-fit runs before any
+        // model load creates a cache), unlike compute_vram_budget_for_plan's
+        // fallback branch above, which is reached only if that function's
+        // own "caches exist before this runs" ordering invariant is
+        // violated (anomalous, hence its WARN). Deliberately silent here:
+        // warning on every ordinary startup would be noise, not signal.
+        // Computes the same authority fresh rather than falling back to the
+        // old independent formula.
         const bool host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
                                   ggml_sycl_info().devices[ctx->device].host_unified_memory;
         const ggml_sycl::vram_budget_authority authority =

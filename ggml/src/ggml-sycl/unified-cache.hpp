@@ -2774,16 +2774,26 @@ class unified_cache {
 
     struct dma_stream_result {
         // `event` remains as the compatibility spelling for terminal_event.
-        sycl::event event;
-        sycl::event terminal_event;
-        sycl::queue * queue             = nullptr;
-        bool        ok                  = false;
-        bool        submitted           = false;
-        bool        used_mmap_direct    = false;
-        bool        mmap_direct_failed  = false;
-        size_t      slices              = 0;
-        size_t      slice_bytes         = 0;
-        size_t      buffer_count        = 0;
+        sycl::event   event;
+        sycl::event   terminal_event;
+        sycl::queue * queue              = nullptr;
+        bool          ok                 = false;
+        bool          submitted          = false;
+        bool          used_mmap_direct   = false;
+        bool          mmap_direct_failed = false;
+        size_t        slices             = 0;
+        size_t        slice_bytes        = 0;
+        size_t        buffer_count       = 0;
+        // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual,
+        // c-53u5): captures e.what() from stream_dma()'s own
+        // `catch (const std::exception & e)` when a slice submission
+        // throws. The exception object itself does not survive past that
+        // catch, so a caller (mmq.cpp) that needs to classify the failure
+        // -- e.g. to route a driver resource-exhaustion signal through the
+        // shared fallback ladder instead of aborting -- has only this text
+        // to work from. Empty when stream_dma() never entered that catch
+        // (including the ok=true case).
+        std::string   failure_message;
     };
 
     dma_stream_result stream_dma(const cache_ptr_view &           src,

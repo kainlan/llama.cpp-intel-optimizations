@@ -1240,14 +1240,31 @@ params-fit, even though the cache was about to reserve headroom out of it
 regardless). Found by the o3h1 spec review (`llama.cpp-o3h1` commit 6,
 ticket comment c-53u5): measured disagreement with the authority on the
 B70, 3265.6 MB vs 2048 MB headroom for the same budget percentage. Fixed
-by folding it into the same reader pattern `compute_vram_budget_for_plan`
-already used (read `base_budget()` off the live cache; fall back to
-`compute_vram_budget_authority()`, WARN-logged, only when no cache exists
-yet for the device) and removing the "only if env var set" gate, since the
-authority reserves headroom at any percentage, including the synthesized
-default. This changes what params-fit sees at default settings — not a
-regression, since the *cache* was always going to reserve that headroom;
-params-fit had simply never been told about it before.
+by folding it into the same reader *shape* `compute_vram_budget_for_plan`
+already used — read `base_budget()` off the live cache; fall back to
+`compute_vram_budget_authority()` only when no cache exists yet for the
+device — and removing the "only if env var set" gate, since the authority
+reserves headroom at any percentage, including the synthesized default.
+This changes what params-fit sees at default settings — not a regression,
+since the *cache* was always going to reserve that headroom; params-fit
+had simply never been told about it before.
+
+**Correction (spec re-review, same ticket comment c-53u5): the fallback
+branch is silent, not "WARN-logged."** Commit 6's own commit message
+described this fallback as WARN-logged by analogy with
+`compute_vram_budget_for_plan`'s fallback branch, which does warn — but
+the two branches are not the same case. `compute_vram_budget_for_plan`'s
+fallback is reached only if the ordering invariant "caches are constructed
+before placement-plan computation" is ever violated, which would be
+anomalous and worth a WARN. `ggml_backend_sycl_device_get_memory`'s
+fallback, by contrast, is the *expected, routine* path: device
+enumeration and params-fit run before any model load creates a cache, so
+hitting it is normal, not a violated invariant, and a WARN there would be
+noise on every ordinary startup rather than a useful signal. The code is
+correct as written (silent); this paragraph's earlier text and the commit
+message for `299fd90c3` were wrong to describe it as warning — left
+uncorrected in that commit's own message (git history is not rewritten),
+fixed here.
 
 This closes the single-authority half of the design the failure required.
 The other half — making a still-insufficient budget a *handled* runtime

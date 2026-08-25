@@ -4698,12 +4698,34 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -4846,12 +4868,34 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_coalesced(const void *    vx,
 
 #undef LAUNCH_Q6_K_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5003,12 +5047,34 @@ static_kernel_path:
 #undef LAUNCH_Q4_0_SOA_KERNEL
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5151,12 +5217,34 @@ static_kernel_path:
 
 #undef LAUNCH_Q4_0_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5255,12 +5343,34 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5361,12 +5471,34 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5467,12 +5599,34 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5573,12 +5727,34 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5661,12 +5837,34 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_soa(const void *    vx,
 
 #undef LAUNCH_Q8_0_SOA_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5740,12 +5938,34 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_coalesced(const void *    vx,
 
 #undef LAUNCH_Q8_0_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5850,12 +6070,34 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -5967,12 +6209,34 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *    vx,
     }
 #endif
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -6079,12 +6343,34 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -6193,12 +6479,34 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -6306,12 +6614,34 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *    vx,
 
 #undef LAUNCH_Q6_K_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -6414,12 +6744,34 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_soa(const void *    vx,
 
 #undef LAUNCH_Q6_K_SOA_KERNEL
 } catch (sycl::exception const & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
-    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
-    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
-    // routes this through the shared resource-exhaustion helper; nothing
-    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
-    // sole caller of this function, has no catch of its own).
+    // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual, c-53u5):
+    // no ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. This function's sole caller, ggml_sycl_mmq_dispatch() (this
+    // file), has no catch of its own, so the rethrow always reaches
+    // ggml_sycl_mmq_dispatch()'s own callers -- but ggml_sycl_mmq_dispatch()
+    // itself has THREE callers, each with a different disposition (commit
+    // 6's comment here named only one, which the re-review's static trace
+    // found factually wrong):
+    //   1. Routed dispatch, via ggml_sycl_op_mul_mat_q() (this file):
+    //      reaches that function's own catch, which routes through the
+    //      shared resource-exhaustion helper (fixed commit 6).
+    //   2. MMQ DMA streaming, via mmq_stream_slice() (this file) inside
+    //      unified_cache::stream_dma() (unified-cache.cpp): reaches
+    //      stream_dma()'s own catch, which converts the exception into a
+    //      dma_stream_result (ok=false, failure_message captured) rather
+    //      than propagating it further -- ggml_sycl_op_mul_mat_q()'s
+    //      !result.ok branch (this file) classifies from that message and
+    //      routes through the shared ladder too (fixed this cycle).
+    //   3. The bench API, via ggml_sycl_mmq_bench_launch() (this file):
+    //      no catch anywhere on this path, so the exception propagates to
+    //      whatever calls it -- tools/sycl-kernel-bench/benchmark_harness.hpp,
+    //      a standalone manual-run kernel microbenchmark tool, not any
+    //      production inference binary or automated pipeline. Left
+    //      unrouted deliberately: no inference session or unattended
+    //      process depends on this path, and a developer actively tuning
+    //      kernel parameters is better served by a loud, immediate crash
+    //      than a silently "handled" CPU fallback masking the condition
+    //      they are trying to measure.
     GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
                   __func__, exc.what());
     throw;
@@ -7289,6 +7641,23 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
                     return;
                 }
             }
+            // llama.cpp-o3h1 final fix cycle (spec re-review, F2 residual,
+            // c-53u5): a host-resident, non-mmap MMQ weight view hitting
+            // driver resource exhaustion during streaming used to reach
+            // only the GGML_ABORT below -- mmap_direct_failed is set only
+            // for HOST_MMAP sources, so this branch is the actual seam for
+            // every other view location. The original sycl::exception (from
+            // a hoisted per-quant-type MMQ launcher, see their catch
+            // comments below) is fully consumed inside
+            // unified_cache::stream_dma()'s own catch before ever reaching
+            // here, so classification works from result.failure_message
+            // (the captured e.what() text) rather than a live exception
+            // object -- ctx and dst are both in scope, matching every other
+            // seam in this ladder.
+            if (ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message(ctx, dst,
+                                                                                 result.failure_message.c_str())) {
+                return;
+            }
             GGML_ABORT("MMQ streaming failed");
         }
         GGML_UNUSED(src1);
@@ -7334,13 +7703,18 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddf_i);
 } catch (const sycl::exception & exc) {
-    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): this is the
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5), corrected by the
+    // final fix cycle (spec re-review, F2 residual, c-53u5): this is the
     // dispatch-path catch that ggml_sycl_mmq_dispatch()'s 16 per-quant-type
-    // kernel launchers (below, in this file) hoist-rethrow up to -- see
-    // their catch comments. It also directly catches anything thrown by
-    // this function's own body. ctx and dst are both in scope, so this
-    // routes through the shared helper the same way ggml_sycl_mul_mat_id
-    // did in commit 3.
+    // kernel launchers (below, in this file) hoist-rethrow up to WHEN
+    // REACHED VIA THIS FUNCTION specifically -- ggml_sycl_mmq_dispatch()
+    // has two OTHER callers (the MMQ streaming path and the bench API; see
+    // the launchers' own catch comments for the full three-caller picture
+    // and their individual dispositions) whose exceptions never reach here
+    // at all. This catch also directly catches anything thrown by this
+    // function's own body. ctx and dst are both in scope, so this routes
+    // through the shared helper the same way ggml_sycl_mul_mat_id did in
+    // commit 3.
     if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
         return;
     }
