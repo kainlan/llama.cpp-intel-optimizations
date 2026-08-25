@@ -40161,7 +40161,20 @@ static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_syc
         // back to direct execution instead (unchanged from commit 2).
         throw;
     }
-    if (!ggml_sycl_is_resource_exhaustion_error_code(e.code().value())) {
+    if (!ggml_sycl_is_resource_exhaustion_exception(e)) {
+        // llama.cpp-o3h1 commit 4: permanent diagnostic, not a temp probe.
+        // The numeric predicate alone (code().value()) was found on
+        // hardware to NOT match a genuine Level Zero backend resource-
+        // exhaustion exception (b50-catch-exercise-756be1d6f.log:1470;
+        // see ggml_sycl_is_resource_exhaustion_message's comment in
+        // common.hpp for why) -- every mismatch through this fallthrough
+        // now logs both axes the combined predicate actually checks, so
+        // the next mismatch self-diagnoses from the log instead of
+        // requiring another forced-pressure hardware exercise to find.
+        GGML_LOG_WARN(
+            "[SYCL] dispatch exception op=%s device=%d did not match resource-exhaustion predicate -- "
+            "code=%d category=%s what=%s\n",
+            dst ? ggml_op_name(dst->op) : "(null)", ctx.device, e.code().value(), e.code().category().name(), e.what());
         return false;
     }
     // Single re-entrancy guard shared by every call site (this function has

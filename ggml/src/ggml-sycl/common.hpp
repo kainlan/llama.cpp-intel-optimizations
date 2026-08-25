@@ -113,6 +113,62 @@ inline bool ggml_sycl_is_resource_exhaustion_error_code(int code) {
     return code == 39 /* UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY */ || code == 40 /* UR_RESULT_ERROR_OUT_OF_RESOURCES */;
 }
 
+// llama.cpp-o3h1 commit 4: ggml_sycl_is_resource_exhaustion_error_code()
+// above was validated only against synthetic ints
+// (tests/test-sycl-layout-choice.cpp) -- never against what code().value()
+// actually returns for a REAL Level Zero backend exception. Commit 3's
+// hardware exercise (ticket log b50-catch-exercise-756be1d6f.log:1470)
+// found the predicate never matched a genuine driver resource-exhaustion
+// exception: DPC++ maps Level Zero backend errors through sycl::errc, not
+// the raw UR result code, so code().value() does not reliably carry 39/40.
+// The one place the real discriminator does survive intact is as TEXT
+// inside what(), in the plugin's own message format, e.g.:
+//   "level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)"
+// This is the second, independently-reliable axis -- a narrow, exact
+// literal set (same narrowness discipline as the numeric predicate above,
+// so an unrelated exception message is never misclassified as
+// recoverable), matching either the UR result name or the plugin's
+// numeric "error: NN" text form.
+//
+// The numeric needles are ANCHORED with a trailing " (" -- a bare
+// "error: 39"/"error: 40" substring also matches "error: 390",
+// "error: 400", "error: 403", ... (any longer error number sharing that
+// two-digit prefix), which would silently misclassify an unrelated error
+// as recoverable and CPU-fallback a genuine bug behind "graceful"
+// recovery. The real L0 plugin message always parenthesizes the UR result
+// name immediately after the number (see the captured line above), so
+// requiring " (" right after the digits is a safe, exact anchor, not a
+// guess -- it is the actual format, not a narrower approximation of it.
+inline bool ggml_sycl_is_resource_exhaustion_message(const char * what_message) {
+    if (!what_message) {
+        return false;
+    }
+    static const char * const needles[] = {
+        "UR_RESULT_ERROR_OUT_OF_RESOURCES",
+        "UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY",
+        "error: 39 (",
+        "error: 40 (",
+    };
+    for (const char * needle : needles) {
+        if (std::strstr(what_message, needle) != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Single entry point combining BOTH axes -- the numeric code().value()
+// check (kept in case some path or driver version DOES surface a real UR
+// value there) and the what()-substring check (the one observed to
+// actually fire on real Level Zero backend exceptions). This is a union,
+// not an intersection: either axis matching is sufficient, so neither
+// becomes a silent regression if the other axis's assumption changes
+// again in some future driver.
+inline bool ggml_sycl_is_resource_exhaustion_exception(const sycl::exception & e) {
+    return ggml_sycl_is_resource_exhaustion_error_code(e.code().value()) ||
+           ggml_sycl_is_resource_exhaustion_message(e.what());
+}
+
 struct ggml_sycl_device_info;
 const ggml_sycl_device_info & ggml_sycl_info();
 

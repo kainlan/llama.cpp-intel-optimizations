@@ -1769,11 +1769,93 @@ static bool run_resource_exhaustion_error_code_test() {
     return true;
 }
 
+// llama.cpp-o3h1 commit 4: the test above proved the NUMERIC predicate is
+// narrow and exact -- it never proved a real Level Zero backend exception
+// actually PRODUCES 39/40 from code().value(). Commit 3's hardware
+// exercise found it does not (b50-catch-exercise-756be1d6f.log:1470):
+// DPC++ maps Level Zero backend errors through sycl::errc, not the raw UR
+// result code, so the numeric predicate was tested against itself, not
+// against the oracle. ggml_sycl_is_resource_exhaustion_message() is the
+// second, independently-reliable axis (common.hpp) -- a plain
+// `const char *` predicate, directly testable host-side with synthetic
+// messages, with no live device or sycl::exception construction required.
+// ggml_sycl_is_resource_exhaustion_exception() (the sycl::exception ||
+// combinator of both axes) is deliberately NOT separately unit-tested
+// here: it is a trivial OR of two already-tested predicates, and
+// constructing a live sycl::exception host-side to exercise it would add
+// test complexity without covering any additional logic.
+static bool run_resource_exhaustion_message_test() {
+    // The exact literal forms observed on hardware, and the two the team
+    // lead's fix cycle asked for explicitly: the UR result name (survives
+    // regardless of what code() maps to) and the plugin's numeric
+    // "error: NN (" text form, anchored with the trailing "(" that the
+    // real L0 plugin message always has immediately after the number (in
+    // case some message carries the number+paren without the UR name
+    // elsewhere in the string).
+    const char * must_match[] = {
+        "level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)",
+        "level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)",
+        "UR_RESULT_ERROR_OUT_OF_RESOURCES",
+        "UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY",
+        "some prefix text ... error: 40 (something) ... some suffix text",
+        "some prefix text ... error: 39 (something) ... some suffix text",
+    };
+    for (const char * msg : must_match) {
+        if (!ggml_sycl_is_resource_exhaustion_message(msg)) {
+            printf("FAIL: message should be classified as resource exhaustion: \"%s\"\n", msg);
+            return false;
+        }
+    }
+    // Narrowness guarantee, same discipline as the numeric predicate:
+    // a neighboring UR result name, an unrelated error, null, and empty
+    // must NOT match -- this is what keeps a genuine correctness/driver
+    // bug from being silently treated as "handled".
+    //
+    // The digit-prefix cases below are the hole the team lead's review
+    // caught before this landed: a bare "error: 39"/"error: 40" substring
+    // (no anchor) also matches "error: 390", "error: 400", "error: 403",
+    // ... -- any longer error number sharing that two-digit prefix -- which
+    // would silently CPU-fallback an unrelated failure behind "graceful"
+    // recovery. All of these must be rejected by the anchored predicate.
+    const char * must_not_match[] = {
+        "UR_RESULT_ERROR_INVALID_ARGUMENT",
+        "UR_RESULT_ERROR_INVALID_KERNEL_ARGS",
+        "some completely unrelated exception message",
+        "",
+        "level_zero backend failed with error: 400 (UR_RESULT_ERROR_UNKNOWN)",
+        "level_zero backend failed with error: 403 (UR_RESULT_ERROR_UNKNOWN)",
+        "level_zero backend failed with error: 390 (UR_RESULT_ERROR_UNKNOWN)",
+        "level_zero backend failed with error: 39x (UR_RESULT_ERROR_UNKNOWN)",
+        "level_zero backend failed with error: 40x (UR_RESULT_ERROR_UNKNOWN)",
+        // "error: 40"/"error: 39" present, but with no "(" immediately
+        // after -- e.g. no parenthesized UR name at all, or one separated
+        // by more than the expected single space.
+        "level_zero backend failed with error: 40",
+        "level_zero backend failed with error: 39",
+        "level_zero backend failed with error: 40  (UR_RESULT_ERROR_OUT_OF_RESOURCES)",
+    };
+    for (const char * msg : must_not_match) {
+        if (ggml_sycl_is_resource_exhaustion_message(msg)) {
+            printf("FAIL: message must NOT be classified as resource exhaustion: \"%s\"\n", msg);
+            return false;
+        }
+    }
+    if (ggml_sycl_is_resource_exhaustion_message(nullptr)) {
+        printf("FAIL: a null message must not be classified as resource exhaustion\n");
+        return false;
+    }
+    printf("PASS: resource-exhaustion message predicate is narrow and exact\n");
+    return true;
+}
+
 int main() {
     if (!run_fused_gate_up_role_test()) {
         return 1;
     }
     if (!run_resource_exhaustion_error_code_test()) {
+        return 1;
+    }
+    if (!run_resource_exhaustion_message_test()) {
         return 1;
     }
     if (!run_vram_budget_authority_test()) {
