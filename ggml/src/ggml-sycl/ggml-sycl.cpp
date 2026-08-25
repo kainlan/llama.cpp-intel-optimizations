@@ -15,9 +15,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef __linux__
-#    include <sys/mman.h>
-#endif
 
 #include <algorithm>
 #include <array>
@@ -5022,17 +5019,17 @@ static bool moe_decode_route_census_enabled() {
 // -- ggml_sycl_probe_moe_planned_layout()'s own entry count, and the
 // fast-path (registered-handle route) vs canonical-key-fallback branch
 // split inside ggml_sycl_resolve_moe_expert_route(). Both call sites are
-// far above where MXFP4_PP_BATCHED_PROFILE's own accumulator struct and
-// mxfp4_pp_batched_profile_enabled() are declared later in this TU, so
-// (same "declared where the call site is, consumed later" pattern gemm.hpp
-// already uses for its own accumulator) these live here as their own
-// small thread_local counters, gated by a forward-declared reference to
-// the same enabled() gate everything else in this instrument uses -- one
-// knob, not a second env-var read. mxfp4_pp_batched_profile_print_and_reset()
-// reads and resets them into the HOST4 line alongside the timing brackets
-// around these same two functions' CALL SITES in ggml_sycl_mul_mat_id.
-static bool mxfp4_pp_batched_profile_enabled();
-
+// far above where MXFP4_PP_BATCHED_PROFILE's own accumulator struct is
+// declared later in this TU, so (same "declared where the call site is,
+// consumed later" pattern gemm.hpp already uses for its own accumulator)
+// these live here as their own small thread_local counters, gated by
+// mxfp4_pp_batched_profile_enabled() -- one knob, not a second env-var
+// read. That function's declaration (quality review fix cycle, F-1) now
+// lives in moe-resolved-batch.hpp, included well above this point, so no
+// separate forward declaration is needed here.
+// mxfp4_pp_batched_profile_print_and_reset() reads and resets these
+// counters into the HOST4 line alongside the timing brackets around these
+// same two functions' CALL SITES in ggml_sycl_mul_mat_id.
 static thread_local uint64_t g_mxfp4_pp_admit_probe_entries = 0;  // ggml_sycl_probe_moe_planned_layout() entries
 static thread_local uint64_t g_mxfp4_pp_admit_resolve_fastpath =
     0;  // ggml_sycl_resolve_moe_expert_route(): registered-handle fast-path hit
@@ -64780,7 +64777,17 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
 // default_queue_properties(); see unified-cache.hpp's dma_queue_ comment,
 // "every backend stream is created with... enable_profiling"), so
 // ctx.stream() already supports these queries.
-static bool mxfp4_pp_batched_profile_enabled() {
+// llama.cpp-iikr (quality review fix cycle, F-1): declared (not static) in
+// moe-resolved-batch.hpp, included well above this point in the TU -- the
+// resolve-loop instrument brackets there need external linkage to this
+// definition, since unified-cache.cpp (a separate translation unit that
+// also includes that header directly) must link against the SAME symbol
+// rather than getting "undeclared identifier" or a second, divergent
+// source of truth. See that header's own declaration comment for why a
+// self-contained inline env-var check there would have been wrong: this
+// function also consults ggml_sycl_graph_recording_active(), not just the
+// env var.
+bool mxfp4_pp_batched_profile_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
         return env && std::atoi(env) != 0;
@@ -75957,7 +75964,7 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     // THIS call, nor which branch this caller actually took. Same env var,
     // same self-validating shape: many lines expected for a normal run,
     // filtered to MoE-routing-hinted nodes specifically so it doesn't flood.
-    const bool moe_routing_device_trace_enabled = [] {
+    static const bool moe_routing_device_trace_enabled = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_ROUTING_DEVICE_TRACE");
         return env && std::atoi(env) != 0;
     }();

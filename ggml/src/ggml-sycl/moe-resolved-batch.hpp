@@ -21,6 +21,26 @@
 
 struct ggml_tensor;
 
+// llama.cpp-iikr (quality review fix cycle, F-1): declared here, in the
+// GLOBAL namespace -- NOT inside `namespace ggml_sycl` below, and NOT a
+// self-contained inline env-var check. Both would be wrong: the real
+// definition (ggml-sycl.cpp, also global-namespace, matching every one of
+// its many unqualified call sites there) also consults ggml_sycl_graph_
+// recording_active() -- submitting extra marker kernels and reading
+// command_start/command_end is forbidden while a SYCL command-graph is
+// being recorded -- so an inline copy inside this header would be a second,
+// DIVERGENT source of truth, not a faithful mirror; and a declaration
+// nested inside `namespace ggml_sycl` would silently create an unrelated
+// `ggml_sycl::mxfp4_pp_batched_profile_enabled` symbol that never matches
+// the global one ggml-sycl.cpp actually defines and calls (caught by
+// ggml-sycl.cpp itself failing to build with "did you mean
+// ggml_sycl::mxfp4_pp_batched_profile_enabled?" the first time this was
+// wired one namespace too deep). External linkage (no `static`) is
+// required anyway: this header is included directly by unified-cache.cpp
+// and cpu-dispatch.hpp, separate translation units from ggml-sycl.cpp's
+// own definition.
+bool mxfp4_pp_batched_profile_enabled();
+
 namespace ggml_sycl {
 
 enum class moe_batch_residency : uint8_t {
@@ -499,16 +519,20 @@ struct moe_batch_local_view {
 // handle identity agree. Conflicting identities fail closed.
 //
 // build_moe_resolved_batch() memoizes by expert_id (see its comment) and
-// copies the whole operand -- residency, owning_device, actual_layout, lease
-// included -- onto every repeat occurrence of an expert already seen in that
-// call. So the admission checks below (residency/device/layout, then
-// lease.resolve(), which each take a lock/atomic per call) produce an
-// identical result for every occurrence of one expert; only occurrence/
-// token_index/slot_index vary. Run the checks and the resolve once per
-// unique expert_id, on first sight, and reuse that result for repeats --
-// this preserves the exact reject reason/occurrence a full per-occurrence
-// re-check would report, because a repeat can never diverge from its first
-// occurrence's outcome.
+// gives every repeat occurrence of an expert already seen in that call a
+// moe_resolved_operand holding a shared_ptr<const moe_resolved_operand_
+// canonical> to the SAME canonical payload the first occurrence built --
+// residency, owning_device, actual_layout, lease and everything else that
+// is invariant per unique expert live there once, not per operand; only
+// expert_id/occurrence/token_index/slot_index differ across repeats (see
+// moe_resolved_operand_canonical's own comment). So the admission checks
+// below (residency/device/layout, then lease.resolve(), which each take a
+// lock/atomic per call) produce an identical result for every occurrence of
+// one expert by construction, not merely by observation. Run the checks and
+// the resolve once per unique expert_id, on first sight, and reuse that
+// result for repeats -- this preserves the exact reject reason/occurrence a
+// full per-occurrence re-check would report, because a repeat can never
+// diverge from its first occurrence's outcome.
 inline moe_batch_local_view make_moe_batch_local_view(const moe_resolved_batch & batch, ggml_layout_mode layout) {
     moe_batch_local_view                out;
     std::unordered_map<int32_t, size_t> expert_slots;
@@ -861,19 +885,25 @@ inline moe_batch_reject_reason validate_moe_batch_route(const moe_batch_route & 
 // at most, memoized so each unique expert pays it once) or in the OUTER
 // per-operand work that runs once per TOKEN OCCURRENCE (up to ~2048
 // operands/role for a 512-token prompt: the memo-hit fast copy path for
-// repeats, plus the occurrence/token_index/slot_index stamping this file's
-// own build_moe_resolved_batch comment already identifies as the ids-
-// dependent part, see lines 771/792-794/825-827 below)? Declared here, not
-// in ggml-sycl.cpp's mxfp4_pp_batched_profile_accum, for the same reason as
-// ggml_sycl_gemm_profile in gemm.hpp: this header is included before that
-// struct is defined in the same translation unit. Unconditional measurement
-// (two cheap chrono reads per UNIQUE EXPERT, not per operand -- see the
-// running-clock placement in the loop below, which brackets the resolver()
-// call itself as INNER and attributes every other iteration's time,
-// including every memo-hit repeat, to OUTER via the same shared clock) so
-// this header carries no dependency on ggml-sycl.cpp's profiling-enabled
-// check; ggml-sycl.cpp's print_and_reset drains these via exchange(0) and
-// folds them into its own report only when ITS OWN gate is on.
+// repeats, plus the occurrence/token_index/slot_index stamping build_moe_
+// resolved_batch's own loop performs). Declared here, not in ggml-sycl.cpp's
+// mxfp4_pp_batched_profile_accum, for the same reason as ggml_sycl_gemm_
+// profile in gemm.hpp: this header is included before that struct is
+// defined in the same translation unit.
+// llama.cpp-iikr (quality review fix cycle, F-1): the three brackets below
+// used to be unconditional on the theory that they were "two cheap chrono
+// reads per unique expert, not per operand" -- true when this comment was
+// written (outer_stamp alone folded every iteration's time, memo-hit
+// repeats included, into one shared bucket), but false as of the outer-
+// stamping remainder cycle just below: the memo-hit branch now has its OWN
+// bracket, and it runs once per REPEAT TOKEN OCCURRENCE -- up to ~2048/role
+// for a 512-token prompt, not ~32. All three brackets (inner_resolve,
+// outer_stamp, memo_hit) now gate on mxfp4_pp_batched_profile_enabled()
+// (declared in the global namespace at the top of this file, before
+// `namespace ggml_sycl` opens -- see that declaration's own comment) --
+// the SAME knob that gates every other MXFP4_PP_BATCHED_PROFILE instrument
+// and the HOST5/HOST6 lines these three accumulators feed, not a second
+// env-var read.
 namespace ggml_sycl_resolve_batch_profile {
 inline std::atomic<int64_t> & inner_resolve_ns_accum() {
     static std::atomic<int64_t> v{ 0 };
@@ -896,18 +926,24 @@ inline std::atomic<int64_t> & outer_stamp_calls_accum() {
 }
 
 // llama.cpp-iikr (outer-stamping remainder cycle): outer_stamp_ns turned out
-// to dominate inner 12:1 (HOST5, c35ddbb71). It conflates two structurally
+// to dominate inner 12:1 (HOST5, c35ddbb71). It conflated two structurally
 // different things: loop overhead + full field stamping for a genuinely NEW
 // expert (~32/role, matches inner's own volume) vs. the memo-HIT branch for
-// every REPEAT token occurrence (~2000+/role for a typical prompt), which
-// copies the WHOLE moe_resolved_operand -- including its mem_handle lease
-// (a copy bumps the target entry's refcount under a lock, mem-handle.hpp:
-// 278-284) and its sycl::event -- just to overwrite 3 scalar fields
-// afterward. Split out here so the two are no longer lumped together: the
-// memo-hit branch now marks itself separately (right before its own
-// `continue`), so outer_stamp_ns naturally narrows to loop-overhead +
+// every REPEAT token occurrence (~2000+/role for a typical prompt) -- at the
+// time, that branch copied the WHOLE moe_resolved_operand field-by-field,
+// including its own mem_handle lease and sycl::event, just to overwrite 3
+// scalar fields afterward (the design note's leading hypothesis for why
+// outer_stamp_ns was so large). Split out here so the two are no longer
+// lumped together: the memo-hit branch marks itself separately (right
+// before its own `continue`), so outer_stamp_ns narrows to loop-overhead +
 // genuinely-new-expert stamping only, and memo_hit_ns isolates the repeat-
-// occurrence copy specifically -- the design note's leading hypothesis.
+// occurrence path specifically. Post-canonical-restructure (ba987da15), that
+// path is a shared_ptr<const moe_resolved_operand_canonical> copy (one
+// atomic refcount bump) plus 4 scalar writes, not a field-by-field struct
+// copy -- see this file's own moe_resolved_operand_canonical comment and
+// make_moe_batch_local_view's memoization comment above for the current
+// contract; memo_hit_ns still isolates this path so the win is measured,
+// not assumed.
 inline std::atomic<int64_t> & memo_hit_ns_accum() {
     static std::atomic<int64_t> v{ 0 };
     return v;
@@ -960,7 +996,17 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
     // (up to ~32/role, memoized), not per operand (up to ~2048/role) -- the
     // latter would make the measurement's own chrono overhead comparable to
     // what it is trying to measure.
-    auto resolve_batch_loop_clock = std::chrono::high_resolution_clock::now();
+    // llama.cpp-iikr (quality review fix cycle, F-1): gated on the same
+    // MXFP4_PP_BATCHED_PROFILE knob every other instrument in this pipeline
+    // uses -- see this namespace's own declaration comment above for why
+    // the memo-hit bracket specifically needed this (it runs per REPEAT
+    // occurrence, up to ~2048/role, not per unique expert). When disabled,
+    // resolve_batch_loop_clock is never read by any of the (also-gated)
+    // brackets below, so leaving it default-constructed rather than paying
+    // for a chrono call is correct, not just cheap.
+    const bool profile_enabled = mxfp4_pp_batched_profile_enabled();
+    auto       resolve_batch_loop_clock =
+        profile_enabled ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
     for (size_t i = 0; i < count; ++i) {
         const int32_t expert_id = out.batch.expert_ids[i];
 
@@ -971,7 +1017,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             operand.token_index          = i / slots_per_token;
             operand.slot_index           = i % slots_per_token;
             out.batch.operands.push_back(std::move(operand));
-            {
+            if (profile_enabled) {
                 const auto now = std::chrono::high_resolution_clock::now();
                 ggml_sycl_resolve_batch_profile::memo_hit_ns_accum().fetch_add(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
@@ -982,7 +1028,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             continue;
         }
 
-        {
+        if (profile_enabled) {
             const auto now = std::chrono::high_resolution_clock::now();
             ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
@@ -991,7 +1037,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
             resolve_batch_loop_clock = now;
         }
         moe_batch_route route = resolver(expert_id);
-        {
+        if (profile_enabled) {
             const auto now = std::chrono::high_resolution_clock::now();
             ggml_sycl_resolve_batch_profile::inner_resolve_ns_accum().fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),
@@ -1069,7 +1115,7 @@ moe_resolved_batch_result build_moe_resolved_batch(const int32_t * ids,
     // above (reject/RECIPE_MISSING) skips this, same posture as every other
     // phase mark in this codebase: an early exit before a mark leaves that
     // call's contribution to it unaccounted.
-    {
+    if (profile_enabled) {
         const auto now = std::chrono::high_resolution_clock::now();
         ggml_sycl_resolve_batch_profile::outer_stamp_ns_accum().fetch_add(
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - resolve_batch_loop_clock).count(),

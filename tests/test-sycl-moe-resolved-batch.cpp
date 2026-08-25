@@ -504,8 +504,8 @@ static bool test_prompt_local_view_uses_exact_retained_handles() {
     // llama.cpp-iikr (spec review fix cycle, F3): moe_batch_role_admissible
     // must refuse the identical genuinely-divergent-lease conflict
     // make_moe_batch_local_view just refused above -- same positive control
-    // (line 484's stable_identity_equal check) already proves the two
-    // leases actually differ before this assertion.
+    // (the first_resolve/second_resolve stable_identity_equal CHECK above)
+    // already proves the two leases actually differ before this assertion.
     CHECK(!ggml_sycl::moe_batch_role_admissible(conflicting_batch, GGML_LAYOUT_SOA));
 
     // A stale same-size external/cache array cannot overwrite the admitted ID snapshot.
@@ -614,8 +614,9 @@ static bool test_planned_prompt_hybrid_identity_readiness_and_layout_miss() {
     CHECK(!drift_view && drift_view.reject == ggml_sycl::moe_batch_reject_reason::POINTER_MISMATCH);
     // llama.cpp-iikr (spec review fix cycle, F3): same species as the
     // conflict_view fixture above, moe_batch_role_admissible side -- the
-    // positive control at line 582 already proves the two leases genuinely
-    // differ before this assertion.
+    // positive control (the drift_first/drift_second stable_identity_equal
+    // CHECK above) already proves the two leases genuinely differ before
+    // this assertion.
     CHECK(!ggml_sycl::moe_batch_role_admissible(drift_batch, GGML_LAYOUT_AOS));
     return true;
 }
