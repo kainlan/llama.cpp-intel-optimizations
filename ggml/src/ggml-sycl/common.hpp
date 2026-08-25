@@ -169,6 +169,28 @@ inline bool ggml_sycl_is_resource_exhaustion_exception(const sycl::exception & e
            ggml_sycl_is_resource_exhaustion_message(e.what());
 }
 
+// llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): the shared clean-failure
+// ladder for a driver-internal kernel-submission resource-exhaustion
+// exception -- graph-recording rethrow, the predicate above, CPU fallback
+// via ggml_sycl_cpu_fallback_graph(), clean failure via
+// ggml_sycl_fallback_error. Defined (not `static`, so every dispatch-path
+// translation unit can link against the ONE implementation -- no per-TU
+// copy) in ggml-sycl.cpp, right after ggml_sycl_cpu_fallback_graph(). The
+// commit-3 census only reached catch sites inside ggml-sycl.cpp itself;
+// the spec review found this same defect class in mmq.cpp (17 sites) and
+// cpy.cpp (1 site), both of which are separate translation units and could
+// not see a `static` helper -- hence the external linkage. See the
+// definition's own comment in ggml-sycl.cpp for the full design rationale.
+// Two overloads for the same reason as before: sycl::exception is-a
+// std::exception, so a broad `catch (const std::exception &)` boundary
+// must route through this too, not just a sycl::exception-typed one.
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                         ggml_tensor *               dst,
+                                                         const sycl::exception &     e);
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                         ggml_tensor *               dst,
+                                                         const std::exception &      e);
+
 struct ggml_sycl_device_info;
 const ggml_sycl_device_info & ggml_sycl_info();
 

@@ -40152,9 +40152,16 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 // through un-swallowed (ggml_sycl_compute_forward already special-cases it
 // first via `catch (const ggml_sycl_fallback_error &) { throw; }`, ahead of
 // its own sycl::exception/std::exception catches).
-static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
-                                                                ggml_tensor *               dst,
-                                                                const sycl::exception &     e) {
+//
+// llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): NOT `static` -- the
+// commit-3 census only reached catch sites inside this translation unit;
+// the spec review found the identical defect class in mmq.cpp (17 sites)
+// and cpy.cpp (1 site), separate translation units that need to link
+// against this ONE definition rather than each getting a copy. Declared
+// in common.hpp.
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                         ggml_tensor *               dst,
+                                                         const sycl::exception &     e) {
     if (g_ggml_sycl_graph_recording) {
         // Graph recording can't run a CPU fallback graph mid-record; let the
         // outer graph-recording handler gracefully disable graphs and fall
@@ -40227,9 +40234,9 @@ static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_syc
 // definition not this narrow driver-resource-exhaustion class, so it
 // returns false immediately and the caller's original disposition for it
 // is unchanged.
-static bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
-                                                                ggml_tensor *               dst,
-                                                                const std::exception &      e) {
+bool ggml_sycl_try_dispatch_resource_exhaustion_fallback(ggml_backend_sycl_context & ctx,
+                                                         ggml_tensor *               dst,
+                                                         const std::exception &      e) {
     const sycl::exception * as_sycl_exc = dynamic_cast<const sycl::exception *>(&e);
     if (!as_sycl_exc) {
         return false;
@@ -98455,25 +98462,38 @@ static void ggml_backend_sycl_device_get_memory(ggml_backend_dev_t dev, size_t *
     ggml_sycl_set_device(ctx->device);
     SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_get_device(ctx->device).get_memory_info(*free, *total)));
 
-    // Apply VRAM budget percentage so llama_params_fit sees the same budget
-    // as the unified cache, preventing over-allocation that triggers streaming fallback.
-    const char * env_pct = std::getenv("GGML_SYCL_VRAM_BUDGET_PCT");
-    if (env_pct) {
-        int    pct      = std::max(1, std::min(100, std::atoi(env_pct)));
-        size_t base_mem = ggml_sycl_info().devices[ctx->device].total_vram;
-        if (base_mem == 0) {
-            base_mem = *total;
-        }
-        size_t       budget       = static_cast<size_t>(base_mem * (static_cast<double>(pct) / 100.0));
-        const size_t min_headroom = 256ull * 1024ull * 1024ull;
-        const size_t headroom     = std::max(min_headroom, base_mem / 10);
-        if (base_mem > headroom && budget > base_mem - headroom) {
-            budget = base_mem - headroom;
-        }
-        if (budget > *free) {
-            budget = *free;
-        }
-        *free = budget;
+    // llama.cpp-o3h1 commit 6 (spec review F3, c-53u5): read the SAME budget
+    // authority every other site reads (compute_vram_budget_for_plan's
+    // "site A" pattern above, unified-cache.cpp's create_cache_for_device
+    // and unified_cache_get_budget_info) instead of an independent
+    // getenv+clamp+max(256MB,total/10) formula -- the exact "fifth
+    // independent computation" commit 1 removed everywhere else in this
+    // ticket. That formula also disagreed with the authority's own headroom
+    // for the same pct (measured on the B70: 3265.6 MB vs 2048 MB) -- two
+    // different answers to "how much VRAM headroom does this device need",
+    // one of which is fiction, feeding llama-model.cpp/arg.cpp/common.cpp's
+    // params-fit.
+    //
+    // Unconditional now, not gated on GGML_SYCL_VRAM_BUDGET_PCT being set:
+    // the unified cache reserves external headroom at ANY pct, including
+    // the unset-env-var default (100), so gating this on "env var present"
+    // was itself part of the disagreement -- params-fit used to see the
+    // raw, unadjusted free VRAM at default settings even though the cache
+    // was about to reserve headroom out of it regardless.
+    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
+        *free = cache->base_budget();
+    } else {
+        // Defensive fallback: no cache exists yet for this device (e.g.
+        // device enumeration/params-fit runs before any model load).
+        // Compute the same authority fresh rather than falling back to the
+        // old independent formula -- matches compute_vram_budget_for_plan's
+        // own fallback branch above.
+        const bool host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
+                                  ggml_sycl_info().devices[ctx->device].host_unified_memory;
+        const ggml_sycl::vram_budget_authority authority =
+            ggml_sycl::compute_vram_budget_authority(host_unified, *total, *free, /*free_vram_at_init_in=*/0,
+                                                     /*default_pct=*/100);
+        *free = authority.budget_bytes;
     }
 }
 

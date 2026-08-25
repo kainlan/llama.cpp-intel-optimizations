@@ -1832,7 +1832,7 @@ static bool run_resource_exhaustion_message_test() {
         // by more than the expected single space.
         "level_zero backend failed with error: 40",
         "level_zero backend failed with error: 39",
-        "level_zero backend failed with error: 40  (UR_RESULT_ERROR_OUT_OF_RESOURCES)",
+        "level_zero backend failed with error: 40  (UR_RESULT_ERROR_UNKNOWN)",
     };
     for (const char * msg : must_not_match) {
         if (ggml_sycl_is_resource_exhaustion_message(msg)) {

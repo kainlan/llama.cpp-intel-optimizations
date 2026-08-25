@@ -1513,6 +1513,21 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) 
         staged_owner = {};
     }
 } catch (const sycl::exception & exc) {
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): the commit-3 census
+    // stopped at ggml-sycl.cpp; this CPY dispatch catch is the identical
+    // print+exit(1)-with-no-resource-exhaustion-routing shape the census
+    // was supposed to reach. ctx is directly available; dst.raw() is
+    // const ggml_tensor* by sycl_tensor's design (it wraps a const pointer
+    // unconditionally, not just when the sycl_tensor object itself is
+    // const), but the object it was actually built from
+    // (ggml_sycl_compute_forward's safe_dst, ggml-sycl.cpp) wraps the
+    // outer, genuinely non-const `ggml_tensor * dst` -- so recovering that
+    // constness here is not UB, just undoing sycl_tensor's read-only view
+    // for the one call (ggml_sycl_cpu_fallback_graph, downstream of the
+    // shared helper) that legitimately needs to write dst's result.
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, const_cast<ggml_tensor *>(dst.raw()), exc)) {
+        return;
+    }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }

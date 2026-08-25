@@ -1228,6 +1228,27 @@ bug, not a headroom policy question) and its pre-existing, unrelated
 per-chunk-cap/N-chunk logic (a genuinely separate concern: the driver's
 single-allocation hardware ceiling, not external headroom).
 
+**The "only function that parses" claim above was false for a while and is
+true again now.** `ggml_backend_sycl_device_get_memory` (`ggml-sycl.cpp`,
+the public `ggml_backend_dev_t` device-memory-query vtable entry consumed
+by `llama-model.cpp`/`arg.cpp`/`common.cpp` for params-fit) survived the
+original consolidation as an uncounted **seventh** independent computation
+— its own `getenv`+clamp+`max(256 MB, total/10)` headroom formula, gated
+behind "only if the env var is explicitly set" (so at the common
+unset-env-var default it reported the *raw*, unadjusted free VRAM to
+params-fit, even though the cache was about to reserve headroom out of it
+regardless). Found by the o3h1 spec review (`llama.cpp-o3h1` commit 6,
+ticket comment c-53u5): measured disagreement with the authority on the
+B70, 3265.6 MB vs 2048 MB headroom for the same budget percentage. Fixed
+by folding it into the same reader pattern `compute_vram_budget_for_plan`
+already used (read `base_budget()` off the live cache; fall back to
+`compute_vram_budget_authority()`, WARN-logged, only when no cache exists
+yet for the device) and removing the "only if env var set" gate, since the
+authority reserves headroom at any percentage, including the synthesized
+default. This changes what params-fit sees at default settings — not a
+regression, since the *cache* was always going to reserve that headroom;
+params-fit had simply never been told about it before.
+
 This closes the single-authority half of the design the failure required.
 The other half — making a still-insufficient budget a *handled* runtime
 state instead of a crash, since no offline-chosen headroom constant can be

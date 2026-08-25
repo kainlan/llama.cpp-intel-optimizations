@@ -4698,8 +4698,15 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 namespace ggml_sycl {
@@ -4839,8 +4846,15 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_coalesced(const void *    vx,
 
 #undef LAUNCH_Q6_K_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // SoA version of Q4_0 MMQ dispatch function
@@ -4989,8 +5003,15 @@ static_kernel_path:
 #undef LAUNCH_Q4_0_SOA_KERNEL
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // Coalesced version of Q4_0 MMQ dispatch function
@@ -5130,8 +5151,15 @@ static_kernel_path:
 
 #undef LAUNCH_Q4_0_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q4_1_q8_1_sycl(const void *    vx,
@@ -5227,8 +5255,15 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q5_0_q8_1_sycl(const void *    vx,
@@ -5326,8 +5361,15 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q5_1_q8_1_sycl(const void *    vx,
@@ -5425,8 +5467,15 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q8_0_q8_1_sycl(const void *    vx,
@@ -5524,8 +5573,15 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // SoA version of Q8_0 MMQ dispatch function
@@ -5605,8 +5661,15 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_soa(const void *    vx,
 
 #undef LAUNCH_Q8_0_SOA_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // Coalesced version of Q8_0 MMQ dispatch function
@@ -5677,8 +5740,15 @@ static void ggml_mul_mat_q8_0_q8_1_sycl_coalesced(const void *    vx,
 
 #undef LAUNCH_Q8_0_COALESCED_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q2_K_q8_1_sycl(const void *    vx,
@@ -5780,8 +5850,15 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q3_K_q8_1_sycl(const void *    vx,
@@ -5890,8 +5967,15 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *    vx,
     }
 #endif
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q4_K_q8_1_sycl(const void *    vx,
@@ -5995,8 +6079,15 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q5_K_q8_1_sycl(const void *    vx,
@@ -6102,8 +6193,15 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *    vx,
         }
     }
 } catch (const sycl::exception & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 static void ggml_mul_mat_q6_K_q8_1_sycl(const void *    vx,
@@ -6208,8 +6306,15 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *    vx,
 
 #undef LAUNCH_Q6_K_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // Q6_K SoA dispatch function - handles weight tensors reordered to Structure-of-Arrays layout
@@ -6309,8 +6414,15 @@ static void ggml_mul_mat_q6_K_q8_1_sycl_soa(const void *    vx,
 
 #undef LAUNCH_Q6_K_SOA_KERNEL
 } catch (sycl::exception const & exc) {
-    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
-    std::exit(1);
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): no
+    // ggml_backend_sycl_context/ggml_tensor in scope here -- hoist-to-
+    // rethrow. ggml_sycl_op_mul_mat_q's own catch (this file) has both and
+    // routes this through the shared resource-exhaustion helper; nothing
+    // between here and there catches (verified: ggml_sycl_mmq_dispatch, the
+    // sole caller of this function, has no catch of its own).
+    GGML_LOG_WARN("[SYCL] sycl::exception in %s: %s -- re-throwing for dispatch-level resource-exhaustion routing\n",
+                  __func__, exc.what());
+    throw;
 }
 
 // Helper to traverse view_src chain and get the underlying storage tensor
@@ -7222,6 +7334,16 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddf_i);
 } catch (const sycl::exception & exc) {
+    // llama.cpp-o3h1 commit 6 (spec review F2, c-53u5): this is the
+    // dispatch-path catch that ggml_sycl_mmq_dispatch()'s 16 per-quant-type
+    // kernel launchers (below, in this file) hoist-rethrow up to -- see
+    // their catch comments. It also directly catches anything thrown by
+    // this function's own body. ctx and dst are both in scope, so this
+    // routes through the shared helper the same way ggml_sycl_mul_mat_id
+    // did in commit 3.
+    if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, exc)) {
+        return;
+    }
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
     std::exit(1);
 }

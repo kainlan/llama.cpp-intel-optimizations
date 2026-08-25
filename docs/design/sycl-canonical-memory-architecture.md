@@ -750,9 +750,10 @@ This contract does not govern:
    `common.hpp`) — narrowly, not any other exception, so a genuine
    correctness or driver bug is never silently masked —
    `ggml_sycl_compute_forward`'s catch block (`ggml-sycl.cpp`, via the shared
-   `ggml_sycl_try_dispatch_resource_exhaustion_fallback` helper every
-   dispatch-path catch site routes through) attempts to recompute that one op
-   via `ggml_sycl_cpu_fallback_graph` (stages the op's device-resident
+   `ggml_sycl_try_dispatch_resource_exhaustion_fallback` helper, declared in
+   `common.hpp` with external linkage so every translation unit that dispatches
+   kernel submissions can call the ONE implementation) attempts to recompute
+   that one op via `ggml_sycl_cpu_fallback_graph` (stages the op's device-resident
    ancestor tensors to host and runs it through ggml's ordinary CPU backend)
    instead of aborting the process. **On this driver, that attempt can itself
    stall**: a failed kernel submission has been observed to leave the device
@@ -788,6 +789,26 @@ This contract does not govern:
    allocator/dispatch layer can paper over from userspace. Proactively
    mirroring every input to host before every dispatch would sidestep it but
    is not justified for a condition unreachable at honest budgets.
+
+   **Census scope, stated honestly (llama.cpp-o3h1 commit 6, spec review F2,
+   ticket comment c-53u5):** the exhaustive catch-site census this mechanism
+   is built on covers `ggml-sycl.cpp`, `mmq.cpp`, and `cpy.cpp` — the
+   MUL_MAT/MUL_MAT_ID/CPY dispatch families, the paths actually reachable
+   from `ggml_sycl_compute_forward`'s op switch. Commit 3's first pass
+   stopped at `ggml-sycl.cpp` alone and claimed "every dispatch-path catch
+   site" — false the moment the same print-then-`exit(1)`-with-no-routing
+   shape was found live in `mmq.cpp` (17 sites, the per-quant-type MMQ
+   kernel launchers reachable via `ggml_sycl_op_mul_mat_q`) and `cpy.cpp` (1
+   site). Fixed by making the shared helper externally linked so those
+   separate translation units can call the one implementation, routing
+   sites that have `ggml_backend_sycl_context`/`ggml_tensor` in scope
+   directly and hoisting the rest to rethrow up to a caller that does
+   (verified per-site, not assumed). `CHECK_TRY_ERROR` (`common.hpp`) — the
+   pervasive, pre-existing macro that converts a caught `std::exception`
+   into a `dpct::error_code` return value rather than printing and
+   terminating — is a structurally different, general-purpose mechanism
+   used at hundreds of call sites across the backend and is ruled out of
+   this census's scope, not merely unexamined.
 
    No mid-`graph_compute` weight eviction is attempted as part of this
    recovery: `unified_cache::evict`/`evict_one`/`evict_and_flush` correctly
