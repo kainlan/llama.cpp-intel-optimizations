@@ -348,7 +348,7 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
     const int32_t selected[] = { 1 };
     auto admitted = ggml_sycl::build_moe_resolved_batch(selected, 1, 1, 0, [&](int32_t) { return route; });
     TEST_ASSERT(admitted, "owned DIRECT slice with stable identity must pass retained route validation");
-    TEST_ASSERT(admitted.batch.operands[0].lease.stable_identity_equal(expert),
+    TEST_ASSERT(admitted.batch.operands[0].lease().stable_identity_equal(expert),
                 "retained route changed canonical owned slice identity");
 
     const size_t          old_identity = expert.stable_identity_hash();
@@ -360,9 +360,26 @@ static bool test_canonical_owned_aos_slice_lifecycle(sycl::queue & q) {
                 "retained expert lease must preserve exact allocation metadata");
     // The admitted operand and normalized route deliberately copied the lease.
     // Release those fixture-owned copies before asserting final reclamation.
-    admitted.batch.operands[0].lease = {};
-    route.lease                      = {};
-    retained                         = {};
+    //
+    // llama.cpp-iikr (ba987da15 fallout, operand-representation migration):
+    // admitted.batch.operands[0].lease() is now a const accessor into a
+    // shared_ptr<const moe_resolved_operand_canonical> -- not directly
+    // assignable, unlike 6ae97a9e7's sibling-test sites that needed an
+    // independently-mutable VARIANT (clone the canonical, mutate the clone,
+    // keep the original valid). This site is different: admitted.batch.operands[0]
+    // is never read again after this point, so the correct release is
+    // simpler than that pattern -- drop this operand's sole reference to its
+    // canonical outright. This batch has exactly one occurrence of one
+    // expert, so the canonical was never shared with anything else (see
+    // moe_resolved_operand_canonical's own comment: sharing happens only
+    // across repeat occurrences of the SAME expert_id within one
+    // build_moe_resolved_batch() call); nulling `canonical` here drops the
+    // refcount to zero and destroys it immediately, releasing its `lease`
+    // member exactly as the original bare `admitted.batch.operands[0].lease = {}`
+    // used to release that one copy directly.
+    admitted.batch.operands[0].canonical = nullptr;
+    route.lease                          = {};
+    retained                             = {};
     TEST_ASSERT(!ggml_sycl::unified_lookup(base, &lookup), "last retained lease must release allocation");
 
     ggml_sycl::alloc_handle replacement{};
