@@ -15093,26 +15093,25 @@ static void compute_vram_budget_for_plan(ggml_backend_sycl_context * ctx,
     // headroom subtraction here (unified_cache_max_external_headroom(),
     // still used internally by the authority) never reached the site that
     // actually governed arena_reserve()'s physical budget_bytes.
-    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
-        vram_budget_out = cache->base_budget();
-        budget_pct_out  = cache->budget_pct();
-        base_mem_out    = cache->authority_base_mem();
-        return;
+    //
+    // llama.cpp-o3h1 quality review (final batch, F2/F4): delegates to
+    // ggml_sycl_device_budget_authority() (unified-cache.hpp), which checks
+    // BOTH "does a cache exist" AND "was its authority actually resolved"
+    // (a cache constructed via set_unified_cache_budget() has neither) --
+    // this site used to trust a live cache pointer alone. Kept its own WARN
+    // here (querying whether the fallback fired at all is still useful) but
+    // no longer distinguishes "no cache" from "cache present but
+    // unresolved" in the message text; the underlying reason no longer
+    // matters to this caller now that one helper handles both.
+    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+        !cache || !cache->authority_resolved()) {
+        GGML_LOG_WARN(
+            "[SYCL-BUDGET] Device %d has no resolved unified_cache budget authority yet; computing fresh instead "
+            "of reading a published value\n",
+            ctx->device);
     }
-
-    // Defensive fallback: no cache exists yet for this device. Should not
-    // happen on the normal model-load path (caches are constructed well
-    // before this function's caller runs); kept so an ordering assumption
-    // that is ever violated degrades to a fresh, still-single-authority
-    // computation instead of silently returning a zero budget.
-    GGML_LOG_WARN(
-        "[SYCL-BUDGET] Device %d has no unified_cache yet; computing the budget authority fresh instead of "
-        "reading a published value\n",
-        ctx->device);
-    const bool host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
-                              ggml_sycl_info().devices[ctx->device].host_unified_memory;
-    const ggml_sycl::vram_budget_authority authority = ggml_sycl::compute_vram_budget_authority(
-        host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0, /*default_pct=*/100);
+    const ggml_sycl::vram_budget_authority authority =
+        ggml_sycl::ggml_sycl_device_budget_authority(ctx->device, total_mem, free_mem, /*default_pct=*/100);
     vram_budget_out = authority.budget_bytes;
     budget_pct_out  = authority.budget_pct;
     base_mem_out    = authority.base_mem;
@@ -15247,17 +15246,16 @@ static void compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             // per-device cache's published authority (already registered by
             // the loop above via unified_cache_register_for_queue) instead of
             // recomputing; fall back to a fresh authority call only if that
-            // device's cache is somehow not yet available.
-            size_t dev_budget;
-            if (ggml_sycl::unified_cache * dev_cache = ggml_sycl::get_unified_cache_for_device(d)) {
-                dev_budget = dev_cache->base_budget();
-            } else {
-                const bool dev_host_unified =
-                    (d >= 0 && d < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[d].host_unified_memory;
-                const ggml_sycl::vram_budget_authority dev_authority = ggml_sycl::compute_vram_budget_authority(
-                    dev_host_unified, dev_total, dev_free, /*free_vram_at_init_in=*/0, budget_pct);
-                dev_budget = dev_authority.budget_bytes;
-            }
+            // device's cache is somehow not yet available or its authority was
+            // never resolved (quality review final batch, F2/F4 --
+            // ggml_sycl_device_budget_authority() checks both). `budget_pct`
+            // here is this plan's own already-resolved percentage, not the
+            // hardcoded 100 the other three call sites of this shared helper
+            // use -- kept as this call's explicit default_pct argument rather
+            // than silently unified with theirs.
+            const ggml_sycl::vram_budget_authority dev_authority =
+                ggml_sycl::ggml_sycl_device_budget_authority(d, dev_total, dev_free, budget_pct);
+            const size_t dev_budget = dev_authority.budget_bytes;
             const double dense_score = ggml_sycl_dense_capability_score_for_device(d);
             budgets.push_back({ d, dev_budget, dev_total, dense_score, dense_score > 0.0 });
         }
@@ -40167,6 +40165,22 @@ bool ggml_sycl_cpu_fallback_graph(ggml_backend_sycl_context & ctx, ggml_tensor *
 // ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message()
 // below, extracted into ggml_sycl_run_resource_exhaustion_recovery() so
 // there is still only one copy of that logic, not three.
+//
+// llama.cpp-o3h1 quality review (final batch, F9): the graph-recording
+// OUTCOME differs across the three callers, even though this shared core
+// treats them identically (it does not see g_ggml_sycl_graph_recording at
+// all -- each caller decides before ever calling in). At the two
+// sycl::exception/std::exception entry points above, graph recording means
+// a bare `throw;` that reaches the OUTER graph-recording handler, which
+// gracefully DISABLES graphs and RETRIES the work via direct execution --
+// the op eventually completes. At the from_message seam
+// (mmq.cpp, MMQ DMA streaming -- see its call site's own comment) there is
+// no live exception to rethrow, so graph recording instead means throwing
+// ggml_sycl_fallback_error directly, which unwinds to a clean
+// GGML_STATUS_FAILED with NO retry -- the op does not complete. Both are
+// correct for their own callers; this note exists so a reader does not
+// assume the two outcomes are interchangeable just because they share this
+// recovery core.
 static bool ggml_sycl_run_resource_exhaustion_recovery(ggml_backend_sycl_context & ctx,
                                                        ggml_tensor *               dst,
                                                        const char *                what_for_log) {
@@ -98535,25 +98549,22 @@ static void ggml_backend_sycl_device_get_memory(ggml_backend_dev_t dev, size_t *
     // was itself part of the disagreement -- params-fit used to see the
     // raw, unadjusted free VRAM at default settings even though the cache
     // was about to reserve headroom out of it regardless.
-    if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device)) {
-        *free = cache->base_budget();
-    } else {
-        // Fallback: no cache exists yet for this device -- the EXPECTED,
-        // ROUTINE case here (device enumeration/params-fit runs before any
-        // model load creates a cache), unlike compute_vram_budget_for_plan's
-        // fallback branch above, which is reached only if that function's
-        // own "caches exist before this runs" ordering invariant is
-        // violated (anomalous, hence its WARN). Deliberately silent here:
-        // warning on every ordinary startup would be noise, not signal.
-        // Computes the same authority fresh rather than falling back to the
-        // old independent formula.
-        const bool host_unified = (ctx->device >= 0 && ctx->device < GGML_SYCL_MAX_DEVICES) &&
-                                  ggml_sycl_info().devices[ctx->device].host_unified_memory;
-        const ggml_sycl::vram_budget_authority authority =
-            ggml_sycl::compute_vram_budget_authority(host_unified, *total, *free, /*free_vram_at_init_in=*/0,
-                                                     /*default_pct=*/100);
-        *free = authority.budget_bytes;
-    }
+    // llama.cpp-o3h1 quality review (final batch, F2/F4): delegates to
+    // ggml_sycl_device_budget_authority() (unified-cache.hpp), which checks
+    // BOTH "does a cache exist" AND "was its authority actually resolved"
+    // (see that function's own comment) -- this site used to trust a live
+    // cache pointer alone, same gap the other three call sites had.
+    // Deliberately silent either way (no cache, or cache present but
+    // unresolved): both are the EXPECTED, ROUTINE case here (device
+    // enumeration/params-fit runs before any model load creates a cache, or
+    // before that cache's authority is resolved), unlike
+    // compute_vram_budget_for_plan's fallback branch above, which is
+    // reached only if that function's own "caches exist before this runs"
+    // ordering invariant is violated (anomalous, hence its WARN). Warning on
+    // every ordinary startup here would be noise, not signal.
+    const ggml_sycl::vram_budget_authority authority =
+        ggml_sycl::ggml_sycl_device_budget_authority(ctx->device, *total, *free, /*default_pct=*/100);
+    *free = authority.budget_bytes;
 }
 
 static enum ggml_backend_dev_type ggml_backend_sycl_device_get_type(ggml_backend_dev_t dev) {

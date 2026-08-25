@@ -1600,6 +1600,17 @@ struct env_var_scope_guard {
         }
     }
 
+    // llama.cpp-o3h1 quality review (final batch, F8): an RAII env-var
+    // restore guard that could be copied would double-restore (or leak, if
+    // moved-from and the moved-from copy's destructor still ran) -- this
+    // guard is used only as a single stack-local per test block, never
+    // needs to be copied or moved, so forbid both explicitly rather than
+    // leaving it to accident.
+    env_var_scope_guard(const env_var_scope_guard &)             = delete;
+    env_var_scope_guard & operator=(const env_var_scope_guard &) = delete;
+    env_var_scope_guard(env_var_scope_guard &&)                  = delete;
+    env_var_scope_guard & operator=(env_var_scope_guard &&)      = delete;
+
     ~env_var_scope_guard() {
         if (had_value) {
             setenv(name.c_str(), prior_value.c_str(), 1);
@@ -1725,6 +1736,8 @@ static bool run_vram_budget_authority_test() {
     // total_mem_in=0 falls back to free_mem_in for base_mem, so a caller that
     // could not determine total VRAM still gets a sane (not zero) budget.
     {
+        env_var_scope_guard guard("GGML_SYCL_VRAM_BUDGET_PCT");
+        unsetenv("GGML_SYCL_VRAM_BUDGET_PCT");
         const auto authority = ggml_sycl::compute_vram_budget_authority(false, /*total_mem_in=*/0,
                                                                         /*free_mem_in=*/8000ull * mib, 0, 100);
         if (authority.base_mem != 8000ull * mib) {

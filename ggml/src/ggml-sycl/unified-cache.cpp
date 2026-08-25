@@ -1077,16 +1077,33 @@ size_t test_arena_external_headroom_bytes(size_t device_total_vram, size_t budge
 }
 
 size_t unified_cache_max_external_headroom(size_t device_total_vram) {
-    // Must mirror the FULL composition arena_reserve() applies (this file's
-    // arena_reserve(), which calls vram_external_headroom_effective() --
-    // NOT arena_default_external_headroom() alone), or callers that pre-
-    // reserve budget against this value can still under-estimate what the
-    // arena will withhold (llama.cpp-o3h1).
+    // llama.cpp-o3h1 quality review (final batch, F3): this comment used to
+    // say this function "must mirror the FULL composition arena_reserve()
+    // applies... which calls vram_external_headroom_effective()" -- true
+    // before commit 1, false after. arena_reserve() (this file) no longer
+    // computes any external-headroom composition of its own at all; its own
+    // comment at its budget_bytes parameter says so explicitly ("budget_bytes
+    // arrives HERE already fully headroom-adjusted by the single budget
+    // authority... this function used to compute its OWN, separate
+    // external-headroom cap on top"). This function is called by
+    // compute_vram_budget_authority() (below) to bake headroom into
+    // budget_bytes UP FRONT, before arena_reserve() ever runs -- there is
+    // nothing left for arena_reserve() to "mirror."
     //
     // budget_bytes=0 makes arena_caller_reserved_headroom() return the full
     // device_total_vram, which is always >= arena_default_external_headroom's
-    // own <=2 GiB formula cap -- so the caller-reserve clamp inside it never
-    // binds and this sub-term evaluates to its unclamped (maximum) value.
+    // own COMPUTED RESULT for this device -- not, as this comment previously
+    // and incorrectly claimed, always >= the flat 2 GiB formula cap (false
+    // for any device with under 2 GiB of VRAM). The formula's own terms
+    // establish the real invariant: min_external_headroom <= total/8 and
+    // proportional_headroom = total/10, so max(min_external_headroom,
+    // proportional_headroom) <= total/8 <= device_total_vram unconditionally,
+    // and capping that at 2 GiB can only shrink it further -- so
+    // device_total_vram bounds the computed result regardless of whether
+    // device_total_vram itself is above or below the 2 GiB cap constant.
+    // The caller-reserve clamp inside arena_caller_reserved_headroom() never
+    // binds either way, so this sub-term evaluates to its unclamped
+    // (maximum) value.
     const size_t default_headroom = arena_default_external_headroom(device_total_vram, /*budget_bytes=*/0);
 
     // onednn_pipeline_planned is conservatively forced true: this function is
@@ -1138,7 +1155,6 @@ vram_budget_authority compute_vram_budget_authority(bool   host_unified,
 
     const size_t raw_base_mem = total_mem_in > 0 ? total_mem_in : free_mem_in;
     result.base_mem           = ggml_sycl_vram_budget_base_mem(host_unified, raw_base_mem);
-    result.free_mem           = free_mem_in;
 
     // default_pct is the programmatic override (set_unified_cache_budget_pct(),
     // g_unified_cache_budget_pct) -- effective only when no env var is set.
@@ -1172,6 +1188,33 @@ vram_budget_authority compute_vram_budget_authority(bool   host_unified,
     result.external_headroom = unified_cache_max_external_headroom(result.base_mem);
     result.budget_bytes      = budget > result.external_headroom ? budget - result.external_headroom : 0;
     return result;
+}
+
+// llama.cpp-o3h1 quality review (final batch, F2/F4): the shared "read the
+// published authority off a live, resolved cache; otherwise compute fresh"
+// entry point, extracted from four independent copies of that same
+// two-branch shape (ggml-sycl.cpp's compute_vram_budget_for_plan, its
+// multi-GPU placement path, ggml_backend_sycl_device_get_memory, and this
+// file's unified_cache_get_budget_info) -- and, per F2, the cache-exists
+// branch of all four used to trust budget_pct()/external_headroom()/
+// authority_base_mem() unconditionally, which is wrong when the cache was
+// constructed via set_unified_cache_budget() rather than the normal
+// auto-calculate path: those getters silently return default-initialized
+// values in that case, not a resolved authority. This is now the only
+// place that distinction is checked.
+vram_budget_authority ggml_sycl_device_budget_authority(int device, size_t total_mem, size_t free_mem,
+                                                         int default_pct) {
+    if (unified_cache * cache = get_unified_cache_for_device(device); cache && cache->authority_resolved()) {
+        vram_budget_authority result;
+        result.budget_pct        = cache->budget_pct();
+        result.base_mem          = cache->authority_base_mem();
+        result.external_headroom = cache->external_headroom();
+        result.budget_bytes      = cache->base_budget();
+        return result;
+    }
+    const bool host_unified =
+        (device >= 0 && device < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[device].host_unified_memory;
+    return compute_vram_budget_authority(host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0, default_pct);
 }
 
 static uint32_t pp_moe_onednn_effective_ring_depth(uint32_t requested_ring_depth) {
@@ -3093,7 +3136,8 @@ unified_cache::unified_cache(sycl::queue & queue,
                              size_t        device_total_vram,
                              int           budget_pct,
                              size_t        external_headroom,
-                             size_t        authority_base_mem) :
+                             size_t        authority_base_mem,
+                             bool          authority_resolved) :
     queue_(queue),
     budget_(budget_bytes),
     base_budget_(budget_bytes),
@@ -3101,6 +3145,7 @@ unified_cache::unified_cache(sycl::queue & queue,
     budget_pct_(budget_pct),
     external_headroom_(external_headroom),
     authority_base_mem_(authority_base_mem),
+    authority_resolved_(authority_resolved),
     device_total_vram_(device_total_vram),
     dma_reserved_bytes_(dma_reserved_bytes) {
     // Register atexit handler once to set shutdown flag before static destructors run
@@ -11392,7 +11437,18 @@ static unified_cache * create_cache_for_device(int                     device_id
     size_t resolved_base_mem   = 0;
     size_t detected_free_mem   = 0;
     size_t detected_total_mem  = 0;
-    if (budget == 0) {
+    // llama.cpp-o3h1 quality review (final batch, F2): captured BEFORE
+    // `budget` is reassigned inside the branch below (to authority.budget_bytes,
+    // which could itself legitimately be 0) -- re-deriving "was the authority
+    // resolved" from budget's value at the end would be wrong, since 0 is
+    // also a valid resolved budget, not just the g_unified_cache_budget
+    // "auto-calculate" sentinel. False means the set_unified_cache_budget()
+    // override path was used and resolved_budget_pct/resolved_headroom/
+    // resolved_base_mem below never get assigned real values -- passed to
+    // the cache constructor's authority_resolved parameter so readers can
+    // detect this instead of trusting default-initialized fiction.
+    const bool authority_resolved = (budget == 0);
+    if (authority_resolved) {
         size_t free_mem = 0, total_mem = 0;
         if (hint && hint->total_mem > 0) {
             // Use caller-provided values to avoid ggml_sycl_info() reentry deadlock.
@@ -11479,7 +11535,8 @@ static unified_cache * create_cache_for_device(int                     device_id
     try {
         g_device_caches[device_id] =
             std::make_unique<unified_cache>(queue, budget, staging_bytes, dma_reserve_bytes, total_vram_for_ctor,
-                                            resolved_budget_pct, resolved_headroom, resolved_base_mem);
+                                            resolved_budget_pct, resolved_headroom, resolved_base_mem,
+                                            authority_resolved);
         // Always baseline pre-existing runtime reservations so they don't
         // eat into the cache's weight budget.  Allocations that existed before
         // cache creation (DMA pre-reserve, probe residuals) are already
@@ -14081,7 +14138,20 @@ unified_budget_info unified_cache_get_budget_info(int device) {
         // instance -- this site used to re-parse GGML_SYCL_VRAM_BUDGET_PCT
         // independently and default to 90, disagreeing with the sites that
         // actually govern allocation (default 100).
-        info.budget_pct      = cache->budget_pct();
+        //
+        // llama.cpp-o3h1 quality review (final batch, F2): budget_pct
+        // specifically must check authority_resolved() -- a cache
+        // constructed via set_unified_cache_budget() never resolves it, and
+        // cache->budget_pct() would silently return the default-initialized
+        // 100 as if it were real. Everything else in this branch
+        // (budget_bytes/weight_bytes/runtime_bytes/total_committed/
+        // available_for_weights/total_available) is live cache occupancy
+        // tracking, not authority data -- real regardless of whether the
+        // authority was ever resolved, so NOT gated the same way.
+        info.budget_pct =
+            cache->authority_resolved() ?
+                cache->budget_pct() :
+                ggml_sycl_device_budget_authority(device, total_mem, free_mem, /*default_pct=*/100).budget_pct;
         info.budget_bytes    = unified_cache_total_managed(device);
         info.weight_bytes    = unified_cache_weight_bytes(device);
         info.runtime_bytes   = unified_cache_get_runtime_bytes(device);
@@ -14094,11 +14164,12 @@ unified_budget_info unified_cache_get_budget_info(int device) {
         // authority every other site uses (previously an ad-hoc
         // max(256 MB, total/10) headroom formula, a fifth independent
         // computation on top of the six this ticket already consolidated).
-        const bool host_unified =
-            (device >= 0 && device < GGML_SYCL_MAX_DEVICES) && ggml_sycl_info().devices[device].host_unified_memory;
+        // llama.cpp-o3h1 quality review (final batch, F4): delegates to the
+        // shared ggml_sycl_device_budget_authority() rather than calling
+        // compute_vram_budget_authority() directly -- one fewer copy of
+        // this exact "no cache, compute fresh" shape.
         const vram_budget_authority authority =
-            compute_vram_budget_authority(host_unified, total_mem, free_mem, /*free_vram_at_init_in=*/0,
-                                          /*default_pct=*/100);
+            ggml_sycl_device_budget_authority(device, total_mem, free_mem, /*default_pct=*/100);
         info.budget_pct            = authority.budget_pct;
         info.budget_bytes          = authority.budget_bytes;
         info.available_for_weights = info.budget_bytes;

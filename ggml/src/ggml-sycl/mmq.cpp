@@ -7654,6 +7654,14 @@ void ggml_sycl_op_mul_mat_q(ggml_backend_sycl_context & ctx,
             // (the captured e.what() text) rather than a live exception
             // object -- ctx and dst are both in scope, matching every other
             // seam in this ladder.
+            //
+            // llama.cpp-o3h1 quality review (final batch, F9): unlike the
+            // sycl::exception/std::exception overloads (ggml-sycl.cpp),
+            // graph recording here does NOT retry the work -- there is no
+            // live exception to bare-rethrow at this seam (see
+            // ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message's
+            // own comment), so recording instead yields a clean
+            // GGML_STATUS_FAILED with the op left incomplete.
             if (ggml_sycl_try_dispatch_resource_exhaustion_fallback_from_message(ctx, dst,
                                                                                  result.failure_message.c_str())) {
                 return;
