@@ -116,7 +116,10 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
 
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+            // nextn not requested (or masked): crop to output rows before the last
+            // layer's FFN/MoE, matching deepseek2 -- otherwise every prompt row runs
+            // the full last layer for an unread hidden state (+1/n_layer MoE PP cost).
             // skip computing output for unused tokens
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
@@ -156,7 +159,7 @@ llama_model_openai_moe::graph::graph(const llama_model & model, const llm_graph_
 
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
