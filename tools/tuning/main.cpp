@@ -106,6 +106,9 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (!d) {
+            continue;
+        }
         if (bname) {
             if (strcmp(ggml_backend_dev_name(d), bname) == 0) {
                 dev = d;

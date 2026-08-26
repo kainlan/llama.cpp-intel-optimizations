@@ -79,11 +79,28 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     factors = loop_values("bool ff")
     discovered_rows = re.findall(r"test_cases\.emplace_back\(new test_rope\((.*?)\)\);", block, re.DOTALL)
     parsed_views = []
+    parsed_offset_views = []
+    skipped_non_inplace = 0
     for row in discovered_rows:
+        # original inplace rows: (..., ff, <v>, true, true)
         match = re.search(r"ff,\s*([-+]?\d+)\s*,\s*true\s*,\s*true\s*$", row)
-        assert match is not None, f"unparsed inplace ROPE inventory row: {row!r}"
-        parsed_views.append(int(match.group(1)))
-    assert len(parsed_views) == len(discovered_rows)
+        if match is not None:
+            parsed_views.append(int(match.group(1)))
+            continue
+        # b10630 rope_set_offset inplace row: (..., <v>, true, true, <n_offs>)
+        # -- outside the type x mode x ff nest, tracked separately from the
+        # nest inventory so the decision arithmetic below stays well-formed.
+        match = re.search(r"([-+]?\d+)\s*,\s*true\s*,\s*true\s*,\s*\d+\s*$", row)
+        if match is not None:
+            parsed_offset_views.append(int(match.group(1)))
+            continue
+        # b10630 rope_set_offset NON-inplace rows: (..., fw, false, <n_offs>) --
+        # outside this contract's inplace inventory, present in the same block.
+        if re.search(r",\s*(?:fw|false|true)\s*,\s*false\s*,\s*\d+\s*$", row):
+            skipped_non_inplace += 1
+            continue
+        raise AssertionError(f"unparsed inplace ROPE inventory row: {row!r}")
+    assert len(parsed_views) + len(parsed_offset_views) + skipped_non_inplace == len(discovered_rows)
 
     assert types == ["GGML_TYPE_F32", "GGML_TYPE_F16"]
     assert modes == [
@@ -95,6 +112,10 @@ def _assert_rope_inventory_contract(inventory: str) -> None:
     ]
     assert factors == ["false", "true"]
     assert parsed_views == [0, 1, 1]
+    # b10630 rope_set_offset block: 4 non-inplace offset rows per fw x ff nest
+    # plus one inplace-with-offset row (view 0), all inside the same window.
+    assert parsed_offset_views == [0]
+    assert skipped_non_inplace == 4
 
     multiplicity = len(types) * len(modes) * len(factors)
     decisions = [view == 0 for view in parsed_views for _ in range(multiplicity)]

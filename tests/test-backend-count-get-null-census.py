@@ -29,14 +29,19 @@ EXPECTED_BY_FILE = {
     "tests/test-sycl-lifecycle-gpu-sequential.cpp": 1,
     "tests/test-sycl-lifecycle-runtime-wrapper.cpp": 8,
     "tests/test-thread-safety.cpp": 1,
-    "tools/llama-bench/llama-bench.cpp": 5,
+    "tools/llama-bench/llama-bench.cpp": 4,
     "tools/rpc/rpc-server.cpp": 2,
-    "tools/server/server-context.cpp": 2,
+    "tools/server/server-context.cpp": 1,
+    "tools/tuning/main.cpp": 1,
 }
 COMPARISON_ONLY = {
     "tests/test-sycl-lifecycle-runtime-wrapper.cpp": 8,
     "tools/server/server-context.cpp": 1,
 }
+# Upstream b10630 removed the server spec-fit tgt_devices block (draft-model
+# memory measurement moved into common_speculative_init_from_params), so the
+# index-aligned placeholder class is retired. The literal is kept as a tripwire:
+# if the pattern reappears anywhere it must be re-classified deliberately.
 PLACEHOLDER = "tgt_devices.push_back(ggml_backend_dev_get(i));"
 
 
@@ -79,10 +84,7 @@ unsafe = []
 for relative, text, match, line in calls:
     invocation = match.group(0)
     if PLACEHOLDER in line:
-        if relative != "tools/server/server-context.cpp":
-            fail(f"unexpected index placeholder in {relative}")
-        classified["index-aligned-placeholder"] += 1
-        continue
+        fail(f"retired index placeholder reappeared in {relative}")
 
     # Calls used only as comparison operands are nullable by construction.
     if re.search(re.escape(invocation) + r"\s*(?:==|!=)", line):
@@ -114,12 +116,11 @@ if unsafe:
 expected_classes = Counter({
     "null-checked-consumer": 26,
     "comparison-only": 9,
-    "index-aligned-placeholder": 1,
 })
 if classified != expected_classes:
     fail(f"classification drifted: {dict(classified)}")
-if sum(classified.values()) != 36:
-    fail(f"expected 36 classified calls, found {sum(classified.values())}")
+if sum(classified.values()) != 35:
+    fail(f"expected 35 classified calls, found {sum(classified.values())}")
 if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
     relative
     for relative, text, match, line in calls
@@ -127,12 +128,7 @@ if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
 ):
     fail("comparison-only allowlist drifted")
 
-server = texts["tools/server/server-context.cpp"]
-if server.count(PLACEHOLDER) != 1:
-    fail("server target-index placeholder must remain present exactly once")
-
 print(
     "backend count/get census: PASS "
-    "(36/36 classified: 26 null-checked, 9 comparison-only, "
-    "1 index-aligned placeholder; unsafe 0)"
+    "(35/35 classified: 26 null-checked, 9 comparison-only; unsafe 0)"
 )
