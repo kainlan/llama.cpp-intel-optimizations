@@ -13,7 +13,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 # clean, so this mock isolates the label-net half.
 cat > "$TMP/ctest-nolabel" <<'EOF'
 #!/usr/bin/env bash
-for a in "$@"; do [ "$a" = "-L" ] && exec echo "Total Tests: 0"; done
+for a in "$@"; do [ "$a" = "-L" ] && { exit 0; }; done
 echo "  Test #1: test-something"
 EOF
 chmod +x "$TMP/ctest-nolabel"
@@ -35,6 +35,32 @@ rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-leak" 2>&1) || rc=$?
 [ "$rc" -eq 1 ] || { echo "FAIL: rc=$rc for backend-ops leak, want 1"; exit 1; }
 grep -qF "SWEEP LEAK" <<<"$out" || { echo "FAIL: RED-2 did not name the cause: $out"; exit 1; }
 echo "RED-2 ok (sweep leak caught)"
+
+# RED-3: the sweep call itself fails (label net still healthy) -- a failed or
+# truncated ctest listing must NOT read as "zero backend-ops matches, so
+# clean". This is the fail-open mode a naive `grep -c ... || true` on the
+# sweep half has: empty/error output greps to 0, which is indistinguishable
+# from a genuinely clean sweep. Must refuse (exit 2), naming the cause, not
+# silently pass.
+cat > "$TMP/ctest-sweep-fails" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "-L" ] && { echo "  Test #5: test-unified-cache-x"; exit 0; }; done
+exit 1
+EOF
+chmod +x "$TMP/ctest-sweep-fails"
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-sweep-fails" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for failed sweep listing, want 2"; exit 1; }
+grep -qF "SWEEP LISTING FAILED" <<<"$out" || { echo "FAIL: RED-3 did not name the cause: $out"; exit 1; }
+echo "RED-3 ok (failed sweep listing refused, not vacuously passed)"
+
+# RED-4: a nonexistent build dir must be refused with its own named cause
+# (MISSING BUILD DIR), not misreported as LABEL NET EMPTY just because ctest
+# against a missing --test-dir happens to select nothing.
+MISSING_BUILD="$TMP/does-not-exist"
+rc=0; out=$(bash "$G" --build-dir "$MISSING_BUILD" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for missing build dir, want 2"; exit 1; }
+grep -qF "MISSING BUILD DIR" <<<"$out" || { echo "FAIL: RED-4 did not name the cause: $out"; exit 1; }
+echo "RED-4 ok (missing build dir refused vacuous pass)"
 
 # GREEN-mock: hermetic positive control for the --ctest-cmd seam -- a mock
 # that returns a labelled test for -L and a clean filtered listing (no
