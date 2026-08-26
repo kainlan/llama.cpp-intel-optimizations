@@ -5,7 +5,7 @@ llama_model_loader: loaded meta data with 24 key-value pairs and 291 tensors fro
 llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B70 Graphics) (unknown id) - 32602 MiB free
 | model                          |       size |     params | backend    | ngl | fa |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | -: | --------------: | -------------------: |
-| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           pp512 |      1415.13 ± 14.63 |
-| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           tg128 |         43.40 ± 1.83 |
+| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           pp512 |      1712.42 ± 14.63 |
+| gpt-oss 20B MXFP4              |  11.27 GiB |    20.91 B | SYCL       |  99 |  1 |           tg128 |         40.22 ± 1.83 |
 
 build: df51c5130 (7412)

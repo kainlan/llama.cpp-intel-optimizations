@@ -66,17 +66,24 @@ ARMS = {
         "pp512": 1128.0,
         "tg128": 44.6,
     },
+    # B70 bands refreshed 2026-08-26 under owner ruling (llama.cpp-kzug):
+    # the pre-refresh rows predated the oneDNN-batched MoE PP default-ON flip
+    # (llama.cpp-iikr) and a master pp improvement, so both binaries of the
+    # Phase C paired certification EXCEEDED the pp bands by ~20% and missed
+    # the mistral tg band identically. New bands anchor on the Phase C
+    # perf-final paired data at 410433dd5 (pre and cand agree in-pair),
+    # widened to the documented B70 noise (tg cv 3.3%, +-10% single-run).
     "b70-gptoss": {
         "selector": "level_zero:0",
         "kind": BAND,
-        "pp512": (1384.81, 1434.14),
-        "tg128": (40.18, 46.27),
+        "pp512": (1600.0, 1810.0),
+        "tg128": (38.0, 46.5),
     },
     "b70-mistral": {
         "selector": "level_zero:0",
         "kind": BAND,
-        "pp512": (2425.24, 2594.58),
-        "tg128": (106.57, 109.15),
+        "pp512": (2850.0, 3200.0),
+        "tg128": (95.0, 112.0),
     },
 }
 

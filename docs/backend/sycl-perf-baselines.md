@@ -646,8 +646,16 @@ The test is band membership against the recorded historical min–max:
 
 | model | PP512 band | TG128 band |
 |---|---|---|
-| GPT-OSS 20B MXFP4 | 1384.81–1434.14 | 40.18–46.27 |
-| Mistral 7B Q4_0 | 2425.24–2594.58 | 106.57–109.15 |
+| GPT-OSS 20B MXFP4 | 1600–1810 | 38.0–46.5 |
+| Mistral 7B Q4_0 | 2850–3200 | 95.0–112.0 |
+
+*(Bands refreshed 2026-08-26 under owner ruling, llama.cpp-kzug: the previous
+rows — GPT-OSS 1384.81–1434.14 / 40.18–46.27, Mistral 2425.24–2594.58 /
+106.57–109.15 — predated the oneDNN-batched MoE PP default-ON flip
+(llama.cpp-iikr) and a master pp improvement; in the Phase C paired
+certification BOTH binaries exceeded the pp bands by ~20% and missed the
+Mistral tg band identically. New anchors: perf-final paired data at
+410433dd5, widened to the documented B70 noise.)*
 
 A B70 mean outside its band **blocks merge and opens an owner-reviewed
 baseline/regression task**. It does not authorize inventing a floor, and it does
