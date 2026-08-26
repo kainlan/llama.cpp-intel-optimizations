@@ -22756,12 +22756,9 @@ static sycl::event mmvq_upload_packed_ids_after(sycl::queue &       q,
                                                  const int32_t *     ids_host,
                                                  size_t              ids_bytes,
                                                  const sycl::event * dependency) {
-    return q.submit([&](sycl::handler & cgh) {
-        if (dependency) {
-            cgh.depends_on(*dependency);
-        }
-        cgh.memcpy(ids_device, ids_host, ids_bytes);
-    });
+    return ggml_sycl::mem_copy_ptr_async(ids_device, ids_host, ids_bytes, q,
+                                         dependency ? std::vector<sycl::event>{ *dependency }
+                                                    : std::vector<sycl::event>{});
 }
 
 static sycl::event mmvq_submit_quantize_q8_1_aos_after(sycl::queue &       q,

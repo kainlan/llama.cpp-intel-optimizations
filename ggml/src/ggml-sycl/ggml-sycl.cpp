@@ -16650,8 +16650,8 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
     // replacement leaves the pointer-table upload with nothing to chain, so the
     // dep_chained assertion below would be checking a property the fixture never
     // established rather than the upload's chaining behaviour.
-    const sycl::event padded_ready =
-        q.memcpy(static_cast<uint8_t *>(padded_base.ptr) + logical_offset, data.data(), data.size());
+    const sycl::event padded_ready = ggml_sycl::mem_copy_ptr_async(
+        static_cast<uint8_t *>(padded_base.ptr) + logical_offset, data.data(), data.size(), q);
     stage_events.push_back(padded_ready);
     if (!extra.remember_moe_storage_handle(expert_id, GGML_LAYOUT_SOA, std::move(padded_owner), &padded_ready,
                                            logical_offset, data.size())) {
@@ -69516,11 +69516,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 throw moe_direct_submit_failure{};
                             }
 #endif
-                            sycl::event dependency = retained_table.has_ready_event ?
-                                exact_queue->submit([&](sycl::handler & h) {
-                                    h.depends_on(retained_table.ready_event);
-                                    h.memcpy(activation, src1_device_base, activation_bytes);
-                                }) : exact_queue->memcpy(activation, src1_device_base, activation_bytes);
+                            sycl::event dependency = ggml_sycl::mem_copy_ptr_async(
+                                activation, src1_device_base, activation_bytes, *exact_queue,
+                                retained_table.has_ready_event ? std::vector<sycl::event>{ retained_table.ready_event }
+                                                               : std::vector<sycl::event>{});
                             mmvq_q1_nvfp4_admitted_buffers buffers{
                                 slices.activation_q8.ptr, slices.activation_q8.bytes,
                                 static_cast<float *>(slices.output_f32.ptr), slices.output_f32.bytes };
@@ -69535,10 +69534,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             g_q1_nvfp4_test_submit.fetch_add(1, std::memory_order_relaxed);
 #endif
-                            sycl::event final = exact_queue->submit([&](sycl::handler & h) {
-                                h.depends_on(kernel);
-                                h.memcpy(dst_device_base, slices.output_f32.ptr, output_bytes);
-                            });
+                            sycl::event final = ggml_sycl::mem_copy_ptr_async(
+                                dst_device_base, slices.output_f32.ptr, output_bytes, *exact_queue, { kernel });
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
                             if (ggml_sycl_q1_nvfp4_test_consume_failure(
                                     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_ASYNC_TERMINAL)) {

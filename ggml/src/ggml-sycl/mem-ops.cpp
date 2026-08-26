@@ -842,6 +842,20 @@ sycl::event mem_fill_async(const mem_handle &               h,
     return mem_fill_submit(h, offset, value, size, queue, deps, true);
 }
 
+sycl::event mem_copy_ptr_async(void *                           dst,
+                               const void *                     src,
+                               size_t                           size,
+                               sycl::queue &                    queue,
+                               const std::vector<sycl::event> & deps) {
+    if (deps.empty()) {
+        return queue.memcpy(dst, src, size);
+    }
+    return queue.submit([&](sycl::handler & cgh) {
+        cgh.depends_on(deps);
+        cgh.memcpy(dst, src, size);
+    });
+}
+
 void mem_copy(const mem_handle &               dst,
               const mem_handle &               src,
               size_t                           size,

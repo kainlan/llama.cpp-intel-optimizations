@@ -167,7 +167,11 @@ UNIFIED_ALLOCATE_DIRECT_HANDLE_PATTERN='return[[:space:]]+mem_handle::from_direc
 # as a mem_handle, which the two surviving branches match.
 MANAGED_HOST_PINNED_LEGACY_PATTERN='(auto[[:space:]]+mh[[:space:]]*=[[:space:]]*handle\.as_mem_handle\(\)|return[[:space:]]+handle\.as_mem_handle\(\))'
 ALLOCATE_MANAGED_HOST_PINNED_LEGACY_PATTERN='(out->as_mem_handle\(\)|unified_free\(\*out\)|ggml_sycl::alloc_handle[[:space:]]+(act_owner|out_owner)\{\}|unified_free\((act_owner|out_owner|weight_owner)\))'
-STAGING_BUFFER_POOL_LEGACY_PATTERN='(has_unified_handle|unified_free\(s\.unified_handle\)|new_slot\.unified_handle[[:space:]]*=[[:space:]]*std::move\(unified_handle\))'
+# The third arm this pattern once carried (new_slot.unified_handle = std::move(unified_handle))
+# is retired: after the intrusive-owner migration the slot member IS a refcounted RAII
+# mem_handle, so that spelling is the sanctioned ownership transfer, not legacy metadata.
+# The two surviving arms still catch the legacy form (bool flag + explicit unified_free).
+STAGING_BUFFER_POOL_LEGACY_PATTERN='(has_unified_handle|unified_free\(s\.unified_handle\))'
 CPU_FALLBACK_HOST_COPY_LEGACY_PATTERN='(entry\.alloc\b|unified_free\(entry\.alloc\)|fallback_host_copy.*alloc_handle)'
 TIERED_KV_ZONE_H_LEGACY_PATTERN='(alloc_handle[[:space:]]+zone_h|\.zone_h(\.|[[:space:]]*=)|zone_h[[:space:]]*=|unified_free\([^)]*zone_h\)|zone_h\.as_mem_handle\()'
 ONEDNN_SCRATCH_LEGACY_OWNER_PATTERN='(std::shared_ptr<alloc_handle>[[:space:]]+onednn_(weights|activations)_scratch_owner_|onednn_(weights|activations)_scratch_owner_->|unified_free\(\*onednn_(weights|activations)_scratch_owner_|release_direct_scratch[^\n]*std::shared_ptr<alloc_handle>|allocate_direct_scratch[^\n]*std::shared_ptr<alloc_handle>)'

@@ -16,6 +16,17 @@ sycl::event mem_copy_async(const mem_handle &               dst,
                            sycl::queue &                    queue,
                            const std::vector<sycl::event> & deps = {});
 
+// Async copy over raw transient views (canonical contract: raw pointers are
+// ABI views resolved from a mem_handle for immediate submission only). The
+// caller MUST hold the owning mem_handle(s) for both endpoints until the
+// returned event completes; this is the single sanctioned site for
+// pointer-level queue copies outside common.hpp/unified-cache.cpp.
+sycl::event mem_copy_ptr_async(void *                           dst,
+                               const void *                     src,
+                               size_t                           size,
+                               sycl::queue &                    queue,
+                               const std::vector<sycl::event> & deps = {});
+
 sycl::event mem_copy_async(const mem_handle &               dst,
                            size_t                           dst_offset,
                            const mem_handle &               src,
