@@ -4,20 +4,26 @@
 # memory: fork-github-actions-disabled-manually). Count is re-derived, never
 # assumed. Offline-testable via --input FILE (JSON array of {id,name,state}).
 set -euo pipefail
-REPO="kainlan/llama.cpp-intel-optimizations" INPUT=""
+REPO="kainlan/llama.cpp-intel-optimizations" INPUT="" GH="gh"
 while [ $# -gt 0 ]; do case "$1" in
-    --repo)  [ $# -ge 2 ] || { echo "check-fork-workflows-disabled: --repo needs a value" >&2; exit 2; }
-             REPO="$2";  shift 2;;
-    --input) [ $# -ge 2 ] || { echo "check-fork-workflows-disabled: --input needs a value" >&2; exit 2; }
-             INPUT="$2"; shift 2;;
+    --repo)   [ $# -ge 2 ] || { echo "check-fork-workflows-disabled: --repo needs a value" >&2; exit 2; }
+              REPO="$2";  shift 2;;
+    --input)  [ $# -ge 2 ] || { echo "check-fork-workflows-disabled: --input needs a value" >&2; exit 2; }
+              INPUT="$2"; shift 2;;
+    --gh-cmd) [ $# -ge 2 ] || { echo "check-fork-workflows-disabled: --gh-cmd needs a value" >&2; exit 2; }
+              GH="$2";    shift 2;;
     *) echo "check-fork-workflows-disabled: unknown arg $1" >&2; exit 2;;
 esac; done
 if [ -n "$INPUT" ]; then
     [ -f "$INPUT" ] || { echo "check-fork-workflows-disabled: --input file not found: $INPUT" >&2; exit 2; }
     json=$(cat "$INPUT")
 else
-    command -v gh >/dev/null || { echo "check-fork-workflows-disabled: gh command not found" >&2; exit 2; }
-    json=$(gh workflow list --repo "$REPO" --all --limit 200 --json id,name,state)
+    command -v "$GH" >/dev/null || { echo "check-fork-workflows-disabled: gh command not found: $GH" >&2; exit 2; }
+    # A gh failure (auth outage, network) must NOT be scored the same as "a
+    # workflow is not disabled" (rc==1) -- fail closed with a distinct rc==2
+    # so T24 can tell "guard ran and found a problem" from "guard couldn't run".
+    json=$("$GH" workflow list --repo "$REPO" --all --limit 200 --json id,name,state) \
+        || { echo "check-fork-workflows-disabled: gh workflow list failed" >&2; exit 2; }
 fi
 command -v jq >/dev/null || { echo "check-fork-workflows-disabled: jq command not found" >&2; exit 2; }
 total=$(jq 'length' <<<"$json")

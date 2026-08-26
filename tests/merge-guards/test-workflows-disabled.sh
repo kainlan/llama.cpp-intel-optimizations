@@ -36,3 +36,18 @@ rc=0; out=$(bash "$G" --input "$TMP/all-off.json" 2>&1) || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: rc=$rc for all-disabled fixture, want 0: $out"; exit 1; }
 grep -qF "all 2 workflows disabled_manually" <<<"$out" || { echo "FAIL: GREEN did not report the exact count: $out"; exit 1; }
 echo "GREEN ok"
+
+# gh-outage: a gh failure (auth outage, network) must exit 2, DISTINCT from
+# the rc==1 "a workflow is not disabled" case above -- T24 scores rc, so the
+# two must never collide. Mirrors the --ldd-cmd mock-override pattern from
+# test-sycl-build-live.sh, applied here as --gh-cmd.
+cat > "$TMP/gh-fail" <<'EOF'
+#!/usr/bin/env bash
+echo "mock gh: auth outage" >&2
+exit 1
+EOF
+chmod +x "$TMP/gh-fail"
+rc=0; out=$(bash "$G" --gh-cmd "$TMP/gh-fail" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: gh failure returned $rc, want 2: $out"; exit 1; }
+grep -qF "gh workflow list failed" <<<"$out" || { echo "FAIL: gh-outage case did not report gh workflow list failed: $out"; exit 1; }
+echo "gh-outage ok"
