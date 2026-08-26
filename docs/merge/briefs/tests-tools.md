@@ -16,7 +16,11 @@ comm -12 <(git diff --name-only 81ff7abe5 master | LC_ALL=C sort) \
 Raw output (18 files); `tests/CMakeLists.txt`, `tools/CMakeLists.txt` and
 `tools/ui/CMakeLists.txt` are excluded — already covered in
 `docs/merge/briefs/build-system.md`. `docs/backend/SYCL.md` is added per the
-spec (wave-5 conflict, outside the glob). **16 entries below.**
+spec (wave-5 conflict, outside the glob), bringing the in-scope total to 17
+files. **15 `##` sections below cover all 17**: 14 sections are one file
+each, and the three tool READMEs
+(`tools/{cli,completion,server}/README.md`) share a single section since
+their fork/upstream story is identical across all three.
 
 **Shapes verified against the real merge, not inferred from diff hunks.**
 Every "conflicts" / "auto-merges" claim in this brief was checked with
@@ -46,7 +50,7 @@ tests/test-gguf.cpp
 tests/test-llama-archs.cpp
 tests/test-model-load-cancel.cpp
 tests/test-quant-type-selection.cpp
-tests/snapshots/qwen3.6-27b.schema   (folded into test-quant-type-selection.cpp below)
+tests/snapshots/qwen3.6-27b.schema   (own section below, adjacent to test-quant-type-selection.cpp)
 tools/cli/README.md
 tools/completion/README.md
 tools/llama-bench/llama-bench.cpp
@@ -97,10 +101,11 @@ replacement doc (or confirmed already covered) rather than silently dropped:
 2. "Do NOT add a new file in `tests/*` without maintainers' approval" — directly
    relevant to this very merge (T12/T22 add no test files, so no violation, but
    future agent-driven work in this repo should carry the rule forward).
-3. The `skills/[skill]` directory pointer — check whether upstream actually
-   shipped a `skills/` dir at `b10630` (`git show b10630 --stat | grep '^skills/'`
-   or `git ls-tree b10630 skills/`) before adding the pointer; do not add a
-   dead link if the fork's checkout has no such directory post-merge.
+3. The `skills/[skill]` directory pointer — **verified real, not
+   conditional**: `git ls-tree b10630 skills/` confirms `b10630` ships
+   `skills/add-new-model/SKILL.md` and `skills/code-review/SKILL.md`. Add the
+   pointer to the fork's rewritten `AGENTS.md`; it will resolve to actual
+   content post-merge, not a dead link.
 
 Everything else upstream added (the reworded banner, expanded bullet lists, the
 comment-style example) is now-superseded prose that the fork's pointer-doc
@@ -135,11 +140,14 @@ being compiled once per test binary). **Upstream's version still exits
 `EXIT_SUCCESS`** on no model — it does not carry the fork's SKIP-return-code
 fix, because that fix does not exist upstream.
 
-Upstream's same commit rewires 5 consumers to call `common_get_model_or_exit`
-instead: `test-autorelease.cpp`, `test-backend-sampler.cpp`,
-`test-model-load-cancel.cpp` (also in this brief, see below),
-`test-quant-type-selection.cpp` (also below), `test-rset-release.cpp`. Only the
-latter two are in this brief's both-touched group; the other three
+Upstream's same commit rewires **four** consumers to call
+`common_get_model_or_exit` instead: `tests/test-autorelease.cpp:10`,
+`tests/test-backend-sampler.cpp:2142`, `tests/test-model-load-cancel.cpp:7`,
+`tests/test-rset-release.cpp:24`. Only `test-model-load-cancel.cpp` is in this
+brief's both-touched group (see its own entry below) — `test-quant-type-selection.cpp`
+references neither `get_model_or_exit` nor `get-model.h` on either side
+(verified — grep returns nothing — see that entry's own note), so it is not a
+consumer of this helper at all. The other three
 (`test-autorelease.cpp`, `test-backend-sampler.cpp`, `test-rset-release.cpp`)
 are **not** touched by the fork in this range, so git will silently take
 upstream's version of those three files cleanly — with no merge conflict, but
@@ -159,7 +167,7 @@ This is a **cross-file dependency outside this brief's own scope**:
 `common/common.cpp`/`common/common.h` are not in the tests/tools/AGENTS.md
 group, so whichever brief/wave owns `common/` must apply this fix — flag it
 explicitly to that wave rather than assuming it falls out of the tests-side
-resolution. If it is missed, the regression is silent: all 5 rewired test
+resolution. If it is missed, the regression is silent: all 4 rewired test
 binaries (3 with no local conflict to force a second look) go back to passing
 vacuously with no model configured, exactly as `llama.cpp-nwip` originally found.
 
@@ -169,7 +177,7 @@ on the missing-model path (either by including `tests/test-skip.h` from
 `common/common.cpp`, which is a layering smell worth a second look since
 `test-skip.h` is a `tests/`-scoped header, or by inlining the same
 fprintf+`exit(77)` there directly with a comment citing `llama.cpp-nwip`).
-Then grep all 5 rewired consumers for `common_get_model_or_exit(` and confirm
+Then grep all 4 rewired consumers for `common_get_model_or_exit(` and confirm
 none still references the deleted `get-model.h`.
 
 ---
@@ -474,8 +482,10 @@ Fork +148/-17 across 10 hunks (all in `test_rms_norm_mul_rope`, `test_argmax`,
 `test_snake_fuse`, expanded `test_ssm_scan`, new `test_diag`; new dtype
 coverage on existing ops — `test_set_rows`, `test_cpy`, `test_rope`,
 `test_conv_2d`/`test_conv_2d_dw` gaining an F16 variant, `test_concat`,
-`test_roll`, `test_flash_attn_ext`; type-array expansion — `all_types`,
-`base_types`, `other_types` gain `GGML_TYPE_Q2_0` and `GGML_TYPE_TQ2_0`).
+`test_roll`, `test_flash_attn_ext`; type-array expansion — `all_types` and
+`other_types` gain `GGML_TYPE_Q2_0` and `GGML_TYPE_TQ2_0`; `base_types` gains
+`GGML_TYPE_Q2_0` only (verified at `b10630:tests/test-backend-ops.cpp:8245-8290`
+— `base_types` there has no `TQ2_0` entry)).
 
 **RESOLVE: confirmed AUTO-MERGE.** `git merge-tree --write-tree master b10630`
 produces `Auto-merging tests/test-backend-ops.cpp` with **no** subsequent
@@ -498,8 +508,8 @@ with `(-inf, -1)` and admits on `>` alone never takes a `-inf` column and ships
 the sentinel instead) and `test_top_k` with fewer than `k` finite values.
 Upstream's additions are broad new op/dtype coverage — `test_snake_fuse`,
 expanded `test_ssm_scan`, `test_diag`, F16 variants of `test_conv_2d_dw`, and
-dtype-array expansion (`all_types`/`base_types`/`other_types` gain
-`GGML_TYPE_Q2_0` and `GGML_TYPE_TQ2_0`). This is squarely the "upstream's new
+dtype-array expansion (`all_types`/`other_types` gain `GGML_TYPE_Q2_0` and
+`GGML_TYPE_TQ2_0`; `base_types` gains `GGML_TYPE_Q2_0` only). This is squarely the "upstream's new
 op coverage is generally WANTED" case from the acceptance criteria — nothing
 here should be dropped, and the auto-merge means nothing here needs to be.
 
@@ -524,10 +534,12 @@ doesn't decline/fall back to CPU, it silently computes wrong numbers that
    states "No Q1_0/NVFP4 capability enable until current-HEAD B70 route...
    certification is green" — confirm whether that gate has since flipped).
 
-**The new prediction this brief adds:** upstream's `GGML_TYPE_Q2_0` and
-`GGML_TYPE_TQ2_0` additions to `all_types`/`base_types`/`other_types` feed
+**The new prediction this brief adds:** upstream adds `GGML_TYPE_Q2_0` to all
+three of `all_types`/`base_types`/`other_types`, and `GGML_TYPE_TQ2_0` to
+`all_types`/`other_types` only (`base_types` does not gain `TQ2_0` — verified
+at `b10630:tests/test-backend-ops.cpp:8245-8290`). Every array member feeds
 `make_test_cases_eval`'s `MUL_MAT_ID` generator the same way every other type
-in those arrays does. **Neither type appears anywhere in
+in that array does. **Neither type appears anywhere in
 `ggml/src/ggml-sycl/moe-mmvq-tables.hpp` or `mmvq.cpp`** (verified by direct
 grep — the only SYCL-side hits for `GGML_TYPE_Q2_0`/`GGML_TYPE_TQ2_0` are in
 `cpu-traits-support.cpp`'s CPU-reference trait table, unrelated to the SYCL MMID
@@ -544,10 +556,13 @@ does, via the CPU-fallback path evidenced by `cpu-traits-support.cpp`) and
 scoping the new-class ticket to `MUL_MAT_ID` specifically, matching `0yi9`/`wh7o`'s
 own scoping.
 
-**CONTRACT:** post-merge `all_types`/`base_types`/`other_types` contain
-`GGML_TYPE_Q2_0` and `GGML_TYPE_TQ2_0`; the fork's argmax/top_k edge-case tests
-and `run()`/registration lines are present; T22's backend-ops scoring explicitly
-checks for a Q2_0/TQ2_0-shaped residual before asserting the three-class
+**CONTRACT:** post-merge `all_types` and `other_types` contain both
+`GGML_TYPE_Q2_0` and `GGML_TYPE_TQ2_0`; `base_types` contains `GGML_TYPE_Q2_0`
+only (no `GGML_TYPE_TQ2_0` entry there — do not fail this contract on a
+correct merge that omits it from `base_types`); the fork's argmax/top_k
+edge-case tests and `run()`/registration lines are present; T22's backend-ops
+scoring explicitly checks for a Q2_0/TQ2_0-shaped residual before asserting
+the three-class
 partition is exhaustive.
 
 ---
