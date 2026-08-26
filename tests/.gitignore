@@ -16,6 +16,8 @@ ggml-common.h
 !data/planner-canaries/**
 !golden
 !golden/**
+!merge-guards
+!merge-guards/**
 sycl-canary/device-info
 sycl-canary/dpas
 sycl-canary/subgroup-reduce
