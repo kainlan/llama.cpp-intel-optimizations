@@ -3,16 +3,27 @@
 CPU-only. No GPU runs, no model loading. All numbers below are computed from
 hparams read directly out of the fixture-generating source
 (`tests/test-llama-archs.cpp`) and a live HF Hub `config.json` for the
-realistic model, using the exact formula the fork uses at runtime. No
-`test-generate-models` fixture GGUFs were available in the checked-out
-`build/` (its `CTestTestfile.cmake` is stale relative to `tests/CMakeLists.txt`
-— `test-generate-models`/`test-download-model`'s newer registrations are
-missing; ctest only lists `test-recurrent-state-rollback` itself, not its
-`generate-models` fixture setup). Per this task's scope ("No builds needed; if
-you believe you need one, ask the lead") this census does not reconfigure or
-rebuild; every hparam below is instead cited from the exact source lines that
-would produce that GGUF, which is equivalent for a purely arithmetic census
-and keeps the answer reproducible without touching `build/`.
+realistic model, using the exact formula the fork uses at runtime.
+
+No `test-generate-models` fixture GGUFs were available in the checked-out
+`build/` (`build/tests/test-models/` is empty) — but `build/tests/CTestTestfile.cmake`
+DOES register `test-generate-models` correctly (`FIXTURES_SETUP
+"generate-models"`, and all three rollback tests carry the matching
+`FIXTURES_REQUIRED`), so the fixtures were simply never staged, not stale
+registrations. Staging them means *running* `test-generate-models`, and that
+test's `add_test` line is `build/bin/test-llama-archs -o
+build/tests/test-models/` — the exact 195–206 GB Shmem model-loading binary
+CLAUDE.md's Hard-Won Rules names as a GPU hazard, not a CPU-only staging step
+like `test-download-model`. (Its `-o` mode does route through `save_models`
+rather than `test_backends`, so it may in practice avoid a device backend —
+but the binary is the one this repo treats as GPU-hazardous by policy, and
+this task's scope is CPU-only with no builds, so staging it is a lead-run
+decision, not something to do unilaterally from a census task.) Per this
+task's scope ("No builds needed; if you believe you need one, ask the lead")
+this census does not stage the fixtures or touch `build/`; every hparam below
+is instead cited from the exact source lines that would produce that GGUF,
+which is equivalent for a purely arithmetic census and keeps the answer
+reproducible.
 
 ## 1. The formula
 
@@ -139,7 +150,7 @@ DEEPSEEK4's analogous per-layer state lives in `llama_dsv4_comp_state`
 (`src/llama-kv-cache-dsv4.cpp:893-998`), named `dsv4_%s_state_kv_l%d` /
 `dsv4_%s_state_score_l%d` (`:967-968`) — a different prefix than
 `cache_r_l`/`cache_s_l`, sized by `n_embd_state × state_size × n_planes`
-(`n_planes = n_stream×(1+n_rs_seq)`, `:962`), not by `n_embd_r()`/`n_embd_s()`.
+(`n_planes = n_stream×(1+n_rs_seq)`, `:964`), not by `n_embd_r()`/`n_embd_s()`.
 
 **Further finding: `llama_dsv4_comp_state` does not route through the tiered
 SYCL KV buft at all.** Its buft selection (`:950-955`) calls
@@ -211,11 +222,11 @@ doesn't explicitly request it — `llama-context.cpp:359-364`) ⇒
 `mem_size = 1`, `n_rows = 1`. This is the realistic default (a single chat
 session, no rollback feature enabled):
 
-| n_seq_max | n_rs_seq | n_rows | r bytes/layer | s bytes/layer | total (27 layers) | % of 16 GiB |
-|---|---|---|---|---|---|---|
-| **1 (default)** | **0 (default)** | 1 | 147,456 B | 5,242,880 B | **145,539,072 B ≈ 138.8 MiB** | **0.847 %** |
-| 8 (concurrent-server) | 0 | 8 | 1,179,648 B | 41,943,040 B | 1,164,312,576 B ≈ 1.08 GiB | 6.78 % |
-| 1 | 8 (rollback on) | 9 | 1,327,104 B | 47,185,920 B | 1,309,851,648 B ≈ 1.25 GiB | 7.62 % |
+| n_seq_max | n_rs_seq | n_rows | r bytes/layer | s bytes/layer | total r (27 layers) | total s (27 layers) | total r+s | % of 16 GiB |
+|---|---|---|---|---|---|---|---|---|
+| **1 (default)** | **0 (default)** | 1 | 147,456 B | 5,242,880 B | 3,981,312 B | 141,557,760 B | **145,539,072 B ≈ 138.8 MiB** | **0.847 %** |
+| 8 (concurrent-server) | 0 | 8 | 1,179,648 B | 41,943,040 B | 31,850,496 B | 1,132,462,080 B | 1,164,312,576 B ≈ 1.08 GiB | 6.78 % |
+| 1 | 8 (rollback on) | 9 | 1,327,104 B | 47,185,920 B | 35,831,808 B | 1,274,019,840 B | 1,309,851,648 B ≈ 1.22 GiB | 7.62 % |
 
 The default single-session, no-rollback configuration — the common case, and
 the only one that doesn't require a caller to opt into an experimental feature
