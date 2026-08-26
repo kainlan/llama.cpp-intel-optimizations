@@ -56,7 +56,11 @@ re-derived at fork commit `bf03d2031` (`master` at that point; `b10630` is a
 fixed tag) via:
 
 ```bash
-tree=$(git merge-tree --write-tree master b10630)   # writes conflict markers into the blob for a conflicted path
+# `| head -1` is load-bearing: on any conflict, --write-tree prints the tree
+# OID on line 1 and then a full conflict report on the lines after it, so
+# capturing the whole output into $tree yields a multi-line string that is
+# not a valid object id for the git show below.
+tree=$(git merge-tree --write-tree master b10630 | head -1)
 git show ${tree}:<path> | grep -n '^<<<<<<<\|^=======\|^>>>>>>>'
 ```
 
@@ -69,10 +73,12 @@ file is not evidence for another. Treat `git merge-tree --write-tree` as the
 sole authority for conflict location in this brief; do not extrapolate from a
 `merge-file` experiment on a different file, however similar it looks.
 
-To reproduce the `merge-file` cross-check for any path: `git merge-tree`'s own
-plumbing output (without `--write-tree`) lists the base/ours/theirs blob OIDs
-for every conflicted path in `<mode> <oid> <stage> <path>` form (stage 1 =
-base, 2 = ours, 3 = theirs) — extract the three blobs by OID and diff them
+To reproduce the `merge-file` cross-check for any path: `git merge-tree`'s
+plumbing output lists the base/ours/theirs blob OIDs for every conflicted
+path in `<mode> <oid> <stage> <path>` form (stage 1 = base, 2 = ours, 3 =
+theirs) — both the plain form and `--write-tree` print this listing (with
+`--write-tree` it follows the tree OID on line 1, which is why the command
+above pipes through `head -1`). Extract the three blobs by OID and diff them
 directly, no worktree or checkout needed:
 
 ```bash
@@ -287,10 +293,11 @@ line. This is NOT a small, localized hunk:
   comment, and closes right after `test-cpu-gpu-soa-interaction`'s
   `RUN_SERIAL TRUE` property line — i.e. it spans nearly the entire
   `GGML_SYCL_BUILD_XMX_TESTS`-gated block described above. `test-xmx-config`'s
-  full registration (merged lines 1194–1215: the `add_executable(...)`
-  through its `set_tests_properties(xmx-config PROPERTIES ... TIMEOUT 60)`
-  call) sits fully **inside** this span, completely intact — it is not
-  touched, spliced, or altered by the merge in any way. A plain
+  full registration (merged lines 1194–1217: the `add_executable(...)`
+  through the closing `)` of its `set_tests_properties(xmx-config PROPERTIES
+  ... TIMEOUT 60)` call at 1216–1217) sits fully **inside** this span,
+  completely intact — it is not touched, spliced, or altered by the merge in
+  any way. A plain
   `git merge-file` 3-way merge (xdiff/diff3) against the same three blobs
   reports a conflict there instead — a different algorithm producing a
   different, wrong answer, not a nuance of the real one (see the method note
@@ -651,8 +658,8 @@ note above), immediately after `llama_build_and_test(test-llama-archs.cpp)`
 inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard.
 
 **OURS is NOT just the `test-archs-exclude-cli` block — it is 226 lines
-registering 12 tests across 8 separate `if (GGML_SYCL AND NOT
-GGML_BACKEND_DL)` guards**, verified by walking the merged blob line by
+registering 12 tests (8 of them in their own `if (GGML_SYCL AND NOT
+GGML_BACKEND_DL)` guard)**, verified by walking the merged blob line by
 line. In order: `test-archs-exclude.cpp` plus the `if (NOT WIN32)`-gated
 `test-archs-exclude-cli` (the pair described just below), then
 unconditionally `test-archs-table.cpp` (line 337) and
@@ -734,9 +741,10 @@ must simply be carried forward: `test-unicode.cpp`, `test-batch-alloc.cpp`
 one is additive on one side only and carries forward mechanically (including
 the auto-merging `LLAMA_USE_SYSTEM_GGML`/`test-alloc` anchor — no manual
 attention needed there). The one exception, the 297–522/524–563 conflict, is
-manual and has three parts:
-1. Keep every line of OURS (297–522) in order — all 12 registrations across
-   the 8 SYCL guards, unchanged.
+manual and has two parts:
+1. Keep every line of OURS (297–522) in order — all 12 registrations (8 of
+   them in their own `if (GGML_SYCL AND NOT GGML_BACKEND_DL)` guard),
+   unchanged.
 2. Insert THEIRS's 40 lines (524–563) immediately after the `if (NOT WIN32)
    ... endif()` sub-block for `test-archs-exclude-cli`, and *before* the very
    next `endif()` (the one that closes the outer `NOT WIN32 OR NOT
@@ -744,15 +752,19 @@ manual and has three parts:
    upstream's own original nesting intent — upstream inserted this content
    immediately after `test-llama-archs.cpp` and before that guard's `endif()`
    in their own diff — without perturbing any of OURS's already-correct
-   structure.
-3. Add a **new** `endif()` immediately after
-   `target_link_libraries(test-sycl-moe-routing-device-oracle PRIVATE
-   llama-common)`, closing the one guard that no longer has a closer once
-   THEIRS's content moves to step 2: the pre-existing trailing `endif()` (that
-   used to sit right after THEIRS in the raw conflict) now correctly closes
-   only the outer guard, immediately following THEIRS's newly-relocated
-   content, and this new one closes `test-sycl-moe-routing-device-oracle`'s
-   own guard where it was previously left open.
+   structure. **No new `endif()` is needed anywhere in this fix.** OURS
+   already supplies the two closers this region needs: the fork-added
+   `endif()` right after this splice point closes the outer `NOT WIN32 OR
+   NOT BUILD_SHARED_LIBS` guard (now immediately following THEIRS's
+   relocated content instead of immediately following
+   `test-archs-exclude-cli`), and the single shared trailing `endif()` that
+   follows the closing conflict marker closes
+   `test-sycl-moe-routing-device-oracle`'s guard, exactly where it already
+   sits. Adding a third `endif()` anywhere in this region unbalances the
+   file (final nesting depth goes negative — a hard CMake parse error), and
+   the obvious-looking "fix" for that — deleting the fork-added `endif()`
+   from step 2 instead — silently re-nests all 10 registrations after
+   `test-archs-exclude-cli` back inside the outer `NOT WIN32` guard.
 
 Verify by constructing the resolved region and hand-checking guard nesting —
 every `if` opened in this span must close before its next sibling
@@ -771,7 +783,7 @@ must NOT end up inside any `if (GGML_SYCL ...)` block.
 | `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict**, markers at 866/3617/3632 (OURS content 867–3616, 2,750 lines / 73 registrations, vs upstream's whole patch at 3618–3631); the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 carries no marker at all and silently loses upstream's feature regardless of how the conflict is resolved | take OURS content 867–3616 + **separate manual flag decision** at 836–838 (highest risk) |
 | `scripts/ui-assets.cmake` | different functions, no overlap. **AUTO-MERGES** | none needed; sanity-check both `hf_download()` and `npm_build()` changes landed |
 | `src/CMakeLists.txt` | insertion points differ by one line (`llama-kv-cache-dsa.cpp` vs `llama-kv-cache-dsv4.cpp`). **AUTO-MERGES** — confirmed absent from `git merge-tree`'s `CONFLICT` output | none needed; sanity-check all six new sources + version rewrite present |
-| `tests/CMakeLists.txt` | **real conflict**, markers at 296/523/564 (OURS content 297–522, 226 lines / 12 registrations across 8 SYCL guards, vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring at 524–563); a naive ours+theirs+shared-`endif()` concatenation nests upstream's 4 new tests inside the last SYCL guard, silently dropping them on non-SYCL builds. The `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard elsewhere in the file auto-merges | manual splice — see the full `tests/CMakeLists.txt` entry above (highest-risk region in this file) |
+| `tests/CMakeLists.txt` | **real conflict**, markers at 296/523/564 (OURS content 297–522, 226 lines / 12 registrations, 8 of them in their own `if (GGML_SYCL AND NOT GGML_BACKEND_DL)` guard, vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring at 524–563); a naive ours+theirs+shared-`endif()` concatenation nests upstream's 4 new tests inside the last SYCL guard, silently dropping them on non-SYCL builds. The `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard elsewhere in the file auto-merges | manual splice, no new `endif()` needed — see the full `tests/CMakeLists.txt` entry above (highest-risk region in this file) |
 | `tools/CMakeLists.txt` | adjacent (not overlapping) insertions around `fit-params`. **AUTO-MERGES** — confirmed absent from `CONFLICT` output | none needed; sanity-check ordering and that `add_subdirectory(parser)` is gone |
 | `tools/ui/CMakeLists.txt` | adjacent (not overlapping), upstream ends exactly where fork's block begins. **AUTO-MERGES** — confirmed absent from `CONFLICT` output | none needed; sanity-check exactly one `endif()` between upstream's and the fork's blocks |
 | `.github/workflows/build-sycl.yml` | disjoint insertions in same job. **AUTO-MERGES** | none needed; sanity-check `continue-on-error: true` plus both `ccache-clear` steps landed |
