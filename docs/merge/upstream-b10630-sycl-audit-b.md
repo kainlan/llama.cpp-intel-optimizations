@@ -1,5 +1,15 @@
 # Upstream SYCL Audit — Part B (commits 26–49 of 49)
 
+Fork side: `master @ 24bebf19a` ("docs(merge): audit ledger A -- reclassify entry 23 DSv4
+ops as port-candidate post-merge") — the commit `master` pointed to when this ledger's
+`ggml-sycl.cpp`/`cpy.cpp`/`mmvq.cpp`/`set_rows.cpp`/`dmmv-esimd.hpp` greps and cites were
+derived, i.e. the parent of this ledger's own first commit (`1f9901994`). Pinned because
+`master` keeps moving under a shared checkout; every citation below is scoped to this SHA
+unless stated otherwise. Re-verified at the current tip after the F1-F5 fix pass: the key
+line cites this pin covers (`ggml-sycl.cpp:98706`/`:98745`/`:98905`/`:98985`, `cpy.cpp:842`)
+still hold verbatim — no source file this ledger cites has changed between the pinned SHA
+and HEAD (only docs/scripts commits from parallel tracks have landed in between).
+
 Enumerated via `git rev-list --reverse 81ff7abe5..b10630 -- ggml/src/ggml-sycl | tail -n +26`.
 Classified per the rubric in `docs/plans/2026-08-25-phase-c-upstream-merge.md` Task 6/7
 (N/A → superseded → port-candidate, in that order; diff evidence, not commit titles).
