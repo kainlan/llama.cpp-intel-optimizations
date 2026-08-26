@@ -2,8 +2,28 @@
 
 Pre-merge analysis of every both-touched `tests/`/`tools/`/`AGENTS.md` file, plus
 `docs/backend/SYCL.md` (a genuine wave-5 merge conflict outside that glob, added
-per the T12 spec). Base for both diffs is `81ff7abe5` (fork/upstream merge-base);
-fork side is `master`, upstream side is tag `b10630`.
+per the T12 spec). Merge-base for both diffs is `81ff7abe5`. Upstream target:
+tag `b10630`. Fork side: `master @ 6e99e8f6c` ("docs(merge): tests-tools brief
+corrections (F1-F4, llama.cpp-4kds)") — this brief's own most recent commit at
+the time its derivation and `git merge-tree` checks were (re-)run. Pinned
+because `master` keeps moving under a shared checkout; every citation below is
+scoped to this SHA unless stated otherwise.
+
+**Read order.** Most entries below are mechanical (quote the verified conflict
+block, state which side wins) and can be executed in any order. Three things
+are not mechanical and should be read **before** starting resolution, not
+discovered mid-merge:
+1. `tests/get-model.cpp` — the fix here is a three-file, cross-wave dependency
+   (this file, `common/common.cpp` in a different brief's scope, and
+   `tests/test-skip-policy.py`) that must land as one unit or a live test gate
+   breaks. Read this before touching any of `get-model.cpp`,
+   `test-model-load-cancel.cpp`, or `test-quant-type-selection.cpp`.
+2. `AGENTS.md` — judgment call (whole-document rewrite vs. incremental
+   upstream edits), not a line-level merge.
+3. `docs/backend/SYCL.md` — the other judgment-heavy entry, and it **sits
+   last positionally** in this document purely because it was added outside
+   the `tests/`/`tools/`/`AGENTS.md` glob per the spec — its difficulty does
+   not match its position at the bottom of the file.
 
 ## Derivation
 
@@ -13,19 +33,36 @@ comm -12 <(git diff --name-only 81ff7abe5 master | LC_ALL=C sort) \
   | grep -E '^tests/|^tools/|^AGENTS.md'
 ```
 
-Raw output (18 files); `tests/CMakeLists.txt`, `tools/CMakeLists.txt` and
+Raw output: 18 files. `tests/CMakeLists.txt`, `tools/CMakeLists.txt` and
 `tools/ui/CMakeLists.txt` are excluded — already covered in
-`docs/merge/briefs/build-system.md`. `docs/backend/SYCL.md` is added per the
-spec (wave-5 conflict, outside the glob), bringing the in-scope total to 17
-files. **15 `##` sections below cover all 17**: 14 sections are one file
-each, and the three tool READMEs
-(`tools/{cli,completion,server}/README.md`) share a single section since
-their fork/upstream story is identical across all three.
+`docs/merge/briefs/build-system.md` — leaving 15. `docs/backend/SYCL.md` is
+added per the spec as the **first** out-of-glob addition (wave-5 conflict,
+outside the `tests/`/`tools/`/`AGENTS.md` pattern): 18 − 3 + 1 = **16**.
+
+That arithmetic is one file short. `tests/snapshots/qwen3.6-27b.schema` is a
+**second** out-of-glob addition, and it does not appear anywhere in the raw 18
+lines above — not filtered out, never present. The reason is structural, not
+an oversight in the `grep`: `comm -12` intersects two *literal path-string*
+sets, and the two sides of this rename never share a literal path. The fork's
+diff (`81ff7abe5`→`master`) reports the ancestor name,
+`tests/snapshots/qwen3.5-27b.schema`, as deleted; upstream's diff
+(`81ff7abe5`→`b10630`) reports the destination name,
+`tests/snapshots/qwen3.6-27b.schema`, as renamed-to. `comm -12` needs the
+*same string* on both sides to intersect on, and there isn't one — so this
+conflict is invisible to the exact command this brief's derivation runs, and
+had to be added by hand from the lead's ground truth (see that file's own
+entry below for the full DU mechanic). Final count: 16 + 1 = **17 in-scope
+files**.
+
+**15 `##` sections below cover all 17**: 14 sections are one file each, and
+the three tool READMEs (`tools/{cli,completion,server}/README.md`) share a
+single section since their fork/upstream story is identical across all three.
 
 **Shapes verified against the real merge, not inferred from diff hunks.**
 Every "conflicts" / "auto-merges" claim in this brief was checked with
-`git merge-tree --write-tree master b10630` (a read-only simulation of the
-exact merge — no working tree touched) and, for every file this brief calls a
+`git merge-tree --write-tree master b10630` (`master` resolving to the pinned
+`6e99e8f6c` above — a read-only simulation of the exact merge, no working tree
+touched) and, for every file this brief calls a
 real conflict, by extracting the actual `<<<<<<</=======/>>>>>>>` markers from
 the write-tree's blob (`git show <tree>:<path>`) rather than reasoning about
 line-range proximity from separate two-way diffs. Confirmed conflict set for
@@ -101,6 +138,13 @@ replacement doc (or confirmed already covered) rather than silently dropped:
 2. "Do NOT add a new file in `tests/*` without maintainers' approval" — directly
    relevant to this very merge (T12/T22 add no test files, so no violation, but
    future agent-driven work in this repo should carry the rule forward).
+   **Concrete do-this:** add a bullet reading `Do NOT add a new file in
+   \`tests/*\` without maintainers' approval — AI tends to add excessive test
+   cases for small features; reuse existing infrastructure` immediately
+   alongside the `ggml-gh-bot` exception paragraph (item 1) — both are
+   maintainer-facing policy facts of the same kind, so co-locating them keeps
+   the pointer-doc from scattering policy across sections that are otherwise
+   organized as "read `CLAUDE.md` for X".
 3. The `skills/[skill]` directory pointer — **verified real, not
    conditional**: `git ls-tree b10630 skills/` confirms `b10630` ships
    `skills/add-new-model/SKILL.md` and `skills/code-review/SKILL.md`. Add the
@@ -117,8 +161,19 @@ structure (table into `CLAUDE.md`, GGTT/PPGTT section, Landing-the-Plane
 checklist) and must not regain any of the duplicated build/perf/architecture
 content the 2026-07-25 rewrite removed (that duplication is the exact defect
 the rewrite fixed — see the file's own "why" paragraph, corroborated by
-`sycl-perf-baselines.md` history). It must gain the `ggml-gh-bot` exception
-verbatim as project policy, independent of which doc style wins.
+`sycl-perf-baselines.md` history).
+- **Item 1:** must gain the `ggml-gh-bot` exception verbatim as project
+  policy, independent of which doc style wins.
+- **Item 2:** must gain the `tests/*` no-new-file-without-approval bullet
+  (the concrete text above) — grep for `tests/\*` or `maintainers' approval`
+  in the merged file and confirm a hit; absence means this item was silently
+  dropped along with the rest of the superseded prose it lived in.
+- **Item 3:** must gain the `skills/` directory pointer, and it must resolve
+  to real content — after the merge, confirm `skills/add-new-model/SKILL.md`
+  and `skills/code-review/SKILL.md` exist in the tree (they are verified
+  present at `b10630`; this contract is a sanity check on the merge itself,
+  not on the fact this brief already confirmed) and that `AGENTS.md`'s
+  pointer text names at least one of them or the `skills/` directory generally.
 
 ---
 
@@ -153,6 +208,20 @@ are **not** touched by the fork in this range, so git will silently take
 upstream's version of those three files cleanly — with no merge conflict, but
 also with no SKIP-semantics fix, unless this entry's fix is applied.
 
+**Mechanic, so the executor doesn't trust an unattended merge here:** a
+modify/delete conflict (fork modified `tests/get-model.cpp`, upstream deleted
+it) produces **no `<<<<<<</=======/>>>>>>>` markers at all** — Git cannot
+3-way-merge a delete against a modify, so it leaves the file in the working
+tree at the *modified* (`master`) version, unstaged, and reports the conflict
+only in `git status`/`git diff --name-status` (`U` for `get-model.cpp`,
+`D` for `get-model.h` since the fork never touched that one). An executor who
+only resolves textual `<<<<<<<` conflicts and doesn't separately check
+`git status` for unmerged paths will ship `tests/get-model.cpp` and
+`tests/get-model.h` **still present** in the final tree, silently reverting
+upstream's consolidation and leaving the pre-fix `get_model_or_exit()`
+alongside a newly-added, unused `common_get_model_or_exit()`. Explicit
+`git rm tests/get-model.cpp tests/get-model.h` is required.
+
 **RESOLVE:** delete `tests/get-model.cpp`/`tests/get-model.h` (take upstream's
 consolidation — it is a real build-time win, one fewer compiled TU per test
 binary) but **port the fork's `test_skip_no_model()` call into
@@ -171,14 +240,53 @@ resolution. If it is missed, the regression is silent: all 4 rewired test
 binaries (3 with no local conflict to force a second look) go back to passing
 vacuously with no model configured, exactly as `llama.cpp-nwip` originally found.
 
-**CONTRACT:** grep `common/common.cpp` post-merge for
+**CRITICAL — deleting `tests/get-model.cpp` breaks a live test gate, and that
+gate must be updated as part of this same resolution, not as an afterthought.**
+`tests/test-skip-policy.py:86-96`'s `test_model_requiring_tests_use_the_shared_skip()`
+does:
+```python
+for name in ("get-model.cpp", "test-thread-safety.cpp"):
+    src = (ROOT / "tests" / name).read_text(encoding="utf-8")
+    assert "test_skip_no_model()" in src, ...
+```
+This is the gate `tests/CMakeLists.txt:1010-1019`'s registration comment
+describes as protecting exactly the `llama.cpp-nwip` fix this entry is
+preserving ("Both halves of the fix are one edit from gone -- tests/get-model.cpp
+is upstream code a rebase can revert..."). If `tests/get-model.cpp` is deleted
+per this entry's RESOLVE and `test-skip-policy.py` is left untouched, `(ROOT /
+"tests" / "get-model.cpp").read_text(...)` raises `FileNotFoundError` — the
+gate **errors**, not merely fails; a hard crash in a `policy`-labelled ctest
+that is supposed to be the safety net for this exact regression class. The
+irony: the very deletion this entry recommends (to land the fix) breaks the
+test that verifies the fix landed correctly.
+
+**RESOLVE adds:** as part of this same resolution, retarget the loop's
+`"get-model.cpp"` element to the path the ported logic now lives at —
+`"../common/common.cpp"` relative to `ROOT / "tests"`, or (cleaner) change the
+loop to iterate full repo-relative paths (`"common/common.cpp"`,
+`"tests/test-thread-safety.cpp"`) and drop the `ROOT / "tests" /` prefix
+construction accordingly, since the ported function no longer lives under
+`tests/`. This is a `tests/test-skip-policy.py` edit that must land in the same
+commit/PR as the `get-model.cpp` deletion and the `common/common.cpp` port —
+it is not optional cleanup, it is the third leg of one fix.
+
+**CONTRACT:** `git status` post-merge shows no unmerged path for
+`tests/get-model.cpp`/`tests/get-model.h`, and **both files are absent from
+the tree** (`test -f tests/get-model.cpp` fails) — the modify/delete mechanic
+above means "no conflict markers visible" is not sufficient evidence the
+deletion actually landed. Then grep `common/common.cpp` post-merge for
 `common_get_model_or_exit` and confirm its body calls something that exits 77
 on the missing-model path (either by including `tests/test-skip.h` from
 `common/common.cpp`, which is a layering smell worth a second look since
 `test-skip.h` is a `tests/`-scoped header, or by inlining the same
 fprintf+`exit(77)` there directly with a comment citing `llama.cpp-nwip`).
 Then grep all 4 rewired consumers for `common_get_model_or_exit(` and confirm
-none still references the deleted `get-model.h`.
+none still references the deleted `get-model.h`. **Additionally, run**
+`ctest --test-dir build -R '^test-skip-policy$' --output-on-failure` (or the
+direct `python3 tests/test-skip-policy.py`) post-merge and confirm it passes —
+not merely that it fails to crash. A `FileNotFoundError` traceback and a clean
+`assert` failure both read as "not passing" in a quick scan, but only a green
+run proves the retarget was actually applied.
 
 ---
 
@@ -202,6 +310,24 @@ So there are two distinct dispositions, not one:
   upstream renames it → **real DU/rename-vs-delete conflict**, surfacing as an
   unresolved add of `tests/snapshots/qwen3.6-27b.schema`.
 
+**Mechanic:** a rename/delete conflict (upstream renamed the ancestor path,
+fork deleted it) is a **stage-1/stage-3 unresolved add** — Git records the
+ancestor (`qwen3.5-27b.schema`) at stage 1, upstream's renamed destination
+(`qwen3.6-27b.schema`) at stage 3, and nothing at stage 2 (fork's side, since
+fork deleted rather than kept-or-modified). There is **no working-tree file
+and no conflict markers to look at** — `qwen3.6-27b.schema` does not exist on
+disk until explicitly created. This is exactly why `comm -12` (this brief's
+derivation command) never surfaces this file: it diffs *tracked-path* sets,
+and the fork side's diff reports the ancestor name (`qwen3.5-27b.schema`,
+deleted) while upstream's diff reports the destination name
+(`qwen3.6-27b.schema`, renamed-to) — the two sides never share a literal
+path string for `comm` to intersect on, so this conflict is invisible to the
+file-list intersection that built this brief's whole file group and had to be
+added by hand (see the Derivation section's note above). **Resolving requires
+an explicit `git checkout --theirs -- tests/snapshots/qwen3.6-27b.schema`
+(or equivalent extraction from the `b10630` tree) followed by `git add`** —
+there is no file to leave alone or markers to strip.
+
 **RESOLVE:** take upstream's file — **adopt** `qwen3.6-27b.schema`, do not
 honor the fork's deletion for this one. See the `test-quant-type-selection.cpp`
 entry below: upstream's `47f686f53` also swaps the `model_specs[]` row from
@@ -213,8 +339,11 @@ the old, pre-drift `Qwen3.5-27B` — i.e. upstream's fix and the fork's TODO
 resolve to the same golden, just reached from a different (now-fixed) source
 repo. No `llama.cpp-mcv8` revision-pin plumbing is needed for this row.
 
-**CONTRACT:** `tests/snapshots/qwen3.6-27b.schema` exists post-merge with
-upstream's (unchanged) content; `tests/snapshots/qwen3.5-27b.schema` and
+**CONTRACT:** `git status` post-merge shows no unmerged/unresolved path for
+this file; `tests/snapshots/qwen3.6-27b.schema` **exists on disk** (not just
+"no conflict reported" — per the mechanic above, doing nothing also produces
+no conflict markers and no file) with upstream's unchanged content, staged via
+`git add`; `tests/snapshots/qwen3.5-27b.schema` and
 `tests/snapshots/qwen3.5-397b-a17b.schema` do **not** exist post-merge.
 
 ---
@@ -629,12 +758,23 @@ worth naming explicitly so a reviewer knows what to spot-check post-merge:**
   `llama.cpp-to9m` describes — that one is about `grep FAIL` returning zero on
   a genuinely failing run due to log interleaving; this one is about a
   structurally-empty run reporting success).
-- Whatever change in `save_models`/`test_backends`/`main` wires the
-  roundtrip-mismatch detection that CLAUDE.md's `rc=0` trustworthiness claim
-  depends on (`rc=0` is described as trustworthy because `all_ok` is computed
-  from in-memory comparisons — verify this computation, not just its call
-  site, is fork content and not something upstream's `get_gguf_ctx` edits
-  incidentally touch).
+- **Identified concretely, not left as "whatever change":** the
+  roundtrip-mismatch computation CLAUDE.md's `rc=0` trustworthiness claim
+  depends on is `test_backends()`'s
+  `const bool roundtrip_broken = !std::isfinite(nmse_rt) || nmse_rt > nmse_gate;`
+  (currently `tests/test-llama-archs.cpp:984`), which sets `all_ok = false`
+  inside the `if (roundtrip_broken) { ... }` block two lines later when the
+  device-vs-roundtrip-reload comparison fails —
+  the same function, same `all_ok`/`n_measured` variables as the exit-77 fix
+  above. Introduced by `1acac16fc` ("test(archs): gate Roundtrip on NMSE,
+  because bit-equality is not achievable here") and hardened by `90165a3f5`
+  ("test(archs): a NaN NMSE is a FAIL, not an OK — the gate was vacuous where
+  it mattered most", which is what makes the `!std::isfinite(nmse_rt)` half of
+  the condition load-bearing rather than redundant). Both commits are fork-only
+  content in the same `test_backends()` function the SYCL/WebGPU skip
+  conflict above lives in, confirmed disjoint from upstream's `get_gguf_ctx`
+  hunks (old lines 99-300) by the same hunk-range check that scoped the rest
+  of this entry.
 
 **CONTRACT:** post-merge, run
 `./build/bin/test-llama-archs -a gemma-embedding; echo "rc=$?"` (or any other
@@ -647,12 +787,20 @@ before/after this fix landed.
 
 ## `tools/llama-bench/llama-bench.cpp`
 
-**Fork intent:** adds `if (!dev) { continue; }` (or the `reg`-equivalent) at
-**5** call sites that enumerate `ggml_backend_dev_count()`/`ggml_backend_reg_count()`
-slots: `get_cpu_info()`, `get_gpu_info()`, the `--list-devices` handler inside
-`parse_cmd_params`, the buffer-type enumeration inside `parse_cmd_params`, and
-`test::get_backend_bench_info` (or equivalent)'s RPC-backend scan. Same
-defensive idiom as the fork's `tests/test-gguf.cpp` entry above — a
+**Fork intent:** adds a null-slot guard at **5** call sites that enumerate
+`ggml_backend_dev_count()`/`ggml_backend_reg_count()` slots (line numbers at
+`master @ 6e99e8f6c`, `git log -1 --format=%H -- tools/llama-bench/llama-bench.cpp`
+= `51d116467a389c7d095628dd5e166a2a893da3db`):
+- `get_cpu_info()` :123 — `if (!dev) { continue; }`
+- `get_gpu_info()` :138 — `if (!dev) { continue; }`
+- the `--list-devices` handler inside `parse_cmd_params()` :681 — `if (!dev) { continue; }`
+  (this is the site this entry's conflict below is about)
+- the buffer-type enumeration inside `parse_cmd_params()` :903 — `if (!dev) { continue; }`
+- `test::get_backend()` :1525 — `if (!reg) { continue; }` (**not** `!dev` —
+  this loop enumerates `ggml_backend_reg_t` via `ggml_backend_reg_get()`, a
+  different registry than the other four)
+
+Same defensive idiom as the fork's `tests/test-gguf.cpp` entry above — a
 backend-registry slot that can return null is apparently a real, recurring
 hazard on this host (plausibly related to the iGPU / multi-device enumeration
 issues `CLAUDE.md`'s VRAM-budget section documents at length, though the exact
@@ -715,15 +863,22 @@ This is a **cross-file dependency outside this brief's own scope** —
 `common/arg.cpp` is not in the tests/tools/AGENTS.md group (it's presumably
 owned by the "core ggml"/common brief, task 10). Flag it explicitly to that
 wave: without this port, the other 4 null-guard sites in `llama-bench.cpp`
-(`get_cpu_info`, `get_gpu_info`, the buffer-type enumeration, the RPC scan) are
-unaffected and stay guarded, but the `--list-devices` path — probably the most
+(`get_cpu_info()`, `get_gpu_info()`, the buffer-type enumeration inside
+`parse_cmd_params()`, and `test::get_backend()`'s `!reg` guard) are unaffected
+and stay guarded, but the `--list-devices` path — probably the most
 frequently invoked of the five, since it's a diagnostic users run directly —
 loses its protection.
 
-**CONTRACT:** `llama-bench.cpp` retains `if (!dev) continue;` guards at the 4
-sites upstream didn't touch; `common/arg.cpp`'s `common_print_available_devices()`
-gains an equivalent guard (coordinate with the common/ brief — do not assume
-it lands automatically).
+**CONTRACT:** `llama-bench.cpp` retains its guard at the four sites upstream
+didn't touch, by symbol (line numbers drift — cite these, not raw numbers):
+`get_cpu_info()`'s `if (!dev) continue;`, `get_gpu_info()`'s `if (!dev) continue;`,
+`parse_cmd_params()`'s buffer-type-enumeration `if (!dev) continue;`, and
+`test::get_backend()`'s `if (!reg) continue;` — that last one is `!reg`, not
+`!dev`; do not "fix" it to match the other three, it enumerates a different
+registry (`ggml_backend_reg_t` via `ggml_backend_reg_count()`/`ggml_backend_reg_get()`,
+not `ggml_backend_dev_t`). `common/arg.cpp`'s `common_print_available_devices()`
+gains an equivalent `!dev` guard (coordinate with the common/ brief — do not
+assume it lands automatically).
 
 ---
 
@@ -868,7 +1023,9 @@ because it reflects a real `llama-gen-docs` regeneration against upstream's
 own `common/arg.cpp` changes in this cycle — new/changed flag descriptions
 elsewhere in the same tables, unrelated to `--fit`.
 
-**The load-bearing finding:** `common/arg.cpp:2559` (fork/master, current) defines the
+**The load-bearing finding:** `common_params_parser_init()`'s `add_opt(common_arg({"-fit", "--fit"}, ...))`
+call (`common/arg.cpp` @ `master 6e99e8f6c`; the pinned SHA, not a line number,
+because this function is edited constantly and a bare line cite drifts) defines the
 `--fit` description via `string_format("whether to adjust unset arguments to
 fit in device memory ('on' or 'off', default: '%s')", ...)` — **with no "ignored
 by SYCL unified cache builds" clause anywhere in the source string.** The fork's
@@ -934,7 +1091,9 @@ producing 5 conflict blocks — this needs judgment per topic, not a single
    rename in the fork's current doc. Do, however, flag to whoever resolves
    `common/arg.cpp`/`include/llama.h`: confirm whether the user-facing
    `--mmap`/`--no-mmap` CLI flag itself survives the `load_mode` struct
-   rename (it's still present in `common/arg.cpp:2401` pre-merge) — if it's
+   rename (it's still present as `common_params_parser_init()`'s
+   `add_opt(common_arg({"--mmap"}, {"--no-mmap"}, ...))` call — `common/arg.cpp`
+   @ `master 6e99e8f6c` — pre-merge) — if it's
    renamed or removed, any *other* fork doc referencing `--mmap` (not just
    this file) needs the same check this entry gave SYCL.md.
 
@@ -999,13 +1158,30 @@ removed the affected examples); for item 3, keep the fork's existing
 `GGML_SYCL_FA_ONEDNN` writeup unchanged and only add the five genuinely-new
 env-var rows, contingent on confirming each still exists post-`ggml-sycl.cpp`-merge.
 
-**CONTRACT:** post-merge `docs/backend/SYCL.md` contains no bare `--device
-SYCL0,SYCL1` or iGPU+dGPU guidance without an adjacent P2P/VRAM-budget caveat
-referencing the fork's own findings; contains exactly one `GGML_SYCL_FA_ONEDNN`
-writeup (the fork's, not a duplicate upstream row); does not document
-`GGML_SYCL_ENABLE_ESIMD` and `GGML_SYCL_ESIMD_DEQUANT` as if they were the same
-variable; any of the five new env-var rows ported in are verified to still
-exist in the merged `ggml-sycl.cpp` source before being documented as live.
+**CONTRACT** — negatives alone pass an executor who ports nothing at all, so
+positive presence checks come first:
+- **Present:** the ported device-management paragraph (mentions `--device
+  SYCL0,SYCL1` and links `docs/multi-gpu.md`) appears at least once in the
+  merged doc, *and* carries the P2P host-bounce caveat in the same paragraph
+  or the one immediately following it — not merely present somewhere in the
+  file.
+- **Present:** both new FAQ entries — the `SYCL_CACHE_PERSISTENT=1` crash
+  advisory, and the iGPU+dGPU `--list-devices`/`--device` entry (the latter
+  with its VRAM-budget caveat attached, same rule as above).
+- **Present:** for each of the five genuinely-new env-var rows
+  (`GGML_SYCL_ENABLE_HOST_PINNED_MEM`, `GGML_SYCL_FA_ONEDNN_MAX_KV`,
+  `GGML_SYCL_ENABLE_MKL_FA` + its `_DEBUG`/`_DIAG` diagnostics,
+  `GGML_SYCL_ENABLE_FUSION`, `GGML_SYCL_ENABLE_ESIMD`) that clears the
+  post-`ggml-sycl.cpp`-merge contingency (i.e. the variable still exists in
+  the merged source), confirm the row was actually added — grep the row name
+  in the merged doc, don't infer it from "the contract didn't flag it."
+- **Absent (the negatives, unchanged):** post-merge `docs/backend/SYCL.md`
+  contains no bare `--device SYCL0,SYCL1` or iGPU+dGPU guidance without an
+  adjacent P2P/VRAM-budget caveat referencing the fork's own findings;
+  contains exactly one `GGML_SYCL_FA_ONEDNN` writeup (the fork's, not a
+  duplicate upstream row); does not document `GGML_SYCL_ENABLE_ESIMD` and
+  `GGML_SYCL_ESIMD_DEQUANT` as if they were the same variable; no env-var row
+  is documented for a variable the `ggml-sycl.cpp` merge ended up deleting.
 
 ---
 
@@ -1024,6 +1200,28 @@ scope** and must be tracked by whoever owns `common/arg.cpp` /
    must move from the three hand-edited READMEs into `common/arg.cpp`'s
    `string_format(...)` source string, or it will not survive the next
    `llama-gen-docs` regeneration.
+4. Whoever resolves `common/arg.cpp`/`include/llama.h` should confirm whether
+   the user-facing `--mmap`/`--no-mmap` CLI flag (`common_params_parser_init()`'s
+   `add_opt(common_arg({"--mmap"}, {"--no-mmap"}, ...))` call, still present at
+   `master @ 6e99e8f6c`) survives the `llama_model_params::use_mmap` →
+   `load_mode` struct rename intact. This brief's `SYCL.md` and
+   `test-model-load-cancel.cpp` entries both depend on the answer: the fork's
+   `docs/backend/SYCL.md` rewrite already removed every `--mmap` example so it
+   needs no change either way, but any *other* fork doc that still shows
+   `--mmap` (not audited by this brief, since it is out of the
+   tests/tools/AGENTS.md scope) would need the same rename this brief applied
+   to `SYCL.md` and `test-model-load-cancel.cpp` if the flag itself moves.
+5. Flag to whichever wave resolves `ggml-sycl.cpp` (wave 4 / the lead, per
+   this repo's SYCL-backend ownership) the contingency this brief's
+   `docs/backend/SYCL.md` entry carries: five new upstream env vars
+   (`GGML_SYCL_ENABLE_HOST_PINNED_MEM`, `GGML_SYCL_FA_ONEDNN_MAX_KV`,
+   `GGML_SYCL_ENABLE_MKL_FA` + its `_DEBUG`/`_DIAG` diagnostics,
+   `GGML_SYCL_ENABLE_FUSION`, `GGML_SYCL_ENABLE_ESIMD`) are recommended for
+   the `SYCL.md` rewrite to document, but only if the `ggml-sycl.cpp` merge
+   actually preserves upstream's corresponding source-code additions rather
+   than superseding or deleting them with a competing fork implementation.
+   Whoever resolves that file should report back which of the five survived,
+   so `SYCL.md`'s executor doesn't document a variable that no longer exists.
 
 New fail-closed class this brief predicts for T22's backend-ops partition:
 **`GGML_TYPE_Q2_0`/`GGML_TYPE_TQ2_0` `MUL_MAT_ID`** — outside all three
