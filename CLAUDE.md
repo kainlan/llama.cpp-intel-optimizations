@@ -132,7 +132,8 @@ the single binary this file separately forbids running unattended (see Hard-Won
 Rules: 50–224 GB of TTM shmem, two OOM kills). At the `-j 4` this file then
 prescribed, it would have started alongside three other tests.
 
-The cause is structural, not a typo: `tests/CMakeLists.txt:494` registers it as
+The cause is structural, not a typo: `tests/CMakeLists.txt:2150` (post-b10630
+merge; the line drifts — verify with a grep) registers it as
 a bare `llama_build_and_test(test-backend-ops.cpp)` with **no labels**, so it
 inherits only the default `main` and no label denylist can reach it. Verify
 rather than assume — a label filter is silently permissive toward anything
@@ -869,6 +870,9 @@ ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-completion \
 #     fits is about -c 56576
 # llama-bench GPT-OSS runs are unaffected throughout — bench does not go through
 # the in-process server path that the chat gate uses.
+# POST-b10630 MERGE (2026-08-26): the gate re-verified green on the landed tree
+# in the form below MINUS `-cnv` and WITH `-c 4096` (digit line count=1, rc=0).
+# `-cnv` still exists post-merge; the -c pin remains required per llama.cpp-uize.
 #   > Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5
 #   1, 2, 3, 4, 5
 # The gate is the digit sequence. (An older note here said the output starts

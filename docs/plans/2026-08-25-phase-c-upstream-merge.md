@@ -107,6 +107,11 @@ digraph dependencies {
 
 ### Task 1: Source-coverage guard (GLOB trap)
 
+> **SNIPPET DRIFT (post-execution, llama.cpp-gdw4 c-iczq):** the code blocks below are the
+> PRE-fix drafts. The shipped `scripts/check-merge-source-coverage.sh` and `tests/merge-guards/test-source-coverage.sh`
+> gained exact-rc scoring, GREEN-mock, --strict, and missing-root refusal in review; the
+> shipped files are authoritative — do not re-implement from these blocks.
+
 **Track:** G
 **Depends on:** None
 **File scope:**
@@ -211,7 +216,7 @@ git commit -m "test(merge): add RED-proven source-coverage guard for the b10630 
 - Create: `tests/merge-guards/test-workflows-disabled.sh`
 
 **Description:**
-Upstream workflow files arrive ACTIVE on the fork after a push (recorded lesson: memory `fork-github-actions-disabled-manually`). This guard lists all workflows via `gh` and fails if any is not `disabled_manually`. Count is re-derived (51 today, never assumed). Testable offline via `--input FILE`.
+Upstream workflow files arrive ACTIVE on the fork after a push (recorded lesson: memory `fork-github-actions-disabled-manually`). This guard lists all workflows via `gh` and fails if any is not `disabled_manually`. Count is re-derived, never assumed (correction llama.cpp-gdw4 c-f0ft: pre-merge the REGISTERED count was 50 — 51 files minus the git-tracked bench.yml.disabled, invisible to gh's registry; post-b10630 landing it is 51 registered, all disabled). Testable offline via `--input FILE`.
 
 **Acceptance Criteria:**
 - [ ] Guard exits 1 and names the workflow on a fixture JSON with one `"state": "active"` (RED proven)
@@ -369,6 +374,11 @@ git commit -m "test(merge): add RED-proven ctest label/exclusion safety-net guar
 ---
 
 ### Task 4: SYCL-live build guard
+
+> **SNIPPET DRIFT (post-execution, llama.cpp-gdw4 c-iczq):** the code blocks below are the
+> PRE-fix drafts. The shipped `scripts/check-sycl-build-live.sh` and `tests/merge-guards/test-sycl-build-live.sh`
+> gained exact-rc scoring, GREEN-mock, --strict, and missing-root refusal in review; the
+> shipped files are authoritative — do not re-implement from these blocks.
 
 **Track:** G
 **Depends on:** None

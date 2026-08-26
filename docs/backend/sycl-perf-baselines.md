@@ -845,3 +845,24 @@ Full derivation in `CLAUDE.md`, "Performance Expectations".
 
 Multi-device (`level_zero:0,1`) GPT-OSS throughput is still **TBD**; direct P2P
 is unavailable, so host-bounce transfer paths are required.
+
+## 2026-08-26 — Phase C upstream b10630 merge landed (history append, NOT a gate change)
+
+Paired interleaved certification at landed tip `410433dd5` vs pre-merge master
+`fbdb31f43` (4 arms x 5 pairs, bench-guard wrapped, ambient load ~60; evidence
+`artifacts/merge-b10630/perf-final/` in the retained merge worktree):
+
+| arm | pre-merge mean | landed mean | verdict |
+|-----|---------------:|------------:|---------|
+| B70 Mistral pp512 / tg128 | ~3018 / ~101.9 | 3018.33 / 101.34 | parity |
+| B70 GPT-OSS pp512 / tg128 | ~1717 / ~40.5 | 1712.42 / 40.22 | parity (cand >= pre in 4/5 pp pairs) |
+| B50 Mistral pp512 / tg128 | ~1293 / ~46.7 | 1290.82 / 46.67 | parity |
+| B50 GPT-OSS pp512 / tg128 | ~857 / ~32.3 | 852.40 / 31.92 | parity (post-qfae fix) |
+
+Notes: (1) the −3.5% GPT-OSS PP deficit the first pass caught was upstream's
+broken nextn last-layer crop, fixed at `2e6dc4782` (llama.cpp-qfae) and
+verified to parity with seed-pinned equal-work pairs; (2) the parser's B70
+bands are stale-low — both binaries EXCEED the pp bands by ~20% and miss the
+tg band identically — refresh is owner-review task llama.cpp-kzug; these rows
+are history, not new floors; (3) absolute values under ambient load are not
+baselines (standing rule).
