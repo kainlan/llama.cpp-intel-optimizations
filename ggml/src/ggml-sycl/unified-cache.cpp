@@ -23290,6 +23290,21 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             item.ne[0] <= 0 || item.ne[1] <= 0) {
             continue;
         }
+        // Only the expert weight matrices are MUL_MAT_ID operands. Per-expert
+        // auxiliary tensors (".scale"/".input_scale" fp8 metadata) share the
+        // "ffn_*_exps" stem — and legitimately get per-expert placement — but
+        // their degenerate shapes (e.g. ne10=2 < QK8_1) must not drive MMID
+        // workspace geometry: q8_1 row sizing rightly refuses them, which used
+        // to invalidate the whole plan and refuse context creation
+        // (demand-invalid, over_by=0.0) on any model carrying expert scales.
+        {
+            static const char weight_suffix[] = ".weight";
+            const std::string & nm = item.name;
+            if (nm.size() < sizeof(weight_suffix) - 1 ||
+                nm.compare(nm.size() - (sizeof(weight_suffix) - 1), sizeof(weight_suffix) - 1, weight_suffix) != 0) {
+                continue;
+            }
+        }
         std::map<int, bool> actual_owners;
         for (const placement_entry & entry : plan.entries) {
             if (entry.name != item.name || entry.expert_id < 0) {
@@ -23330,6 +23345,8 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             moe_mmid_workspace_geometry candidate;
             if (!moe_mmid_plan_workspace(shape, secondary, &candidate) ||
                 !moe_mmid_component_max(&maxima[owner], candidate)) {
+                GGML_LOG_WARN("[SYCL-PLAN] MMID workspace demand invalid for %s (ne10=%zu ne01=%zu top_k=%zu c=%zu)\n",
+                              item.name.c_str(), shape.ne10, shape.ne01, shape.top_k, shape.c);
                 plan.moe_mmid_workspace_valid = false;
             }
         }
