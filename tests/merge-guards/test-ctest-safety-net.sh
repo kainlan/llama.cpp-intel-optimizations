@@ -55,12 +55,48 @@ echo "RED-3 ok (failed sweep listing refused, not vacuously passed)"
 
 # RED-4: a nonexistent build dir must be refused with its own named cause
 # (MISSING BUILD DIR), not misreported as LABEL NET EMPTY just because ctest
-# against a missing --test-dir happens to select nothing.
+# against a missing --test-dir happens to select nothing. Hermetic: reuses
+# the RED-1 mock purely so `command -v "$CTEST"` has something to resolve --
+# the mock is never actually invoked, since the build-dir check must fire
+# first, so this arm does not depend on a real ctest being on PATH.
 MISSING_BUILD="$TMP/does-not-exist"
-rc=0; out=$(bash "$G" --build-dir "$MISSING_BUILD" 2>&1) || rc=$?
+rc=0; out=$(bash "$G" --build-dir "$MISSING_BUILD" --ctest-cmd "$TMP/ctest-nolabel" 2>&1) || rc=$?
 [ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for missing build dir, want 2"; exit 1; }
 grep -qF "MISSING BUILD DIR" <<<"$out" || { echo "FAIL: RED-4 did not name the cause: $out"; exit 1; }
 echo "RED-4 ok (missing build dir refused vacuous pass)"
+
+# RED-5: the LABEL half fails the same way RED-3 covers for the sweep half --
+# a truncated-but-nonempty label listing (one real Test line, then an error
+# and a nonzero exit) must NOT read as "1 labelled test, safety net intact".
+# Symmetric fix to RED-3: ctest's own exit status must be checked BEFORE the
+# label-net grep is trusted.
+cat > "$TMP/ctest-label-fails" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+    [ "$a" = "-L" ] && { echo "  Test #1: test-something"; echo "ctest: internal error" >&2; exit 1; }
+done
+echo "  Test #9: test-something-else"
+EOF
+chmod +x "$TMP/ctest-label-fails"
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-label-fails" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for failed label listing, want 2"; exit 1; }
+grep -qF "LABEL LISTING FAILED" <<<"$out" || { echo "FAIL: RED-5 did not name the cause: $out"; exit 1; }
+echo "RED-5 ok (failed label listing refused, not vacuously passed)"
+
+# RED-6: the sweep half's non-vacuity check -- an -LE that exits 0 but
+# selects NOTHING (empty stdout) must not certify an empty set as "no leak,
+# safe". Must refuse (exit 2), naming the cause, distinctly from RED-3's
+# ctest-failure case (this one is a clean exit 0 with vacuous output).
+cat > "$TMP/ctest-sweep-empty" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "-L" ] && { echo "  Test #5: test-unified-cache-x"; exit 0; }; done
+exit 0
+EOF
+chmod +x "$TMP/ctest-sweep-empty"
+rc=0; out=$(bash "$G" --ctest-cmd "$TMP/ctest-sweep-empty" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: rc=$rc for empty sweep listing, want 2"; exit 1; }
+grep -qF "SWEEP LISTING EMPTY" <<<"$out" || { echo "FAIL: RED-6 did not name the cause: $out"; exit 1; }
+echo "RED-6 ok (empty sweep listing refused, not vacuously passed)"
 
 # GREEN-mock: hermetic positive control for the --ctest-cmd seam -- a mock
 # that returns a labelled test for -L and a clean filtered listing (no
