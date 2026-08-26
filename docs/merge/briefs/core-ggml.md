@@ -821,10 +821,11 @@ unrelated param-type hunk needs nothing re-applied against it.
 
 ### `ggml/src/ggml-cpu/spacemit/ime.cpp`
 
-**Fork intent (ours):** 2 hunks (old lines 1469–1474, 1646–1663), 8 lines
-across two spots — `get_caps` (F1) on `ggml_backend_riscv64_spacemit_buffer_i`
-and on `ggml_backend_cpu_riscv64_spacemit_buffer_type` (plus re-indentation of
-that initializer's existing fields).
+**Fork intent (ours):** 3 hunks (old lines 1469–1474, 1646–1652, 1654–1663 —
+old line 1653 sits untouched between the last two), 8 lines across two spots
+— `get_caps` (F1) on `ggml_backend_riscv64_spacemit_buffer_i` and on
+`ggml_backend_cpu_riscv64_spacemit_buffer_type` (plus re-indentation of that
+initializer's existing fields).
 
 **Upstream intent (theirs):** 2 hunks (old lines 195–200, 214–219), 2-line
 addition — a `case GGML_TYPE_Q5_0:` added alongside `Q4_K/Q6_K/Q8_0/Q5_1/Q5_K`
@@ -944,7 +945,7 @@ incidental struct-literal reflow, no Metal logic added by the fork here.
 (F1) on `ggml_backend_opencl_buffer_interface` and
 `ggml_backend_opencl_buffer_type_interface`.
 
-**Upstream intent (theirs):** HUGE — 3312 ins / 389 del across ~190 hunks (old
+**Upstream intent (theirs):** HUGE — 3312 ins / 389 del across ~280 hunks (old
 lines 13–22411; characterized by hunk-header category, not read in full: the
 majority (~130 hunks) are `load_cl_kernels()` new SPIR-V/CL kernel
 registrations; `ggml_backend_opencl_context`/FA-kernel-variant struct growth;
@@ -1094,7 +1095,7 @@ SYCL; `apir_device_get_props` is virtgpu-internal IPC with no SYCL analog.
 (with reflow).
 
 **Upstream intent (theirs):** HUGE — 1244 ins / 280 del across ~200 hunks (old
-lines 128–19556; characterized by hunk-header category, not read in full): new
+lines 128–18600; characterized by hunk-header category, not read in full): new
 Vulkan feature-struct plumbing and topk-moe additions; `vk_device_struct`
 capability-field growth; new push-constant structs for binary/rope/snake/
 wkv7/ssm_scan ops; FLOPs-estimation and fence-wait/pipeline restructuring; a
@@ -1134,8 +1135,8 @@ flash-attention API split (`ggml_webgpu_flash_attn_kv_direct` →
 gates.
 
 **RESOLVE:** **AUTO-MERGES — sanity check only.** Fork's hunks fall in gaps
-between upstream's nearest neighbors (3164–3169 and 3652–3658 bracket 3579;
-3766–3771 follows 4019–4025) — no overlap.
+between upstream's nearest neighbors: 3164–3169 and 3652–3658 bracket
+3579–3584; 3766–3771 and 4102–4114 bracket 4019–4025 — no overlap.
 
 **CONTRACT:** None — WebGPU's new depthwise-conv op and FA K/V-direct path
 split are backend-specific; no shared symbols with `ggml-sycl.cpp`.
