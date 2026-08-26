@@ -529,8 +529,8 @@ ops, threading fixes, and buffer-sizing hunks, then re-insert the fork's two
 `SET_ROWS_PAGED`/`ALL_REDUCE_SUM` case labels (additive, non-conflicting).
 
 **CONTRACT:** `GGML_OP_SET_ROWS_PAGED`/`GGML_OP_ALL_REDUCE_SUM` — confirmed live
-SYCL consumers: `ggml-sycl.cpp` has `case GGML_OP_SET_ROWS_PAGED:` at 4 sites
-(76407, 81266, 98963, 99645) and `case GGML_OP_ALL_REDUCE_SUM:` at 2 sites
+SYCL consumers: `ggml-sycl.cpp` has `case GGML_OP_SET_ROWS_PAGED:` at 5 sites
+(65191, 76407, 81266, 98963, 99645) and `case GGML_OP_ALL_REDUCE_SUM:` at 2 sites
 (76765, 99304) — this CPU dispatch is the fallback counterpart of a full SYCL
 feature (paged KV write + tensor-parallel all-reduce); **must not be dropped**.
 `LIGHTNING_INDEXER`/`DSV4_HC_*` — zero hits in `ggml-sycl.cpp`; SYCL has no
