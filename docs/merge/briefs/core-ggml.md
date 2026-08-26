@@ -852,7 +852,7 @@ whitespace-realignment pass as `kleidiai.cpp`/`repack.cpp`.
 `ggml_backend_cuda_buffer_type_interface`, and the inline host-buffer-type
 literal (with incidental multi-line reflow).
 
-**Upstream intent (theirs):** 433 ins / 80 del across ~58 hunks — device
+**Upstream intent (theirs):** 433 ins / 80 del across ~54 hunks — device
 init/parsing, pool/vmm struct growth, `mul_mat_cublas`/`mul_mat_id` dispatch
 refactors, graph-fusion additions (RoPE/set_rows fusion, GDN cache fusion,
 topk-moe fusion), graph capture/evaluate changes, device-count/UMA-memory
@@ -862,7 +862,7 @@ device type — see CONTRACT below), `device_supports_op` extensions (new
 `GGML_TYPE_Q2_0` support, other type/shape gates).
 
 **RESOLVE:** **AUTO-MERGES — sanity check only.** No proximity between fork's
-3 hunks and any of upstream's ~58.
+3 hunks and any of upstream's ~54.
 
 **CONTRACT:** None as a compile/link dependency (CUDA-specific: pool/vmm,
 graph-fusion heuristics, Q2_0 support). Worth flagging for awareness, not as a
@@ -885,7 +885,7 @@ logic.
 **Fork intent (ours):** 3 one-line `get_caps` (F1) additions (old lines 981,
 1053, 1062).
 
-**Upstream intent (theirs):** 588 lines across ~90 hunks — htp-event/op-profiling
+**Upstream intent (theirs):** 588 lines across ~93 hunks — htp-event/op-profiling
 additions; tiled-repack padding-alignment fixes across Q4_0/Q4_1/Q8_0/MXFP4;
 a large `ggml_hexagon_opqueue`/`opbatch` restructuring; flash-attention
 HMX-eligibility changes; a matmul-params precompute rewrite/relocation;
@@ -1009,8 +1009,8 @@ substantial rewrite of `is_op_unsupported_case` (includes a 47-line
 deletion+replace); `device_supports_op` tail tweaks.
 
 **RESOLVE:** **AUTO-MERGES — sanity check only.** Fork's hunks (420/479/534)
-fall in gaps between upstream's hunks (nearest neighbors at 32–37, 135–140,
-235–244, 274–279, 458–465, 618–624 — none intersect 420–539).
+fall in gaps between upstream's hunks (nearest neighbors 274–279 / 458–465 /
+618–624; upstream's 458–465 lies in the fork's own 425–479 gap) — no overlap.
 
 **CONTRACT:** None — OpenVINO op-support predicates and overflow helpers are
 backend-siloed; no shared symbols with `ggml-sycl.cpp`.
@@ -1126,7 +1126,7 @@ pattern, no Vulkan shader/dispatch logic touched.
 literal inside `ggml_backend_webgpu_device_get_buffer_type` (with minor
 reflow).
 
-**Upstream intent (theirs):** 420 lines across ~28 hunks — `ggml_webgpu_tensor_buf`
+**Upstream intent (theirs):** 420 lines across ~30 hunks — `ggml_webgpu_tensor_buf`
 growth; new `ggml_webgpu_conv_2d_dw` (depthwise conv) op + dispatch entry;
 `ggml_webgpu_ssm_scan` restructuring; `set_rows`/`mul_mat` tweaks; a
 flash-attention API split (`ggml_webgpu_flash_attn_kv_direct` →
