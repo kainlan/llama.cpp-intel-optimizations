@@ -381,7 +381,7 @@ static int check_batched_vs_per_slot(sycl::queue & q) {
 // ---------------------------------------------------------------------------
 static int run_and_check_fn(sycl::queue & q,
                             const char *  label,
-                            void (*repack_fn)(const void *, uint8_t *, uint8_t *, int, int, int, dpct::queue_ptr),
+                            void (*repack_fn)(const void *, uint8_t *, uint8_t *, int, int, int, dpct::queue_ptr, int),
                             const uint8_t * src,
                             size_t          src_bytes,
                             int             blocks_per_row,
@@ -396,7 +396,7 @@ static int run_and_check_fn(sycl::queue & q,
     uint8_t * scale_dev = (uint8_t *) sycl::malloc_device(scales_bytes, q);
     q.memcpy(src_dev, src, src_bytes).wait();
 
-    repack_fn(src_dev, nib_dev, scale_dev, blocks_per_row, nrows, tile_n_total, &q);
+    repack_fn(src_dev, nib_dev, scale_dev, blocks_per_row, nrows, tile_n_total, &q, -1);
     q.wait();
 
     std::vector<uint8_t> got_nibbles(nibbles_bytes);
