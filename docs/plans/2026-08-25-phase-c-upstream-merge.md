@@ -583,6 +583,8 @@ Classify the first 25 of the 49 upstream commits touching `ggml/src/ggml-sycl` (
    - **N/A** — the change targets something the fork's design forbids or removed entirely: direct `sycl::malloc_*`/side-cache allocation patterns (canonical memory contract), paths only reachable on hardware this fork does not run, upstream-only build modes.
    - **Superseded** — touches a subsystem the fork rewrote wholesale: mul_mat dispatch, fattn, memory/allocation, graph replay, mmvq/mmq kernel organization. Verify by checking whether the upstream hunk's context lines still exist in the fork's file (`cat ggml/src/ggml-sycl/<file> | grep -nF '<distinctive context line>'` — for `ggml-sycl.cpp` use the piped-grep form; codescout is blind in that file).
    - **Port-candidate** — a correctness fix or table addition to code the fork retains in recognizable form (dequant tables in `dequantize.hpp`/`convert.cpp`, `quants.hpp` offsets, `common.hpp` shared types, `vecdotq.hpp` shared dot-product helpers, element-wise ops), or a new capability worth a fork-native reimplementation (e.g. upstream's `topk-moe.hpp` fused top-k — the fork has its own MoE routing, so this is likely superseded, but decide from the diff, not the name).
+
+   **Ownership screen, applied across all three classes (owner directive 2026-08-25, epic comment c-j62d):** upstream code that allocates outside unified-cache surfaces (`sycl::malloc_*`, raw TLSF, side caches/pools/scratch), keys identity on raw device pointers, or lets a pointer outlive its owner is NEVER a port-candidate *as written*; forced-eviction / forced-reap / zone-reset reclamation is **N/A by design** (zone reset is being eliminated; refcounted `mem_handle` release is the sole reclamation model). Valuable allocating functionality is still classified port-candidate, but the entry MUST carry "requires re-expression through `unified_allocate`/`unified_allocate_owner` → `mem_handle`; verbatim port forbidden by the canonical contract", and the landing zone names the sanctioned surface consumed. Authorities: CLAUDE.md "SYCL Memory Ownership", `docs/design/sycl-canonical-memory-architecture.md`, `docs/backend/sycl-memory-design.md`.
 4. Write entries in this exact format:
 
 ```markdown
@@ -638,7 +640,7 @@ Merge parts A and B into the single committed ledger, cross-check counts (25+24=
 
 **Acceptance Criteria:**
 - [ ] `docs/merge/upstream-b10630-sycl-audit.md` holds all 49 entries + summary table
-- [ ] Tracker epic exists; every port-candidate has a ticket with a `task_dep` edge to the epic
+- [ ] Tracker epic exists; every port-candidate has a ticket with a `task_dep` edge to the epic; each ticket names the sanctioned ownership surface (`mem_handle` lease / `alloc_owner` / cache materialization helper) its port consumes and carries the re-expression note where the ownership screen applies (owner directive, epic comment c-j62d)
 - [ ] Ledger lists each ticket ID next to its entry (IDs cited from a **previous** tool block, never the same one that created them — recorded lesson)
 - [ ] Parts A/B files are removed in the same commit (content absorbed)
 
@@ -871,7 +873,7 @@ Expected: configure rc=0; coverage guard `fail=0`; SYCL-live guard `cache ON, ld
 **File scope (worktree):** conflicted `ggml/` files outside `ggml-sycl/` (per T10 brief)
 
 **Description:**
-Resolve per the T10 brief. Every entry whose `CONTRACT:` line is non-none gets its fork-side consumers checked immediately: `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<changed symbol>'` (piped grep — codescout is blind in that file) plus `search_code` over the rest of the backend. Where a contract changed, the fork-side adaptation is made NOW, in this wave, so the wave-boundary build stays meaningful.
+Resolve per the T10 brief. Every entry whose `CONTRACT:` line is non-none gets its fork-side consumers checked immediately: `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<changed symbol>'` (piped grep — codescout is blind in that file) plus `search_code` over the rest of the backend. Where a contract changed, the fork-side adaptation is made NOW, in this wave, so the wave-boundary build stays meaningful. Upstream changes to allocation/buffer interfaces (`ggml-alloc.c`, `ggml-backend.*` — e.g. the `get_caps` / `mmap_support` additions the T10 brief flags) are additionally reviewed against the fork's ownership model (owner directive, epic comment c-j62d): SYCL-side allocations flow through the unified cache, `mem_handle` is the sole ownership token, raw pointers are transient ABI views — an upstream interface that invites direct allocation or pointer-keyed identity gets a fork-side adaptation that keeps the canonical surfaces authoritative, never a verbatim adoption.
 
 **Implementation Guide:**
 
@@ -1018,6 +1020,8 @@ df -h / | awk 'NR==2{print $4" free"}'        # require >= 60G
 bash /Apps/llama.cpp/scripts/check-merge-source-coverage.sh --build-ninja build/build.ninja --repo-root .
 bash /Apps/llama.cpp/scripts/check-sycl-build-live.sh --build-dir build
 bash /Apps/llama.cpp/scripts/check-ctest-safety-net.sh --build-dir build
+# canonical memory-contract source gates (CPU-only source asserts; owner directive, epic c-j62d):
+ctest --test-dir build -R 'sycl-alloc-policy|sycl-handle-policy|sycl-ensure-cached-alloc-policy|canonical-checksum' --output-on-failure
 git commit          # merge commit; message below
 ```
 
