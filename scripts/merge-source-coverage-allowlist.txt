@@ -1,0 +1,87 @@
+# sources intentionally not built; one repo-relative path per line
+#
+# Each group below was verified against the pre-merge tree (master @ 35a2c86eb)
+# on 2026-08-25 as pre-existing, by-design unbuilt state -- not a merge
+# regression from the b10630 sync. Comment lines document why; the guard
+# matches each path line with `grep -qxF`, so keep paths on their own line
+# (no trailing comments -- they would break the exact-line match).
+
+# Group 1: gated behind the GGML_SYCL_BUILD_XMX_TESTS CMake option (default
+# OFF; ggml-sycl/CMakeLists.txt:856 `if (GGML_SYCL_BUILD_XMX_TESTS AND ...)`).
+# add_executable() targets for these ARE registered in CMakeLists.txt, but the
+# option is off in the current build config, so CMake never emits them into
+# build.ninja. Passing -DGGML_SYCL_BUILD_XMX_TESTS=ON would build them.
+ggml/src/ggml-sycl/tests/test-esimd-prefetch.cpp
+ggml/src/ggml-sycl/tests/test-esimd-vectorized-dequant.cpp
+ggml/src/ggml-sycl/tests/test-moe-mxfp4-dp4a.cpp
+ggml/src/ggml-sycl/tests/test-mxfp4-vector-dequant.cpp
+ggml/src/ggml-sycl/tests/test-unified-kernel.cpp
+ggml/src/ggml-sycl/tests/test-unified-kernel-ops.cpp
+ggml/src/ggml-sycl/tests/test-unified-kernel-persistent.cpp
+ggml/src/ggml-sycl/tests/test-xmx-compute.cpp
+ggml/src/ggml-sycl/tests/test-xmx-config.cpp
+ggml/src/ggml-sycl/tests/test-xmx-default-enable.cpp
+ggml/src/ggml-sycl/tests/test-xmx-esimd-basic.cpp
+ggml/src/ggml-sycl/tests/test-xmx-hardware-detect.cpp
+ggml/src/ggml-sycl/tests/test-xmx-moe-mxfp4.cpp
+ggml/src/ggml-sycl/tests/test-xmx-optimization.cpp
+
+# Group 2: standalone manual-build test script, never registered in CMake by
+# design. The file's own header says so: "Build: c++ -std=c++17 -O2
+# test-q1-nvfp4-direct-mmvq.cpp -o /tmp/test-q1-nvfp4-direct-mmvq".
+ggml/src/ggml-sycl/tests/test-q1-nvfp4-direct-mmvq.cpp
+
+# Group 3: template-instances/ -- vestigial per-head-dim explicit-instantiation
+# files (46 total: 10 fattn-tile-instance-*, 36 fattn-vec-instance-*). Verified
+# zero references anywhere in ggml-sycl/CMakeLists.txt (the `file(GLOB
+# GGML_SOURCES_SYCL "*.cpp")` at CMakeLists.txt:83 is non-recursive -- top
+# level of ggml-sycl/ only -- so it never reaches this subdirectory) and zero
+# #include of any of them from any in-tree .cpp/.hpp (fattn-tile.cpp and
+# fattn-vec.hpp implement flash attention directly and do not pull these in).
+# Dead/orphaned, not wired into the build by any mechanism.
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq112-dv112.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq128-dv128.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq256-dv256.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq40-dv40.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq512-dv512.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq576-dv512.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq64-dv64.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq72-dv72.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq80-dv80.cpp
+ggml/src/ggml-sycl/template-instances/fattn-tile-instance-dkq96-dv96.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-f16-q8_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_0-q8_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q4_1-q8_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_0-q8_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q5_1-q8_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-f16.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-q4_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-q4_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-q5_0.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-q5_1.cpp
+ggml/src/ggml-sycl/template-instances/fattn-vec-instance-q8_0-q8_0.cpp
