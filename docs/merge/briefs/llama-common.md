@@ -99,9 +99,10 @@ action — this is a non-issue for Task 11, confirmed rather than assumed.
 
 ## The four fork behaviors — traced to their protecting hunks
 
-**(a) `fit_params=false` under SYCL.** Declared in `common/common.h:476` inside
-`#ifdef GGML_USE_SYCL ... #else ... #endif` (commit implicit in the fork's `common.h` diff —
-one hunk, 4 lines). The disabled-fitter body is inside `common_fit_params()`
+**(a) `fit_params=false` under SYCL.** Declared at `common/common.h:477`
+(`bool fit_params = false;`), inside the `#ifdef GGML_USE_SYCL ... #else ... #endif` block that
+opens at `common/common.h:476` (commit implicit in the fork's `common.h` diff — one hunk,
+4 lines). The disabled-fitter body is inside `common_fit_params()`
 (`common/fit.cpp:789`), whose `#ifdef GGML_USE_SYCL` arm begins at `common/fit.cpp:798`, same
 `#ifdef` pattern: the SYCL arm short-circuits to
 `COMMON_PARAMS_FIT_STATUS_FAILURE` with a `LOG_WRN` ("unified cache owns memory placement")
@@ -464,8 +465,15 @@ references anything in the other, so there is nothing to interleave, only to pla
 ordering: keep upstream's four probe constants immediately after the three existing ones
 (same declaration family, contiguous), then the fork's entire SYCL exec-hooks apparatus after
 that (or before — genuinely order-independent, confirmed no cross-reference either direction).
-**CONTRACT: the four upstream probes arrive unused by the fork; no action in wave 3; if a
-consumer appears in a later upstream sync it lands through normal merge review.**
+**CONTRACT: the four upstream probes are consumed by upstream's own `resolve(...)` calls at
+`b10630:src/llama-context.cpp:568` and `:574-576`, which sit outside this conflict and
+auto-merge in unconditionally — so all four declarations must survive the concatenation intact
+or the auto-merged call sites fail to compile. No fork code references them; no other action in
+wave 3.** (Verified directly: `git show b10630:src/llama-context.cpp` has
+`resolve(llm_fused_op_lid_probe, cparams.fused_lid);` at line 568 and the three
+`resolve(llm_fused_op_dsv4_hc_{pre,comb,post}_probe, ...)` calls at lines 574-576; the actual
+`merge-tree`-simulated merged blob carries the same four calls, unmodified, at lines 1017 and
+1023-1025 — outside the `<<<<<<<`/`>>>>>>>` range for this file's one conflict.)
 
 ## `src/llama-sampler.cpp` — RESOLVE / CONTRACT
 
@@ -475,11 +483,17 @@ counterpart (`llama_sampler_logits_trace_enabled/limit/topn/next_sample/piece/du
 `common/sampling.cpp`'s version above, independently named, same env vars). Upstream's side is
 one small new public API: `llama_sampler_backend_n_nodes(const llama_sampler *)`, returning
 `chain->n_nodes` after asserting the sampler is an initialized chain. **RESOLVE: concatenate
-both — no shared symbol, no cross-reference.** **CONTRACT: `llama_sampler_backend_n_nodes` is
-a new public API surface (declared presumably in `llama.h` or `llama-sampler.h`, neither in
-this both-touched group, so not chased further here) — if either header is fork-modified
-elsewhere it should already have been caught by a different conflict-brief task; nothing in
-this group's diff touches it.**
+both — no shared symbol, no cross-reference.** **CONTRACT: `llama_sampler_backend_n_nodes` is a
+new public API surface, declared at `b10630:src/llama-sampler.h:38`
+(`uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);`), with its consumer
+at `b10630:src/llama-context.cpp:2320` (`const uint32_t n_nodes =
+llama_sampler_backend_n_nodes(sampler);`, inside a sampling-node accounting loop) — both auto-
+merge in unconditionally, same reasoning as the `llama-context.cpp` probes above.
+`src/llama-sampler.h` is inside this brief's `src/`/`common/` derivation scope by pattern, but
+is correctly absent from the both-touched list precisely because the fork never touches it:
+`git diff 81ff7abe5 master -- src/llama-sampler.h` is empty. So the declaration lands
+automatically when the merge takes `b10630`'s copy of that header wholesale — there is nothing
+further to chase, and no other conflict-brief task owns it since it isn't both-touched.**
 
 ## The one finding that should gate this whole brief: `common/chat.cpp` × `common/chat.h`
 
