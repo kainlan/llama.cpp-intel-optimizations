@@ -223,8 +223,7 @@ git commit -m "docs(tiered-kv): recurrent state size census + fix-direction verd
 - Create: `ggml/src/ggml-sycl/kv-runtime-demotion.hpp`
 - Create: `ggml/src/ggml-sycl/kv-runtime-demotion.cpp`
 - Create: `ggml/src/ggml-sycl/tests/test-kv-runtime-demotion.cpp`
-- Modify: `tests/CMakeLists.txt` (clone the `test-moe-mmid-workspace-plan` registration — grep for it)
-- Modify: `ggml/src/ggml-sycl/CMakeLists.txt` ONLY if backend sources are listed explicitly (check for a `file(GLOB` first — upstream-globs-swallow-fork-local-entries: if it's a glob matching `*.cpp`, no edit needed)
+- Modify: `ggml/src/ggml-sycl/CMakeLists.txt` — register the test by cloning the `test-kv-slice-sizing` block (≈line 1557); that is the verified host-only precedent. [CORRECTED 2026-08-26 during execution: this plan originally said to clone a `test-moe-mmid-workspace-plan` registration in `tests/CMakeLists.txt`; that pattern does not exist there — zero `moe-mmid` matches. A zero-SYCL-include TU may omit `SYCL_LINK_ONLY_TEST_OPTIONS`/`ggml-base` linkage if it links clean.]
 
 **Description:**
 
