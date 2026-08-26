@@ -1,6 +1,11 @@
 # Conflict brief: src/llama + common
 
-Merge-base: `81ff7abe5`. Upstream target: tag `b10630` (remote `ggml-org`). Fork side: `master`.
+Merge-base: `81ff7abe5`. Upstream target: tag `b10630` (remote `ggml-org`). Fork side:
+`master @ 627af4d55` ("docs(plans): bind unified-cache/mem_handle ownership contract into
+Phase C gates") — the commit `master` pointed to when this brief's derivation and
+`merge-tree` checks were run, i.e. the parent of this brief's own first commit
+(`2f4487a9a`). Pinned because `master` keeps moving under a shared checkout; every citation
+below is scoped to this SHA unless stated otherwise.
 
 **Verification method:** every conflict/clean claim below was checked against the actual merge
 algorithm, not inferred from reading the two sides' diffs side by side:
@@ -9,10 +14,13 @@ algorithm, not inferred from reading the two sides' diffs side by side:
 git merge-tree --write-tree --name-only master b10630
 ```
 
+**READ ORDER: read the `common/chat.cpp` section (below) BEFORE resolving any other entry — it
+is the gating finding of this group.**
+
 This is a read-only simulation of the exact merge the eventual merge task will run — it writes
 no ref, touches no tracked state, and needs no checkout. Its `CONFLICT (content): ...` lines
-are the ground truth for which files actually conflict; everything else in that output
-auto-merges. For this group the result is exactly six conflicts — `common/arg.cpp`,
+are the ground truth for which files actually conflict; files not appearing in that output
+auto-merge. For this group the result is exactly six conflicts — `common/arg.cpp`,
 `common/chat.cpp`, `src/llama-context.cpp`, `src/llama-graph.cpp`,
 `src/llama-model-loader.cpp`, `src/llama-sampler.cpp` — matching the lead's census. The other
 ten both-touched files auto-merge with no conflict markers, so their entries below are
@@ -93,8 +101,9 @@ action — this is a non-issue for Task 11, confirmed rather than assumed.
 
 **(a) `fit_params=false` under SYCL.** Declared in `common/common.h:476` inside
 `#ifdef GGML_USE_SYCL ... #else ... #endif` (commit implicit in the fork's `common.h` diff —
-one hunk, 4 lines). The disabled-fitter body is `common/fit.cpp:795` inside
-`common_fit_params()`, same `#ifdef` pattern: the SYCL arm short-circuits to
+one hunk, 4 lines). The disabled-fitter body is inside `common_fit_params()`
+(`common/fit.cpp:789`), whose `#ifdef GGML_USE_SYCL` arm begins at `common/fit.cpp:798`, same
+`#ifdef` pattern: the SYCL arm short-circuits to
 `COMMON_PARAMS_FIT_STATUS_FAILURE` with a `LOG_WRN` ("unified cache owns memory placement")
 and `GGML_UNUSED()`s every parameter; the non-SYCL arm keeps the original body untouched. Both
 hunks merge with **no conflict markers** — but `common/fit.cpp` is the one "clean" file in this
@@ -109,7 +118,7 @@ Checked three ways for callers outside its own file: `find_references` on
 recursive call and `tests/test-tensor-class.cpp`; `search_text` for `llama-tensor-class.h`
 across the whole repo returns exactly two includes (its own `.cpp` and the test); a literal
 `grep -n "class\|priority_for\|tensor_class"` over `src/llama-model-loader.cpp` returns only
-an unrelated `class GKV` declaration. It is compiled (`src/CMakeLists.txt:39` lists it
+an unrelated `class GKV` declaration. It is compiled (`src/CMakeLists.txt:42` lists it
 explicitly, not just via glob) but has **zero production call sites** anywhere in `src/` or
 `common/` — staged infrastructure with test coverage, awaiting a consumer that has not landed.
 **CONTRACT: none currently** — there is nothing to interleave with upstream because there is
@@ -200,10 +209,15 @@ upstream deleted and moved. **RESOLVE: take upstream's refactor (call the shared
 it's also used by other new call sites, not shown here, so keeping the inline duplicate would
 diverge from upstream's structure for no reason), but port `if (!dev) continue;` into the body
 of `common_print_available_devices()` before its `if (ggml_backend_dev_type(dev) != ...)`
-check.** **CONTRACT: `common_print_available_devices()` is a new upstream-introduced function
-signature (`void common_print_available_devices();`, declared wherever upstream put the
-`common_arg.h`/`common.h` prototype) that the fork must patch at its one definition site, not
-at a call site** — there's only one definition, so this is a single, precisely located edit.
+check.** **CONTRACT: `common_print_available_devices()` is a new upstream-introduced function**
+— declared at `b10630:common/arg.h:128` (`void common_print_available_devices();`; confirmed
+by grepping `b10630`'s `common/common.h`, `common/arg.h`, and `common/arg.cpp` — the header hit
+is the only one). `common/arg.h` is upstream-only-touched (the fork never edits it, confirmed
+by an empty `git diff 81ff7abe5 master -- common/arg.h`), so it is correctly outside this
+both-touched group and the declaration lands automatically, unconflicted, when the merge takes
+`b10630`'s `arg.h` wholesale. The fork's one required edit is at the *definition*
+(`common/arg.cpp:1138`, inside this both-touched file), not at the declaration — there's only
+one definition, so this is a single, precisely located edit.
 
 **Unrelated non-conflicting hunks in this file, confirmed clean by diffing upstream's
 `arg.cpp` against the fork's five gpu-offload-warning removals:** upstream's diff has **zero**
@@ -278,10 +292,19 @@ a function with an unused parameter that every other parameter in the same list 
 suppressed for; whether that's a hard error depends on `-Wunused-parameter -Werror` being in
 the SYCL build's flags (not confirmed either way here — treat it as a real risk to close during
 the merge, not a "maybe" to defer). **CONTRACT: `common_fit_params()`'s public signature
-changes (new trailing-before-log_level parameter, `common_fit_extra_model *`) — its only
-caller in this fork-visible scope is `common_memory_breakdown_print` in the same file (unaffected,
-different function), so the signature change has no other fork call site to chase within this
-group.** Also note the fork's small unrelated addition to `common_memory_breakdown_print`
+changes (new trailing-before-log_level parameter, `common_fit_extra_model *`).** The real
+caller set, found by grepping every call site of `common_fit_params(` in the fork (not
+guessed from this file alone — `common_memory_breakdown_print`, named here in an earlier pass,
+calls it zero times and was the wrong lead to name): `common/common.cpp:1228` (both-touched,
+covered in this group's own entry below), `tools/fit-params/fit-params.cpp:34`
+(upstream-only-touched — the fork never edits this file, so the merge takes `b10630`'s version
+wholesale, which already threads a `nullptr` through as the new parameter), and
+`tools/llama-bench/llama-bench.cpp:2285` (both-touched, and this file *does* have a real
+conflict elsewhere at lines 679-701 — but that conflict doesn't reach this call site; the
+`common_fit_params(...)` call itself is edited only by upstream, which added the same `nullptr`
+there, confirmed in the actual `merge-tree` blob). **tools/ callers surveyed: yes, resolve
+clean** — all three land on a working call after the auto-merge, none needs interleave
+guidance. Also note the fork's small unrelated addition to `common_memory_breakdown_print`
 (`if (ctx == nullptr) return;`, added right after the `#endif` closing this function) sits
 outside both conflict ranges and merges without any interaction.
 
@@ -441,14 +464,8 @@ references anything in the other, so there is nothing to interleave, only to pla
 ordering: keep upstream's four probe constants immediately after the three existing ones
 (same declaration family, contiguous), then the fork's entire SYCL exec-hooks apparatus after
 that (or before — genuinely order-independent, confirmed no cross-reference either direction).
-**CONTRACT: none from this hunk itself** — but flagging for the implementer: this block is the
-single largest concentration of fork-only SYCL context-lifecycle code in the whole group, so
-after resolving it, a scan for any *other* upstream hunk later in the same file that might
-call the pre-existing `llm_fused_op_*_probe` table (to see if the four new probes need a
-corresponding dispatch-site addition beyond their declaration) is worth a follow-up check —
-not done here since it's outside a `src/llama-context.cpp`-only, `src/common/`-scoped brief's
-budget, but the four new probes existing without any use nearby would be worth noticing during
-implementation.
+**CONTRACT: the four upstream probes arrive unused by the fork; no action in wave 3; if a
+consumer appears in a later upstream sync it lands through normal merge review.**
 
 ## `src/llama-sampler.cpp` — RESOLVE / CONTRACT
 
@@ -512,22 +529,25 @@ so the fork's intended value (`"<|start|>assistant"`) is silently discarded in f
 upstream's (`"<|channel|>analysis<|message|>"`) — whichever assignment textually comes second
 wins, with no error, warning, or trace of the discarded one.
 
-**RESOLVE: this needs a human/functional call, not a mechanical merge.** These two pairs
-of values encode different semantic intents for where GPT-OSS "thinking" starts and ends —
-fork's values bracket "from the assistant preamble to the final channel," upstream's bracket
-"the analysis channel content, ending at the model's own `<|end|>` token." Simply keeping one
-side's assignment discards the other's design intent without anyone deciding that on purpose.
-Concretely: (1) delete the stray `data.thinking_end_tag = ...` line (old field, would not
-compile); (2) an implementer with a running B70/B50 must decide which start/end pair is
-correct against the model's actual Harmony-format output — not guess from the diff — and (3)
-**re-run the canonical GPT-OSS chat-correctness gate from CLAUDE.md
-(`ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/llama-cli -m
-/models/gpt-oss-20b-mxfp4.gguf ... --reasoning-format none --reasoning-budget 0 ...`,
-expecting the clean `1, 2, 3, 4, 5` digit sequence) after resolving this, specifically because
-a wrong thinking-tag boundary would show up as garbled or channel-leaked output on exactly this
-gate.** This is a build+GPU verification step outside this brief's no-build/no-GPU scope — it
-belongs to whichever task actually performs and lands the merge, but it must not be skipped
-because the merge tool will tell you nothing is wrong. **CONTRACT: `common_chat_params`'s
+**RESOLVE: standing ruling from the lead (tracker `llama.cpp-90ns` comment `c-478m`) — this is
+an executable procedure, not an open question, and needs no further stop.** Interim
+disposition: adapt the fork's semantics to the new plural type first —
+```cpp
+data.thinking_start_tag = "<|start|>assistant";
+data.thinking_end_tags  = {"<|channel|>final<|message|>"};   // brace-init vector<string>, replaces the old singular-string assignment
+```
+i.e. keep the fork's own start/end values, just re-expressed against `thinking_end_tags`
+(vector<string>) instead of the removed `thinking_end_tag` (string) — do **not** default to
+upstream's pair as the starting point. Then **the canonical GPT-OSS B50 chat-correctness gate
+from CLAUDE.md, run with `-c 4096`** (the `llama.cpp-uize` context-fit workaround), is the
+arbiter: if it produces the clean digit sequence, that pair is certified and the merge is done
+for this hunk; if it fails, switch to upstream's pair
+(`data.thinking_start_tag = "<|channel|>analysis<|message|>"; data.thinking_end_tags =
+{"<|end|>"};`) and re-run the same gate. Record whichever pair passes in the wave notes as the
+certified pair. This is a build+GPU verification step outside this brief's no-build/no-GPU
+scope — it belongs to whichever task actually performs and lands the merge (the lead executes
+wave 3), but the procedure above is the decision; escalate to the lead only if *neither* pair
+passes the gate. **CONTRACT: `common_chat_params`'s
 `thinking_end_tag` (string) → `thinking_end_tags` (vector<string>) rename is the load-bearing
 upstream interface change for this whole file** — every other one of the nine call sites
 already resolves correctly through the ordinary auto-merge; this is the only one that needs
