@@ -27,6 +27,8 @@ while IFS= read -r f; do
     rel="${f#"$ROOT"/}"
     if [ -f "$ALLOW" ] && grep -qxF "$rel" "$ALLOW"; then skipped=$((skipped+1)); continue; fi
     checked=$((checked+1))
+    # Deliberately a substring match, not anchored: build.ninja references
+    # sources as "../ggml/src/..." etc., so $rel must match as a substring.
     grep -qF "$rel" "$NINJA" || { echo "UNREACHABLE: $rel"; fail=1; }
 done < <(find "$ROOT/ggml/src/ggml-sycl" "$ROOT/src" \( -name '*.cpp' -o -name '*.c' \) | sort)
 if [ "$checked" -eq 0 ]; then
@@ -37,7 +39,8 @@ echo "source coverage: $checked checked, $skipped allowlisted, fail=$fail"
 # file that (a) exists on disk and (b) is STILL absent from build.ninja --
 # otherwise the allowlisting is stale (wrong path, or the file got wired into
 # the build and the entry should have been removed).
-if [ "$STRICT" -eq 1 ] && [ -f "$ALLOW" ]; then
+if [ "$STRICT" -eq 1 ]; then
+    [ -f "$ALLOW" ] || { echo "STRICT requested but allowlist missing: $ALLOW" >&2; exit 2; }
     while IFS= read -r entry; do
         case "$entry" in
             ''|'#'*) continue;;
