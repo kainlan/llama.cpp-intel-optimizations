@@ -98745,6 +98745,19 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         // placement; ADD_ID consumes the same device-produced routing IDs with
         // small planner-managed tables.  Do not reject them merely because the
         // planner placed some backing table in host-pinned memory.
+        //
+        // Residency-blind admission is not type-blind admission. Q1_0 and
+        // NVFP4 stay admitted here by design: they carry fp16 converters and
+        // are refused by the runtime route oracle (the sanctioned fail-closed
+        // class of c-wps7). Every other type outside the MUL_MAT allowlist —
+        // upstream b10630's q2_0/tq2_0 and anything future — is refused at
+        // this gate instead, because the MoE executor computes wrong answers
+        // on them (q2_0 MMID: ERR up to 90 vs 5e-4), which is not a refusal.
+        const ggml_type indexed_a_type = op->src[0]->type;
+        if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&
+            !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {
+            return false;
+        }
         return true;
     }
     // Explicit multi-GPU MoE keeps routing tensors in the SYCL/unified-cache

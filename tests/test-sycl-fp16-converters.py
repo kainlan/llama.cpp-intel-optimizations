@@ -107,7 +107,15 @@ def _contract(convert_source: str, support_source: str = SUPPORT_SOURCE) -> bool
     mmid_guard = "if (op->op == GGML_OP_ADD_ID || op->op == GGML_OP_MUL_MAT_ID)"
     if mmid_guard not in supports:
         return False
-    mmid_body = supports[supports.index(mmid_guard) : supports.index("}", supports.index(mmid_guard)) + 1]
+    # The guard body now type-gates unknown expert types (b10630) but must
+    # keep q1_0/nvfp4 flowing to the runtime route oracle: slice through the
+    # first `return true;` after the guard so the exemptions are visible.
+    mmid_start = supports.index(mmid_guard)
+    mmid_body = supports[mmid_start : supports.index("return true;", mmid_start) + len("return true;")]
+    if "indexed_a_type != GGML_TYPE_Q1_0" not in mmid_body:
+        return False
+    if "indexed_a_type != GGML_TYPE_NVFP4" not in mmid_body:
+        return False
     return (
         "case GGML_TYPE_Q1_0:\n            return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;" in getter
         and "case GGML_TYPE_NVFP4:\n            return dequantize_row_nvfp4_fp16_sycl;" in getter

@@ -185,7 +185,7 @@ def contract(text: str) -> bool:
     return (
         function_body_open < early < early_close < router_flag < planner < planner_close < switch
         and executable_body(function[function_body_open + 1 : early]) == EXPECTED_PRE_INDEXED_GUARD_PREFIX
-        and executable_body(early_body) == "returntrue;"
+        and executable_body(early_body) == "constggml_typeindexed_a_type=op->src[0]->type;if(indexed_a_type!=GGML_TYPE_Q1_0&&indexed_a_type!=GGML_TYPE_NVFP4&&!ggml_sycl_mul_mat_type_supported(indexed_a_type)){returnfalse;}returntrue;"
         and "GGML_OP_ADD_ID" in function[early : early_close + 1]
         and "GGML_OP_MUL_MAT_ID" in function[early : early_close + 1]
         and router_residency_exception ==
@@ -375,30 +375,64 @@ def test_decision_parser_rejects_else_and_unknown_statements() -> None:
     assert not contract(replace_in_supports_function(SOURCE, first_rejection, unknown_statement))
 
 
+# The tail of the early guard: q1_0/nvfp4 flow on to the runtime route
+# oracle (the sanctioned c-wps7 fail-closed class); every other type outside
+# the MUL_MAT allowlist is refused here before it can compute wrong answers.
+EARLY_RETURN = "return true;"
+EARLY_TYPE_GUARD = (
+    "if (indexed_a_type != GGML_TYPE_Q1_0 && indexed_a_type != GGML_TYPE_NVFP4 &&\n"
+    "            !ggml_sycl_mul_mat_type_supported(indexed_a_type)) {"
+)
+
+
 def test_removing_only_early_return_is_rejected() -> None:
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
-    assert early_body.count("return true;") == 1
-    mutated_body = early_body.replace("return true;", "", 1)
+    assert early_body.count(EARLY_RETURN) == 1
+    mutated_body = early_body.replace(EARLY_RETURN, "", 1)
     assert not contract(replace_in_supports_function(SOURCE, early_body, mutated_body))
+
+
+def test_reopening_early_guard_to_unconditional_admission_is_rejected() -> None:
+    # The pre-b10630 form admitted every expert type into the MoE executor;
+    # q2_0 MMID then computed ERR ~90 wrong answers. Stripping the type guard
+    # back to a bare `return true;` body must fail the contract.
+    function = supports_function(SOURCE)
+    _, _, early_body = braced_body(function, EARLY_GUARD)
+    assert EARLY_TYPE_GUARD in early_body
+    mutated_body = "\n        return true;\n    "
+    assert not contract(replace_in_supports_function(SOURCE, early_body, mutated_body))
+
+
+def test_widening_type_guard_exemptions_is_rejected() -> None:
+    # Adding another exempt type (here q2_0) reopens the wrong-answer path.
+    function = supports_function(SOURCE)
+    _, _, early_body = braced_body(function, EARLY_GUARD)
+    assert EARLY_TYPE_GUARD in early_body
+    widened = early_body.replace(
+        "indexed_a_type != GGML_TYPE_NVFP4",
+        "indexed_a_type != GGML_TYPE_NVFP4 && indexed_a_type != GGML_TYPE_Q2_0",
+        1,
+    )
+    assert not contract(replace_in_supports_function(SOURCE, early_body, widened))
 
 
 def test_moving_return_immediately_outside_guard_is_rejected() -> None:
     function = supports_function(SOURCE)
     early, early_close, early_body = braced_body(function, EARLY_GUARD)
     guard = function[early : early_close + 1]
-    assert early_body.count("return true;") == 1
-    moved = guard.replace("return true;", "", 1) + "\n    return true;"
+    assert early_body.count(EARLY_RETURN) == 1
+    moved = guard.replace(EARLY_RETURN, "", 1) + "\n    " + EARLY_RETURN
     assert not contract(replace_in_supports_function(SOURCE, guard, moved))
 
 
 def test_conditioning_return_on_add_id_is_rejected() -> None:
     function = supports_function(SOURCE)
     _, _, early_body = braced_body(function, EARLY_GUARD)
-    assert early_body.count("return true;") == 1
+    assert early_body.count(EARLY_RETURN) == 1
     conditional = early_body.replace(
-        "return true;",
-        "if (op->op == GGML_OP_ADD_ID) { return true; }",
+        EARLY_RETURN,
+        "if (op->op == GGML_OP_ADD_ID) { " + EARLY_RETURN + " }",
         1,
     )
     assert not contract(replace_in_supports_function(SOURCE, early_body, conditional))
