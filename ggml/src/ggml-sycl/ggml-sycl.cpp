@@ -99280,6 +99280,18 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->src[3]->ne[0] == 1) {
                 // Mamba2
                 // (kernel only supports (d_state == 128 || d_state == 256) && d_head % WARP_SIZE == 0)
+                {
+                    // The kernel predates upstream b10630's K rollback
+                    // snapshots, where dst carries K state copies and
+                    // nelements(dst) = nelements(src1) + K * state_elems.
+                    // It asserts the K == 1 form of that identity, so refuse
+                    // any other dst shape here instead of aborting there.
+                    const int64_t state_elems =
+                        op->src[0]->ne[0] * op->src[0]->ne[1] * op->src[1]->ne[1] * op->src[1]->ne[3];
+                    if (ggml_nelements(op) - ggml_nelements(op->src[1]) != state_elems) {
+                        return false;
+                    }
+                }
                 return (op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256) && op->src[0]->ne[1] % WARP_SIZE == 0;
             } else {
                 // TODO Mamba-1 not yet ported to SYCL
