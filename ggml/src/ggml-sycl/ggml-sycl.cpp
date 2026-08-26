@@ -99209,6 +99209,13 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 return max_bias == 0.0f;
             }
         case GGML_OP_ROPE:
+            // The kernels predate upstream b10630's ggml_rope_set_offset
+            // (n_offs, op_params[15]) and would silently compute the
+            // unshifted rotation, so refuse any nonzero offset until the
+            // offset-aware kernel is ported.
+            if (((const int32_t *) op->op_params)[15] != 0) {
+                return false;
+            }
             // ROPE kernels consume src0 row/channel strides, but every variant
             // writes dst with packed offsets. An in-place result is a view and
             // inherits src0's strides, so only the non-contiguous in-place case
@@ -99304,7 +99311,10 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_ROLL:
-            return op->type == GGML_TYPE_F32;
+            // ggml_roll only requires nb[0] == type size, so upstream b10630
+            // feeds permuted views; the kernel indexes src0 as packed rows and
+            // computes wrong answers on them (ERR 1.78 on the permuted case).
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
 
         case GGML_OP_ARANGE:
             return op->type == GGML_TYPE_F32;
