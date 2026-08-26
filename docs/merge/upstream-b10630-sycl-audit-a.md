@@ -13,7 +13,7 @@ raw device pointers as cache/identity keys get the same treatment; forced evicti
 zone-reset-style reclamation is N/A by design. Each port-candidate below names the
 ownership surface (or "none touched") its landing zone would consume.
 
-**25 commits: 15 port-candidate / 9 superseded / 1 n-a**
+**25 commits: 16 port-candidate / 9 superseded / 0 n-a**
 
 ---
 
@@ -157,9 +157,11 @@ ownership surface (or "none touched") its landing zone would consume.
 
 ### 23. `31558dbb7657` — sycl : Support DSv4 OPs: LIGHTNING_INDEXER,DSV4_HC_COMB,DSV4_HC_POST,DSV4_HC_PRE (#26568)
 **Files:** ggml/src/ggml-sycl/dsv4-hc.cpp (new), ggml/src/ggml-sycl/dsv4-hc.hpp (new), ggml/src/ggml-sycl/ggml-sycl.cpp, ggml/src/ggml-sycl/lightning-indexer.cpp (new), ggml/src/ggml-sycl/lightning-indexer.hpp (new)
-**Class:** n-a
-**Why:** Implements SYCL kernels for four new DeepSeek-v4-specific ggml ops. Verified via `search_text` scoped to `ggml/include`: neither `LIGHTNING_INDEXER` nor `DSV4_HC` appears anywhere in the fork's (pre-merge master) `ggml/include/ggml.h` — the `GGML_OP_*` enum values these kernels dispatch on do not exist in this codebase's ggml core today (unlike entry 6's `GGML_UNARY_OP_XIELU`, which already exists upstream-side in the fork). This SYCL-only slice cannot compile or be reached without those enum values, which is not part of the `ggml/src/ggml-sycl` commit set this task audits. Not "N/A because we don't have the feature" (the Task 7 gotcha) — N/A because a hard compile-time prerequisite this task cannot supply is missing today.
-⚠️ **REVISIT POST-MERGE:** verified directly against the `b10630` tag (`git show b10630:ggml/include/ggml.h`) — `GGML_OP_LIGHTNING_INDEXER`, `GGML_OP_DSV4_HC_COMB`, `GGML_OP_DSV4_HC_PRE`, and `GGML_OP_DSV4_HC_POST` all already exist there, ahead of `GGML_OP_COUNT`. The enum prerequisite lands with the b10630 merge itself, so this "n-a" is only true against master *before* the merge completes. T8 should file this as a ticket **blocked-on-merge**, not skip it: once the merge is on master, reclassify as port-candidate and file for real.
+**Class:** port-candidate (post-merge — blocked on this Phase C merge landing)
+**Why:** Implements SYCL kernels for four DeepSeek-v4-specific ggml ops that are unreachable against pre-merge master (`GGML_OP_LIGHTNING_INDEXER`/`GGML_OP_DSV4_HC_*` don't exist in today's `ggml/include/ggml.h`), but the blocker is satisfied by this exact merge: confirmed both prerequisite commits are inside `81ff7abe5..b10630` (`git merge-base --is-ancestor`) — `00f5442cc4e8` adds `GGML_OP_LIGHTNING_INDEXER` (ggml.h/ggml.c/CPU ops, no SYCL) and `0dc74e332ede` adds `GGML_OP_DSV4_HC_COMB/PRE/POST` (ggml.h/ggml.c/CPU/CUDA, no SYCL) — so the enum, CPU reference, and graph-building support all land with the merge itself, not as a separate out-of-scope commit. The fork's dispatch has diverged from upstream's single `do_ggml_backend_sycl_device_supports_op` switch (the fork's equivalent is `ggml_backend_sycl_device_supports_op` at a different line, and there are additional `GGML_OP_*` switches for node classification and storage-readiness gating that don't exist upstream), so upstream's ~35-line switch addition is a reimplementation against the fork's dispatch shape, not a copy.
+🚫 **Do NOT port** the `docs/ops/SYCL.csv` churn this commit carries (23,541 lines) — that file is an auto-generated ops-support matrix, not hand-maintained content.
+**Landing zone:** new `ggml/src/ggml-sycl/{dsv4-hc,lightning-indexer}.{cpp,hpp}` (fork-native kernel implementations) + fork-native insertions into `ggml_sycl_compute_forward`'s op switch and `ggml_backend_sycl_device_supports_op`'s capability switch in `ggml-sycl.cpp`.
+**Ownership surface:** none — clean against the screen's allocation patterns (verified with a positive control: the same `malloc`/`pool_alloc`/TLSF grep against this commit's SYCL diff returns zero hits, while the identical grep against entry 19's diff — known to allocate — returns 6, so the zero here isn't vacuous); ticket-writer must confirm the kernels need no scratch beyond work-group local memory.
 
 ### 24. `6b5c2efb4e2f` — sycl: *glu flat path (#26354)
 **Files:** ggml/src/ggml-sycl/element_wise.cpp, ggml/src/ggml-sycl/presets.hpp
