@@ -86,11 +86,10 @@ guard rc=0; fresh-clone `sycl-build.sh` rc=0 with `GGML_SYCL=ON`.
 
 ## Evidence
 
-Worktree `/Apps/llama.cpp-merge-b10630` (KEPT until owner review):
-`artifacts/merge-b10630/sweeps/` (backend-ops master/r3/r4, filtered),
-`artifacts/merge-b10630/perf{,-eqwork,-final}/` (paired logs + manifests),
-`artifacts/merge-b10630/gates/`. Fresh-clone proof at
-`/Apps/llama.cpp-freshclone` (deletable after review).
+Owner review completed 2026-08-26; the evidence worktree and fresh-clone
+proof were then removed. All artifacts preserved in the MAIN checkout at
+`artifacts/merge-b10630/`: `sweeps/` (backend-ops master/r3/r4, filtered),
+`perf{,-eqwork,-final}/` (paired logs + `.complete` manifests), `gates/`.
 
 ## Perf history (2026-08-26, ambient load ~60, driver 26.27, landed tip)
 
