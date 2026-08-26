@@ -44,14 +44,33 @@ ggml/src/ggml.c
 
 All hunk-range claims below were produced with
 `git diff 81ff7abe5..<side> -- <file> | grep -n '^@@'` and, for the six highest-risk
-files, verified by reading the actual hunk content (not just headers). Overlap
-verdicts were derived by comparing old-file line ranges across both sides' hunk
-headers, then confirmed by reading the two colliding hunks side by side. `CONTRACT`
+files, verified by reading the actual hunk content (not just headers). `CONTRACT`
 findings that name a symbol were checked against `ggml-sycl.cpp` with
 `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '<symbol>'` (codescout is blind in
 that file — see CLAUDE.md) after a positive control
 (`ggml_backend_sycl_buffer_get_caps`, confirmed present) proved the grep pipeline
 itself works; other files used codescout `search_text` (indexed correctly there).
+
+**Conflict shapes below are verified against an actual merge simulation, not
+inferred from hunk-line-range proximity.** `git merge-tree --write-tree master
+b10630` was run and its output tree (`135b7a4a7`) inspected directly: the tree
+listing's stage-1/2/3 entries are the ground truth for which paths git's real
+3-way merge actually leaves conflicted, and `git merge-file -p --diff3` was run
+against each conflicted path's three stage blobs to see the exact conflict-marker
+regions git would produce. **In this file group, exactly three files conflict:
+`ggml/include/ggml-rpc.h`, `ggml/src/ggml-backend-meta.cpp`, and
+`ggml/src/ggml.c`** — every other one of the 26 files auto-merges cleanly with no
+conflict markers. An earlier pass through this brief used hunk-line-range
+proximity as a conflict proxy and got two files wrong as a result
+(`ggml-backend-reg.cpp` and `ggml-opencl.cpp`, both flagged as "genuine conflict,
+hand-merge required" — corrected below to "auto-merges cleanly" once the actual
+merge-tree output showed otherwise). Where a RESOLVE verdict below says a file
+auto-merges, that verdict is now a **sanity-check finding** (read the merged
+result, confirm it's semantically sound), not a manual-interleave instruction —
+git already does the interleave. The three genuine conflicts (and the one
+semantic-but-non-conflicting gap found while re-checking `ggml-backend-reg.cpp`'s
+actual merged blob) are the only places wave-2 execution needs to write code by
+hand.
 
 ---
 
@@ -369,20 +388,49 @@ deterministic test barriers), and `ggml_backend_registry_cached_name`/
 `register_backend(ggml_backend_et_reg())` call inserted between the
 `GGML_USE_OPENVINO` and `GGML_USE_CPU` blocks in the registration chain.
 
-**RESOLVE:** **Genuine overlap, hand-merge required.** Fork's giant hunk 3
-(old lines 103–295) fully rewrites `register_builtin_backends()`, including the
-exact `#ifdef GGML_USE_OPENVINO ... #ifdef GGML_USE_CPU` region (old lines
-161–167) that upstream's second hunk touches — confirmed by range containment
-(103–295 ⊇ 161–167). Take the fork's rewrite wholesale (it is the larger,
-load-bearing architecture), then manually re-insert upstream's `#ifdef
-GGML_USE_ET` block — wrapped in the fork's `if (!disable_device_backends) { ...
-}` guard, consistent with every other device-backend registration in the
-merged function — between the `GGML_USE_OPENVINO` and `GGML_USE_CPU` blocks.
-Also re-apply the top-of-file `#ifdef GGML_USE_ET / #include "ggml-et.h" /
-#endif` guard (fork's hunk 1, old line 3, is far from upstream's hunk there —
-no overlap, trivial union). All other fork hunks (296–563: `ggml_backend_device_register`
-tail additions, `striequals`, `ggml_backend_init_best`, `ggml_backend_load_best`,
-`ggml_backend_load_all_from_path`) have zero upstream overlap.
+**RESOLVE:** **Corrected — auto-merges cleanly, but the auto-merged result has a
+real semantic gap worth a deliberate fix, not just a sanity check.** An earlier
+pass through this brief called this a "genuine overlap, hand-merge required" on
+the reasoning that fork's giant hunk 3 (old lines 103–295, rewriting
+`register_builtin_backends()`) range-contains upstream's insertion point (old
+lines 161–167, the `#ifdef GGML_USE_OPENVINO ... #ifdef GGML_USE_CPU` region).
+**`git merge-tree --write-tree master b10630` shows this file does NOT appear in
+the conflict set** — git's real 3-way merge auto-resolves it with no conflict
+markers. Reading the actual merged blob (`git show
+135b7a4a7:ggml/src/ggml-backend-reg.cpp`) confirms why and surfaces the gap:
+
+```c
+#ifdef GGML_USE_OPENVINO
+        if (!disable_device_backends) {
+            register_backend(ggml_backend_openvino_reg());
+        }
+#endif
+#ifdef GGML_USE_ET
+        register_backend(ggml_backend_et_reg());
+#endif
+#ifdef GGML_USE_CPU
+        register_backend(ggml_backend_cpu_reg());
+#endif
+```
+
+Git's line-based merge inserted upstream's 3-line `#ifdef GGML_USE_ET` block
+verbatim between the fork's already-guarded `OPENVINO` and `CPU` blocks — which
+is textually clean (no overlapping lines) but **semantically inconsistent**:
+every other device backend in this function is wrapped in
+`if (!disable_device_backends) { ... }` (the fork's CPU-only override, F3-adjacent
+but really a distinct fork feature — see `ggml-backend.h`'s entry), and `ET`
+silently isn't. Once merged as-is, `--device none`/`GGML_BACKEND_CPU_ONLY` would
+fail to suppress the `ET` backend the way it suppresses every other device
+backend. **Action for wave-2 execution: after taking the auto-merge, wrap the
+`register_backend(ggml_backend_et_reg());` line in the same
+`if (!disable_device_backends) { ... }` guard as its siblings** — a 3-line fix,
+not a hand-merge. The top-of-file `#ifdef GGML_USE_ET / #include "ggml-et.h" /
+#endif` guard (old line 3 region) auto-merges with no such issue (it's a plain
+`#include` guard, nothing to wrap). All other fork hunks (296–563:
+`ggml_backend_device_register` tail additions, `striequals`,
+`ggml_backend_init_best`, `ggml_backend_load_best`,
+`ggml_backend_load_all_from_path`) have zero upstream overlap and auto-merge
+cleanly.
 
 **CONTRACT:** None beyond F1/F2/F3, already covered. The registry rewrite adds
 no new public header declarations beyond what `ggml-backend.h` already lists
@@ -776,19 +824,38 @@ additions for new dtypes; **implements `ggml_backend_opencl_buffer_type_get_allo
 `mmap_support` (F2) at ~9815; large new elementwise/FA CL-op implementations;
 `mul_mat`/`mul_mat_id`/Adreno mul_mat variant growth).
 
-**RESOLVE:** **One genuine conflict, verified by direct read.** Upstream's
-hunk at old line 9763–9776 rewrites the same `ggml_backend_opencl_buffer_type_interface`
-struct literal the fork's hunk touches at old line 9770 — upstream changes
-`.get_alloc_size` from `NULL` to the new function two lines above `.is_host`;
-the fork appends `.get_caps = NULL,` after `.is_host`. Confirmed by reading
-both diffs: upstream's hunk ends exactly at `.is_host = NULL,\n};`, the same
-closing brace the fork's hunk targets. Manual 3-way merge of this one ~7-line
-struct literal (trivial once flagged: keep both changes, `.get_alloc_size =
-ggml_backend_opencl_buffer_type_get_alloc_size,` and `.get_caps = NULL,`), not
-a blind patch-apply. The first fork hunk (`buffer_interface` at 9707) has no
-upstream overlap and applies cleanly. Take upstream wholesale for everything
+**RESOLVE:** **Corrected — auto-merges cleanly, verified against the actual
+merged blob.** An earlier pass through this brief flagged this as a genuine
+conflict because upstream's hunk at old line 9763–9776 (implementing
+`ggml_backend_opencl_buffer_type_get_alloc_size` and wiring it into
+`ggml_backend_opencl_buffer_type_interface`) and the fork's `get_caps` hunk at
+old line 9770 both touch the same ~7-line struct literal. **`git merge-tree
+--write-tree master b10630` shows this file is NOT in the conflict set** —
+confirmed by reading the actual merged blob
+(`git show 135b7a4a7:ggml/src/ggml-opencl/ggml-opencl.cpp`), which contains
+exactly the correct union of both changes:
+
+```c
+static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_opencl_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_opencl_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_opencl_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_opencl_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_opencl_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+    /* .get_caps         = */ NULL,
+};
+```
+
+Git's line-based 3-way merge algorithm resolves this correctly on its own
+because the two edits touch different lines within the same literal
+(`.get_alloc_size` vs. an appended trailing `.get_caps` line) even though they
+share hunk context — no hand-merge needed, only the sanity check above (already
+done). The first fork hunk (`buffer_interface` at old line 9707) has no upstream
+overlap and auto-merges trivially. Take the merge result as-is for everything
 else (do not attempt to read/reconcile the ~3700-line kernel-registration body
-by hand — it is purely additive new kernel variants).
+by hand — it is purely additive new kernel variants, none of it near either
+fork hunk).
 
 **CONTRACT:** None — Adreno/OpenCL kernel dispatch is backend-siloed; no shared
 symbols with `ggml-sycl.cpp`.
@@ -1017,21 +1084,33 @@ sides' changes are substantive, not mechanical.
 
 ---
 
-## Summary — files with a genuine textual conflict requiring hand-merge
+## Summary — files with a genuine merge-tree conflict, and the one auto-merge semantic gap
 
-Every file above resolves to "take upstream wholesale, re-apply fork's small
-hunk(s)" **except** these five, which need an actual manual reconciliation step
-at wave-2 merge time:
+Verified against `git merge-tree --write-tree master b10630` (tree `135b7a4a7`)
+plus `git merge-file -p --diff3` on each conflicted path's three stage blobs —
+this is ground truth for git's real 3-way merge, not an inference from hunk
+proximity. **Exactly three of the 26 files in this group produce conflict
+markers; every other file auto-merges with no markers at all:**
 
-| File | Conflict | Resolution |
+| File | Conflict (from the actual diff3 output) | Resolution |
 |---|---|---|
-| `ggml/include/ggml-rpc.h` | `GGML_OP_COUNT` assert + version constants, same 3 lines both sides | `GGML_OP_COUNT → 103`; take upstream's MAJOR/MINOR bump, pick fresh PATCH |
-| `ggml/src/ggml.c` (×2 sites) | `GGML_OP_COUNT` assert after `GGML_OP_NAME[]` and after `GGML_OP_SYMBOL[]` | Same fix, `→ 103`, both sites |
-| `ggml/src/ggml-backend-reg.cpp` | Fork's `register_builtin_backends()` rewrite fully contains upstream's `GGML_USE_ET` insertion point | Take fork's rewrite; hand-insert the `ET` `#ifdef` block (guarded by `disable_device_backends`, consistent with siblings) between OPENVINO and CPU |
-| `ggml/src/ggml-backend-meta.cpp` | `.memset_tensor` struct-literal line, both sides | Take upstream's real implementation; drop fork's cosmetic edit |
-| `ggml/src/ggml-opencl/ggml-opencl.cpp` | `ggml_backend_opencl_buffer_type_interface` struct literal, `.get_alloc_size`/`.get_caps` on adjacent lines | Keep both: `.get_alloc_size = ggml_backend_opencl_buffer_type_get_alloc_size,` + `.get_caps = NULL,` |
+| `ggml/include/ggml-rpc.h` | Two conflict blocks: `RPC_PROTO_{MAJOR,MINOR,PATCH}_VERSION` (4/0/2 vs. 5/1/0), and `static_assert(GGML_OP_COUNT == 99 ...)` vs `== 101` | `GGML_OP_COUNT → 103`; take upstream's `MAJOR 5`/`MINOR 1` bump (it reflects the real `memset_tensor`/`use_count` protocol change), pick a fresh `PATCH` (e.g. `0`) |
+| `ggml/src/ggml.c` (2 conflict blocks, same file) | `static_assert(GGML_OP_COUNT == 99 ...)` vs `== 101`, once after `GGML_OP_NAME[]` and once after `GGML_OP_SYMBOL[]` — confirmed via diff3 to be the **only** two conflict regions in the file; everything else (both sides' array insertions) merged clean | Same fix, `→ 103`, both sites |
+| `ggml/src/ggml-backend-meta.cpp` | One conflict block: `.memset_tensor` struct-literal line — fork's cosmetic whitespace edit vs. upstream's real `ggml_backend_meta_buffer_memset_tensor` implementation | Take upstream's implementation; drop the fork's cosmetic edit |
 
-All other conflicts in this brief are semantic, not textual — F3's array
-ordering (auto-merges, but check it), F5's `ggml_ssm_scan` SYCL `supports_op`
-gap, and F2's `mmap_support` SYCL gap. None of the five textual conflicts are
-large; each is a 1–10 line hand-fix once identified.
+**Two files an earlier pass through this brief wrongly called conflicts —
+corrected above after checking merge-tree, both auto-merge cleanly with no
+markers:** `ggml/src/ggml-backend-reg.cpp` and
+`ggml/src/ggml-opencl/ggml-opencl.cpp`. The opencl one needs nothing further —
+the merged blob already contains the correct union. The backend-reg one auto-
+merges textually but leaves a **semantic** gap worth a deliberate 3-line fix
+(not a hand-merge): the new `GGML_USE_ET` registration lands without the
+`disable_device_backends` guard every sibling backend registration has — see
+that file's entry above for the exact merged snippet and fix.
+
+All other findings in this brief are semantic, not textual — F3's array
+ordering (auto-merges correctly, confirmed by diff3, no action needed), F5's
+`ggml_ssm_scan` SYCL `supports_op` gap, and F2's `mmap_support` SYCL gap. The
+three genuine conflicts are each a 1–10 line hand-fix once identified; the one
+semantic gap in the auto-merged `ggml-backend-reg.cpp` is a similarly small,
+deliberate fix.
