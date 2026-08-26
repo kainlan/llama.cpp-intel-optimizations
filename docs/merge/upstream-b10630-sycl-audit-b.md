@@ -5,10 +5,16 @@ ops as port-candidate post-merge") — the commit `master` pointed to when this 
 `ggml-sycl.cpp`/`cpy.cpp`/`mmvq.cpp`/`set_rows.cpp`/`dmmv-esimd.hpp` greps and cites were
 derived, i.e. the parent of this ledger's own first commit (`1f9901994`). Pinned because
 `master` keeps moving under a shared checkout; every citation below is scoped to this SHA
-unless stated otherwise. Re-verified at the current tip after the F1-F5 fix pass: the key
-line cites this pin covers (`ggml-sycl.cpp:98706`/`:98745`/`:98905`/`:98985`, `cpy.cpp:842`)
-still hold verbatim — no source file this ledger cites has changed between the pinned SHA
-and HEAD (only docs/scripts commits from parallel tracks have landed in between).
+unless stated otherwise. Re-verified at the current tip (`2ef0681c4`) after the F1-F5 fix
+pass: every key line cite this pin covers still holds verbatim — `ggml-sycl.cpp:98706`
+(`ggml_sycl_mul_mat_type_supported` definition), `:98745` (`ADD_ID`/`MUL_MAT_ID`
+unconditional `return true`), `:98905` (the `MUL_MAT` allowlist call site), `:98985` (the
+`CPY` same-type-contiguous fast path); `cpy.cpp:842` (`ggml_cpy_f32_iq4_nl_sycl`
+definition) and its single-lane launch body at `:861-863`; and the five over-launch
+same-type passthrough sites (`ggml_cpy_{q8_0,q5_0,q5_1,q4_0,q4_1}_q8_0/q5_0/q5_1/q4_0/q4_1`,
+each `num_blocks = ceil_div(ne, SYCL_CPY_BLOCK_SIZE)`, now at `cpy.cpp:1176/1203/1230/
+1258/1285`). No source file this ledger cites has changed between the pinned SHA and HEAD
+— only docs/scripts commits from parallel tracks have landed in between.
 
 Enumerated via `git rev-list --reverse 81ff7abe5..b10630 -- ggml/src/ggml-sycl | tail -n +26`.
 Classified per the rubric in `docs/plans/2026-08-25-phase-c-upstream-merge.md` Task 6/7
