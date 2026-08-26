@@ -30,6 +30,21 @@ Duplicated numbers rot silently, because two documents cannot disagree loudly.
 | Hard-won rules (safety, workflow, architecture) | `CLAUDE.md` → *Hard-Won Rules* |
 | Live debugging state, bisects, regression hunts | the codescout task tracker (`task_list`, `task_show`) — **not a document** |
 
+## Upstream policy carried forward (b10630 merge)
+
+Three upstream policy facts live here rather than in `CLAUDE.md` because they
+are maintainer/contribution policy, not build or architecture content:
+
+- **Only `ggml-gh-bot` may post PR comments or replies.** This is a hard,
+  non-overridable upstream rule: agents and automation must never post to
+  upstream PRs from any other account.
+- Do NOT add a new file in `tests/*` without maintainers' approval — AI tends
+  to add excessive test cases for small features; reuse existing
+  infrastructure.
+- Upstream ships reusable task recipes under `skills/` (e.g.
+  `skills/add-new-model/SKILL.md`, `skills/code-review/SKILL.md`) — check
+  there before hand-deriving a workflow they already cover.
+
 ## Intel Arc GPU Memory Architecture (Critical for Multi-GPU)
 
 On Intel Arc discrete GPUs (Xe architecture), there are two GPU address

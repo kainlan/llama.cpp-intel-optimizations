@@ -84,11 +84,14 @@ def test_skip_header_defines_77() -> None:
 
 
 def test_model_requiring_tests_use_the_shared_skip() -> None:
-    # get-model.cpp is upstream, so a rebase can revert it to exit(EXIT_SUCCESS)
-    # without a conflict. test-thread-safety.cpp held a duplicate of the same
-    # logic with `return 0`; the point of the shared helper is that there is one
-    # skip policy, so a second copy reappearing is itself the regression.
-    for name in ("get-model.cpp", "test-thread-safety.cpp"):
+    # The no-model skip moved from tests/get-model.cpp into
+    # common_get_model_or_exit() in common/common.cpp when upstream b10630
+    # dissolved get-model.cpp (Phase C merge). The helper is upstream-shaped,
+    # so a future rebase can revert it to exit(EXIT_SUCCESS) without a
+    # conflict. test-thread-safety.cpp held a duplicate of the same logic with
+    # `return 0`; the point of the shared helper is that there is one skip
+    # policy, so a second copy reappearing is itself the regression.
+    for name in ("../common/common.cpp", "test-thread-safety.cpp"):
         src = (ROOT / "tests" / name).read_text(encoding="utf-8")
         assert "test_skip_no_model()" in src, (
             f"tests/{name} no longer routes its no-model skip through "

@@ -463,13 +463,13 @@ Examples:
 - Use device 0:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm none -mg 0
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm none -mg 0 --load-mode auto
 ```
 
 - Use multiple devices:
 
 ```sh
-ZES_ENABLE_SYSMAN=1 ./build/bin/llama-cli -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm layer
+ZES_ENABLE_SYSMAN=1 ./build/bin/llama-completion -no-cnv -m models/llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 400 -e -ngl 99 -sm layer --load-mode auto
 ```
 
 *Notes:*
@@ -483,6 +483,14 @@ Or
 ```sh
 use 1 SYCL GPUs: [0] with Max compute units:512
 ```
+
+User can use the device management in [docs/multi-gpu.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md), like parameter `--device SYCL0,SYCL1` to assign one or more devices.
+
+> **Fork caveat (this machine's topology):** the B70 and B50 have **no direct
+> P2P path** (different CPU root ports, no shared PCIe switch — see `CLAUDE.md`
+> "Patched compute-runtime & P2P topology"), so a multi-device `--device
+> SYCL0,SYCL1` run silently host-bounces all cross-device traffic rather than
+> running device-to-device. Expect roughly halved throughput versus one card.
 
 ## Windows
 
@@ -758,13 +766,13 @@ Examples:
 - Use device 0:
 
 ```
-build\bin\llama-cli.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm none -mg 0
+build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm none -mg 0 --load-mode auto
 ```
 
 - Use multiple devices:
 
 ```
-build\bin\llama-cli.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm layer
+build\bin\llama-completion.exe -no-cnv -m models\llama-2-7b.Q4_0.gguf -p "Building a website can be done in 10 simple steps:\nStep 1:" -n 400 -e -ngl 99 -sm layer --load-mode auto
 ```
 
 
@@ -782,6 +790,13 @@ Or
 use 1 SYCL GPUs: [0] with Max compute units:512
 ```
 
+User can use the device management in [docs/multi-gpu.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md), like parameter `--device SYCL0,SYCL1` to assign one or more devices.
+
+> **Fork caveat (this machine's topology):** the B70 and B50 have **no direct
+> P2P path** (different CPU root ports, no shared PCIe switch — see `CLAUDE.md`
+> "Patched compute-runtime & P2P topology"), so a multi-device `--device
+> SYCL0,SYCL1` run silently host-bounces all cross-device traffic rather than
+> running device-to-device. Expect roughly halved throughput versus one card.
 
 ## Environment Variable
 
@@ -1156,6 +1171,52 @@ Diagnostics for future cross-device KV tasks must report, at minimum, the planne
     export UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
     set UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1
   ```
+
+- When I set `SYCL_CACHE_PERSISTENT=1` in running time, I meet crash.
+
+  `SYCL_CACHE_PERSISTENT=1` is not recommended by llama.cpp SYCL backend.
+  When cache is enabled, SYCL runtime will try to cache and reuse JIT-compiled binaries.
+
+  We find some AI will tell user this cmd to speed up SYCL backend. It only speeds up the startup to skip the JIT process, instead of running speed.
+
+  It will bring negative impact when the SYCL binary file is changed frequently in your running environment. The new & old codes mix will lead to crash.
+
+  Compare to the benefit, it has brought more failed cases.
+  If you are not familiar with the SYCL compiler principle of JIT and AOT, please don't use it.
+
+  To restore, you need to remove the local cache: `~/.cache/libsycl_cache/` and execute `unset SYCL_CACHE_PERSISTENT` in running time.
+
+- How to use iGPU and dGPU in same time?
+
+  1. Detect the devices in your running time.
+  ```
+  source /opt/intel/oneapi/setvars.sh
+  ./build/bin/llama-server --list-devices
+
+  or
+  ./build/bin/llama-cli --list-devices
+  ./build/bin/llama-bench --list-devices
+  ./build/bin/llama-completion --list-devices
+
+  Available devices:
+    SYCL0: Intel(R) Arc(TM) A770 Graphics (15473 MiB, 15473 MiB free)
+    SYCL1: Intel(R) UHD Graphics 770 (59675 MiB, 44986 MiB free)
+  ```
+
+  The dGPU will be in the head of this list and iGPU will be the end.
+  If not all GPUs are listed, please check the env var: ONEAPI_DEVICE_SELECTOR and unset it.
+
+  2. Set the iGPU and dGPU
+
+  Set the iGPU and dGPU by `./build/bin/llama-server --device SYCL0,SYCL1,SYCLxxx`.
+
+  > **Fork caveat:** on this fork's hardware the iGPU reports ~94% of system
+  > RAM as "VRAM" and the default budget claims it (the `llama.cpp-403s`
+  > integrated-GPU VRAM-budget hazard — see `CLAUDE.md` "Hard-Won Rules").
+  > Prefer pinning discrete cards only (`ONEAPI_DEVICE_SELECTOR=level_zero:0,1`)
+  > unless you specifically need the iGPU, and note the P2P host-bounce caveat
+  > above applies to any multi-device set.
+
 
 ### **GitHub contribution**:
 Please add the `SYCL :` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.

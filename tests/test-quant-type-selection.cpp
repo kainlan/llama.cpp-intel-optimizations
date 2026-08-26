@@ -216,43 +216,18 @@ static std::string snapshot_file_from_name(const std::string & name) {
 }
 
 static const remote_model_spec model_specs[] = {
-    { "ggml-org/Qwen3-0.6B-GGUF",                   "Q8_0"   },
-    { "ggml-org/GLM-4.6V-GGUF",                     "Q8_0"   },
-    { "ggml-org/Step-3.5-Flash-GGUF",               "Q4_K"   },
-    { "ggml-org/Qwen3-Coder-Next-GGUF",             "Q8_0"   },
-    { "ggml-org/Qwen3-14B-GGUF",                    "Q8_0"   },
-    { "ggml-org/Nemotron-Nano-3-30B-A3B-GGUF",      "Q8_0"   },
-    { "ggml-org/gpt-oss-120b-GGUF",                 "mxfp4"  },
-    { "ggml-org/gemma-3-4b-it-GGUF",                "Q8_0"   },
-    { "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF", "Q4_K_M" },
-    { "bartowski/deepseek-ai_DeepSeek-V3.1-GGUF",   "IQ1_M"  },
-    // Both bartowski/Qwen_Qwen3.5-* rows were dropped from here, together with their
-    // tests/snapshots/qwen3.5-{397b-a17b,27b}.schema goldens.  Upstream re-quantized both
-    // repos to add the MTP/NextN layer, so each gained a block:
-    //
-    //     Qwen3.5-397B-A17B (IQ1_S)  block_count 60 -> 61
-    //     Qwen3.5-27B       (Q8_0)   block_count 64 -> 65
-    //
-    // That breaks the goldens two ways at once: the last real block crosses the
-    // use_more_bits 7*n/8 boundary (7*60/8 = 52 vs 7*61/8 = 53), and the new final block
-    // has no golden entry at all, so it is scored against the section default while the
-    // code applies its unconditional promotions.
-    //
-    // Regenerating was rejected: llama_quant_model_from_metadata never sets
-    // n_layer_nextn, so the mock has n_layer() == n_layer_all and a regenerated golden
-    // would bake in behaviour that diverges from a real load of the same file -- exactly
-    // the distinction b3ce5cedf exists to make.
-    //
-    // Owner ruling 2026-08-10 (llama.cpp-pp72 cluster C5): drop now, restore under
-    // llama.cpp-mcv8 with the fetch pinned to a revision instead of /resolve/main/.
-    // mcv8 also carries the fix for a fetch failure counting as SKIP rather than failure.
-    // The two rows restore differently:
-    //   - 27B is pinnable to fb655ce5de0de9a09fe0acd8e2009b157a6b6d5e, which reads
-    //     block_count 64 and so matches the golden that was removed here;
-    //   - 397B is not.  Its IQ1_S shard first appears at revision 3e252863 (2026-05-21)
-    //     already at 61, so no revision reproducing its 60-layer golden has ever
-    //     existed; restoring it needs a different source altogether, e.g. a ggml-org
-    //     release if one appears, with a golden generated from that source.
+    { "ggml-org/Qwen3-0.6B-GGUF",                     "Q8_0"   },
+    { "ggml-org/GLM-4.6V-GGUF",                       "Q8_0"   },
+    { "ggml-org/Step-3.5-Flash-GGUF",                 "Q4_K"   },
+    { "ggml-org/Qwen3-Coder-Next-GGUF",               "Q8_0"   },
+    { "ggml-org/Qwen3-14B-GGUF",                      "Q8_0"   },
+    { "ggml-org/NVIDIA-Nemotron-Nano-3-30B-A3B-GGUF", "Q8_0"   },
+    { "ggml-org/gpt-oss-120b-GGUF",                   "mxfp4"  },
+    { "ggml-org/gemma-3-4b-it-GGUF",                  "Q8_0"   },
+    { "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF",   "Q4_K_M" },
+    { "bartowski/deepseek-ai_DeepSeek-V3.1-GGUF",     "IQ1_M"  },
+  //{ "bartowski/Qwen_Qwen3.5-397B-A17B-GGUF",        "IQ1_S"  }, // TODO: swap with ggml-org if/when it's released
+    { "ggml-org/Qwen3.6-27B-GGUF",                    "Q8_0"   },
 };
 
 static const int n_model_specs = (int) (sizeof(model_specs) / sizeof(model_specs[0]));

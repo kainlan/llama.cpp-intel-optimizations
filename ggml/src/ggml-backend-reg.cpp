@@ -92,6 +92,10 @@
 #include "ggml-openvino.h"
 #endif
 
+#ifdef GGML_USE_ET
+#include "ggml-et.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::atomic<bool> g_disable_device_backends{false};
@@ -323,6 +327,11 @@ struct ggml_backend_registry {
 #ifdef GGML_USE_OPENVINO
         if (!disable_device_backends) {
             register_backend(ggml_backend_openvino_reg());
+        }
+#endif
+#ifdef GGML_USE_ET
+        if (!disable_device_backends) {
+            register_backend(ggml_backend_et_reg());
         }
 #endif
 #ifdef GGML_USE_CPU
