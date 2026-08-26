@@ -3,6 +3,13 @@
 Enumerated via `git rev-list --reverse 81ff7abe5..b10630 -- ggml/src/ggml-sycl | head -25`.
 Classified per the rubric in `docs/plans/2026-08-25-phase-c-upstream-merge.md` Task 6
 (N/A → superseded → port-candidate, in that order; diff evidence, not commit titles).
+Merge-base: `81ff7abe5`. Upstream target: tag `b10630` (remote `ggml-org`). Fork side:
+`master @ d37e4cedb269` ("fix(merge-guards): symmetric rc-check + non-vacuity on both
+safety-net halves") — the commit `master` pointed to when this fix round's fork-state
+greps (source line numbers, symbol presence/absence, allocation-pattern counts) were run.
+Pinned because `master` keeps moving under a shared checkout; every fork-state citation
+below is scoped to this SHA unless stated otherwise.
+
 The rubric includes an ownership screen (owner directive, mid-flight): every port-candidate
 is checked against the fork's canonical memory-ownership contract (CLAUDE.md "SYCL Memory
 Ownership"; `docs/design/sycl-canonical-memory-architecture.md`;
@@ -14,6 +21,25 @@ zone-reset-style reclamation is N/A by design. Each port-candidate below names t
 ownership surface (or "none touched") its landing zone would consume.
 
 **25 commits: 16 port-candidate / 9 superseded / 0 n-a**
+
+## Cross-cutting items
+
+🔶 **CARRY TO TRACKER (general, not scoped to any single entry's files):** 18 live
+`ggml_sycl_pool_alloc`/`ctx.pool()` call sites remain fork-wide — a candidate unified-cache
+migration backlog for T8 to file as ONE ticket. Verified per file (`cat <file> | grep -cE
+'ggml_sycl_pool_alloc|ctx\.pool\(\)'`, positive-controlled against `fattn-onednn.cpp`'s
+already-migrated 0) and confirmed each hit is a real call site, not the template's own
+definition (`common.hpp:3215-3259` is the `ggml_sycl_pool_alloc` struct/ctors/dtor/deleted
+members — infrastructure, not a site to migrate, and should be removed last, once no
+callers remain):
+- `ggml-sycl.cpp` (13): lines 41129, 41257, 41310, 41323, 41342, 41343, 52068, 58718,
+  58719, 58893, 58894, 59989, 59990
+- `conv3d.cpp` (3): lines 84, 104, 105
+- `cross_entropy_loss.cpp` (2): lines 124, 175
+
+Two further mentions are comments, not call sites, and don't count toward the 18:
+`mmvq.cpp:15998` (documents a graph-mode workaround) and `fattn-buffers.hpp:54` (documents
+a replacement wrapper).
 
 ---
 
@@ -30,7 +56,7 @@ ownership surface (or "none touched") its landing zone would consume.
 ### 3. `c1063ac9d75f` — sycl: set fattn_vec_nthreads to 256 for Battlemage (#25205)
 **Files:** ggml/src/ggml-sycl/fattn-vec.hpp
 **Class:** port-candidate
-**Why:** Detects Battlemage/Lunar Lake (`gpu_arch::intel_gpu_bmg_g21/g31/lnl_m`) and runs the flash-attention vec kernel with a 256-thread work group instead of 128. The fork's `fattn-vec.hpp` has no per-arch dispatch at all — `nthreads` is the flat compile-time macro `FATTN_VEC_NTHREADS = 128` (`fattn-common.hpp:22`) — so this is a real, unapplied tuning fact for exactly this fork's two cards (B70 = bmg_g31, B50 = bmg_g21). Must land together with entry 22 (`eef5f3e`), a required companion fix for a template-instantiation bug this change introduces.
+**Why:** Detects Battlemage/Lunar Lake (`gpu_arch::intel_gpu_bmg_g21/g31/lnl_m`) and runs the flash-attention vec kernel with a 256-thread work group instead of 128. The fork's `fattn-vec.hpp` has no per-arch dispatch at all — `nthreads` is the flat compile-time macro `FATTN_VEC_NTHREADS = 128` (`fattn-common.hpp:22`) — so this is a real, unapplied tuning fact for exactly this fork's two cards (B70 = bmg_g31, B50 = bmg_g21). Must land together with entry 22 (`eef5f3e3430a`), a required companion fix for a template-instantiation bug this change introduces.
 **Landing zone:** `ggml/src/ggml-sycl/fattn-common.hpp` (replace the flat `FATTN_VEC_NTHREADS` macro with an arch-conditional helper) + the launch site in `ggml/src/ggml-sycl/fattn-vec.hpp` that currently hardcodes `nthreads` from the macro.
 **Ownership surface:** none — pure launch-geometry constant (thread/warp count), no allocation of any kind.
 
@@ -68,7 +94,7 @@ ownership surface (or "none touched") its landing zone would consume.
 ### 9. `0bd0ec60998d` — sycl: fix row calculation when K_QUANTS_PER_ITERATION is 1 (#25690)
 **Files:** ggml/src/ggml-sycl/dmmv.cpp
 **Class:** port-candidate
-**Why:** Fixes an off-by-one (`row > nrows` → `row >= nrows`) across the base (non-reorder) Q2_K/Q3_K/Q4_K/Q6_K DMMV kernels, plus a second-half fix that only applies to the *reorder* Q5_K kernel. Verified against the fork's current source: `dmmv.cpp:1981` (q2_k), `:2089` (q3_k), and `:2203` (q4_k) all still read `if (row > nrows)`, while q6_k (`:2475`) is already `>=` — three of the four sites genuinely need the same one-character fix. Upstream's diff does also touch the non-reorder Q5_K kernel (adding an `nrows` parameter, a multi-row `get_group(2)*local_range(1)+get_local_id(1)` calculation, an `>=` guard, and switching its launcher to KQPI-style block dims) — but that upstream change is moot for the fork: its own non-reorder Q5_K kernel already distributes both `im` halves across different threads in the same work-group (`:2366-2374`, correct as-is), and its launcher (`:2941-2952`) already grids exactly `nrows` groups with `local_range(1)==1`, so `row = get_group(2)` can never exceed `nrows-1` — an `nrows` guard would be structurally inert *in the fork*, regardless of what upstream's own diff does to its own copy. Upstream's separate im-loop restructure lands in the *reorder* Q5_K kernel, which is unreachable in this fork (`ggml_sycl_supports_reorder_dmmv()` returns true only for `GGML_TYPE_Q4_0`).
+**Why:** Fixes an off-by-one (`row > nrows` → `row >= nrows`) across the base (non-reorder) Q2_K/Q3_K/Q4_K/Q6_K DMMV kernels, plus a second-half fix that only applies to the *reorder* Q5_K kernel. Verified against the fork's current source: `dmmv.cpp:1981` (q2_k), `:2089` (q3_k), and `:2203` (q4_k) all still read `if (row > nrows)`, while q6_k (`:2475`) is already `>=` — three of the four sites genuinely need the same one-character fix. Upstream's diff also touches the non-reorder Q5_K kernel (`nrows` parameter, multi-row calculation, `>=` guard, KQPI-style launcher), but the fork's own non-reorder Q5_K kernel already distributes both `im` halves across different threads in the work-group (`:2366-2374`) and its launcher (`:2941-2952`) already grids exactly `nrows` groups with `local_range(1)==1`, making an `nrows` guard structurally inert there; upstream's separate im-loop restructure lands in the *reorder* Q5_K kernel, unreachable in this fork (`ggml_sycl_supports_reorder_dmmv()` returns true only for `GGML_TYPE_Q4_0`).
 **Landing zone:** `ggml/src/ggml-sycl/dmmv.cpp`, the three `if (row > nrows)` guards in `dequantize_mul_mat_vec_q2_k` (`:1981`), `_q3_k` (`:2089`), and `_q4_k` (`:2203`) — change to `>=`. No change needed to Q5_K (non-reorder is correct and its launcher makes the guard inert; the reorder-side fix is unreachable).
 **Ownership surface:** none — a one-character bounds-comparison fix over existing device buffers; no allocation.
 
@@ -98,7 +124,7 @@ ownership surface (or "none touched") its landing zone would consume.
 **Files:** ggml/src/ggml-sycl/convert.cpp, ggml/src/ggml-sycl/dequantize.hpp, ggml/src/ggml-sycl/mmvq.cpp, ggml/src/ggml-sycl/vecdotq.hpp
 **Class:** port-candidate
 **Why:** Adds MMVQ dot-product and dequantize support for `GGML_TYPE_Q2_0`. `GGML_TYPE_Q2_0` (value 42) already exists in the fork's `ggml/include/ggml.h`, but there is no `Q2_0`/`q2_0` symbol anywhere in the fork's `vecdotq.hpp` or `mmvq.cpp` — mul_mat for this type is simply unimplemented. `vecdotq.hpp`/`convert.cpp`/`dequantize.hpp` are explicitly the rubric's shared-table port-candidate files, and mmvq.cpp additions here are purely additive (new `case` arms), not a rewrite of the fork's own MMVQ dispatch.
-**Landing zone:** `ggml/src/ggml-sycl/{dequantize.hpp,convert.cpp,vecdotq.hpp,mmvq.cpp}`, paired with entry 16 (`d5d3e05`, cpy-side Q2_0 support).
+**Landing zone:** `ggml/src/ggml-sycl/{dequantize.hpp,convert.cpp,vecdotq.hpp,mmvq.cpp}`, paired with entry 16 (`d5d3e05bf8d2`, cpy-side Q2_0 support).
 **Ownership surface:** none confirmed in the diff (`grep`'d for `malloc`/`pool_alloc` in `mmvq.cpp`/`convert.cpp` — no hits) — dot-product/dequant/convert code reading existing weight buffers; no allocation.
 
 ### 15. `1c5b89ff6315` — sycl : support dev2dev memcpy by DEV2DEV_MEMCPY_FORWARD (#26234)
@@ -109,8 +135,8 @@ ownership surface (or "none touched") its landing zone would consume.
 ### 16. `d5d3e05bf8d2` — [SYCL] support the missed types in cpy (#26005)
 **Files:** ggml/src/ggml-sycl/cpy.cpp, ggml/src/ggml-sycl/cpy.hpp
 **Class:** port-candidate
-**Why:** Adds `cpy_blck_f32_q2_0` and other missing quantize/copy block functions (paired with entry 14's Q2_0 mul_mat support). The fork's `cpy.cpp` dispatch (grep of `case GGML_TYPE_*` pairs) covers F32/F16/BF16/I16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_NL pairs but has no `Q2_0` arm at all — this is additive coverage in the same shared-conversion-table category, not a rewrite.
-**Landing zone:** `ggml/src/ggml-sycl/cpy.hpp` (new `cpy_blck_f32_q2_0` and any paired block) + `ggml/src/ggml-sycl/cpy.cpp` dispatch table, alongside entry 14.
+**Why:** Adds `cpy_blck_f32_q2_0` (F32→Q2_0 quantize) and `cpy_blck_q2_0_f32` (Q2_0→F32 dequantize), plus their dispatch-table pairing (paired with entry 14's Q2_0 mul_mat support). The fork's `cpy.cpp` dispatch (grep of `case GGML_TYPE_*` pairs) covers F32/F16/BF16/I16/I32/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_NL pairs but has no `Q2_0` arm at all — this is additive coverage in the same shared-conversion-table category, not a rewrite.
+**Landing zone:** `ggml/src/ggml-sycl/cpy.hpp` (new `cpy_blck_f32_q2_0` and `cpy_blck_q2_0_f32`) + `ggml/src/ggml-sycl/cpy.cpp` dispatch table, alongside entry 14.
 **Ownership surface:** none confirmed in the diff (`grep`'d `cpy.cpp`/`cpy.hpp` for `malloc`/`pool_alloc` — no hits) — per-block quantize/copy math over existing src/dst buffers; no allocation.
 
 ### 17. `9d9a6d29f6b9` — SYCL: add oneMKL GEMM flash attention for XMX-accelerated prompt processing (#25025)
@@ -130,7 +156,7 @@ ownership surface (or "none touched") its landing zone would consume.
 **Class:** port-candidate
 **Why:** Extends the oneDNN SDPA gate to accept Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and F32 KV by dequantizing/converting K/V to dense F16 before the SDPA graph (prefill-only, K≥1024, Q≥32). The fork's `ggml_sycl_flash_attn_ext_onednn_supported()` (`fattn-onednn.cpp:277`) still hard-gates `params.K_type != GGML_TYPE_F16 || params.V_type != GGML_TYPE_F16` — quantized-KV prefill (which the fork's own perf baselines explicitly benchmark, e.g. "q8_0 KV" runs) cannot reach the oneDNN path today and falls back to the slower native kernel. This is a genuine capability gap in a subsystem the fork already extended once (`MATERIALIZE_REQUIRED` K/V materialization for GQA) — reusing that same materializer machinery for a dequant-to-F16 conversion is a natural, moderate-risk extension rather than a duplicate.
 ⚠️ **Ownership screen:** upstream's own diff stages the converted K/V into `ggml_sycl_pool_alloc<sycl::half>` scratch (`ctx.pool()`) — that is upstream's code, not the fork's. Verified against the fork's actual current `fattn-onednn.cpp`: `grep -cE 'ggml_sycl_pool_alloc|ctx\.pool\(\)'` returns **0** there (vs. **11** in `git show b10630:.../fattn-onednn.cpp`, upstream's version) — the fork's own pre-existing K/V materialization scratch is already routed through the unified-cache-backed materializer (see the file's own comments, e.g. "ask the unified-cache-backed materializer for dense f16 K/V"), i.e. already on a sanctioned surface. **This re-expression requirement applies only to the NEW scratch this port itself would add** for dequantizing quantized/F32 KV to F16 — that new code must go through `unified_allocate`/`unified_allocate_owner()` → `mem_handle` (or an `alloc_owner` via `mem_handle::from_owned_alloc()`), not `ctx.pool()`, matching the standard the file's existing code already meets.
-🔶 **CARRY TO TRACKER (general, not this entry's files):** 29 legacy `ggml_sycl_pool_alloc`/`ctx.pool()` sites remain fork-wide (verified via `cat <file> | grep -cE 'ggml_sycl_pool_alloc|ctx\.pool\(\)'` per file, positive-controlled against `fattn-onednn.cpp`'s 0): `conv3d.cpp` (3), `cross_entropy_loss.cpp` (2), `ggml-sycl.cpp` (13), `mmvq.cpp` (1), `common.hpp` (9), `fattn-buffers.hpp` (1) — candidate unified-cache migration backlog for T8 to file as ONE ticket. (Two of the 29 — `mmvq.cpp:15998` and `fattn-buffers.hpp:54` — are comments referencing the pattern rather than live allocation call sites; the ticket-writer should confirm the true call-site count when scoping the work.)
+(A general legacy-`ctx.pool()` backlog exists fork-wide but is unrelated to this file/port — see "Cross-cutting items" above.)
 **Landing zone:** `ggml/src/ggml-sycl/fattn-onednn.cpp`, `ggml_sycl_flash_attn_ext_onednn_supported()` gate (line ~277) and the K/V staging call sites feeding the `MATERIALIZE_REQUIRED` plan.
 **Ownership surface:** `mem_handle` lease over a unified-cache scratch allocation for the dequantized K/V dense-F16 buffers — NOT `ggml_sycl_pool_alloc`/`ctx.pool()` as upstream wrote it.
 
@@ -151,7 +177,7 @@ ownership surface (or "none touched") its landing zone would consume.
 ### 22. `eef5f3e3430a` — sycl : fix error Error OP FLASH_ATTN_EXT on arc770 (#26441)
 **Files:** ggml/src/ggml-sycl/fattn-vec.hpp
 **Class:** port-candidate
-**Why:** Converts a runtime `if (D <= 256 && nthreads == 256)` into `if constexpr (D <= 256) { if (nthreads == 256) {...; return;} }` in `ggml_sycl_flash_attn_ext_vec_case_impl`, fixing a template-instantiation bug that entry 3 (`c1063ac`, the Battlemage-256-thread change) introduced: at `D > 256` the `nthreads_hw=256` branch was still being *instantiated* (just not executed), overflowing 64 KB work-group local memory. This has no independent value without entry 3 and does not apply to the fork's current flat-macro `fattn-vec.hpp` — it is a required companion fix that must land in the same change as entry 3's port.
+**Why:** Converts a runtime `if (D <= 256 && nthreads == 256)` into `if constexpr (D <= 256) { if (nthreads == 256) {...; return;} }` in `ggml_sycl_flash_attn_ext_vec_case_impl`, fixing a template-instantiation bug that entry 3 (`c1063ac9d75f`, the Battlemage-256-thread change) introduced: at `D > 256` the `nthreads_hw=256` branch was still being *instantiated* (just not executed), overflowing 64 KB work-group local memory. This has no independent value without entry 3 and does not apply to the fork's current flat-macro `fattn-vec.hpp` — it is a required companion fix that must land in the same change as entry 3's port.
 **Landing zone:** Same as entry 3 — the arch-conditional launch dispatch in `ggml/src/ggml-sycl/fattn-vec.hpp`; use `if constexpr` from the start rather than porting entry 3's runtime `if` and immediately following with this fix.
 **Ownership surface:** none — compile-time template-instantiation fix, no allocation.
 
@@ -173,6 +199,6 @@ ownership surface (or "none touched") its landing zone would consume.
 ### 25. `fc3f10b3895e` — sycl: fix UE4M3 parsing (#25608)
 **Files:** ggml/src/ggml-sycl/common.hpp
 **Class:** port-candidate
-**Why:** Fixes NVFP4's unsigned UE4M3 scale-byte decode, which upstream's *old* code mishandled by reinterpreting it as signed E4M3. The fork's `ggml_sycl_ue4m3_to_fp32()` (`common.hpp:6797`) already uses the same corrected unsigned-decode formula (`exp = (x>>3)&0xf`, `man = x&0x7`, `ldexp`-based reconstruction, `raw*0.5f`) as this commit's fix, but retains an extra `x == 0xff → 0.0f` special case left over from the old buggy code that upstream's fixed formula explicitly removed (its comment: "exp == 0xF is a valid exponent (256-448 range), not NaN") — byte `0xFF` should decode to ≈240 and currently silently zeros instead. Narrow, low-risk reconciliation of one residual branch.
-**Landing zone:** `ggml/src/ggml-sycl/common.hpp`, function `ggml_sycl_ue4m3_to_fp32` — drop the `x == 0xff` branch of the leading guard.
+**Why:** Fixes NVFP4's unsigned UE4M3 scale-byte decode, which upstream's *old* code mishandled by reinterpreting it as signed E4M3. The fork's `ggml_sycl_ue4m3_to_fp32()` (`common.hpp:6797`) already uses the same corrected unsigned-decode formula as this commit's fix, but retains an extra `x == 0xff → 0.0f` special case left over from the old buggy code that upstream's fixed formula explicitly removed. This divergence is latent, not live: `ggml_fp32_to_ue4m3` saturates at 0x7E and never sets bit 7, so no real encoder can ever emit byte `0xFF` — the fork's own test documents exactly this (`ggml/src/ggml-sycl/tests/test-q1-nvfp4-adapter-device.cpp:271-276`: "0xFF is deliberately absent because ggml_sycl_ue4m3_to_fp32 maps it to 0.0f while ggml_ue4m3_to_fp32 does not -- a pre-existing divergence in common.hpp that no encoder can reach"). Narrow, low-risk reconciliation of a dead branch, not a live-data bug.
+**Landing zone:** `ggml/src/ggml-sycl/common.hpp`, function `ggml_sycl_ue4m3_to_fp32` — drop the `x == 0xff` branch of the leading guard; `ggml/src/ggml-sycl/tests/test-q1-nvfp4-adapter-device.cpp` (its comment at lines 271-276 documents the divergence this drop resolves and goes stale once the branch is gone).
 **Ownership surface:** none — a pure scalar decode function, no allocation.
