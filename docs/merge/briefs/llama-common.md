@@ -2,6 +2,30 @@
 
 Merge-base: `81ff7abe5`. Upstream target: tag `b10630` (remote `ggml-org`). Fork side: `master`.
 
+**Verification method:** every conflict/clean claim below was checked against the actual merge
+algorithm, not inferred from reading the two sides' diffs side by side:
+
+```bash
+git merge-tree --write-tree --name-only master b10630
+```
+
+This is a read-only simulation of the exact merge the eventual merge task will run — it writes
+no ref, touches no tracked state, and needs no checkout. Its `CONFLICT (content): ...` lines
+are the ground truth for which files actually conflict; everything else in that output
+auto-merges. For this group the result is exactly six conflicts — `common/arg.cpp`,
+`common/chat.cpp`, `src/llama-context.cpp`, `src/llama-graph.cpp`,
+`src/llama-model-loader.cpp`, `src/llama-sampler.cpp` — matching the lead's census. The other
+ten both-touched files auto-merge with no conflict markers, so their entries below are
+**semantic-review notes** (what upstream changed that the fork's behavior must still hold
+against) rather than hunk-level interleave guidance — interleave guidance is reserved for the
+six files git actually can't resolve on its own. For files that auto-merge, I additionally
+pulled the real merged blob out of the simulated tree (`git show <tree>:<path>`) wherever a
+"clean" result still needed a second look — twice that surfaced a merge that was clean by
+git's definition (no `<<<<<<<` markers) but wrong by the codebase's: a missing
+`GGML_UNUSED(extra)` in `common/fit.cpp`, and a genuinely broken, uncompilable double-assignment
+in `common/chat.cpp` hiding behind a file (`common/chat.h`) that isn't even in this
+both-touched group. Both are called out in full below.
+
 ## Derivation
 
 ```bash
@@ -276,8 +300,10 @@ upstream's changes here.
 
 Clean per `merge-tree`, and worth confirming precisely because it's the file where upstream's
 `--load-mode` feature actually lands its call-site update. Fork's diff is three more
-`51d116467` null-check sites (`llama_prepare_model_devices`'s two device-enumeration loops,
-`llama_print_system_info`'s backend-registry loop) — none overlapping upstream's changes.
+null-check sites of the `51d116467` pattern (introduced here by `1f15d0e3f`, confirmed via
+`git log -S 'if (!dev) {' -- src/llama.cpp`, which lands `1f15d0e3f` ahead of `51d116467` on
+the same day) — `llama_prepare_model_devices`'s two device-enumeration loops,
+`llama_print_system_info`'s backend-registry loop — none overlapping upstream's changes.
 Upstream's diff is unrelated in the same file: it (1) adds `llama_load_mode_name` /
 `llama_load_mode_from_str` and `llama_version()`, (2) changes the iGPU dedup condition in
 `llama_prepare_model_devices` (an `if (igpus.empty())` becomes
@@ -486,7 +512,7 @@ so the fork's intended value (`"<|start|>assistant"`) is silently discarded in f
 upstream's (`"<|channel|>analysis<|message|>"`) — whichever assignment textually comes second
 wins, with no error, warning, or trace of the discarded one.
 
-**RESOLVE, and this needs a human/functional call, not a mechanical merge:** these two pairs
+**RESOLVE: this needs a human/functional call, not a mechanical merge.** These two pairs
 of values encode different semantic intents for where GPT-OSS "thinking" starts and ends —
 fork's values bracket "from the assistant preamble to the final channel," upstream's bracket
 "the analysis channel content, ending at the model's own `<|end|>` token." Simply keeping one
@@ -520,7 +546,7 @@ don't share a hunk. `llama-model.cpp` carries the largest fork diff in this grou
 `llama_model_sycl_compute_early_plan`/`llama_model_sycl_set_late_inventory` and their call
 sites inside `load_tensors`) against upstream's 472-line diff to the same file; despite the
 size on both sides, `merge-tree` found no overlapping hunk. `llama-model.h`'s fork diff is
-small (17 lines) and clean against upstream's 53-line diff. **RESOLVE for all four: trust the
+small (17 lines) and clean against upstream's 53-line diff. **RESOLVE: for all four, trust the
 auto-merge.** **CONTRACT: none identified** — I did not find a fork call site in these four
 files referencing anything from the four fork behaviors above, and the two moe-profile/
 tensor-class behaviors have no call sites anywhere per the (b)/(c) findings, so there is
