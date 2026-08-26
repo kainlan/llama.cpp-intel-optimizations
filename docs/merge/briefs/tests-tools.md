@@ -242,7 +242,7 @@ vacuously with no model configured, exactly as `llama.cpp-nwip` originally found
 
 **CRITICAL — deleting `tests/get-model.cpp` breaks a live test gate, and that
 gate must be updated as part of this same resolution, not as an afterthought.**
-`tests/test-skip-policy.py:86-96`'s `test_model_requiring_tests_use_the_shared_skip()`
+`tests/test-skip-policy.py:86-98`'s `test_model_requiring_tests_use_the_shared_skip()`
 does:
 ```python
 for name in ("get-model.cpp", "test-thread-safety.cpp"):
@@ -275,12 +275,20 @@ it is not optional cleanup, it is the third leg of one fix.
 the tree** (`test -f tests/get-model.cpp` fails) — the modify/delete mechanic
 above means "no conflict markers visible" is not sufficient evidence the
 deletion actually landed. Then grep `common/common.cpp` post-merge for
-`common_get_model_or_exit` and confirm its body calls something that exits 77
-on the missing-model path (either by including `tests/test-skip.h` from
-`common/common.cpp`, which is a layering smell worth a second look since
-`test-skip.h` is a `tests/`-scoped header, or by inlining the same
-fprintf+`exit(77)` there directly with a comment citing `llama.cpp-nwip`).
-Then grep all 4 rewired consumers for `common_get_model_or_exit(` and confirm
+`common_get_model_or_exit` and confirm its body **calls `test_skip_no_model()`
+itself** (including `tests/test-skip.h` from `common/common.cpp`, or hoisting
+the helper if that layering is judged wrong — either way, one named policy
+function, actually called). **Do not accept an inlined
+`fprintf(...); exit(77);` as satisfying this contract**: the gate this entry
+exists to keep green,
+`test-skip-policy.py:86-98`'s `test_model_requiring_tests_use_the_shared_skip()`,
+asserts the literal string `"test_skip_no_model()"` appears in the checked
+source — an inlined equivalent that exits 77 correctly but never spells that
+name is invisible to the assertion and fails it, and it is independently the
+exact "second copy of the skip policy" regression the gate's own header
+comment (`test-skip-policy.py:87-90`) names as the failure mode a shared
+helper is supposed to prevent. Then grep all 4 rewired consumers for
+`common_get_model_or_exit(` and confirm
 none still references the deleted `get-model.h`. **Additionally, run**
 `ctest --test-dir build -R '^test-skip-policy$' --output-on-failure` (or the
 direct `python3 tests/test-skip-policy.py`) post-merge and confirm it passes —
