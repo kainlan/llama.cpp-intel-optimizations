@@ -31,6 +31,24 @@ tools/ui/CMakeLists.txt
 
 12 entries below, one per file.
 
+**Conflict shapes verified against `git merge-tree --write-tree master b10630`**
+(read-only — simulates the exact merge T15 will do, without touching the
+working tree). Of these 12 files, only **four** actually produce a merge
+conflict in git's own attempt: `ggml/src/ggml-sycl/CMakeLists.txt`,
+`tests/CMakeLists.txt`, `.github/workflows/build-wasm.yml`, and
+`.github/workflows/build-webgpu.yml`. The other eight — `CMakeLists.txt`,
+`ggml/CMakeLists.txt`, `ggml/src/CMakeLists.txt`, `scripts/ui-assets.cmake`,
+`src/CMakeLists.txt`, `tests/CMakeLists.txt`'s sibling `tools/CMakeLists.txt`,
+`tools/ui/CMakeLists.txt`, and `.github/workflows/build-sycl.yml` — auto-merge
+cleanly despite adjacent or nearby hunks; their entries below describe the
+apparent adjacency for context and end in a sanity-check, not a conflict
+resolution. Confirm the four-file list yourself before trusting any of this:
+
+```bash
+git merge-tree --write-tree master b10630 > /tmp/mt.txt
+grep CONFLICT /tmp/mt.txt
+```
+
 ---
 
 ## `CMakeLists.txt` (root)
@@ -134,8 +152,9 @@ itself touch OpenMP, so this is a low-risk sequencing check only).
 ## `ggml/src/ggml-sycl/CMakeLists.txt`
 
 **This is the GLOB trap file** — by far the largest and highest-risk entry.
-Upstream's whole diff against base is 14 lines, confined to the
-`GGML_SYCL_DEVICE_ARCH` AOT block; the fork's diff is ~4,900 lines and
+Upstream's whole diff against base is **11 lines added, 0 removed**
+(`git diff --numstat 81ff7abe5..b10630 -- ggml/src/ggml-sycl/CMakeLists.txt`),
+confined to the `GGML_SYCL_DEVICE_ARCH` AOT block; the fork's diff is ~4,900 lines and
 registers the bulk of the fork's SYCL test suite directly in this file, far
 beyond upstream's two source `file(GLOB ...)` calls (base file, unmodified by
 either side elsewhere: `GGML_SOURCES_SYCL` glob at base line 26 and the
@@ -217,13 +236,34 @@ default to "ours" here without confirming which AOT flag form the fork
 actually needs on hardware — this is a functional compiler-flag choice, not a
 cosmetic one.
 
+**⚠️ The conflict git's own merge actually reports is at the WRONG location —
+do not trust its line numbers.** Ran for real (`git merge-file -L ours -L base
+-L theirs` against the three blobs `git merge-tree` names for this path):
+git's xdiff-based 3-way merge places the conflict markers around
+`add_executable(test-xmx-config ...)`'s `target_include_directories(...)`
+block (~line 1197 of the merged text), splicing upstream's
+`GGML_SYCL_MAX_PARALLEL_LINK_JOBS` patch in there instead of anywhere near
+`GGML_SYCL_DEVICE_ARCH`. Worse: the *real* semantic site — master's lines
+836–838, the `--offload-arch=` block quoted above — passes through this merge
+completely untouched, with **no conflict marker at all**, silently keeping
+master's form and silently dropping upstream's `-fsycl-max-parallel-link-jobs`
+feature. The file's ~4,900-line rewrite is large enough that git's LCS-based
+diff loses track of which block corresponds to which; the merge tool's output
+for this file cannot be used as a checklist. Wave 1 must (1) not assume the
+absence of a conflict marker at `GGML_SYCL_DEVICE_ARCH` means it's resolved —
+it isn't, it's silently wrong — and (2) not act on the spurious marker it
+does produce near `test-xmx-config` beyond taking "ours" there (upstream's
+content landed in the wrong place and carries no meaning at that location).
+
 **RESOLVE:** interleave, with a flagged manual decision — carry forward all
 123 fork test registrations and the option/glob/link-workaround additions
 verbatim (upstream touches none of that region); for the `GGML_SYCL_DEVICE_ARCH`
-block specifically, do NOT auto-merge — route to whoever owns the SYCL AOT
-compile-flag choice (`--offload-arch=` vs `spir64_gen`) before landing, per the
-option (a)/(b) above. Flagging this as the **highest-risk single hunk in the
-whole build-system group.**
+block specifically, do NOT trust git's merge output either way (see above) —
+manually decide between option (a)/(b) and edit master's lines 836–838
+directly, then manually revert whatever git spliced into the `test-xmx-config`
+block back to master's original `target_include_directories(...)` form.
+Flagging this as the **highest-risk single hunk in the whole build-system
+group.**
 
 ---
 
@@ -250,49 +290,49 @@ no line overlap.
 ## `src/CMakeLists.txt`
 
 **Fork intent:** adds four fork-only source files to the `add_library(llama
-...)` list: `llama-kv-block.cpp` (right after `llama-kv-cache-dsv4.cpp`... no —
-right after `llama-kv-cache-dsa.cpp`, before `llama-kv-cache-dsv4.cpp`),
+...)` list: `llama-kv-block.cpp` (immediately after `llama-kv-cache-dsv4.cpp`),
 `llama-pp-scheduler.cpp` (after `llama-memory-recurrent.cpp`, before
-`llama-mmap.cpp`), `llama-moe-profile.cpp` (after `llama-quant.cpp`... before
-it, between `llama-model.cpp` and `llama-quant.cpp`), `llama-tensor-class.cpp`
-(after `llama-sampler.cpp`, before `llama-vocab.cpp`). No changes to
-`set_target_properties` in this diff.
+`llama-mmap.cpp`), `llama-moe-profile.cpp` (between `llama-model.cpp` and
+`llama-quant.cpp`), `llama-tensor-class.cpp` (after `llama-sampler.cpp`,
+before `llama-vocab.cpp`). No changes to `set_target_properties` in this diff.
 
 **Upstream intent:** adds two new upstream source files,
-`llama-kv-cache-dsa-iswa.cpp` and `llama-kv-cache-msa.cpp`, in the *same*
-region — immediately after `llama-kv-cache-dsa.cpp`, before
-`llama-kv-cache-dsv4.cpp` (the identical insertion point the fork uses for
-`llama-kv-block.cpp`). Also rewrites `set_target_properties(llama ...)`:
-`VERSION ${LLAMA_INSTALL_VERSION}` / `SOVERSION 0` become `VERSION
-${LLAMA_VERSION_BASE}` / `SOVERSION ${LLAMA_VERSION_MAJOR}` (follows the root
-`CMakeLists.txt` version-scheme rename), and adds a
-`target_compile_definitions(llama PRIVATE LLAMA_VERSION="..."
+`llama-kv-cache-dsa-iswa.cpp` and `llama-kv-cache-msa.cpp`, immediately after
+`llama-kv-cache-dsa.cpp` and before `llama-kv-cache-dsv4.cpp`. Also rewrites
+`set_target_properties(llama ...)`: `VERSION ${LLAMA_INSTALL_VERSION}` /
+`SOVERSION 0` become `VERSION ${LLAMA_VERSION_BASE}` / `SOVERSION
+${LLAMA_VERSION_MAJOR}` (follows the root `CMakeLists.txt` version-scheme
+rename), and adds a `target_compile_definitions(llama PRIVATE LLAMA_VERSION="..."
 LLAMA_COMMIT="...")` block.
 
-**⚠️ Real line-level conflict:** both sides insert into the `add_library(llama
-...)` file list at the *same anchor point* (immediately after
-`llama-kv-cache-dsa.cpp`) with different new files
-(`llama-kv-cache-dsa-iswa.cpp` + `llama-kv-cache-msa.cpp` vs
-`llama-kv-block.cpp`). Git will conflict-mark this hunk. The fix is additive,
-not exclusive — all three new files are real, both-sides-needed sources; the
-resolution is to keep all three lines (order doesn't matter to CMake, but
-keeping alphabetical-ish grouping matches file convention: `llama-kv-block.cpp`,
-`llama-kv-cache-dsa-iswa.cpp`, `llama-kv-cache-dsv4.cpp`,
-`llama-kv-cache-msa.cpp`, or similar — pick one and don't drop any).
-
-The `set_target_properties`/version rewrite has no fork-side edit to conflict
-with (fork's diff doesn't touch it) — this is a clean "theirs" take, but it
-depends on the root `CMakeLists.txt` `LLAMA_VERSION_BASE`/`LLAMA_VERSION_MAJOR`
-variables existing post-merge (see root entry above) — do not take this hunk
-before that one lands, or the build breaks on an undefined variable used where
+**Auto-merges cleanly.** The two sides' insertion points are NOT the same line
+— upstream's two files land right after `llama-kv-cache-dsa.cpp`, the fork's
+`llama-kv-block.cpp` lands after `llama-kv-cache-dsv4.cpp`, one line further
+down — so git's 3-way merge resolves this without a conflict marker. Confirmed
+against `git merge-tree --write-tree master b10630` (this path does not appear
+in its `CONFLICT` output) and by reading the resulting merged blob directly,
+which contains all six new sources in one unbroken run, in this order:
+```
+llama-kv-cache-dsa.cpp
+llama-kv-cache-dsa-iswa.cpp     <- upstream
+llama-kv-cache-msa.cpp          <- upstream
+llama-kv-cache-dsv4.cpp
+llama-kv-block.cpp              <- fork
+```
+The `set_target_properties`/version rewrite likewise has no fork-side edit to
+conflict with — it merges as a clean "theirs" take, but it depends on the root
+`CMakeLists.txt` `LLAMA_VERSION_BASE`/`LLAMA_VERSION_MAJOR` variables existing
+post-merge (see root entry above) — do not take this hunk before that one
+lands, or the build breaks on an undefined variable where
 `LLAMA_INSTALL_VERSION` used to be.
 
-**RESOLVE:** interleave with a manual merge of the source-file-list hunk (keep
-all five new files: `llama-kv-block.cpp`, `llama-pp-scheduler.cpp`,
-`llama-moe-profile.cpp`, `llama-tensor-class.cpp` from the fork, plus
-`llama-kv-cache-dsa-iswa.cpp` and `llama-kv-cache-msa.cpp` from upstream);
-take upstream's `set_target_properties`/`target_compile_definitions` rewrite
-verbatim, sequenced after the root `CMakeLists.txt` version-scheme resolution.
+**RESOLVE:** this file needs no manual hunk merge. Sanity-check only — after
+T15's merge, grep `add_library(llama` in the resulting file and confirm all
+six new sources are present (`llama-kv-cache-dsa-iswa.cpp`,
+`llama-kv-cache-msa.cpp`, `llama-kv-block.cpp`, `llama-pp-scheduler.cpp`,
+`llama-moe-profile.cpp`, `llama-tensor-class.cpp`) and that
+`set_target_properties`/`target_compile_definitions` took upstream's form,
+sequenced after the root `CMakeLists.txt` version-scheme resolution lands.
 
 ---
 
@@ -455,10 +495,10 @@ CI enablement is T24's concern, not this brief's.
 | `CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
 | `ggml/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
 | `ggml/src/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
-| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict** in the `GGML_SYCL_DEVICE_ARCH` AOT block (fork replaced the form upstream's patch extends); 123 fork test registrations elsewhere, untouched by upstream | interleave + **manual flag decision** (highest risk) |
+| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict**, and git's own merge marks the WRONG location (spurious hit near `test-xmx-config`; the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 shows no marker and silently loses upstream's feature); 123 fork test registrations elsewhere, untouched by upstream | interleave + **manual flag decision**, ignore git's conflict markers (highest risk) |
 | `scripts/ui-assets.cmake` | different functions, no overlap | interleave |
-| `src/CMakeLists.txt` | **real conflict** — both insert new source files at the same anchor line in `add_library(llama ...)` | interleave with manual source-list merge; sequence after root `CMakeLists.txt` |
-| `tests/CMakeLists.txt` | function-body edits interleave cleanly; one high-density anchor point (`test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard vs ~90+ fork test insertions) needs care | interleave, careful manual splice at the `LLAMA_USE_SYSTEM_GGML` guard |
+| `src/CMakeLists.txt` | auto-merges cleanly — insertion points differ by one line (`llama-kv-cache-dsa.cpp` vs `llama-kv-cache-dsv4.cpp`); confirmed absent from `git merge-tree`'s CONFLICT output | none needed; sanity-check all six new sources + version rewrite present |
+| `tests/CMakeLists.txt` | **real conflict** at merged lines 296–564 (fork's `test-archs-exclude-cli` block vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring); the `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard auto-merges | interleave, manual splice at lines 296–564 only |
 | `tools/CMakeLists.txt` | adjacent (not overlapping) insertions around `fit-params` | interleave |
 | `tools/ui/CMakeLists.txt` | adjacent (not overlapping), upstream ends exactly where fork's block begins | interleave |
 | `.github/workflows/build-sycl.yml` | disjoint insertions in same job | interleave (content-only) |
@@ -516,41 +556,72 @@ current file for the full, current set before editing. This is the mechanism
 CLAUDE.md's "Verification Commands" section documents as making a skip
 *visible* as a skip rather than a false "Passed".
 
-**Structural additions at risk from a naive upstream take:**
-- Restores five host-only C++ tests (`test-tensor-data`, `test-q8-0-soa`,
-  `test-mmq-soa-q4-0`, `test-sycl-model-shapes`, and one more in the same
-  batch) plus `test-q4-0-q8-0-vec-dot-regression` (with its own
-  `target_include_directories(... ${PROJECT_SOURCE_DIR}/ggml/src)`, needed
-  because the restored source includes `ggml-cpu/quants.h` → `ggml-common.h`),
-  citing llama.cpp-0igs and a specific pre-fork commit (`3c8f296fd`) as the
-  provenance for "byte-identical, restored, not reinvented" — do not
-  re-derive these from scratch during merge; keep the restored blocks intact.
-- These insertions land immediately after `llama_build_and_test(test-alloc.cpp)
-  target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)`
-  — **the exact same anchor point upstream restructures** (upstream moves both
-  `test-gguf.cpp` and `test-alloc.cpp` under a new `if (NOT
-  LLAMA_USE_SYSTEM_GGML)` guard, and removes the older, separately-located
-  standalone `llama_build_and_test(test-gguf.cpp)` call that used to sit next
-  to `test-backend-ops.cpp`). The fork's `master` does not touch the
-  `LLAMA_USE_SYSTEM_GGML` guard or move `test-gguf.cpp` at all (confirmed:
-  `git diff 81ff7abe5..master -- tests/CMakeLists.txt` has zero hits for
-  `LLAMA_USE_SYSTEM_GGML` or a `test-gguf.cpp` relocation). **This is the
-  file's highest-density interleave point** — wave 1 must apply upstream's
-  `LLAMA_USE_SYSTEM_GGML` guard + dedup of `test-gguf.cpp` *and* insert all of
-  the fork's restored/new tests immediately after, without losing either side.
-- Other upstream additions elsewhere in the file that fork doesn't touch and
-  must simply be carried forward: `test-unicode.cpp`, `test-batch-alloc.cpp`
-  (inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard), the
-  `test-recurrent-state-rollback` restructuring onto a generated-model fixture
-  (`test-generate-models` / `FIXTURES_SETUP generate-models`, replacing the old
-  single `FIXTURES_REQUIRED test-download-model` registration — three
-  variants: dense, `-nemotron-h`, `-dsv4`), `test-chat-analysis.cpp` (build
-  only, not registered as a test), `test-model-resolution.cpp` (+
-  `target_link_libraries(... PRIVATE cpp-httplib)`), `test-mtmd-impl.cpp` (+
-  `target_link_libraries(... PRIVATE mtmd)`), and `test-rset-release.cpp`
-  under `if (APPLE)`.
+**`test-gguf.cpp`/`test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` anchor auto-merges
+cleanly** — verified by running the real 3-way merge (`git merge-file` against
+the three blobs `git merge-tree --write-tree master b10630` names for this
+path): no conflict marker appears anywhere near this guard. Upstream moves
+both `test-gguf.cpp` and `test-alloc.cpp` under a new `if (NOT
+LLAMA_USE_SYSTEM_GGML)` guard (dropping `test-alloc`'s previously-standalone
+`target_include_directories(... ${PROJECT_SOURCE_DIR}/ggml/src)` line in the
+process) and removes the older, separately-located standalone
+`llama_build_and_test(test-gguf.cpp)` call that used to sit next to
+`test-backend-ops.cpp`; the fork's five restored tests, described below, land
+right after this guard in the merged file with no interaction. Fork's `master`
+never touches `LLAMA_USE_SYSTEM_GGML` or moves `test-gguf.cpp`, so there is
+nothing for these two edits to collide over.
+
+**⚠️ The real conflict is a ~270-line span the earlier draft of this brief
+missed entirely: merged-file lines 296–564** (per `git merge-file -L ours -L
+base -L theirs`), immediately after `llama_build_and_test(test-llama-archs.cpp)`
+inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard. Both sides insert new
+content at that exact point and each side's insertion runs through to the
+guard's closing `endif()`:
+- **Fork ("ours")** inserts the `test-archs-exclude-cli` block: a
+  `llama_build_and_test(test-archs-exclude.cpp)` call plus, under `if (NOT
+  WIN32)`, a `llama_test_cmd(bash NAME test-archs-exclude-cli ...)`
+  registration (`SKIP_RETURN_CODE 77` when the driven binary wasn't built) —
+  gates `-x/--exclude` of `test-llama-archs`, deliberately not named
+  `test-llama-archs-exclude` because four CI workflows run `ctest -E
+  "test-llama-archs"` (an unanchored regex) that would otherwise swallow it.
+- **Upstream ("theirs")** inserts the `test-generate-models` /
+  `test-recurrent-state-rollback` fixture restructuring at the same point: a
+  `MODEL_DIR` + `llama_test(test-llama-archs NAME test-generate-models ...)`
+  with `FIXTURES_SETUP generate-models`, then three
+  `test-recurrent-state-rollback*` variants (dense, `-nemotron-h`, `-dsv4`)
+  each with `FIXTURES_REQUIRED generate-models`, replacing the old
+  `llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS
+  -m "${MODEL_DEST}")` registration that lived elsewhere in the base file.
+
+Both blocks are real and both-sides-needed; the fix is additive, not
+exclusive. Also restores five host-only C++ tests, unrelated to and *not*
+overlapping this span — `test-tensor-data`, `test-q8-0-soa`,
+`test-mmq-soa-q4-0`, `test-sycl-model-shapes`, and `test-tensor-class` (the
+fifth; links the classifier from libllama per llama.cpp-habh rather than
+compiling `src/llama-tensor-class.cpp` a second time into the test binary) —
+plus `test-q4-0-q8-0-vec-dot-regression` (with its own
+`target_include_directories(... ${PROJECT_SOURCE_DIR}/ggml/src)`, needed
+because the restored source includes `ggml-cpu/quants.h` → `ggml-common.h`),
+citing llama.cpp-0igs and a specific pre-fork commit (`3c8f296fd`) as the
+provenance for "byte-identical, restored, not reinvented" — do not re-derive
+these from scratch during merge; keep the restored blocks intact. These land
+after the (auto-merging) `LLAMA_USE_SYSTEM_GGML` guard described above, well
+past the real conflict span.
+
+Other upstream additions elsewhere in the file that fork doesn't touch and
+must simply be carried forward: `test-unicode.cpp`, `test-batch-alloc.cpp`
+(inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard), `test-chat-analysis.cpp`
+(build only, not registered as a test), `test-model-resolution.cpp` (+
+`target_link_libraries(... PRIVATE cpp-httplib)`), `test-mtmd-impl.cpp` (+
+`target_link_libraries(... PRIVATE mtmd)`), and `test-rset-release.cpp` under
+`if (APPLE)`.
 
 **RESOLVE (tests/CMakeLists.txt as a whole):** interleave, with manual care at
-exactly one point — the `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` anchor
-described above. Every other hunk in this file is additive on one side only
-and carries forward mechanically.
+exactly one point — the ~270-line span at merged lines 296–564 described
+above: keep the fork's `test-archs-exclude-cli` block, then insert upstream's
+`test-generate-models`/`test-recurrent-state-rollback` restructuring
+immediately after it, then a single closing `endif()` (git's raw merge
+duplicates or drops this incorrectly when the span is this size — verify by
+hand that exactly one `endif()` closes the `NOT WIN32 OR NOT
+BUILD_SHARED_LIBS` guard afterward). The `LLAMA_USE_SYSTEM_GGML`/`test-alloc`
+anchor needs no manual attention — sanity-check only. Every other hunk in this
+file is additive on one side only and carries forward mechanically.
