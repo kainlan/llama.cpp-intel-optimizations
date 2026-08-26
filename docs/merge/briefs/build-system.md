@@ -49,6 +49,26 @@ git merge-tree --write-tree master b10630 > /tmp/mt.txt
 grep CONFLICT /tmp/mt.txt
 ```
 
+Merged-file line numbers cited below (e.g. "merged lines 296–564") are read
+directly out of the blob `git merge-tree --write-tree` produces — this is the
+merge-ort algorithm, the one `git merge`/wave-1's actual merge uses. They were
+re-derived at fork commit `bf03d2031` (`master` at that point; `b10630` is a
+fixed tag) via:
+
+```bash
+tree=$(git merge-tree --write-tree master b10630)   # writes conflict markers into the blob for a conflicted path
+git show ${tree}:<path> | grep -n '^<<<<<<<\|^=======\|^>>>>>>>'
+```
+
+This is a different algorithm from `git merge-file` (plain 3-way, xdiff/diff3)
+run directly against the three blobs `git merge-tree` names for a path — the
+two agree on `tests/CMakeLists.txt` (both land at 296/523/564) but **diverge**
+on `ggml/src/ggml-sycl/CMakeLists.txt`, where `merge-file` reports a conflict
+at a location `merge-tree`/merge-ort does not touch at all. Agreement on one
+file is not evidence for another. Treat `git merge-tree --write-tree` as the
+sole authority for conflict location in this brief; do not extrapolate from a
+`merge-file` experiment on a different file, however similar it looks.
+
 ---
 
 ## `CMakeLists.txt` (root)
@@ -236,34 +256,68 @@ default to "ours" here without confirming which AOT flag form the fork
 actually needs on hardware — this is a functional compiler-flag choice, not a
 cosmetic one.
 
-**⚠️ The conflict git's own merge actually reports is at the WRONG location —
-do not trust its line numbers.** Ran for real (`git merge-file -L ours -L base
--L theirs` against the three blobs `git merge-tree` names for this path):
-git's xdiff-based 3-way merge places the conflict markers around
-`add_executable(test-xmx-config ...)`'s `target_include_directories(...)`
-block (~line 1197 of the merged text), splicing upstream's
-`GGML_SYCL_MAX_PARALLEL_LINK_JOBS` patch in there instead of anywhere near
-`GGML_SYCL_DEVICE_ARCH`. Worse: the *real* semantic site — master's lines
-836–838, the `--offload-arch=` block quoted above — passes through this merge
-completely untouched, with **no conflict marker at all**, silently keeping
-master's form and silently dropping upstream's `-fsycl-max-parallel-link-jobs`
-feature. The file's ~4,900-line rewrite is large enough that git's LCS-based
-diff loses track of which block corresponds to which; the merge tool's output
-for this file cannot be used as a checklist. Wave 1 must (1) not assume the
-absence of a conflict marker at `GGML_SYCL_DEVICE_ARCH` means it's resolved —
-it isn't, it's silently wrong — and (2) not act on the spurious marker it
-does produce near `test-xmx-config` beyond taking "ours" there (upstream's
-content landed in the wrong place and carries no meaning at that location).
+**Actual merge-ort conflict location** (the authority — `git merge-tree
+--write-tree master b10630`, then `git show <tree>:ggml/src/ggml-sycl/CMakeLists.txt`,
+re-derived at fork commit `bf03d2031`): **one conflict, at merged lines
+866 / 3617 / 3632.** This is NOT a small, localized hunk:
 
-**RESOLVE:** interleave, with a flagged manual decision — carry forward all
-123 fork test registrations and the option/glob/link-workaround additions
-verbatim (upstream touches none of that region); for the `GGML_SYCL_DEVICE_ARCH`
-block specifically, do NOT trust git's merge output either way (see above) —
-manually decide between option (a)/(b) and edit master's lines 836–838
-directly, then manually revert whatever git spliced into the `test-xmx-config`
-block back to master's original `target_include_directories(...)` form.
-Flagging this as the **highest-risk single hunk in the whole build-system
-group.**
+- **OURS (master), lines 866–3616 — 2,751 lines, containing 73
+  `add_executable(...)` registrations** (counted directly:
+  `sed -n '866,3617p' <merged-blob> | grep -c 'add_executable('`). It opens
+  immediately after `set(XMX_TEST_SYCL_OPTIONS ...)` with the
+  `# ⚠️ UNIFIED_KERNEL_TEST_STANDALONE IS RETIRED. Do not reintroduce it.`
+  comment, and closes right after `test-cpu-gpu-soa-interaction`'s
+  `RUN_SERIAL TRUE` property line — i.e. it spans nearly the entire
+  `GGML_SYCL_BUILD_XMX_TESTS`-gated block described above. `test-xmx-config`
+  (merged lines ~1194–1198) sits fully **inside** this span, completely
+  intact — it is not touched, spliced, or altered by the merge in any way. A
+  plain `git merge-file` 3-way merge (xdiff/diff3) against the same three
+  blobs reports a conflict there instead — a different algorithm producing a
+  different, wrong answer, not a nuance of the real one (see the method note
+  below). There is no `test-xmx-config` splice to revert.
+- **THEIRS (b10630), lines 3618–3631** — upstream's entire patch to this file
+  reproduced in full (the `ProcessorCount`/`GGML_SYCL_MAX_PARALLEL_LINK_JOBS`
+  addition to the `GGML_SYCL_DEVICE_ARCH` AOT block, shown above under
+  "Upstream intent").
+- A trailing `)` + `endif()` is shared context immediately after the marker,
+  closing both sides' surrounding blocks.
+
+**The core problem stands, just relocated:** master's real
+`GGML_SYCL_DEVICE_ARCH` site — lines 836–838, the `--offload-arch=` form
+quoted above — passes through this merge with **no conflict marker anywhere
+near it**, and `-fsycl-max-parallel-link-jobs`/`ProcessorCount` appear nowhere
+in the merged file except inside the THEIRS side of the 866/3617/3632
+conflict. So resolving that conflict as "ours" — i.e. keeping the 2,751-line
+block wholesale, which is what a shallow "just take ours, it's bigger and
+it's all our tests" instinct would do — silently discards upstream's
+parallel-link-jobs feature exactly as before; it does not appear anywhere
+else to be recovered from. The option (a)/(b) decision from "Upstream intent"
+above still stands and still requires a manual edit to lines 836–838
+specifically, independent of how the 866/3617/3632 conflict itself is
+resolved.
+
+**Method note:** a plain `git merge-file` 3-way merge against the same three
+blobs agrees with this `git merge-tree` result for `tests/CMakeLists.txt`
+(both land at merged lines 296/523/564) but **disagrees** for this file,
+placing its conflict at the wrong location entirely (see above). One file's
+agreement is not evidence for another's — this file's ~4,900-line rewrite is
+large enough that a plain xdiff-based 3-way merge loses track of which block
+corresponds to which. `git merge-tree --write-tree` (merge-ort) is the tool
+wave-1's actual merge runs, and is the sole authority used for every
+coordinate in this brief.
+
+**RESOLVE:** for the 866/3617/3632 conflict, take OURS in full (all 2,751
+lines / 73 registrations — this is the fork's entire XMX test suite and
+upstream contributes nothing inside this span). Separately and additionally,
+manually resolve the `GGML_SYCL_DEVICE_ARCH` AOT flag question at lines
+836–838 — this is NOT satisfied by resolving the conflict above, since
+upstream's patch to that block never appears as a marked conflict there.
+Manually decide between option (a) (port `-fsycl-max-parallel-link-jobs`
+onto the fork's `--offload-arch=` lines) or (b) (restore upstream's
+`spir64_gen` form and re-verify `--offload-arch=` wasn't load-bearing) before
+landing. Also carry forward the option/glob/link-workaround additions outside
+the 866–3616 span verbatim (upstream touches none of that region). Flagging
+this as the **highest-risk single hunk in the whole build-system group.**
 
 ---
 
@@ -310,15 +364,25 @@ LLAMA_COMMIT="...")` block.
 `llama-kv-block.cpp` lands after `llama-kv-cache-dsv4.cpp`, one line further
 down — so git's 3-way merge resolves this without a conflict marker. Confirmed
 against `git merge-tree --write-tree master b10630` (this path does not appear
-in its `CONFLICT` output) and by reading the resulting merged blob directly,
-which contains all six new sources in one unbroken run, in this order:
+in its `CONFLICT` output). Reading the resulting merged blob directly: only
+three of the six new sources land contiguously — upstream's two plus the
+fork's `llama-kv-block.cpp` — interspersed with the two pre-existing anchor
+lines each side inserted next to:
 ```
-llama-kv-cache-dsa.cpp
-llama-kv-cache-dsa-iswa.cpp     <- upstream
-llama-kv-cache-msa.cpp          <- upstream
-llama-kv-cache-dsv4.cpp
-llama-kv-block.cpp              <- fork
+llama-kv-cache-dsa.cpp          (pre-existing anchor)
+llama-kv-cache-dsa-iswa.cpp     <- upstream, new
+llama-kv-cache-msa.cpp          <- upstream, new
+llama-kv-cache-dsv4.cpp         (pre-existing anchor)
+llama-kv-block.cpp              <- fork, new
 ```
+The other three fork-only sources are NOT part of this run — they sit
+scattered elsewhere in the same `add_library(llama ...)` list, at their
+already-described anchor points (`llama-pp-scheduler.cpp` after
+`llama-memory-recurrent.cpp`, `llama-moe-profile.cpp` between
+`llama-model.cpp` and `llama-quant.cpp`, `llama-tensor-class.cpp` after
+`llama-sampler.cpp`). All six are present in the merged file — they are just
+not contiguous with each other.
+
 The `set_target_properties`/version rewrite likewise has no fork-side edit to
 conflict with — it merges as a clean "theirs" take, but it depends on the root
 `CMakeLists.txt` `LLAMA_VERSION_BASE`/`LLAMA_VERSION_MAJOR` variables existing
@@ -495,7 +559,7 @@ CI enablement is T24's concern, not this brief's.
 | `CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
 | `ggml/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
 | `ggml/src/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
-| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict**, and git's own merge marks the WRONG location (spurious hit near `test-xmx-config`; the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 shows no marker and silently loses upstream's feature); 123 fork test registrations elsewhere, untouched by upstream | interleave + **manual flag decision**, ignore git's conflict markers (highest risk) |
+| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict** at merged lines 866/3617/3632 (2,751-line OURS span, 73 registrations, vs upstream's whole patch); the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 carries no marker at all and silently loses upstream's feature regardless of how the conflict is resolved | take OURS at 866/3617/3632 + **separate manual flag decision** at 836–838 (highest risk) |
 | `scripts/ui-assets.cmake` | different functions, no overlap | interleave |
 | `src/CMakeLists.txt` | auto-merges cleanly — insertion points differ by one line (`llama-kv-cache-dsa.cpp` vs `llama-kv-cache-dsv4.cpp`); confirmed absent from `git merge-tree`'s CONFLICT output | none needed; sanity-check all six new sources + version rewrite present |
 | `tests/CMakeLists.txt` | **real conflict** at merged lines 296–564 (fork's `test-archs-exclude-cli` block vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring); the `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard auto-merges | interleave, manual splice at lines 296–564 only |
@@ -570,10 +634,12 @@ right after this guard in the merged file with no interaction. Fork's `master`
 never touches `LLAMA_USE_SYSTEM_GGML` or moves `test-gguf.cpp`, so there is
 nothing for these two edits to collide over.
 
-**⚠️ The real conflict is a ~270-line span the earlier draft of this brief
-missed entirely: merged-file lines 296–564** (per `git merge-file -L ours -L
-base -L theirs`), immediately after `llama_build_and_test(test-llama-archs.cpp)`
-inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard. Both sides insert new
+**The real conflict is a ~270-line span at merged lines 296–564** (per
+`git merge-tree --write-tree master b10630`, cross-checked with
+`git merge-file -L ours -L base -L theirs` against the same three blobs —
+the two agree here, see the method note above), immediately after
+`llama_build_and_test(test-llama-archs.cpp)` inside the `NOT WIN32 OR NOT
+BUILD_SHARED_LIBS` guard. Both sides insert new
 content at that exact point and each side's insertion runs through to the
 guard's closing `endif()`:
 - **Fork ("ours")** inserts the `test-archs-exclude-cli` block: a
