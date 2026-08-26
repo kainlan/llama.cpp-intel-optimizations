@@ -38,7 +38,7 @@ conflict in git's own attempt: `ggml/src/ggml-sycl/CMakeLists.txt`,
 `tests/CMakeLists.txt`, `.github/workflows/build-wasm.yml`, and
 `.github/workflows/build-webgpu.yml`. The other eight — `CMakeLists.txt`,
 `ggml/CMakeLists.txt`, `ggml/src/CMakeLists.txt`, `scripts/ui-assets.cmake`,
-`src/CMakeLists.txt`, `tests/CMakeLists.txt`'s sibling `tools/CMakeLists.txt`,
+`src/CMakeLists.txt`, `tools/CMakeLists.txt`,
 `tools/ui/CMakeLists.txt`, and `.github/workflows/build-sycl.yml` — auto-merge
 cleanly despite adjacent or nearby hunks; their entries below describe the
 apparent adjacency for context and end in a sanity-check, not a conflict
@@ -68,6 +68,21 @@ at a location `merge-tree`/merge-ort does not touch at all. Agreement on one
 file is not evidence for another. Treat `git merge-tree --write-tree` as the
 sole authority for conflict location in this brief; do not extrapolate from a
 `merge-file` experiment on a different file, however similar it looks.
+
+To reproduce the `merge-file` cross-check for any path: `git merge-tree`'s own
+plumbing output (without `--write-tree`) lists the base/ours/theirs blob OIDs
+for every conflicted path in `<mode> <oid> <stage> <path>` form (stage 1 =
+base, 2 = ours, 3 = theirs) — extract the three blobs by OID and diff them
+directly, no worktree or checkout needed:
+
+```bash
+git merge-tree master b10630 | awk -v p='tests/CMakeLists.txt' \
+  '$0 ~ "\t"p"$" {print $2, $3}'                # -> <oid> <stage> per line, 3 lines for a conflict
+git show <stage-1-oid> > base.txt   # repeat for stage 2 (ours) -> ours.txt, stage 3 (theirs) -> theirs.txt
+cp ours.txt merged.txt
+git merge-file -L ours -L base -L theirs merged.txt base.txt theirs.txt
+grep -n '^<<<<<<<\|^=======\|^>>>>>>>' merged.txt
+```
 
 ---
 
@@ -258,47 +273,51 @@ cosmetic one.
 
 **Actual merge-ort conflict location** (the authority — `git merge-tree
 --write-tree master b10630`, then `git show <tree>:ggml/src/ggml-sycl/CMakeLists.txt`,
-re-derived at fork commit `bf03d2031`): **one conflict, at merged lines
-866 / 3617 / 3632.** This is NOT a small, localized hunk:
+re-derived at fork commit `bf03d2031`): **one conflict; markers at merged
+lines 866 / 3617 / 3632.** Line numbers below are marker-exclusive — content
+starts the line *after* an opening marker and ends the line *before* the
+next one, since an executor resolving this keeps the content, never a marker
+line. This is NOT a small, localized hunk:
 
-- **OURS (master), lines 866–3616 — 2,751 lines, containing 73
+- **OURS (master) content, lines 867–3616 — 2,750 lines, containing 73
   `add_executable(...)` registrations** (counted directly:
-  `sed -n '866,3617p' <merged-blob> | grep -c 'add_executable('`). It opens
+  `sed -n '867,3616p' <merged-blob> | grep -c 'add_executable('`). It opens
   immediately after `set(XMX_TEST_SYCL_OPTIONS ...)` with the
   `# ⚠️ UNIFIED_KERNEL_TEST_STANDALONE IS RETIRED. Do not reintroduce it.`
   comment, and closes right after `test-cpu-gpu-soa-interaction`'s
   `RUN_SERIAL TRUE` property line — i.e. it spans nearly the entire
-  `GGML_SYCL_BUILD_XMX_TESTS`-gated block described above. `test-xmx-config`
-  (merged lines ~1194–1198) sits fully **inside** this span, completely
-  intact — it is not touched, spliced, or altered by the merge in any way. A
-  plain `git merge-file` 3-way merge (xdiff/diff3) against the same three
-  blobs reports a conflict there instead — a different algorithm producing a
+  `GGML_SYCL_BUILD_XMX_TESTS`-gated block described above. `test-xmx-config`'s
+  full registration (merged lines 1194–1215: the `add_executable(...)`
+  through its `set_tests_properties(xmx-config PROPERTIES ... TIMEOUT 60)`
+  call) sits fully **inside** this span, completely intact — it is not
+  touched, spliced, or altered by the merge in any way. A plain
+  `git merge-file` 3-way merge (xdiff/diff3) against the same three blobs
+  reports a conflict there instead — a different algorithm producing a
   different, wrong answer, not a nuance of the real one (see the method note
   below). There is no `test-xmx-config` splice to revert.
-- **THEIRS (b10630), lines 3618–3631** — upstream's entire patch to this file
-  reproduced in full (the `ProcessorCount`/`GGML_SYCL_MAX_PARALLEL_LINK_JOBS`
-  addition to the `GGML_SYCL_DEVICE_ARCH` AOT block, shown above under
-  "Upstream intent").
-- A trailing `)` + `endif()` is shared context immediately after the marker,
-  closing both sides' surrounding blocks.
+- **THEIRS (b10630) content, lines 3618–3631** — upstream's entire patch to
+  this file reproduced in full (the
+  `ProcessorCount`/`GGML_SYCL_MAX_PARALLEL_LINK_JOBS` addition to the
+  `GGML_SYCL_DEVICE_ARCH` AOT block, shown above under "Upstream intent").
+- A trailing `)` + `endif()` is shared context immediately after the closing
+  marker, closing both sides' surrounding blocks.
 
 **The core problem stands, just relocated:** master's real
 `GGML_SYCL_DEVICE_ARCH` site — lines 836–838, the `--offload-arch=` form
 quoted above — passes through this merge with **no conflict marker anywhere
 near it**, and `-fsycl-max-parallel-link-jobs`/`ProcessorCount` appear nowhere
-in the merged file except inside the THEIRS side of the 866/3617/3632
-conflict. So resolving that conflict as "ours" — i.e. keeping the 2,751-line
-block wholesale, which is what a shallow "just take ours, it's bigger and
-it's all our tests" instinct would do — silently discards upstream's
+in the merged file except inside the THEIRS content of this conflict. So
+resolving the conflict as "ours" — i.e. keeping the 2,750-line block
+wholesale, which is what a shallow "just take ours, it's bigger and it's all
+our tests" instinct would do — silently discards upstream's
 parallel-link-jobs feature exactly as before; it does not appear anywhere
 else to be recovered from. The option (a)/(b) decision from "Upstream intent"
 above still stands and still requires a manual edit to lines 836–838
-specifically, independent of how the 866/3617/3632 conflict itself is
-resolved.
+specifically, independent of how this conflict itself is resolved.
 
 **Method note:** a plain `git merge-file` 3-way merge against the same three
 blobs agrees with this `git merge-tree` result for `tests/CMakeLists.txt`
-(both land at merged lines 296/523/564) but **disagrees** for this file,
+(both land at marker lines 296/523/564) but **disagrees** for this file,
 placing its conflict at the wrong location entirely (see above). One file's
 agreement is not evidence for another's — this file's ~4,900-line rewrite is
 large enough that a plain xdiff-based 3-way merge loses track of which block
@@ -306,8 +325,8 @@ corresponds to which. `git merge-tree --write-tree` (merge-ort) is the tool
 wave-1's actual merge runs, and is the sole authority used for every
 coordinate in this brief.
 
-**RESOLVE:** for the 866/3617/3632 conflict, take OURS in full (all 2,751
-lines / 73 registrations — this is the fork's entire XMX test suite and
+**RESOLVE:** for this conflict, take the OURS content in full (867–3616, all
+2,750 lines / 73 registrations — this is the fork's entire XMX test suite and
 upstream contributes nothing inside this span). Separately and additionally,
 manually resolve the `GGML_SYCL_DEVICE_ARCH` AOT flag question at lines
 836–838 — this is NOT satisfied by resolving the conflict above, since
@@ -316,7 +335,7 @@ Manually decide between option (a) (port `-fsycl-max-parallel-link-jobs`
 onto the fork's `--offload-arch=` lines) or (b) (restore upstream's
 `spir64_gen` form and re-verify `--offload-arch=` wasn't load-bearing) before
 landing. Also carry forward the option/glob/link-workaround additions outside
-the 866–3616 span verbatim (upstream touches none of that region). Flagging
+the 867–3616 span verbatim (upstream touches none of that region). Flagging
 this as the **highest-risk single hunk in the whole build-system group.**
 
 ---
@@ -424,18 +443,16 @@ immediately *after* `add_subdirectory(fit-params)` and before
 **Interaction:** the two insertions are adjacent (fork's SYCL block goes
 before `fit-params`, upstream's METAL/`tuning` block goes after it, both
 between the same two anchor lines `add_subdirectory(export-lora)`/`endif()` and
-`add_subdirectory(results)`), which is close enough that a 3-line-context diff
-may still conflict-mark depending on merge driver — treat as needing a manual
-check even if it applies cleanly. No overlapping *content* (different guard
-variables, different subdirectories, different insertion points relative to
-`fit-params`).
+`add_subdirectory(results)`) but do not overlap. **Auto-merges cleanly** —
+confirmed absent from `git merge-tree --write-tree master b10630`'s
+`CONFLICT` output.
 
-**RESOLVE:** interleave, order: `add_subdirectory(export-lora)` → `endif()` →
+**RESOLVE:** none needed; sanity-check the resulting order: `add_subdirectory(export-lora)` → `endif()` →
 [fork's `GGML_SYCL AND NOT GGML_BACKEND_DL` block, 4 subdirs] →
 `add_subdirectory(fit-params)` → [upstream's `GGML_METAL` → `tuning` block] →
-`add_subdirectory(results)`. Drop `add_subdirectory(parser)` per upstream. Take
-the icpx-depfile workaround (fork, first hunk) verbatim — no upstream touch
-there.
+`add_subdirectory(results)`, that `add_subdirectory(parser)` is gone per
+upstream, and that the icpx-depfile workaround (fork, first hunk) is present
+verbatim.
 
 ---
 
@@ -470,15 +487,14 @@ instrumentation.
 
 **Interaction:** upstream's hunk ends exactly where the fork's replaced block
 begins (base line 69, the comment `# Run the provisioning script every build
-...`) — adjacent, not overlapping. Low conflict risk but verify the merge
-driver doesn't mis-splice the `endif()` that closes upstream's `else()` branch
-right before the fork's stamp-based rewrite begins.
+...`) — adjacent, not overlapping. **Auto-merges cleanly** — confirmed absent
+from `git merge-tree --write-tree master b10630`'s `CONFLICT` output.
 
-**RESOLVE:** interleave — take upstream's sanitizer-exclusion wrapper around
-`add_executable(llama-ui-embed ...)` verbatim (it precedes the fork's
-replacement region and touches nothing the fork changed), then take the fork's
-full stamp/`UI_ASSET_DEPENDS`/axis-inventory rewrite verbatim immediately
-after.
+**RESOLVE:** none needed; sanity-check that the resulting file has upstream's
+sanitizer-exclusion wrapper around `add_executable(llama-ui-embed ...)`
+followed immediately by the fork's full stamp/`UI_ASSET_DEPENDS`/axis-inventory
+rewrite, with exactly one `endif()` closing upstream's `else()` branch between
+them (not swallowed or duplicated).
 
 ---
 
@@ -528,8 +544,14 @@ up before `b10630`.
 
 **Interaction:** none — no fork-local content exists to preserve.
 
-**RESOLVE:** theirs — take `b10630`'s version verbatim. Content-only; runtime
-CI enablement is T24's concern, not this brief's.
+**RESOLVE:** theirs — take `b10630`'s version verbatim:
+
+```bash
+git show b10630:.github/workflows/build-wasm.yml > .github/workflows/build-wasm.yml
+git add .github/workflows/build-wasm.yml
+```
+
+Content-only; runtime CI enablement is T24's concern, not this brief's.
 
 ---
 
@@ -547,27 +569,14 @@ already identical between the two sides.
 
 **Interaction:** none — no fork-local content exists to preserve.
 
-**RESOLVE:** theirs — take `b10630`'s version verbatim. Content-only; runtime
-CI enablement is T24's concern, not this brief's.
+**RESOLVE:** theirs — take `b10630`'s version verbatim:
 
----
+```bash
+git show b10630:.github/workflows/build-webgpu.yml > .github/workflows/build-webgpu.yml
+git add .github/workflows/build-webgpu.yml
+```
 
-## Summary table
-
-| file | conflict shape | RESOLVE |
-|---|---|---|
-| `CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
-| `ggml/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
-| `ggml/src/CMakeLists.txt` | disjoint hunks, no textual overlap | interleave |
-| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict** at merged lines 866/3617/3632 (2,751-line OURS span, 73 registrations, vs upstream's whole patch); the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 carries no marker at all and silently loses upstream's feature regardless of how the conflict is resolved | take OURS at 866/3617/3632 + **separate manual flag decision** at 836–838 (highest risk) |
-| `scripts/ui-assets.cmake` | different functions, no overlap | interleave |
-| `src/CMakeLists.txt` | auto-merges cleanly — insertion points differ by one line (`llama-kv-cache-dsa.cpp` vs `llama-kv-cache-dsv4.cpp`); confirmed absent from `git merge-tree`'s CONFLICT output | none needed; sanity-check all six new sources + version rewrite present |
-| `tests/CMakeLists.txt` | **real conflict** at merged lines 296–564 (fork's `test-archs-exclude-cli` block vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring); the `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard auto-merges | interleave, manual splice at lines 296–564 only |
-| `tools/CMakeLists.txt` | adjacent (not overlapping) insertions around `fit-params` | interleave |
-| `tools/ui/CMakeLists.txt` | adjacent (not overlapping), upstream ends exactly where fork's block begins | interleave |
-| `.github/workflows/build-sycl.yml` | disjoint insertions in same job | interleave (content-only) |
-| `.github/workflows/build-wasm.yml` | fork is a strict subset of upstream | theirs (content-only) |
-| `.github/workflows/build-webgpu.yml` | fork is a strict subset of upstream | theirs (content-only) |
+Content-only; runtime CI enablement is T24's concern, not this brief's.
 
 ---
 
@@ -634,37 +643,77 @@ right after this guard in the merged file with no interaction. Fork's `master`
 never touches `LLAMA_USE_SYSTEM_GGML` or moves `test-gguf.cpp`, so there is
 nothing for these two edits to collide over.
 
-**The real conflict is a ~270-line span at merged lines 296–564** (per
-`git merge-tree --write-tree master b10630`, cross-checked with
-`git merge-file -L ours -L base -L theirs` against the same three blobs —
-the two agree here, see the method note above), immediately after
-`llama_build_and_test(test-llama-archs.cpp)` inside the `NOT WIN32 OR NOT
-BUILD_SHARED_LIBS` guard. Both sides insert new
-content at that exact point and each side's insertion runs through to the
-guard's closing `endif()`:
-- **Fork ("ours")** inserts the `test-archs-exclude-cli` block: a
-  `llama_build_and_test(test-archs-exclude.cpp)` call plus, under `if (NOT
-  WIN32)`, a `llama_test_cmd(bash NAME test-archs-exclude-cli ...)`
-  registration (`SKIP_RETURN_CODE 77` when the driven binary wasn't built) —
-  gates `-x/--exclude` of `test-llama-archs`, deliberately not named
-  `test-llama-archs-exclude` because four CI workflows run `ctest -E
-  "test-llama-archs"` (an unanchored regex) that would otherwise swallow it.
-- **Upstream ("theirs")** inserts the `test-generate-models` /
-  `test-recurrent-state-rollback` fixture restructuring at the same point: a
-  `MODEL_DIR` + `llama_test(test-llama-archs NAME test-generate-models ...)`
-  with `FIXTURES_SETUP generate-models`, then three
-  `test-recurrent-state-rollback*` variants (dense, `-nemotron-h`, `-dsv4`)
-  each with `FIXTURES_REQUIRED generate-models`, replacing the old
-  `llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS
-  -m "${MODEL_DEST}")` registration that lived elsewhere in the base file.
+**The real conflict spans marker-exclusive content lines 297–522 (OURS) and
+524–563 (THEIRS)**, markers at 296/523/564 (per `git merge-tree --write-tree
+master b10630`, cross-checked with `git merge-file -L ours -L base -L
+theirs` against the same three blobs — the two agree here, see the method
+note above), immediately after `llama_build_and_test(test-llama-archs.cpp)`
+inside the `NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard.
 
-Both blocks are real and both-sides-needed; the fix is additive, not
-exclusive. Also restores five host-only C++ tests, unrelated to and *not*
-overlapping this span — `test-tensor-data`, `test-q8-0-soa`,
-`test-mmq-soa-q4-0`, `test-sycl-model-shapes`, and `test-tensor-class` (the
-fifth; links the classifier from libllama per llama.cpp-habh rather than
-compiling `src/llama-tensor-class.cpp` a second time into the test binary) —
-plus `test-q4-0-q8-0-vec-dot-regression` (with its own
+**OURS is NOT just the `test-archs-exclude-cli` block — it is 226 lines
+registering 12 tests across 8 separate `if (GGML_SYCL AND NOT
+GGML_BACKEND_DL)` guards**, verified by walking the merged blob line by
+line. In order: `test-archs-exclude.cpp` plus the `if (NOT WIN32)`-gated
+`test-archs-exclude-cli` (the pair described just below), then
+unconditionally `test-archs-table.cpp` (line 337) and
+`test-sycl-moe-mmvq-tables.cpp` (line 345 — deliberately NOT SYCL-guarded per
+its own comment, since it's host-only), then eight independently-gated
+registrations, each in its own `if (GGML_SYCL AND NOT GGML_BACKEND_DL)`
+block: `test-sycl-route-table-stamp` (360), `test-sycl-vram-headroom` (381),
+`test-onednn-woq-mxfp4` (401), `test-sycl-mxfp4-woq-repack` (426),
+`test-sycl-mxfp4-woq-tiled-repack` (453), `test-sycl-mxfp4-woq-repack-bench`
+(477, `add_executable` only, not a ctest), `test-sycl-mxfp4-woq-gemm-bench`
+(496, likewise), and `test-sycl-moe-routing-device-oracle` (521, likewise).
+- The archs-exclude pair: a `llama_build_and_test(test-archs-exclude.cpp)`
+  call plus, under `if (NOT WIN32)`, a `llama_test_cmd(bash NAME
+  test-archs-exclude-cli ...)` registration (`SKIP_RETURN_CODE 77` when the
+  driven binary wasn't built) — gates `-x/--exclude` of `test-llama-archs`,
+  deliberately not named `test-llama-archs-exclude` because four CI
+  workflows run `ctest -E "test-llama-archs"` (an unanchored regex) that
+  would otherwise swallow it.
+
+**THEIRS is upstream's `test-generate-models`/`test-recurrent-state-rollback`
+fixture restructuring**, 40 lines: a `MODEL_DIR` + `llama_test(test-llama-archs
+NAME test-generate-models ...)` with `FIXTURES_SETUP generate-models`, then
+three `test-recurrent-state-rollback*` variants (dense, `-nemotron-h`,
+`-dsv4`) each with `FIXTURES_REQUIRED generate-models`, replacing the old
+`llama_build_and_test(test-recurrent-state-rollback.cpp LABEL "model" ARGS
+-m "${MODEL_DEST}")` registration that lived elsewhere in the base file.
+
+**⚠️ Why a naive OURS+THEIRS+shared-`endif()` concatenation is wrong — the
+true mechanism, not a guess about size:** the single `endif()` immediately
+after THEIRS's content (the line right after the closing conflict marker) is
+textually unchanged from the base file, so merge-ort factored it as shared
+trailing context instead of duplicating it per side. But it closes a
+*different construct* on each side. Verified from the raw
+`git diff 81ff7abe5..master -- tests/CMakeLists.txt`: master closes the outer
+`NOT WIN32 OR NOT BUILD_SHARED_LIBS` guard *early*, with a **new** `endif()`
+added immediately after the `if (NOT WIN32) ... endif()` sub-block for
+`test-archs-exclude-cli` — so every registration after that point, including
+the very last one (`test-sycl-moe-routing-device-oracle`, opening at line
+521), is unconditional or independently SYCL-gated, and it is *that* last
+block whose closing `endif()` is the base's original line, reused. In
+upstream's file the same original `endif()` still closes the outer `NOT
+WIN32 OR NOT BUILD_SHARED_LIBS` guard, unchanged, because upstream never
+restructured it — its four new fixture tests are inserted immediately before
+that same line, still inside the guard. So concatenating OURS in full, then
+THEIRS in full, then the one shared `endif()`, produces CMake that is
+syntactically balanced (every `if` still has a matching `endif`) but
+semantically wrong: upstream's `MODEL_DIR`/`test-generate-models`/rollback
+fixtures end up nested inside `if (GGML_SYCL AND NOT GGML_BACKEND_DL)` (the
+guard `test-sycl-moe-routing-device-oracle` opened, since nothing ever closes
+it within OURS's own content) — so those four tests silently do not register
+at all on a non-SYCL build, which is the common, default configuration. This
+is not "git duplicates or drops an endif because the span is large" — it is
+one specific, identifiable `endif()` correctly recognized as textually
+identical on both sides while playing two different structural roles.
+
+Also restores five host-only C++ tests, unrelated to and *not* overlapping
+this span — `test-tensor-data`, `test-q8-0-soa`, `test-mmq-soa-q4-0`,
+`test-sycl-model-shapes`, and `test-tensor-class` (the fifth; links the
+classifier from libllama per llama.cpp-habh rather than compiling
+`src/llama-tensor-class.cpp` a second time into the test binary) — plus
+`test-q4-0-q8-0-vec-dot-regression` (with its own
 `target_include_directories(... ${PROJECT_SOURCE_DIR}/ggml/src)`, needed
 because the restored source includes `ggml-cpu/quants.h` → `ggml-common.h`),
 citing llama.cpp-0igs and a specific pre-fork commit (`3c8f296fd`) as the
@@ -681,13 +730,50 @@ must simply be carried forward: `test-unicode.cpp`, `test-batch-alloc.cpp`
 `target_link_libraries(... PRIVATE mtmd)`), and `test-rset-release.cpp` under
 `if (APPLE)`.
 
-**RESOLVE (tests/CMakeLists.txt as a whole):** interleave, with manual care at
-exactly one point — the ~270-line span at merged lines 296–564 described
-above: keep the fork's `test-archs-exclude-cli` block, then insert upstream's
-`test-generate-models`/`test-recurrent-state-rollback` restructuring
-immediately after it, then a single closing `endif()` (git's raw merge
-duplicates or drops this incorrectly when the span is this size — verify by
-hand that exactly one `endif()` closes the `NOT WIN32 OR NOT
-BUILD_SHARED_LIBS` guard afterward). The `LLAMA_USE_SYSTEM_GGML`/`test-alloc`
-anchor needs no manual attention — sanity-check only. Every other hunk in this
-file is additive on one side only and carries forward mechanically.
+**RESOLVE (tests/CMakeLists.txt as a whole):** every hunk in this file except
+one is additive on one side only and carries forward mechanically (including
+the auto-merging `LLAMA_USE_SYSTEM_GGML`/`test-alloc` anchor — no manual
+attention needed there). The one exception, the 297–522/524–563 conflict, is
+manual and has three parts:
+1. Keep every line of OURS (297–522) in order — all 12 registrations across
+   the 8 SYCL guards, unchanged.
+2. Insert THEIRS's 40 lines (524–563) immediately after the `if (NOT WIN32)
+   ... endif()` sub-block for `test-archs-exclude-cli`, and *before* the very
+   next `endif()` (the one that closes the outer `NOT WIN32 OR NOT
+   BUILD_SHARED_LIBS` guard early). This is the one placement that preserves
+   upstream's own original nesting intent — upstream inserted this content
+   immediately after `test-llama-archs.cpp` and before that guard's `endif()`
+   in their own diff — without perturbing any of OURS's already-correct
+   structure.
+3. Add a **new** `endif()` immediately after
+   `target_link_libraries(test-sycl-moe-routing-device-oracle PRIVATE
+   llama-common)`, closing the one guard that no longer has a closer once
+   THEIRS's content moves to step 2: the pre-existing trailing `endif()` (that
+   used to sit right after THEIRS in the raw conflict) now correctly closes
+   only the outer guard, immediately following THEIRS's newly-relocated
+   content, and this new one closes `test-sycl-moe-routing-device-oracle`'s
+   own guard where it was previously left open.
+
+Verify by constructing the resolved region and hand-checking guard nesting —
+every `if` opened in this span must close before its next sibling
+registration begins, and `test-generate-models`/`test-recurrent-state-rollback*`
+must NOT end up inside any `if (GGML_SYCL ...)` block.
+
+---
+
+## Summary table
+
+| file | conflict shape | RESOLVE |
+|---|---|---|
+| `CMakeLists.txt` | disjoint hunks, no textual overlap. **AUTO-MERGES** | none needed; sanity-check exactly one `include(CTest)` (the early one) and the vendor/version-scheme hunks landed |
+| `ggml/CMakeLists.txt` | disjoint hunks, no textual overlap. **AUTO-MERGES** | none needed; sanity-check `enable_testing()` appears exactly once (the fork's early, broadened gate) |
+| `ggml/src/CMakeLists.txt` | disjoint hunks, no textual overlap. **AUTO-MERGES** | none needed; sanity-check `ggml-private-test-registry` and the OpenMP-fetch rewrite both landed |
+| `ggml/src/ggml-sycl/CMakeLists.txt` | **real conflict**, markers at 866/3617/3632 (OURS content 867–3616, 2,750 lines / 73 registrations, vs upstream's whole patch at 3618–3631); the real `GGML_SYCL_DEVICE_ARCH` site at master lines 836–838 carries no marker at all and silently loses upstream's feature regardless of how the conflict is resolved | take OURS content 867–3616 + **separate manual flag decision** at 836–838 (highest risk) |
+| `scripts/ui-assets.cmake` | different functions, no overlap. **AUTO-MERGES** | none needed; sanity-check both `hf_download()` and `npm_build()` changes landed |
+| `src/CMakeLists.txt` | insertion points differ by one line (`llama-kv-cache-dsa.cpp` vs `llama-kv-cache-dsv4.cpp`). **AUTO-MERGES** — confirmed absent from `git merge-tree`'s `CONFLICT` output | none needed; sanity-check all six new sources + version rewrite present |
+| `tests/CMakeLists.txt` | **real conflict**, markers at 296/523/564 (OURS content 297–522, 226 lines / 12 registrations across 8 SYCL guards, vs upstream's `test-generate-models`/`FIXTURES_SETUP` restructuring at 524–563); a naive ours+theirs+shared-`endif()` concatenation nests upstream's 4 new tests inside the last SYCL guard, silently dropping them on non-SYCL builds. The `test-alloc.cpp`/`LLAMA_USE_SYSTEM_GGML` guard elsewhere in the file auto-merges | manual splice — see the full `tests/CMakeLists.txt` entry above (highest-risk region in this file) |
+| `tools/CMakeLists.txt` | adjacent (not overlapping) insertions around `fit-params`. **AUTO-MERGES** — confirmed absent from `CONFLICT` output | none needed; sanity-check ordering and that `add_subdirectory(parser)` is gone |
+| `tools/ui/CMakeLists.txt` | adjacent (not overlapping), upstream ends exactly where fork's block begins. **AUTO-MERGES** — confirmed absent from `CONFLICT` output | none needed; sanity-check exactly one `endif()` between upstream's and the fork's blocks |
+| `.github/workflows/build-sycl.yml` | disjoint insertions in same job. **AUTO-MERGES** | none needed; sanity-check `continue-on-error: true` plus both `ccache-clear` steps landed |
+| `.github/workflows/build-wasm.yml` | fork is a strict subset of upstream. **Real conflict (add/add)** per `git merge-tree`, but trivial — no fork-local content | `git show b10630:.github/workflows/build-wasm.yml > .github/workflows/build-wasm.yml && git add .github/workflows/build-wasm.yml` (theirs, content-only) |
+| `.github/workflows/build-webgpu.yml` | fork is a strict subset of upstream. **Real conflict (content)** per `git merge-tree`, but trivial — no fork-local content | `git show b10630:.github/workflows/build-webgpu.yml > .github/workflows/build-webgpu.yml && git add .github/workflows/build-webgpu.yml` (theirs, content-only) |
