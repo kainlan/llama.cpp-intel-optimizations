@@ -89,6 +89,15 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type(v
 // NULL for foreign/stale devices; never falls back to a default device.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev);
 
+// Dedicated pinned-host buffer type for runtime-demoted KV layers (distinct
+// identity/name "SYCL_KV_Host" from the generic host buft above, so the
+// structural residency decline and diagnostics key on exactly this buft
+// without perturbing other pinned-host consumers).
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type(void);
+// Whether layer `il`'s KV currently lives on-device per the active placement
+// plan. Returns true (today's tiered-device behavior) when no plan is active.
+GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
+
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.
 // Unlike host_buffer_type, this uses the SYCL buffer interface so it works with SYCL kernels.

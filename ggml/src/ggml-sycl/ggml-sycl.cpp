@@ -38554,6 +38554,29 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
     return &ggml_backend_sycl_buffer_type_host;
 }
 
+static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "SYCL_KV_Host";
+}
+
+// Dedicated pinned-host buft for runtime-demoted KV layers (llama.cpp-uize
+// c-qjb5). Shares the generic host buft's alloc/free/clear iface and context
+// (same unified-cache-owned allocation path) but carries a distinct identity
+// via .get_name, so `ggml_sycl_tensor_in_kv_host_buft` (the structural
+// residency decline) and any diagnostics key on exactly this buft and never
+// perturb other pinned-host consumers (e.g. the token-index host staging at
+// line ~10012 above, which must keep resolving to the generic host buft).
+ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) return nullptr;
+    static ggml_backend_buffer_type type = [] {
+        ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();
+        t.iface.get_name = ggml_backend_sycl_kv_host_buffer_type_name;
+        return t;
+    }();
+    return &type;
+}
+
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
@@ -98621,6 +98644,18 @@ ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backen
     return ggml_backend_sycl_kv_buffer_type(ctx->device);
 }
 
+// Whether layer `il`'s KV currently lives on-device per the active placement
+// plan (llama.cpp-uize c-qjb5 registry hook). No active plan preserves
+// today's behavior: every layer reports on-device (the tiered device buft).
+bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il) {
+    GGML_UNUSED(dev);
+    const auto snapshot = ggml_sycl_global_plan_snapshot();
+    if (!snapshot || !snapshot->plan) {
+        return true;
+    }
+    return snapshot->plan->get_kv_device(static_cast<int>(il)) >= 0;
+}
+
 static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_backend_dev_t dev,
                                                                            void *             ptr,
                                                                            size_t             size,
@@ -100478,6 +100513,12 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_cancel_kv_layer_mask_from_dev") == 0) {
         return (void *) ggml_backend_sycl_cancel_kv_layer_mask_from_dev;
+    }
+    if (strcmp(name, "ggml_backend_sycl_kv_host_buffer_type") == 0) {
+        return (void *) ggml_backend_sycl_kv_host_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_sycl_kv_layer_on_device_from_dev") == 0) {
+        return (void *) ggml_backend_sycl_kv_layer_on_device_from_dev;
     }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     if (strcmp(name, "ggml_backend_sycl_test_pop_kv_layer_mask") == 0) {
