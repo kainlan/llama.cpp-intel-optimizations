@@ -21279,6 +21279,36 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
 
             size_t             nbytes            = ggml_nbytes(tensor);
             ggml_sycl_cache_id staging_cache_key = ggml_backend_sycl_get_tensor_cache_key(tensor, device);
+
+            // llama.cpp-38jl: graph_prestage_leaf_tensors() may already have staged
+            // this exact tensor into the UNIFIED CACHE (the cache->ensure_cached()
+            // branch of stage_tensor(), keyed identically to staging_cache_key
+            // above) before recording began. The staging cache consulted below is a
+            // SEPARATE store that branch never populates, so without this check a
+            // dispatch-time lookup here always misses for such tensors and falls
+            // through to the raw (unstaged) tensor->data -- fatal for any op (e.g.
+            // bin-broadcast) that refuses to submit a memcpy while a SYCL command
+            // graph is recording. This is also a canonical-contract fix: a
+            // dispatch-time cache that never consults the unified cache's own
+            // mapping is the "side cache outside the unified-cache implementation"
+            // the memory contract (sycl-canonical-memory-architecture.md SS1.2)
+            // forbids. lookup() is lock-free/non-allocating/non-blocking per its own
+            // doc comment, so this costs nothing on the (common) miss path.
+            if (staging_cache_key.valid) {
+                if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device)) {
+                    void * unified_cached = cache->lookup(staging_cache_key, GGML_LAYOUT_AOS);
+                    if (unified_cached != nullptr) {
+                        GGML_SYCL_DEBUG(
+                            "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via unified cache "
+                            "(prestage) %p -> %p (%zu bytes)\n",
+                            tensor->name, device, tensor->data, unified_cached, nbytes);
+                        g_data_ptr_cache[{ tensor, device }] =
+                            ggml_sycl::mem_handle::from_chunk_ptr(unified_cached, device, GGML_LAYOUT_AOS, true);
+                        return unified_cached;
+                    }
+                }
+            }
+
             // Hold the OWNING handle (llama.cpp-1df8): the device-side staging
             // allocation backing this pointer is minted with must_device=true and
             // no prefer_vram_zone/use_pinned_pool/KV role, so unified_allocate()
