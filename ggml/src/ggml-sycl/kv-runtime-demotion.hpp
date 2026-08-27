@@ -13,9 +13,15 @@ struct kv_demotion_input {
     size_t               vram_budget      = 0;
     size_t               vram_bytes       = 0;  // current total incl. device-resident KV
     size_t               kv_per_layer     = 0;  // full-attn per-layer KV bytes at requested n_ctx
+    // Carried for parity with placement_plan; deliberately unread -- SWA layers
+    // are never demoted, so only kv_per_layer participates in the decision.
     size_t               kv_per_swa_layer = 0;
-    std::vector<int>     kv_device;             // index = layer id; >=0 device, -1 host
-    std::vector<uint8_t> swa_layer_mask;        // 1 = SWA layer (never demoted)
+    // Index = layer id; must be sized to n_layers. >=0 means device-resident on
+    // that device id; -1 means already on the host tier. Layers absent from
+    // placement_plan::kv_device are represented here as -1 (the caller adapts
+    // the plan's sparse map into this dense vector before calling).
+    std::vector<int>     kv_device;
+    std::vector<uint8_t> swa_layer_mask;  // 1 = SWA layer (never demoted)
 };
 
 struct kv_demotion_result {

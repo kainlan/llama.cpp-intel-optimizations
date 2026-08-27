@@ -1582,9 +1582,15 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
 # Runtime KV demotion decision (llama.cpp-uize/llama.cpp-3px1).  Deliberately a
 # pure host-linkable TU with no include of unified-cache.hpp (the c-8lff siting
 # lesson: an enum placed in unified-cache.hpp "would not have linked" for a
-# host-only harness).  kv-runtime-demotion.{hpp,cpp} touch no SYCL header at
-# all, so unlike every other test in this file this target needs neither
-# SYCL_LINK_ONLY_TEST_OPTIONS nor ggml-base -- it is a plain host binary.
+# host-only harness).  Same arrangement as test-zone-sizing (CMakeLists.txt
+# :4324-4344), same reason -- the TU includes no SYCL header, so this target
+# needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor ggml-base and builds in
+# seconds. kv-runtime-demotion.cpp is ALSO globbed into libggml-sycl (file(GLOB
+# at :83) and compiled there with -fsycl like every other backend TU -- that is
+# the production build Task 5 links against, this target is the host-only one.
+# Staying SYCL-header-free is therefore a live constraint, not incidental: any
+# future #include of a SYCL/unified-cache header here would still compile in
+# the production TU but break this test's build.
 add_executable(test-kv-runtime-demotion
     tests/test-kv-runtime-demotion.cpp
     kv-runtime-demotion.cpp

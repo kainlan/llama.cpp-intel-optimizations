@@ -11,6 +11,14 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         return r;
     }
 
+    // Loop-invariant: kv_per_layer never changes across layers, so a caller
+    // that supplied no per-layer byte figure cannot size any demotion --
+    // decide nothing rather than evaluate the same false premise per layer.
+    if (in.kv_per_layer == 0) {
+        r.fits = false;
+        return r;
+    }
+
     const int n_layers = (int) in.kv_device.size();
     for (int l = n_layers - 1; l >= 0; --l) {
         if (in.kv_device[l] < 0) {
@@ -20,8 +28,8 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         if (is_swa) {
             continue;  // SWA KV is ~1.5 MB/layer; demoting it buys nothing and costs a split
         }
-        if (in.kv_per_layer == 0) {
-            break;
+        if (in.kv_per_layer > r.vram_bytes_after) {
+            break;  // demoting would underflow vram_bytes_after; refuse rather than wrap
         }
         r.demoted_layers.push_back(l);
         r.vram_bytes_after -= in.kv_per_layer;
