@@ -1579,6 +1579,25 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# Runtime KV demotion decision (llama.cpp-uize/llama.cpp-3px1).  Deliberately a
+# pure host-linkable TU with no include of unified-cache.hpp (the c-8lff siting
+# lesson: an enum placed in unified-cache.hpp "would not have linked" for a
+# host-only harness).  kv-runtime-demotion.{hpp,cpp} touch no SYCL header at
+# all, so unlike every other test in this file this target needs neither
+# SYCL_LINK_ONLY_TEST_OPTIONS nor ggml-base -- it is a plain host binary.
+add_executable(test-kv-runtime-demotion
+    tests/test-kv-runtime-demotion.cpp
+    kv-runtime-demotion.cpp
+)
+target_include_directories(test-kv-runtime-demotion PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-kv-runtime-demotion COMMAND test-kv-runtime-demotion)
+set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
+    LABELS "sycl;kv;demotion;hostonly"
+    TIMEOUT 60
+)
+
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
