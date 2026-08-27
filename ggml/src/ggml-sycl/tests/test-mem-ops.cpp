@@ -1,3 +1,4 @@
+#include "../common.hpp"
 #include "../mem-handle.hpp"
 #include "../mem-ops.hpp"
 #include "../unified-cache.hpp"
@@ -139,6 +140,45 @@ int main() {
         auto                  unified_back = ggml_sycl::mem_copy_async(host_b_h, unified_h, size, q, { unified_fill });
         unified_back.wait_and_throw();
         failed += !check_bytes(host_b, size, 0x55, "unified_alloc-owned fill+D2H");
+    }
+
+    // llama.cpp-4do9 (TKV-9): the census over tiered_kv_buffer_set_tensor and
+    // the tp-buffer get/set functions found every ggml_sycl_copy_handle_for_raw_ptr
+    // call site already declaring its byte contract (fixed by c1f4504c8; see
+    // that commit's message for the family of sites this guards). Lock in the
+    // underlying primitive's behavior directly so a future 3-arg regression at
+    // any of those call sites -- or a new one added later -- is caught
+    // structurally rather than only by re-reading the source: an unregistered
+    // external pointer with NO declared byte contract must resolve to extent 0
+    // (the exact fxrg failure shape -- llama.cpp-fxrg), and the same pointer
+    // WITH a byte contract must resolve to that declared extent.
+    {
+        std::vector<uint8_t> unregistered_buf(128, 0xAB);
+
+        ggml_sycl::mem_handle no_contract =
+            ggml_sycl_memcpy_handle_for_raw_ptr(unregistered_buf.data(), /*fallback_device=*/-1, GGML_LAYOUT_AOS,
+                                                /*fallback_on_device=*/false, /*fallback_unknown=*/false,
+                                                /*trusted_extent=*/0);
+        ggml_sycl::resolved_ptr no_contract_resolved = no_contract.resolve();
+        if (no_contract_resolved.extent != 0) {
+            std::fprintf(stderr, "FAIL: unregistered pointer with no byte contract must resolve to extent 0, got %zu\n",
+                         no_contract_resolved.extent);
+            failed++;
+        }
+
+        constexpr size_t      contract_bytes = 128;
+        ggml_sycl::mem_handle with_contract =
+            ggml_sycl_memcpy_handle_for_raw_ptr(unregistered_buf.data(), /*fallback_device=*/-1, GGML_LAYOUT_AOS,
+                                                /*fallback_on_device=*/false, /*fallback_unknown=*/false,
+                                                /*trusted_extent=*/contract_bytes);
+        ggml_sycl::resolved_ptr with_contract_resolved = with_contract.resolve();
+        if (with_contract_resolved.ptr != unregistered_buf.data() || with_contract_resolved.extent != contract_bytes) {
+            std::fprintf(stderr,
+                         "FAIL: unregistered pointer with a %zu-byte contract must resolve to that extent "
+                         "(got ptr=%p extent=%zu)\n",
+                         contract_bytes, with_contract_resolved.ptr, with_contract_resolved.extent);
+            failed++;
+        }
     }
 
     sycl::free(host_a, q);
