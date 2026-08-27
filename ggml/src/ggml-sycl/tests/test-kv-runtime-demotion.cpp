@@ -96,7 +96,7 @@ int main() {
         CHECK(r.fits, "case 6: fits");
         CHECK(r.demoted_layers == (std::vector<int>{ 2 }), "case 6: only layer 2 newly demoted");
     }
-    // 7. a single layer's KV exceeds the whole overshoot: refuse without
+    // 7. a single layer's KV exceeds the remaining total VRAM: refuse without
     // wrapping vram_bytes_after (size_t underflow would report a huge total
     // instead of "did not fit").
     {

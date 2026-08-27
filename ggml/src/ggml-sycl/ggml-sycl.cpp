@@ -147,6 +147,7 @@
 #include "ggml-sycl/fused-ffn.hpp"
 #include "ggml-sycl/fused-moe-esimd.hpp"
 #include "ggml-sycl/fused-norm-gemm.hpp"
+#include "ggml-sycl/kv-runtime-demotion.hpp"
 #include "ggml-sycl/kv-tier-manager.hpp"
 #include "ggml-sycl/l2-prefetch.hpp"
 #include "ggml-sycl/layer-prefetch.hpp"
@@ -15811,8 +15812,71 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
     next_plan.planner_n_seq_max = n_seq_max;
     ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
-    if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(
-            next_plan, g_tensor_inventory_detail, next_kv_info.n_expert_used, &replan_reason)) {
+    bool replan_ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(next_plan, g_tensor_inventory_detail,
+                                                                       next_kv_info.n_expert_used, &replan_reason);
+
+    // Over budget: try re-placing full-attn KV overflow to the host tier
+    // (owner ruling llama.cpp-uize c-qjb5) before refusing. Only the two
+    // reasons that mean "this plan is simply larger than the budget" are
+    // demotable -- DEMAND_INVALID/GLOBAL_CHARGE_MISMATCH/
+    // PER_DEVICE_REACCOUNT_FAILED/HOST_GROWTH_OVERFLOW/ARITHMETIC_OVERFLOW/
+    // EXCEPTION are accounting defects that demotion would mask, not capacity
+    // problems it can cure (f3aa4a803's reason classification).
+    if (!replan_ok && (replan_reason == ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED ||
+                       replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED)) {
+        ggml_sycl::kv_demotion_input din;
+        din.vram_budget       = next_plan.vram_budget;
+        din.vram_bytes        = next_plan.vram_bytes;
+        din.kv_per_layer      = next_plan.kv_per_layer;
+        din.kv_per_swa_layer  = next_plan.kv_per_swa_layer;
+        const size_t n_layers = next_plan.kv_layer_count();
+        din.kv_device.resize(n_layers);
+        din.swa_layer_mask.assign(next_plan.swa_layer_mask.begin(), next_plan.swa_layer_mask.end());
+        for (size_t l = 0; l < n_layers; ++l) {
+            din.kv_device[l] = next_plan.get_kv_device((int) l);
+        }
+
+        const ggml_sycl::kv_demotion_result dr = ggml_sycl::plan_runtime_kv_demotion(din);
+        if (dr.fits && !dr.demoted_layers.empty()) {
+            for (int l : dr.demoted_layers) {
+                next_plan.kv_device[l] = -1;
+            }
+            next_plan.refresh_kv_byte_totals();
+            bool reaccounted = next_plan.rebuild_runtime_per_device_vram();
+            if (reaccounted) {
+                // BUDGET_EXCEEDED/GROWTH_BUDGET_EXCEEDED are both gated on
+                // !plan.multi_device inside replan_moe_mmid_workspaces_for_runtime,
+                // so this reason pair cannot occur for a multi-device plan --
+                // mirror the single-device mmid-pool reconciliation the
+                // original call above performs rather than trust an untested
+                // multi-device path.
+                if (next_plan.multi_device) {
+                    reaccounted = false;
+                } else if (next_plan.vram_bytes > SIZE_MAX - current->plan->moe_mmid_device_pool_bytes) {
+                    reaccounted = false;
+                } else {
+                    next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
+                }
+            }
+            if (reaccounted) {
+                ggml_sycl::moe_mmid_runtime_reason retry_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+                if (ggml_sycl::replan_moe_mmid_workspaces_for_runtime(next_plan, g_tensor_inventory_detail,
+                                                                      next_kv_info.n_expert_used, &retry_reason)) {
+                    replan_ok = true;
+                    GGML_LOG_WARN(
+                        "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
+                        "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
+                        "Largest all-VRAM context is about -c %u\n",
+                        dr.demoted_layers.size(), dr.host_kv_bytes_added / (1024.0 * 1024.0), n_ctx,
+                        ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+                } else {
+                    replan_reason = retry_reason;
+                }
+            }
+        }
+    }
+
+    if (!replan_ok) {
         // Report the cause and the numbers behind it. The predecessor of this
         // line named MMID workspaces for every refusal, including the common one
         // that has no MMID component at all -- a KV-driven budget overrun -- and
