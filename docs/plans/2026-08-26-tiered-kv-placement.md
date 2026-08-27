@@ -239,7 +239,8 @@ The demotion decision as a pure function in its own host-linkable TU — deliber
 
 **Implementation Guide:**
 
-1. **RED** — create `ggml/src/ggml-sycl/tests/test-kv-runtime-demotion.cpp`:
+1. **RED** — create `ggml/src/ggml-sycl/tests/test-kv-runtime-demotion.cpp`.
+   [AMENDED 2026-08-26 during execution, lead-approved: the sketch below uses bare `assert()`, which this repo's Release build strips via `-O3 -DNDEBUG`, making the test silently vacuous (known issue llama.cpp-u2mz). The implemented test replaces every `assert` with the `CHECK(cond, msg)` fprintf+return-1 macro per the `test-zone-sizing.cpp` precedent, preserving the 6 behaviors 1:1. Registration also landed in `ggml/src/ggml-sycl/CMakeLists.txt` as test `sycl-kv-runtime-demotion` (see the corrected file-scope note above).]
 
 ```cpp
 #include "../kv-runtime-demotion.hpp"
