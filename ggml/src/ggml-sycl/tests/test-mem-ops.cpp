@@ -145,13 +145,15 @@ int main() {
     // llama.cpp-4do9 (TKV-9): the census over tiered_kv_buffer_set_tensor and
     // the tp-buffer get/set functions found every ggml_sycl_copy_handle_for_raw_ptr
     // call site already declaring its byte contract (fixed by c1f4504c8; see
-    // that commit's message for the family of sites this guards). Lock in the
-    // underlying primitive's behavior directly so a future 3-arg regression at
-    // any of those call sites -- or a new one added later -- is caught
-    // structurally rather than only by re-reading the source: an unregistered
-    // external pointer with NO declared byte contract must resolve to extent 0
-    // (the exact fxrg failure shape -- llama.cpp-fxrg), and the same pointer
-    // WITH a byte contract must resolve to that declared extent.
+    // that commit's message for the family of sites this guards). This locks
+    // in the underlying primitive's trusted-extent resolution directly: an
+    // unregistered external pointer with NO declared byte contract must
+    // resolve to extent 0 (the exact fxrg failure shape -- llama.cpp-fxrg),
+    // and the same pointer WITH a byte contract must resolve to that declared
+    // extent. It does NOT exercise the call sites above, and dropping the
+    // `, size` argument at any of them would still leave this test green --
+    // call-site discipline is source-review (census) territory, not something
+    // this test can catch structurally.
     {
         std::vector<uint8_t> unregistered_buf(128, 0xAB);
 
