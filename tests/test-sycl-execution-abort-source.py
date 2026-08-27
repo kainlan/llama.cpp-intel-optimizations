@@ -171,15 +171,30 @@ checks = {
     # --- llama.cpp-8q35 (TKV-15): foreign-terminal drain on DEVICE_BUSY ---
     # Lives in graph_compute_impl's retry slice, NOT begin_graph_body -- see
     # the comment above graph_compute_impl_retry_body's definition for why.
-    "begin drains a terminal FOREIGN owner before refusing DEVICE_BUSY":
-        "ggml_sycl_execution_drain_context_terminal_events(" in graph_compute_impl_retry_body,
+    # Named "graph_compute_impl drains ..." (not "begin drains ...") on
+    # purpose: this is graph_compute_impl's own drain-and-retry, and the
+    # subject of every clause name below says so explicitly -- begin_graph is
+    # only ever the function BEING retried, never the actor doing the
+    # draining. Spec review flagged an earlier draft's ambiguous "begin ..."
+    # phrasing as readable the other way around.
+    #
+    # The needle is the call WITH its argument
+    # ("...(owner_ctx.value)"), not the bare function name. The bare name
+    # alone also appears in the rationale comment above graph_compute_impl_
+    # retry_body's own definition ("...drain_context_terminal_events() also
+    # takes [the lock]"), so a needle without the argument self-matches that
+    # comment and would still report PASS with the real call deleted. Spec
+    # review caught this; verified by mutation (delete the call, keep the
+    # comment -- the old needle stayed green, this one goes red).
+    "graph_compute_impl drains a terminal FOREIGN owner before refusing DEVICE_BUSY":
+        "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value)" in graph_compute_impl_retry_body,
     # The foreign-terminal drain must fire only on the contract-compliant
     # DEVICE_BUSY refusal, never on a registry defect (MISMATCH/STALE/
     # OVERFLOW) -- those must keep failing immediately, unmodified.
     "foreign drain only fires on DEVICE_BUSY, never on MISMATCH/STALE/OVERFLOW": ordered(
         graph_compute_impl_retry_body,
         "error::DEVICE_BUSY",
-        "ggml_sycl_execution_drain_context_terminal_events(",
+        "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value)",
     ),
     # Only a TERMINAL foreign owner (COMPLETE/QUARANTINED) may be drained -- an
     # OPEN/SEALED owner is genuine concurrent use and must keep refusing hard,
@@ -190,24 +205,42 @@ checks = {
         "error::DEVICE_BUSY",
         "graph_phase::COMPLETE",
         "graph_phase::QUARANTINED",
-        "ggml_sycl_execution_drain_context_terminal_events(",
+        "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value)",
     ),
     # Exactly one retry within the slice -- the slice starts AFTER the
     # original begin_graph call (consumed as the start_needle), so the retry
-    # call is the only occurrence expected here. No loop.
-    "foreign drain retries begin_graph exactly once":
+    # call is the only occurrence expected here.
+    "graph_compute_impl retries begin_graph exactly once":
         graph_compute_impl_retry_body.count(
             "ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error)"
         ) == 1,
+    # count==1 alone passes on a retry LOOP that wraps the same call text --
+    # e.g. `for (...) { ...begin_graph(...); }` still contains the literal
+    # exactly once even though it can execute any number of times. Spec
+    # review caught this; verified by mutation (wrap the retry call in a
+    # `for` loop -- the count==1 check alone stayed green, this one goes red
+    # because "for (" now appears between the drain and the retry). Slicing
+    # from the drain call to the retry call and requiring no loop keyword in
+    # between catches it: in the real fix the retry sits after the drain
+    # loop has already closed, so nothing between them opens a new one.
+    "graph_compute_impl's retry is not wrapped in a loop": bool(
+        (lambda between: between and "for (" not in between and "while (" not in between)(
+            slice_between(
+                graph_compute_impl_retry_body,
+                "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);",
+                "ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error)",
+            )
+        )
+    ),
     # The deadlock this design avoids (see the comment above
-    # graph_compute_impl_retry_body): the retry slice must never ACQUIRE
-    # begin_graph's own BINDING lock itself, since
+    # graph_compute_impl_retry_body): graph_compute_impl's retry must never
+    # ACQUIRE begin_graph's own BINDING lock itself, since
     # ggml_sycl_execution_drain_context_terminal_events() already takes it
     # internally and performs a blocking wait under it. A lock ACQUISITION
     # pattern, not a bare mention -- the surrounding rationale comment names
     # this same mutex legitimately, so testing for the identifier's mere
     # presence would fail on the comment that explains why it's absent.
-    "foreign drain never re-enters begin_graph's own binding lock":
+    "graph_compute_impl's retry never re-enters begin_graph's own binding lock":
         re.search(r"std::lock_guard<std::mutex>\s*\w*\s*\(\s*g_execution_backend_binding_mutex\s*\)",
                   graph_compute_impl_retry_body) is None,
     "registry device-owner accessor is declared":

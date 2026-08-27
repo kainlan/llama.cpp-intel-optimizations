@@ -83742,13 +83742,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // that is genuine concurrent use and must keep refusing hard, per
         // canonical contract §12.3 ("unsupported today; no optimistic
         // overlap").
-        auto &           registry      = ggml_sycl::execution::global_registry();
-        std::vector<int> busy_devices  = ggml_sycl_execution_aggregate_devices(sycl_ctx);
-        bool             all_drainable = true;
+        auto &                                       registry      = ggml_sycl::execution::global_registry();
+        std::vector<int>                             busy_devices  = ggml_sycl_execution_aggregate_devices(sycl_ctx);
+        bool                                         all_drainable = true;
+        std::vector<ggml_sycl::execution::ContextId> drainable_owners;
+        // PASS 1: validate every contended device's current owner before
+        // touching anything (llama.cpp-8q35 review finding). Draining
+        // device N's owner and only THEN discovering device N+1's owner is
+        // OPEN would mutate registry state on the path this function's
+        // caller is told is "today's unmodified DEVICE_BUSY failure" -- so
+        // nothing may be drained until every device has been confirmed
+        // drainable.
         for (int device : busy_devices) {
             ggml_sycl::execution::ContextId owner_ctx{};
-            if (registry.device_owner_context(device, &owner_ctx) != ggml_sycl::execution::error::OK) {
-                continue;  // freed itself between the failed claim and here
+            const auto                      owner_rc = registry.device_owner_context(device, &owner_ctx);
+            if (owner_rc == ggml_sycl::execution::error::NOT_FOUND) {
+                continue;  // freed itself between the failed claim and here -- nothing to drain
+            }
+            if (owner_rc != ggml_sycl::execution::error::OK) {
+                // Any other registry error (e.g. MISMATCH) is an unexpected
+                // state, not "device is free" -- do not guess, do not drain.
+                all_drainable = false;
+                break;
             }
             ggml_sycl::execution::snapshot owner_snap{};
             if (registry.extract(owner_ctx, &owner_snap) != ggml_sycl::execution::error::OK ||
@@ -83757,9 +83772,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 all_drainable = false;
                 break;
             }
-            ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);
+            drainable_owners.push_back(owner_ctx);
         }
+        // PASS 2: only now, with every contended device proven drainable,
+        // actually drain them and retry once.
         if (all_drainable) {
+            for (const auto & owner_ctx : drainable_owners) {
+                ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);
+            }
             execution_graph_error  = ggml_sycl::execution::error::OK;
             execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
         }

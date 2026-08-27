@@ -516,8 +516,11 @@ int main() {
     // This is the exact registry-level shape of the production defect (probe
     // evidence: requester_context=3 blocked_by_context=2, blocked_by_state=
     // COMPLETE). The fix under review (device_owner_context() plus a foreign-
-    // terminal drain in ggml_sycl_execution_begin_graph()) is a ggml-sycl.cpp
-    // change verified separately on real hardware; this test proves the
+    // terminal drain in ggml_backend_sycl_graph_compute_impl() -- the CALLER
+    // of ggml_sycl_execution_begin_graph(), deliberately not inside
+    // begin_graph's own locked body; see the rationale comment at that call
+    // site) is a ggml-sycl.cpp change verified separately on real hardware;
+    // this test proves the
     // Registry-level state machine the fix depends on: (a) the new accessor
     // correctly identifies the blocking owner, (b) that owner's graph really
     // is COMPLETE (never OPEN -- the two must not be conflated), and (c)
