@@ -235,7 +235,7 @@ The demotion decision as a pure function in its own host-linkable TU — deliber
 
 - [ ] All 6 test behaviors below RED first, then GREEN.
 - [ ] Test binary builds host-only (no SYCL device) and runs in <1 s.
-- [ ] `ctest --test-dir build -R '^test-kv-runtime-demotion$'` passes.
+- [ ] `ctest --test-dir build -R '^sycl-kv-runtime-demotion$'` passes. [name corrected with the registration amendment — the pre-amendment `^test-kv-runtime-demotion$` regex selects 0 tests and scores vacuously]
 
 **Implementation Guide:**
 
