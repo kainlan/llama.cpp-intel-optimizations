@@ -15737,8 +15737,13 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
                                             const std::vector<ggml_sycl::placement_tensor_info> & tensor_inventory,
                                             int                                                   n_expert_used,
                                             uint32_t                                              n_ctx,
-                                            size_t                          old_moe_mmid_device_pool_bytes,
-                                            ggml_sycl::kv_demotion_result * out_demotion) {
+                                            size_t                               old_moe_mmid_device_pool_bytes,
+                                            ggml_sycl::kv_demotion_result *      out_demotion,
+                                            ggml_sycl::moe_mmid_runtime_reason * out_reason) {
+    // Retained for a future multi-device demotion path; the hard refusal
+    // below means it is not read on the branch that would have used it.
+    GGML_UNUSED(old_mmid_charges);
+
     const size_t n_layers = plan.kv_layer_count();
 
     ggml_sycl::kv_demotion_input kv_demotion_in;
@@ -15776,16 +15781,14 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
         // BUDGET_EXCEEDED/GROWTH_BUDGET_EXCEEDED (the only reasons that route
         // here) are both gated on !plan.multi_device inside
         // replan_moe_mmid_workspaces_for_runtime, so this branch is
-        // structurally unreachable -- kept, and left silent on failure like
-        // its counterpart in the original call above, only so an untested
-        // path never silently claims success.
-        if (!ggml_sycl::moe_mmid_reaccount_replacement({}, old_mmid_charges, plan.devices, plan.per_device_vram_budgets,
-                                                       &plan.per_device_vram, &plan.vram_bytes)) {
-            return false;
-        }
+        // structurally unreachable. Refuse unconditionally rather than
+        // attempt (and potentially succeed at) an untested multi-device
+        // reconciliation path -- the safer contract is a hard refusal, not a
+        // best-effort one.
+        return false;
     } else if (plan.vram_bytes > SIZE_MAX - old_moe_mmid_device_pool_bytes) {
         GGML_LOG_ERROR(
-            "[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow -- "
+            "[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow (demotion retry) -- "
             "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
             n_ctx, plan.vram_bytes / (1024.0 * 1024.0), old_moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
         return false;
@@ -15793,7 +15796,7 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
         plan.vram_bytes += old_moe_mmid_device_pool_bytes;
     }
 
-    if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(plan, tensor_inventory, n_expert_used, nullptr)) {
+    if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(plan, tensor_inventory, n_expert_used, out_reason)) {
         return false;
     }
     *out_demotion = demotion_result;
@@ -15904,11 +15907,12 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         // failed attempt cannot leave next_plan -- and the numbers the
         // refusal below prints -- partially mutated. next_plan is replaced
         // only once the demoted plan re-validates.
-        ggml_sycl::placement_plan     demoted_plan = next_plan;
-        ggml_sycl::kv_demotion_result demotion_result;
-        if (ggml_sycl_try_demote_runtime_kv(demoted_plan, old_mmid_charges, g_tensor_inventory_detail,
-                                            next_kv_info.n_expert_used, n_ctx,
-                                            current->plan->moe_mmid_device_pool_bytes, &demotion_result)) {
+        ggml_sycl::placement_plan          demoted_plan = next_plan;
+        ggml_sycl::kv_demotion_result      demotion_result;
+        ggml_sycl::moe_mmid_runtime_reason demote_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
+        if (ggml_sycl_try_demote_runtime_kv(
+                demoted_plan, old_mmid_charges, g_tensor_inventory_detail, next_kv_info.n_expert_used, n_ctx,
+                current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason)) {
             // The "-c" figure describes what fits without ANY demotion, so it
             // must read the pre-demotion next_plan, not demoted_plan: the
             // demoted layers no longer count against budget in
@@ -15922,6 +15926,15 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                 ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
             next_plan = std::move(demoted_plan);
             replan_ok = true;
+        } else if (demote_reason != ggml_sycl::moe_mmid_runtime_reason::OK) {
+            // The demotion actually moved KV and re-validated through the
+            // gate, which then refused it for a DIFFERENT reason than the
+            // original over-budget one. Surface that without touching
+            // next_plan/replan_reason -- the refusal below still reports the
+            // original numbers, this just adds the extra context that
+            // demotion was tried and could not help either.
+            GGML_LOG_WARN("[SYCL-PLAN] host-tier demotion also rejected: %s\n",
+                          ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
         }
         // On failure, demoted_plan is discarded here -- next_plan and
         // replan_reason (the original refusal) are untouched, so the refusal
