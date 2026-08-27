@@ -29,3 +29,13 @@ Acceptance floor for TKV-11, measured on the landed build, B50, default n_ctx (1
 3. **In-VRAM invariant (already in the plan):** contexts that fit entirely in VRAM regress by ≤ noise band vs pre-campaign master (paired interleaved A/B per `docs/backend/sycl-perf-baselines.md`).
 
 Not proposed: a floor at full 131K fill — no cell measured it (32K prefill already dominates cell wall-time; 131K prefill through CPU attention would blow the timeout), and the gate's chat runs never approach it. If the owner wants one, it extrapolates to ≈2–3 tok/s all-host / ≈4–5 tok/s partial-demotion, bandwidth-scaled.
+
+## OWNER RATIFICATION (2026-08-26, supersedes the proposal above)
+
+The owner set a different and stricter bar: **decode TG ≥ 80% of the OVERLAPPED memory-bandwidth roofline** — the theoretical tokens/sec permitted when the host (DDR5, feeding CPU attention over demoted-layer KV) and the device (VRAM, feeding everything device-resident) memory systems stream **concurrently**: `roofline_TG = 1 / max(host_bytes_per_token / host_BW, device_bytes_per_token / device_BW)`, with both bandwidths **measured on this host** (not spec-sheet), and the byte counts taken from the landed plan's actual demotion set at the gate's fill level.
+
+Consequences, accepted by the owner explicitly:
+- The serial scheduler-split execution (B1′) cannot reach 80% of the overlapped roofline at meaningful fill (back-of-envelope at 32K: serial ceiling ≈8.4 tok/s vs overlapped ≈14 → bar ≈11). **B2 — overlapped host-task attention (NEO-style, event-chained per the no-host-waits ruling) is therefore MANDATORY scope**, tracked as TKV-13.
+- B1′ remains the correctness landing step; the correctness acceptance (default-ctx gate) is scored on B1′, the perf floor on B1′+B2.
+- The in-VRAM no-regression invariant and the pairwise-ratio methodology stand unchanged.
+- Gate prerequisite: measured sustained host read BW (STREAM-like, CPU attention access pattern) and device VRAM read BW on the B50, recorded in the TKV-11 gate evidence with the roofline arithmetic shown.
