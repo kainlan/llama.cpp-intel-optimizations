@@ -753,7 +753,7 @@ Direction (b): stop routing recurrent caches through the attention-geometry tier
 **Acceptance Criteria:**
 
 - [ ] RED first: `ctest --test-dir build -R 'test-recurrent-state-rollback' --output-on-failure` currently aborts with `[MEM-OPS] mem_copy destination range rejected: ... extent=60928 ... size=131072` (rc=134). Reproduce and record before editing. (GPU tests — request the lead to run the RED and GREEN invocations; the code edit itself is subagent-safe.)
-- [ ] GREEN: all three `test-recurrent-state-rollback{,-dsv4,-nemotron-h}` pass.
+- [ ] GREEN: `test-recurrent-state-rollback` and `-nemotron-h` pass. [AMENDED 2026-08-26 per TKV-3 census (llama.cpp-ybor comment c-h7t6): dsv4 does not construct `llama_memory_recurrent` — its RED gets a one-run lead root-cause; if the mechanism differs it becomes a separate ticket and does NOT block this task.]
 - [ ] Direction (b) diff is ≤10 lines; direction (a) requires a written justification quoting Task 3's numbers.
 
 **Implementation Guide (direction b):**
@@ -803,7 +803,7 @@ The campaign's acceptance runs, serial on the lead: correctness at default conte
 - [ ] Mistral digit gate: unchanged output.
 - [ ] Paired interleaved A/B (this build vs pre-campaign master) llama-bench Mistral + GPT-OSS at in-VRAM contexts: within noise bands per `docs/backend/sycl-perf-baselines.md` (B70 tg ±10% single-run noise; B50 steady).
 - [ ] Perf floor (owner-ratified 2026-08-26): decode TG ≥ **80% of the overlapped memory-bandwidth roofline** at 32K fill — prerequisite measurements (sustained host DDR5 read BW, B50 VRAM read BW, both on-host) and the roofline arithmetic recorded in the gate evidence. Scored on the B1′+B2 build (Task 13).
-- [ ] `test-recurrent-state-rollback{,-dsv4,-nemotron-h}` green.
+- [ ] `test-recurrent-state-rollback{,-nemotron-h}` green; dsv4 green OR root-caused to a non-zsyj mechanism with its own ticket (amendment c-h7t6).
 - [ ] Decline-engagement observable from Task 8 is NONZERO in the default-ctx gate run (absence-of-work-looks-like-success).
 - [ ] GPU clean after each run (journalctl grep).
 
