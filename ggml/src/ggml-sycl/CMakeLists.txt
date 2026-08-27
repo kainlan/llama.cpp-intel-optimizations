@@ -1680,6 +1680,41 @@ set_tests_properties(sycl-attn-host-pool PROPERTIES
     TIMEOUT 30
 )
 
+# TKV-13 (B2) step 5.1: sustained host DDR5 read bandwidth roofline
+# prerequisite (docs/plans/2026-08-27-tkv13-b2-addendum.md §5.1). Pure host
+# C++ -- no ggml, no SYCL header at all -- so unlike every other target in
+# this file it needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor -fsycl. Not a
+# ctest target: it is a benchmark the lead runs manually and records numbers
+# from, mirroring the bench-dnnl-ops precedent above (add_executable, no
+# add_test).
+add_executable(bench-host-kv-bandwidth
+    tests/bench-host-kv-bandwidth.cpp
+)
+target_link_libraries(bench-host-kv-bandwidth PRIVATE Threads::Threads)
+set_target_properties(bench-host-kv-bandwidth PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# TKV-13 (B2) step 5.2: B50 VRAM read bandwidth roofline prerequisite
+# (docs/plans/2026-08-27-tkv13-b2-addendum.md §5.2). A standalone SYCL
+# microbench with its OWN raw-API device buffer -- not part of the ggml-sycl
+# backend or the unified cache, exactly like bench-dnnl-ops above -- so it
+# needs a real device kernel compile (not SYCL_LINK_ONLY_TEST_OPTIONS) but no
+# AOT target list: it is JIT-compiled at first launch like bench-dnnl-ops,
+# which is fine for a benchmark that warms up before timing. Not a ctest
+# target and NEVER run by an implementer -- GPU work stays lead-run per
+# CLAUDE.md; this only builds the binary for the lead to invoke manually,
+# selector-pinned, single runs.
+add_executable(bench-device-vram-bandwidth
+    tests/bench-device-vram-bandwidth.cpp
+)
+target_compile_options(bench-device-vram-bandwidth PRIVATE "-fsycl")
+target_link_options(bench-device-vram-bandwidth PRIVATE "-fsycl")
+if (IntelSYCL_FOUND)
+    target_link_libraries(bench-device-vram-bandwidth PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(bench-device-vram-bandwidth PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
