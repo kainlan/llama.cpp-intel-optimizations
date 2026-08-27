@@ -80,7 +80,7 @@ n_embd_s = ssm_d_state * ssm_d_inner
 
 ### 1a. Verifying the Mamba branch is actually the one taken (KDA dead-key trap)
 
-`tests/test-llama-archs.cpp:442` writes `LLM_KV_KDA_HEAD_DIM = 128`
+`tests/test-llama-archs.cpp:444` writes `LLM_KV_KDA_HEAD_DIM = 128`
 **unconditionally, for every arch**, including QWEN35/NEMOTRON_H/DEEPSEEK4.
 That key is only ever read by `ml.get_key(LLM_KV_KDA_HEAD_DIM,
 hparams.n_embd_head_kda)` in `src/models/kimi-linear.cpp:10`,
@@ -98,7 +98,7 @@ three archs.
 whether a *wrong*-branch bug would even be visible: the KDA formula is
 `n_embd_head_kda² × n_head()` = `128² × n_head()` = `16384 × n_head()`. Both
 `qwen35-dense` and `nemotron_h-dense` fixtures use `n_head=2` (base default,
-unmodified by either arch's override branch — `test-llama-archs.cpp:230,268`),
+unmodified by either arch's override branch — `test-llama-archs.cpp:231,268`),
 so the KDA formula would evaluate to `16384×2 = 32768` for both:
 
 - **`qwen35-dense`**: KDA branch would give 32768; the correct Mamba branch
@@ -194,9 +194,14 @@ for NEMOTRON_H (`:308-318` head count, `:291-297` FF count) give:
 **Load-bearing finding, not a fixture-shaped guess:** `LLM_ARCH_DEEPSEEK4` has
 its own `case` in the memory-construction switch (`src/llama-model.cpp:2894-2936`)
 that runs *before* the `default:` branch which builds `llama_memory_hybrid`/
-`llama_memory_recurrent` (`:2963-2985`). DEEPSEEK4 always constructs
-`llama_kv_cache_dsv4` instead — it never creates `cache_r_l%d`/`cache_s_l%d`
-tensors, `hparams.n_embd_r()`/`n_embd_s()` are never called for it, and
+`llama_memory_recurrent` (`:2963-2985`). DEEPSEEK4's own case has two
+sub-branches (`:2896-2935`): the `LLAMA_CONTEXT_TYPE_MTP` path constructs
+`llama_kv_cache_iswa` (`:2898-2918`), and the normal path constructs
+`llama_kv_cache_dsv4` (`:2919-2935`) — but **neither** sub-branch ever
+constructs `llama_memory_hybrid`/`llama_memory_recurrent`, so this finding is
+unaffected by which of the two runs: it never creates `cache_r_l%d`/
+`cache_s_l%d` tensors on either branch, `hparams.n_embd_r()`/`n_embd_s()` are
+never called for it, and
 `llm_arch_is_hybrid(DEEPSEEK4) == true` (`llama-arch.cpp:1012`) is consulted
 elsewhere (e.g. `llm_arch_supports_rs_rollback`, `llama-arch.cpp:1036`) but
 **not** by the memory-construction switch, precisely because DEEPSEEK4 is
@@ -281,7 +286,7 @@ n_embd_r = (4-1) * (10240 + 2*8*128) = 3 * 12288 = 36,864
 n_embd_s = 128 * 10240               = 1,310,720
 ```
 
-`llama_context_default_params()` (`src/llama-context.cpp:3966`) defaults
+`llama_context_default_params()` (`src/llama-context.cpp:3966-3967`) defaults
 `n_seq_max = 1`, `n_rs_seq = 0` (`include/llama.h:356` documents `n_rs_seq` as
 `[EXPERIMENTAL], 0 = no rollback`) ⇒ `mem_size = 1`, `n_rows = 1` unless a
 caller explicitly opts in.
@@ -336,7 +341,7 @@ so the choice of denominator does not change the verdict:
 |---|---|---|
 | 16 GiB (17,179,869,184 B) | binary reading of "16 GB" | 0.847 % |
 | 16 GB (16,000,000,000 B) | literal SI reading of "16 GB" | 0.910 % |
-| 14,828 MB (15,552,675,840 B) | the B50's actual VRAM budget after weights, per the CLAUDE.md GPT-OSS refusal-message example (`budget=14828.0 MB`) | 0.936 % |
+| 14,828 MiB (15,548,284,928 B) | the B50's actual VRAM budget after weights, per the CLAUDE.md GPT-OSS refusal-message example (`budget=14828.0 MB`) | 0.936 % |
 
 All three numbers are well under the 5 % gate.
 
@@ -399,8 +404,8 @@ Caveats carried into Task 10:
 - `src/llama-kv-cache-dsv4.cpp:893-998,950-955,1210-1330` (dsv4 comp-state
   sizing and buft selection)
 - `src/llama-context.cpp:359-364` (n_rs_seq rollback-support clamp),
-  `:3966` (`llama_context_default_params()`'s `n_rs_seq=0`);
-  `include/llama.h:351-356` (`n_seq_max`/`n_rs_seq` field docs)
+  `:3966` (`llama_context_default_params()`'s `n_seq_max=1`), `:3967` (its
+  `n_rs_seq=0`); `include/llama.h:351-356` (`n_seq_max`/`n_rs_seq` field docs)
 - `tests/CMakeLists.txt:324-360` (tracked fixture/ctest registration source;
   `build/tests/CTestTestfile.cmake` corroborates but is gitignored/generated)
 - `docs/plans/2026-08-26-tiered-kv-placement.md` Task 10/11 acceptance,
