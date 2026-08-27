@@ -19,16 +19,11 @@
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 static ggml_backend_buffer_type_t llama_recurrent_sycl_kv_buft(ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = ggml_backend_dev_backend_reg(dev);
-    if (!reg || std::strcmp(ggml_backend_reg_name(reg), "SYCL") != 0) {
-        return nullptr;
-    }
-    auto fn = reinterpret_cast<decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_buffer_type_from_dev"));
-    return fn ? fn(dev) : nullptr;
+    // Recurrent r/s state has SSM geometry the tiered attention-KV arena cannot
+    // slice (llama.cpp-zsyj): route to the plain device buft (unified-cache-owned)
+    // until recurrent placement is designed.
+    GGML_UNUSED(dev);
+    return nullptr;
 }
 #endif
 
