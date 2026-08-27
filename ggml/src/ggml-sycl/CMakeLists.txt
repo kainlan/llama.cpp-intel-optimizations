@@ -1605,6 +1605,36 @@ set_tests_properties(sycl-kv-runtime-demotion PROPERTIES
     TIMEOUT 60
 )
 
+# TKV-13 (B2) step 1: the DAG-consumption check that will let the SYCL
+# backend defer a pending host-computed demoted-layer attention result
+# instead of blocking on it (docs/plans/2026-08-27-tkv13-b2-addendum.md
+# §2, §6 step 1). attn-host-dispatch.cpp includes only ggml.h -- no
+# unified-cache.hpp, no SYCL header -- so unlike test-kv-slice-sizing above
+# it needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor -fsycl at all; it links
+# ggml-base for real ggml_tensor/ggml_init/ggml_view_1d, exactly the
+# "host-only, no -fsycl, links ggml-base" shape test-dmmv-coalesced-q4-0-oracle
+# already establishes below. attn-host-dispatch.cpp is ALSO globbed into
+# libggml-sycl (the file(GLOB) at :83) and compiled there with -fsycl like
+# every other backend TU; it is dead code there until TKV-13 step 3 wires it
+# into ggml_backend_sycl_device_supports_op / the graph-compute node loop --
+# this target is the host-only proof it works first.
+add_executable(test-attn-host-dispatch
+    tests/test-attn-host-dispatch.cpp
+    attn-host-dispatch.cpp
+)
+target_include_directories(test-attn-host-dispatch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-attn-host-dispatch PRIVATE ggml-base)
+set_target_properties(test-attn-host-dispatch PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-attn-host-dispatch COMMAND test-attn-host-dispatch)
+set_tests_properties(sycl-attn-host-dispatch PROPERTIES
+    LABELS "sycl;attn;tkv13;hostonly"
+    TIMEOUT 30
+)
+
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
