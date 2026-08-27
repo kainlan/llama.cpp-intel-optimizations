@@ -20,9 +20,11 @@
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 struct llama_kv_cache_sycl_hooks {
-    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)       kv_buft     = nullptr;
-    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)   push_mask   = nullptr;
-    decltype(&ggml_backend_sycl_cancel_kv_layer_mask_from_dev) cancel_mask = nullptr;
+    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)         kv_buft            = nullptr;
+    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)     push_mask          = nullptr;
+    decltype(&ggml_backend_sycl_cancel_kv_layer_mask_from_dev)   cancel_mask        = nullptr;
+    decltype(&ggml_backend_sycl_kv_host_buffer_type)             kv_host_buft       = nullptr;
+    decltype(&ggml_backend_sycl_kv_layer_on_device_from_dev)     kv_layer_on_device = nullptr;
 };
 
 // Fork-local constraint (llama.cpp-y36c): a pushed KV layer mask is staged for
@@ -67,6 +69,10 @@ static llama_kv_cache_sycl_hooks llama_kv_cache_sycl_hooks_for(ggml_backend_dev_
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_push_kv_layer_mask_from_dev"));
     hooks.cancel_mask = reinterpret_cast<decltype(hooks.cancel_mask)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_cancel_kv_layer_mask_from_dev"));
+    hooks.kv_host_buft = reinterpret_cast<decltype(hooks.kv_host_buft)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_host_buffer_type"));
+    hooks.kv_layer_on_device = reinterpret_cast<decltype(hooks.kv_layer_on_device)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_kv_layer_on_device_from_dev"));
     return hooks;
 }
 
@@ -275,12 +281,25 @@ llama_kv_cache::llama_kv_cache(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        bool                       kv_host_layer = false;
 
         if (offload) {
             auto * dev = model.dev_layer(il);
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-            if (llama_kv_cache_dev_is_sycl(dev)) {
-                buft = llama_kv_cache_sycl_hooks_for(dev).kv_buft(dev);
+            const auto hooks = llama_kv_cache_sycl_hooks_for(dev);
+            if (hooks.kv_buft) {
+                // Follow the plan's per-layer placement (llama.cpp-uize): a layer
+                // this cache is materializing here always has KV of its own (the
+                // has_kv/filter/share continues above already skipped anything
+                // that doesn't), so it is safe to ask the hook for this layer.
+                // false means "not device-resident KV" -- route it to the
+                // dedicated KV-host buft instead of the tiered SYCL buft.
+                if (hooks.kv_host_buft && hooks.kv_layer_on_device && !hooks.kv_layer_on_device(dev, il)) {
+                    buft          = hooks.kv_host_buft();
+                    kv_host_layer = true;
+                } else {
+                    buft = hooks.kv_buft(dev);
+                }
             } else {
                 buft = ggml_backend_dev_buffer_type(dev);
             }
@@ -288,7 +307,7 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 #endif
 
-            dev_name = ggml_backend_dev_name(dev);
+            dev_name = kv_host_layer ? "SYCL_KV_Host" : ggml_backend_dev_name(dev);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -299,8 +318,13 @@ llama_kv_cache::llama_kv_cache(
         }
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        // The KV-host buft never gets a layer mask: masks are consumed only by
+        // the tiered SYCL buft's allocator to slice per-layer regions, and the
+        // KV-host buft's device likely also reports as SYCL (same underlying
+        // unified cache), so this guard must be explicit rather than falling
+        // out of the is_sycl check below.
         ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
-        if (llama_kv_cache_dev_is_sycl(buft_dev)) {
+        if (!kv_host_layer && llama_kv_cache_dev_is_sycl(buft_dev)) {
             auto & mask = sycl_kv_layer_masks[buft];
             if (mask.empty()) {
                 mask.assign(hparams.n_layer(), 0);
