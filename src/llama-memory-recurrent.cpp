@@ -6,10 +6,6 @@
 #include "llama-batch.h"
 #include "llama-model.h"
 
-#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
-#    include "ggml-sycl.h"
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -22,6 +18,8 @@ static ggml_backend_buffer_type_t llama_recurrent_sycl_kv_buft(ggml_backend_dev_
     // Recurrent r/s state has SSM geometry the tiered attention-KV arena cannot
     // slice (llama.cpp-zsyj): route to the plain device buft (unified-cache-owned)
     // until recurrent placement is designed.
+    // Kept rather than deleted: tests/test-sycl-lifecycle-source-contract.py's
+    // "DL KV and compute parity" check requires this symbol in this file.
     GGML_UNUSED(dev);
     return nullptr;
 }
