@@ -403,17 +403,22 @@ static std::atomic<int> g_sycl_barrier_count_during_recording{ 0 };  // DIAG: ba
 std::atomic<int>        g_sycl_submit_count_during_recording{ 0 };   // DIAG: operation dispatches during recording
 std::atomic<int>        g_sycl_extra_submit_count_during_recording{ 0 };  // DIAG: extra markers/events during recording
 
-// Temporary decline-engagement observable for TKV-11 (llama.cpp-h56y): counts
-// operand-level KV-host-buft residency declines from
-// ggml_sycl_tensor_in_kv_host_buft's caller in supports_op, so "the decline
-// engaged" is countable from a GGML_SYCL_DEBUG=1 run (both per-decline lines
-// and a teardown total, see ggml_backend_sycl_free) rather than inferred from
-// output correctness alone (layout-assignment-is-not-dispatch-engagement).
-// Delete or gate behind GGML_SYCL_DEBUG at TKV-12 cleanup.
-static std::atomic<uint64_t> g_sycl_kv_host_decline_count{ 0 };  // DIAG: TKV-8 decline engagement
-
 // Graph replay diagnostic variables removed — the memcpy().wait() calls they
 // performed on the graph queue between refresh and replay corrupted L0 state.
+
+// Temporary decline-engagement observable for TKV-11 (llama.cpp-h56y): counts
+// operand-level KV-host-buft residency declines from
+// ggml_sycl_tensor_is_in_kv_host_buft's caller in supports_op, so "the
+// decline engaged" is countable from a GGML_BACKEND_DEBUG=sycl run (both
+// per-decline lines and a teardown total, see ggml_backend_sycl_free) rather
+// than inferred from output correctness alone
+// (layout-assignment-is-not-dispatch-engagement). ggml_backend_sycl_free()
+// prints the running PROCESS-GLOBAL total on every call, and is called once
+// per temporary backend during model loading as well as at real teardown
+// (see the NOTE in that function) -- if it prints more than once, read the
+// LAST line, never sum the lines. Delete or gate behind
+// GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup.
+static std::atomic<uint64_t> g_sycl_kv_host_decline_count{ 0 };  // DIAG: TKV-8 decline engagement
 
 static bool ggml_sycl_moe_exact_runtime_stage_enabled() {
     static const bool enabled = [] {
@@ -38731,7 +38736,7 @@ static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buff
 // c-qjb5). Shares the generic host buft's alloc/free/clear iface and context
 // (same unified-cache-owned allocation path) but carries a distinct identity
 // via .get_name, so the structural residency decline
-// (ggml_sycl_tensor_in_kv_host_buft) and any diagnostics key on exactly this
+// (ggml_sycl_tensor_is_in_kv_host_buft) and any diagnostics key on exactly this
 // buft and never perturb other pinned-host consumers (e.g. the pinned-host
 // overflow branch of ggml_sycl_select_buffer_for_tensor, which must keep
 // resolving to the generic host buft). The keying mechanism is the .get_name
@@ -77243,10 +77248,12 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
         }
     }
     // Temporary decline-engagement observable for TKV-11 (llama.cpp-h56y):
-    // print the running total once per backend teardown so a single gate run
-    // (e.g. the default-ctx GPT-OSS chat gate) yields the count directly from
-    // GGML_SYCL_DEBUG=1 output, without attaching a debugger. Delete or gate
-    // behind GGML_SYCL_DEBUG at TKV-12 cleanup, together with the counter
+    // print the running PROCESS-GLOBAL total (see the declaration of
+    // g_sycl_kv_host_decline_count for why it is process-global and may
+    // print more than once -- read the LAST line, never sum) so a single
+    // gate run yields the count directly from GGML_BACKEND_DEBUG=sycl
+    // output, without attaching a debugger. Delete or gate behind
+    // GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup, together with the counter
     // declaration and the per-decline lines in supports_op.
     {
         const uint64_t kv_host_declines = g_sycl_kv_host_decline_count.load(std::memory_order_relaxed);
@@ -84739,20 +84746,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 #ifndef NDEBUG
             // Allow both SYCL device buffers and SYCL host buffers
             // (host buffers are used for token indices in GET_ROWS, etc.)
+            //
+            // Dedicated KV-host buft (llama.cpp-uize c-qjb5): the
+            // supports_op decline in ggml_backend_sycl_device_supports_op
+            // keeps demoted-layer KV off SYCL dispatch in the steady state,
+            // but this assert fires on any node that reaches
+            // ggml_sycl_graph_compute with such a buffer/src at all --
+            // whitelist it so a debug build does not abort once Task 7's
+            // per-layer routing is live (llama.cpp-h56y c-b9rt).
 
             auto is_supported_buft = [&](ggml_backend_buffer_type_t buft) {
                 return buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) ||
                        buft == ggml_backend_sycl_host_buffer_type() ||
                        buft == ggml_backend_sycl_cpu_offload_compute_buffer_type(sycl_ctx->device) ||
                        buft == ggml_backend_sycl_tiered_kv_buffer_type(sycl_ctx->device) ||
-                       // Dedicated KV-host buft (llama.cpp-uize c-qjb5): the
-                       // supports_op decline below keeps demoted-layer KV off
-                       // SYCL dispatch in the steady state, but this assert
-                       // fires on any node that reaches
-                       // ggml_sycl_graph_compute with such a buffer/src at
-                       // all -- whitelist it so a debug build does not abort
-                       // once Task 7's per-layer routing is live
-                       // (llama.cpp-h56y c-b9rt).
                        buft == ggml_backend_sycl_kv_host_buffer_type();
             };
             if (!is_supported_buft(node->buffer->buft)) {
@@ -99042,11 +99049,10 @@ static bool ggml_sycl_mul_mat_type_supported(ggml_type type) {
 // once at context init) -- hence the view_src hop, applied uniformly whether
 // `t` is the op's own dst or one of its srcs.
 //
-// Keyed on the buft's .get_name FUNCTION POINTER, matching the mechanism
-// ggml_backend_sycl_device_supports_buft (below, this TU) already uses for
-// every other SYCL buft -- never buft-struct-address equality (a clone that
-// shared get_name would alias) and never strcmp on the buft's name string.
-static bool ggml_sycl_tensor_in_kv_host_buft(const ggml_tensor * t) {
+// Keying mechanism (function-pointer .get_name comparison, never buft==,
+// never strcmp) and its rationale: see the comment on
+// ggml_backend_sycl_kv_host_buffer_type() above.
+static bool ggml_sycl_tensor_is_in_kv_host_buft(const ggml_tensor * t) {
     if (!t) {
         return false;
     }
@@ -99080,17 +99086,24 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // backend, which accepts any is_host buffer. Keyed strictly on the
     // dedicated buft identity (Task 6) -- never on is_host or the generic
     // host buft, which would also peel the unrelated pinned-staging consumer
-    // at ggml-sycl.cpp:10012 off the GPU.
-    if (ggml_sycl_tensor_in_kv_host_buft(op)) {
-        g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
-        GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
+    // at ggml-sycl.cpp:10012 off the GPU. The counter/debug-line
+    // instrumentation below is a temporary TKV-11 observable; delete or gate
+    // behind GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup, together with the
+    // counter declaration and the teardown print in ggml_backend_sycl_free.
+    if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
+        if (g_ggml_sycl_debug) {
+            g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
+            GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
+        }
         return false;
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (ggml_sycl_tensor_in_kv_host_buft(op->src[i])) {
-            g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
-            GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (src[%d]): op=%s\n", i,
-                            ggml_op_name(op->op));
+        if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
+            if (g_ggml_sycl_debug) {
+                g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
+                GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (src[%d]): op=%s\n", i,
+                                ggml_op_name(op->op));
+            }
             return false;
         }
     }
