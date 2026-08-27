@@ -52,6 +52,29 @@ def catch_block(body):
     return body[start:end] if end > start else ""
 
 
+def slice_between(source, start_needle, end_needle):
+    """Text strictly between the first occurrence of start_needle and the
+    first occurrence of end_needle that follows it.
+
+    Used instead of function_body() when the region under test is a handful
+    of statements inside ggml_backend_sycl_graph_compute_impl() -- by far the
+    largest function in this TU (CLAUDE.md), so extracting its WHOLE body via
+    function_body()'s "next line that is a bare `}`" regex is both slow and
+    fragile (any column-0 `}` anywhere in that function's thousands of lines
+    would truncate the match early). Empty when either anchor is missing,
+    which fails every clause that reads it -- same fail-closed contract as
+    function_body().
+    """
+    start = source.find(start_needle)
+    if start < 0:
+        return ""
+    start += len(start_needle)
+    end = source.find(end_needle, start)
+    if end < 0:
+        return ""
+    return source[start:end]
+
+
 # llama.cpp-2dgc (RCA c-5ozb): the u7vj tail guard submits on every early exit
 # and deliberately does not release, so a caller that computes twice with no
 # ggml_backend_sycl_synchronize() between reaches begin_graph with its OWN
@@ -65,6 +88,30 @@ own_drain_body = function_body(
 begin_graph_body = function_body(
     backend,
     r"static bool ggml_sycl_execution_begin_graph\s*\(\s*ggml_backend_sycl_context\s*\*\s*ctx\s*,",
+)
+
+# llama.cpp-8q35 (TKV-15): a terminal-but-unreleased SIBLING context's device
+# claim (own_drain_body above only ever drains this SAME ctx's own terminal --
+# see "own-terminal drain admits only this root's terminal invocation") must
+# also be drained, via the SAME primitive teardown already uses
+# (ggml_sycl_execution_drain_context_terminal_events). This happens in
+# ggml_backend_sycl_graph_compute_impl() -- the CALLER of begin_graph, not
+# inside begin_graph itself: begin_graph's fresh branch holds
+# g_execution_backend_binding_mutex (BINDING, see the H8 lock-class comment)
+# for the rest of its body, and ggml_sycl_execution_drain_context_terminal_
+# events() also takes that same mutex and performs a blocking queue wait --
+# retrying from inside begin_graph's locked body would self-deadlock. Scoped
+# to the handful of statements between begin_graph's first call and the
+# state_lock block that turns a still-failed attempt into the thrown error,
+# not begin_graph_body -- see slice_between()'s docstring for why.
+device_owner_context_body = function_body(
+    registry_cpp,
+    r"error Registry::device_owner_context\s*\(\s*int\s+device\s*,\s*ContextId\s*\*\s*out\s*\)\s*const\s*noexcept\s*\{",
+)
+graph_compute_impl_retry_body = slice_between(
+    backend,
+    "bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);",
+    "std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);",
 )
 
 checks = {
@@ -121,6 +168,55 @@ checks = {
     "destructor drains callbacks before unbind": "binding->cv.wait(lock, [&] { return binding->pin_count == 0; });" in backend,
     "pp-moe detached waiter removed": "std::thread([device, ring_depth, slot, generation" not in backend,
     "pp-moe shutdown drain exists": "pp_moe_onednn_drain_scratch_slots(device);" in backend,
+    # --- llama.cpp-8q35 (TKV-15): foreign-terminal drain on DEVICE_BUSY ---
+    # Lives in graph_compute_impl's retry slice, NOT begin_graph_body -- see
+    # the comment above graph_compute_impl_retry_body's definition for why.
+    "begin drains a terminal FOREIGN owner before refusing DEVICE_BUSY":
+        "ggml_sycl_execution_drain_context_terminal_events(" in graph_compute_impl_retry_body,
+    # The foreign-terminal drain must fire only on the contract-compliant
+    # DEVICE_BUSY refusal, never on a registry defect (MISMATCH/STALE/
+    # OVERFLOW) -- those must keep failing immediately, unmodified.
+    "foreign drain only fires on DEVICE_BUSY, never on MISMATCH/STALE/OVERFLOW": ordered(
+        graph_compute_impl_retry_body,
+        "error::DEVICE_BUSY",
+        "ggml_sycl_execution_drain_context_terminal_events(",
+    ),
+    # Only a TERMINAL foreign owner (COMPLETE/QUARANTINED) may be drained -- an
+    # OPEN/SEALED owner is genuine concurrent use and must keep refusing hard,
+    # per canonical contract §12.3 ("unsupported ... no optimistic overlap").
+    # Ordered after the DEVICE_BUSY gate.
+    "foreign drain admits only COMPLETE/QUARANTINED owners": ordered(
+        graph_compute_impl_retry_body,
+        "error::DEVICE_BUSY",
+        "graph_phase::COMPLETE",
+        "graph_phase::QUARANTINED",
+        "ggml_sycl_execution_drain_context_terminal_events(",
+    ),
+    # Exactly one retry within the slice -- the slice starts AFTER the
+    # original begin_graph call (consumed as the start_needle), so the retry
+    # call is the only occurrence expected here. No loop.
+    "foreign drain retries begin_graph exactly once":
+        graph_compute_impl_retry_body.count(
+            "ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error)"
+        ) == 1,
+    # The deadlock this design avoids (see the comment above
+    # graph_compute_impl_retry_body): the retry slice must never ACQUIRE
+    # begin_graph's own BINDING lock itself, since
+    # ggml_sycl_execution_drain_context_terminal_events() already takes it
+    # internally and performs a blocking wait under it. A lock ACQUISITION
+    # pattern, not a bare mention -- the surrounding rationale comment names
+    # this same mutex legitimately, so testing for the identifier's mere
+    # presence would fail on the comment that explains why it's absent.
+    "foreign drain never re-enters begin_graph's own binding lock":
+        re.search(r"std::lock_guard<std::mutex>\s*\w*\s*\(\s*g_execution_backend_binding_mutex\s*\)",
+                  graph_compute_impl_retry_body) is None,
+    "registry device-owner accessor is declared":
+        "error device_owner_context(int device, ContextId * out) const noexcept;" in registry_h,
+    # Read-only: must not mint a new id (next_id) or write into device_owners_
+    # -- it may only report the ContextId already recorded there.
+    "registry device-owner accessor is read-only": bool(device_owner_context_body)
+        and "next_id(" not in device_owner_context_body
+        and re.search(r"device_owners_\[[^\]]*\]\s*=", device_owner_context_body) is None,
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:

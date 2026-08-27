@@ -1696,6 +1696,22 @@ error Registry::extract(ContextId context, snapshot * out) const noexcept {
     return error::OK;
 }
 
+error Registry::device_owner_context(int device, ContextId * out) const noexcept {
+    if (!out) {
+        return error::NULL_OUTPUT;
+    }
+    if (device < 0 || device >= static_cast<int>(max_devices)) {
+        return error::MISMATCH;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto &                owner = device_owners_[device];
+    if (owner.invocation.value == 0) {
+        return error::NOT_FOUND;  // device currently free
+    }
+    *out = owner.context;
+    return error::OK;
+}
+
 Registry & global_registry() {
     static Registry registry;
     return registry;

@@ -367,6 +367,15 @@ class Registry {
 
     error extract(ContextId context, snapshot * out) const noexcept;
 
+    // Read-only reverse lookup: who currently holds device `device`'s
+    // exclusive execution claim, if anyone (llama.cpp-8q35). Mints nothing,
+    // mutates nothing -- it only reports the ContextId already recorded in
+    // device_owners_. A caller combines this with extract() on the returned
+    // ContextId to decide whether that owner's graph is a drainable terminal
+    // (COMPLETE/QUARANTINED) before ever touching it; an OPEN/SEALED owner
+    // must stay untouched, per canonical contract §12.3.
+    error device_owner_context(int device, ContextId * out) const noexcept;
+
   private:
     friend class AuthoritativeInvocationSnapshot;
     error finish_authoritative_invocation_snapshot_locked(AuthoritativeInvocationSnapshot * snapshot) noexcept;

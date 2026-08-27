@@ -508,6 +508,152 @@ int main() {
                     error::LOCK_HELD_ALLOCATION,
             "lock-held allocation instrumentation mutation survived");
 
+    // llama.cpp-8q35 (TKV-15): host-only reproduction of the cross-context
+    // DEVICE_BUSY collision -- context A submits an invocation (drives its
+    // graph to COMPLETE) but is never released; context B then tries to open
+    // a fresh invocation on the SAME device and is refused DEVICE_BUSY, even
+    // though A's graph is a drainable terminal, not genuinely in-flight work.
+    // This is the exact registry-level shape of the production defect (probe
+    // evidence: requester_context=3 blocked_by_context=2, blocked_by_state=
+    // COMPLETE). The fix under review (device_owner_context() plus a foreign-
+    // terminal drain in ggml_sycl_execution_begin_graph()) is a ggml-sycl.cpp
+    // change verified separately on real hardware; this test proves the
+    // Registry-level state machine the fix depends on: (a) the new accessor
+    // correctly identifies the blocking owner, (b) that owner's graph really
+    // is COMPLETE (never OPEN -- the two must not be conflated), and (c)
+    // releasing it unblocks the second context's identical retry.
+    {
+        Registry          cross_ctx_registry;
+        error             cross_ctx_err = error::OK;
+        const auto        ctx_a         = cross_ctx_registry.create_context(cross_ctx_err);
+        const auto        root_a        = root_token(800);
+        SessionId         session_a{};
+        SessionResetEpoch reset_a{};
+        GraphEpoch        graph_a{};
+        InvocationId      invocation_a{};
+        const int         device0[] = { 0 };
+        require(cross_ctx_err == error::OK && cross_ctx_registry.bind_backend(ctx_a, 0) == error::OK &&
+                    cross_ctx_registry.attach_root(ctx_a, root_a, &session_a, &reset_a) == error::OK &&
+                    cross_ctx_registry.begin_graph(ctx_a, session_a, reset_a, root_a, &graph_a) == error::OK &&
+                    cross_ctx_registry.begin_invocation(ctx_a, session_a, reset_a, graph_a, root_a, device0, 1, device0,
+                                                        1, 0, &invocation_a) == error::OK,
+                "cross-context fixture: context A failed to claim device 0");
+        require(cross_ctx_registry.submit_invocation(ctx_a, session_a, reset_a, graph_a, invocation_a, root_a, 0) ==
+                    error::OK,
+                "cross-context fixture: context A failed to submit (reach COMPLETE)");
+
+        // A's graph is now COMPLETE but deliberately unreleased -- exactly the
+        // "terminal-but-unreleased sibling" state the probe caught in
+        // production. Confirm it via extract() before using it as a fixture.
+        snapshot a_snap{};
+        require(cross_ctx_registry.extract(ctx_a, &a_snap) == error::OK && a_snap.graph_state == graph_phase::COMPLETE,
+                "cross-context fixture: context A did not reach COMPLETE");
+
+        const auto        ctx_b  = cross_ctx_registry.create_context(cross_ctx_err);
+        const auto        root_b = root_token(801);
+        SessionId         session_b{};
+        SessionResetEpoch reset_b{};
+        GraphEpoch        graph_b{};
+        InvocationId      invocation_b{};
+        require(cross_ctx_err == error::OK && cross_ctx_registry.bind_backend(ctx_b, 0) == error::OK &&
+                    cross_ctx_registry.attach_root(ctx_b, root_b, &session_b, &reset_b) == error::OK &&
+                    cross_ctx_registry.begin_graph(ctx_b, session_b, reset_b, root_b, &graph_b) == error::OK,
+                "cross-context fixture: context B failed to attach/begin its own graph");
+
+        // RED (today): B is refused, even though A's graph is a drainable
+        // terminal -- this is execution-lifecycle.cpp:1128 reproduced host-only.
+        require(cross_ctx_registry.begin_invocation(ctx_b, session_b, reset_b, graph_b, root_b, device0, 1, device0, 1,
+                                                    0, &invocation_b) == error::DEVICE_BUSY,
+                "context B unexpectedly succeeded while A still holds device 0 -- fixture invalid");
+
+        // device_owner_context() must identify A as the blocker, and extract()
+        // on that ContextId must confirm COMPLETE -- the exact two facts a
+        // foreign-terminal drain needs before it may touch another context's
+        // invocation (never on OPEN/SEALED -- canonical contract §12.3).
+        ContextId blocker{};
+        require(cross_ctx_registry.device_owner_context(0, &blocker) == error::OK && blocker.value == ctx_a.value,
+                "device_owner_context did not identify context A as the blocking owner");
+        snapshot blocker_snap{};
+        require(cross_ctx_registry.extract(blocker, &blocker_snap) == error::OK &&
+                    blocker_snap.graph_state == graph_phase::COMPLETE,
+                "blocking owner's graph was not reported COMPLETE");
+
+        // GREEN after drain: releasing A's terminal invocation (what the real
+        // fix's foreign-terminal drain does, after actually waiting on A's
+        // device queue -- device-side, not reproducible host-only) frees
+        // device 0, and B's IDENTICAL retry now succeeds.
+        require(cross_ctx_registry.release_invocation(ctx_a, session_a, reset_a, graph_a, invocation_a, root_a) ==
+                    error::OK,
+                "releasing context A's terminal invocation failed");
+        require(cross_ctx_registry.device_owner_context(0, &blocker) == error::NOT_FOUND,
+                "device 0 still reports an owner after A's release");
+        require(cross_ctx_registry.begin_invocation(ctx_b, session_b, reset_b, graph_b, root_b, device0, 1, device0, 1,
+                                                    0, &invocation_b) == error::OK,
+                "context B's retry after A's release still failed");
+    }
+
+    // llama.cpp-8q35: the Q2 reconciliation case -- a caller's own LOCALLY
+    // CACHED invocation id can go stale relative to the registry's current
+    // one. This is exactly what ggml_sycl_execution_release_graph()'s
+    // ctx->execution_invocation_id gate is vulnerable to in production: it
+    // trusts the caller's last-seen id, not the registry's current one.
+    // Releasing with a STALE graph_epoch/invocation must be refused, never
+    // silently succeed against the WRONG (now-current) one -- and the drain
+    // path must recover by re-reading current state via extract()/
+    // device_owner_context() rather than trusting any caller's cached id.
+    {
+        Registry          stale_registry;
+        error             stale_err = error::OK;
+        const auto        ctx_c     = stale_registry.create_context(stale_err);
+        const auto        root_c    = root_token(802);
+        SessionId         session_c{};
+        SessionResetEpoch reset_c{};
+        GraphEpoch        graph_c1{};
+        InvocationId      invocation_c1{};
+        const int         device0[] = { 0 };
+        require(stale_err == error::OK && stale_registry.bind_backend(ctx_c, 0) == error::OK &&
+                    stale_registry.attach_root(ctx_c, root_c, &session_c, &reset_c) == error::OK &&
+                    stale_registry.begin_graph(ctx_c, session_c, reset_c, root_c, &graph_c1) == error::OK &&
+                    stale_registry.begin_invocation(ctx_c, session_c, reset_c, graph_c1, root_c, device0, 1, device0, 1,
+                                                    0, &invocation_c1) == error::OK &&
+                    stale_registry.submit_invocation(ctx_c, session_c, reset_c, graph_c1, invocation_c1, root_c, 0) ==
+                        error::OK &&
+                    stale_registry.release_invocation(ctx_c, session_c, reset_c, graph_c1, invocation_c1, root_c) ==
+                        error::OK &&
+                    stale_registry.retire_graph(ctx_c, session_c, reset_c, graph_c1, root_c) == error::OK,
+                "stale-id fixture: first begin/submit/release/retire cycle failed");
+
+        // Second cycle on the SAME context: graph_epoch/invocation both
+        // advance, mirroring ctx_src's graph_epoch=7 in the production probe.
+        GraphEpoch   graph_c2{};
+        InvocationId invocation_c2{};
+        require(stale_registry.begin_graph(ctx_c, session_c, reset_c, root_c, &graph_c2) == error::OK &&
+                    stale_registry.begin_invocation(ctx_c, session_c, reset_c, graph_c2, root_c, device0, 1, device0, 1,
+                                                    0, &invocation_c2) == error::OK &&
+                    stale_registry.submit_invocation(ctx_c, session_c, reset_c, graph_c2, invocation_c2, root_c, 0) ==
+                        error::OK,
+                "stale-id fixture: second begin/submit cycle failed");
+
+        // A caller still holding the FIRST (stale) graph_epoch/invocation --
+        // exactly what a desynced ctx->execution_invocation_id would replay --
+        // must be refused, never silently released against the CURRENT one.
+        require(
+            stale_registry.release_invocation(ctx_c, session_c, reset_c, graph_c1, invocation_c1, root_c) != error::OK,
+            "release with a stale graph_epoch/invocation incorrectly succeeded");
+        snapshot still_blocked{};
+        require(stale_registry.extract(ctx_c, &still_blocked) == error::OK &&
+                    still_blocked.graph_state == graph_phase::COMPLETE &&
+                    still_blocked.invocation.value == invocation_c2.value,
+                "device 0 was incorrectly freed by the stale release attempt");
+
+        // The CURRENT (correct) id still releases cleanly -- this is what a
+        // drain that re-reads registry state via extract()/device_owner_
+        // context() (rather than trusting a caller's cached id) achieves.
+        require(
+            stale_registry.release_invocation(ctx_c, session_c, reset_c, graph_c2, invocation_c2, root_c) == error::OK,
+            "release with the current graph_epoch/invocation failed");
+    }
+
     std::cout << "graph epoch lifecycle: ok\n";
     return 0;
 }

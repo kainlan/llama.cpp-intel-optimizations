@@ -83694,7 +83694,54 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     compute_impl_guard _reentry_guard(sycl_ctx->device);
     ggml_sycl::execution::error execution_graph_error = ggml_sycl::execution::error::OK;
-    const bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
+    bool execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
+    if (!execution_graph_active && execution_graph_error == ggml_sycl::execution::error::DEVICE_BUSY) {
+        // llama.cpp-8q35 (TKV-15): a SIBLING context's TERMINAL invocation
+        // (COMPLETE/QUARANTINED -- already submitted, just not yet released)
+        // can still occupy device_owners_ for one of this ctx's contended
+        // devices. ggml_sycl_execution_drain_own_terminal() (inside
+        // begin_graph, called before begin_graph's own locks -- see its
+        // comment) only ever drains THIS ctx's own root; nothing before this
+        // point looks at a DIFFERENT context's terminal.
+        //
+        // Drain that other context's terminal via the exact primitive
+        // teardown already uses, then retry begin_graph ONCE. This runs here,
+        // in the CALLER, deliberately -- not inside begin_graph's own locked
+        // body. begin_graph has already returned by the time we get here, so
+        // its two lock_guards (g_execution_backend_binding_mutex,
+        // ctx->execution_state_mutex) are already released; retrying from
+        // inside that locked body would re-enter g_execution_backend_binding_
+        // mutex, which ggml_sycl_execution_drain_context_terminal_events()
+        // also takes, and perform a blocking queue wait under it -- exactly
+        // the stall/deadlock hazard begin_graph's own comment above
+        // ggml_sycl_execution_drain_own_terminal() already warns against.
+        //
+        // Never touch a device whose current owner is still OPEN/SEALED --
+        // that is genuine concurrent use and must keep refusing hard, per
+        // canonical contract §12.3 ("unsupported today; no optimistic
+        // overlap").
+        auto &           registry      = ggml_sycl::execution::global_registry();
+        std::vector<int> busy_devices  = ggml_sycl_execution_aggregate_devices(sycl_ctx);
+        bool             all_drainable = true;
+        for (int device : busy_devices) {
+            ggml_sycl::execution::ContextId owner_ctx{};
+            if (registry.device_owner_context(device, &owner_ctx) != ggml_sycl::execution::error::OK) {
+                continue;  // freed itself between the failed claim and here
+            }
+            ggml_sycl::execution::snapshot owner_snap{};
+            if (registry.extract(owner_ctx, &owner_snap) != ggml_sycl::execution::error::OK ||
+                (owner_snap.graph_state != ggml_sycl::execution::graph_phase::COMPLETE &&
+                 owner_snap.graph_state != ggml_sycl::execution::graph_phase::QUARANTINED)) {
+                all_drainable = false;
+                break;
+            }
+            ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value);
+        }
+        if (all_drainable) {
+            execution_graph_error  = ggml_sycl::execution::error::OK;
+            execution_graph_active = ggml_sycl_execution_begin_graph(sycl_ctx, &execution_graph_error);
+        }
+    }
     {
         std::lock_guard<std::mutex> state_lock(sycl_ctx->execution_state_mutex);
         if (sycl_ctx->execution_context_id != 0 && sycl_ctx->execution_root_model_id != 0 && !execution_graph_active) {
