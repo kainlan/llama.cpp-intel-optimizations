@@ -207,6 +207,28 @@ checks = {
         "graph_phase::QUARANTINED",
         "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value)",
     ),
+    # PASS 1 (the validation walk) must never drain anything -- that is the
+    # whole point of the two-pass restructure: nothing is touched until every
+    # contended device is proven drainable. Delta review found this had NO
+    # regression gate: reverting to the old single-pass shape (drain inside
+    # the validation loop, before checking the next device) left every
+    # existing clause green, because they only assert the drain call exists
+    # SOMEWHERE in the retry slice, not that it is absent from pass 1.
+    # `bool(pass1_body) and ...`, not just `... not in pass1_body`, on
+    # purpose: slice_between() returns "" when an anchor is missing (e.g. a
+    # revert that also deletes the PASS 1/2 comments), and "x not in ''' is
+    # vacuously True -- exactly the empty-probe trap this repo has hit
+    # before. An empty slice must fail this clause, not pass it.
+    "PASS 1 (validation) never drains before PASS 2 confirms all_drainable": bool(
+        (lambda pass1_body: pass1_body and
+            "ggml_sycl_execution_drain_context_terminal_events(owner_ctx.value)" not in pass1_body)(
+            slice_between(
+                graph_compute_impl_retry_body,
+                "// PASS 1: validate every contended device's current owner before",
+                "// PASS 2: only now, with every contended device proven drainable,",
+            )
+        )
+    ),
     # Exactly one retry within the slice -- the slice starts AFTER the
     # original begin_graph call (consumed as the start_needle), so the retry
     # call is the only occurrence expected here.
