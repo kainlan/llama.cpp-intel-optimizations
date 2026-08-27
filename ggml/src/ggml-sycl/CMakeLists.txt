@@ -1635,6 +1635,51 @@ set_tests_properties(sycl-attn-host-dispatch PROPERTIES
     TIMEOUT 30
 )
 
+# TKV-13 (B2) step 2: the dedicated persistent thread pool for demoted-layer
+# attention (docs/plans/2026-08-27-tkv13-b2-addendum.md §2, §6 step 2). Its
+# own class -- NOT a CpuExpertPool generalization (owner ruling 2026-08-27,
+# llama.cpp-sbky). Needs -fsycl because attn-host-pool.hpp includes
+# common.hpp for the sycl::queue type (SYCL_LINK_ONLY_TEST_OPTIONS per rule 1
+# above -- no device kernel code of its own), and links ggml-sycl for
+# ggml_sycl_is_shutting_down() (unified-cache.cpp) exactly like
+# CpuExpertPool's own destructor guard.
+#
+# The test constructs its queue with sycl::cpu_selector_v, not a level_zero
+# selector -- it exercises only thread/queue-lifecycle logic (init/submit/
+# shutdown), never a device kernel or device allocation -- so it deliberately
+# carries NO ONEAPI_DEVICE_SELECTOR override: pinning to level_zero here would
+# ask the CPU selector to find a CPU device on a backend that doesn't expose
+# one and break the test outright. LD_LIBRARY_PATH is still required -- the
+# binary links the SYCL runtime because of the headers.
+add_executable(test-attn-host-pool
+    tests/test-attn-host-pool.cpp
+    attn-host-pool.cpp
+)
+target_include_directories(test-attn-host-pool PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-attn-host-pool PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-attn-host-pool PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-attn-host-pool PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-attn-host-pool PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-attn-host-pool COMMAND test-attn-host-pool)
+set_tests_properties(sycl-attn-host-pool PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;attn;tkv13;hostonly"
+    TIMEOUT 30
+)
+
 # Tiny model-free packed-K live lifecycle.  This compiles the Intel production
 # packed consumer leaf from fattn-xmx-f16-v2.hpp, so its device image must use
 # the same AOT/JIT target set and split-barrier options as libggml-sycl.
