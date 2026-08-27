@@ -976,7 +976,21 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // A fused op landing on the CPU backend is not evidence the op is
+            // unsupported: CPU is the reference implementation for every fused op.
+            // For the SYCL backend's tiered-KV placement this CPU landing is the
+            // DESIGNED outcome for a host-demoted layer's attention op (owner ruling:
+            // placement decides the executor -- docs/backend/sycl-memory-design.md).
+            // Disabling FA globally on that mismatch is strictly worse than leaving it
+            // fused: it forces EVERY layer, not just the demoted one, onto the unfused
+            // KQ path, whose materialized [n_kv, n_tokens, n_head] intermediate can
+            // exceed available memory at a large n_ctx (llama.cpp-7nzm: a 17.3GB SYCL0
+            // compute-buffer request at n_ctx=131072 on GPT-OSS 20B traced to exactly
+            // this codepath). Pre-change behavior disabled the fused op globally on ANY
+            // device_fused != device_layer, including a CPU landing; only a mismatch
+            // onto a different, non-CPU device is treated as a genuine capability gap.
+            if (device_fused != device_layer &&
+                (!device_fused || ggml_backend_dev_type(device_fused) != GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
