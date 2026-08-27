@@ -20,11 +20,11 @@
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 struct llama_kv_cache_sycl_hooks {
-    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)         kv_buft            = nullptr;
-    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)     push_mask          = nullptr;
-    decltype(&ggml_backend_sycl_cancel_kv_layer_mask_from_dev)   cancel_mask        = nullptr;
-    decltype(&ggml_backend_sycl_kv_host_buffer_type)             kv_host_buft       = nullptr;
-    decltype(&ggml_backend_sycl_kv_layer_on_device_from_dev)     kv_layer_on_device = nullptr;
+    decltype(&ggml_backend_sycl_kv_buffer_type_from_dev)       kv_buft            = nullptr;
+    decltype(&ggml_backend_sycl_push_kv_layer_mask_from_dev)   push_mask          = nullptr;
+    decltype(&ggml_backend_sycl_cancel_kv_layer_mask_from_dev) cancel_mask        = nullptr;
+    decltype(&ggml_backend_sycl_kv_host_buffer_type)           kv_host_buft       = nullptr;
+    decltype(&ggml_backend_sycl_kv_layer_on_device_from_dev)   kv_layer_on_device = nullptr;
 };
 
 // Fork-local constraint (llama.cpp-y36c): a pushed KV layer mask is staged for
@@ -280,7 +280,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft          = ggml_backend_cpu_buffer_type();
         bool                       kv_host_layer = false;
 
         if (offload) {
@@ -288,13 +288,14 @@ llama_kv_cache::llama_kv_cache(
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
             const auto hooks = llama_kv_cache_sycl_hooks_for(dev);
             if (hooks.kv_buft) {
-                // Follow the plan's per-layer placement (llama.cpp-uize): a layer
-                // this cache is materializing here always has KV of its own (the
-                // has_kv/filter/share continues above already skipped anything
-                // that doesn't), so it is safe to ask the hook for this layer.
-                // false means "not device-resident KV" -- route it to the
-                // dedicated KV-host buft instead of the tiered SYCL buft.
-                if (hooks.kv_host_buft && hooks.kv_layer_on_device && !hooks.kv_layer_on_device(dev, il)) {
+                // Placement decides the executor (owner ruling 2026-08-16):
+                // host-tier KV must be ALLOCATED in host memory so the CPU,
+                // not GPU-streaming, runs that layer's attention. This hook
+                // is only asked about layers with KV in this cache (the
+                // has_kv/filter/share continues above skipped the rest), so
+                // false here always means "not device-resident", never "no
+                // KV at all" (llama.cpp-uize).
+                if (hooks.kv_host_buft && hooks.kv_layer_on_device && !hooks.kv_layer_on_device(dev, (int32_t) il)) {
                     buft          = hooks.kv_host_buft();
                     kv_host_layer = true;
                 } else {
@@ -307,7 +308,11 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 #endif
 
-            dev_name = kv_host_layer ? "SYCL_KV_Host" : ggml_backend_dev_name(dev);
+            // ggml_backend_buft_name(buft) derefs buft; safe unguarded here
+            // because kv_host_layer is only ever set in the branch above
+            // that just assigned buft = hooks.kv_host_buft(), so buft is
+            // never null on this path.
+            dev_name = kv_host_layer ? ggml_backend_buft_name(buft) : ggml_backend_dev_name(dev);
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -319,10 +324,11 @@ llama_kv_cache::llama_kv_cache(
 
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
         // The KV-host buft never gets a layer mask: masks are consumed only by
-        // the tiered SYCL buft's allocator to slice per-layer regions, and the
-        // KV-host buft's device likely also reports as SYCL (same underlying
-        // unified cache), so this guard must be explicit rather than falling
-        // out of the is_sycl check below.
+        // the tiered SYCL buft's allocator to slice per-layer regions. The
+        // KV-host buft clone inherits .device = SYCL dev 0 from the generic
+        // host buft it is built from (ggml-sycl.cpp:38550-38551), so it WILL
+        // pass the is_sycl check below -- that is exactly why !kv_host_layer
+        // is a separate, load-bearing condition rather than implied by it.
         ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
         if (!kv_host_layer && llama_kv_cache_dev_is_sycl(buft_dev)) {
             auto & mask = sycl_kv_layer_masks[buft];
