@@ -15724,6 +15724,82 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
     return static_cast<uint32_t>((cells / 256) * 256);
 }
 
+// Attempts to move full-attention KV overflow for `plan` -- a scratch COPY of
+// the runtime-update candidate -- onto the host tier and re-validate through
+// the same MMID gate every other plan goes through. `plan` is mutated in
+// place regardless of outcome; per the copy-on-attempt discipline the caller
+// must adopt it ONLY when this returns true. On false, `plan` is not a valid
+// candidate and must be discarded -- never merged into the plan the caller
+// keeps, so a failed attempt cannot leave that plan (or the numbers a
+// subsequent refusal prints) partially demoted.
+static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &                           plan,
+                                            const std::vector<std::pair<int, size_t>> &           old_mmid_charges,
+                                            const std::vector<ggml_sycl::placement_tensor_info> & tensor_inventory,
+                                            int                                                   n_expert_used,
+                                            uint32_t                                              n_ctx,
+                                            size_t                          old_moe_mmid_device_pool_bytes,
+                                            ggml_sycl::kv_demotion_result * out_demotion) {
+    const size_t n_layers = plan.kv_layer_count();
+
+    ggml_sycl::kv_demotion_input kv_demotion_in;
+    kv_demotion_in.vram_budget      = plan.vram_budget;
+    kv_demotion_in.vram_bytes       = plan.vram_bytes;
+    kv_demotion_in.kv_per_layer     = plan.kv_per_layer;
+    kv_demotion_in.kv_per_swa_layer = plan.kv_per_swa_layer;
+    kv_demotion_in.kv_device.resize(n_layers);
+    kv_demotion_in.swa_layer_mask.assign(plan.swa_layer_mask.begin(), plan.swa_layer_mask.end());
+    for (size_t l = 0; l < n_layers; ++l) {
+        kv_demotion_in.kv_device[l] = plan.get_kv_device((int) l);
+    }
+
+    const ggml_sycl::kv_demotion_result demotion_result = ggml_sycl::plan_runtime_kv_demotion(kv_demotion_in);
+    // fits==true with an empty demoted_layers list would mean the plan
+    // already fit without moving anything -- impossible for a plan this
+    // helper is only ever called on (already refused as over budget on a KV
+    // dimension), but if the failure was actually on some OTHER dimension the
+    // demotion algorithm can't see, an empty list is exactly what it returns,
+    // and retrying an identical replan on an identical plan could only fail
+    // identically. Treat that combination as "cannot help" rather than spend
+    // a redundant validation pass.
+    if (!demotion_result.fits || demotion_result.demoted_layers.empty()) {
+        return false;
+    }
+
+    for (int l : demotion_result.demoted_layers) {
+        plan.kv_device[l] = -1;
+    }
+    plan.refresh_kv_byte_totals();
+    if (!plan.rebuild_runtime_per_device_vram()) {
+        return false;
+    }
+    if (plan.multi_device) {
+        // BUDGET_EXCEEDED/GROWTH_BUDGET_EXCEEDED (the only reasons that route
+        // here) are both gated on !plan.multi_device inside
+        // replan_moe_mmid_workspaces_for_runtime, so this branch is
+        // structurally unreachable -- kept, and left silent on failure like
+        // its counterpart in the original call above, only so an untested
+        // path never silently claims success.
+        if (!ggml_sycl::moe_mmid_reaccount_replacement({}, old_mmid_charges, plan.devices, plan.per_device_vram_budgets,
+                                                       &plan.per_device_vram, &plan.vram_bytes)) {
+            return false;
+        }
+    } else if (plan.vram_bytes > SIZE_MAX - old_moe_mmid_device_pool_bytes) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow -- "
+            "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
+            n_ctx, plan.vram_bytes / (1024.0 * 1024.0), old_moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
+        return false;
+    } else {
+        plan.vram_bytes += old_moe_mmid_device_pool_bytes;
+    }
+
+    if (!ggml_sycl::replan_moe_mmid_workspaces_for_runtime(plan, tensor_inventory, n_expert_used, nullptr)) {
+        return false;
+    }
+    *out_demotion = demotion_result;
+    return true;
+}
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
@@ -15824,56 +15900,32 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // problems it can cure (f3aa4a803's reason classification).
     if (!replan_ok && (replan_reason == ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED ||
                        replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED)) {
-        ggml_sycl::kv_demotion_input din;
-        din.vram_budget       = next_plan.vram_budget;
-        din.vram_bytes        = next_plan.vram_bytes;
-        din.kv_per_layer      = next_plan.kv_per_layer;
-        din.kv_per_swa_layer  = next_plan.kv_per_swa_layer;
-        const size_t n_layers = next_plan.kv_layer_count();
-        din.kv_device.resize(n_layers);
-        din.swa_layer_mask.assign(next_plan.swa_layer_mask.begin(), next_plan.swa_layer_mask.end());
-        for (size_t l = 0; l < n_layers; ++l) {
-            din.kv_device[l] = next_plan.get_kv_device((int) l);
+        // Copy-on-attempt: run the demotion pass against a scratch copy so a
+        // failed attempt cannot leave next_plan -- and the numbers the
+        // refusal below prints -- partially mutated. next_plan is replaced
+        // only once the demoted plan re-validates.
+        ggml_sycl::placement_plan     demoted_plan = next_plan;
+        ggml_sycl::kv_demotion_result demotion_result;
+        if (ggml_sycl_try_demote_runtime_kv(demoted_plan, old_mmid_charges, g_tensor_inventory_detail,
+                                            next_kv_info.n_expert_used, n_ctx,
+                                            current->plan->moe_mmid_device_pool_bytes, &demotion_result)) {
+            // The "-c" figure describes what fits without ANY demotion, so it
+            // must read the pre-demotion next_plan, not demoted_plan: the
+            // demoted layers no longer count against budget in
+            // ggml_sycl_largest_fitting_n_ctx, which would overstate the
+            // all-VRAM figure if read from the post-demotion plan.
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
+                "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
+                "Largest all-VRAM context is about -c %u\n",
+                demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0), n_ctx,
+                ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+            next_plan = std::move(demoted_plan);
+            replan_ok = true;
         }
-
-        const ggml_sycl::kv_demotion_result dr = ggml_sycl::plan_runtime_kv_demotion(din);
-        if (dr.fits && !dr.demoted_layers.empty()) {
-            for (int l : dr.demoted_layers) {
-                next_plan.kv_device[l] = -1;
-            }
-            next_plan.refresh_kv_byte_totals();
-            bool reaccounted = next_plan.rebuild_runtime_per_device_vram();
-            if (reaccounted) {
-                // BUDGET_EXCEEDED/GROWTH_BUDGET_EXCEEDED are both gated on
-                // !plan.multi_device inside replan_moe_mmid_workspaces_for_runtime,
-                // so this reason pair cannot occur for a multi-device plan --
-                // mirror the single-device mmid-pool reconciliation the
-                // original call above performs rather than trust an untested
-                // multi-device path.
-                if (next_plan.multi_device) {
-                    reaccounted = false;
-                } else if (next_plan.vram_bytes > SIZE_MAX - current->plan->moe_mmid_device_pool_bytes) {
-                    reaccounted = false;
-                } else {
-                    next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
-                }
-            }
-            if (reaccounted) {
-                ggml_sycl::moe_mmid_runtime_reason retry_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
-                if (ggml_sycl::replan_moe_mmid_workspaces_for_runtime(next_plan, g_tensor_inventory_detail,
-                                                                      next_kv_info.n_expert_used, &retry_reason)) {
-                    replan_ok = true;
-                    GGML_LOG_WARN(
-                        "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
-                        "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
-                        "Largest all-VRAM context is about -c %u\n",
-                        dr.demoted_layers.size(), dr.host_kv_bytes_added / (1024.0 * 1024.0), n_ctx,
-                        ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
-                } else {
-                    replan_reason = retry_reason;
-                }
-            }
-        }
+        // On failure, demoted_plan is discarded here -- next_plan and
+        // replan_reason (the original refusal) are untouched, so the refusal
+        // below reports the original plan's numbers.
     }
 
     if (!replan_ok) {
