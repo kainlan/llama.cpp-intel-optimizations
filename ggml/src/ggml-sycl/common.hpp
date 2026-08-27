@@ -4649,7 +4649,15 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
 //   - Weights: O(1) via data_handle smart pointer (generation-checked),
 //              falls back to cache lookup only if handle is empty
 //   - Non-weights: data_device_ptr fast path + alloc_registry lookup
-// O(1) hot path.  Safe at graph build time (no SYCL runtime locks).
+// O(1) hot path ONLY for the smart-handle fast paths above (data_handle's
+// resolve(), ~3ns, genuinely lock-free). The fallback branches below --
+// get_weight_ptr() for weights, and try_get_cached_with_event() for
+// non-weights (added by llama.cpp-38jl) -- both take
+// unified_cache::rw_mutex_ under an exclusive std::unique_lock and are NOT
+// lock-free; "no SYCL runtime locks" was never true for those branches.
+// Verified against the implementation, not assumed from this comment --
+// the same one-level-down mistake this line itself used to make is
+// corrected in get_data_ptr_slow()'s lookup() comment (ggml-sycl.cpp).
 inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int device) {
     ggml_sycl::resolved_ptr result{};
     if (!tensor) {
@@ -4784,21 +4792,50 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
     // because graph_prestage_leaf_tensors() content-validates every
     // node->src[] for THIS recorded graph before recording begins.
     if (!is_weight) {
+        // This branch's precondition is "any non-weight tensor", which can
+        // be an INPUT tensor whose host bytes changed since prestage
+        // populated this cache entry -- the same staleness get_data_ptr_slow's
+        // sibling branch (ggml-sycl.cpp) already guards against. Derived the
+        // same way get_data_ptr_slow does: is_input_tensor isn't threaded
+        // into resolve(), both underlying facts (tensor->flags, the
+        // process-global TP config) are directly available here.
+        const bool is_input_tensor = (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+        const bool tp_enabled      = g_sycl_tp_config.enabled && g_sycl_tp_config.world_size > 1;
         if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
             ggml_sycl_cache_id key = ggml_backend_sycl_get_tensor_cache_key(tensor, device);
             if (key.valid) {
                 sycl::event event;
                 bool        has_event = false;
                 void *      cached    = cache->try_get_cached_with_event(key, GGML_LAYOUT_AOS, &event, &has_event);
-                if (cached != nullptr) {
-                    result.ptr       = cached;
-                    result.extent    = ggml_nbytes(tensor);
-                    result.layout    = GGML_LAYOUT_AOS;
-                    result.on_device = true;
-                    if (has_event) {
-                        result.has_ready_event = true;
-                        result.ready_event     = event;
+                // Require has_event before trusting `cached`. try_get_cached_with_event()
+                // (unified-cache.cpp) returns a non-null device_ptr for an
+                // IN_PROGRESS entry even when has_ready_event is false --
+                // allocate_slot() (unified-cache.cpp:7258-7273) publishes exactly
+                // that shape (device_ptr set, state=IN_PROGRESS, has_ready_event
+                // still false) before the fill is submitted and the event is
+                // attached. try_get_cached_with_event() has had zero live callers
+                // until this branch, so that window has never actually been
+                // observed through this primitive -- but this branch is now its
+                // first live caller and would otherwise inherit the hazard
+                // silently: trusting an eventless IN_PROGRESS pointer here would
+                // resurrect the same "unstaged/not-yet-written pointer reaches a
+                // graph-recording op" class of bug this ticket exists to fix.
+                // A cached-but-eventless READY entry (e.g. the synchronous
+                // host-fallback memcpy path, unified-cache.cpp:4512-4524) is
+                // safe to trust but is indistinguishable from the IN_PROGRESS
+                // case at this call site, so it falls through to the slower,
+                // already-correct resolution paths below instead -- strictly
+                // conservative, never incorrect.
+                if (cached != nullptr && has_event) {
+                    if (is_input_tensor && !tp_enabled && tensor->data) {
+                        ggml_sycl_refresh_cached_input_ptr(cached, tensor->data, ggml_nbytes(tensor), device);
                     }
+                    result.ptr             = cached;
+                    result.extent          = ggml_nbytes(tensor);
+                    result.layout          = GGML_LAYOUT_AOS;
+                    result.on_device       = true;
+                    result.has_ready_event = true;
+                    result.ready_event     = event;
                     return result;
                 }
             }
