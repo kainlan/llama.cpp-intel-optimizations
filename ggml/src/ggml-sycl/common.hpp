@@ -4765,6 +4765,46 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
         }
     }
 
+    // llama.cpp-38jl: for non-weight tensors, graph_prestage_leaf_tensors()
+    // may already have staged this exact tensor into the unified cache
+    // (keyed identically to ggml_backend_sycl_get_tensor_cache_key()) before
+    // recording began. try_get_cached_with_event() -- not a READY-only
+    // lookup -- is required: a recomputed intermediate (e.g. an SSM_SCAN
+    // output like nemotron_h's node_66) triggers ensure_cached()'s
+    // content-changed re-upload path every decode step, which leaves the
+    // entry IN_PROGRESS with a pending ready_event rather than READY.
+    // Mirrors the WEIGHT branch above (get_weight_ptr()/has_ready_event) so
+    // ggml_sycl_chain_ready_event_if_needed() at each caller's dispatch site
+    // (already present, e.g. binbcast.cpp:773-777) chains on it -- no host
+    // wait, no new event-chaining code, reuses existing infrastructure.
+    // Same exclusive-lock/mutation profile as try_get_cached_fast (not
+    // lock-free); this is try_get_cached_with_event()'s first live caller,
+    // previously declared but unused. Freshness dependency: same as
+    // get_data_ptr_slow()'s equivalent check in ggml-sycl.cpp -- safe only
+    // because graph_prestage_leaf_tensors() content-validates every
+    // node->src[] for THIS recorded graph before recording begins.
+    if (!is_weight) {
+        if (auto * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
+            ggml_sycl_cache_id key = ggml_backend_sycl_get_tensor_cache_key(tensor, device);
+            if (key.valid) {
+                sycl::event event;
+                bool        has_event = false;
+                void *      cached    = cache->try_get_cached_with_event(key, GGML_LAYOUT_AOS, &event, &has_event);
+                if (cached != nullptr) {
+                    result.ptr       = cached;
+                    result.extent    = ggml_nbytes(tensor);
+                    result.layout    = GGML_LAYOUT_AOS;
+                    result.on_device = true;
+                    if (has_event) {
+                        result.has_ready_event = true;
+                        result.ready_event     = event;
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+
     // Non-weight tensors OR weight fallback: raw data pointer
     result.ptr    = ggml_sycl_get_data_ptr(tensor, device);
     result.extent = result.ptr ? ggml_nbytes(tensor) : 0;

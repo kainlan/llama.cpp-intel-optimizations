@@ -416,8 +416,7 @@ std::atomic<int>        g_sycl_extra_submit_count_during_recording{ 0 };  // DIA
 // prints the running PROCESS-GLOBAL total on every call, and is called once
 // per temporary backend during model loading as well as at real teardown
 // (see the NOTE in that function) -- if it prints more than once, read the
-// LAST line, never sum the lines. Delete or gate behind
-// GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup.
+// LAST line, never sum the lines. Delete at TKV-12 cleanup.
 static std::atomic<uint64_t> g_sycl_kv_host_decline_count{ 0 };  // DIAG: TKV-8 decline engagement
 
 static bool ggml_sycl_moe_exact_runtime_stage_enabled() {
@@ -21297,12 +21296,35 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
             // dispatch-time cache that never consults the unified cache's own
             // mapping is the "side cache outside the unified-cache implementation"
             // the memory contract (sycl-canonical-memory-architecture.md SS1.2)
-            // forbids. lookup() is lock-free/non-allocating/non-blocking per its own
-            // doc comment, so this costs nothing on the (common) miss path.
+            // forbids.
+            //
+            // lookup() is NOT lock-free/non-blocking despite unified-cache.hpp's
+            // doc comment on it (that header doc is stale -- tracked separately,
+            // not fixed here): it delegates to try_get_cached_fast(), which takes
+            // an EXCLUSIVE unique_lock on rw_mutex_ and mutates the entry via
+            // stamp_pending_owner() on a hit; an early miss can also emit a
+            // rate-limited GGML_LOG_WARN. Still cheap relative to the staging-
+            // cache fallback below (one hash lookup under a lock vs. a fresh
+            // allocation), just not free.
+            //
+            // Freshness: this returns whatever the unified cache currently holds
+            // under this key WITHOUT re-validating it against the tensor's
+            // current host bytes -- lookup() cannot see host memory at all. Safe
+            // only because graph_prestage_leaf_tensors() already ran
+            // ensure_cached(..., validate_content=true) for every node->src[] in
+            // THIS recorded graph immediately before recording began. Residual: a
+            // caller reaching get_data_ptr_slow() for this tensor+device via a
+            // path that skipped this graph's own prestage pass could observe
+            // content validated for a different graph/caller. All known callers
+            // are post-prestage graph-dispatch paths; this is not a general
+            // freshness guarantee and must not be treated as one.
             if (staging_cache_key.valid) {
-                if (ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device)) {
+                if (ggml_sycl::unified_cache * cache = ggml_sycl::get_existing_unified_cache_for_device(device)) {
                     void * unified_cached = cache->lookup(staging_cache_key, GGML_LAYOUT_AOS);
                     if (unified_cached != nullptr) {
+                        if (is_input_tensor && !tp_enabled && tensor->data) {
+                            ggml_sycl_refresh_cached_input_ptr(unified_cached, tensor->data, nbytes, device);
+                        }
                         GGML_SYCL_DEBUG(
                             "ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, resolved via unified cache "
                             "(prestage) %p -> %p (%zu bytes)\n",
@@ -77252,9 +77274,9 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     // g_sycl_kv_host_decline_count for why it is process-global and may
     // print more than once -- read the LAST line, never sum) so a single
     // gate run yields the count directly from GGML_BACKEND_DEBUG=sycl
-    // output, without attaching a debugger. Delete or gate behind
-    // GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup, together with the counter
-    // declaration and the per-decline lines in supports_op.
+    // output, without attaching a debugger. Delete at TKV-12 cleanup,
+    // together with the counter declaration and the per-decline lines in
+    // supports_op.
     {
         const uint64_t kv_host_declines = g_sycl_kv_host_decline_count.load(std::memory_order_relaxed);
         if (kv_host_declines > 0) {
@@ -83809,7 +83831,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 all_drainable = false;
                 break;
             }
-            drainable_owners.push_back(owner_ctx);
+            // llama.cpp-8q35 (c-pfp8): aggregate_devices dedups DEVICES, not
+            // OWNERS -- a context holding two contended devices would appear
+            // here twice and get drained twice in PASS 2. The primitive
+            // tolerates a duplicate drain (the second release fails harmlessly
+            // -> abort_and_release), so this is an efficiency fix, not a
+            // correctness one; folding it in since this touch is already here.
+            if (std::find(drainable_owners.begin(), drainable_owners.end(), owner_ctx) == drainable_owners.end()) {
+                drainable_owners.push_back(owner_ctx);
+            }
         }
         // PASS 2: only now, with every contended device proven drainable,
         // actually drain them and retry once.
@@ -99087,9 +99117,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // dedicated buft identity (Task 6) -- never on is_host or the generic
     // host buft, which would also peel the unrelated pinned-staging consumer
     // at ggml-sycl.cpp:10012 off the GPU. The counter/debug-line
-    // instrumentation below is a temporary TKV-11 observable; delete or gate
-    // behind GGML_BACKEND_DEBUG=sycl at TKV-12 cleanup, together with the
-    // counter declaration and the teardown print in ggml_backend_sycl_free.
+    // instrumentation below is a temporary TKV-11 observable; delete at
+    // TKV-12 cleanup, together with the counter declaration and the
+    // teardown print in ggml_backend_sycl_free.
     if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
         if (g_ggml_sycl_debug) {
             g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
