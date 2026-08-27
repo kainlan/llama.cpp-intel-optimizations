@@ -73,6 +73,10 @@ GGML_BACKEND_API void ggml_backend_sycl_shutdown(void);
 // KV buffer type for a backend device (falls back to default buffer type if not SYCL)
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backend_dev_t device);
 
+// Whether layer `il`'s KV currently lives on-device per the active placement
+// plan. Returns true (today's tiered-device behavior) when no plan is active.
+GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
+
 // Get the byte offset for reading this rank's shard from GGUF file
 // For column-parallel tensors, this is the offset into the tensor data
 // For row-parallel tensors, returns 0 (requires special handling due to interleaved data)
@@ -94,9 +98,6 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_f
 // structural residency decline and diagnostics key on exactly this buft
 // without perturbing other pinned-host consumers).
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type(void);
-// Whether layer `il`'s KV currently lives on-device per the active placement
-// plan. Returns true (today's tiered-device behavior) when no plan is active.
-GGML_BACKEND_API bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il);
 
 // Host compute buffer type - uses SYCL host memory (malloc_host) with SYCL buffer interface
 // This is used for TP compute buffers to allow cross-device data sharing.

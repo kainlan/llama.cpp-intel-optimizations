@@ -38556,25 +38556,32 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
 
 static const char * ggml_backend_sycl_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return "SYCL_KV_Host";
+    return GGML_SYCL_NAME "_KV_Host";
 }
 
 // Dedicated pinned-host buft for runtime-demoted KV layers (llama.cpp-uize
 // c-qjb5). Shares the generic host buft's alloc/free/clear iface and context
 // (same unified-cache-owned allocation path) but carries a distinct identity
-// via .get_name, so `ggml_sycl_tensor_in_kv_host_buft` (the structural
-// residency decline) and any diagnostics key on exactly this buft and never
-// perturb other pinned-host consumers (e.g. the token-index host staging at
-// line ~10012 above, which must keep resolving to the generic host buft).
+// via .get_name, so the structural residency decline
+// (ggml_sycl_tensor_in_kv_host_buft) and any diagnostics key on exactly this
+// buft and never perturb other pinned-host consumers (e.g. the pinned-host
+// overflow branch of ggml_sycl_select_buffer_for_tensor, which must keep
+// resolving to the generic host buft). The keying mechanism is the .get_name
+// FUNCTION POINTER, not buft-struct identity: ggml_backend_sycl_device_supports_buft
+// (and the analogous checks near it) compare
+// `buft->iface.get_name == ggml_backend_sycl_host_buffer_type_name`, so a
+// clone that reused the generic name function instead of overriding it here
+// would silently defeat the decline -- the new buft must have its OWN
+// .get_name, and callers must never rely on struct-address comparison alone.
 ggml_backend_buffer_type_t ggml_backend_sycl_kv_host_buffer_type() {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return nullptr;
-    static ggml_backend_buffer_type type = [] {
+    static ggml_backend_buffer_type buffer_type_kv_host = [] {
         ggml_backend_buffer_type t = *ggml_backend_sycl_host_buffer_type();
-        t.iface.get_name = ggml_backend_sycl_kv_host_buffer_type_name;
+        t.iface.get_name           = ggml_backend_sycl_kv_host_buffer_type_name;
         return t;
     }();
-    return &type;
+    return &buffer_type_kv_host;
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_dev_t dev) {
@@ -98648,7 +98655,11 @@ ggml_backend_buffer_type_t ggml_backend_sycl_kv_buffer_type_from_dev(ggml_backen
 // plan (llama.cpp-uize c-qjb5 registry hook). No active plan preserves
 // today's behavior: every layer reports on-device (the tiered device buft).
 bool ggml_backend_sycl_kv_layer_on_device_from_dev(ggml_backend_dev_t dev, int32_t il) {
-    GGML_UNUSED(dev);
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return true;   // neutral: preserve on-device default
+    }
+    GGML_UNUSED(dev);  // the placement plan is process-global, not per-device
     const auto snapshot = ggml_sycl_global_plan_snapshot();
     if (!snapshot || !snapshot->plan) {
         return true;

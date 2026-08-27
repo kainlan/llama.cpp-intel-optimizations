@@ -32,6 +32,8 @@ saveable_mutating_procs = {
     "ggml_backend_sycl_kv_buffer_type_from_dev": "ggml_backend_sycl_kv_buffer_type_from_dev",
     "ggml_backend_sycl_push_kv_layer_mask_from_dev": "ggml_backend_sycl_push_kv_layer_mask_from_dev",
     "ggml_backend_sycl_cancel_kv_layer_mask_from_dev": "ggml_backend_sycl_cancel_kv_layer_mask_from_dev",
+    "ggml_backend_sycl_kv_host_buffer_type": "ggml_backend_sycl_kv_host_buffer_type",
+    "ggml_backend_sycl_kv_layer_on_device_from_dev": "ggml_backend_sycl_kv_layer_on_device_from_dev",
     "ggml_backend_sycl_test_pop_kv_layer_mask": "ggml_backend_sycl_test_pop_kv_layer_mask",
     "ggml_backend_sycl_test_pending_kv_layer_mask_count": "ggml_backend_sycl_test_pending_kv_layer_mask_count",
     "ggml_backend_sycl_host_compute_buffer_type": "ggml_backend_sycl_host_compute_buffer_type",
@@ -471,9 +473,12 @@ checks = {
         # The seven-reader reduction is deliberate: abecb785 removed six
         # retired prompt-fusion routes and 90a3f2a removed two decode bypasses,
         # after 75883a6 added one owned host-recipe reader (127 + 1 - 6 - 2).
+        # f5f0d3758 (llama.cpp-tnse) added an eighth->ninth reader:
+        # ggml_backend_sycl_kv_layer_on_device_from_dev consults the active
+        # plan snapshot's get_kv_device(il) (8 + 1).
         "ggml_sycl_cache_plan_owner": 120,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 8,
+        "ggml_sycl_global_plan_snapshot": 9,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
