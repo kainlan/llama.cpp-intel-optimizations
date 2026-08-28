@@ -42,56 +42,65 @@
 // public ggml_backend_graph_compute() API on both sides is what actually
 // reaches ggml_compute_forward_flash_attn_ext correctly on both paths.
 //
-// *** WRAPPER DEFECT FOUND WHILE BUILDING THIS HARNESS (reported, not fixed
-// here -- out of this task's file scope; see llama.cpp-sbky) ***
+// *** GGML_TENSOR_FLAG_COMPUTE: a real hazard for a synthetic test fixture,
+// NOT a production defect (investigated, then RULED OUT; see
+// llama.cpp-sbky) ***
 //
 // ggml_sycl_dispatch_host_flash_attn builds its graph purely manually
 // (ggml-sycl.cpp:76551-76553: `graph->n_nodes = 1; graph->nodes[0] =
-// &dst_host;`), with a comment claiming ggml_backend_graph_compute() "does
-// not need leafs[] populated". That half is true -- ggml-cpu.c's execution
-// loop never reads cgraph->leafs -- but the manual construction ALSO skips
-// something that IS load-bearing: ggml_build_forward_expand() (the normal
-// way to populate a graph) sets GGML_TENSOR_FLAG_COMPUTE on every non-leaf
-// node it visits (ggml.c:7230-7231, ggml_visit_parents_graph), and
-// ggml_graph_compute_thread's per-node dispatch loop
-// (ggml-cpu.c:3113-3115) silently `continue`s past any node lacking that
-// flag:
+// &dst_host;`). ggml_graph_compute_thread's per-node dispatch loop
+// (ggml-cpu.c:3113-3115) silently `continue`s past any node lacking
+// GGML_TENSOR_FLAG_COMPUTE:
 //     if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { continue; }
-// A tensor built via plain ggml_new_tensor() (as ggml_flash_attn_ext's
-// result is) starts with flags == 0, so a manually-assigned dst node NEVER
-// gets that flag and is silently skipped -- ggml_compute_forward is never
-// called on it. ggml_backend_graph_compute() still returns
-// GGML_STATUS_SUCCESS (nothing "failed"; the node was just never visited),
-// and dst's freshly-allocated (therefore zero) memory is returned
-// unchanged.
+// and that flag is normally set by ggml_build_forward_expand()
+// (ggml.c:7230-7231, ggml_visit_parents_graph) on every non-leaf node it
+// visits -- not by plain ggml_new_tensor(), which leaves flags == 0.
 //
-// This was caught empirically, not by inspection: an early draft of this
-// harness reproduced the wrapper's exact manual construction for both
-// paths (a) and (b) and case 1 (byte-identical) PASSED -- vacuously, since
-// both sides silently computed nothing and compared two all-zero buffers.
-// Only case 2 (the perturbation control) caught it, because a different Q
-// input still produced the identical (zero) output. Swapping in
-// ggml_build_forward_expand() for the SAME tensors/backend made the output
-// real and input-sensitive; a control run that only widened the graph's
-// node/leaf capacity (without setting the flag) stayed all-zero -- isolating
-// GGML_TENSOR_FLAG_COMPUTE, specifically, as the missing ingredient, not
-// graph capacity or leaf registration.
+// An early draft of this harness built dst directly via
+// ggml_flash_attn_ext() with no preceding ggml_build_forward_expand() call
+// at all, reproduced the wrapper's exact manual node-array assignment
+// verbatim, and got all-zero output on BOTH compared paths -- case 1
+// (byte-identical) PASSED vacuously; only case 2 (the perturbation
+// control) caught it, because a differently-perturbed Q still produced the
+// identical zero output. That looked exactly like the wrapper silently
+// skipping the node.
 //
-// Consequence for production: with GGML_SYCL_ATTN_HOST_DISPATCH=1 (default
-// OFF), every demoted-layer FLASH_ATTN_EXT routed through this wrapper
-// today silently returns zeroed attention output instead of a real
-// result -- no crash, no log line, GGML_STATUS_SUCCESS. This blocks step 6
-// (the B1'-vs-B2 bit-identical logit diff) until fixed. Likely minimal fix
-// (for whoever owns ggml-sycl.cpp, not applied here): set
-// `dst_host.flags |= GGML_TENSOR_FLAG_COMPUTE;` before building the graph,
-// or call ggml_build_forward_expand(graph, &dst_host) instead of the
-// manual n_nodes/nodes[0] assignment.
+// It is not: dst_host is built as `ggml_tensor dst_host = *dst;` -- a
+// shallow copy of dst, which is always a REAL node from the model's live
+// ggml_cgraph (ggml_sycl_dispatch_host_flash_attn's only caller,
+// ggml_sycl_compute_forward, is the single funnel every dispatch path in
+// this file uses; dst is never fabricated ad hoc). llama.cpp rebuilds and
+// re-expands the whole model graph via ggml_build_forward_expand() every
+// decode step BEFORE any backend ever sees a node, so by the time dst
+// reaches this function, dst->flags already carries
+// GGML_TENSOR_FLAG_COMPUTE, and the plain struct-copy `dst_host = *dst`
+// copies that flag along with everything else -- no extra step needed.
+// Verified directly (a standalone repro built dst via ggml_flash_attn_ext,
+// ran ggml_build_forward_expand() on it exactly once as llama.cpp's real
+// graph build does, THEN shallow-copied it and ran the identical manual
+// 1-node graph with no flag-setting of its own): dst_host inherited the
+// flag and produced real, correct, nonzero output. So this harness's own
+// fixture -- which never runs an initial ggml_build_forward_expand() pass,
+// unlike every real production dst -- needs the explicit
+// `dst->flags |= GGML_TENSOR_FLAG_COMPUTE;` in make_single_node_graph()
+// below purely to stand in for that missing initial build step, not to
+// paper over a wrapper bug. ggml_sycl_dispatch_host_flash_attn itself is
+// NOT touched by this task.
 //
-// Because that manual-construction shape is the one found broken, this
-// harness's own make_single_node_graph() below explicitly sets the flag
-// (see its comment) rather than silently reproducing the wrapper's exact
-// lines -- reproducing the defect here would make both compared paths
-// equally (and vacuously) broken, defeating the point of an identity check.
+// (A second question the same investigation answered: would
+// ggml_build_forward_expand() be a safer fix than flag-poking, if a fix
+// were needed? No -- it would be actively wrong here. The wrapper's
+// stand-in tensors (q_host = *q_src, etc., ggml-sycl.cpp:76463-76473) are
+// shallow copies that preserve q_src's original .op and .src[] verbatim;
+// only .data and dst_host.src[] are overridden. ggml_build_forward_expand
+// walks a node's .src[] recursively and adds any non-NONE-op ancestor as a
+// COMPUTE node, so it would pull q_host/k_host/v_host's *original*
+// upstream producers (e.g. whatever RoPE fed q_src) into the graph and try
+// to recompute them on the CPU backend from .data pointers that may still
+// be raw GPU device pointers -- wrong at best, a crash at worst. The
+// narrow, single-tensor flag-set is the only safe option here, which is
+// exactly what turned out to be unnecessary in production, since the flag
+// already arrives set.)
 //
 // Perturbation control (case 2): a comparison harness that always reports
 // "identical" proves nothing (a-positive-control-can-itself-be-void). Case
@@ -99,7 +108,7 @@
 // output DIFFERS from the unperturbed run -- demonstrating the memcmp
 // actually discriminates real output changes, not just comparing two
 // degenerate (e.g. all-zero) buffers that happen to match. It is what
-// caught the wrapper defect above.
+// caught the fixture gap above before it was misread as a wrapper defect.
 //
 // Fixture shape: a single decode-time query row (N=1, matches the actual
 // TG-time production case -- "Q ... one row per token at TG", addendum §2),
@@ -190,16 +199,17 @@ fixture make_fixture(ggml_context * ctx, uint32_t seed) {
 }
 
 // Builds a 1-node graph wrapping dst, in its own no_alloc graph context --
-// the same shape ggml_sycl_dispatch_host_flash_attn itself builds
+// the same manual shape ggml_sycl_dispatch_host_flash_attn itself builds
 // (ggml-sycl.cpp: "A minimal single-node graph ... does not need leafs[]
-// populated") EXCEPT for one explicit line this file's top comment
-// documents as the wrapper's own missing piece: without
-// GGML_TENSOR_FLAG_COMPUTE, ggml_graph_compute_thread's dispatch loop
-// (ggml-cpu.c:3113) silently skips this node instead of computing it.
-// Normally ggml_build_forward_expand() sets this flag (ggml.c:7230); this
-// harness sets it directly to stay faithful to the wrapper's manual,
-// leafs-free construction while still being a REAL identity check rather
-// than a vacuous zero-vs-zero comparison.
+// populated"). The one addition, `dst->flags |= GGML_TENSOR_FLAG_COMPUTE`,
+// is NOT reproducing a wrapper fix -- it stands in for the
+// ggml_build_forward_expand() pass every real production dst has already
+// been through before it ever reaches the wrapper (see this file's top
+// comment for the full investigation). This harness's dst comes straight
+// from ggml_flash_attn_ext() with no such pass, so without this line
+// ggml_graph_compute_thread's dispatch loop (ggml-cpu.c:3113) would
+// silently skip the node and this would be a vacuous zero-vs-zero
+// comparison instead of a real identity check.
 struct owned_graph {
     ggml_context * gctx;
     ggml_cgraph *  graph;
