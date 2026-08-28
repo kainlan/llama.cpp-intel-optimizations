@@ -1680,6 +1680,49 @@ set_tests_properties(sycl-attn-host-pool PROPERTIES
     TIMEOUT 30
 )
 
+# TKV-13 (B2) step 4: identity-case correctness harness
+# (docs/plans/2026-08-27-tkv13-b2-addendum.md §4.3, §7 step 4). Proves the
+# landed wrapper's mechanism -- routing FLASH_ATTN_EXT through AttnHostPool
+# instead of calling ggml_backend_graph_compute() directly on the calling
+# thread -- changes WHO calls the CPU kernel and WHEN the host blocks, never
+# a single byte of output. ggml_sycl_dispatch_host_flash_attn itself
+# (ggml-sycl.cpp) is `static` (internal linkage in that TU) and cannot be
+# linked into a separate test binary -- see the long comment at the top of
+# the test file for why this harness instead reconstructs the wrapper's own
+# two call lines against the real AttnHostPool class, and why a raw call to
+# ggml_compute_forward_flash_attn_ext was rejected (it needs a
+# ggml_graph_plan-sized params->wdata/threadpool a bare caller cannot safely
+# fabricate). Same shape as test-attn-host-pool above -- needs -fsycl only
+# for attn-host-pool.hpp's sycl::queue type, cpu_selector_v, no device.
+add_executable(test-attn-host-flash-attn-identity
+    tests/test-attn-host-flash-attn-identity.cpp
+    attn-host-pool.cpp
+)
+target_include_directories(test-attn-host-flash-attn-identity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-attn-host-flash-attn-identity PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-attn-host-flash-attn-identity PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-attn-host-flash-attn-identity PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-attn-host-flash-attn-identity PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-attn-host-flash-attn-identity COMMAND test-attn-host-flash-attn-identity)
+set_tests_properties(sycl-attn-host-flash-attn-identity PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;attn;tkv13;hostonly"
+    TIMEOUT 30
+)
+
 # TKV-13 (B2) step 5.1: sustained host DDR5 read bandwidth roofline
 # prerequisite (docs/plans/2026-08-27-tkv13-b2-addendum.md §5.1). Pure host
 # C++ -- no ggml, no SYCL header at all -- so unlike every other target in
