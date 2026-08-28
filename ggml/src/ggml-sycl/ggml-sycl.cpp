@@ -76549,19 +76549,26 @@ static bool flush_pending_attn_if_consumed(const ggml_tensor * consuming_dst, in
 }
 
 // Runs FLASH_ATTN_EXT on the host for a layer whose K/V lives in the
-// dedicated KV-host buft. Q (and mask, if present) are D2H-copied into
-// pinned staging; K/V are already host-resident (pinned, zero-copy) --
-// exactly the point of routing these layers' attention to the CPU. The
-// result is staged host-side; publishing it to the real dst buffer is
-// deferred to flush_pending_attn_dispatch (called by
-// flush_pending_attn_if_consumed or the graph-boundary drain), not done
-// here.
+// dedicated KV-host buft, via the overlapped/deferred pending-slot
+// mechanism -- the shape that transforms prompt processing (the whole
+// graph keeps submitting GPU work while this op computes in the
+// background). Q (and mask, if present) are D2H-copied into pinned
+// staging; K/V are already host-resident (pinned, zero-copy) -- exactly
+// the point of routing these layers' attention to the CPU. The result is
+// staged host-side; publishing it to the real dst buffer is deferred to
+// flush_pending_attn_dispatch (called by flush_pending_attn_if_consumed or
+// the graph-boundary drain), not done here.
+//
+// Owner ruling 2026-08-28 (llama.cpp-sbky): this path is for PP ubatches
+// only. For single-token decode, use ggml_sycl_dispatch_host_flash_attn_sync
+// instead (measured faster there -- see the mode-split dispatcher below,
+// ggml_sycl_dispatch_host_flash_attn).
 //
 // Returns false (never having mutated dst) on any setup failure, so the
 // caller can fall back rather than silently producing wrong output --
 // mirrors the existing ggml_sycl_fallback_error/throw discipline used by
 // other CPU-dispatch paths in this file (e.g. the MoE CPU route).
-static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int device = ctx.device;
 
     // A previous dispatch's already-flushed resources are released one
@@ -76723,6 +76730,157 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     });
 
     return true;
+}
+
+// Runs FLASH_ATTN_EXT on the host for a layer whose K/V lives in the
+// dedicated KV-host buft, synchronously -- the step-3 landing's original
+// shape, restored verbatim (this function's body is unchanged from
+// c099dbc1c). Owner ruling 2026-08-28 (llama.cpp-sbky): re-measurement
+// showed the async pending-slot path (ggml_sycl_dispatch_host_flash_attn_async,
+// above) costs ~27ms/token more than this shape at single-token decode --
+// the async path's own bookkeeping (heap allocation, pool submit/join)
+// outweighs any overlap window one token's worth of subsequent GPU work
+// can give it, unlike PP where hundreds of ubatch rows follow. Q (and
+// mask, if present) are D2H-copied into pinned staging; K/V are already
+// host-resident. The result is staged host-side, then H2D-copied into the
+// real dst buffer before returning -- no pending slot, no deferred flush.
+//
+// Returns false (never having mutated dst) on any setup failure, so the
+// caller can fall back rather than silently producing wrong output --
+// mirrors the existing ggml_sycl_fallback_error/throw discipline used by
+// other CPU-dispatch paths in this file (e.g. the MoE CPU route).
+static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
+    if (!cpu_backend) {
+        GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host dispatch\n");
+        return false;
+    }
+
+    const int     device = ctx.device;
+    sycl::queue & q_dev  = *ctx.stream();
+
+    auto & pool = g_attn_host_pools[device];
+    if (!pool.is_active()) {
+        pool.init(1, q_dev);  // single worker for this synchronous landing
+    }
+
+    ggml_tensor * q_src    = dst->src[0];
+    ggml_tensor * k_src    = dst->src[1];
+    ggml_tensor * v_src    = dst->src[2];
+    ggml_tensor * mask_src = dst->src[3];
+    if (!q_src || !k_src || !v_src) {
+        GGML_LOG_WARN("[ATTN-HOST] FLASH_ATTN_EXT missing Q/K/V; declining host dispatch\n");
+        return false;
+    }
+
+    // Stand-in tensors: shallow struct copies preserve ne/nb/type/op/
+    // op_params/name exactly; only .data (and, on dst_host, .src[]) is
+    // overridden below. ggml_compute_forward_* reads ->data/->ne/->nb/
+    // ->type/->op_params only, never ->buffer, so no other field needs to
+    // change for the CPU kernel to compute correctly over these copies.
+    ggml_tensor q_host = *q_src;
+    ggml_tensor k_host = *k_src;
+    ggml_tensor v_host = *v_src;
+    ggml_tensor mask_host{};
+    ggml_tensor dst_host = *dst;
+    dst_host.src[0]      = &q_host;
+    dst_host.src[1]      = &k_host;
+    dst_host.src[2]      = &v_host;
+    if (mask_src) {
+        mask_host       = *mask_src;
+        dst_host.src[3] = &mask_host;
+    }
+
+    const size_t q_bytes    = ggml_nbytes(q_src);
+    const size_t dst_bytes  = ggml_nbytes(dst);
+    const size_t mask_bytes = mask_src ? ggml_nbytes(mask_src) : 0;
+
+    ggml_sycl::alloc_constraints c;
+    c.must_host_pinned = true;
+
+    ggml_sycl::alloc_request req;
+    req.queue  = &q_dev;
+    req.device = -1;
+    req.size   = q_bytes;
+    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_q", c };
+    ggml_sycl::mem_handle q_handle = ggml_sycl::unified_allocate(req);
+    void *                q_ptr    = q_handle.resolve().ptr;
+
+    req.size   = dst_bytes;
+    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_dst", c };
+    ggml_sycl::mem_handle dst_handle = ggml_sycl::unified_allocate(req);
+    void *                dst_ptr    = dst_handle.resolve().ptr;
+
+    ggml_sycl::mem_handle mask_handle;
+    void *                mask_ptr = nullptr;
+    if (mask_src && mask_bytes > 0) {
+        req.size   = mask_bytes;
+        req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_mask", c };
+        mask_handle = ggml_sycl::unified_allocate(req);
+        mask_ptr    = mask_handle.resolve().ptr;
+    }
+
+    if (!q_ptr || !dst_ptr || (mask_src && mask_bytes > 0 && !mask_ptr)) {
+        GGML_LOG_WARN("[ATTN-HOST] pinned staging allocation failed; declining host dispatch\n");
+        return false;
+    }
+
+    q_host.data   = q_ptr;
+    dst_host.data = dst_ptr;
+    if (mask_src) {
+        mask_host.data = mask_ptr;
+    }
+
+    // D2H: Q (and mask, if present) must be visible on the host before the
+    // CPU kernel reads them. K/V need no copy -- already pinned host memory.
+    ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev).wait();
+    if (mask_src && mask_bytes > 0) {
+        ggml_sycl::mem_copy_ptr_async(mask_ptr, mask_src->data, mask_bytes, q_dev).wait();
+    }
+
+    // A minimal single-node graph: ggml_backend_graph_compute() only walks
+    // nodes[] to dispatch compute_forward per node -- it does not need
+    // leafs[] populated (that bookkeeping is for the backend's own tensor
+    // allocator, which this path never uses, since every operand's .data
+    // is already set to real memory before the graph is built).
+    ggml_init_params gip{ /*.mem_size   =*/ggml_graph_overhead_custom(1, false),
+                          /*.mem_buffer =*/nullptr,
+                          /*.no_alloc   =*/true };
+    ggml_context *   gctx = ggml_init(gip);
+    if (!gctx) {
+        GGML_LOG_WARN("[ATTN-HOST] scratch ggml_context alloc failed; declining host dispatch\n");
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(gctx, 1, false);
+    graph->n_nodes      = 1;
+    graph->nodes[0]     = &dst_host;
+
+    std::future<void> future = pool.submit([cpu_backend, graph] { ggml_backend_graph_compute(cpu_backend, graph); });
+    future.get();  // synchronous for this landing -- see the function comment above
+
+    ggml_free(gctx);
+
+    // H2D: publish the host-computed result to the real device buffer.
+    ggml_sycl::mem_copy_ptr_async(dst->data, dst_ptr, dst_bytes, q_dev).wait();
+
+    return true;
+}
+
+// Mode-split entry point (owner ruling 2026-08-28, llama.cpp-sbky). The
+// async pending-slot path transforms PP throughput but measured ~27ms/token
+// SLOWER than the synchronous stepping-stone shape at single-token decode
+// -- its own bookkeeping outweighs an overlap window one token's worth of
+// subsequent GPU work can give it. Discriminator: Q's row count
+// (dst->src[0]->ne[1], the same N the FLASH_ATTN_EXT kernel itself uses,
+// i.e. the ubatch size at this op) -- 1 at TG, >1 at PP. If q_src is
+// somehow absent, fall through to the sync path, which itself checks and
+// declines with a clear log line rather than dereferencing a null pointer.
+static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q_src = dst->src[0];
+    if (q_src && q_src->ne[1] > 1) {
+        return ggml_sycl_dispatch_host_flash_attn_async(ctx, dst);
+    }
+    return ggml_sycl_dispatch_host_flash_attn_sync(ctx, dst);
 }
 
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
