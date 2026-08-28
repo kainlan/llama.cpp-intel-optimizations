@@ -2215,6 +2215,10 @@ static void ggml_sycl_release_host_weight_extras(ggml_sycl_host_weight_release_m
 // 2026-08-27, llama.cpp-sbky) -- two independent producers sharing one
 // pending-result slot would be a correctness hazard.
 #include "ggml-sycl/attn-host-pool.hpp"
+// TKV-13 (B2) step 1: attn_op_consumes_tensor / attn_tensor_depends_on --
+// the host-testable DAG-scan the final overlap increment's
+// flush_pending_attn_if_consumed reuses rather than duplicating.
+#include "ggml-sycl/attn-host-dispatch.hpp"
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -76421,29 +76425,166 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
     }
 }
 
+// TKV-13 (B2) final increment: the overlapped, deferred-flush form of the
+// host attention dispatch (docs/plans/2026-08-27-tkv13-b2-addendum.md §2,
+// §3). Replaces the step-3 landing's synchronous future.get() + three
+// blocking .wait() copies with the same overlap mechanism CpuExpertPool's
+// MoE dispatch already proves in production: submit without waiting, defer
+// the join to the point a real consumer needs the result (or graph end),
+// and let the input-side D2H join happen INSIDE the worker thread instead
+// of on the submitting thread (mirrors act_deferred_evt/act_deferred_pending,
+// ~70378-70393/70517-70520).
+//
+// A SEPARATE pending slot from g_pending_scatter/g_pending_cpu_pipeline
+// (owner ruling 2026-08-27, llama.cpp-sbky): two independent producers
+// sharing one pending-result slot is a correctness hazard (the blast-radius
+// note, addendum §6) -- a second submission before the first is flushed
+// would silently drop the first result.
+//
+// The stand-in tensors (q_host/k_host/v_host/mask_host/dst_host) and the
+// scratch ggml_context/ggml_cgraph used to be stack-local, safe only
+// because the function blocked until compute finished before returning.
+// Now that submission outlives the call, they are heap-owned
+// (attn_stand_in_tensors, allocated with the pending dispatch) so the
+// worker thread's captured graph pointer stays valid until this dispatch
+// is actually flushed.
+struct attn_stand_in_tensors {
+    ggml_tensor q_host;
+    ggml_tensor k_host;
+    ggml_tensor v_host;
+    ggml_tensor mask_host{};
+    ggml_tensor dst_host;
+};
+
+struct pending_attn_dispatch {
+    std::future<void>                      future;
+    const ggml_tensor *                    dst       = nullptr;  // real production tensor this result belongs to
+    void *                                 dst_ptr   = nullptr;  // host-pinned staging holding the computed result
+    size_t                                 dst_bytes = 0;
+    sycl::queue *                          stream    = nullptr;
+    ggml_context *                         gctx      = nullptr;  // owns the 1-node graph
+    std::unique_ptr<attn_stand_in_tensors> stand_ins;
+    ggml_sycl::mem_handle                  q_handle;
+    ggml_sycl::mem_handle                  dst_handle;
+    ggml_sycl::mem_handle                  mask_handle;
+    bool                                   active = false;
+};
+
+// One in-flight dispatch per device (addendum's model, §6), plus one
+// "stale" slot per device holding the PREVIOUS dispatch's resources after
+// it has been flushed. The stale slot exists because flush's own H2D
+// publish (below) is submitted async and deliberately not waited on -- the
+// backing dst_handle must not be released while that DMA could still be
+// reading it. Releasing it one dispatch (or one graph boundary) later
+// mirrors g_pending_scatter's prev_bufs deferred-release pattern
+// (~20105-20135), the same problem MoE's own async scatter already solved.
+static thread_local pending_attn_dispatch g_pending_attn_dispatch[GGML_SYCL_MAX_DEVICES] = {};
+static thread_local pending_attn_dispatch g_stale_attn_dispatch[GGML_SYCL_MAX_DEVICES]   = {};
+
+static void release_stale_attn_dispatch(int device) {
+    pending_attn_dispatch & stale = g_stale_attn_dispatch[device];
+    if (stale.gctx) {
+        ggml_free(stale.gctx);
+    }
+    stale = pending_attn_dispatch{};  // mem_handle destructors release the pinned staging back to the cache
+}
+
+// Bounded, blocking join on the CPU compute future -- the addendum's
+// designated "edge" (§3): a real consumer is either about to be dispatched
+// (flush_pending_attn_if_consumed) or the graph has ended
+// (ggml_backend_sycl_graph_compute_impl's boundary drain), and either way
+// GPU submission genuinely cannot proceed without this result. Publishes
+// the host-computed output to the real device buffer via an async H2D copy
+// that is deliberately NOT waited here -- it is submitted on the same
+// in-order queue the caller is about to submit the actual consumer's
+// kernel onto, so device-side execution order is correct without a host
+// wait (the same reasoning already documented for g_pending_scatter's own
+// async scatter events).
+static void flush_pending_attn_dispatch(int device) {
+    pending_attn_dispatch & pending = g_pending_attn_dispatch[device];
+    if (!pending.active) {
+        return;
+    }
+
+    bool compute_ok = true;
+    if (pending.future.valid()) {
+        try {
+            pending.future.get();
+        } catch (...) {
+            // Compute failed on the worker thread. Nothing to publish; the
+            // device buffer keeps whatever it already held, matching the
+            // existing ggml_sycl_fallback_error discipline of never
+            // silently writing wrong data.
+            compute_ok = false;
+        }
+    }
+
+    if (compute_ok && pending.stream && pending.dst && pending.dst_ptr) {
+        ggml_sycl::mem_copy_ptr_async(pending.dst->data, pending.dst_ptr, pending.dst_bytes, *pending.stream);
+    }
+
+    pending.active = false;
+    release_stale_attn_dispatch(device);
+    g_stale_attn_dispatch[device] = std::move(pending);
+    pending                       = pending_attn_dispatch{};
+}
+
+// Selective flush: only join if `consuming_dst` actually reads the pending
+// dispatch's output -- the same DAG-scan shape as
+// flush_pending_cpu_scatter_if_consumed, reusing the step-1 host-testable
+// implementation (attn-host-dispatch.hpp/.cpp) rather than duplicating it.
+// A node for which this returns false is dispatched without waiting at
+// all; the genuine overlap window is everything between this dispatch and
+// the first op that actually consumes its output.
+static bool flush_pending_attn_if_consumed(const ggml_tensor * consuming_dst, int device) {
+    pending_attn_dispatch & pending = g_pending_attn_dispatch[device];
+    if (!pending.active || !consuming_dst) {
+        return false;
+    }
+    if (!pending.dst || ggml_sycl::attn_op_consumes_tensor(consuming_dst, pending.dst)) {
+        flush_pending_attn_dispatch(device);
+        return true;
+    }
+    return false;
+}
+
 // Runs FLASH_ATTN_EXT on the host for a layer whose K/V lives in the
 // dedicated KV-host buft. Q (and mask, if present) are D2H-copied into
 // pinned staging; K/V are already host-resident (pinned, zero-copy) --
 // exactly the point of routing these layers' attention to the CPU. The
-// result is staged host-side, then H2D-copied into the real dst buffer.
+// result is staged host-side; publishing it to the real dst buffer is
+// deferred to flush_pending_attn_dispatch (called by
+// flush_pending_attn_if_consumed or the graph-boundary drain), not done
+// here.
 //
 // Returns false (never having mutated dst) on any setup failure, so the
 // caller can fall back rather than silently producing wrong output --
 // mirrors the existing ggml_sycl_fallback_error/throw discipline used by
 // other CPU-dispatch paths in this file (e.g. the MoE CPU route).
 static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const int device = ctx.device;
+
+    // A previous dispatch's already-flushed resources are released one
+    // step late (see the struct comment above); do that now, and force-
+    // flush any dispatch that is still active -- one in flight per device
+    // is the model this overlap is designed around; a second submission
+    // before the first is drained would silently drop the first result.
+    release_stale_attn_dispatch(device);
+    if (g_pending_attn_dispatch[device].active) {
+        flush_pending_attn_dispatch(device);
+    }
+
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
         GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host dispatch\n");
         return false;
     }
 
-    const int     device = ctx.device;
-    sycl::queue & q_dev  = *ctx.stream();
+    sycl::queue & q_dev = *ctx.stream();
 
     auto & pool = g_attn_host_pools[device];
     if (!pool.is_active()) {
-        pool.init(1, q_dev);  // single worker for this synchronous landing
+        pool.init(1, q_dev);
     }
 
     ggml_tensor * q_src    = dst->src[0];
@@ -76460,17 +76601,25 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     // overridden below. ggml_compute_forward_* reads ->data/->ne/->nb/
     // ->type/->op_params only, never ->buffer, so no other field needs to
     // change for the CPU kernel to compute correctly over these copies.
-    ggml_tensor q_host = *q_src;
-    ggml_tensor k_host = *k_src;
-    ggml_tensor v_host = *v_src;
-    ggml_tensor mask_host{};
-    ggml_tensor dst_host = *dst;
-    dst_host.src[0]      = &q_host;
-    dst_host.src[1]      = &k_host;
-    dst_host.src[2]      = &v_host;
+    // dst_host.flags is likewise copied from the real dst: llama.cpp
+    // rebuilds and re-expands the whole model graph via
+    // ggml_build_forward_expand() every decode step before any backend
+    // ever sees a node, so dst already carries GGML_TENSOR_FLAG_COMPUTE by
+    // the time it reaches here, and this shallow copy carries it along --
+    // verified directly; see the identity harness's header comment
+    // (test-attn-host-flash-attn-identity.cpp) for the investigation that
+    // ruled out needing to set it here.
+    auto stand_ins             = std::make_unique<attn_stand_in_tensors>();
+    stand_ins->q_host          = *q_src;
+    stand_ins->k_host          = *k_src;
+    stand_ins->v_host          = *v_src;
+    stand_ins->dst_host        = *dst;
+    stand_ins->dst_host.src[0] = &stand_ins->q_host;
+    stand_ins->dst_host.src[1] = &stand_ins->k_host;
+    stand_ins->dst_host.src[2] = &stand_ins->v_host;
     if (mask_src) {
-        mask_host       = *mask_src;
-        dst_host.src[3] = &mask_host;
+        stand_ins->mask_host       = *mask_src;
+        stand_ins->dst_host.src[3] = &stand_ins->mask_host;
     }
 
     const size_t q_bytes    = ggml_nbytes(q_src);
@@ -76507,17 +76656,24 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
         return false;
     }
 
-    q_host.data   = q_ptr;
-    dst_host.data = dst_ptr;
+    stand_ins->q_host.data   = q_ptr;
+    stand_ins->dst_host.data = dst_ptr;
     if (mask_src) {
-        mask_host.data = mask_ptr;
+        stand_ins->mask_host.data = mask_ptr;
     }
 
-    // D2H: Q (and mask, if present) must be visible on the host before the
-    // CPU kernel reads them. K/V need no copy -- already pinned host memory.
-    ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev).wait();
+    // D2H: capture the events but do NOT wait here -- the wait is deferred
+    // to immediately before the CPU task actually reads the data, INSIDE
+    // the worker thread below, so GPU submission for other graph regions
+    // in between is never blocked by it. Mirrors act_deferred_evt/
+    // act_deferred_pending (~70378-70393, 70517-70520). K/V need no copy or
+    // event -- already pinned host memory.
+    sycl::event q_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
+    sycl::event mask_evt;
+    bool        have_mask_evt = false;
     if (mask_src && mask_bytes > 0) {
-        ggml_sycl::mem_copy_ptr_async(mask_ptr, mask_src->data, mask_bytes, q_dev).wait();
+        mask_evt      = ggml_sycl::mem_copy_ptr_async(mask_ptr, mask_src->data, mask_bytes, q_dev);
+        have_mask_evt = true;
     }
 
     // A minimal single-node graph: ggml_backend_graph_compute() only walks
@@ -76535,15 +76691,36 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     }
     ggml_cgraph * graph = ggml_new_graph_custom(gctx, 1, false);
     graph->n_nodes      = 1;
-    graph->nodes[0]     = &dst_host;
+    graph->nodes[0]     = &stand_ins->dst_host;
 
-    std::future<void> future = pool.submit([cpu_backend, graph] { ggml_backend_graph_compute(cpu_backend, graph); });
-    future.get();  // synchronous for this landing -- see the function comment above
+    pending_attn_dispatch & pending = g_pending_attn_dispatch[device];
+    pending.dst                     = dst;
+    pending.dst_ptr                 = dst_ptr;
+    pending.dst_bytes               = dst_bytes;
+    pending.stream                  = &q_dev;
+    pending.gctx                    = gctx;
+    pending.q_handle                = std::move(q_handle);
+    pending.dst_handle              = std::move(dst_handle);
+    pending.mask_handle             = std::move(mask_handle);
+    pending.stand_ins               = std::move(stand_ins);
+    pending.active                  = true;
 
-    ggml_free(gctx);
-
-    // H2D: publish the host-computed result to the real device buffer.
-    ggml_sycl::mem_copy_ptr_async(dst->data, dst_ptr, dst_bytes, q_dev).wait();
+    // Submit WITHOUT get() -- this is the actual overlap. The worker
+    // thread joins the D2H events itself (off this, the submitting,
+    // thread), then runs the CPU kernel; the submitting thread returns
+    // immediately and the scheduler keeps submitting GPU work for the rest
+    // of the graph. flush_pending_attn_if_consumed (called from
+    // ggml_sycl_compute_forward's single funnel point and the main
+    // node-loop's fusion-bypass site) or the graph-boundary drain in
+    // ggml_backend_sycl_graph_compute_impl is what eventually joins this
+    // future.
+    pending.future = pool.submit([cpu_backend, graph, q_evt, mask_evt, have_mask_evt]() mutable {
+        q_evt.wait();
+        if (have_mask_evt) {
+            mask_evt.wait();
+        }
+        ggml_backend_graph_compute(cpu_backend, graph);
+    });
 
     return true;
 }
@@ -76617,6 +76794,10 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     flush_pending_cpu_scatter_if_consumed(dst, ctx.device);
     flush_pending_secondary_scatter_if_consumed(dst, ctx.device);
     flush_pending_cpu_pipeline_if_consumed(dst, ctx.device);
+    // TKV-13 (B2) final increment: same shape, own pending slot -- see
+    // flush_pending_attn_if_consumed's comment above
+    // ggml_sycl_dispatch_host_flash_attn.
+    flush_pending_attn_if_consumed(dst, ctx.device);
 
     if (dt.enabled) {
         dt.flush_us = dt.elapsed_us();
@@ -84281,6 +84462,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         g_pending_cpu_pipeline.future = {};
     }
+    // TKV-13 (B2) final increment: unconditional graph-boundary drain for
+    // the attention pending slot, mirroring the two drains immediately
+    // above. If the graph ended without any consumer ever reaching
+    // flush_pending_attn_if_consumed, this still publishes the result
+    // (rather than silently dropping it) and prevents the pending future /
+    // heap-owned stand-in tensors from lingering until whenever the next
+    // attention dispatch happens to occur. flush_pending_attn_dispatch
+    // moves this dispatch's resources into the stale slot rather than
+    // freeing them immediately (its own async H2D publish has not
+    // necessarily completed on the device yet); release_stale_attn_dispatch
+    // frees whatever was ALREADY stale from the dispatch before this one.
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; d++) {
+        if (g_pending_attn_dispatch[d].active) {
+            flush_pending_attn_dispatch(d);
+        }
+        release_stale_attn_dispatch(d);
+    }
 
     // Release cached staging buffer leases BEFORE the zone boundary check
     // below.  The staging buffers are sub-allocated from the host STAGING
@@ -84984,6 +85182,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             flush_pending_cpu_scatter_if_consumed(node, sycl_ctx->device);
             flush_pending_secondary_scatter_if_consumed(node, sycl_ctx->device);
             flush_pending_cpu_pipeline_if_consumed(node, sycl_ctx->device);
+            // TKV-13 (B2) final increment: same bypass hazard applies to the
+            // attention pending slot.
+            flush_pending_attn_if_consumed(node, sycl_ctx->device);
             {
                 int precomputed_final_idx = -1;
                 if (ggml_sycl_moe_precomputed_down_sum_take(node, sycl_ctx->device, &precomputed_final_idx)) {
