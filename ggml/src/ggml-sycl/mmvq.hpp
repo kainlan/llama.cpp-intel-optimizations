@@ -163,6 +163,14 @@ bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
                                   const ggml_sycl::mem_handle *   glu_dst_handle,
                                   mxfp4_moe_prompt_q8_preflight * out);
 
+// llama.cpp-2gag: reset the cross-call GLU-Q8 reuse cache (g_mxfp4_moe_tg_reuse
+// in mmvq.cpp) at a graph boundary. Its validity check keys on device/layer/
+// role/shape/pointer-identity, and a layer's glu_dst tensor sits at the same
+// device address every decode token, so nothing else invalidates it per graph.
+// Call from the same per-graph cache-invalidation point that resets the
+// sibling g_moe_precomputed_mmid_skip family (ggml_sycl_moe_precomputed_skip_new_graph).
+void ggml_sycl_mxfp4_moe_tg_reuse_new_graph();
+
 bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
                                                   const ggml_tensor *           gate_weight,
                                                   const ggml_tensor *           up_weight,

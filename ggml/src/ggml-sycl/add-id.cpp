@@ -219,7 +219,22 @@ void ggml_sycl_add_id(ggml_backend_sycl_context& ctx, ggml_sycl::sycl_tensor dst
   sycl::queue& q = *ctx.stream();
 
   const float* src0_d = src0.resolve_as<const float>();
-  const float* src1_d = src1.resolve_as<const float>();
+  // llama.cpp-2gag: src1 is the per-expert bias matrix for a standalone
+  // (non-fused) MoE ADD_ID node -- the same tensor class as the gate/up/down
+  // bias operands fixed in ggml-sycl.cpp and mmvq.cpp. resolve_as() routes
+  // through sycl_tensor::resolve_ptr() -> ggml_sycl_resolve_tensor_ptr(),
+  // whose fast path trusts a DIRECT-kind mem_handle memoized on the tensor's
+  // own extra->data_handle[device] forever, with no per-graph refresh. When
+  // the bias's host-staged copy lives in the same transient staging pool as
+  // TKV-13's host-attention slots, that memoized pointer survives the
+  // staging allocation being freed and reused by an unrelated tenant, so a
+  // standalone ADD_ID (a layer whose bias is not absorbed into the fused
+  // GLU dispatch) reads garbage from an address that used to be its own
+  // bias. ggml_sycl_get_data_ptr_slow() re-derives the pointer through the
+  // per-graph g_data_ptr_cache (cleared every graph, llama.cpp-bgf1) instead
+  // of the tensor-local sticky handle, so it cannot go stale across tokens.
+  const float* src1_d = static_cast<const float *>(ggml_sycl_get_data_ptr_slow(src1.raw(), src1.device()));
+  GGML_ASSERT(src1_d != nullptr && "ggml_sycl_add_id: null pointer -- bias tensor data not resolved");
   const int32_t* src2_d = src2.resolve_as<const int32_t>();
   float* dst_d = dst.resolve_as<float>();
 

@@ -1910,6 +1910,28 @@ static void mxfp4_moe_tg_reuse_invalidate() {
     g_mxfp4_moe_tg_reuse.ready_event_set = false;
 }
 
+// llama.cpp-2gag: g_mxfp4_moe_tg_reuse's validity check (mxfp4_moe_tg_reuse_can_use)
+// keys on {device, layer, role, shape, src1_handle pointer-identity} -- and a
+// layer's glu_dst tensor sits at the SAME device address every decode token
+// (it's a persistent graph node), so the pointer-identity check is satisfied
+// trivially across tokens and proves nothing about which token's data is in
+// the buffer. Every call site that invalidates this cache is inside the
+// gate/up dispatch's own internal branches (mmvq.cpp); none of them run
+// unconditionally, and no per-graph reset call exists anywhere for this
+// cache (verified by exhaustive search across the file -- unlike the sibling
+// g_moe_precomputed_mmid_skip family, which IS reset every graph via
+// ggml_sycl_moe_precomputed_skip_new_graph()). If some internal branch of
+// the gate/up dispatch neither re-stores nor invalidates the cache for a
+// given token, while the down-projection dispatch for that same layer still
+// finds mxfp4_moe_tg_reuse_can_use() true, the down projection silently
+// consumes a stale, previous-token GLU-Q8 artifact -- plausible-magnitude,
+// systematically wrong output, not garbage. Exposed here so the canonical
+// per-graph cache invalidation point (ggml_backend_sycl_graph_compute_impl)
+// can reset it exactly like its sibling caches.
+void ggml_sycl_mxfp4_moe_tg_reuse_new_graph() {
+    mxfp4_moe_tg_reuse_invalidate();
+}
+
 static void mxfp4_moe_tg_reuse_append_ready_dep(std::vector<sycl::event> & deps) {
     const auto & cache = g_mxfp4_moe_tg_reuse;
     if (cache.valid && cache.ready_event_set) {
@@ -20395,8 +20417,15 @@ bool mmvq_moe_batched_dispatch_down_sum_from_cached_q8_mxfp4(
         dst_d = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(final_dst, runtime_device));
     }
     const float * weights_d = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(moe_weights, runtime_device));
+    // llama.cpp-2gag: same dangling-DIRECT-handle hazard as the gate/up bias
+    // resolves in ggml-sycl.cpp (see those call sites' comments) -- down_bias
+    // is a host-staged copy from a transient per-graph staging pool, and
+    // ggml_sycl_resolve_tensor_ptr's tensor->extra->data_handle fast path
+    // trusts a DIRECT-kind handle forever once populated, with no re-staging
+    // signal when the underlying pool reuses the address. Use the slow path
+    // directly so this resolves fresh every dispatch.
     const float * bias_d =
-        down_bias ? static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(down_bias, runtime_device)) : nullptr;
+        down_bias ? static_cast<const float *>(ggml_sycl_get_data_ptr_slow(down_bias, runtime_device)) : nullptr;
     if (!dst_d || !weights_d || (down_bias && !bias_d)) {
         return false;
     }

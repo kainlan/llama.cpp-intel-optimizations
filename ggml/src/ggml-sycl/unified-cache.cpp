@@ -3108,6 +3108,40 @@ static bool ext_alloc_trace_enabled() {
     return enabled != 0;
 }
 
+// llama.cpp-2gag bisection: trace every allocation that lands in a host
+// zone (pointer, byte range, zone, role/category, cohort tag) so a run can
+// be checked for address overlap between the persistent attn-host staging
+// slots (llama.cpp-sbky) and any other live host-zone consumer -- the
+// slot-vs-slot aliasing check already ruled out the five slots colliding
+// with EACH OTHER, but never checked them against anything else sharing the
+// zone. Off by default; the atomic load is the only always-paid cost.
+static bool host_zone_alloc_trace_enabled() {
+    static std::atomic<int> cached{ -1 };
+    int                     enabled = cached.load(std::memory_order_acquire);
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char * env = std::getenv("GGML_SYCL_HOST_ZONE_ALLOC_TRACE");
+    enabled          = (env && std::atoi(env) != 0) ? 1 : 0;
+    cached.store(enabled, std::memory_order_release);
+    return enabled != 0;
+}
+
+static void host_zone_alloc_trace_print(const char * where, host_zone_id zone, void * ptr, size_t size,
+                                        const alloc_request & req, uint64_t alloc_id, size_t used_after,
+                                        size_t largest_free_after) {
+    if (!host_zone_alloc_trace_enabled() || !ptr) {
+        return;
+    }
+    fprintf(stderr,
+            "[HOST-ZONE-ALLOC] where=%s dev=%d zone=%s ptr=%p end=%p bytes=%zu role=%d category=%d "
+            "cohort=%s alloc_id=%llu used_after=%zu largest_free_after=%zu\n",
+            where, req.device, host_zone_name(zone), ptr, static_cast<char *>(ptr) + size, size,
+            static_cast<int>(req.intent.role), static_cast<int>(req.intent.category),
+            req.intent.cohort_id ? req.intent.cohort_id : "?", (unsigned long long) alloc_id, used_after,
+            largest_free_after);
+}
+
 static bool copy_to_device_sync_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     enabled = cached.load(std::memory_order_acquire);
@@ -12351,6 +12385,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                         zone_managed                = true;
                         output_metadata.zone_managed = true;
                         output_metadata.host_zone    = pool_zone;
+                        host_zone_alloc_trace_print("pinned-pool", pool_zone, ptr, alloc_size, req, reserved_alloc_id,
+                                                    ucache->host_zone_used(pool_zone),
+                                                    ucache->host_zone_largest_free_block(pool_zone));
                     }
                 }
                 if (ptr) {
@@ -12363,6 +12400,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 if (zone_managed) {
                     output_metadata.zone_managed = true;
                     output_metadata.host_zone    = zone;
+                    host_zone_alloc_trace_print("direct-zone", zone, ptr, alloc_size, req, reserved_alloc_id,
+                                                ucache->host_zone_used(zone),
+                                                ucache->host_zone_largest_free_block(zone));
                 }
             } else {
                 // Zones not configured: direct runtime allocation.  host_pool_alloc
@@ -16987,6 +17027,9 @@ void unified_cache::host_zone_free(host_zone_id zone, void * ptr) {
     if (!host_arena_ || !ptr) {
         return;
     }
+    if (host_zone_alloc_trace_enabled()) {
+        fprintf(stderr, "[HOST-ZONE-ALLOC] where=free dev=? zone=%s ptr=%p\n", host_zone_name(zone), ptr);
+    }
     const zone_audit_timer audit_timer(zone_audit_host_timing(zone), true);
     host_arena_->zone_free(zone, ptr);
 }
@@ -17024,7 +17067,16 @@ bool unified_cache::host_zone_grow(host_zone_id zone, size_t additional_bytes) {
     if (!host_arena_ || !host_arena_->zones_configured() || additional_bytes == 0) {
         return false;
     }
-    return host_arena_->grow_zone(zone, additional_bytes);
+    if (host_zone_alloc_trace_enabled()) {
+        fprintf(stderr, "[HOST-ZONE-ALLOC] where=grow zone=%s additional_bytes=%zu used_before=%zu cap_before=%zu\n",
+                host_zone_name(zone), additional_bytes, host_zone_used(zone), host_zone_capacity(zone));
+    }
+    const bool grew = host_arena_->grow_zone(zone, additional_bytes);
+    if (host_zone_alloc_trace_enabled()) {
+        fprintf(stderr, "[HOST-ZONE-ALLOC] where=grow-result zone=%s ok=%d cap_after=%zu\n", host_zone_name(zone),
+                (int) grew, host_zone_capacity(zone));
+    }
+    return grew;
 }
 
 void unified_cache::configure_host_zones(size_t weight_bytes,
