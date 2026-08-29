@@ -76386,8 +76386,9 @@ static bool ggml_sycl_attn_host_dispatch_enabled() {
     return enabled;
 }
 
-static ggml_backend_t g_attn_host_cpu_backend = nullptr;
-static std::mutex     g_attn_host_cpu_backend_mutex;
+static ggml_backend_t    g_attn_host_cpu_backend    = nullptr;
+static ggml_threadpool * g_attn_host_cpu_threadpool = nullptr;
+static std::mutex        g_attn_host_cpu_backend_mutex;
 
 // Process-lifetime CPU backend instance shared by every device's demoted
 // layers -- the CPU backend has no device affinity, so there is exactly one,
@@ -76406,12 +76407,36 @@ static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
     }
     be = ggml_backend_cpu_init();
     if (be) {
-        // One query at TG, one AttnHostPool worker per dispatch -- the pool
-        // is this path's unit of parallelism, not this backend's own
-        // internal thread pool. Multiple internal threads for a single
-        // decode-time attention row would only add synchronization
-        // overhead here.
-        ggml_backend_cpu_set_n_threads(be, 1);
+        // The work here scales with n_kv, not with the single query row: at
+        // an 8K-filled cache one decode-step FLASH_ATTN_EXT reads ~16 MB of
+        // K/V, and single-threaded that measured 20-30 ms/call
+        // (ATTN-SYNC-PROFILE, llama.cpp-sbky) -- the whole decode overhead.
+        // 8 threads matches the configuration the host-KV bandwidth floor
+        // was calibrated at (34.7 GB/s, spike-floor-calibration.md); the
+        // AttnHostPool admits one dispatch at a time (single pending slot),
+        // so these threads never stack across concurrent dispatches.
+        //
+        // Persistent threadpool: without one, every graph_compute here
+        // spawns and joins its worker threads -- one dispatch per token per
+        // demoted layer, several ms/token of pure thread churn under
+        // ambient load. Created once, freed with the backend.
+        // GGML_SYCL_ATTN_HOST_THREADS overrides the count (tuning knob for
+        // llama.cpp-sbky's floor work; the FA here is compute-bound, so the
+        // right count depends on ambient CPU contention, not bandwidth).
+        int n_threads = 8;
+        if (const char * env = std::getenv("GGML_SYCL_ATTN_HOST_THREADS")) {
+            const int v = std::atoi(env);
+            if (v >= 1 && v <= 64) {
+                n_threads = v;
+            }
+        }
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+        g_attn_host_cpu_threadpool = ggml_threadpool_new(&tpp);
+        if (g_attn_host_cpu_threadpool) {
+            ggml_backend_cpu_set_threadpool(be, g_attn_host_cpu_threadpool);
+        } else {
+            ggml_backend_cpu_set_n_threads(be, 8);
+        }
     }
     g_attn_host_cpu_backend = be;
     return be;
@@ -76422,6 +76447,10 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
     if (g_attn_host_cpu_backend) {
         ggml_backend_free(g_attn_host_cpu_backend);
         g_attn_host_cpu_backend = nullptr;
+    }
+    if (g_attn_host_cpu_threadpool) {
+        ggml_threadpool_free(g_attn_host_cpu_threadpool);
+        g_attn_host_cpu_threadpool = nullptr;
     }
 }
 
@@ -76749,7 +76778,24 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
 // caller can fall back rather than silently producing wrong output --
 // mirrors the existing ggml_sycl_fallback_error/throw discipline used by
 // other CPU-dispatch paths in this file (e.g. the MoE CPU route).
+// Per-segment attribution probe for the sync host-attention body
+// (llama.cpp-sbky overhead hunt). Gated behind GGML_SYCL_ATTN_SYNC_PROFILE
+// so it is a no-op unless explicitly requested. This probe found all three
+// stacked overhead layers (sched KV streaming, 1-thread CPU FA, split
+// churn); it is a temporary TKV-11 observable -- delete at TKV-12 cleanup
+// together with the env check, like the decline counters.
+static bool ggml_sycl_attn_sync_profile_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_ATTN_SYNC_PROFILE") != nullptr;
+    return enabled;
+}
+
 static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const bool                            attn_profile = ggml_sycl_attn_sync_profile_enabled();
+    std::chrono::steady_clock::time_point t_entry, t_setup1, t_d2h, t_graph, t_compute, t_h2d;
+    if (attn_profile) {
+        t_entry = std::chrono::steady_clock::now();
+    }
+
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
         GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host dispatch\n");
@@ -76831,11 +76877,24 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
         mask_host.data = mask_ptr;
     }
 
+    if (attn_profile) {
+        t_setup1 = std::chrono::steady_clock::now();
+    }
+
     // D2H: Q (and mask, if present) must be visible on the host before the
     // CPU kernel reads them. K/V need no copy -- already pinned host memory.
-    ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev).wait();
+    sycl::event q_d2h_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
+    q_d2h_evt.wait();
+    sycl::event mask_d2h_evt;
+    bool        have_mask_d2h_evt = false;
     if (mask_src && mask_bytes > 0) {
-        ggml_sycl::mem_copy_ptr_async(mask_ptr, mask_src->data, mask_bytes, q_dev).wait();
+        mask_d2h_evt = ggml_sycl::mem_copy_ptr_async(mask_ptr, mask_src->data, mask_bytes, q_dev);
+        mask_d2h_evt.wait();
+        have_mask_d2h_evt = true;
+    }
+
+    if (attn_profile) {
+        t_d2h = std::chrono::steady_clock::now();
     }
 
     // A minimal single-node graph: ggml_backend_graph_compute() only walks
@@ -76855,14 +76914,191 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     graph->n_nodes      = 1;
     graph->nodes[0]     = &dst_host;
 
+    if (attn_profile) {
+        t_graph = std::chrono::steady_clock::now();
+    }
+
     std::future<void> future = pool.submit([cpu_backend, graph] { ggml_backend_graph_compute(cpu_backend, graph); });
     future.get();  // synchronous for this landing -- see the function comment above
+
+    if (attn_profile) {
+        t_compute = std::chrono::steady_clock::now();
+    }
 
     ggml_free(gctx);
 
     // H2D: publish the host-computed result to the real device buffer.
     ggml_sycl::mem_copy_ptr_async(dst->data, dst_ptr, dst_bytes, q_dev).wait();
 
+    if (attn_profile) {
+        t_h2d = std::chrono::steady_clock::now();
+
+        auto us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+        };
+
+        // Device-side event timing, best-effort: q_dev almost certainly was
+        // NOT constructed with property::queue::enable_profiling (this is
+        // the real production per-device queue, not a probe-owned one), so
+        // get_profiling_info() is expected to throw here -- caught and
+        // reported as -1 rather than crashing the run.
+        long long q_dev_ns = -1, mask_dev_ns = -1;
+        try {
+            q_dev_ns = (long long) (q_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                    q_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_start>());
+        } catch (...) {
+        }
+        if (have_mask_d2h_evt) {
+            try {
+                mask_dev_ns =
+                    (long long) (mask_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_end>() -
+                                 mask_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_start>());
+            } catch (...) {
+            }
+        }
+
+        fprintf(stderr,
+                "[ATTN-SYNC-PROFILE] setup_us=%lld d2h_host_us=%lld d2h_dev_q_ns=%lld d2h_dev_mask_ns=%lld "
+                "graph_build_us=%lld compute_us=%lld h2d_host_us=%lld total_us=%lld "
+                "(d2h_host_us/h2d_host_us are HOST-observed wait time, which per "
+                "host-chrono-cannot-see-past-submission-backpressure can include queue "
+                "backpressure, not pure DMA time; d2h_dev_*_ns is -1 when queue profiling "
+                "is unavailable)\n",
+                (long long) us(t_entry, t_setup1), (long long) us(t_setup1, t_d2h), q_dev_ns, mask_dev_ns,
+                (long long) us(t_d2h, t_graph), (long long) us(t_graph, t_compute), (long long) us(t_compute, t_h2d),
+                (long long) us(t_entry, t_h2d));
+    }
+
+    return true;
+}
+
+// TKV-13 step 5: host-side SET_ROWS for demoted-layer KV writes -- the
+// addendum's disclosed CPY/SET_ROWS follow-up, SET_ROWS half. Without it,
+// every decode graph carries a mid-graph CPU split just to append one KV
+// row (GPU drain -> sched transition -> CPU SET_ROWS -> GPU relaunch),
+// which measured as the dominant per-token overhead once the FA intercept
+// actually engaged. Executing the write host-side from inside the SYCL
+// graph walk removes that split: dst is a view of the pinned host KV
+// (written in place through its own strides -- no publish copy), and only
+// src0 (the new row values, device) and src1 (row ids, a sched device
+// copy of the CPU input leaf) need D2H staging, a few KB at decode.
+// Synchronous by design: the write must be visible before this layer's
+// FLASH_ATTN_EXT (later in the same graph) reads K/V on the host, and the
+// staged bytes are too small for overlap to buy anything.
+static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
+    if (!cpu_backend) {
+        GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host SET_ROWS\n");
+        return false;
+    }
+
+    sycl::queue & q_dev = *ctx.stream();
+
+    ggml_tensor * val_src = dst->src[0];
+    ggml_tensor * ids_src = dst->src[1];
+    if (!val_src || !ids_src) {
+        GGML_LOG_WARN("[ATTN-HOST] SET_ROWS missing values/ids; declining host dispatch\n");
+        return false;
+    }
+
+    // Stand-ins as in the FA bodies above: shallow copies, only .data (and
+    // dst_host.src[]) overridden. dst_host keeps the real dst->data -- the
+    // pinned host KV view -- so the CPU kernel's writes land in place.
+    ggml_tensor val_host = *val_src;
+    ggml_tensor ids_host = *ids_src;
+    ggml_tensor dst_host = *dst;
+    dst_host.src[0]      = &val_host;
+    dst_host.src[1]      = &ids_host;
+
+    const size_t val_bytes = ggml_nbytes(val_src);
+    const size_t ids_bytes = ggml_nbytes(ids_src);
+
+    ggml_sycl::alloc_constraints c;
+    c.must_host_pinned = true;
+
+    ggml_sycl::alloc_request req;
+    req.queue  = &q_dev;
+    req.device = -1;
+    req.size   = val_bytes;
+    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_setrows_val",
+                   c };
+    ggml_sycl::mem_handle val_handle = ggml_sycl::unified_allocate(req);
+    void *                val_ptr    = val_handle.resolve().ptr;
+
+    req.size   = ids_bytes;
+    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_setrows_ids",
+                   c };
+    ggml_sycl::mem_handle ids_handle = ggml_sycl::unified_allocate(req);
+    void *                ids_ptr    = ids_handle.resolve().ptr;
+
+    if (!val_ptr || !ids_ptr) {
+        GGML_LOG_WARN("[ATTN-HOST] pinned staging allocation failed; declining host SET_ROWS\n");
+        return false;
+    }
+
+    val_host.data = val_ptr;
+    ids_host.data = ids_ptr;
+
+    // D2H both srcs; the in-order queue sequences these after their
+    // producers, and the second wait covers both copies.
+    ggml_sycl::mem_copy_ptr_async(val_ptr, val_src->data, val_bytes, q_dev);
+    ggml_sycl::mem_copy_ptr_async(ids_ptr, ids_src->data, ids_bytes, q_dev).wait();
+
+    // Hot path: inline single-threaded scatter on the calling thread --
+    // one row per token at decode, so a CPU-backend graph launch (thread
+    // wake + join per call) costs far more than the work itself. The loop
+    // mirrors ggml_compute_forward_set_rows_impl (ggml-cpu/ops.cpp)
+    // exactly, including the ids broadcast over dims 2/3, and uses the
+    // same per-type from_float as the reference kernel. Anything outside
+    // the f32-values case falls through to the CPU-backend graph below.
+    const ggml_from_float_t from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    if (val_src->type == GGML_TYPE_F32 && from_float &&
+        (ids_src->type == GGML_TYPE_I64 || ids_src->type == GGML_TYPE_I32)) {
+        const int64_t nc   = val_src->ne[0];
+        const int64_t nr   = val_src->ne[1];
+        const int64_t ne02 = val_src->ne[2];
+        const int64_t ne03 = val_src->ne[3];
+        const int64_t ne11 = ids_src->ne[1];
+        const int64_t ne12 = ids_src->ne[2];
+        for (int64_t i03 = 0; i03 < ne03; ++i03) {
+            for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                for (int64_t i = 0; i < nr; ++i) {
+                    const char * ids_cell = (const char *) ids_ptr + i * ids_src->nb[0] +
+                                            (i02 % ne11) * ids_src->nb[1] + (i03 % ne12) * ids_src->nb[2];
+                    const int64_t i1 = ids_src->type == GGML_TYPE_I64 ? *(const int64_t *) ids_cell :
+                                                                        (int64_t) *(const int32_t *) ids_cell;
+                    if (i1 < 0 || i1 >= dst->ne[1]) {
+                        GGML_LOG_WARN("[ATTN-HOST] SET_ROWS row id %ld out of range (ne1=%ld)\n", (long) i1,
+                                      (long) dst->ne[1]);
+                        return false;
+                    }
+                    from_float((const float *) ((const char *) val_ptr + i * val_src->nb[1] + i02 * val_src->nb[2] +
+                                                i03 * val_src->nb[3]),
+                               (char *) dst->data + i1 * dst->nb[1] + i02 * dst->nb[2] + i03 * dst->nb[3], nc);
+                }
+            }
+        }
+        return true;
+    }
+
+    ggml_init_params gip{ /*.mem_size   =*/ggml_graph_overhead_custom(1, false),
+                          /*.mem_buffer =*/nullptr,
+                          /*.no_alloc   =*/true };
+    ggml_context *   gctx = ggml_init(gip);
+    if (!gctx) {
+        GGML_LOG_WARN("[ATTN-HOST] scratch ggml_context alloc failed; declining host SET_ROWS\n");
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(gctx, 1, false);
+    graph->n_nodes      = 1;
+    graph->nodes[0]     = &dst_host;
+
+    ggml_backend_graph_compute(cpu_backend, graph);
+
+    ggml_free(gctx);
+
+    // No H2D publish: dst IS the host KV view, written in place; its only
+    // consumer on this path is the host FLASH_ATTN_EXT dispatch.
     return true;
 }
 
@@ -76902,6 +77138,14 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
     if (dst && dst->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_attn_host_dispatch_enabled() &&
         (ggml_sycl_tensor_is_in_kv_host_buft(dst->src[1]) || ggml_sycl_tensor_is_in_kv_host_buft(dst->src[2]))) {
         return ggml_sycl_dispatch_host_flash_attn(ctx, dst);
+    }
+
+    // TKV-13 step 5: the KV append for a demoted layer, kept inside the
+    // SYCL graph by the matching supports_op acceptance and executed
+    // host-side (see ggml_sycl_dispatch_host_set_rows_sync).
+    if (dst && dst->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled() &&
+        ggml_sycl_tensor_is_in_kv_host_buft(dst)) {
+        return ggml_sycl_dispatch_host_set_rows_sync(ctx, dst);
     }
 
     // Per-op dispatch overhead profiling: GGML_SYCL_DISPATCH_TIMING=1
@@ -99731,11 +99975,24 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
     // TKV-12 cleanup, together with the counter declaration and the
     // teardown print in ggml_backend_sycl_free.
     if (ggml_sycl_tensor_is_in_kv_host_buft(op)) {
-        if (g_ggml_sycl_debug) {
-            g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
-            GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
+        // TKV-13 step 5: SET_ROWS writing demoted-layer KV is accepted --
+        // not declined -- when GGML_SYCL_ATTN_HOST_DISPATCH is set, so the
+        // scheduler never carves a mid-graph CPU split for the KV append;
+        // ggml_sycl_compute_forward's funnel routes it to
+        // ggml_sycl_dispatch_host_set_rows_sync (host-side, in-place).
+        // Every other dst-resident op kind keeps declining exactly as
+        // before.
+        if (!(op->op == GGML_OP_SET_ROWS && ggml_sycl_attn_host_dispatch_enabled())) {
+            if (g_ggml_sycl_debug) {
+                g_sycl_kv_host_decline_count.fetch_add(1, std::memory_order_relaxed);
+                GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft residency decline (dst): op=%s\n", ggml_op_name(op->op));
+            }
+            return false;
         }
-        return false;
+        if (g_ggml_sycl_debug) {
+            g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
+            GGML_SYCL_DEBUG("[SYCL-SUPPORT] KV-host-buft SET_ROWS accepted for host dispatch (dst)\n");
+        }
     }
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (ggml_sycl_tensor_is_in_kv_host_buft(op->src[i])) {
@@ -99753,13 +100010,19 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // checks below that already gate normal (fully device-resident)
             // FLASH_ATTN_EXT support, so this cannot accept a shape/type this
             // backend could not otherwise compute.
-            if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_attn_host_dispatch_enabled()) {
+            // SET_ROWS joins the exception (TKV-13 step 5): post-merge
+            // SET_ROWS carries its destination view as src[2] as well, so
+            // without this the dst-check acceptance above is immediately
+            // undone here and the op still lands on the CPU backend via a
+            // mid-graph split -- the exact overhead step 5 removes.
+            if ((op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_SET_ROWS) &&
+                ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
                     GGML_SYCL_DEBUG(
-                        "[SYCL-SUPPORT] KV-host-buft FLASH_ATTN_EXT accepted for host dispatch "
+                        "[SYCL-SUPPORT] KV-host-buft %s accepted for host dispatch "
                         "(src[%d])\n",
-                        i);
+                        ggml_op_name(op->op), i);
                 }
                 continue;
             }
@@ -100420,6 +100683,24 @@ static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_
     // CPU-offload compute buffer type - host-pinned with is_host=true
     if (buft->iface.get_name == ggml_backend_sycl_cpu_offload_compute_buffer_type_name) {
         return true;
+    }
+
+    // Dedicated KV-host buft (TKV-13 step 5). Fail-closed by default: falling
+    // through to `return false` is what keeps every SYCL kernel away from
+    // host-resident KV (TKV-8's decline handles ops; this handles buffers).
+    // But when GGML_SYCL_ATTN_HOST_DISPATCH opts in, supports_op accepts
+    // demoted-layer FLASH_ATTN_EXT for the compute_forward funnel intercept --
+    // and if this function still returns false for the buft,
+    // ggml_backend_sched sees an accepted op whose K/V srcs live in an
+    // "unsupported" buffer and silently rewires them to device copies
+    // (SYCL0#cache_k_l<N>#0), streaming the full view extent host->device
+    // every graph execution (the forbidden streaming pattern) and leaving the
+    // intercept's residency check permanently false. Accepting the buft here
+    // (env-gated, so the default path is unchanged) suppresses those copies;
+    // zero-copy protection for every op stays with supports_op's per-op
+    // decline, which this does not weaken.
+    if (buft->iface.get_name == ggml_backend_sycl_kv_host_buffer_type_name) {
+        return ggml_sycl_attn_host_dispatch_enabled();
     }
 
     return false;
