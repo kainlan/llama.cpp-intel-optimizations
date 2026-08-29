@@ -21125,17 +21125,27 @@ void * ggml_sycl_get_data_ptr_slow(const ggml_tensor * tensor, int device) {
             return cached_ptr;
         }
     }
+    // Gated (llama.cpp-2gag M3): rev-2gag found the seven rerouted bias
+    // resolves only avoided the dangling extra->data_handle because the
+    // tiered-cache branch above happened to return first -- this consult was
+    // the unstated fallback back onto the stale pointer whenever the tiered
+    // lookup misses (unnamed tensor, cache miss, tiered mode off). Same
+    // predicate as every other consult site: a distrusted DIRECT handle
+    // skips data_device_ptr() entirely, raw twin included.
     if (tensor->view_src == nullptr && tensor->extra != nullptr) {
-        auto * extra   = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-        void * dev_ptr = extra->data_device_ptr(device);
-        if (dev_ptr != nullptr) {
-            if (is_input_tensor && !tp_enabled && tensor->data) {
-                ggml_sycl_refresh_cached_input_ptr(dev_ptr, tensor->data, ggml_nbytes(tensor), device);
+        auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        if (!ggml_sycl_valid_device_index(device) ||
+            ggml_sycl_direct_handle_trust_ok(tensor, extra->data_handle[device])) {
+            void * dev_ptr = extra->data_device_ptr(device);
+            if (dev_ptr != nullptr) {
+                if (is_input_tensor && !tp_enabled && tensor->data) {
+                    ggml_sycl_refresh_cached_input_ptr(dev_ptr, tensor->data, ggml_nbytes(tensor), device);
+                }
+                GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using extra->data_device[%d]=%p\n",
+                                tensor->name, device, device, dev_ptr);
+                g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, dev_ptr);
+                return dev_ptr;
             }
-            GGML_SYCL_DEBUG("ggml_sycl_get_data_ptr_slow: tensor=%s, device=%d, using extra->data_device[%d]=%p\n",
-                            tensor->name, device, device, dev_ptr);
-            g_data_ptr_cache[{ tensor, device }] = make_data_ptr_handle(tensor, device, dev_ptr);
-            return dev_ptr;
         }
     }
 
@@ -46955,8 +46965,13 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
 // funnel point (ggml_sycl_compute_forward_impl's own comment: every dispatch
 // path -- direct, fusion, graph replay, persistent-TG, MoE-precomputed,
 // host-attention -- calls it) so every call site is covered without touching
-// any of them. Correctness of the dump matters, not speed -- always waits
-// the queue and does a real D2H for device-resident dst.
+// any of them. Correctness of the dump matters, not speed -- it does a real
+// D2H for device-resident dst and waits that COPY's event (not the whole
+// queue; rev-2gag S8 corrected an overclaim here). Known caveat, also S8:
+// on the ASYNC host-FA path compute_forward_impl returns before the pool
+// worker writes dst, so the wrapper checksums a not-yet-written dst for
+// those nodes -- their checksums are meaningful only under the SYNC
+// dispatch mode.
 static bool ggml_sycl_node_checksum_enabled() {
     static const bool enabled = std::getenv("GGML_SYCL_NODE_CHECKSUM") != nullptr;
     return enabled;
@@ -69348,10 +69363,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // to an unrelated staging allocation's TLSF region.
                     // ggml_sycl_get_data_ptr_slow re-derives the pointer fresh
                     // every call (its own memo, g_data_ptr_cache, IS correctly
-                    // cleared every graph -- llama.cpp-bgf1) and re-populates
-                    // extra->data_handle/data_device with the fresh result, so
-                    // this also self-heals the fast path for any other reader
-                    // in the same graph.
+                    // cleared every graph -- llama.cpp-bgf1). It does NOT
+                    // refresh extra->data_handle for non-view tensors
+                    // (rev-2gag M2 corrected an overclaim here) -- other
+                    // readers are instead protected by the DIRECT-trust gate
+                    // in ggml_sycl_resolve_tensor_ptr/ggml_sycl_resolve
+                    // (common.hpp, rev-2gag M3), which stops the fast path
+                    // from serving a stale DIRECT handle for this tensor
+                    // class in the first place.
                     const float * gate_bias_ptr =
                         pair.gate_bias ?
                             static_cast<const float *>(ggml_sycl_get_data_ptr_slow(pair.gate_bias, ctx.device)) :
@@ -69379,14 +69398,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // settles whether ids_device (the DEVICE-side copy the kernel
                     // reads, separate from the already-verified HOST ids) carries
                     // the same expert selection, and whether the bias/storage-handle
-                    // inputs match, instead of more blind code reading. Filtered to
-                    // layer 23's gate weight to keep volume sane.
-                    static const bool moe_glu_dispatch_trace_enabled = [] {
+                    // inputs match, instead of more blind code reading.
+                    // GGML_SYCL_MOE_GLU_DISPATCH_TRACE=1 traces every layer;
+                    // any other non-empty value is a substring filter on the
+                    // gate weight's name (e.g. "blk.23.") -- same treatment as
+                    // GGML_SYCL_NODE_CHECKSUM_DETAIL (rev-2gag S7; the original
+                    // hardcoded "23." also matched blk.123.*).
+                    static const char * moe_glu_dispatch_trace_filter = []() -> const char * {
                         const char * env = std::getenv("GGML_SYCL_MOE_GLU_DISPATCH_TRACE");
-                        return env && std::atoi(env) != 0;
+                        if (!env || !env[0] || std::strcmp(env, "0") == 0) {
+                            return nullptr;                            // disabled
+                        }
+                        return std::strcmp(env, "1") == 0 ? "" : env;  // "" = trace every layer
                     }();
-                    if (moe_glu_dispatch_trace_enabled && pair.gate_weight && pair.gate_weight->name &&
-                        std::strstr(pair.gate_weight->name, "23.")) {
+                    if (moe_glu_dispatch_trace_filter && pair.gate_weight && pair.gate_weight->name &&
+                        (moe_glu_dispatch_trace_filter[0] == '\0' ||
+                         std::strstr(pair.gate_weight->name, moe_glu_dispatch_trace_filter))) {
                         static std::atomic<uint64_t> glu_dispatch_launch_seq{ 0 };
                         const uint64_t                launch_id =
                             glu_dispatch_launch_seq.fetch_add(1, std::memory_order_relaxed);
@@ -76691,16 +76718,27 @@ static std::mutex        g_attn_host_cpu_backend_mutex;
 // control's 21 us/op, ~+24 ms/token across a 1374-node decode graph.
 // Grow-only with 1 MiB rounding so the mask's slow growth with n_kv
 // re-allocates rarely; only the graph-walker thread for a device touches
-// its slots (both bodies are synchronous), so no locking. Released
-// explicitly in ggml_sycl_attn_host_cpu_backend_free() -- a static-dtor
-// release would outlive the cache.
+// the slot STRUCTS (get/grow), so no locking on the array itself -- but the
+// ASYNC FA body also uses the slots and hands dst_ptr to a pool worker
+// thread, so slot-CONTENT reuse safety is NOT "both bodies are synchronous"
+// (rev-2gag S1). The real invariant is written at the staging-get call site
+// in the async body (search "S1 invariant"). Released explicitly in
+// ggml_sycl_attn_host_cpu_backend_free() -- a static-dtor release would
+// outlive the cache -- and per rev-2gag S3, "released explicitly" alone was
+// not enough: a plain static array of mem_handle still HAS static
+// destructors, which are safe no-ops only when the explicit free ran first;
+// on any exit path that skips it they release into a torn-down cache.
+// Heap-allocate via this file's own leak idiom (cf. the `static auto * x =
+// new ...` pattern near ggml_sycl_shutdown_global_runtime_pinned_owners) so
+// no static dtor ever runs; the explicit free below remains the sole
+// release point.
 struct ggml_sycl_attn_host_staging_slot {
     ggml_sycl::mem_handle handle;
     void *                ptr = nullptr;
     size_t                cap = 0;
 };
 
-static ggml_sycl_attn_host_staging_slot g_attn_host_staging[GGML_SYCL_MAX_DEVICES][5];
+static auto * const g_attn_host_staging = new ggml_sycl_attn_host_staging_slot[GGML_SYCL_MAX_DEVICES][5];
 
 enum ggml_sycl_attn_host_staging_kind {
     ATTN_STAGE_Q = 0,
@@ -76739,7 +76777,9 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
     if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {
         ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
         if (bytes > slot.cap) {
-            const size_t rounded = (bytes + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
+            // rev-2gag S4: same canary-tail reservation as the persistent
+            // branch below.
+            const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
             ggml_sycl::alloc_constraints c;
             c.must_host_pinned = true;
             ggml_sycl::alloc_request req;
@@ -76751,9 +76791,12 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
             if (grown.resolve().ptr) {
                 slot.handle = std::move(grown);
                 slot.ptr    = slot.handle.resolve().ptr;
-                slot.cap    = rounded;
-                fprintf(stderr, "[ATTN-STAGING-ALLOC] IDLE dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device,
-                        (int) kind, slot.ptr, rounded, tag);
+                slot.cap    = rounded - 64;
+                memset((char *) slot.ptr + slot.cap, 0xC5, 64);
+                if (g_ggml_sycl_debug) {
+                    fprintf(stderr, "[ATTN-STAGING-ALLOC] IDLE dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device,
+                            (int) kind, slot.ptr, rounded, tag);
+                }
             }
         }
         // slot held but NEVER handed out; the caller gets a per-call buffer
@@ -76780,7 +76823,12 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
     }
     ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
     if (bytes > slot.cap) {
-        const size_t rounded = (bytes + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
+        // rev-2gag S4: size for bytes PLUS the 64-byte canary tail, and
+        // publish cap as the USABLE size (rounded - 64) -- previously cap
+        // was the full allocation, so a request landing within 64 bytes of
+        // capacity was legitimately handed the canary region and the
+        // checker then reported a false FOREIGN write.
+        const size_t                 rounded = (bytes + 64 + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
         ggml_sycl::alloc_constraints c;
         c.must_host_pinned = true;
         ggml_sycl::alloc_request req;
@@ -76795,27 +76843,38 @@ static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_st
         }
         slot.handle = std::move(grown);  // old handle released -- rare, amortized
         slot.ptr    = ptr;
-        slot.cap    = rounded;
-        // Aliasing probe (llama.cpp-sbky bisection): raw fprintf so it
-        // always prints; slot allocations are rare (grow-only).
-        fprintf(stderr, "[ATTN-STAGING-ALLOC] dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device, (int) kind, ptr,
-                rounded, tag);
-        // Stomper canary: poison the slot's unused tail; checked per use in
-        // ggml_sycl_attn_host_staging_check_canary. A dead canary means a
+        slot.cap    = rounded - 64;
+        // Aliasing probe (llama.cpp-sbky bisection). Gated (rev-2gag S5):
+        // rare (grow-only), but the mask slot regrows with n_kv, so a
+        // long-context run would otherwise write several lines into every
+        // user's stderr on the default path.
+        if (g_ggml_sycl_debug) {
+            fprintf(stderr, "[ATTN-STAGING-ALLOC] dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device, (int) kind, ptr,
+                    rounded, tag);
+        }
+        // Stomper canary: poison the RESERVED tail (never handed out, see
+        // the cap comment above); checked in
+        // ggml_sycl_attn_host_staging_check_canaries. A dead canary means a
         // FOREIGN write landed inside this slot's allocation.
-        memset((char *) ptr + rounded - 64, 0xC5, 64);
+        memset((char *) ptr + slot.cap, 0xC5, 64);
     }
     return slot.ptr;
 }
 
+// rev-2gag S6: armed on every slot grow but CHECKED at exactly one boundary
+// -- FA-sync entry, and only under GGML_SYCL_ATTN_SYNC_PROFILE. The async/PP
+// and SET_ROWS paths never call this; a stomp on those paths surfaces only
+// when a later profiled sync dispatch happens to run. Deliberate: the check
+// walks every slot's tail, and putting it on the per-token async path would
+// cost more than the diagnostic is worth when not actively hunting.
 static void ggml_sycl_attn_host_staging_check_canaries(const char * where) {
     for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
         for (int k = 0; k < 5; ++k) {
             const ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[d][k];
-            if (!slot.ptr || slot.cap < 64) {
+            if (!slot.ptr || slot.cap == 0) {
                 continue;
             }
-            const unsigned char * c = (const unsigned char *) slot.ptr + slot.cap - 64;
+            const unsigned char * c = (const unsigned char *) slot.ptr + slot.cap;
             for (int b = 0; b < 64; ++b) {
                 if (c[b] != 0xC5) {
                     fprintf(stderr, "[ATTN-STAGING-CANARY] DEAD dev=%d kind=%d at=%s byte=%d val=%02x ptr=%p\n", d, k,
@@ -76959,6 +77018,12 @@ struct pending_attn_dispatch {
 // reading it. Releasing it one dispatch (or one graph boundary) later
 // mirrors g_pending_scatter's prev_bufs deferred-release pattern
 // (~20105-20135), the same problem MoE's own async scatter already solved.
+// rev-2gag S2: these are thread_local while g_attn_host_staging is
+// process-global -- the "one dispatch in flight per device" invariant that
+// makes slot reuse safe is enforced per-thread against a per-process
+// resource. Latent only because same-device concurrent inference is
+// unsupported (canonical contract SS5); if that ever changes, these two
+// storage classes must be reconciled first.
 static thread_local pending_attn_dispatch g_pending_attn_dispatch[GGML_SYCL_MAX_DEVICES] = {};
 static thread_local pending_attn_dispatch g_stale_attn_dispatch[GGML_SYCL_MAX_DEVICES]   = {};
 
@@ -77117,15 +77182,31 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     // Persistent grow-only staging (see ggml_sycl_attn_host_staging_get):
     // per-call allocate/release here churned cache entries and bumped the
     // global generation, un-memoizing every weight handle -- 73 vs 21 us/op
-    // resolve. Reuse across dispatches is safe: one dispatch in flight per
-    // device (sync body, or the single force-flushed pending slot), and all
-    // staging reads/writes are ordered through the same in-order queue.
+    // resolve.
+    //
+    // S1 invariant (rev-2gag): slot reuse safety on THIS async path does NOT
+    // come from "both bodies are synchronous" -- this body hands dst_ptr to a
+    // pool worker thread, and with persistent slots pending.dst_handle is
+    // EMPTY, so the g_stale_attn_dispatch deferred-release mechanism no
+    // longer guards the flushed dispatch's unwaited H2D publish. What
+    // actually keeps the worker from overwriting a slot the previous
+    // dispatch's DMA may still be reading is, in full:
+    //   1. the force-flush of any pending dispatch before this one is
+    //      staged, so at most one dispatch per device holds the slots; and
+    //   2. in-order q_dev ordering: the flush's deliberately UNWAITED H2D
+    //      (dst slot -> device) is enqueued on q_dev BEFORE this dispatch's
+    //      Q D2H on the same queue, and the worker blocks on that D2H's
+    //      event before touching any slot -- so the H2D has fully drained by
+    //      the time the worker can write.
+    // Both legs assume ctx.stream() returns the SAME queue for a device
+    // across dispatches; a per-dispatch queue would silently break leg 2.
     ggml_sycl::mem_handle q_fb, dst_fb, mask_fb;  // kill-switch fallbacks; moved into pending below
-    void * q_ptr    = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
-    void * dst_ptr  = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
+    void * q_ptr   = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
+    void * dst_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
     void * mask_ptr = nullptr;
     if (mask_src && mask_bytes > 0) {
-        mask_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
+        mask_ptr =
+            ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
     }
 
     if (!q_ptr || !dst_ptr || (mask_src && mask_bytes > 0 && !mask_ptr)) {
@@ -77295,15 +77376,18 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     // Persistent grow-only staging (see ggml_sycl_attn_host_staging_get):
     // per-call allocate/release here churned cache entries and bumped the
     // global generation, un-memoizing every weight handle -- 73 vs 21 us/op
-    // resolve. Reuse across dispatches is safe: one dispatch in flight per
-    // device (sync body, or the single force-flushed pending slot), and all
-    // staging reads/writes are ordered through the same in-order queue.
+    // resolve. This body IS synchronous (it blocks on the CPU compute before
+    // returning), but a previously flushed ASYNC dispatch's unwaited H2D can
+    // still be in flight when this one writes the Q slot -- reuse safety
+    // rests on the same-queue in-order invariant documented at the async
+    // body's staging-get site (search "S1 invariant").
     ggml_sycl::mem_handle q_fb, dst_fb, mask_fb;  // per-call fallback lifetimes (kill-switch path only)
-    void * q_ptr    = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
-    void * dst_ptr  = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
+    void * q_ptr   = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
+    void * dst_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
     void * mask_ptr = nullptr;
     if (mask_src && mask_bytes > 0) {
-        mask_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
+        mask_ptr =
+            ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
     }
 
     if (!q_ptr || !dst_ptr || (mask_src && mask_bytes > 0 && !mask_ptr)) {
@@ -77484,8 +77568,10 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     // the FA bodies (see ggml_sycl_attn_host_staging_get).
     const int device  = ctx.device;
     ggml_sycl::mem_handle val_fb, ids_fb;  // kill-switch fallback lifetimes
-    void *    val_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_VAL, val_bytes, q_dev, "attn_host_setrows_val", val_fb);
-    void *    ids_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_IDS, ids_bytes, q_dev, "attn_host_setrows_ids", ids_fb);
+    void *                val_ptr =
+        ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_VAL, val_bytes, q_dev, "attn_host_setrows_val", val_fb);
+    void * ids_ptr =
+        ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_IDS, ids_bytes, q_dev, "attn_host_setrows_ids", ids_fb);
 
     if (!val_ptr || !ids_ptr) {
         GGML_LOG_WARN("[ATTN-HOST] pinned staging allocation failed; declining host SET_ROWS\n");
@@ -77502,11 +77588,14 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     if (attn_profile) {
         t_sr_enter = std::chrono::steady_clock::now();
     }
-    // Both copies waited individually: mem_copy_ptr_async may route through
-    // the unified cache's internal DMA queue, and the no-host-waits ruling's
-    // own caveat applies -- in-order q_dev does NOT order library internals,
-    // so waiting only the second event does not cover the first copy.
-    ggml_sycl::mem_copy_ptr_async(val_ptr, val_src->data, val_bytes, q_dev).wait();
+    // One wait covers both copies: mem_copy_ptr_async with default (empty)
+    // deps is a bare queue.memcpy on the caller's queue (mem-ops.cpp), and
+    // q_dev is in-order, so the second copy's completion implies the first's.
+    // (rev-2gag M5: an earlier revision waited each copy individually on the
+    // false premise that the copy might route through a library-internal DMA
+    // queue -- it does not on this path, and the double wait serialized two
+    // copies that overlap under a single wait.)
+    ggml_sycl::mem_copy_ptr_async(val_ptr, val_src->data, val_bytes, q_dev);
     ggml_sycl::mem_copy_ptr_async(ids_ptr, ids_src->data, ids_bytes, q_dev).wait();
     if (attn_profile) {
         const auto now = std::chrono::steady_clock::now();
@@ -85000,18 +85089,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // Re-entrancy guard: Prevent nested calls to compute_impl
     static thread_local bool g_in_compute_impl = false;
 
-    // g_data_ptr_cache is documented as "per-graph" but was never cleared at
-    // graph entry -- its cross-graph staleness (tensor structs are recycled
-    // across per-token graph rebuilds, so a {tensor*, device} key can hit an
-    // entry cached for a DIFFERENT node) was masked for years by an
-    // accident: per-token allocation churn bumped cache_generation every
-    // graph, invalidating the gen-checked entries as a side effect. The
-    // TKV-13 persistent host-attention staging produced the first bump-free
-    // decode graphs and the stale hits surfaced as wrong-pointer reads
-    // (llama.cpp-sbky bisection: content-verified staging, live canaries,
-    // failure tracking allocation LAYOUT -- the classic pointer-keyed-memo
-    // signature). Clear at entry: intra-graph reuse (the cache's actual
-    // purpose) is preserved, cross-graph keys can no longer alias.
+    // g_data_ptr_cache "per-graph" clear, POSITIONAL fix (rev-2gag M1
+    // corrected an earlier overclaim here): the canonical invalidation block
+    // later in this function ALREADY clears this cache once per graph, so
+    // "never cleared at graph entry" was false. What this earlier clear
+    // buys is position only -- it runs before the compute_impl guard's
+    // queue drain, prestage, split_merge_drain() and profile setup, so a
+    // resolve in that prologue can no longer hit a prior graph's entry
+    // (tensor structs are recycled across per-token graph rebuilds, so a
+    // {tensor*, device} key can hit an entry cached for a DIFFERENT node;
+    // that staleness was masked for years by per-token allocation churn
+    // bumping cache_generation as a side effect, and surfaced when TKV-13's
+    // persistent staging produced the first bump-free decode graphs --
+    // llama.cpp-sbky/llama.cpp-bgf1). The canonical-block clear remains
+    // load-bearing for the node loop; do not remove either.
     ggml_sycl_data_ptr_cache_new_graph();
 
     struct moe_precomputed_skip_graph_scope {

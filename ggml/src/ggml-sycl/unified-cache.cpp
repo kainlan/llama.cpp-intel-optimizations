@@ -3114,7 +3114,12 @@ static bool ext_alloc_trace_enabled() {
 // slots (llama.cpp-sbky) and any other live host-zone consumer -- the
 // slot-vs-slot aliasing check already ruled out the five slots colliding
 // with EACH OTHER, but never checked them against anything else sharing the
-// zone. Off by default; the atomic load is the only always-paid cost.
+// zone. Off by default; the atomic load is the only always-paid cost of THIS
+// function -- rev-2gag M4 found call sites (unified_alloc's two zone-alloc
+// branches) that evaluated host_zone_used()/host_zone_largest_free_block()
+// as call arguments before this gate ran, paying two pinned_chunk_pool
+// global-mutex zone walks per host allocation unconditionally. Fixed by
+// gating the call, not just the print; callers must do the same.
 static bool host_zone_alloc_trace_enabled() {
     static std::atomic<int> cached{ -1 };
     int                     enabled = cached.load(std::memory_order_acquire);
@@ -12385,9 +12390,16 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                         zone_managed                = true;
                         output_metadata.zone_managed = true;
                         output_metadata.host_zone    = pool_zone;
-                        host_zone_alloc_trace_print("pinned-pool", pool_zone, ptr, alloc_size, req, reserved_alloc_id,
-                                                    ucache->host_zone_used(pool_zone),
-                                                    ucache->host_zone_largest_free_block(pool_zone));
+                        // llama.cpp-2gag (rev-2gag M4): host_zone_used()/host_zone_largest_free_block()
+                        // each take pinned_chunk_pool::mutex_ and walk every chunk allocator
+                        // (pinned-pool.cpp:552-563, :576-593) -- real cost, not the ~1ns atomic
+                        // load the trace's own doc comment claims. Gate the call, not just the
+                        // print, so a disabled trace pays nothing on this allocation path.
+                        if (host_zone_alloc_trace_enabled()) {
+                            host_zone_alloc_trace_print("pinned-pool", pool_zone, ptr, alloc_size, req,
+                                                        reserved_alloc_id, ucache->host_zone_used(pool_zone),
+                                                        ucache->host_zone_largest_free_block(pool_zone));
+                        }
                     }
                 }
                 if (ptr) {
@@ -12400,9 +12412,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 if (zone_managed) {
                     output_metadata.zone_managed = true;
                     output_metadata.host_zone    = zone;
-                    host_zone_alloc_trace_print("direct-zone", zone, ptr, alloc_size, req, reserved_alloc_id,
-                                                ucache->host_zone_used(zone),
-                                                ucache->host_zone_largest_free_block(zone));
+                    // llama.cpp-2gag (rev-2gag M4): same gate-the-call fix as the pinned-pool
+                    // branch above -- see that comment.
+                    if (host_zone_alloc_trace_enabled()) {
+                        host_zone_alloc_trace_print("direct-zone", zone, ptr, alloc_size, req, reserved_alloc_id,
+                                                    ucache->host_zone_used(zone),
+                                                    ucache->host_zone_largest_free_block(zone));
+                    }
                 }
             } else {
                 // Zones not configured: direct runtime allocation.  host_pool_alloc

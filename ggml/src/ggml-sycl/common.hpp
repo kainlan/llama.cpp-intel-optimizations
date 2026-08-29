@@ -4267,6 +4267,29 @@ inline bool ggml_sycl_checked_tensor_span_bytes(const ggml_tensor * tensor, size
     return ggml_sycl_checked_size_add(max_offset, ggml_type_size(tensor->type), span);
 }
 
+// llama.cpp-2gag M3: may a tensor's cached DIRECT-kind handle -- and its raw
+// data_device[] twin, which set_data_device() writes together with it -- be
+// trusted without re-validation? A DIRECT handle by contract skips the
+// generation check and returns its cached pointer forever (mem-handle.hpp),
+// which is sound only for tensors whose owner re-publishes a fresh handle
+// before every use. GGML_TENSOR_FLAG_INPUT tensors qualify (stable
+// malloc_host addresses, refreshed in place by set_tensor). A DIRECT handle
+// on anything else can have been minted from a transient staging
+// allocation whose TLSF pool later re-dealt the address to a foreign tenant
+// -- the proven llama.cpp-2gag corruption -- and no consult site can detect
+// that: the alloc_registry raw-pointer fallback is NOT fail-closed either,
+// because a freed pool suballocation still lies inside its live registered
+// chunk, so interior lookup happily blesses the stale address. Legitimate
+// long-lived handles are WEIGHT/CHUNK_LEASE/ARENA_* kinds (register_host_
+// weight returns from_weight_lease_locked; arena-backed pointers get chunk
+// leases from from_chunk_ptr), so refusing DIRECT here does not touch them.
+// Callers that fail this test must fall through to re-deriving resolution
+// (tiered cache / staging / tensor->data), never consult
+// extra->data_device_ptr() for the tensor.
+inline bool ggml_sycl_direct_handle_trust_ok(const ggml_tensor * tensor, const ggml_sycl::mem_handle & handle) {
+    return handle.kind() != ggml_sycl::mem_handle_kind::DIRECT || (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+}
+
 // Hot path: 2 dereferences + 1 null check for common case (model fits in VRAM)
 // Input tensor refresh is handled by set_tensor (scheduler) and graph_refresh_input_tensors (replay),
 // NOT here — calling refresh here would add get_pointer_type() driver round-trips to every resolution.
@@ -4360,10 +4383,18 @@ inline void * ggml_sycl_get_data_ptr(const ggml_tensor * tensor, int device) {
     }
     // Fast path 1: extra->data_device (set by weight buffer init_tensor and KV init_tensor)
     // Uses data_device_ptr() which resolves smart handle or falls back to raw pointer.
+    // Gated (llama.cpp-2gag M3): a distrusted DIRECT handle must skip this consult
+    // ENTIRELY -- data_device_ptr()'s raw fallback is set together with the handle
+    // and is equally stale, and its alloc_registry check cannot fail closed for a
+    // freed pool suballocation (see ggml_sycl_direct_handle_trust_ok).
     if (tensor->extra != nullptr) {
-        void * ptr = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)->data_device_ptr(device);
-        if (ptr != nullptr) {
-            return ptr;
+        auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        if (!ggml_sycl_valid_device_index(device) ||
+            ggml_sycl_direct_handle_trust_ok(tensor, extra->data_handle[device])) {
+            void * ptr = extra->data_device_ptr(device);
+            if (ptr != nullptr) {
+                return ptr;
+            }
         }
     }
     // Fast path 2: for tensors with tensor->data that's already a USM pointer
@@ -4409,12 +4440,38 @@ inline void * ggml_sycl_resolve_tensor_ptr(const ggml_tensor * tensor, int devic
     }
     // Fast path: smart handle resolve.  data_handle is populated during
     // S1-PRELOAD (weights via from_cache_id) and set_data_device (non-weights
-    // via from_direct).  resolve() checks a generation counter in ~3ns.
+    // via from_direct/from_chunk_ptr's untracked-pointer fallback).  resolve()
+    // checks a generation counter in ~3ns -- EXCEPT for a DIRECT-kind handle,
+    // which by contract (mem-handle.hpp: "used for scratch/KV/staging buffers
+    // that are never moved by the cache") skips generation checking entirely
+    // and returns its cached pointer forever.
+    //
+    // llama.cpp-2gag M3: that contract holds for tensors whose owning dispatch
+    // re-publishes a fresh handle every use (activations, KV, GGML_TENSOR_FLAG_INPUT
+    // tensors) but not for a non-weight, non-input tensor resolved once and then
+    // read unchanged across many tokens -- e.g. a MoE per-expert bias vector
+    // reached via a standalone ADD_ID or a declined mul_mat+add fusion. If such a
+    // tensor's DIRECT handle was ever minted from a transient/staging allocation,
+    // the backing TLSF pool can re-deal that address to an unrelated tenant
+    // between resolves, and this fast path has no way to notice: it would keep
+    // returning the same now-foreign pointer forever (proven by address
+    // arithmetic in llama.cpp-2gag's fix). Gate the fast-path trust of a cached
+    // DIRECT handle to the tensor classes the contract actually covers (see
+    // ggml_sycl_direct_handle_trust_ok -- deliberately NO is_weight exemption:
+    // legitimate weight handles are WEIGHT-kind, so a weight carrying a DIRECT
+    // handle is itself the anomaly, and a distrusted weight falls through to
+    // get_layout_ptr_impl's own generation-checked memo, not to a cold path);
+    // every other tensor with a DIRECT handle here falls through to the slow,
+    // re-validating resolution below instead of trusting a handle whose
+    // staleness this fast path cannot detect.
     if (tensor->view_src == nullptr && tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
-        auto * extra    = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-        auto   resolved = extra->data_handle[device].resolve(device);
-        if (resolved) {
-            return resolved.ptr;
+        auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
+        const auto & handle = extra->data_handle[device];
+        if (ggml_sycl_direct_handle_trust_ok(tensor, handle)) {
+            auto resolved = handle.resolve(device);
+            if (resolved) {
+                return resolved.ptr;
+            }
         }
     }
     // Slow path: full resolution chain (alloc_registry, cache lookup, staging).
@@ -4668,7 +4725,14 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
     if (!is_weight && tensor->view_src == nullptr && tensor->extra != nullptr && ggml_sycl_valid_device_index(device)) {
         auto *       extra  = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
         const auto & handle = extra->data_handle[device];
-        if (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
+        // llama.cpp-2gag M2/M3: same DIRECT-handle staleness hazard as
+        // ggml_sycl_resolve_tensor_ptr's fast path above -- see that function's
+        // comment for the mechanism. This is the branch binbcast.cpp's generic
+        // ADD/MUL/DIV/SUB dispatch reaches via ggml_sycl_resolve(), so a bias
+        // tensor read through an unfused GGML_OP_ADD (e.g. when a mul_mat+add
+        // fusion declines) hits this exact code, not just resolve_tensor_ptr's.
+        if (ggml_sycl_direct_handle_trust_ok(tensor, handle) &&
+            (handle.device() == device || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE)) {
             auto resolved = handle.resolve(device);
             if (resolved) {
                 return resolved;
