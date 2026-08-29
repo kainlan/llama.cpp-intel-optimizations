@@ -46946,7 +46946,192 @@ static bool ggml_sycl_copy_tensor_span_from_device(ggml_backend_sycl_context & c
     return true;
 }
 
-static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+
+// llama.cpp-2gag (round 3, lead-directed localization instrument): FNV-1a
+// checksum of every node's dst bytes right after it computes, so a held-slot
+// vs per-call trace diff names the FIRST tensor whose data actually goes
+// wrong instead of continuing to test theories about WHY. Wraps the single
+// funnel point (ggml_sycl_compute_forward_impl's own comment: every dispatch
+// path -- direct, fusion, graph replay, persistent-TG, MoE-precomputed,
+// host-attention -- calls it) so every call site is covered without touching
+// any of them. Correctness of the dump matters, not speed -- always waits
+// the queue and does a real D2H for device-resident dst.
+static bool ggml_sycl_node_checksum_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_NODE_CHECKSUM") != nullptr;
+    return enabled;
+}
+
+static uint64_t ggml_sycl_fnv1a(const void * data, size_t n) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    uint64_t        h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// llama.cpp-2gag (round 4, lead-directed): byte checksums are defeated by
+// benign run-to-run GPU floating-point non-determinism (confirmed: a
+// same-config pair diverges the same way the held-vs-per-call pair does).
+// Magnitude statistics at coarse (%.3g, 3 significant digits) precision are
+// stable across that jitter while still catching a real correctness break
+// (garbage shifts magnitudes grossly, jitter only perturbs low bits).
+// Returns true and fills the two stats for F32/F16 tensors; false (stats
+// left at 0) for any other type, so the caller falls back to the FNV
+// checksum as the lead specified.
+static bool ggml_sycl_abs_stats(const void * data, size_t nelements, ggml_type type, double * out_absmean,
+                                double * out_absmax) {
+    double sum = 0.0;
+    double mx  = 0.0;
+    if (type == GGML_TYPE_F32) {
+        const float * p = static_cast<const float *>(data);
+        for (size_t i = 0; i < nelements; ++i) {
+            const double v = std::fabs(static_cast<double>(p[i]));
+            sum += v;
+            mx   = std::max(mx, v);
+        }
+    } else if (type == GGML_TYPE_F16) {
+        const ggml_fp16_t * p = static_cast<const ggml_fp16_t *>(data);
+        for (size_t i = 0; i < nelements; ++i) {
+            const double v = std::fabs(static_cast<double>(ggml_fp16_to_fp32(p[i])));
+            sum += v;
+            mx   = std::max(mx, v);
+        }
+    } else {
+        return false;
+    }
+    *out_absmean = nelements > 0 ? sum / static_cast<double>(nelements) : 0.0;
+    *out_absmax  = mx;
+    return true;
+}
+
+// Substring match against dst->name; empty/unset means no detail dump.
+static const char * ggml_sycl_node_checksum_detail_filter() {
+    static const char * filter = std::getenv("GGML_SYCL_NODE_CHECKSUM_DETAIL");
+    return (filter && filter[0] != '\0') ? filter : nullptr;
+}
+
+// Resolve one operand exactly as the consuming kernel will read it (through
+// ggml_sycl_resolve, D2H'd if device-resident) and print its identity:
+// resolved ptr, layout, on_device, extent, plus absmean/absmax for float
+// types (checksum fallback for everything else -- see ggml_sycl_abs_stats).
+static void ggml_sycl_node_checksum_detail_dump_src(const char * label, const ggml_tensor * src, int device,
+                                                    sycl::queue & q) {
+    if (!src) {
+        fprintf(stderr, "  %s: (null)\n", label);
+        return;
+    }
+    auto         resolved = ggml_sycl_resolve(src, device);
+    const size_t nbytes   = ggml_nbytes(src);
+    bool         read_ok  = false;
+    const void * readable = nullptr;
+    std::vector<uint8_t> host_buf;
+    if (resolved.ptr && nbytes > 0) {
+        if (resolved.on_device) {
+            host_buf.resize(nbytes);
+            try {
+                ggml_sycl::mem_copy_ptr_async(host_buf.data(), resolved.ptr, nbytes, q).wait();
+                readable = host_buf.data();
+                read_ok  = true;
+            } catch (...) {
+                read_ok = false;
+            }
+        } else {
+            readable = resolved.ptr;
+            read_ok  = true;
+        }
+    }
+    double   absmean = 0.0, absmax = 0.0;
+    uint64_t cksum   = 0;
+    bool     is_float = false;
+    if (read_ok) {
+        is_float = ggml_sycl_abs_stats(readable, ggml_nelements(src), src->type, &absmean, &absmax);
+        if (!is_float) {
+            cksum = ggml_sycl_fnv1a(readable, nbytes);
+        }
+    }
+    fprintf(stderr,
+            "  %s=%s data=%p resolved_ptr=%p layout=%d on_device=%d extent=%zu bytes=%zu read_ok=%d "
+            "absmean=%.3g absmax=%.3g src_checksum=0x%016llx\n",
+            label, src->name ? src->name : "", src->data, resolved.ptr, (int) resolved.layout,
+            (int) resolved.on_device, resolved.extent, nbytes, (int) read_ok, absmean, absmax,
+            (unsigned long long) cksum);
+}
+
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) {
+    const bool ok = ggml_sycl_compute_forward_impl(ctx, dst);
+    if (ok && dst && ggml_sycl_node_checksum_enabled()) {
+        static std::atomic<uint64_t> g_node_checksum_seq{ 0 };
+        const uint64_t       seq     = g_node_checksum_seq.fetch_add(1, std::memory_order_relaxed);
+        const size_t         nbytes  = ggml_nbytes(dst);
+        bool                 read_ok = false;
+        const void *         readable = nullptr;
+        std::vector<uint8_t> host_buf;
+        sycl::queue &        q = *ctx.stream();
+        if (nbytes > 0) {
+            auto resolved = ggml_sycl_resolve(dst, ctx.device);
+            if (resolved.ptr) {
+                if (resolved.on_device) {
+                    host_buf.resize(nbytes);
+                    try {
+                        ggml_sycl::mem_copy_ptr_async(host_buf.data(), resolved.ptr, nbytes, q).wait();
+                        readable = host_buf.data();
+                        read_ok  = true;
+                    } catch (...) {
+                        read_ok = false;
+                    }
+                } else {
+                    readable = resolved.ptr;
+                    read_ok  = true;
+                }
+            }
+        }
+        // llama.cpp-2gag (round 4): magnitude stats, not byte checksum, are
+        // the stable signal -- run-to-run GPU float non-determinism perturbs
+        // low bits (a same-config pair was confirmed to diverge the same
+        // way the held-vs-per-call pair does), but %.3g absmean/absmax stays
+        // put under that jitter while still catching a real magnitude break.
+        double   absmean = 0.0, absmax = 0.0;
+        uint64_t cksum   = 0;
+        if (read_ok) {
+            if (!ggml_sycl_abs_stats(readable, ggml_nelements(dst), dst->type, &absmean, &absmax)) {
+                cksum = ggml_sycl_fnv1a(readable, nbytes);
+            }
+        }
+        fprintf(stderr,
+                "[NODE-CHECKSUM] seq=%llu op=%s dst=%s bytes=%zu read_ok=%d absmean=%.3g absmax=%.3g "
+                "checksum=0x%016llx\n",
+                (unsigned long long) seq, ggml_op_name(dst->op), dst->name ? dst->name : "", nbytes, (int) read_ok,
+                absmean, absmax, (unsigned long long) cksum);
+
+        const char * detail_filter = ggml_sycl_node_checksum_detail_filter();
+        if (detail_filter && dst->name && std::strstr(dst->name, detail_filter)) {
+            fprintf(stderr, "[NODE-CHECKSUM-DETAIL] seq=%llu op=%s dst=%s\n", (unsigned long long) seq,
+                    ggml_op_name(dst->op), dst->name);
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                if (!dst->src[i]) {
+                    continue;
+                }
+                char label[16];
+                std::snprintf(label, sizeof(label), "src[%d]", i);
+                ggml_sycl_node_checksum_detail_dump_src(label, dst->src[i], ctx.device, q);
+            }
+            if (read_ok && dst->type == GGML_TYPE_F32) {
+                const float * fp       = static_cast<const float *>(readable);
+                const size_t  n_floats = std::min<size_t>(8, ggml_nelements(dst));
+                fprintf(stderr, "  dst first %zu floats:", n_floats);
+                for (size_t i = 0; i < n_floats; ++i) {
+                    fprintf(stderr, " %.9g", fp[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    return ok;
+}
+
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src0,
                               const ggml_tensor *         src1,
@@ -67698,12 +67883,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                 // GGML_SYCL_MOE_PP_BIAS_FUSION is unset, topology_ok already forced
                                 // pair.gate_bias/pair.up_bias to null, so this resolves to the same
                                 // nullptr/nullptr/0/0 passed here before.
+                                // llama.cpp-2gag: same dangling-DIRECT-handle hazard as the
+                                // decode fused-GLU path (see that call site's comment) --
+                                // use the slow path directly so this graph's resolve is
+                                // never served from a stale tensor->extra->data_handle.
                                 const float *            gate_bias_ptr =
                                     pair.gate_bias ? static_cast<const float *>(
-                                                         ggml_sycl_resolve_tensor_ptr(pair.gate_bias, ctx.device)) :
+                                                         ggml_sycl_get_data_ptr_slow(pair.gate_bias, ctx.device)) :
                                                                 nullptr;
                                 const float * up_bias_ptr = pair.up_bias ?
-                                                                static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(
+                                                                static_cast<const float *>(ggml_sycl_get_data_ptr_slow(
                                                                     pair.up_bias, ctx.device)) :
                                                                 nullptr;
                                 const bool    gate_up_ok  = mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(
@@ -69143,13 +69332,33 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 if (full_gpu_cover && ids_device != nullptr) {
+                    // llama.cpp-2gag: use the SLOW path directly, bypassing
+                    // ggml_sycl_resolve_tensor_ptr's tensor->extra->data_handle
+                    // fast path. That fast path trusts a DIRECT-kind mem_handle
+                    // forever once populated (DIRECT bypasses the generation
+                    // check by design), but gate_bias/up_bias's underlying
+                    // storage here is a host-staged copy from a TRANSIENT
+                    // per-graph/per-token staging pool -- once that pool
+                    // reuses the address for a different tenant, the cached
+                    // DIRECT handle silently dangles and every later resolve
+                    // via the fast path returns foreign data. Proven on
+                    // hardware (llama.cpp-2gag): gate_bias_absmean read correct
+                    // on the first dispatch then wrong from the second dispatch
+                    // onward, with the stale address landing exactly adjacent
+                    // to an unrelated staging allocation's TLSF region.
+                    // ggml_sycl_get_data_ptr_slow re-derives the pointer fresh
+                    // every call (its own memo, g_data_ptr_cache, IS correctly
+                    // cleared every graph -- llama.cpp-bgf1) and re-populates
+                    // extra->data_handle/data_device with the fresh result, so
+                    // this also self-heals the fast path for any other reader
+                    // in the same graph.
                     const float * gate_bias_ptr =
                         pair.gate_bias ?
-                            static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.gate_bias, ctx.device)) :
+                            static_cast<const float *>(ggml_sycl_get_data_ptr_slow(pair.gate_bias, ctx.device)) :
                             nullptr;
                     const float * up_bias_ptr =
                         pair.up_bias ?
-                            static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(pair.up_bias, ctx.device)) :
+                            static_cast<const float *>(ggml_sycl_get_data_ptr_slow(pair.up_bias, ctx.device)) :
                             nullptr;
 
                     // Q8 artifact wiring (llama.cpp-ihqu): mint stable storage handles for the
@@ -69164,6 +69373,88 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         decode_glu_storage.handle.has_stable_owner_identity() &&
                         ggml_sycl_find_tensor_storage_handle(pair.down_dst, ctx.device, &decode_down_storage) &&
                         decode_down_storage.handle.has_stable_owner_identity();
+
+                    // llama.cpp-2gag (lead-directed): dump the fused GLU dispatch's
+                    // actual runtime inputs immediately before the GEMM launch --
+                    // settles whether ids_device (the DEVICE-side copy the kernel
+                    // reads, separate from the already-verified HOST ids) carries
+                    // the same expert selection, and whether the bias/storage-handle
+                    // inputs match, instead of more blind code reading. Filtered to
+                    // layer 23's gate weight to keep volume sane.
+                    static const bool moe_glu_dispatch_trace_enabled = [] {
+                        const char * env = std::getenv("GGML_SYCL_MOE_GLU_DISPATCH_TRACE");
+                        return env && std::atoi(env) != 0;
+                    }();
+                    if (moe_glu_dispatch_trace_enabled && pair.gate_weight && pair.gate_weight->name &&
+                        std::strstr(pair.gate_weight->name, "23.")) {
+                        static std::atomic<uint64_t> glu_dispatch_launch_seq{ 0 };
+                        const uint64_t                launch_id =
+                            glu_dispatch_launch_seq.fetch_add(1, std::memory_order_relaxed);
+                        sycl::queue &         trace_q = *ctx.stream();
+                        std::vector<int32_t>  ids_dump(ids_n_elem);
+                        bool                   ids_read_ok = false;
+                        try {
+                            if (!ids_dump.empty()) {
+                                ggml_sycl::mem_copy_ptr_async(ids_dump.data(), ids_device,
+                                                              ids_dump.size() * sizeof(int32_t), trace_q)
+                                    .wait();
+                            }
+                            ids_read_ok = true;
+                        } catch (...) {
+                            ids_read_ok = false;
+                        }
+                        double gate_bias_mean = 0.0, up_bias_mean = 0.0;
+                        if (gate_bias_ptr) {
+                            const size_t        n = static_cast<size_t>(std::min<int64_t>(8, pair.gate_bias->ne[0]));
+                            std::vector<float> gb(n);
+                            try {
+                                ggml_sycl::mem_copy_ptr_async(gb.data(), gate_bias_ptr, n * sizeof(float), trace_q)
+                                    .wait();
+                                for (float v : gb) {
+                                    gate_bias_mean += std::fabs(static_cast<double>(v));
+                                }
+                                gate_bias_mean /= std::max<size_t>(1, n);
+                            } catch (...) {
+                            }
+                        }
+                        if (up_bias_ptr) {
+                            const size_t        n = static_cast<size_t>(std::min<int64_t>(8, pair.up_bias->ne[0]));
+                            std::vector<float> ub(n);
+                            try {
+                                ggml_sycl::mem_copy_ptr_async(ub.data(), up_bias_ptr, n * sizeof(float), trace_q)
+                                    .wait();
+                                for (float v : ub) {
+                                    up_bias_mean += std::fabs(static_cast<double>(v));
+                                }
+                                up_bias_mean /= std::max<size_t>(1, n);
+                            } catch (...) {
+                            }
+                        }
+                        fprintf(stderr,
+                                "[MOE-GLU-DISPATCH-TRACE] launch=%llu gate=%s ids_device=%p ids_n=%lld "
+                                "ids_read_ok=%d ids=[",
+                                (unsigned long long) launch_id, pair.gate_weight->name, (const void *) ids_device,
+                                (long long) ids_n_elem, (int) ids_read_ok);
+                        for (size_t i = 0; i < ids_dump.size() && i < 16; ++i) {
+                            fprintf(stderr, "%s%d", i ? "," : "", ids_dump[i]);
+                        }
+                        // llama.cpp-2gag: does the "stable storage handle" path
+                        // (glu_dst_handle_override, used when decode_q8_handles_ok)
+                        // resolve to the SAME address as the generic fallback resolve
+                        // the GEMM output write falls back to when it doesn't? If
+                        // these ever disagree, the storage-handle lookup itself is
+                        // the stale/wrong-address mechanism, not just a Q8-artifact
+                        // reuse question.
+                        void * glu_fallback_ptr = ggml_sycl_resolve_tensor_ptr(pair.glu_dst, ctx.device);
+                        fprintf(stderr,
+                                "] gate_bias_ptr=%p gate_bias_absmean=%.6g up_bias_ptr=%p up_bias_absmean=%.6g "
+                                "glu_storage_ptr=%p glu_fallback_ptr=%p ptr_match=%d down_storage_ptr=%p "
+                                "decode_q8_handles_ok=%d\n",
+                                (const void *) gate_bias_ptr, gate_bias_mean, (const void *) up_bias_ptr,
+                                up_bias_mean, decode_glu_storage.handle.resolve(ctx.device).ptr, glu_fallback_ptr,
+                                (int) (decode_glu_storage.handle.resolve(ctx.device).ptr == glu_fallback_ptr),
+                                decode_down_storage.handle.resolve(ctx.device).ptr, (int) decode_q8_handles_ok);
+                    }
 
                     sycl::event                           glu_event;
                     bool                                  glu_event_set = false;
@@ -76390,6 +76681,161 @@ static ggml_backend_t    g_attn_host_cpu_backend    = nullptr;
 static ggml_threadpool * g_attn_host_cpu_threadpool = nullptr;
 static std::mutex        g_attn_host_cpu_backend_mutex;
 
+// Persistent grow-only pinned staging for the SYNCHRONOUS host-dispatch
+// bodies (FA sync Q/dst/mask, SET_ROWS val/ids). Rationale
+// (llama.cpp-sbky residual hunt): per-call unified_allocate/release churned
+// 3+ cache entries per decode token, and entry erase paths call
+// cache_generation_bump() -- one bump per token invalidates EVERY weight
+// handle's generation memo, so every subsequent resolve takes the slow
+// revalidation path; DISPATCH_TIMING measured resolve at 73 us/op vs the
+// control's 21 us/op, ~+24 ms/token across a 1374-node decode graph.
+// Grow-only with 1 MiB rounding so the mask's slow growth with n_kv
+// re-allocates rarely; only the graph-walker thread for a device touches
+// its slots (both bodies are synchronous), so no locking. Released
+// explicitly in ggml_sycl_attn_host_cpu_backend_free() -- a static-dtor
+// release would outlive the cache.
+struct ggml_sycl_attn_host_staging_slot {
+    ggml_sycl::mem_handle handle;
+    void *                ptr = nullptr;
+    size_t                cap = 0;
+};
+
+static ggml_sycl_attn_host_staging_slot g_attn_host_staging[GGML_SYCL_MAX_DEVICES][5];
+
+enum ggml_sycl_attn_host_staging_kind {
+    ATTN_STAGE_Q = 0,
+    ATTN_STAGE_DST,
+    ATTN_STAGE_MASK,
+    ATTN_STAGE_VAL,
+    ATTN_STAGE_IDS
+};
+
+// Kill-switch / bisection mask (llama.cpp-sbky): GGML_SYCL_ATTN_HOST_STAGING
+// unset = all slots persistent; otherwise an integer bitmask of which slot
+// kinds use the persistent path (1=Q, 2=DST, 4=MASK, 8=VAL, 16=IDS; 0 = all
+// per-call). Lets a single build isolate which slot's reuse misbehaves.
+static bool ggml_sycl_attn_host_staging_enabled(ggml_sycl_attn_host_staging_kind kind) {
+    static const int mask = [] {
+        const char * env = std::getenv("GGML_SYCL_ATTN_HOST_STAGING");
+        return env ? std::atoi(env) : 31;
+    }();
+    return (mask & (1 << (int) kind)) != 0;
+}
+
+static void * ggml_sycl_attn_host_staging_get(int device, ggml_sycl_attn_host_staging_kind kind, size_t bytes,
+                                              sycl::queue & q_dev, const char * tag,
+                                              ggml_sycl::mem_handle & fallback_holder) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || bytes == 0) {
+        return nullptr;
+    }
+    // GGML_SYCL_ATTN_HOST_STAGING_IDLE=1 (bisection): allocate and HOLD the
+    // persistent slot exactly as normal, but hand the caller a per-call
+    // buffer -- separates "holding a never-freed mid-graph allocation" from
+    // "writing through the slot pointer" as the corruption trigger.
+    static const bool idle_slots = [] {
+        const char * env = std::getenv("GGML_SYCL_ATTN_HOST_STAGING_IDLE");
+        return env && std::atoi(env) != 0;
+    }();
+    if (idle_slots && ggml_sycl_attn_host_staging_enabled(kind)) {
+        ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
+        if (bytes > slot.cap) {
+            const size_t rounded = (bytes + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
+            ggml_sycl::alloc_constraints c;
+            c.must_host_pinned = true;
+            ggml_sycl::alloc_request req;
+            req.queue  = &q_dev;
+            req.device = -1;
+            req.size   = rounded;
+            req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
+            ggml_sycl::mem_handle grown = ggml_sycl::unified_allocate(req);
+            if (grown.resolve().ptr) {
+                slot.handle = std::move(grown);
+                slot.ptr    = slot.handle.resolve().ptr;
+                slot.cap    = rounded;
+                fprintf(stderr, "[ATTN-STAGING-ALLOC] IDLE dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device,
+                        (int) kind, slot.ptr, rounded, tag);
+            }
+        }
+        // slot held but NEVER handed out; the caller gets a per-call buffer
+        ggml_sycl::alloc_constraints c;
+        c.must_host_pinned = true;
+        ggml_sycl::alloc_request req;
+        req.queue       = &q_dev;
+        req.device      = -1;
+        req.size        = bytes;
+        req.intent      = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
+        fallback_holder = ggml_sycl::unified_allocate(req);
+        return fallback_holder.resolve().ptr;
+    }
+    if (!ggml_sycl_attn_host_staging_enabled(kind)) {
+        ggml_sycl::alloc_constraints c;
+        c.must_host_pinned = true;
+        ggml_sycl::alloc_request req;
+        req.queue       = &q_dev;
+        req.device      = -1;
+        req.size        = bytes;
+        req.intent      = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
+        fallback_holder = ggml_sycl::unified_allocate(req);
+        return fallback_holder.resolve().ptr;
+    }
+    ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[device][kind];
+    if (bytes > slot.cap) {
+        const size_t rounded = (bytes + (1u << 20) - 1) & ~((size_t) (1u << 20) - 1);
+        ggml_sycl::alloc_constraints c;
+        c.must_host_pinned = true;
+        ggml_sycl::alloc_request req;
+        req.queue  = &q_dev;
+        req.device = -1;
+        req.size   = rounded;
+        req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, tag, c };
+        ggml_sycl::mem_handle grown = ggml_sycl::unified_allocate(req);
+        void *                ptr   = grown.resolve().ptr;
+        if (!ptr) {
+            return nullptr;  // caller declines; old slot (if any) stays usable
+        }
+        slot.handle = std::move(grown);  // old handle released -- rare, amortized
+        slot.ptr    = ptr;
+        slot.cap    = rounded;
+        // Aliasing probe (llama.cpp-sbky bisection): raw fprintf so it
+        // always prints; slot allocations are rare (grow-only).
+        fprintf(stderr, "[ATTN-STAGING-ALLOC] dev=%d kind=%d ptr=%p bytes=%zu tag=%s\n", device, (int) kind, ptr,
+                rounded, tag);
+        // Stomper canary: poison the slot's unused tail; checked per use in
+        // ggml_sycl_attn_host_staging_check_canary. A dead canary means a
+        // FOREIGN write landed inside this slot's allocation.
+        memset((char *) ptr + rounded - 64, 0xC5, 64);
+    }
+    return slot.ptr;
+}
+
+static void ggml_sycl_attn_host_staging_check_canaries(const char * where) {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        for (int k = 0; k < 5; ++k) {
+            const ggml_sycl_attn_host_staging_slot & slot = g_attn_host_staging[d][k];
+            if (!slot.ptr || slot.cap < 64) {
+                continue;
+            }
+            const unsigned char * c = (const unsigned char *) slot.ptr + slot.cap - 64;
+            for (int b = 0; b < 64; ++b) {
+                if (c[b] != 0xC5) {
+                    fprintf(stderr, "[ATTN-STAGING-CANARY] DEAD dev=%d kind=%d at=%s byte=%d val=%02x ptr=%p\n", d, k,
+                            where, b, c[b], slot.ptr);
+                    memset((void *) c, 0xC5, 64);  // re-arm so each stomp reports once
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void ggml_sycl_attn_host_staging_free_all() {
+    for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+        for (int k = 0; k < 5; ++k) {
+            g_attn_host_staging[d][k] = ggml_sycl_attn_host_staging_slot{};
+        }
+    }
+}
+
 // Process-lifetime CPU backend instance shared by every device's demoted
 // layers -- the CPU backend has no device affinity, so there is exactly one,
 // not one per GPU (unlike g_attn_host_pools, which is per-device because
@@ -76434,9 +76880,14 @@ static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
         g_attn_host_cpu_threadpool = ggml_threadpool_new(&tpp);
         if (g_attn_host_cpu_threadpool) {
             ggml_backend_cpu_set_threadpool(be, g_attn_host_cpu_threadpool);
-        } else {
-            ggml_backend_cpu_set_n_threads(be, 8);
         }
+        // ALWAYS set n_threads too (rev-step5 finding 1, llama.cpp-sbky
+        // c-prkf): ggml_backend_cpu_graph_compute plans with
+        // cpu_ctx->n_threads (default 4) regardless of the threadpool's
+        // size -- without this line the pool ran 4 threads while claiming
+        // 8, and under GGML_OPENMP a request BELOW 4 would launch 4 OMP
+        // threads over a smaller workers[] array (out-of-bounds).
+        ggml_backend_cpu_set_n_threads(be, n_threads);
     }
     g_attn_host_cpu_backend = be;
     return be;
@@ -76452,6 +76903,7 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
         ggml_threadpool_free(g_attn_host_cpu_threadpool);
         g_attn_host_cpu_threadpool = nullptr;
     }
+    ggml_sycl_attn_host_staging_free_all();
 }
 
 // TKV-13 (B2) final increment: the overlapped, deferred-flush form of the
@@ -76662,29 +77114,18 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     const size_t dst_bytes  = ggml_nbytes(dst);
     const size_t mask_bytes = mask_src ? ggml_nbytes(mask_src) : 0;
 
-    ggml_sycl::alloc_constraints c;
-    c.must_host_pinned = true;
-
-    ggml_sycl::alloc_request req;
-    req.queue  = &q_dev;
-    req.device = -1;
-    req.size   = q_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_q", c };
-    ggml_sycl::mem_handle q_handle = ggml_sycl::unified_allocate(req);
-    void *                q_ptr    = q_handle.resolve().ptr;
-
-    req.size   = dst_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_dst", c };
-    ggml_sycl::mem_handle dst_handle = ggml_sycl::unified_allocate(req);
-    void *                dst_ptr    = dst_handle.resolve().ptr;
-
-    ggml_sycl::mem_handle mask_handle;
-    void *                mask_ptr = nullptr;
+    // Persistent grow-only staging (see ggml_sycl_attn_host_staging_get):
+    // per-call allocate/release here churned cache entries and bumped the
+    // global generation, un-memoizing every weight handle -- 73 vs 21 us/op
+    // resolve. Reuse across dispatches is safe: one dispatch in flight per
+    // device (sync body, or the single force-flushed pending slot), and all
+    // staging reads/writes are ordered through the same in-order queue.
+    ggml_sycl::mem_handle q_fb, dst_fb, mask_fb;  // kill-switch fallbacks; moved into pending below
+    void * q_ptr    = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
+    void * dst_ptr  = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
+    void * mask_ptr = nullptr;
     if (mask_src && mask_bytes > 0) {
-        req.size   = mask_bytes;
-        req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_mask", c };
-        mask_handle = ggml_sycl::unified_allocate(req);
-        mask_ptr    = mask_handle.resolve().ptr;
+        mask_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
     }
 
     if (!q_ptr || !dst_ptr || (mask_src && mask_bytes > 0 && !mask_ptr)) {
@@ -76735,9 +77176,12 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
     pending.dst_bytes               = dst_bytes;
     pending.stream                  = &q_dev;
     pending.gctx                    = gctx;
-    pending.q_handle                = std::move(q_handle);
-    pending.dst_handle              = std::move(dst_handle);
-    pending.mask_handle             = std::move(mask_handle);
+    // With persistent slots active these are empty handles (the slots own
+    // the staging); on the kill-switch path they carry the per-call
+    // allocations, so pending's release keeps them alive until flush.
+    pending.q_handle                = std::move(q_fb);
+    pending.dst_handle              = std::move(dst_fb);
+    pending.mask_handle             = std::move(mask_fb);
     pending.stand_ins               = std::move(stand_ins);
     pending.active                  = true;
 
@@ -76789,11 +77233,18 @@ static bool ggml_sycl_attn_sync_profile_enabled() {
     return enabled;
 }
 
+// Graph-enter timestamp for the probe's in-graph deltas (set by the guard in
+// ggml_backend_sycl_graph_compute; read by the SET_ROWS/FA host bodies to
+// report how far into the graph's wall each host detour began). thread_local
+// mirrors the walker's threading; same TKV-12 cleanup scope as the probe.
+static thread_local std::chrono::steady_clock::time_point g_attn_graph_profile_t0;
+
 static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const bool                            attn_profile = ggml_sycl_attn_sync_profile_enabled();
     std::chrono::steady_clock::time_point t_entry, t_setup1, t_d2h, t_graph, t_compute, t_h2d;
     if (attn_profile) {
         t_entry = std::chrono::steady_clock::now();
+        ggml_sycl_attn_host_staging_check_canaries("fa-sync-entry");
     }
 
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
@@ -76841,29 +77292,18 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     const size_t dst_bytes  = ggml_nbytes(dst);
     const size_t mask_bytes = mask_src ? ggml_nbytes(mask_src) : 0;
 
-    ggml_sycl::alloc_constraints c;
-    c.must_host_pinned = true;
-
-    ggml_sycl::alloc_request req;
-    req.queue  = &q_dev;
-    req.device = -1;
-    req.size   = q_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_q", c };
-    ggml_sycl::mem_handle q_handle = ggml_sycl::unified_allocate(req);
-    void *                q_ptr    = q_handle.resolve().ptr;
-
-    req.size   = dst_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_dst", c };
-    ggml_sycl::mem_handle dst_handle = ggml_sycl::unified_allocate(req);
-    void *                dst_ptr    = dst_handle.resolve().ptr;
-
-    ggml_sycl::mem_handle mask_handle;
-    void *                mask_ptr = nullptr;
+    // Persistent grow-only staging (see ggml_sycl_attn_host_staging_get):
+    // per-call allocate/release here churned cache entries and bumped the
+    // global generation, un-memoizing every weight handle -- 73 vs 21 us/op
+    // resolve. Reuse across dispatches is safe: one dispatch in flight per
+    // device (sync body, or the single force-flushed pending slot), and all
+    // staging reads/writes are ordered through the same in-order queue.
+    ggml_sycl::mem_handle q_fb, dst_fb, mask_fb;  // per-call fallback lifetimes (kill-switch path only)
+    void * q_ptr    = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_Q, q_bytes, q_dev, "attn_host_q", q_fb);
+    void * dst_ptr  = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_DST, dst_bytes, q_dev, "attn_host_dst", dst_fb);
+    void * mask_ptr = nullptr;
     if (mask_src && mask_bytes > 0) {
-        req.size   = mask_bytes;
-        req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_mask", c };
-        mask_handle = ggml_sycl::unified_allocate(req);
-        mask_ptr    = mask_handle.resolve().ptr;
+        mask_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_MASK, mask_bytes, q_dev, "attn_host_mask", mask_fb);
     }
 
     if (!q_ptr || !dst_ptr || (mask_src && mask_bytes > 0 && !mask_ptr)) {
@@ -76885,6 +77325,29 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
     // CPU kernel reads them. K/V need no copy -- already pinned host memory.
     sycl::event q_d2h_evt = ggml_sycl::mem_copy_ptr_async(q_ptr, q_src->data, q_bytes, q_dev);
     q_d2h_evt.wait();
+
+    // Staging-corruption bisection probe (llama.cpp-sbky): re-copy Q into a
+    // fresh per-call buffer and byte-compare against the slot. Differing
+    // bytes convict the persistent-slot copy path; equal bytes exonerate it.
+    if (attn_profile) {
+        ggml_sycl::alloc_constraints vc;
+        vc.must_host_pinned = true;
+        ggml_sycl::alloc_request vreq;
+        vreq.queue  = &q_dev;
+        vreq.device = -1;
+        vreq.size   = q_bytes;
+        vreq.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE,
+                        "attn_host_q_verify", vc };
+        ggml_sycl::mem_handle vh = ggml_sycl::unified_allocate(vreq);
+        void *                vp = vh.resolve().ptr;
+        if (vp) {
+            ggml_sycl::mem_copy_ptr_async(vp, q_src->data, q_bytes, q_dev).wait();
+            const int cmp = memcmp(q_ptr, vp, q_bytes);
+            fprintf(stderr, "[ATTN-STAGING-VERIFY] q_bytes=%zu cmp=%d slot=%p fresh=%p src=%p\n", q_bytes, cmp,
+                    q_ptr, vp, q_src->data);
+        }
+    }
+
     sycl::event mask_d2h_evt;
     bool        have_mask_d2h_evt = false;
     if (mask_src && mask_bytes > 0) {
@@ -76937,11 +77400,12 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
             return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
         };
 
-        // Device-side event timing, best-effort: q_dev almost certainly was
-        // NOT constructed with property::queue::enable_profiling (this is
-        // the real production per-device queue, not a probe-owned one), so
-        // get_profiling_info() is expected to throw here -- caught and
-        // reported as -1 rather than crashing the run.
+        // Device-side event timing: every backend stream in this fork
+        // carries property::queue::enable_profiling (common.hpp
+        // default_queue_properties; rev-step5 c-prkf corrected this
+        // comment, which used to claim the opposite), so these normally
+        // report real times; -1 means get_profiling_info threw for some
+        // OTHER reason and deserves a look, not a shrug.
         long long q_dev_ns = -1, mask_dev_ns = -1;
         try {
             q_dev_ns = (long long) (q_d2h_evt.get_profiling_info<sycl::info::event_profiling::command_end>() -
@@ -76957,8 +77421,11 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
             }
         }
 
+        fprintf(stderr, "[ATTN-SYNC-PROFILE] at_us=%lld ",
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(t_entry - g_attn_graph_profile_t0)
+                    .count());
         fprintf(stderr,
-                "[ATTN-SYNC-PROFILE] setup_us=%lld d2h_host_us=%lld d2h_dev_q_ns=%lld d2h_dev_mask_ns=%lld "
+                "setup_us=%lld d2h_host_us=%lld d2h_dev_q_ns=%lld d2h_dev_mask_ns=%lld "
                 "graph_build_us=%lld compute_us=%lld h2d_host_us=%lld total_us=%lld "
                 "(d2h_host_us/h2d_host_us are HOST-observed wait time, which per "
                 "host-chrono-cannot-see-past-submission-backpressure can include queue "
@@ -77013,23 +77480,12 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     const size_t val_bytes = ggml_nbytes(val_src);
     const size_t ids_bytes = ggml_nbytes(ids_src);
 
-    ggml_sycl::alloc_constraints c;
-    c.must_host_pinned = true;
-
-    ggml_sycl::alloc_request req;
-    req.queue  = &q_dev;
-    req.device = -1;
-    req.size   = val_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_setrows_val",
-                   c };
-    ggml_sycl::mem_handle val_handle = ggml_sycl::unified_allocate(req);
-    void *                val_ptr    = val_handle.resolve().ptr;
-
-    req.size   = ids_bytes;
-    req.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_setrows_ids",
-                   c };
-    ggml_sycl::mem_handle ids_handle = ggml_sycl::unified_allocate(req);
-    void *                ids_ptr    = ids_handle.resolve().ptr;
+    // Persistent grow-only staging -- same generation-churn rationale as
+    // the FA bodies (see ggml_sycl_attn_host_staging_get).
+    const int device  = ctx.device;
+    ggml_sycl::mem_handle val_fb, ids_fb;  // kill-switch fallback lifetimes
+    void *    val_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_VAL, val_bytes, q_dev, "attn_host_setrows_val", val_fb);
+    void *    ids_ptr = ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_IDS, ids_bytes, q_dev, "attn_host_setrows_ids", ids_fb);
 
     if (!val_ptr || !ids_ptr) {
         GGML_LOG_WARN("[ATTN-HOST] pinned staging allocation failed; declining host SET_ROWS\n");
@@ -77041,8 +77497,26 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
 
     // D2H both srcs; the in-order queue sequences these after their
     // producers, and the second wait covers both copies.
-    ggml_sycl::mem_copy_ptr_async(val_ptr, val_src->data, val_bytes, q_dev);
+    const bool                            attn_profile = ggml_sycl_attn_sync_profile_enabled();
+    std::chrono::steady_clock::time_point t_sr_enter;
+    if (attn_profile) {
+        t_sr_enter = std::chrono::steady_clock::now();
+    }
+    // Both copies waited individually: mem_copy_ptr_async may route through
+    // the unified cache's internal DMA queue, and the no-host-waits ruling's
+    // own caveat applies -- in-order q_dev does NOT order library internals,
+    // so waiting only the second event does not cover the first copy.
+    ggml_sycl::mem_copy_ptr_async(val_ptr, val_src->data, val_bytes, q_dev).wait();
     ggml_sycl::mem_copy_ptr_async(ids_ptr, ids_src->data, ids_bytes, q_dev).wait();
+    if (attn_profile) {
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[ATTN-SETROWS-PROFILE] at_us=%lld drain_us=%lld dst=%s\n",
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(t_sr_enter -
+                                                                                  g_attn_graph_profile_t0)
+                    .count(),
+                (long long) std::chrono::duration_cast<std::chrono::microseconds>(now - t_sr_enter).count(),
+                dst->name ? dst->name : "");
+    }
 
     // Hot path: inline single-threaded scatter on the calling thread --
     // one row per token at decode, so a CPU-backend graph launch (thread
@@ -77119,7 +77593,7 @@ static bool ggml_sycl_dispatch_host_flash_attn(ggml_backend_sycl_context & ctx, 
     return ggml_sycl_dispatch_host_flash_attn_sync(ctx, dst);
 }
 
-static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
+static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
     if (!g_sycl_loaded) {
         fprintf(stderr, "[SYCL] compute_forward false: backend not loaded op=%s dst=%s ctx=%d\n",
                 dst ? ggml_op_name(dst->op) : "(null)", dst && dst->name ? dst->name : "", ctx.device);
@@ -79343,7 +79817,9 @@ static bool ggml_sycl_try_fuse_moe_down_weighted_sum(ggml_backend_sycl_context &
     }
 
     const float *   down_d    = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(down, ctx.device));
-    const float *   bias_d    = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(bias, ctx.device));
+    // llama.cpp-2gag: same dangling-DIRECT-handle hazard as the gate/up/down
+    // bias resolves elsewhere in this file -- use the slow path directly.
+    const float *   bias_d    = static_cast<const float *>(ggml_sycl_get_data_ptr_slow(bias, ctx.device));
     const int32_t * ids_d     = static_cast<const int32_t *>(ggml_sycl_resolve_tensor_ptr(ids, ctx.device));
     const float *   weights_d = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(weights, ctx.device));
     float *         final_d   = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(final, ctx.device));
@@ -79682,7 +80158,10 @@ static bool ggml_sycl_try_fuse_tg_router_f32_add_argsort(ggml_backend_sycl_conte
 
     const float * weight_ptr = static_cast<const float *>(resolved.ptr);
     const float * act_ptr    = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(act, ctx.device));
-    const float * bias_ptr   = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(addend, ctx.device));
+    // llama.cpp-2gag: same dangling-DIRECT-handle hazard as the MoE expert
+    // gate/up/down bias resolves elsewhere in this file -- use the slow
+    // path directly for this router-bias addend.
+    const float * bias_ptr   = static_cast<const float *>(ggml_sycl_get_data_ptr_slow(addend, ctx.device));
     float *       probs_ptr  = static_cast<float *>(ggml_sycl_resolve_tensor_ptr(add, ctx.device));
     int32_t *     sort_ptr   = static_cast<int32_t *>(ggml_sycl_resolve_tensor_ptr(sort, ctx.device));
     if (!weight_ptr || !act_ptr || !bias_ptr || !probs_ptr || !sort_ptr) {
@@ -79767,7 +80246,15 @@ static bool ggml_sycl_try_fuse_tg_mul_mat_add(ggml_backend_sycl_context & ctx,
     if (!resolved.ptr || !resolved.on_device) {
         return false;
     }
-    const float * addend_ptr = static_cast<const float *>(ggml_sycl_resolve_tensor_ptr(addend, ctx.device));
+    // llama.cpp-2gag: addend is a per-layer constant bias vector fused into a
+    // TG mul_mat+add dispatch -- the same tensor class (small, contiguous,
+    // constant-across-tokens) as the MoE gate/up/down bias resolves fixed
+    // elsewhere in this file. ggml_sycl_resolve_tensor_ptr()'s fast path
+    // trusts a DIRECT-kind mem_handle memoized on the tensor's own
+    // extra->data_handle[device] forever, with no per-graph refresh, so a
+    // host-staged bias whose backing allocation is later freed and reused
+    // reads garbage under a stable pointer. Use the slow path directly.
+    const float * addend_ptr = static_cast<const float *>(ggml_sycl_get_data_ptr_slow(addend, ctx.device));
     if (!addend_ptr) {
         return false;
     }
@@ -84513,6 +85000,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // Re-entrancy guard: Prevent nested calls to compute_impl
     static thread_local bool g_in_compute_impl = false;
 
+    // g_data_ptr_cache is documented as "per-graph" but was never cleared at
+    // graph entry -- its cross-graph staleness (tensor structs are recycled
+    // across per-token graph rebuilds, so a {tensor*, device} key can hit an
+    // entry cached for a DIFFERENT node) was masked for years by an
+    // accident: per-token allocation churn bumped cache_generation every
+    // graph, invalidating the gen-checked entries as a side effect. The
+    // TKV-13 persistent host-attention staging produced the first bump-free
+    // decode graphs and the stale hits surfaced as wrong-pointer reads
+    // (llama.cpp-sbky bisection: content-verified staging, live canaries,
+    // failure tracking allocation LAYOUT -- the classic pointer-keyed-memo
+    // signature). Clear at entry: intra-graph reuse (the cache's actual
+    // purpose) is preserved, cross-graph keys can no longer alias.
+    ggml_sycl_data_ptr_cache_new_graph();
+
     struct moe_precomputed_skip_graph_scope {
         ~moe_precomputed_skip_graph_scope() { ggml_sycl_moe_precomputed_skip_new_graph(); }
     } moe_precomputed_skip_graph_scope_;
@@ -84811,6 +85312,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_sycl_cpu_quant_cache_new_graph();
     ggml_sycl_moe_ids_cache_new_graph();
     ggml_sycl_moe_layer_ids_cache_new_graph(g_moe_layer_ids_cache);
+    // llama.cpp-2gag: g_moe_precomputed_mmid_skip/g_moe_precomputed_node_skip
+    // (and siblings) are keyed by {ggml_tensor*, device} -- explicitly
+    // documented at their key-builder as "a graph-local semantic marker...
+    // The node pointer is stable for the graph" (ggml-sycl.cpp:18082-18084),
+    // i.e. exactly the bgf1 hazard: per-token graph rebuilds heap-recycle
+    // tensor structs, so a stale key from a prior graph can alias a live
+    // tensor in this one. This call was missing from the one place that is
+    // supposed to invalidate every per-graph cache before the first
+    // graph-local lookup -- the ad-hoc clears at individual MoE dispatch
+    // call sites elsewhere in this file do not cover every path into a new
+    // graph. See llama.cpp-bgf1 for the sibling cache (g_data_ptr_cache)
+    // that had the identical gap, fixed the same way.
+    ggml_sycl_moe_precomputed_skip_new_graph();
+    // llama.cpp-2gag: g_mxfp4_moe_tg_reuse (mmvq.cpp) is a second, distinct
+    // graph-local cache with the same hazard -- its validity check keys on
+    // {device, layer, role, shape, src1_handle pointer-identity}, and a
+    // layer's glu_dst tensor sits at the same device address every decode
+    // token, so pointer-identity alone cannot distinguish this token's GLU
+    // output from a stale one left by a prior token. No per-graph reset
+    // existed for it anywhere in the codebase (only ad-hoc invalidation
+    // inside specific internal branches of the gate/up dispatch itself).
+    ggml_sycl_mxfp4_moe_tg_reuse_new_graph();
 #ifdef GGML_SYCL_GRAPH
     if (sycl_ctx->moe_direct_dispatch_graphs_n_nodes != cgraph->n_nodes ||
         sycl_ctx->moe_direct_dispatch_graphs_is_decode != g_moe_descriptor_capture_decode_phase) {
@@ -99455,6 +99978,38 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         ~stage_trace_exit() { ggml_sycl::stage_trace_mark("graph-exit"); }
     } stage_trace_exit_guard;
 
+    // llama.cpp-sbky residual-overhead hunt: per-graph host wall time on the
+    // same env as the FA per-segment probe, so one decode token decomposes
+    // into (token_total - graph_wall) outside the backend, (graph_wall -
+    // FA total_us) in-graph non-FA, and the FA body. Host chrono by intent:
+    // this measures the submission-side wall this call holds the caller,
+    // which for decode is the number the token budget actually pays --
+    // device-event sums cannot see submission stalls. NOTE an unprofiled
+    // decode graph_compute may return with kernels still in flight, so
+    // graph_wall_us under-reports device tail work; read it against the
+    // token total, not as GPU time. Temporary TKV-11 observable -- delete
+    // at TKV-12 cleanup with the FA probe.
+    struct attn_graph_profile_exit {
+        bool                                  enabled;
+        int                                   n_nodes;
+        std::chrono::steady_clock::time_point t0;
+        attn_graph_profile_exit(bool enabled_, int n_nodes_, std::chrono::steady_clock::time_point t0_)
+            : enabled(enabled_), n_nodes(n_nodes_), t0(t0_) {
+            if (enabled) {
+                g_attn_graph_profile_t0 = t0;
+            }
+        }
+        ~attn_graph_profile_exit() {
+            if (enabled) {
+                const long long us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - t0)
+                                         .count();
+                fprintf(stderr, "[ATTN-GRAPH-PROFILE] graph_wall_us=%lld n_nodes=%d\n", us, n_nodes);
+            }
+        }
+    } attn_graph_profile_guard{ ggml_sycl_attn_sync_profile_enabled(), cgraph ? cgraph->n_nodes : -1,
+                                std::chrono::steady_clock::now() };
+
     try {
 #if GGML_SYCL_DNNL
         // llama.cpp-6405: GGML_SYCL_MXFP4_PP_PROFILE component 5 ("everything
@@ -100015,7 +100570,13 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             // without this the dst-check acceptance above is immediately
             // undone here and the op still lands on the CPU backend via a
             // mid-graph split -- the exact overhead step 5 removes.
-            if ((op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_SET_ROWS) &&
+            // SET_ROWS additionally requires the DST to be KV-host-resident
+            // (rev-step5 finding 2, c-prkf): the funnel intercept keys on
+            // the dst, so a src-only match would be admitted to SYCL,
+            // decline the intercept, and run the normal GPU kernel over
+            // host KV -- the forbidden zero-copy, via predicate asymmetry.
+            if ((op->op == GGML_OP_FLASH_ATTN_EXT ||
+                 (op->op == GGML_OP_SET_ROWS && ggml_sycl_tensor_is_in_kv_host_buft(op))) &&
                 ggml_sycl_attn_host_dispatch_enabled()) {
                 if (g_ggml_sycl_debug) {
                     g_sycl_attn_host_accept_count.fetch_add(1, std::memory_order_relaxed);
