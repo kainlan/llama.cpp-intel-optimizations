@@ -86696,7 +86696,41 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                                 }
                             }
                         }
-                        if (mul_only_used_by_add && scale_ok && bias_ok) {
+                        // llama.cpp-dkw0 (bit6 stride/view-offset guard, sibling of the
+                        // already-fixed 81gx bit1 guard): k_mul_add_fused (binbcast.cpp)
+                        // indexes all three operands with a flat idx = i1*ne0+i0 and no
+                        // view_offs term, so any of x/scale/bias being a non-zero-offset
+                        // view corrupts the read with fully valid memory -- same failure
+                        // shape as 81gx, just unguarded here. Same guard fn, same
+                        // decline-and-fall-through: on an unsafe operand, skip the fused
+                        // kernel and let the unfused MUL then ADD dispatch normally below.
+                        const bool operands_offset_safe = ggml_sycl_fusion_operand_view_offset_safe(x) &&
+                                                          ggml_sycl_fusion_operand_view_offset_safe(scale) &&
+                                                          ggml_sycl_fusion_operand_view_offset_safe(bias);
+                        // llama.cpp-dkw0 (N14): one-shot positive control,
+                        // mirrors bit1's FUSION-BIT1-REACH print -- confirms
+                        // this guard actually declines something on a real
+                        // run rather than being a permanently-vacuous,
+                        // unreachable branch. Fires only when every OTHER
+                        // condition for this fusion already held and the
+                        // offset check is the one thing that said no.
+                        if (mul_only_used_by_add && scale_ok && bias_ok && !operands_offset_safe) {
+                            static const char * dkw0_bit6_decline_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                            if (dkw0_bit6_decline_env && std::atoi(dkw0_bit6_decline_env) != 0) {
+                                static std::atomic<int> dkw0_bit6_decline_count{ 0 };
+                                if (dkw0_bit6_decline_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+                                    fprintf(stderr,
+                                            "[FUSION-BIT6-DECLINE] mul=%s(idx=%d) x=%s scale=%s bias=%s x_safe=%d "
+                                            "scale_safe=%d bias_safe=%d\n",
+                                            node->name ? node->name : "?", i, x ? x->name : "?",
+                                            scale ? scale->name : "?", bias ? bias->name : "?",
+                                            ggml_sycl_fusion_operand_view_offset_safe(x) ? 1 : 0,
+                                            ggml_sycl_fusion_operand_view_offset_safe(scale) ? 1 : 0,
+                                            ggml_sycl_fusion_operand_view_offset_safe(bias) ? 1 : 0);
+                                }
+                            }
+                        }
+                        if (mul_only_used_by_add && scale_ok && bias_ok && operands_offset_safe) {
                             if (ggml_sycl_fusion_chain_accessible_on_device(cgraph, i, 2, sycl_ctx->device)) {
                                 ggml_sycl_op_mul_add_fused(*sycl_ctx, node, next);
                                 gpu_queue_dirty = true;  // D+: GPU fusion submitted work
