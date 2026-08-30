@@ -970,7 +970,18 @@ correctness. Full rationale and sources: `docs/backend/gpt-oss-testing.md`.
 
 ### Patched compute-runtime & P2P topology
 
-The system `libze_intel_gpu.so.1` is a patched 26.22/BMG-only build (from
+⚠️ **STALE-PIN CORRECTION (verified 2026-08-30, llama.cpp-09um):** the paragraph
+below described the loader state until 2026-08-18, when a PPA upgrade (one-way)
+moved `libze_intel_gpu.so.1` to **26.31** (`libze_intel_gpu.so.1.17.39395`,
+package `libze-intel-gpu1 26.31.39395.13`). The patched 26.22 build
+(`1.14.37435`) and stock `1.14.36300.orig` remain on disk in
+`/usr/lib/x86_64-linux-gnu/` but are NOT loaded. Every measurement since
+2026-08-18 — including the dkw0 campaign — ran on 26.31. The perf-baseline
+tables were validated under 26.27; treat driver-version deltas accordingly, and
+note the patched build's fixes (below) may have landed upstream in 26.31 —
+unverified. Historical record follows:
+
+The system `libze_intel_gpu.so.1` *was* a patched 26.22/BMG-only build (from
 `/Apps/compute-runtime-26.22-llama`, branch `llama/26.22-cross-device`) carrying
 the hung-i915 discovery fix, cross-device in-order dependency fixes, and the
 PR 930 USM compression fix. Stock `1.14.37020` is preserved alongside for

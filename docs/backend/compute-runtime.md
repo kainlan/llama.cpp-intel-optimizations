@@ -128,3 +128,15 @@ This is a PCI P2PDMA/topology restriction, not just a compute-runtime selector
 bug. Do not enable direct peer-copy or shared-context transfer paths by default
 unless a runtime check confirms they are safe on the active hardware, kernel, and
 driver.
+
+## Loader state correction (2026-08-30, llama.cpp-09um)
+
+A one-way PPA upgrade on 2026-08-18 moved the loaded driver to **26.31**
+(`libze_intel_gpu.so.1 -> libze_intel_gpu.so.1.17.39395`, package
+`libze-intel-gpu1 26.31.39395.13-1~26.04~ppa1`). The patched 26.22 build
+(`1.14.37435`) and the stock `.orig` remain on disk in
+`/usr/lib/x86_64-linux-gnu/` but are no longer loaded. All measurements since
+2026-08-18 ran on 26.31. Whether 26.31 carries the patched build's fixes
+(hung-i915 discovery, cross-device in-order deps, PR 930 USM compression) is
+unverified; the 26.22-vs-26.27 GPT-OSS TG regression measured 2026-07-24 has
+not been re-measured on 26.31.
