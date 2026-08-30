@@ -4296,7 +4296,12 @@ inline bool ggml_sycl_checked_tensor_span_bytes(const ggml_tensor * tensor, size
 // predicate should say what it means: an empty handle isn't a stale DIRECT
 // handle, it's simply not populated yet.
 inline bool ggml_sycl_direct_handle_trust_ok(const ggml_tensor * tensor, const ggml_sycl::mem_handle & handle) {
-    return !handle.valid() || handle.kind() != ggml_sycl::mem_handle_kind::DIRECT ||
+    // rev-2gag (post-c-1p1o nit): kind() first -- a plain member read that
+    // short-circuits before valid()'s per-handle spin lock, sparing every
+    // WEIGHT/ARENA/CHUNK_LEASE handle (the overwhelming majority of resolves)
+    // an atomic RMW they don't need. Semantically identical to checking
+    // valid() first; only the hot-path cost changes.
+    return handle.kind() != ggml_sycl::mem_handle_kind::DIRECT || !handle.valid() ||
            (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
 }
 
