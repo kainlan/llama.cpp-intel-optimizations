@@ -4286,8 +4286,18 @@ inline bool ggml_sycl_checked_tensor_span_bytes(const ggml_tensor * tensor, size
 // Callers that fail this test must fall through to re-deriving resolution
 // (tiered cache / staging / tensor->data), never consult
 // extra->data_device_ptr() for the tensor.
+//
+// rev-2gag F2: kind() DEFAULTS to DIRECT on an empty (never-populated)
+// handle, so without the valid() check this predicate also untrusted every
+// unpopulated data_handle[device] slot across the ~20 write sites that rely
+// on the unenforced "leave it default-constructed until first use"
+// convention. Benign today (an untrusted empty handle still correctly falls
+// through, since resolve() on it returns nothing either way), but the
+// predicate should say what it means: an empty handle isn't a stale DIRECT
+// handle, it's simply not populated yet.
 inline bool ggml_sycl_direct_handle_trust_ok(const ggml_tensor * tensor, const ggml_sycl::mem_handle & handle) {
-    return handle.kind() != ggml_sycl::mem_handle_kind::DIRECT || (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+    return !handle.valid() || handle.kind() != ggml_sycl::mem_handle_kind::DIRECT ||
+           (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
 }
 
 // Hot path: 2 dereferences + 1 null check for common case (model fits in VRAM)
@@ -4760,6 +4770,17 @@ inline ggml_sycl::resolved_ptr ggml_sycl_resolve(const ggml_tensor * tensor, int
             if (handle.device() != device && handle.device() != ggml_sycl::mem_handle::HOST_DEVICE) {
                 GGML_SYCL_DEBUG("[RESOLVE] skipping foreign handle tensor=%s request_device=%d handle_device=%d\n",
                                 tensor->name ? tensor->name : "?", device, handle.device());
+            } else if (!ggml_sycl_direct_handle_trust_ok(tensor, handle)) {
+                // rev-2gag F1: this is_weight branch's own consult was the gap the
+                // trust gate missed -- a bias tensor is weights-usage (is_weight()
+                // true), so it never reaches the !is_weight fast path above that
+                // already gated this same hazard. Distrusting here falls through
+                // to the cache lookup below, exactly like a genuinely empty
+                // data_handle already does two lines down.
+                GGML_SYCL_DEBUG(
+                    "[RESOLVE] distrusted DIRECT handle for weight-usage tensor '%s' device %d, "
+                    "falling through to cache lookup\n",
+                    tensor->name ? tensor->name : "?", device);
             } else {
                 auto resolved = handle.resolve(device);
                 if (resolved) {

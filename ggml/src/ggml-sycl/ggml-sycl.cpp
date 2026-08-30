@@ -77420,15 +77420,15 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
         vreq.queue  = &q_dev;
         vreq.device = -1;
         vreq.size   = q_bytes;
-        vreq.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE,
-                        "attn_host_q_verify", vc };
+        vreq.intent = { ggml_sycl::alloc_role::COMPUTE, ggml_sycl::runtime_category::HOST_COMPUTE, "attn_host_q_verify",
+                        vc };
         ggml_sycl::mem_handle vh = ggml_sycl::unified_allocate(vreq);
         void *                vp = vh.resolve().ptr;
         if (vp) {
             ggml_sycl::mem_copy_ptr_async(vp, q_src->data, q_bytes, q_dev).wait();
             const int cmp = memcmp(q_ptr, vp, q_bytes);
-            fprintf(stderr, "[ATTN-STAGING-VERIFY] q_bytes=%zu cmp=%d slot=%p fresh=%p src=%p\n", q_bytes, cmp,
-                    q_ptr, vp, q_src->data);
+            fprintf(stderr, "[ATTN-STAGING-VERIFY] q_bytes=%zu cmp=%d slot=%p fresh=%p src=%p\n", q_bytes, cmp, q_ptr,
+                    vp, q_src->data);
         }
     }
 
@@ -77566,7 +77566,7 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
 
     // Persistent grow-only staging -- same generation-churn rationale as
     // the FA bodies (see ggml_sycl_attn_host_staging_get).
-    const int device  = ctx.device;
+    const int             device = ctx.device;
     ggml_sycl::mem_handle val_fb, ids_fb;  // kill-switch fallback lifetimes
     void *                val_ptr =
         ggml_sycl_attn_host_staging_get(device, ATTN_STAGE_VAL, val_bytes, q_dev, "attn_host_setrows_val", val_fb);
