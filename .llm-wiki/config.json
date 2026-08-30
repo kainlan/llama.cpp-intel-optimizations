@@ -1,0 +1,8 @@
+{
+  "name": "llama.cpp SYCL backend (Intel Arc GPU optimizations)",
+  "mode": "company",
+  "topic": "llama.cpp SYCL backend (Intel Arc GPU optimizations)",
+  "created": "2026-08-29",
+  "version": "1.0",
+  "knowledge_format": "okf-0.2"
+}

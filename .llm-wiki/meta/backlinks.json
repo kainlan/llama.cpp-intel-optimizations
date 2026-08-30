@@ -1,0 +1,761 @@
+{
+  "concepts/ab-harness-tracecompare": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/accepted-is-not-the-same-as-correct": [
+    "concepts/woq-gemm-weight-only-quantized",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/accuracy-ratio": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/across-process-spread": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/allocationcontrolclass": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/baseline-measurement-discipline": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/bench-guard-preflight-refusal": [
+    "concepts/bench-guard-validsuspect-verdict",
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/bench-guard-validsuspect-verdict": [
+    "concepts/bench-guard-preflight-refusal",
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/buffer-scoped-weight-provenance": [
+    "concepts/non-owning-storage-handle-route",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/capability-query-vs-capability-check": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/correctness-gates-before-throughput": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/cross-device-in-order-dependency-fixes": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/devicelost-on-multi-gpu-context": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/diverted-library-path-symlink-rollback": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/dmmv-coalesced-fallback": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/epoch-refcounted-transient-zones": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/fail-closed-admission-contract": [
+    "concepts/xmxtiled-grouped-dpas-route",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/fail-closed-contract": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/flag-presence-test": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/free-vram-confound": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/host-bounce": [
+    "entities/oneapideviceselector",
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/interleaved-ab-design": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/invalidated-vs-superseded": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/kernel-confirmation-from-output-not-setup": [
+    "concepts/tg-fast-path",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/known-stale-baseline": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/layout-follows-residency": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/lazy-re-resolution": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/leases-inusecount": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/live-card-derivation": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/masking-bug": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/measurement-masking-co-resident-tenants": [
+    "concepts/bench-guard-preflight-refusal",
+    "concepts/bench-guard-validsuspect-verdict",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/misleading-error-attribution": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/mmvq-with-q81-activations": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/mmvqmmqdmmvesimd-kernel-families": [
+    "concepts/tg-fast-path",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/multi-context-device-contention": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/multi-gpu-device-collapse": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/multi-gpu-moe-ggmlsyclmoemultigpu": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/no-weight-streaming": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/no-zero-copy-host-reads": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/non-owning-storage-handle-route": [
+    "concepts/buffer-scoped-weight-provenance",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/one-layout-per-weight": [
+    "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/opt-out-default-on-variable-polarity": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/opt-out-performance-defaults": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/oracle-fit-ratio": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/owner-first-allocation": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/pcipcie-topology-restriction": [
+    "entities/intel-arc-pro-b50",
+    "entities/intel-arc-pro-b70",
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/peer-to-peer-p2p-dma": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/per-allocation-hardware-caps": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/pl2-throttling": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/placement-decided-once": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/placement-decides-the-executor": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/placement-lifetime-transient-view-triad": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/placement-plan": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/pp512-tg128": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/presence-tested-env-var": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/q81-activation-quantization": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/refusible-release": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/routing-dependent-flag-effect": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/scratch-ring-admission": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/session-drift": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/shmem-ceiling": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/sign-flip-under-blocked-design": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/single-allocation-entry-point": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/single-allocator-invariant": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/stableidentityhash": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/staging-scope-boundary": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/stale-gpu-tenant": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/sycl-graph-replay": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/tensor-identity-ggmlsyclcacheid": [
+    "concepts/buffer-scoped-weight-provenance",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/tg-fast-path": [
+    "sources/SRC-2026-08-29-001",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/tg-vs-pp": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/tiered-memory-hierarchy": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/typed-allocation-errors": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/usm-compression-upstream-pr-930": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/usm-unified-shared-memory": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/vram-budget": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/vram-zone": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/weight-handle-leases": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled": [
+    "concepts/xmxtiled-grouped-dpas-route",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/winner-holds-forever-devicebusy": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/woq-gemm-weight-only-quantized": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "concepts/xmxtiled-grouped-dpas-route": [
+    "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/0b7b49e07": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/agentsmd": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/artifactsperf-recoveryc4-pp-validationmd": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/artifactsperf-recoveryd3-b70-baselinemd": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/b50-b70": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/battlemage-g21": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/battlemage-g31": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/canaccesspeer": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/claudemd": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/codescout": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/comfyui": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/computeplacementplan-placementplan": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/cpuexpertpool": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/dmmv": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/dnnlgemmwrapper": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/docsbackendsycl-env-varsmd": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/docsbackendsycl-perf-baselinesmd": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ensurecachedalloc": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/extoneapienablepeeraccess": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/gallocr": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ggml": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ggml-sycl": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/ggmlsrcggml-syclggml-syclcpp": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/ggmlsyclbatchexperts": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclcacheid": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ggmlsycldisablegraph": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclesimddequant": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclfaonednnmaterialize": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclforcedmmv": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsycllayoutoverride": [
+    "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclmoedownxmxtiled": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclmoepponednnf16batched": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclmoeppwoq": [
+    "concepts/woq-gemm-weight-only-quantized",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclmoeppwoq3d": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclmulmatroutetrace": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/ggmlsyclmxfp4groupeddpasrowlisttiles": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclonednnmul": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclonednnpp": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsycloptimeoutms": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/ggmlsyclpppipeline": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclpublishbackendaosexperthandles": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ggmlsyclq8denseaos": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclq8onednncoalesced": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclresolvemoeexpertroute-ggmlsycltrymoestoragehandleroute": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ggmlsycltgfast": [
+    "concepts/tg-fast-path",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclunifiedforcelegacy": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclunifiedsoa": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclusexmxgemm": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclxmxmoesorted": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclxmxthreshold": [
+    "concepts/xmxtiled-grouped-dpas-route",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/ggmlsyclxmxtiledpp": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/gpt-oss": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/gpt-oss-20b-mxfp4": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/igc": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/intel-arc-a580": [
+    "entities/intel-arc-b580",
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/intel-arc-b580": [
+    "entities/intel-arc-a580",
+    "entities/intel-arc-pro-b70",
+    "sources/SRC-2026-08-29-001",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/intel-arc-pro-b50": [
+    "entities/intel-arc-pro-b70",
+    "entities/oneapideviceselector",
+    "sources/SRC-2026-08-29-001",
+    "sources/SRC-2026-08-29-002",
+    "sources/SRC-2026-08-29-003",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/intel-arc-pro-b70": [
+    "entities/intel-arc-a580",
+    "entities/intel-arc-b580",
+    "entities/intel-arc-pro-b50",
+    "entities/oneapideviceselector",
+    "sources/SRC-2026-08-29-001",
+    "sources/SRC-2026-08-29-002",
+    "sources/SRC-2026-08-29-003",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/intel-compute-runtime": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/level-zero": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/libzeintelgpuso": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/libzeloaderso": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/llama-bench": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/llama-cli": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/llama-completion": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/llamacpp": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/llamacpp-sycl-fork": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/mem-handle": [
+    "concepts/buffer-scoped-weight-provenance",
+    "concepts/non-owning-storage-handle-route",
+    "entities/sycl-canonical-memory-architecture",
+    "entities/unified-cache",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/mistral": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/mistral-7b-q40": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/mmvq": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/mxfp4": [
+    "concepts/woq-gemm-weight-only-quantized",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/ocloc": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/oneapi": [
+    "entities/oneapideviceselector",
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/oneapi-20253": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/oneapideviceselector": [
+    "sources/SRC-2026-08-29-001",
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/onednn": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/openvino": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/q81": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/scriptsbench-guardsh": [
+    "concepts/bench-guard-preflight-refusal",
+    "concepts/bench-guard-validsuspect-verdict",
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/sycl": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/sycl-canonical-memory-architecture": [
+    "entities/mem-handle",
+    "entities/unified-cache",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/sycl-ls": [
+    "sources/SRC-2026-08-29-003"
+  ],
+  "entities/test-thread-safety": [
+    "sources/SRC-2026-08-29-004"
+  ],
+  "entities/teststest-bench-guardsh": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/teststest-dmmv-q4-0-coalescedcpp": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/ttm-shmem": [
+    "sources/SRC-2026-08-29-001"
+  ],
+  "entities/unified-cache": [
+    "entities/mem-handle",
+    "entities/sycl-canonical-memory-architecture",
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/unifiedallocate": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "entities/unifiedallocateowner": [
+    "sources/SRC-2026-08-29-002"
+  ],
+  "sources/SRC-2026-08-29-001": [
+    "concepts/accuracy-ratio",
+    "concepts/across-process-spread",
+    "concepts/baseline-measurement-discipline",
+    "concepts/bench-guard-preflight-refusal",
+    "concepts/bench-guard-validsuspect-verdict",
+    "concepts/correctness-gates-before-throughput",
+    "concepts/dmmv-coalesced-fallback",
+    "concepts/flag-presence-test",
+    "concepts/free-vram-confound",
+    "concepts/interleaved-ab-design",
+    "concepts/invalidated-vs-superseded",
+    "concepts/known-stale-baseline",
+    "concepts/live-card-derivation",
+    "concepts/masking-bug",
+    "concepts/mmvq-with-q81-activations",
+    "concepts/oracle-fit-ratio",
+    "concepts/pl2-throttling",
+    "concepts/pp512-tg128",
+    "concepts/presence-tested-env-var",
+    "concepts/q81-activation-quantization",
+    "concepts/routing-dependent-flag-effect",
+    "concepts/session-drift",
+    "concepts/shmem-ceiling",
+    "concepts/sign-flip-under-blocked-design",
+    "concepts/stale-gpu-tenant",
+    "concepts/tg-fast-path",
+    "entities/artifactsperf-recoveryc4-pp-validationmd",
+    "entities/artifactsperf-recoveryd3-b70-baselinemd",
+    "entities/comfyui",
+    "entities/dmmv",
+    "entities/docsbackendsycl-env-varsmd",
+    "entities/ggml-sycl",
+    "entities/ggmlsrcggml-syclggml-syclcpp",
+    "entities/ggmlsyclmulmatroutetrace",
+    "entities/ggmlsycloptimeoutms",
+    "entities/gpt-oss-20b-mxfp4",
+    "entities/intel-arc-b580",
+    "entities/intel-arc-pro-b50",
+    "entities/intel-arc-pro-b70",
+    "entities/llama-bench",
+    "entities/llama-cli",
+    "entities/llama-completion",
+    "entities/llamacpp-sycl-fork",
+    "entities/mistral-7b-q40",
+    "entities/mmvq",
+    "entities/oneapideviceselector",
+    "entities/openvino",
+    "entities/scriptsbench-guardsh",
+    "entities/teststest-bench-guardsh",
+    "entities/teststest-dmmv-q4-0-coalescedcpp",
+    "entities/ttm-shmem"
+  ],
+  "sources/SRC-2026-08-29-002": [
+    "concepts/allocationcontrolclass",
+    "concepts/buffer-scoped-weight-provenance",
+    "concepts/epoch-refcounted-transient-zones",
+    "concepts/layout-follows-residency",
+    "concepts/lazy-re-resolution",
+    "concepts/leases-inusecount",
+    "concepts/no-weight-streaming",
+    "concepts/no-zero-copy-host-reads",
+    "concepts/non-owning-storage-handle-route",
+    "concepts/owner-first-allocation",
+    "concepts/placement-decided-once",
+    "concepts/placement-decides-the-executor",
+    "concepts/placement-lifetime-transient-view-triad",
+    "concepts/placement-plan",
+    "concepts/refusible-release",
+    "concepts/single-allocation-entry-point",
+    "concepts/single-allocator-invariant",
+    "concepts/stableidentityhash",
+    "concepts/staging-scope-boundary",
+    "concepts/tensor-identity-ggmlsyclcacheid",
+    "concepts/tiered-memory-hierarchy",
+    "concepts/typed-allocation-errors",
+    "concepts/vram-budget",
+    "concepts/vram-zone",
+    "concepts/weight-handle-leases",
+    "entities/0b7b49e07",
+    "entities/b50-b70",
+    "entities/computeplacementplan-placementplan",
+    "entities/cpuexpertpool",
+    "entities/ensurecachedalloc",
+    "entities/gallocr",
+    "entities/ggml",
+    "entities/ggmlsyclcacheid",
+    "entities/ggmlsyclpublishbackendaosexperthandles",
+    "entities/ggmlsyclresolvemoeexpertroute-ggmlsycltrymoestoragehandleroute",
+    "entities/intel-arc-pro-b50",
+    "entities/intel-arc-pro-b70",
+    "entities/mem-handle",
+    "entities/mxfp4",
+    "entities/onednn",
+    "entities/q81",
+    "entities/sycl",
+    "entities/sycl-canonical-memory-architecture",
+    "entities/unified-cache",
+    "entities/unifiedallocate",
+    "entities/unifiedallocateowner"
+  ],
+  "sources/SRC-2026-08-29-003": [
+    "concepts/capability-query-vs-capability-check",
+    "concepts/cross-device-in-order-dependency-fixes",
+    "concepts/devicelost-on-multi-gpu-context",
+    "concepts/diverted-library-path-symlink-rollback",
+    "concepts/host-bounce",
+    "concepts/misleading-error-attribution",
+    "concepts/multi-gpu-moe-ggmlsyclmoemultigpu",
+    "concepts/pcipcie-topology-restriction",
+    "concepts/peer-to-peer-p2p-dma",
+    "concepts/per-allocation-hardware-caps",
+    "concepts/usm-compression-upstream-pr-930",
+    "concepts/usm-unified-shared-memory",
+    "entities/battlemage-g21",
+    "entities/battlemage-g31",
+    "entities/canaccesspeer",
+    "entities/claudemd",
+    "entities/extoneapienablepeeraccess",
+    "entities/gpt-oss",
+    "entities/igc",
+    "entities/intel-arc-a580",
+    "entities/intel-arc-pro-b50",
+    "entities/intel-arc-pro-b70",
+    "entities/intel-compute-runtime",
+    "entities/level-zero",
+    "entities/libzeintelgpuso",
+    "entities/libzeloaderso",
+    "entities/llamacpp",
+    "entities/ocloc",
+    "entities/oneapideviceselector",
+    "entities/sycl-ls"
+  ],
+  "sources/SRC-2026-08-29-004": [
+    "concepts/ab-harness-tracecompare",
+    "concepts/accepted-is-not-the-same-as-correct",
+    "concepts/fail-closed-admission-contract",
+    "concepts/fail-closed-contract",
+    "concepts/kernel-confirmation-from-output-not-setup",
+    "concepts/measurement-masking-co-resident-tenants",
+    "concepts/mmvqmmqdmmvesimd-kernel-families",
+    "concepts/multi-context-device-contention",
+    "concepts/multi-gpu-device-collapse",
+    "concepts/one-layout-per-weight",
+    "concepts/opt-out-default-on-variable-polarity",
+    "concepts/opt-out-performance-defaults",
+    "concepts/scratch-ring-admission",
+    "concepts/sycl-graph-replay",
+    "concepts/tg-fast-path",
+    "concepts/tg-vs-pp",
+    "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled",
+    "concepts/winner-holds-forever-devicebusy",
+    "concepts/woq-gemm-weight-only-quantized",
+    "concepts/xmxtiled-grouped-dpas-route",
+    "entities/agentsmd",
+    "entities/codescout",
+    "entities/dnnlgemmwrapper",
+    "entities/docsbackendsycl-perf-baselinesmd",
+    "entities/ggmlsyclbatchexperts",
+    "entities/ggmlsycldisablegraph",
+    "entities/ggmlsyclesimddequant",
+    "entities/ggmlsyclfaonednnmaterialize",
+    "entities/ggmlsyclforcedmmv",
+    "entities/ggmlsycllayoutoverride",
+    "entities/ggmlsyclmoedownxmxtiled",
+    "entities/ggmlsyclmoepponednnf16batched",
+    "entities/ggmlsyclmoeppwoq",
+    "entities/ggmlsyclmoeppwoq3d",
+    "entities/ggmlsyclmxfp4groupeddpasrowlisttiles",
+    "entities/ggmlsyclonednnmul",
+    "entities/ggmlsyclonednnpp",
+    "entities/ggmlsyclpppipeline",
+    "entities/ggmlsyclq8denseaos",
+    "entities/ggmlsyclq8onednncoalesced",
+    "entities/ggmlsycltgfast",
+    "entities/ggmlsyclunifiedforcelegacy",
+    "entities/ggmlsyclunifiedsoa",
+    "entities/ggmlsyclusexmxgemm",
+    "entities/ggmlsyclxmxmoesorted",
+    "entities/ggmlsyclxmxthreshold",
+    "entities/ggmlsyclxmxtiledpp",
+    "entities/intel-arc-b580",
+    "entities/intel-arc-pro-b50",
+    "entities/intel-arc-pro-b70",
+    "entities/mistral",
+    "entities/oneapi",
+    "entities/oneapi-20253",
+    "entities/test-thread-safety"
+  ],
+  "sources/multi-source-ingest-fragmentation-dedup-pass": [],
+  "sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor": [],
+  "sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-": []
+}

@@ -1,0 +1,194 @@
+# Wiki Index
+
+> Auto-generated from meta/registry.json. Do not edit manually.
+
+## Concepts
+
+- [[concepts/ab-harness-tracecompare]] — A/B harness (_TRACE/_COMPARE) *(created: 2026-08-29)*
+- [[concepts/accepted-is-not-the-same-as-correct]] — Accepted is not the same as correct *(created: 2026-08-29)*
+- [[concepts/accuracy-ratio]] — Accuracy ratio *(created: 2026-08-29)*
+- [[concepts/across-process-spread]] — Across-process spread *(created: 2026-08-29)*
+- [[concepts/allocationcontrolclass]] — allocation_control_class *(created: 2026-08-29)*
+- [[concepts/baseline-measurement-discipline]] — Baseline measurement discipline *(created: 2026-08-29)*
+- [[concepts/bench-guard-preflight-refusal]] — Bench-guard preflight refusal *(created: 2026-08-29)*
+- [[concepts/bench-guard-validsuspect-verdict]] — bench-guard VALID/SUSPECT verdict *(created: 2026-08-29)*
+- [[concepts/buffer-scoped-weight-provenance]] — Buffer-scoped weight provenance *(created: 2026-08-29)*
+- [[concepts/capability-query-vs-capability-check]] — Capability query vs capability check *(created: 2026-08-29)*
+- [[concepts/correctness-gates-before-throughput]] — Correctness gates before throughput *(created: 2026-08-29)*
+- [[concepts/cross-device-in-order-dependency-fixes]] — Cross-device in-order dependency fixes *(created: 2026-08-29)*
+- [[concepts/devicelost-on-multi-gpu-context]] — DEVICE_LOST on multi-GPU context *(created: 2026-08-29)*
+- [[concepts/diverted-library-path-symlink-rollback]] — Diverted library path / symlink rollback *(created: 2026-08-29)*
+- [[concepts/dmmv-coalesced-fallback]] — DMMV coalesced fallback *(created: 2026-08-29)*
+- [[concepts/epoch-refcounted-transient-zones]] — Epoch-refcounted transient zones *(created: 2026-08-29)*
+- [[concepts/fail-closed-admission-contract]] — Fail-closed admission contract *(created: 2026-08-29)*
+- [[concepts/fail-closed-contract]] — Fail-closed contract *(created: 2026-08-29)*
+- [[concepts/flag-presence-test]] — Flag presence-test *(created: 2026-08-29)*
+- [[concepts/free-vram-confound]] — Free-VRAM confound *(created: 2026-08-29)*
+- [[concepts/host-bounce]] — Host bounce *(created: 2026-08-29)*
+- [[concepts/interleaved-ab-design]] — Interleaved A/B design *(created: 2026-08-29)*
+- [[concepts/invalidated-vs-superseded]] — Invalidated vs superseded *(created: 2026-08-29)*
+- [[concepts/kernel-confirmation-from-output-not-setup]] — Kernel confirmation from output, not setup *(created: 2026-08-29)*
+- [[concepts/known-stale-baseline]] — Known-stale baseline *(created: 2026-08-29)*
+- [[concepts/layout-follows-residency]] — Layout follows residency *(created: 2026-08-29)*
+- [[concepts/lazy-re-resolution]] — Lazy re-resolution *(created: 2026-08-29)*
+- [[concepts/leases-inusecount]] — Leases (in_use_count) *(created: 2026-08-29)*
+- [[concepts/live-card-derivation]] — Live card derivation *(created: 2026-08-29)*
+- [[concepts/masking-bug]] — Masking bug *(created: 2026-08-29)*
+- [[concepts/measurement-masking-co-resident-tenants]] — Measurement masking (co-resident tenants) *(created: 2026-08-29)*
+- [[concepts/misleading-error-attribution]] — Misleading error attribution *(created: 2026-08-29)*
+- [[concepts/mmvq-with-q81-activations]] — MMVQ with q8_1 activations *(created: 2026-08-29)*
+- [[concepts/mmvqmmqdmmvesimd-kernel-families]] — MMVQ/MMQ/DMMV/ESIMD kernel families *(created: 2026-08-29)*
+- [[concepts/multi-context-device-contention]] — Multi-context device contention *(created: 2026-08-29)*
+- [[concepts/multi-gpu-device-collapse]] — Multi-GPU device collapse *(created: 2026-08-29)*
+- [[concepts/multi-gpu-moe-ggmlsyclmoemultigpu]] — Multi-GPU MoE (GGML_SYCL_MOE_MULTI_GPU) *(created: 2026-08-29)*
+- [[concepts/no-weight-streaming]] — No weight streaming *(created: 2026-08-29)*
+- [[concepts/no-zero-copy-host-reads]] — No zero-copy host reads *(created: 2026-08-29)*
+- [[concepts/non-owning-storage-handle-route]] — Non-owning storage-handle route *(created: 2026-08-29)*
+- [[concepts/one-layout-per-weight]] — One layout per weight *(created: 2026-08-29)*
+- [[concepts/opt-out-default-on-variable-polarity]] — Opt-out (default ON) variable polarity *(created: 2026-08-29)*
+- [[concepts/opt-out-performance-defaults]] — Opt-out performance defaults *(created: 2026-08-29)*
+- [[concepts/oracle-fit-ratio]] — Oracle fit ratio *(created: 2026-08-29)*
+- [[concepts/owner-first-allocation]] — Owner-first allocation *(created: 2026-08-29)*
+- [[concepts/pcipcie-topology-restriction]] — PCI/PCIe topology restriction *(created: 2026-08-29)*
+- [[concepts/peer-to-peer-p2p-dma]] — Peer-to-peer (P2P) DMA *(created: 2026-08-29)*
+- [[concepts/per-allocation-hardware-caps]] — Per-allocation hardware caps *(created: 2026-08-29)*
+- [[concepts/pl2-throttling]] — PL2 throttling *(created: 2026-08-29)*
+- [[concepts/placement-decided-once]] — Placement decided once *(created: 2026-08-29)*
+- [[concepts/placement-decides-the-executor]] — Placement decides the executor *(created: 2026-08-29)*
+- [[concepts/placement-lifetime-transient-view-triad]] — Placement / lifetime / transient-view triad *(created: 2026-08-29)*
+- [[concepts/placement-plan]] — Placement plan *(created: 2026-08-29)*
+- [[concepts/pp512-tg128]] — PP512 / TG128 *(created: 2026-08-29)*
+- [[concepts/presence-tested-env-var]] — Presence-tested env var *(created: 2026-08-29)*
+- [[concepts/q81-activation-quantization]] — q8_1 activation quantization *(created: 2026-08-29)*
+- [[concepts/refusible-release]] — Refusible release *(created: 2026-08-29)*
+- [[concepts/routing-dependent-flag-effect]] — Routing-dependent flag effect *(created: 2026-08-29)*
+- [[concepts/scratch-ring-admission]] — Scratch ring admission *(created: 2026-08-29)*
+- [[concepts/session-drift]] — Session drift *(created: 2026-08-29)*
+- [[concepts/shmem-ceiling]] — Shmem ceiling *(created: 2026-08-29)*
+- [[concepts/sign-flip-under-blocked-design]] — Sign flip under blocked design *(created: 2026-08-29)*
+- [[concepts/single-allocation-entry-point]] — Single allocation entry point *(created: 2026-08-29)*
+- [[concepts/single-allocator-invariant]] — Single-allocator invariant *(created: 2026-08-29)*
+- [[concepts/stableidentityhash]] — stable_identity_hash *(created: 2026-08-29)*
+- [[concepts/staging-scope-boundary]] — Staging scope boundary *(created: 2026-08-29)*
+- [[concepts/stale-gpu-tenant]] — Stale GPU tenant *(created: 2026-08-29)*
+- [[concepts/sycl-graph-replay]] — SYCL graph replay *(created: 2026-08-29)*
+- [[concepts/tensor-identity-ggmlsyclcacheid]] — Tensor identity (ggml_sycl_cache_id) *(created: 2026-08-29)*
+- [[concepts/tg-fast-path]] — TG fast-path *(created: 2026-08-29)*
+- [[concepts/tg-vs-pp]] — TG vs PP *(created: 2026-08-29)*
+- [[concepts/tiered-memory-hierarchy]] — Tiered memory hierarchy *(created: 2026-08-29)*
+- [[concepts/typed-allocation-errors]] — Typed allocation errors *(created: 2026-08-29)*
+- [[concepts/usm-compression-upstream-pr-930]] — USM compression (upstream PR 930) *(created: 2026-08-29)*
+- [[concepts/usm-unified-shared-memory]] — USM (Unified Shared Memory) *(created: 2026-08-29)*
+- [[concepts/vram-budget]] — VRAM budget *(created: 2026-08-29)*
+- [[concepts/vram-zone]] — VRAM zone *(created: 2026-08-29)*
+- [[concepts/weight-handle-leases]] — WEIGHT handle leases *(created: 2026-08-29)*
+- [[concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled]] — Weight memory layouts (SOA / AOS / COALESCED / XMX_TILED) *(created: 2026-08-29)*
+- [[concepts/winner-holds-forever-devicebusy]] — Winner-holds-forever DEVICE_BUSY *(created: 2026-08-29)*
+- [[concepts/woq-gemm-weight-only-quantized]] — WOQ GEMM (weight-only-quantized) *(created: 2026-08-29)*
+- [[concepts/xmxtiled-grouped-dpas-route]] — XMX_TILED grouped-DPAS route *(created: 2026-08-29)*
+
+## Entitys
+
+- [[entities/0b7b49e07]] — 0b7b49e07 *(created: 2026-08-29)*
+- [[entities/agentsmd]] — AGENTS.md *(created: 2026-08-29)*
+- [[entities/artifactsperf-recoveryc4-pp-validationmd]] — artifacts/perf-recovery/C4-pp-validation.md *(created: 2026-08-29)*
+- [[entities/artifactsperf-recoveryd3-b70-baselinemd]] — artifacts/perf-recovery/D3-b70-baseline.md *(created: 2026-08-29)*
+- [[entities/b50-b70]] — B50 / B70 *(created: 2026-08-29)*
+- [[entities/battlemage-g21]] — Battlemage G21 *(created: 2026-08-29)*
+- [[entities/battlemage-g31]] — Battlemage G31 *(created: 2026-08-29)*
+- [[entities/canaccesspeer]] — can_access_peer *(created: 2026-08-29)*
+- [[entities/claudemd]] — CLAUDE.md *(created: 2026-08-29)*
+- [[entities/codescout]] — codescout *(created: 2026-08-29)*
+- [[entities/comfyui]] — ComfyUI *(created: 2026-08-29)*
+- [[entities/computeplacementplan-placementplan]] — compute_placement_plan / placement_plan *(created: 2026-08-29)*
+- [[entities/cpuexpertpool]] — CpuExpertPool *(created: 2026-08-29)*
+- [[entities/dmmv]] — DMMV *(created: 2026-08-29)*
+- [[entities/dnnlgemmwrapper]] — DnnlGemmWrapper *(created: 2026-08-29)*
+- [[entities/docsbackendsycl-env-varsmd]] — docs/backend/sycl-env-vars.md *(created: 2026-08-29)*
+- [[entities/docsbackendsycl-perf-baselinesmd]] — docs/backend/sycl-perf-baselines.md *(created: 2026-08-29)*
+- [[entities/ensurecachedalloc]] — ensure_cached_alloc *(created: 2026-08-29)*
+- [[entities/extoneapienablepeeraccess]] — ext_oneapi_enable_peer_access() *(created: 2026-08-29)*
+- [[entities/gallocr]] — gallocr *(created: 2026-08-29)*
+- [[entities/ggml]] — ggml *(created: 2026-08-29)*
+- [[entities/ggml-sycl]] — ggml-sycl *(created: 2026-08-29)*
+- [[entities/ggmlsrcggml-syclggml-syclcpp]] — ggml/src/ggml-sycl/ggml-sycl.cpp *(created: 2026-08-29)*
+- [[entities/ggmlsyclbatchexperts]] — GGML_SYCL_BATCH_EXPERTS *(created: 2026-08-29)*
+- [[entities/ggmlsyclcacheid]] — ggml_sycl_cache_id *(created: 2026-08-29)*
+- [[entities/ggmlsycldisablegraph]] — GGML_SYCL_DISABLE_GRAPH *(created: 2026-08-29)*
+- [[entities/ggmlsyclesimddequant]] — GGML_SYCL_ESIMD_DEQUANT *(created: 2026-08-29)*
+- [[entities/ggmlsyclfaonednnmaterialize]] — GGML_SYCL_FA_ONEDNN_MATERIALIZE *(created: 2026-08-29)*
+- [[entities/ggmlsyclforcedmmv]] — GGML_SYCL_FORCE_DMMV *(created: 2026-08-29)*
+- [[entities/ggmlsycllayoutoverride]] — GGML_SYCL_LAYOUT_OVERRIDE *(created: 2026-08-29)*
+- [[entities/ggmlsyclmoedownxmxtiled]] — GGML_SYCL_MOE_DOWN_XMX_TILED *(created: 2026-08-29)*
+- [[entities/ggmlsyclmoepponednnf16batched]] — GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED *(created: 2026-08-29)*
+- [[entities/ggmlsyclmoeppwoq]] — GGML_SYCL_MOE_PP_WOQ *(created: 2026-08-29)*
+- [[entities/ggmlsyclmoeppwoq3d]] — GGML_SYCL_MOE_PP_WOQ_3D *(created: 2026-08-29)*
+- [[entities/ggmlsyclmulmatroutetrace]] — GGML_SYCL_MUL_MAT_ROUTE_TRACE *(created: 2026-08-29)*
+- [[entities/ggmlsyclmxfp4groupeddpasrowlisttiles]] — GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES *(created: 2026-08-29)*
+- [[entities/ggmlsyclonednnmul]] — GGML_SYCL_ONEDNN_MUL *(created: 2026-08-29)*
+- [[entities/ggmlsyclonednnpp]] — GGML_SYCL_ONEDNN_PP *(created: 2026-08-29)*
+- [[entities/ggmlsycloptimeoutms]] — GGML_SYCL_OP_TIMEOUT_MS *(created: 2026-08-29)*
+- [[entities/ggmlsyclpppipeline]] — GGML_SYCL_PP_PIPELINE *(created: 2026-08-29)*
+- [[entities/ggmlsyclpublishbackendaosexperthandles]] — ggml_sycl_publish_backend_aos_expert_handles *(created: 2026-08-29)*
+- [[entities/ggmlsyclq8denseaos]] — GGML_SYCL_Q8_DENSE_AOS *(created: 2026-08-29)*
+- [[entities/ggmlsyclq8onednncoalesced]] — GGML_SYCL_Q8_ONEDNN_COALESCED *(created: 2026-08-29)*
+- [[entities/ggmlsyclresolvemoeexpertroute-ggmlsycltrymoestoragehandleroute]] — ggml_sycl_resolve_moe_expert_route / ggml_sycl_try_moe_storage_handle_route *(created: 2026-08-29)*
+- [[entities/ggmlsycltgfast]] — GGML_SYCL_TG_FAST *(created: 2026-08-29)*
+- [[entities/ggmlsyclunifiedforcelegacy]] — GGML_SYCL_UNIFIED_FORCE_LEGACY *(created: 2026-08-29)*
+- [[entities/ggmlsyclunifiedsoa]] — GGML_SYCL_UNIFIED_SOA *(created: 2026-08-29)*
+- [[entities/ggmlsyclusexmxgemm]] — GGML_SYCL_USE_XMX_GEMM *(created: 2026-08-29)*
+- [[entities/ggmlsyclxmxmoesorted]] — GGML_SYCL_XMX_MOE_SORTED *(created: 2026-08-29)*
+- [[entities/ggmlsyclxmxthreshold]] — GGML_SYCL_XMX_THRESHOLD *(created: 2026-08-29)*
+- [[entities/ggmlsyclxmxtiledpp]] — GGML_SYCL_XMX_TILED_PP *(created: 2026-08-29)*
+- [[entities/gpt-oss]] — GPT-OSS *(created: 2026-08-29)*
+- [[entities/gpt-oss-20b-mxfp4]] — GPT-OSS 20B (MXFP4) *(created: 2026-08-29)*
+- [[entities/igc]] — IGC *(created: 2026-08-29)*
+- [[entities/intel-arc-a580]] — Intel Arc A580 *(created: 2026-08-29)*
+- [[entities/intel-arc-b580]] — Intel Arc B580 *(created: 2026-08-29)*
+- [[entities/intel-arc-pro-b50]] — Intel Arc Pro B50 *(created: 2026-08-29)*
+- [[entities/intel-arc-pro-b70]] — Intel Arc Pro B70 *(created: 2026-08-29)*
+- [[entities/intel-compute-runtime]] — Intel compute-runtime *(created: 2026-08-29)*
+- [[entities/level-zero]] — Level Zero *(created: 2026-08-29)*
+- [[entities/libzeintelgpuso]] — libze_intel_gpu.so *(created: 2026-08-29)*
+- [[entities/libzeloaderso]] — libze_loader.so *(created: 2026-08-29)*
+- [[entities/llama-bench]] — llama-bench *(created: 2026-08-29)*
+- [[entities/llama-cli]] — llama-cli *(created: 2026-08-29)*
+- [[entities/llama-completion]] — llama-completion *(created: 2026-08-29)*
+- [[entities/llamacpp]] — llama.cpp *(created: 2026-08-29)*
+- [[entities/llamacpp-sycl-fork]] — llama.cpp (SYCL fork) *(created: 2026-08-29)*
+- [[entities/mem-handle]] — mem_handle *(created: 2026-08-29)*
+- [[entities/mistral]] — Mistral *(created: 2026-08-29)*
+- [[entities/mistral-7b-q40]] — Mistral 7B Q4_0 *(created: 2026-08-29)*
+- [[entities/mmvq]] — MMVQ *(created: 2026-08-29)*
+- [[entities/mxfp4]] — MXFP4 *(created: 2026-08-29)*
+- [[entities/ocloc]] — ocloc *(created: 2026-08-29)*
+- [[entities/oneapi]] — oneAPI *(created: 2026-08-29)*
+- [[entities/oneapi-20253]] — oneAPI 2025.3 *(created: 2026-08-29)*
+- [[entities/oneapideviceselector]] — ONEAPI_DEVICE_SELECTOR *(created: 2026-08-29)*
+- [[entities/onednn]] — oneDNN *(created: 2026-08-29)*
+- [[entities/openvino]] — OpenVINO *(created: 2026-08-29)*
+- [[entities/q81]] — Q8_1 *(created: 2026-08-29)*
+- [[entities/scriptsbench-guardsh]] — scripts/bench-guard.sh *(created: 2026-08-29)*
+- [[entities/sycl]] — SYCL *(created: 2026-08-29)*
+- [[entities/sycl-canonical-memory-architecture]] — SYCL canonical memory architecture (design doc) *(created: 2026-08-29)*
+- [[entities/sycl-ls]] — sycl-ls *(created: 2026-08-29)*
+- [[entities/test-thread-safety]] — test-thread-safety *(created: 2026-08-29)*
+- [[entities/teststest-bench-guardsh]] — tests/test-bench-guard.sh *(created: 2026-08-29)*
+- [[entities/teststest-dmmv-q4-0-coalescedcpp]] — tests/test-dmmv-q4-0-coalesced.cpp *(created: 2026-08-29)*
+- [[entities/ttm-shmem]] — TTM-shmem *(created: 2026-08-29)*
+- [[entities/unified-cache]] — unified_cache *(created: 2026-08-29)*
+- [[entities/unifiedallocate]] — unified_allocate *(created: 2026-08-29)*
+- [[entities/unifiedallocateowner]] — unified_allocate_owner *(created: 2026-08-29)*
+
+## Sources
+
+- [[sources/multi-source-ingest-fragmentation-dedup-pass]] — Multi-source background ingest fragments entities; run a dedup pass after *(created: 2026-08-29)*
+- [[sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor]] — Observation: Wiki rebuild/lint results post async — verify file state before reacting to error toasts *(created: 2026-08-29)*
+- [[sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-]] — Observation: Dockerized Obsidian (LinuxServer/Selkies) serves the LLM Wiki on LAN port 3001 *(created: 2026-08-30)*
+- [[sources/SRC-2026-08-29-001]] — sycl-perf-baselines.md *(created: unknown)*
+- [[sources/SRC-2026-08-29-002]] — sycl-memory-design.md *(created: unknown)*
+- [[sources/SRC-2026-08-29-003]] — compute-runtime.md *(created: unknown)*
+- [[sources/SRC-2026-08-29-004]] — sycl-env-vars.md *(created: unknown)*
+
+---
+*Last updated: 2026-08-30T01:16:29.481Z* | *Total pages: 179*

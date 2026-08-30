@@ -1,0 +1,11 @@
+{
+  "id": "SRC-2026-08-29-004",
+  "captured": "2026-08-29",
+  "packet_version": "1.0",
+  "title": "sycl-env-vars.md",
+  "file_path": "/Apps/llama.cpp/docs/backend/sycl-env-vars.md",
+  "format": "markdown",
+  "extractor": "passthrough",
+  "extraction_status": "success",
+  "content_type": "text/markdown"
+}

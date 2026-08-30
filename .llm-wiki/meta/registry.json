@@ -1,0 +1,1292 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-08-30T01:16:29.481Z",
+  "pages": {
+    "concepts/ab-harness-tracecompare": {
+      "type": "concept",
+      "title": "A/B harness (_TRACE/_COMPARE)",
+      "description": "Built-in env-var pairs (e.g., _TRACE=1, _COMPARE=1 + _COMPARE_LIMIT) that make a decision revisitable from one build via two env-var runs, without patching or a second libggml-sycl.so.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/accepted-is-not-the-same-as-correct": {
+      "type": "concept",
+      "title": "Accepted is not the same as correct",
+      "description": "A primitive being accepted by oneDNN (no refusal in the log) does not guarantee correct numerics — the 3-D WOQ scale mask is accepted yet reproducibly wrong on B70; the same trap as ext_oneapi_enable_peer_access.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/accuracy-ratio": {
+      "type": "concept",
+      "title": "Accuracy ratio",
+      "description": "Scoring kernel accuracy as the fit ratio between candidate oracles (dfloat must fit ≥100× better than q8_1-MMVQ) rather than as an absolute tolerance against one oracle.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/across-process-spread": {
+      "type": "concept",
+      "title": "Across-process spread",
+      "description": "Basing figures on mean ± sd across ≥5 separate processes with min–max range, never llama-bench's tighter within-process ±.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/allocationcontrolclass": {
+      "type": "concept",
+      "title": "allocation_control_class",
+      "description": "The stamp on each owner (CACHE_BACKING, CACHE_SUBALLOCATION, EXTERNAL_EXACT) that is the enforceable part of the contract, specified in the canonical doc §3.1.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/baseline-measurement-discipline": {
+      "type": "concept",
+      "title": "Baseline measurement discipline",
+      "description": "Mean ± sd across ≥5 separate processes, free VRAM recorded each run, GT-reset checks before/after, and selector-based device keying.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/bench-guard-preflight-refusal": {
+      "type": "concept",
+      "title": "Bench-guard preflight refusal",
+      "description": "The three ordered host-health preflight checks (stale GPU tenant, Shmem ceiling, PL2 throttle/active card) that can refuse a benchmark run with exit 3.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/bench-guard-validsuspect-verdict": {
+      "type": "concept",
+      "title": "bench-guard VALID/SUSPECT verdict",
+      "description": "First-line stamp on every archived benchmark log; a number whose log does not start with '# bench-guard: VALID' is not a citable baseline.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/buffer-scoped-weight-provenance": {
+      "type": "concept",
+      "title": "Buffer-scoped weight provenance",
+      "description": "A second legitimate owner-minting occasion at buffer allocation, seeded from managed_meta.id and namespaced by the top bit (1ull << 63), so buffer and model Registry id spaces are disjoint by enforcement.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/capability-query-vs-capability-check": {
+      "type": "concept",
+      "title": "Capability query vs capability check",
+      "description": "can_access_peer is the honest device-level capability query, whereas enable_peer_access is a no-op on no-P2P hardware and not a valid capability check.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/correctness-gates-before-throughput": {
+      "type": "concept",
+      "title": "Correctness gates before throughput",
+      "description": "Mistral/GPT-OSS completion gates that must pass before any llama-bench number is trusted, on both arms of any A/B.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/cross-device-in-order-dependency-fixes": {
+      "type": "concept",
+      "title": "Cross-device in-order dependency fixes",
+      "description": "Local compute-runtime fixes for ordering dependencies across devices, carried in the patched 26.22 build.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/devicelost-on-multi-gpu-context": {
+      "type": "concept",
+      "title": "DEVICE_LOST on multi-GPU context",
+      "description": "Behavior where the single-context multi-GPU Level Zero configuration on compute-runtime 26.x triggers DEVICE_LOST, motivating per-device isolated contexts in the test.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/diverted-library-path-symlink-rollback": {
+      "type": "concept",
+      "title": "Diverted library path / symlink rollback",
+      "description": "Installing the patched driver via a diverted libze_intel_gpu.so.1 symlink with stock/prior versions preserved, enabling rollback without removing the diversion.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/dmmv-coalesced-fallback": {
+      "type": "concept",
+      "title": "DMMV coalesced fallback",
+      "description": "Coalesced dot-product kernel that is a fallback/debug path, not the production batch=1 TG kernel for reorder-eligible types.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/epoch-refcounted-transient-zones": {
+      "type": "concept",
+      "title": "Epoch-refcounted transient zones",
+      "description": "A ring of equal-sized regions each carrying a live-handle counter (the epoch) that rewinds on zero, giving reset-only scratch/staging zones a real per-allocation release path without replacing the bump allocator or the reset.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/fail-closed-admission-contract": {
+      "type": "concept",
+      "title": "Fail-closed admission contract",
+      "description": "Once an XMX_TILED-claimed op reaches the batched MoE PP executor, every internal decline throws ggml_sycl_fallback_error rather than returning false, because the outer dispatch has already skipped every other route that could decode the claimed layout.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/fail-closed-contract": {
+      "type": "concept",
+      "title": "Fail-closed contract",
+      "description": "Once an op is claimed to a layout its fallback cannot decode, internal executor decline points must throw ggml_sycl_fallback_error instead of returning false.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/flag-presence-test": {
+      "type": "concept",
+      "title": "Flag presence-test",
+      "description": "Reading an env var as getenv != nullptr, so =0 enables the behavior and only unset disables it (GGML_SYCL_UNIFIED_FORCE_LEGACY), with static latching per process.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/free-vram-confound": {
+      "type": "concept",
+      "title": "Free-VRAM confound",
+      "description": "A B70 run reporting ~13.8 GB instead of ~32.6 GB is confounded (e.g., by ComfyUI) and discarded; holders verified via a drm-pdev fdinfo sweep.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/host-bounce": {
+      "type": "concept",
+      "title": "Host bounce",
+      "description": "Transferring data device→host→device as a fallback when direct P2P is unavailable; validated via ONEAPI_DEVICE_SELECTOR=level_zero:0,1.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/interleaved-ab-design": {
+      "type": "concept",
+      "title": "Interleaved A/B design",
+      "description": "Alternating treatment and control arms so session drift loads both equally; blocked designs can invert the sign of a measured effect (−3.6% vs +2.3%).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/invalidated-vs-superseded": {
+      "type": "concept",
+      "title": "Invalidated vs superseded",
+      "description": "Baseline rows measured under a hidden tenant or wrong default arm are invalidated (not gateable) rather than superseded by a newer number.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/kernel-confirmation-from-output-not-setup": {
+      "type": "concept",
+      "title": "Kernel confirmation from output, not setup",
+      "description": "Because the fast-path can bypass setup preconditions, the actually-running kernel must be verified from GGML_SYCL_MUL_MAT_ROUTE_TRACE=1 or an oracle-fit ratio — a passing precondition is not evidence about which kernel ran.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/known-stale-baseline": {
+      "type": "concept",
+      "title": "Known-stale baseline",
+      "description": "A correctly measured number that must no longer gate anything because the measurement conditions (hidden tenant) invalidated it.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/layout-follows-residency": {
+      "type": "concept",
+      "title": "Layout follows residency",
+      "description": "Wherever a weight lives, it is materialized in the optimal layout for the processor that executes on it (per device), and dispatch routes must consume the materialized layout, never the reverse.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/lazy-re-resolution": {
+      "type": "concept",
+      "title": "Lazy re-resolution",
+      "description": "A global generation counter bumped whenever a pointer could have moved makes resolve() a ~3 ns compare-and-return fast path, with resolve_slow() re-querying the cache on a miss so weights can migrate VRAM↔host transparently.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/leases-inusecount": {
+      "type": "concept",
+      "title": "Leases (in_use_count)",
+      "description": "A live WEIGHT handle increments the cache entry's in_use_count; eviction may only remove entries with in_use_count == 0, so a held lease means a missing release to fix, never a forced eviction.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/live-card-derivation": {
+      "type": "concept",
+      "title": "Live card derivation",
+      "description": "Resolving the DRM card from the PCI device symlink (0000:03:00.0 B70 / 0000:07:00.0 B50) instead of a static cardN index that moves across boots.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/masking-bug": {
+      "type": "concept",
+      "title": "Masking bug",
+      "description": "A hidden co-resident tenant that makes a defect or a slow arm invisible, e.g., the hung llama-cli tenants in llama.cpp-o3h1 or the OpenVINO embedder behind rows A–D.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/measurement-masking-co-resident-tenants": {
+      "type": "concept",
+      "title": "Measurement masking (co-resident tenants)",
+      "description": "A secretly co-resident process (codescout's embedder on B50) inflates baseline measurements, producing invalid baselines that must be filed separately (llama.cpp-9klr) and that make stale baseline rows unusable for gating.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/misleading-error-attribution": {
+      "type": "concept",
+      "title": "Misleading error attribution",
+      "description": "A P2P refusal surfacing as UR/ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (error 39), which can misdirect debugging toward a nonexistent VRAM-budget bug.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/mmvq-with-q81-activations": {
+      "type": "concept",
+      "title": "MMVQ with q8_1 activations",
+      "description": "Production quantized kernel that quantizes activations to 8-bit per 32-element blocks (scale amax/127, per-block fp16 sum), matching the upstream CUDA convention.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/mmvqmmqdmmvesimd-kernel-families": {
+      "type": "concept",
+      "title": "MMVQ/MMQ/DMMV/ESIMD kernel families",
+      "description": "SYCL quantized GEMM kernels dispatched by batch size and force flags; MMVQ is the production batch=1 TG kernel, coalesced DMMV a fallback/debug path.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/multi-context-device-contention": {
+      "type": "concept",
+      "title": "Multi-context device contention",
+      "description": "Winner-holds-forever graph-invocation behavior plus exactly-once DEVICE_BUSY refusal for other contexts; open question under llama.cpp-u7vj (P2), with same-device concurrent inference unsupported per contract §5.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/multi-gpu-device-collapse": {
+      "type": "concept",
+      "title": "Multi-GPU device collapse",
+      "description": "On current Level Zero multi-GPU runtimes the scheduler-visible device set collapses to one device, so all contexts in a process share device 0's registry slot regardless of how many physical GPUs are installed.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/multi-gpu-moe-ggmlsyclmoemultigpu": {
+      "type": "concept",
+      "title": "Multi-GPU MoE (GGML_SYCL_MOE_MULTI_GPU)",
+      "description": "Opt-in multi-device path that moves expert data between cards; host-bounces here because the cards cannot DMA to each other.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/no-weight-streaming": {
+      "type": "concept",
+      "title": "No weight streaming",
+      "description": "Copying host-resident weights into device scratch per dispatch is forbidden (a PCIe copy plus scratch pressure); the answer is CPU expert dispatch overlapped via sycl::depends_on.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/no-zero-copy-host-reads": {
+      "type": "concept",
+      "title": "No zero-copy host reads",
+      "description": "Feeding a host-pinned pointer to a GPU kernel is forbidden — measured slower (11.3 GB/s vs CPU AOS 18–30 GB/s) and a break of the tier abstraction.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/non-owning-storage-handle-route": {
+      "type": "concept",
+      "title": "Non-owning storage-handle route",
+      "description": "Per-expert slices of the buffer's managed_handle that are owning ref-counted leases but not cache entries — published transactionally and consulted by the expert resolver before any cache key is formed.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/one-layout-per-weight": {
+      "type": "concept",
+      "title": "One layout per weight",
+      "description": "The MXFP4 MoE layout chokepoint is a single per-weight planning-time decision with no PP/decode caller identity — no duplicate layouts per weight and no dispatch-time layout shifts.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/opt-out-default-on-variable-polarity": {
+      "type": "concept",
+      "title": "Opt-out (default ON) variable polarity",
+      "description": "Performance-critical GGML_SYCL_* flags default ON and are disabled by opt-out, in contrast to experimental opt-in flags that default OFF.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/opt-out-performance-defaults": {
+      "type": "concept",
+      "title": "Opt-out performance defaults",
+      "description": "The fork's performance-critical SYCL features default ON and are disabled by setting their GGML_SYCL_* variable, so disabling a 'fix' is always an opt-out, not an opt-in.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/oracle-fit-ratio": {
+      "type": "concept",
+      "title": "Oracle fit ratio",
+      "description": "Judging kernel accuracy by the ratio of fit between two oracles (dfloat vs q8_1-MMVQ) rather than by an absolute tolerance.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/owner-first-allocation": {
+      "type": "concept",
+      "title": "Owner-first allocation",
+      "description": "unified_allocate_owner allocates the intrusive alloc_owner_control before the physical allocation, so an allocation can never exist without an owner.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/pcipcie-topology-restriction": {
+      "type": "concept",
+      "title": "PCI/PCIe topology restriction",
+      "description": "A limitation imposed by which root ports/switches a device hangs off, independent of card identity — why the B580→B70 swap in the same slot changed nothing.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/peer-to-peer-p2p-dma": {
+      "type": "concept",
+      "title": "Peer-to-peer (P2P) DMA",
+      "description": "Direct device-to-device memory transfer over PCIe; absent here because the two cards do not share an upstream or whitelisted host bridge.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/per-allocation-hardware-caps": {
+      "type": "concept",
+      "title": "Per-allocation hardware caps",
+      "description": "Clean enforcement of per-allocation size limits by the patched runtime; reverting to stock without the old allocation check can reintroduce silent oversized-allocation hangs.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/pl2-throttling": {
+      "type": "concept",
+      "title": "PL2 throttling",
+      "description": "throttle/status or act_freq nonzero under tile0/gt0/freq0; alone decayed identical-binary readings 2–5× with a clean kernel log.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/placement-decided-once": {
+      "type": "concept",
+      "title": "Placement decided once",
+      "description": "Placement is chosen for fit and execution optimality in a single planning pass and is never re-litigated by the dispatcher at op time; symmetric failure modes (zero-copy reads, weight streaming) are structurally forbidden.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/placement-decides-the-executor": {
+      "type": "concept",
+      "title": "Placement decides the executor",
+      "description": "The planning pass decides where data lives; inference then executes each op where its data already is — VRAM operand on that GPU, host-pinned operand on the CPU.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/placement-lifetime-transient-view-triad": {
+      "type": "concept",
+      "title": "Placement / lifetime / transient-view triad",
+      "description": "The core invariant: the cache owns placement, the mem_handle owns lifetime, and a raw pointer is only a transient view resolved for one immediate use and never stored.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/placement-plan": {
+      "type": "concept",
+      "title": "Placement plan",
+      "description": "The model-load-time plan (compute_placement_plan → placement_plan) that is the sole authority for where weights, MoE experts, KV layers, and scratch live, assigning each a device and VRAM zone.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/pp512-tg128": {
+      "type": "concept",
+      "title": "PP512 / TG128",
+      "description": "Prompt-processing (512-token) and token-generation (128-new-token) throughput metrics in tok/s.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/presence-tested-env-var": {
+      "type": "concept",
+      "title": "Presence-tested env var",
+      "description": "GGML_SYCL_UNIFIED_FORCE_LEGACY is checked via getenv != nullptr, so =0 enables the bypass and the static latches per process.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/q81-activation-quantization": {
+      "type": "concept",
+      "title": "q8_1 activation quantization",
+      "description": "MMVQ's activation format: 8 bits per 32-element block, scale amax/127, per-block sum, both stored as fp16, matching the upstream CUDA convention.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/refusible-release": {
+      "type": "concept",
+      "title": "Refusible release",
+      "description": "Dropping the last reference calls into the device's allocation_release_coordinator, which may return RETRY_SCHEDULED; the retry is queued via a retry_next_ pointer that allocates nothing, so it works under memory pressure.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/routing-dependent-flag-effect": {
+      "type": "concept",
+      "title": "Routing-dependent flag effect",
+      "description": "A dispatch flag whose cost depends on the model's default routing — a no-op on GPT-OSS but ~⅔ PP loss on Mistral.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/scratch-ring-admission": {
+      "type": "concept",
+      "title": "Scratch ring admission",
+      "description": "The MoE oneDNN scratch ring is sized for all n_expert experts and admission is fail-closed (since f2bdfbffe), so plan-time sizing mistakes (e.g. stale WOQ arm choice) make admission refuse every dispatch.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/session-drift": {
+      "type": "concept",
+      "title": "Session drift",
+      "description": "Within-session throughput drift (a B50 block climbed 7% across five identical runs) that makes sequential blocks inseparable from flag effects.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/shmem-ceiling": {
+      "type": "concept",
+      "title": "Shmem ceiling",
+      "description": "Shmem in /proc/meminfo above 10 GB, the TTM-shmem OOM signature this repo has hit repeatedly.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/sign-flip-under-blocked-design": {
+      "type": "concept",
+      "title": "Sign flip under blocked design",
+      "description": "Same-flag measurements yielding −3.6% (sequential) vs +2.3% (interleaved), showing blocked output is not a measurement of the flag.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/single-allocation-entry-point": {
+      "type": "concept",
+      "title": "Single allocation entry point",
+      "description": "All runtime/scratch/staging/KV/compute allocation goes through unified_allocate, which routes by alloc_intent to a tier and VRAM zone; a raw sycl::malloc may occur only inside the cache implementation.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/single-allocator-invariant": {
+      "type": "concept",
+      "title": "Single-allocator invariant",
+      "description": "All backend allocation flows through one allocator (the unified cache) and is owned by one lifetime token (mem_handle); raw allocation calls, raw pointer keying, and stored raw pointers are forbidden.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/stableidentityhash": {
+      "type": "concept",
+      "title": "stable_identity_hash",
+      "description": "The stable handle identity used to key pointer tables and dispatch caches, in place of a transient device pointer.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/staging-scope-boundary": {
+      "type": "concept",
+      "title": "Staging scope boundary",
+      "description": "Staging that converts the format of device-resident data (e.g., on-device MXFP4 dequant to f16 scratch) is not a placement violation — the rule governs residency, not layout conversion — but such conversion scratch belongs to planned zones.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/stale-gpu-tenant": {
+      "type": "concept",
+      "title": "Stale GPU tenant",
+      "description": "A live llama-cli/llama-bench/llama-completion process that depresses co-taken readings and can mask a real hardware defect.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/sycl-graph-replay": {
+      "type": "concept",
+      "title": "SYCL graph replay",
+      "description": "Command-graph record/replay submission path; a replay-active graph currently never reaches a terminal state, so its invocation is held indefinitely (release_invocation no-ops), blocking other contexts with a one-shot DEVICE_BUSY.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/tensor-identity-ggmlsyclcacheid": {
+      "type": "concept",
+      "title": "Tensor identity (ggml_sycl_cache_id)",
+      "description": "The stable identity key for WEIGHT handles, distinct from the transient pointer; a tensor that never went through a minting occasion has no owner and cannot be admitted at all.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/tg-fast-path": {
+      "type": "concept",
+      "title": "TG fast-path",
+      "description": "The ggml_sycl_mul_mat() shortcut for batch=1 quantized non-AoS MUL_MAT — it dispatches MMVQ and returns before any FORCE_DMMV or LAYOUT_OVERRIDE read, so MMVQ is the production TG kernel.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/tg-vs-pp": {
+      "type": "concept",
+      "title": "TG vs PP",
+      "description": "Token generation (decode, batch=1) and prompt processing (batch>1) are the two workload axes the flags tune separately; many changes bank a PP win at a TG cost or vice versa (e.g. Q8_DENSE_AOS).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/tiered-memory-hierarchy": {
+      "type": "concept",
+      "title": "Tiered memory hierarchy",
+      "description": "Device VRAM → pinned host → mmap hierarchy that the cache must be free to migrate allocations between at any time without dangling pointers.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/typed-allocation-errors": {
+      "type": "concept",
+      "title": "Typed allocation errors",
+      "description": "allocation_result::error distinguishes INVALID_REQUEST, CONTROL_ALLOCATION_FAILED, PHYSICAL_ALLOCATION_FAILED, METADATA_PUBLICATION_FAILED, and RELEASE_RETAINED.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/usm-compression-upstream-pr-930": {
+      "type": "concept",
+      "title": "USM compression (upstream PR 930)",
+      "description": "Upstream USM compression fix included in the patched compute-runtime build.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/usm-unified-shared-memory": {
+      "type": "concept",
+      "title": "USM (Unified Shared Memory)",
+      "description": "Unified shared-memory allocation model; a direct D2D USM copy between the two cards fails in both directions despite ample free VRAM.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/vram-budget": {
+      "type": "concept",
+      "title": "VRAM budget",
+      "description": "The enforced device-memory cap min(total*pct, free_at_init) that gates allocation and eviction behavior.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/vram-zone": {
+      "type": "concept",
+      "title": "VRAM zone",
+      "description": "Budgeted fixed regions of the VRAM arena (vram_zone_id: KV, WEIGHT, ONEDNN, RUNTIME, SCRATCH) allocated via arena/zone TLSF sub-allocation.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/weight-handle-leases": {
+      "type": "concept",
+      "title": "WEIGHT handle leases",
+      "description": "Weights are handed out as WEIGHT-kind handles keyed by tensor identity that hold a lease (in_use_count) on the cache entry; lazy generation-counter resolution permits transparent VRAM↔host migration, and eviction may only remove entries with in_use_count == 0.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled": {
+      "type": "concept",
+      "title": "Weight memory layouts (SOA / AOS / COALESCED / XMX_TILED)",
+      "description": "Per-weight data layouts for quantized weights, chosen by the layout policy at planning time under the one-layout-per-weight rule; overridable per-weight via GGML_SYCL_LAYOUT_OVERRIDE.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/winner-holds-forever-devicebusy": {
+      "type": "concept",
+      "title": "Winner-holds-forever DEVICE_BUSY",
+      "description": "Multi-context failure mode where the first context to begin a tracked graph on a device holds its invocation indefinitely and every other context's claim is refused exactly once with no path to later success; under open P2 adjudication (llama.cpp-u7vj).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/woq-gemm-weight-only-quantized": {
+      "type": "concept",
+      "title": "WOQ GEMM (weight-only-quantized)",
+      "description": "Batched oneDNN matmul consuming 4-bit MXFP4 weights plus e8m0 scales directly (repacked into ~4x-smaller scratch), avoiding f16 dequant; runs woq_gemm_batch_mxfp4.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "concepts/xmxtiled-grouped-dpas-route": {
+      "type": "concept",
+      "title": "XMX_TILED grouped-DPAS route",
+      "description": "Intel XMX matrix-extend grouped-DPAS kernel route for MXFP4 MoE gate/up/down projections, selected by planner/admission gates at layout time; productized for PP and enabled for the down projection.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/0b7b49e07": {
+      "type": "entity",
+      "title": "0b7b49e07",
+      "description": "The commit at which unified_allocate_owner had 48 call sites (25 in ggml-sycl.cpp, 23 across common, fattn, vram-pool, unified-cache and private fixtures).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/agentsmd": {
+      "type": "entity",
+      "title": "AGENTS.md",
+      "description": "Former doc that was the only documentation of GGML_SYCL_LAYOUT_OVERRIDE before the 2026-07-25 migration into this catalog.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/artifactsperf-recoveryc4-pp-validationmd": {
+      "type": "entity",
+      "title": "artifacts/perf-recovery/C4-pp-validation.md",
+      "description": "Artifact holding the full C4 PP snapshot matrix and ONEDNN_VERBOSE share analysis.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/artifactsperf-recoveryd3-b70-baselinemd": {
+      "type": "entity",
+      "title": "artifacts/perf-recovery/D3-b70-baseline.md",
+      "description": "Artifact deriving the Track E B70 flip thresholds (pp512 ≥ 1351.5, tg128 ≥ 48.5).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/b50-b70": {
+      "type": "entity",
+      "title": "B50 / B70",
+      "description": "The two GPU cards discussed; their differing capabilities (tile shapes, XMX generation) make optimal weight layout a per-device answer.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/battlemage-g21": {
+      "type": "entity",
+      "title": "Battlemage G21",
+      "description": "Battlemage GPU device/die of the Arc Pro B50.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/battlemage-g31": {
+      "type": "entity",
+      "title": "Battlemage G31",
+      "description": "Battlemage GPU device/die of the Arc Pro B70.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/canaccesspeer": {
+      "type": "entity",
+      "title": "can_access_peer",
+      "description": "Device-level P2P capability query that honestly returns false for access_supported and atomics_supported in both directions.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/claudemd": {
+      "type": "entity",
+      "title": "CLAUDE.md",
+      "description": "Project notes file holding the durable rules (what is installed, rollback, no-direct-P2P restriction); this file is the full record.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/codescout": {
+      "type": "entity",
+      "title": "codescout",
+      "description": "Tool whose embedder was secretly resident on the B50 during old default-arm baseline runs, invalidating the ~894/~1415 pp512 baselines (masking-bug class).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/comfyui": {
+      "type": "entity",
+      "title": "ComfyUI",
+      "description": "Background workload that once held 18.3 GiB on the B70 and invalidated an entire round of measurements.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/computeplacementplan-placementplan": {
+      "type": "entity",
+      "title": "compute_placement_plan / placement_plan",
+      "description": "The Planner primitive and its output: the sole authority for deciding where memory lives, run once at model load for dense weights, MoE experts, per-layer KV, and oneDNN scratch.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/cpuexpertpool": {
+      "type": "entity",
+      "title": "CpuExpertPool",
+      "description": "CPU-side expert dispatch machinery for host-resident MoE experts, live in ggml_sycl_mul_mat_id.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/dmmv": {
+      "type": "entity",
+      "title": "DMMV",
+      "description": "Coalesced kernel that is a fallback/debug path, not the production TG kernel for reorder-eligible types.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/dnnlgemmwrapper": {
+      "type": "entity",
+      "title": "DnnlGemmWrapper",
+      "description": "C++ oneDNN wrapper exposing woq_gemm_batch_mxfp4 and gemm_batch_strided for batched MoE matmuls (gemm.hpp).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/docsbackendsycl-env-varsmd": {
+      "type": "entity",
+      "title": "docs/backend/sycl-env-vars.md",
+      "description": "Reference documenting the SYCL environment-variable rows, including the batched-MoE-PP flag.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/docsbackendsycl-perf-baselinesmd": {
+      "type": "entity",
+      "title": "docs/backend/sycl-perf-baselines.md",
+      "description": "Perf baselines doc whose old default-route rows are known-stale (masked by the codescout embedder) and must not be gated against.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ensurecachedalloc": {
+      "type": "entity",
+      "title": "ensure_cached_alloc",
+      "description": "The single sanctioned exception that deliberately allocates outside the arena (direct sycl::malloc_device, budget-gated); zero production callers, 34 test call sites.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/extoneapienablepeeraccess": {
+      "type": "entity",
+      "title": "ext_oneapi_enable_peer_access()",
+      "description": "oneAPI extension that wrongly returns OK on hardware with no P2P, making it an untrustworthy capability check.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/gallocr": {
+      "type": "entity",
+      "title": "gallocr",
+      "description": "Buffer allocator that frees buffers first, forcing buffer destructors to drop tensor cache entries by stored key rather than dereferencing tensors.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggml": {
+      "type": "entity",
+      "title": "ggml",
+      "description": "Tensor/ML library whose SYCL backend (ggml/src/ggml-sycl) implements the unified cache and mem_handle design.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggml-sycl": {
+      "type": "entity",
+      "title": "ggml-sycl",
+      "description": "SYCL backend (ggml/src/ggml-sycl/ggml-sycl.cpp); ggml_sycl_mul_mat() hosts the TG fast-path, MMVQ dispatch, and both FORCE_DMMV sites.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsrcggml-syclggml-syclcpp": {
+      "type": "entity",
+      "title": "ggml/src/ggml-sycl/ggml-sycl.cpp",
+      "description": "SYCL backend file containing the TG fast-path, both FORCE_DMMV sites, and the force_legacy presence check.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclbatchexperts": {
+      "type": "entity",
+      "title": "GGML_SYCL_BATCH_EXPERTS",
+      "description": "Opt-out (default ON) that disables batched expert kernel launches.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclcacheid": {
+      "type": "entity",
+      "title": "ggml_sycl_cache_id",
+      "description": "The tensor-identity key (not pointer) under which WEIGHT handles and weight provenance rows are filed via ggml_sycl_owner_name_key(owner, tensor_name).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsycldisablegraph": {
+      "type": "entity",
+      "title": "GGML_SYCL_DISABLE_GRAPH",
+      "description": "Opt-out (default OFF) for SYCL graph replay; currently load-bearing for multi-context workloads due to the never-terminal replay invocation bug.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclesimddequant": {
+      "type": "entity",
+      "title": "GGML_SYCL_ESIMD_DEQUANT",
+      "description": "Opt-in (default OFF) retest hatch for ESIMD small-block dequant; the 1.9x-slower justification is a historical Arc B580 + oneAPI 2025.3 measurement.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclfaonednnmaterialize": {
+      "type": "entity",
+      "title": "GGML_SYCL_FA_ONEDNN_MATERIALIZE",
+      "description": "Opt-in (default OFF since the 2026-08-10 olpg polarity ruling) for MATERIALIZE_REQUIRED on GQA/MQA flash-attention KV-stride-mismatch shapes; =1 retained as the A/B axis for the oneDNN SDPA plan.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclforcedmmv": {
+      "type": "entity",
+      "title": "GGML_SYCL_FORCE_DMMV",
+      "description": "Forces DMMV kernels, but has no effect at batch=1 on its own because the TG fast-path returns before the flag is read; pair with GGML_SYCL_TG_FAST=0.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsycllayoutoverride": {
+      "type": "entity",
+      "title": "GGML_SYCL_LAYOUT_OVERRIDE",
+      "description": "Forces a weight layout (aos/soa/coalesced/xmx_tiled) for A/B isolation; still binds on materialization at batch=1 even though MMVQ reads the buffer.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmoedownxmxtiled": {
+      "type": "entity",
+      "title": "GGML_SYCL_MOE_DOWN_XMX_TILED",
+      "description": "Opt-out (default ON since sk67) for the XMX_TILED grouped-DPAS route on the MoE down projection; previously a no-op flag.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmoepponednnf16batched": {
+      "type": "entity",
+      "title": "GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED",
+      "description": "Route policy (default ON on both cards since iikr) selecting the batched oneDNN MoE PP executor; gate/up keep XMX_TILED, down plans SOA; XMX_TILED-claimed declines throw fail-closed.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmoeppwoq": {
+      "type": "entity",
+      "title": "GGML_SYCL_MOE_PP_WOQ",
+      "description": "Opt-out (default ON) for the WOQ arm of the batched PP MoE executor; read at both the dispatch executor and plan-time scratch sizing, so must be set before model load; the f16 fallback arm is SOA-only.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmoeppwoq3d": {
+      "type": "entity",
+      "title": "GGML_SYCL_MOE_PP_WOQ_3D",
+      "description": "Opt-in (default OFF) for the known-broken 3-D scale mask in the WOQ batched GEMM; unset now means the correct 2-D loop directly; do not re-enable 3-D in production.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmulmatroutetrace": {
+      "type": "entity",
+      "title": "GGML_SYCL_MUL_MAT_ROUTE_TRACE",
+      "description": "Route trace emitting the kernel and layout at dispatch on both routes; LIMIT defaults to 256; survives the GGML_LOG_INFO verbosity gate.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclmxfp4groupeddpasrowlisttiles": {
+      "type": "entity",
+      "title": "GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES",
+      "description": "Caps the grouped-DPAS MXFP4 MoE row-list chunk size (caps.N*N rows per submission); default 256, raised from 16 on 2026-08-17 for +7.5% B50 / ~+30% B70 pp512.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclonednnmul": {
+      "type": "entity",
+      "title": "GGML_SYCL_ONEDNN_MUL",
+      "description": "Opt-in (default OFF) enabling oneDNN for element-wise MUL; the SYCL kernel is 2.3x faster by default.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclonednnpp": {
+      "type": "entity",
+      "title": "GGML_SYCL_ONEDNN_PP",
+      "description": "Opt-out (default ON) that disables oneDNN for prompt processing.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsycloptimeoutms": {
+      "type": "entity",
+      "title": "GGML_SYCL_OP_TIMEOUT_MS",
+      "description": "Watchdog timeout variable; B70 runs require 180000 because cold prestage exceeds the 30 s default.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclpppipeline": {
+      "type": "entity",
+      "title": "GGML_SYCL_PP_PIPELINE",
+      "description": "Opt-in (default OFF) double-buffered FP16 weight dequant prefetch; improves B50 GPT-OSS PP to ~1030–1043 tok/s but chat correctness currently fails with repeated isNaN.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclpublishbackendaosexperthandles": {
+      "type": "entity",
+      "title": "ggml_sycl_publish_backend_aos_expert_handles",
+      "description": "Publishes per-expert slices of the buffer's managed_handle on tensor extra records, transactionally, at the three points where an AoS upload becomes complete.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclq8denseaos": {
+      "type": "entity",
+      "title": "GGML_SYCL_Q8_DENSE_AOS",
+      "description": "Opt-in (default OFF) routing Q8_0 dense projections AOS so PP batches hit the oneDNN arm; +38% B70 pp512 but −34% B50 tg128, superseded for the PP win by GGML_SYCL_Q8_ONEDNN_COALESCED.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclq8onednncoalesced": {
+      "type": "entity",
+      "title": "GGML_SYCL_Q8_ONEDNN_COALESCED",
+      "description": "Opt-out (default ON) enabling the layout-neutral ONEDNN_COALESCED Q8_0 arm above batch 8, keeping TG on the coalesced kernel.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclresolvemoeexpertroute-ggmlsycltrymoestoragehandleroute": {
+      "type": "entity",
+      "title": "ggml_sycl_resolve_moe_expert_route / ggml_sycl_try_moe_storage_handle_route",
+      "description": "Expert route resolution that tries the non-owning storage-handle route for each candidate layout before forming any cache key; a hit returns FOUND and the cache is never consulted.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsycltgfast": {
+      "type": "entity",
+      "title": "GGML_SYCL_TG_FAST",
+      "description": "Opt-out (default ON) that disables the batch=1 MMVQ TG fast-path; the only way to make GGML_SYCL_FORCE_DMMV or a GGML_SYCL_LAYOUT_OVERRIDE kernel choice bind at batch=1.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclunifiedforcelegacy": {
+      "type": "entity",
+      "title": "GGML_SYCL_UNIFIED_FORCE_LEGACY",
+      "description": "Opt-in (default OFF) that forces legacy kernel dispatch, skipping the unified kernel.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclunifiedsoa": {
+      "type": "entity",
+      "title": "GGML_SYCL_UNIFIED_SOA",
+      "description": "Opt-out (default ON) that disables SOA memory layout, falling back to AOS and ~4x slower TG.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclusexmxgemm": {
+      "type": "entity",
+      "title": "GGML_SYCL_USE_XMX_GEMM",
+      "description": "Routes quantized MUL_MAT through experimental XMX GEMM kernels (measured 5–11x slower); no-op unless the build carries both GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclxmxmoesorted": {
+      "type": "entity",
+      "title": "GGML_SYCL_XMX_MOE_SORTED",
+      "description": "Opt-in (default OFF) diagnostic-only sorted MoE wrapper (try_xmx_sorted_moe); once pre-empted the grouped-DPAS PP route, measuring 5x slower on B70 and aborting (rc=134) on B50.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclxmxthreshold": {
+      "type": "entity",
+      "title": "GGML_SYCL_XMX_THRESHOLD",
+      "description": "Upper batch bound for the XMX GEMM path (batch >= 1 && batch < N); default 64, stated only in the ggml_check_sycl() settings table.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ggmlsyclxmxtiledpp": {
+      "type": "entity",
+      "title": "GGML_SYCL_XMX_TILED_PP",
+      "description": "Opt-out (default ON) for the XMX_TILED grouped-DPAS PP route for MXFP4 gate/up; older GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP/GGML_SYCL_XMX_MOE_PP names still honored as compatibility opt-outs.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/gpt-oss": {
+      "type": "entity",
+      "title": "GPT-OSS",
+      "description": "Model used in a full bench run through llama.cpp's isolated/host-bounce path on the historical B580↔B50 pair.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/gpt-oss-20b-mxfp4": {
+      "type": "entity",
+      "title": "GPT-OSS 20B (MXFP4)",
+      "description": "Benchmark model (gpt-oss-20b-mxfp4.gguf) for FA-on baselines and the count correctness gate.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/igc": {
+      "type": "entity",
+      "title": "IGC",
+      "description": "Intel GPU Compiler whose installed version does not recognize 26.22's future Xe3p/NVLP built-ins, motivating the BMG-only build config.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/intel-arc-a580": {
+      "type": "entity",
+      "title": "Intel Arc A580",
+      "description": "Discrete card removed from this machine on 2026-07-24; its P2P test results are historical and superseded by the B70.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/intel-arc-b580": {
+      "type": "entity",
+      "title": "Intel Arc B580",
+      "description": "Older Battlemage card removed from this machine on 2026-07-24 (replaced by the Arc Pro B70); its baselines are SUPERSEDED and gate nothing.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/intel-arc-pro-b50": {
+      "type": "entity",
+      "title": "Intel Arc Pro B50",
+      "description": "Secondary benchmark card in this machine (Battlemage G21, PCI 0000:07:00.0, level_zero:1, ~16.2 GB VRAM); unchanged through the B580→B70 swap.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/intel-arc-pro-b70": {
+      "type": "entity",
+      "title": "Intel Arc Pro B70",
+      "description": "Primary benchmark card in this machine (Battlemage G31, 256 CU, PCI 0000:03:00.0, level_zero:0, ~32.6 GB VRAM); replaced the B580 on 2026-07-24.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/intel-compute-runtime": {
+      "type": "entity",
+      "title": "Intel compute-runtime",
+      "description": "Patched 26.22 Battlemage/BMG-only build installed as the system-default Level Zero driver from branch llama/26.22-cross-device.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/level-zero": {
+      "type": "entity",
+      "title": "Level Zero",
+      "description": "Khronos low-level GPU API whose loader, tracing, and validation libraries this machine's processes must resolve from the packaged path.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/libzeintelgpuso": {
+      "type": "entity",
+      "title": "libze_intel_gpu.so",
+      "description": "Intel's Level Zero runtime library; patched 1.15.38646 is the diverted system default, with stock 1.14.37020 and prior 26.09 builds preserved.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/libzeloaderso": {
+      "type": "entity",
+      "title": "libze_loader.so",
+      "description": "Level Zero loader whose stale copy in /usr/local/lib was quarantined so new processes resolve the packaged /usr/lib loader.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/llama-bench": {
+      "type": "entity",
+      "title": "llama-bench",
+      "description": "Benchmark binary used for all throughput measurements; -v prints the free-VRAM line.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/llama-cli": {
+      "type": "entity",
+      "title": "llama-cli",
+      "description": "Inference binary counted as a stale GPU tenant by the bench guard; does not print the free-VRAM line.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/llama-completion": {
+      "type": "entity",
+      "title": "llama-completion",
+      "description": "Inference binary counted as a stale GPU tenant by the bench guard.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/llamacpp": {
+      "type": "entity",
+      "title": "llama.cpp",
+      "description": "Inference framework whose isolated/host-bounce multi-device path (GGML_SYCL_MOE_MULTI_GPU) is constrained by the P2P restriction.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/llamacpp-sycl-fork": {
+      "type": "entity",
+      "title": "llama.cpp (SYCL fork)",
+      "description": "The repo this baseline document belongs to, with an actively developed SYCL backend.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/mem-handle": {
+      "type": "entity",
+      "title": "mem_handle",
+      "description": "ggml_sycl::mem_handle - the backend's ownership/lifetime token: lightweight, copyable, ref-counted; resolves to the current pointer on dereference.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/mistral": {
+      "type": "entity",
+      "title": "Mistral",
+      "description": "Model used for the end-to-end 'digit gate' verification of the DIRECT flash-attention plan.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/mistral-7b-q40": {
+      "type": "entity",
+      "title": "Mistral 7B Q4_0",
+      "description": "Benchmark model, steadier on the B70 than GPT-OSS; used for the deterministic completion gate.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/mmvq": {
+      "type": "entity",
+      "title": "MMVQ",
+      "description": "Production batch=1 quantized MUL_MAT kernel using q8_1 activations for reorder-eligible types.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/mxfp4": {
+      "type": "entity",
+      "title": "MXFP4",
+      "description": "4-bit quantized format with layout-aware _id launchers and an on-device dequant path into f16 scratch for oneDNN.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ocloc": {
+      "type": "entity",
+      "title": "ocloc",
+      "description": "OpenCL-to-ISA compiler tool, referenced alongside IGC for the 26.22 built-in compatibility limitation.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/oneapi": {
+      "type": "entity",
+      "title": "oneAPI",
+      "description": "Intel AI development toolchain; version 2025.3 was used in the historical ESIMD dequant measurement.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/oneapi-20253": {
+      "type": "entity",
+      "title": "oneAPI 2025.3",
+      "description": "Toolchain version paired with the B580 in the historical ESIMD small-block dequant measurement.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/oneapideviceselector": {
+      "type": "entity",
+      "title": "ONEAPI_DEVICE_SELECTOR",
+      "description": "Environment variable keying device identity (level_zero:0 = B70, level_zero:1 = B50); the logged device=N is assigned after selector filtering.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/onednn": {
+      "type": "entity",
+      "title": "oneDNN",
+      "description": "DNN library whose scratch allocations and calls flow through the unified cache; its on-device dequant (e.g. MXFP4 → f16) is a permitted format-conversion staging.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/openvino": {
+      "type": "entity",
+      "title": "OpenVINO",
+      "description": "Runtime of the embedder tenant (semantic.openvino_device=GPU.2) that confounded the A–D rows.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/q81": {
+      "type": "entity",
+      "title": "Q8_1",
+      "description": "Quantization type whose scratch demand (unified_cache_reserve_moe_q8_1_scratch) sizes the scratch pool as one epoch's full capacity.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/scriptsbench-guardsh": {
+      "type": "entity",
+      "title": "scripts/bench-guard.sh",
+      "description": "Mandatory preflight guard that refuses corrupted hosts (exit 3) and stamps VALID/SUSPECT as the first line of archived benchmark logs.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/sycl": {
+      "type": "entity",
+      "title": "SYCL",
+      "description": "C++ GPU programming model used by the backend (sycl::queue, sycl::malloc_device, sycl::depends_on, sycl::free).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/sycl-canonical-memory-architecture": {
+      "type": "entity",
+      "title": "SYCL canonical memory architecture (design doc)",
+      "description": "docs/design/sycl-canonical-memory-architecture.md — the authoritative, enforceable version of the unified-cache + mem_handle design.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/sycl-ls": {
+      "type": "entity",
+      "title": "sycl-ls",
+      "description": "SYCL device enumeration tool historically used to list B580/B50 devices; flagged as not to be used for checking the B50 now.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/test-thread-safety": {
+      "type": "entity",
+      "title": "test-thread-safety",
+      "description": "ctest (3 models × 4 contexts, decodes serialized per device) whose registration sets GGML_SYCL_DISABLE_GRAPH=1; fails at 3.4s with replay on, passes at 6.95s with replay off.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/teststest-bench-guardsh": {
+      "type": "entity",
+      "title": "tests/test-bench-guard.sh",
+      "description": "Test covering the bench guard; also runnable via ctest -R '^test-bench-guard$'.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/teststest-dmmv-q4-0-coalescedcpp": {
+      "type": "entity",
+      "title": "tests/test-dmmv-q4-0-coalesced.cpp",
+      "description": "Test gating on the dfloat-vs-q8_1-MMVQ oracle fit ratio (≥100×), cleared by 4239–8150× when DMMV runs.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/ttm-shmem": {
+      "type": "entity",
+      "title": "TTM-shmem",
+      "description": "Kernel shmem allocator whose >10 GB usage in /proc/meminfo is a bench-guard preflight refusal.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/unified-cache": {
+      "type": "entity",
+      "title": "unified_cache",
+      "description": "ggml_sycl::unified_cache — the sole allocator and owner of SYCL backend memory (tiered weight cache, VRAM arena and zones, host pinned pool).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/unifiedallocate": {
+      "type": "entity",
+      "title": "unified_allocate",
+      "description": "The single allocation entry point: routes an alloc_request by intent to a tier and VRAM zone and returns a mem_handle; the older unified_alloc/unified_free pair still backs the same machinery.",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "entities/unifiedallocateowner": {
+      "type": "entity",
+      "title": "unified_allocate_owner",
+      "description": "Owner-first allocation front door that allocates the intrusive alloc_owner_control before the physical allocation, so an allocation can never exist without an owner (48 call sites at 0b7b49e07).",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/SRC-2026-08-29-001": {
+      "type": "source",
+      "title": "sycl-perf-baselines.md",
+      "status": "ingested",
+      "raw_path": "raw/sources/SRC-2026-08-29-001/extracted.md",
+      "source_id": "SRC-2026-08-29-001",
+      "format": "markdown",
+      "captured": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/SRC-2026-08-29-002": {
+      "type": "source",
+      "title": "sycl-memory-design.md",
+      "status": "ingested",
+      "raw_path": "raw/sources/SRC-2026-08-29-002/extracted.md",
+      "source_id": "SRC-2026-08-29-002",
+      "format": "markdown",
+      "captured": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/SRC-2026-08-29-003": {
+      "type": "source",
+      "title": "compute-runtime.md",
+      "status": "ingested",
+      "raw_path": "raw/sources/SRC-2026-08-29-003/extracted.md",
+      "source_id": "SRC-2026-08-29-003",
+      "format": "markdown",
+      "captured": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/SRC-2026-08-29-004": {
+      "type": "source",
+      "title": "sycl-env-vars.md",
+      "status": "ingested",
+      "raw_path": "raw/sources/SRC-2026-08-29-004/extracted.md",
+      "source_id": "SRC-2026-08-29-004",
+      "format": "markdown",
+      "captured": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/multi-source-ingest-fragmentation-dedup-pass": {
+      "type": "source",
+      "title": "Multi-source background ingest fragments entities; run a dedup pass after",
+      "category": "workflow",
+      "status": "insight",
+      "slug": "multi-source-ingest-fragmentation-dedup-pass",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor": {
+      "type": "source",
+      "title": "Observation: Wiki rebuild/lint results post async — verify file state before reacting to error toasts",
+      "tags": [
+        "llm-wiki",
+        "tooling",
+        "async"
+      ],
+      "status": "observation",
+      "slug": "obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor",
+      "relevance": "medium",
+      "observed_at": "2026-08-29T22:42:17.595Z",
+      "source_context": "Reviewing curation pass results; user received stale frontmatter error notifications",
+      "created": "2026-08-29",
+      "updated": "2026-08-29"
+    },
+    "sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-": {
+      "type": "source",
+      "title": "Observation: Dockerized Obsidian (LinuxServer/Selkies) serves the LLM Wiki on LAN port 3001",
+      "tags": [
+        "obsidian",
+        "docker",
+        "machine-setup",
+        "llm-wiki"
+      ],
+      "status": "observation",
+      "slug": "obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-",
+      "relevance": "high",
+      "observed_at": "2026-08-30T00:04:41.341Z",
+      "source_context": "Setting up Dockerized Obsidian to browse the LLM Wiki vault over the LAN",
+      "created": "2026-08-30",
+      "updated": "2026-08-30"
+    }
+  }
+}

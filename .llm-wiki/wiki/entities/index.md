@@ -1,0 +1,94 @@
+# entities
+
+## Concepts
+
+- [0b7b49e07](0b7b49e07.md) — The commit at which unified_allocate_owner had 48 call sites (25 in ggml-sycl.cpp, 23 across common, fattn, vram-pool, unified-cache and private fixtures).
+- [AGENTS.md](agentsmd.md) — Former doc that was the only documentation of GGML_SYCL_LAYOUT_OVERRIDE before the 2026-07-25 migration into this catalog.
+- [artifacts/perf-recovery/C4-pp-validation.md](artifactsperf-recoveryc4-pp-validationmd.md) — Artifact holding the full C4 PP snapshot matrix and ONEDNN_VERBOSE share analysis.
+- [artifacts/perf-recovery/D3-b70-baseline.md](artifactsperf-recoveryd3-b70-baselinemd.md) — Artifact deriving the Track E B70 flip thresholds (pp512 ≥ 1351.5, tg128 ≥ 48.5).
+- [B50 / B70](b50-b70.md) — The two GPU cards discussed; their differing capabilities (tile shapes, XMX generation) make optimal weight layout a per-device answer.
+- [Battlemage G21](battlemage-g21.md) — Battlemage GPU device/die of the Arc Pro B50.
+- [Battlemage G31](battlemage-g31.md) — Battlemage GPU device/die of the Arc Pro B70.
+- [can_access_peer](canaccesspeer.md) — Device-level P2P capability query that honestly returns false for access_supported and atomics_supported in both directions.
+- [CLAUDE.md](claudemd.md) — Project notes file holding the durable rules (what is installed, rollback, no-direct-P2P restriction); this file is the full record.
+- [codescout](codescout.md) — Tool whose embedder was secretly resident on the B50 during old default-arm baseline runs, invalidating the ~894/~1415 pp512 baselines (masking-bug class).
+- [ComfyUI](comfyui.md) — Background workload that once held 18.3 GiB on the B70 and invalidated an entire round of measurements.
+- [compute_placement_plan / placement_plan](computeplacementplan-placementplan.md) — The Planner primitive and its output: the sole authority for deciding where memory lives, run once at model load for dense weights, MoE experts, per-layer KV, and oneDNN scratch.
+- [CpuExpertPool](cpuexpertpool.md) — CPU-side expert dispatch machinery for host-resident MoE experts, live in ggml_sycl_mul_mat_id.
+- [DMMV](dmmv.md) — Coalesced kernel that is a fallback/debug path, not the production TG kernel for reorder-eligible types.
+- [DnnlGemmWrapper](dnnlgemmwrapper.md) — C++ oneDNN wrapper exposing woq_gemm_batch_mxfp4 and gemm_batch_strided for batched MoE matmuls (gemm.hpp).
+- [docs/backend/sycl-env-vars.md](docsbackendsycl-env-varsmd.md) — Reference documenting the SYCL environment-variable rows, including the batched-MoE-PP flag.
+- [docs/backend/sycl-perf-baselines.md](docsbackendsycl-perf-baselinesmd.md) — Perf baselines doc whose old default-route rows are known-stale (masked by the codescout embedder) and must not be gated against.
+- [ensure_cached_alloc](ensurecachedalloc.md) — The single sanctioned exception that deliberately allocates outside the arena (direct sycl::malloc_device, budget-gated); zero production callers, 34 test call sites.
+- [ext_oneapi_enable_peer_access()](extoneapienablepeeraccess.md) — oneAPI extension that wrongly returns OK on hardware with no P2P, making it an untrustworthy capability check.
+- [gallocr](gallocr.md) — Buffer allocator that frees buffers first, forcing buffer destructors to drop tensor cache entries by stored key rather than dereferencing tensors.
+- [ggml](ggml.md) — Tensor/ML library whose SYCL backend (ggml/src/ggml-sycl) implements the unified cache and mem_handle design.
+- [ggml-sycl](ggml-sycl.md) — SYCL backend (ggml/src/ggml-sycl/ggml-sycl.cpp); ggml_sycl_mul_mat() hosts the TG fast-path, MMVQ dispatch, and both FORCE_DMMV sites.
+- [ggml/src/ggml-sycl/ggml-sycl.cpp](ggmlsrcggml-syclggml-syclcpp.md) — SYCL backend file containing the TG fast-path, both FORCE_DMMV sites, and the force_legacy presence check.
+- [GGML_SYCL_BATCH_EXPERTS](ggmlsyclbatchexperts.md) — Opt-out (default ON) that disables batched expert kernel launches.
+- [ggml_sycl_cache_id](ggmlsyclcacheid.md) — The tensor-identity key (not pointer) under which WEIGHT handles and weight provenance rows are filed via ggml_sycl_owner_name_key(owner, tensor_name).
+- [GGML_SYCL_DISABLE_GRAPH](ggmlsycldisablegraph.md) — Opt-out (default OFF) for SYCL graph replay; currently load-bearing for multi-context workloads due to the never-terminal replay invocation bug.
+- [GGML_SYCL_ESIMD_DEQUANT](ggmlsyclesimddequant.md) — Opt-in (default OFF) retest hatch for ESIMD small-block dequant; the 1.9x-slower justification is a historical Arc B580 + oneAPI 2025.3 measurement.
+- [GGML_SYCL_FA_ONEDNN_MATERIALIZE](ggmlsyclfaonednnmaterialize.md) — Opt-in (default OFF since the 2026-08-10 olpg polarity ruling) for MATERIALIZE_REQUIRED on GQA/MQA flash-attention KV-stride-mismatch shapes; =1 retained as the A/B axis for the oneDNN SDPA plan.
+- [GGML_SYCL_FORCE_DMMV](ggmlsyclforcedmmv.md) — Forces DMMV kernels, but has no effect at batch=1 on its own because the TG fast-path returns before the flag is read; pair with GGML_SYCL_TG_FAST=0.
+- [GGML_SYCL_LAYOUT_OVERRIDE](ggmlsycllayoutoverride.md) — Forces a weight layout (aos/soa/coalesced/xmx_tiled) for A/B isolation; still binds on materialization at batch=1 even though MMVQ reads the buffer.
+- [GGML_SYCL_MOE_DOWN_XMX_TILED](ggmlsyclmoedownxmxtiled.md) — Opt-out (default ON since sk67) for the XMX_TILED grouped-DPAS route on the MoE down projection; previously a no-op flag.
+- [GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED](ggmlsyclmoepponednnf16batched.md) — Route policy (default ON on both cards since iikr) selecting the batched oneDNN MoE PP executor; gate/up keep XMX_TILED, down plans SOA; XMX_TILED-claimed declines throw fail-closed.
+- [GGML_SYCL_MOE_PP_WOQ](ggmlsyclmoeppwoq.md) — Opt-out (default ON) for the WOQ arm of the batched PP MoE executor; read at both the dispatch executor and plan-time scratch sizing, so must be set before model load; the f16 fallback arm is SOA-only.
+- [GGML_SYCL_MOE_PP_WOQ_3D](ggmlsyclmoeppwoq3d.md) — Opt-in (default OFF) for the known-broken 3-D scale mask in the WOQ batched GEMM; unset now means the correct 2-D loop directly; do not re-enable 3-D in production.
+- [GGML_SYCL_MUL_MAT_ROUTE_TRACE](ggmlsyclmulmatroutetrace.md) — Route trace emitting the kernel and layout at dispatch on both routes; LIMIT defaults to 256; survives the GGML_LOG_INFO verbosity gate.
+- [GGML_SYCL_MXFP4_GROUPED_DPAS_ROW_LIST_TILES](ggmlsyclmxfp4groupeddpasrowlisttiles.md) — Caps the grouped-DPAS MXFP4 MoE row-list chunk size (caps.N*N rows per submission); default 256, raised from 16 on 2026-08-17 for +7.5% B50 / ~+30% B70 pp512.
+- [GGML_SYCL_ONEDNN_MUL](ggmlsyclonednnmul.md) — Opt-in (default OFF) enabling oneDNN for element-wise MUL; the SYCL kernel is 2.3x faster by default.
+- [GGML_SYCL_ONEDNN_PP](ggmlsyclonednnpp.md) — Opt-out (default ON) that disables oneDNN for prompt processing.
+- [GGML_SYCL_OP_TIMEOUT_MS](ggmlsycloptimeoutms.md) — Watchdog timeout variable; B70 runs require 180000 because cold prestage exceeds the 30 s default.
+- [GGML_SYCL_PP_PIPELINE](ggmlsyclpppipeline.md) — Opt-in (default OFF) double-buffered FP16 weight dequant prefetch; improves B50 GPT-OSS PP to ~1030–1043 tok/s but chat correctness currently fails with repeated isNaN.
+- [ggml_sycl_publish_backend_aos_expert_handles](ggmlsyclpublishbackendaosexperthandles.md) — Publishes per-expert slices of the buffer's managed_handle on tensor extra records, transactionally, at the three points where an AoS upload becomes complete.
+- [GGML_SYCL_Q8_DENSE_AOS](ggmlsyclq8denseaos.md) — Opt-in (default OFF) routing Q8_0 dense projections AOS so PP batches hit the oneDNN arm; +38% B70 pp512 but −34% B50 tg128, superseded for the PP win by GGML_SYCL_Q8_ONEDNN_COALESCED.
+- [GGML_SYCL_Q8_ONEDNN_COALESCED](ggmlsyclq8onednncoalesced.md) — Opt-out (default ON) enabling the layout-neutral ONEDNN_COALESCED Q8_0 arm above batch 8, keeping TG on the coalesced kernel.
+- [ggml_sycl_resolve_moe_expert_route / ggml_sycl_try_moe_storage_handle_route](ggmlsyclresolvemoeexpertroute-ggmlsycltrymoestoragehandleroute.md) — Expert route resolution that tries the non-owning storage-handle route for each candidate layout before forming any cache key; a hit returns FOUND and the cache is never consulted.
+- [GGML_SYCL_TG_FAST](ggmlsycltgfast.md) — Opt-out (default ON) that disables the batch=1 MMVQ TG fast-path; the only way to make GGML_SYCL_FORCE_DMMV or a GGML_SYCL_LAYOUT_OVERRIDE kernel choice bind at batch=1.
+- [GGML_SYCL_UNIFIED_FORCE_LEGACY](ggmlsyclunifiedforcelegacy.md) — Opt-in (default OFF) that forces legacy kernel dispatch, skipping the unified kernel.
+- [GGML_SYCL_UNIFIED_SOA](ggmlsyclunifiedsoa.md) — Opt-out (default ON) that disables SOA memory layout, falling back to AOS and ~4x slower TG.
+- [GGML_SYCL_USE_XMX_GEMM](ggmlsyclusexmxgemm.md) — Routes quantized MUL_MAT through experimental XMX GEMM kernels (measured 5–11x slower); no-op unless the build carries both GGML_SYCL_XMX_GEMM and GGML_SYCL_MMQ_XMX.
+- [GGML_SYCL_XMX_MOE_SORTED](ggmlsyclxmxmoesorted.md) — Opt-in (default OFF) diagnostic-only sorted MoE wrapper (try_xmx_sorted_moe); once pre-empted the grouped-DPAS PP route, measuring 5x slower on B70 and aborting (rc=134) on B50.
+- [GGML_SYCL_XMX_THRESHOLD](ggmlsyclxmxthreshold.md) — Upper batch bound for the XMX GEMM path (batch >= 1 && batch < N); default 64, stated only in the ggml_check_sycl() settings table.
+- [GGML_SYCL_XMX_TILED_PP](ggmlsyclxmxtiledpp.md) — Opt-out (default ON) for the XMX_TILED grouped-DPAS PP route for MXFP4 gate/up; older GGML_SYCL_XMX_MOE_ALLOW_UNSAFE_PP/GGML_SYCL_XMX_MOE_PP names still honored as compatibility opt-outs.
+- [GPT-OSS](gpt-oss.md) — Model used in a full bench run through llama.cpp's isolated/host-bounce path on the historical B580↔B50 pair.
+- [GPT-OSS 20B (MXFP4)](gpt-oss-20b-mxfp4.md) — Benchmark model (gpt-oss-20b-mxfp4.gguf) for FA-on baselines and the count correctness gate.
+- [IGC](igc.md) — Intel GPU Compiler whose installed version does not recognize 26.22's future Xe3p/NVLP built-ins, motivating the BMG-only build config.
+- [Intel Arc A580](intel-arc-a580.md) — Discrete card removed from this machine on 2026-07-24; its P2P test results are historical and superseded by the B70.
+- [Intel Arc B580](intel-arc-b580.md) — Older Battlemage card removed from this machine on 2026-07-24 (replaced by the Arc Pro B70); its baselines are SUPERSEDED and gate nothing.
+- [Intel Arc Pro B50](intel-arc-pro-b50.md) — Secondary benchmark card in this machine (Battlemage G21, PCI 0000:07:00.0, level_zero:1, ~16.2 GB VRAM); unchanged through the B580→B70 swap.
+- [Intel Arc Pro B70](intel-arc-pro-b70.md) — Primary benchmark card in this machine (Battlemage G31, 256 CU, PCI 0000:03:00.0, level_zero:0, ~32.6 GB VRAM); replaced the B580 on 2026-07-24.
+- [Intel compute-runtime](intel-compute-runtime.md) — Patched 26.22 Battlemage/BMG-only build installed as the system-default Level Zero driver from branch llama/26.22-cross-device.
+- [Level Zero](level-zero.md) — Khronos low-level GPU API whose loader, tracing, and validation libraries this machine's processes must resolve from the packaged path.
+- [libze_intel_gpu.so](libzeintelgpuso.md) — Intel's Level Zero runtime library; patched 1.15.38646 is the diverted system default, with stock 1.14.37020 and prior 26.09 builds preserved.
+- [libze_loader.so](libzeloaderso.md) — Level Zero loader whose stale copy in /usr/local/lib was quarantined so new processes resolve the packaged /usr/lib loader.
+- [llama-bench](llama-bench.md) — Benchmark binary used for all throughput measurements; -v prints the free-VRAM line.
+- [llama-cli](llama-cli.md) — Inference binary counted as a stale GPU tenant by the bench guard; does not print the free-VRAM line.
+- [llama-completion](llama-completion.md) — Inference binary counted as a stale GPU tenant by the bench guard.
+- [llama.cpp](llamacpp.md) — Inference framework whose isolated/host-bounce multi-device path (GGML_SYCL_MOE_MULTI_GPU) is constrained by the P2P restriction.
+- [llama.cpp (SYCL fork)](llamacpp-sycl-fork.md) — The repo this baseline document belongs to, with an actively developed SYCL backend.
+- [mem_handle](mem-handle.md) — ggml_sycl::mem_handle - the backend's ownership/lifetime token: lightweight, copyable, ref-counted; resolves to the current pointer on dereference.
+- [Mistral](mistral.md) — Model used for the end-to-end 'digit gate' verification of the DIRECT flash-attention plan.
+- [Mistral 7B Q4_0](mistral-7b-q40.md) — Benchmark model, steadier on the B70 than GPT-OSS; used for the deterministic completion gate.
+- [MMVQ](mmvq.md) — Production batch=1 quantized MUL_MAT kernel using q8_1 activations for reorder-eligible types.
+- [MXFP4](mxfp4.md) — 4-bit quantized format with layout-aware _id launchers and an on-device dequant path into f16 scratch for oneDNN.
+- [ocloc](ocloc.md) — OpenCL-to-ISA compiler tool, referenced alongside IGC for the 26.22 built-in compatibility limitation.
+- [oneAPI](oneapi.md) — Intel AI development toolchain; version 2025.3 was used in the historical ESIMD dequant measurement.
+- [oneAPI 2025.3](oneapi-20253.md) — Toolchain version paired with the B580 in the historical ESIMD small-block dequant measurement.
+- [ONEAPI_DEVICE_SELECTOR](oneapideviceselector.md) — Environment variable keying device identity (level_zero:0 = B70, level_zero:1 = B50); the logged device=N is assigned after selector filtering.
+- [oneDNN](onednn.md) — DNN library whose scratch allocations and calls flow through the unified cache; its on-device dequant (e.g. MXFP4 → f16) is a permitted format-conversion staging.
+- [OpenVINO](openvino.md) — Runtime of the embedder tenant (semantic.openvino_device=GPU.2) that confounded the A–D rows.
+- [Q8_1](q81.md) — Quantization type whose scratch demand (unified_cache_reserve_moe_q8_1_scratch) sizes the scratch pool as one epoch's full capacity.
+- [scripts/bench-guard.sh](scriptsbench-guardsh.md) — Mandatory preflight guard that refuses corrupted hosts (exit 3) and stamps VALID/SUSPECT as the first line of archived benchmark logs.
+- [SYCL](sycl.md) — C++ GPU programming model used by the backend (sycl::queue, sycl::malloc_device, sycl::depends_on, sycl::free).
+- [SYCL canonical memory architecture (design doc)](sycl-canonical-memory-architecture.md) — docs/design/sycl-canonical-memory-architecture.md — the authoritative, enforceable version of the unified-cache + mem_handle design.
+- [sycl-ls](sycl-ls.md) — SYCL device enumeration tool historically used to list B580/B50 devices; flagged as not to be used for checking the B50 now.
+- [test-thread-safety](test-thread-safety.md) — ctest (3 models × 4 contexts, decodes serialized per device) whose registration sets GGML_SYCL_DISABLE_GRAPH=1; fails at 3.4s with replay on, passes at 6.95s with replay off.
+- [tests/test-bench-guard.sh](teststest-bench-guardsh.md) — Test covering the bench guard; also runnable via ctest -R '^test-bench-guard$'.
+- [tests/test-dmmv-q4-0-coalesced.cpp](teststest-dmmv-q4-0-coalescedcpp.md) — Test gating on the dfloat-vs-q8_1-MMVQ oracle fit ratio (≥100×), cleared by 4239–8150× when DMMV runs.
+- [TTM-shmem](ttm-shmem.md) — Kernel shmem allocator whose >10 GB usage in /proc/meminfo is a bench-guard preflight refusal.
+- [unified_cache](unified-cache.md) — ggml_sycl::unified_cache — the sole allocator and owner of SYCL backend memory (tiered weight cache, VRAM arena and zones, host pinned pool).
+- [unified_allocate](unifiedallocate.md) — The single allocation entry point: routes an alloc_request by intent to a tier and VRAM zone and returns a mem_handle; the older unified_alloc/unified_free pair still backs the same machinery.
+- [unified_allocate_owner](unifiedallocateowner.md) — Owner-first allocation front door that allocates the intrusive alloc_owner_control before the physical allocation, so an allocation can never exist without an owner (48 call sites at 0b7b49e07).
