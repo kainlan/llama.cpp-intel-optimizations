@@ -87714,8 +87714,16 @@ gpu_dispatch:
                     auto      read_debug_sample = [&](void * dst, const void * src, size_t bytes) {
                         auto dst_handle = ggml_sycl::mem_handle::from_direct(dst, GGML_LAYOUT_AOS, /*on_device=*/false,
                                                                                   ggml_sycl::mem_handle::HOST_DEVICE, bytes);
-                        auto src_handle =
-                            ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS, queue_device);
+                        // llama.cpp-dkw0: this is a 14th instance of the llama.cpp-fxrg
+                        // byte-contract-omission defect (see
+                        // tests/test-mem-handle-byte-contract.cpp) -- the 3-arg call left
+                        // operation_bytes at its default of 0, so an unregistered-external
+                        // src pointer minted extent=0 and mem_copy's require_resolved_range
+                        // guard correctly refused it (GGML_ABORT), aborting NAN_CHECK before
+                        // it could report anything. Pass the byte contract this lambda
+                        // already knows.
+                        auto src_handle = ggml_sycl_copy_handle_for_raw_ptr(const_cast<void *>(src), GGML_LAYOUT_AOS,
+                                                                            queue_device, bytes);
                         ggml_sycl::mem_copy(dst_handle, src_handle, bytes, *stream);
                     };
 
