@@ -1163,8 +1163,25 @@ static void dequantize_block_q8_0_soa_rowmajor(const void * __restrict__ vx,
     }
 }
 
+// llama.cpp-dkw0: templated on dst_t (was hardcoded to sycl::half) so this
+// SAME proven-correct, row-padding-aware addressing can also serve an fp32
+// consumer. Addressing logic is UNCHANGED from the original -- only the
+// output element type varies. See ggml_sycl_q8_0_coalesced_row_quants_bytes
+// (common.hpp): row_quants_bytes rounds blocks_per_row UP to a whole number
+// of MMVQ_COALESCED_TILE_BLOCKS-sized tiles, so for a blocks_per_row that
+// isn't already a tile-size multiple (e.g. 2560/32=80 blocks, not a multiple
+// of the 32-block tile), each row carries real padding before the next
+// row's quants begin, and the scale plane starts after ALL rows' PADDED
+// quant regions. A from-scratch "flat, whole-tensor" reimplementation that
+// doesn't know about this per-row padding (as tried and disproven earlier in
+// this ticket) silently derives a scale-plane offset that is too small,
+// landing inside the quant region instead and reading unrelated quant bytes
+// as if they were the f16 scale -- wrong by a large, essentially-random
+// factor, not a small numerical error. Reusing this exact addressing avoids
+// re-deriving it.
+template <typename dst_t>
 static void dequantize_block_q8_0_coalesced_rowmajor(const void * __restrict__ vx,
-                                                     sycl::half * __restrict__ yy,
+                                                     dst_t * __restrict__     yy,
                                                      const int                blocks_per_row,
                                                      const int                nrows,
                                                      const sycl::nd_item<2> & item) {
@@ -1192,18 +1209,40 @@ static void dequantize_block_q8_0_coalesced_rowmajor(const void * __restrict__ v
 
     const int64_t      block_i = static_cast<int64_t>(row) * blocks_per_row + block_idx;
     const sycl::half * d       = reinterpret_cast<const sycl::half *>(src + total_quants_bytes);
-    sycl::half *       y       = yy + block_i * QK8_0;
+    dst_t *             y      = yy + block_i * QK8_0;
     const float        df      = static_cast<float>(d[block_i]);
 
 #pragma unroll
     for (int word = 0; word < WORDS_PER_BLOCK; ++word) {
         const int64_t word_offset = tile_qs_base + word * WORD_PLANE_STRIDE + block_in_tile * 4;
         const int8_t * q          = reinterpret_cast<const int8_t *>(src + word_offset);
-        y[word * 4 + 0]           = sycl::half(df * static_cast<float>(q[0]));
-        y[word * 4 + 1]           = sycl::half(df * static_cast<float>(q[1]));
-        y[word * 4 + 2]           = sycl::half(df * static_cast<float>(q[2]));
-        y[word * 4 + 3]           = sycl::half(df * static_cast<float>(q[3]));
+        y[word * 4 + 0]           = dst_t(df * static_cast<float>(q[0]));
+        y[word * 4 + 1]           = dst_t(df * static_cast<float>(q[1]));
+        y[word * 4 + 2]           = dst_t(df * static_cast<float>(q[2]));
+        y[word * 4 + 3]           = dst_t(df * static_cast<float>(q[3]));
     }
+}
+
+// llama.cpp-dkw0: generic host wrapper (was fp16-only). The existing public
+// dequantize_row_q8_0_coalesced_to_fp16_rowmajor below now just instantiates
+// this at sycl::half, so every existing caller's signature and behavior is
+// unchanged. Used directly (dst_t=float) at the actual bug's call site in
+// ggml_sycl_op_mul_mat_sycl (ggml-sycl.cpp) instead of the broken flat
+// dequantize_row_q8_0_sycl_coalesced.
+template <typename dst_t>
+static void dequantize_row_q8_0_coalesced_rowmajor(const void *    src,
+                                                    dst_t *         dst,
+                                                    int             blocks_per_row,
+                                                    int             nrows,
+                                                    dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+
+    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(nrows, tiles_per_row * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            dequantize_block_q8_0_coalesced_rowmajor<dst_t>(src, dst, blocks_per_row, nrows, item);
+        });
 }
 
 void dequantize_row_q8_0_soa_to_fp16_rowmajor(const void *    src,
@@ -1231,14 +1270,20 @@ void dequantize_row_q8_0_coalesced_to_fp16_rowmajor(const void *    src,
                                                     int             blocks_per_row,
                                                     int             nrows,
                                                     dpct::queue_ptr stream) {
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    // llama.cpp-dkw0: now a thin instantiation of the generic template above
+    // -- signature and behavior for existing callers are unchanged.
+    dequantize_row_q8_0_coalesced_rowmajor<sycl::half>(src, dst, blocks_per_row, nrows, stream);
+}
 
-    const int tiles_per_row = ggml_sycl_coalesced_fixed_tile_count(blocks_per_row);
-    stream->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(nrows, tiles_per_row * WARP_SIZE), sycl::range<2>(1, WARP_SIZE)),
-        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-            dequantize_block_q8_0_coalesced_rowmajor(src, dst, blocks_per_row, nrows, item);
-        });
+// llama.cpp-dkw0: fp32 sibling, exposed for the legacy to_fp32 call site
+// (ggml_sycl_op_mul_mat_sycl in ggml-sycl.cpp) to call directly, bypassing
+// the broken flat dequantize_row_q8_0_sycl_coalesced.
+void dequantize_row_q8_0_coalesced_to_fp32_rowmajor(const void *    src,
+                                                    float *         dst,
+                                                    int             blocks_per_row,
+                                                    int             nrows,
+                                                    dpct::queue_ptr stream) {
+    dequantize_row_q8_0_coalesced_rowmajor<float>(src, dst, blocks_per_row, nrows, stream);
 }
 
 // SOA→row-major FP16 dequant for oneDNN PP path.
@@ -2651,6 +2696,37 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst, bool ful
         case GGML_TYPE_Q5_1:
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
+            // llama.cpp-dkw0: dequantize_q8_0 assumes the classic AOS block
+            // layout {d, qs[32]} repeated per block. When a Q8_0 weight is
+            // materialized COALESCED, this generic function-pointer
+            // dispatcher structurally CANNOT dequant it correctly: its
+            // to_fp16_sycl_t signature carries only a flattened element
+            // count `k`, never `blocks_per_row`/`nrows` separately, and the
+            // COALESCED scale-plane offset depends on
+            // ggml_sycl_q8_0_coalesced_row_quants_bytes(blocks_per_row) --
+            // which rounds up to a whole multiple of
+            // MMVQ_COALESCED_TILE_BLOCKS (row padding). A flat/1D kernel
+            // that doesn't know blocks_per_row therefore reads the wrong
+            // scale bytes (confirmed: read them off by an exact per-element
+            // factor of -3046.0 on a 2560x2048 tensor whose blocks_per_row
+            // (80) isn't a multiple of the 32-block tile). That was tried
+            // here and reverted -- root cause of a partial-NaN/garbage
+            // bug (llama.cpp-dkw0 track b).
+            //
+            // The real fix lives at the call sites that actually have
+            // blocks_per_row/nrows in scope: ggml_sycl_op_mul_mat_sycl's
+            // oneDNN/oneMath F16 GEMM branches already special-case a
+            // COALESCED-resident Q8_0 weight (q8_0_coalesced_ptr,
+            // llama.cpp-e3xj) by looking the pointer up directly via
+            // ggml_sycl_get_weight_layout_ptr(..., GGML_LAYOUT_COALESCED)
+            // and calling dequantize_row_q8_0_coalesced_to_fp16_rowmajor
+            // with real blocks_per_row/nrows -- bypassing this switch
+            // entirely. The sibling fp32 GEMM branch got the same
+            // treatment (dequantize_row_q8_0_coalesced_to_fp32_rowmajor,
+            // llama.cpp-dkw0) for the same reason. This case is therefore
+            // reached only when no coalesced-resident materialization was
+            // found for src0 -- i.e. the bytes really are plain AOS -- so
+            // the plain kernel is correct here, unconditionally.
             return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_sycl;
@@ -2727,6 +2803,20 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst, bool ful
         case GGML_TYPE_Q5_1:
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
+            // llama.cpp-dkw0: same reasoning as the identical case in
+            // ggml_get_to_fp16_sycl above -- this flat function-pointer
+            // dispatcher cannot carry blocks_per_row/nrows separately, so it
+            // structurally cannot dequant a COALESCED-materialized Q8_0
+            // weight correctly (row padding makes the scale-plane offset
+            // depend on blocks_per_row, not just the flattened element
+            // count). The real fix is at the call site that has
+            // blocks_per_row/nrows in scope: ggml_sycl_op_mul_mat_sycl's
+            // fp32 GEMM branch looks the COALESCED pointer up directly via
+            // ggml_sycl_get_weight_layout_ptr(..., GGML_LAYOUT_COALESCED)
+            // and calls dequantize_row_q8_0_coalesced_to_fp32_rowmajor,
+            // bypassing this switch entirely when a coalesced materialization
+            // exists. This case is reached only when it does not -- i.e. the
+            // bytes really are plain AOS -- so the plain kernel is correct.
             return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_Q2_K:
             return dequantize_row_q2_K_sycl;

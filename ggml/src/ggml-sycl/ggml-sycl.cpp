@@ -41614,11 +41614,47 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
 
                                                  " : converting src0 to fp32");
             // SoA reorder kernels require full tensor (they compute d_offset from k)
-            const bool           src0_full_tensor = (row_diff == src0->ne[1]);
-            const to_fp32_sycl_t to_fp32_sycl     = ggml_get_to_fp32_sycl(src0->type, dst, src0_full_tensor);
-            GGML_ASSERT(to_fp32_sycl != nullptr);
+            const bool src0_full_tensor = (row_diff == src0->ne[1]);
             GGML_ASSERT(src0_ddq_as_f32.alloc(row_diff * ne00));
-            to_fp32_sycl(src0_dd_i, src0_ddq_as_f32.get(), row_diff * ne00, stream);
+
+            // llama.cpp-dkw0: mirror the Q8_0-COALESCED special case that
+            // llama.cpp-e3xj already added to the sibling oneDNN/oneMath F16
+            // GEMM branches above (search q8_0_coalesced_ptr in this
+            // function). This fp32 GEMM branch is the one actually taken
+            // whenever the outer `use_fp16` gate is false (e.g. a
+            // GGML_SYCL_F16=OFF build) or any of its other conditions
+            // decline -- and it never got the same fix, so a Q8_0 weight
+            // materialized COALESCED fell through to the flat, layout-blind
+            // to_fp32_sycl() dispatcher below, which for Q8_0 reads scale
+            // bytes as quant bytes and vice versa: deterministic garbage,
+            // confirmed root cause of llama.cpp-dkw0 track (b). Look the
+            // coalesced pointer up directly (independent of what src0_dd_i
+            // already resolved to) rather than trusting a toggle whose
+            // purpose is choosing a GEMM *strategy*, not deciding whether
+            // these bytes are safe to read as AOS -- if no coalesced,
+            // device/shared-resident materialization exists (cache miss,
+            // host tier, GGML_SYCL_Q8_ONEDNN_COALESCED=0 never materialized
+            // it, etc.) this falls straight through to the unmodified
+            // to_fp32_sycl() path below, never erroring.
+            void * dkw0_q8_0_coalesced_ptr = nullptr;
+            if (src0->type == GGML_TYPE_Q8_0) {
+                void * dkw0_candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
+                if (dkw0_candidate) {
+                    const sycl::usm::alloc dkw0_ptr_type = ggml_sycl_get_alloc_type(dkw0_candidate);
+                    if (dkw0_ptr_type == sycl::usm::alloc::device || dkw0_ptr_type == sycl::usm::alloc::shared) {
+                        dkw0_q8_0_coalesced_ptr = dkw0_candidate;
+                    }
+                }
+            }
+            if (dkw0_q8_0_coalesced_ptr) {
+                const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
+                dequantize_row_q8_0_coalesced_to_fp32_rowmajor(dkw0_q8_0_coalesced_ptr, src0_ddq_as_f32.get(),
+                                                               blocks_per_row, static_cast<int>(row_diff), stream);
+            } else {
+                const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src0->type, dst, src0_full_tensor);
+                GGML_ASSERT(to_fp32_sycl != nullptr);
+                to_fp32_sycl(src0_dd_i, src0_ddq_as_f32.get(), row_diff * ne00, stream);
+            }
         }
         if (src1->type != GGML_TYPE_F32) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp32_sycl", dst, /*num_src=*/2,

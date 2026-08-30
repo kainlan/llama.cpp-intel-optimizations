@@ -171,6 +171,14 @@ void dequantize_row_q8_0_coalesced_to_fp16_rowmajor(
     int nrows,
     dpct::queue_ptr stream);
 
+// llama.cpp-dkw0: fp32 sibling used directly by the legacy to_fp32 call site.
+void dequantize_row_q8_0_coalesced_to_fp32_rowmajor(
+    const void * src,
+    float * dst,
+    int blocks_per_row,
+    int nrows,
+    dpct::queue_ptr stream);
+
 void dequantize_row_q8_0_soa_to_fp16_rowmajor(
     const void * src,
     sycl::half * dst,
