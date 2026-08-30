@@ -5579,6 +5579,16 @@ struct ggml_backend_sycl_context {
     struct sycl_exec_graph_replay_state {
         sycl_exec_graph_key key;
         bool                valid = false;
+        // llama.cpp-dkw0 (defect #4, hypothesis: graph_hash collision between two
+        // distinct splits that share topology+shape but not tensor identity):
+        // identity of the first node recorded into this slot's executable graph,
+        // captured at record time so a later "match" decision can be checked
+        // against the CURRENT call's first node under GGML_SYCL_DKW0_PTR_CHECK.
+        // Empty/zero until the first real record (see sycl_exec_graph_mark_active).
+        char        dkw0_node0_name[64] = {};
+        int         dkw0_node0_op       = -1;
+        char        dkw0_src0_name[64]  = {};
+        const void * dkw0_src0_data     = nullptr;
     };
 
     std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
@@ -5588,6 +5598,37 @@ struct ggml_backend_sycl_context {
     int      warmup_decode_n_nodes    = 0;      // Track which decode graph has been warmed up
     int      warmup_prompt_n_nodes    = 0;      // Track which prompt graph has been warmed up
     bool     graphs_disabled          = false;  // Set when graph recording fails; disables graphs for this context
+    // llama.cpp-dkw0 (defect #4 closing fix): one exec_graph slot per context but
+    // partial-offload graphs fragment a token's compute into many small,
+    // differently-shaped splits that all cycle through that single slot. The
+    // slot then invalidates+re-records almost every eligible call and never
+    // gets to replay -- all the cost and unsoundness of command-graph capture
+    // (record-mode execution of fragmented splits was bisected as the actual
+    // garbage-output mechanism), none of the benefit. This counts consecutive
+    // RECORDS whose signature differs from the previously recorded one --
+    // observed at the two actual record sites, not at the slot-state check --
+    // and permanently falls back to direct dispatch for the context once it
+    // trips, leaving the whole-graph regime (single split, stable shape, real
+    // reuse -- ngl=99 Mistral/GPT-OSS) untouched: it records once, then every
+    // later call is a genuine replay match and the counter never grows past 0.
+    // exec_graph_last_recorded_hash/exec_graph_has_recorded deliberately
+    // persist across sycl_exec_graph_clear_active(): the slot going empty
+    // between eligible calls is exactly the symptom being measured, so the
+    // observation point must not itself depend on the slot being populated.
+    int      exec_graph_consecutive_misses  = 0;
+    bool     exec_graph_replay_futile       = false;
+    uint64_t exec_graph_last_recorded_hash  = 0;
+    bool     exec_graph_has_recorded        = false;
+    // llama.cpp-dkw0 (N9 fix-round-2): the preventive '#'-name scan lives on
+    // the SHARED path (before the record/replay branch decision), not inside
+    // a specific record branch -- a branch-local placement (tried and
+    // reverted) missed fragmentation on at least one path the actual records
+    // flowed through, and proving branch-local coverage requires enumerating
+    // every path that can reach a record, which the shared path does not
+    // need. Memoized against graph_hash so the healthy whole-graph regime
+    // (one shape, forever) scans once instead of every call.
+    uint64_t exec_graph_last_scanned_hash   = 0;
+    bool     exec_graph_has_scanned         = false;
     bool     moe_graphs_disabled      = false;  // Set when MoE preload fails; disables graphs for all splits
     bool     moe_graphs_disabled_once = false;  // Set when we skip graphs for a single run
     bool     moe_graph_rerecord       = false;  // Once set, never cleared — MoE models always re-record per token

@@ -92196,6 +92196,44 @@ static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph) {
     return h;
 }
 
+// llama.cpp-dkw0 (defect #4 closing fix, preventive fragmentation detector):
+// ggml_backend_sched rewires every cross-backend split input to a device copy
+// tensor named "%s#%s#%d" (backend name # source tensor name # copy index --
+// see ggml_format_name(tensor_copy, ...) in ggml-backend.cpp). A single-split
+// whole-graph workload (ngl=99: the entire model is one SYCL split) never has
+// such a tensor anywhere in its graph. A partial-offload split, by
+// construction, always does -- that is precisely how sched hands it its
+// cross-backend inputs. So this is a structural, zero-false-positive signal
+// that the current call is a fragment of a larger multi-backend graph, and it
+// is available BEFORE the first record: the reactive consecutive-miss counter
+// (see sycl_exec_graph_mark_active) can only stop FUTURE thrashing once it has
+// already seen several bad records go out; this stops the first one.
+static bool ggml_sycl_graph_has_split_boundary_tensor(const ggml_cgraph * cgraph) {
+    if (!cgraph) {
+        return false;
+    }
+    auto name_has_hash = [](const ggml_tensor * t) { return t && t->name[0] && strchr(t->name, '#') != nullptr; };
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        if (name_has_hash(cgraph->leafs[i])) {
+            return true;
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (name_has_hash(node)) {
+            return true;
+        }
+        if (node) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (name_has_hash(node->src[j])) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 static ggml_backend_sycl_context::sycl_exec_graph_key sycl_exec_graph_make_key(const ggml_backend_sycl_context & ctx,
                                                                                const ggml_cgraph *               cgraph,
                                                                                uint64_t graph_hash,
@@ -92229,7 +92267,8 @@ static const char * sycl_exec_graph_miss_reason(const ggml_backend_sycl_context 
 }
 
 static void sycl_exec_graph_mark_active(ggml_backend_sycl_context &                            ctx,
-                                        const ggml_backend_sycl_context::sycl_exec_graph_key & key) {
+                                        const ggml_backend_sycl_context::sycl_exec_graph_key & key,
+                                        const ggml_cgraph * recorded_cgraph = nullptr) {
     ctx.active_exec_graph.key   = key;
     ctx.active_exec_graph.valid = true;
 
@@ -92238,6 +92277,72 @@ static void sycl_exec_graph_mark_active(ggml_backend_sycl_context &             
     ctx.exec_graph_n_nodes   = key.n_nodes;
     ctx.exec_graph_is_decode = key.is_decode;
     ctx.exec_graph_hash      = key.graph_hash;
+
+    // llama.cpp-dkw0 (defect #4 closing fix, replay-futility gate): gated on
+    // `recorded_cgraph` alone (any genuine record), NOT on it having any
+    // nodes or a populated first node -- unlike the identity capture below,
+    // which genuinely needs a real node[0] to snapshot, this counter's job is
+    // just "was this call a record", and gating it on the same precondition
+    // as the identity capture would silently let a zero-node or empty-first-
+    // node record escape the futility count entirely. This executes at every
+    // genuine record independent of whether the slot was populated on entry
+    // -- unlike a check keyed off exec_graph being non-null, it survives
+    // sycl_exec_graph_clear_active() nulling the slot between calls, which is
+    // the actual symptom being measured (fragmented partial-offload graphs
+    // invalidate almost every eligible call). A record of the SAME signature
+    // as last time means the prior graph was lost to something other than a
+    // shape change (e.g. a recording exception) and is not counted as
+    // thrashing; any different signature is another re-record with no
+    // intervening replay.
+    if (recorded_cgraph) {
+        if (!ctx.exec_graph_has_recorded || ctx.exec_graph_last_recorded_hash != key.graph_hash) {
+            ctx.exec_graph_has_recorded       = true;
+            ctx.exec_graph_last_recorded_hash = key.graph_hash;
+            constexpr int REPLAY_FUTILITY_THRESHOLD = 12;
+            ctx.exec_graph_consecutive_misses++;
+            if (ctx.exec_graph_consecutive_misses > REPLAY_FUTILITY_THRESHOLD && !ctx.exec_graph_replay_futile) {
+                ctx.exec_graph_replay_futile = true;
+                GGML_LOG_WARN(
+                    "[SYCL-GRAPH] replay futility: %d consecutive re-records with no intervening replay hit "
+                    "on device %d -- disabling command-graph record/replay for this context (direct dispatch "
+                    "only from here on). This is expected for fragmented partial-offload graphs (many small, "
+                    "differently-shaped splits sharing one exec-graph slot); it should never trip for a "
+                    "whole-graph, single-split workload.\n",
+                    ctx.exec_graph_consecutive_misses, ctx.device);
+                // llama.cpp-dkw0 (N8): the just-tripped record's own pins/pool
+                // retentions must NOT be released here -- the caller still has
+                // to submit this graph's one-time execution via
+                // ext_oneapi_graph() right after this function returns, and
+                // sycl_exec_graph_clear_active() would reset ctx.exec_graph to
+                // null out from under that submission (crash: dereferencing an
+                // empty unique_ptr). Both record call sites instead check
+                // ctx->exec_graph_replay_futile right AFTER their execute-once
+                // submission and call sycl_exec_graph_clear_active() there,
+                // where clear_active's own wait-before-destroy guard covers
+                // waiting for that submission to finish first.
+            }
+        }
+    }
+
+    // llama.cpp-dkw0: only a REAL record (caller passes the cgraph that was
+    // just captured into ctx.exec_graph) updates the remembered identity.  The
+    // legacy-key-reconstruction call sites pass nullptr deliberately -- they are
+    // re-deriving tracking state for an ALREADY-recorded graph, not recording a
+    // new one, so they must not overwrite what was actually baked into the slot.
+    if (recorded_cgraph && recorded_cgraph->n_nodes > 0 && recorded_cgraph->nodes[0]) {
+        const ggml_tensor * node0 = recorded_cgraph->nodes[0];
+        snprintf(ctx.active_exec_graph.dkw0_node0_name, sizeof(ctx.active_exec_graph.dkw0_node0_name), "%s",
+                 node0->name);
+        ctx.active_exec_graph.dkw0_node0_op = (int) node0->op;
+        if (node0->src[0]) {
+            snprintf(ctx.active_exec_graph.dkw0_src0_name, sizeof(ctx.active_exec_graph.dkw0_src0_name), "%s",
+                     node0->src[0]->name);
+            ctx.active_exec_graph.dkw0_src0_data = node0->src[0]->data;
+        } else {
+            ctx.active_exec_graph.dkw0_src0_name[0] = '\0';
+            ctx.active_exec_graph.dkw0_src0_data    = nullptr;
+        }
+    }
 }
 
 static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ctx) {
@@ -92266,11 +92371,43 @@ static void sycl_exec_graph_release_pool_retained(ggml_backend_sycl_context * ct
     }
 }
 
+// llama.cpp-dkw0: NOT side-effect-free even when exec_graph is already null --
+// besides tearing down the executable graph, this unconditionally unpins MoE
+// experts/weights, clears the CPU staging cache, and invalidates MoE
+// segment/phase-layout/input-tensor caches. Calling it at a point where
+// nothing was recorded still perturbs that other state; a caller with
+// nothing to release should skip the call rather than rely on this being a
+// no-op (measured regression: calling it unconditionally at a preventive,
+// nothing-recorded-yet trip site altered gemma's decode output relative to
+// GGML_SYCL_DISABLE_GRAPH=1 at identical settings).
 static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const char * reason) {
     if (!ctx) {
         return;
     }
     GGML_SYCL_DEBUG("[SYCL-GRAPH] clearing active graph state (%s)\n", reason ? reason : "unknown");
+    // llama.cpp-dkw0 (defect #4): the exec_graph wrapper's destructor tears
+    // down the executable graph's device-side resources (SYCL's
+    // exec_graph_impl). Every caller here reaches this point via a fire-
+    // and-forget submission path -- ggml_backend_sycl_graph_compute_unchecked's
+    // own comment two call sites over documents this deliberately ("these
+    // paths return WITHOUT waiting for the work they just submitted... the
+    // release then happens... after the queue wait") -- so at a phase
+    // boundary (PP<->TG, model teardown, re-record) the graph this call is
+    // about to destroy can still have GPU work in flight from the LAST
+    // ext_oneapi_graph() submission on this stream. Destroying the C++
+    // wrapper while that submission is still outstanding double-frees the
+    // runtime's own graph-execution bookkeeping the instant it completes and
+    // tries to clean up after itself -- reproduced live as a glibc "corrupted
+    // size vs. prev_size" abort with an exec_graph_impl destructor frame
+    // (gdb backtrace, llama.cpp-dkw0 defect #4), and the far more common
+    // failure mode on a heap layout that merely shifts instead of aborting:
+    // silent execution of stale/freed graph state. This function is a rare,
+    // phase-boundary event (once per prompt/generation transition), never a
+    // per-token hot path, so an explicit wait here does not touch the "no
+    // host waits" performance rule that governs per-op dispatch.
+    if (ctx->exec_graph) {
+        ggml_sycl_trace_queue_wait(ctx->stream(), reason ? reason : "exec-graph-clear", ctx->device, -1, nullptr);
+    }
     ctx->exec_graph.reset();
     sycl_exec_graph_release_pool_retained(ctx);
     ctx->active_exec_graph.valid = false;
@@ -99459,10 +99596,77 @@ normal_dispatch:
 
         // Layout finalization decides coalesced usage before graph recording.
         // Minimum nodes to benefit from graph batching - skip tiny graphs
-        constexpr int MIN_GRAPH_NODES = 10;
+        //
+        // llama.cpp-dkw0 (defect #4 bisect lever): env-overridable so the team
+        // can sweep the threshold {12, 14, 17, 99, ...} against the eligible
+        // split-size distribution (13/11/16-node splits dominate) without a
+        // recompile per value, to localize which split size's RECORD-MODE
+        // execution (as opposed to eager compute_impl dispatch) produces
+        // garbage. Default unchanged at 10.
+        static const int MIN_GRAPH_NODES = [] {
+            const char * env = std::getenv("GGML_SYCL_GRAPH_MIN_NODES");
+            return (env && std::atoi(env) > 0) ? std::atoi(env) : 10;
+        }();
         if (cgraph->n_nodes < MIN_GRAPH_NODES) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] skipping - graph too small (%d < %d nodes)\n", cgraph->n_nodes,
                             MIN_GRAPH_NODES);
+            compute_impl_unlocked();
+            record_completion(false);
+            return GGML_STATUS_SUCCESS;
+        }
+        // llama.cpp-dkw0 (defect #4 closing fix, preventive, N9): scanned on
+        // this SHARED path -- before the record/replay branch decision --
+        // rather than inside a specific record branch. A branch-local
+        // placement (tried and reverted: gemma ngl1 regressed to garbage
+        // again, log showed 13 record-mode executions before the REACTIVE
+        // counter tripped, meaning this preventive scan never fired) missed
+        // fragmentation on at least one path the actual records flowed
+        // through. Proving a branch-local placement covers every path that
+        // can reach a record requires enumerating them all; this shared
+        // placement needs no such proof -- every eligible call passes through
+        // here before any branch is chosen. Memoized against graph_hash (see
+        // exec_graph_last_scanned_hash) so the healthy whole-graph regime
+        // (one shape, forever) pays one strchr sweep total instead of one per
+        // call.
+        if (!sycl_ctx->exec_graph_replay_futile &&
+            (!sycl_ctx->exec_graph_has_scanned || sycl_ctx->exec_graph_last_scanned_hash != graph_hash)) {
+            sycl_ctx->exec_graph_has_scanned       = true;
+            sycl_ctx->exec_graph_last_scanned_hash = graph_hash;
+            if (ggml_sycl_graph_has_split_boundary_tensor(cgraph)) {
+                sycl_ctx->exec_graph_replay_futile = true;
+                GGML_LOG_WARN(
+                    "[SYCL-GRAPH] replay futility: fragmented-split detected on device %d (a node/src/leaf name "
+                    "contains '#', the ggml_backend_sched cross-backend split-copy marker) -- disabling "
+                    "command-graph record/replay for this context. Whole-graph workloads (ngl=99, a single "
+                    "split) never carry such tensors.\n",
+                    sycl_ctx->device);
+                // llama.cpp-dkw0 (N8 correction): do NOT unconditionally call
+                // clear_active here. At THIS trip site nothing has been
+                // recorded yet -- exec_graph is null in the common case, so
+                // there are no graph pins to release -- but clear_active's
+                // teardown is not side-effect-free even when exec_graph is
+                // null: it also unpins MoE experts/weights, clears the CPU
+                // staging cache, and invalidates MoE segment/phase-layout/
+                // input-tensor caches unconditionally. Running that mid-PP,
+                // when nothing was recorded, perturbed OTHER machinery's state
+                // that was still relying on it (measured: gemma ngl1 went
+                // from clean digits to a stuttering "...8, 8, 8," relative to
+                // GGML_SYCL_DISABLE_GRAPH=1 at identical settings, once this
+                // call was added here). Only clear if a graph actually exists
+                // to release -- the corner where one somehow does at this
+                // preventive trip (e.g. carried over from a prior call).
+                if (sycl_ctx->exec_graph) {
+                    sycl_exec_graph_clear_active(sycl_ctx, "replay-futility");
+                }
+            }
+        }
+        // llama.cpp-dkw0 (defect #4 closing fix): once this context has proven
+        // the record/replay slot is thrashing (see the counter update below,
+        // and the preventive scan just above), stop paying for record-mode
+        // capture on every call -- it is not just wasted cost, it is the
+        // bisected root cause of the garbage output.
+        if (sycl_ctx->exec_graph_replay_futile) {
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] skipping - replay futility gate tripped for this context\n");
             compute_impl_unlocked();
             record_completion(false);
             return GGML_STATUS_SUCCESS;
@@ -99484,6 +99688,24 @@ normal_dispatch:
             }
 
             const char * miss_reason = sycl_exec_graph_miss_reason(*sycl_ctx, graph_key);
+
+            // llama.cpp-dkw0 (defect #4 closing fix): a "match" here means the
+            // slot is about to be replayed for real (falls through, unchanged
+            // below, to the "else if (sycl_ctx->exec_graph)" replay branch) --
+            // reset the thrash counter. The INCREMENT side deliberately does
+            // NOT live here: this block only runs when exec_graph is already
+            // non-null, but sycl_exec_graph_clear_active() nulls it on almost
+            // every miss in the fragmented regime, so a call-site check here
+            // would miss most of the misses it needs to count (measured: the
+            // slot was empty at entry on all but one of 2340 calls). The
+            // increment instead happens at the two actual record sites below,
+            // against exec_graph_last_recorded_hash, which is NOT reset by
+            // clear_active and so survives exactly the slot-emptying this
+            // check cannot see through.
+            if (std::strcmp(miss_reason, "match") == 0) {
+                sycl_ctx->exec_graph_consecutive_misses = 0;
+            }
+
             if (std::strcmp(miss_reason, "match") != 0) {
                 GGML_SYCL_DEBUG(
                     "[SYCL-GRAPH] invalidating active graph: reason=%s old(device=%d phase=%s nodes=%d hash=%llu) "
@@ -99830,12 +100052,23 @@ normal_dispatch:
                 auto exec_graph = model_sycl_graph.finalize();
                 sycl_ctx->exec_graph =
                     std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-                sycl_exec_graph_mark_active(*sycl_ctx, graph_key);
+                sycl_exec_graph_mark_active(*sycl_ctx, graph_key, cgraph);
 
                 graph_executed = true;
                 sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
                 g_graph_diag_counters.rerecord_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
+                // llama.cpp-dkw0 (N8): if THIS record just tripped replay
+                // futility (sycl_exec_graph_mark_active's reactive counter),
+                // release its pins/pool retentions now instead of holding them
+                // for the context's lifetime. Must run AFTER the execute-once
+                // submission above, never before -- clear_active would reset
+                // ctx->exec_graph to null, and the submission line right above
+                // dereferences it. clear_active's own wait-before-destroy guard
+                // covers waiting for that submission to complete first.
+                if (sycl_ctx->exec_graph_replay_futile) {
+                    sycl_exec_graph_clear_active(sycl_ctx, "replay-futility");
+                }
             } catch (const sycl::exception & exc) {
                 g_ggml_sycl_graph_recording = false;
                 g_recording_graph_ptr       = nullptr;
@@ -99995,7 +100228,7 @@ normal_dispatch:
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] finalize done, creating unique_ptr...\n");
                 sycl_ctx->exec_graph =
                     std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
-                sycl_exec_graph_mark_active(*sycl_ctx, graph_key);
+                sycl_exec_graph_mark_active(*sycl_ctx, graph_key, cgraph);
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] unique_ptr created, cached n_nodes=%d, phase=%s\n", cgraph->n_nodes,
                                 is_decode_phase ? "decode" : "prompt");
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute new graph...\n");
@@ -100004,6 +100237,11 @@ normal_dispatch:
                 sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
                 g_graph_diag_counters.full_record_success.fetch_add(1, std::memory_order_relaxed);
                 recording_guard.committed = true;
+                // llama.cpp-dkw0 (N8): same reasoning as the re-record site
+                // above -- only safe AFTER the execute-once submission.
+                if (sycl_ctx->exec_graph_replay_futile) {
+                    sycl_exec_graph_clear_active(sycl_ctx, "replay-futility");
+                }
 
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] execute done\n");
             } catch (const sycl::exception & exc) {
