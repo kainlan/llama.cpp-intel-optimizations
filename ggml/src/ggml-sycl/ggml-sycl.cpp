@@ -13304,6 +13304,54 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
                 ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
                                          tensor->name ? tensor->name : "unknown", (void *) existing.extra,
                                          (void *) extra);
+                // llama.cpp-dkw0: tied-weight aliasing fix. A name collision
+                // here means TWO DISTINCT ggml_tensor* objects reference the
+                // SAME logical weight (llama-model-loader's TENSOR_DUPLICATED
+                // path for tied token_embd/output, or per-layer rope_freqs) --
+                // the identity-keyed unified cache already treats them as one
+                // shared entry (proven: identical cache_id for both). Before
+                // this fix, the code below released (and, on refcount 0,
+                // *deleted*) the displaced tensor's OWN extra while that
+                // tensor's `->extra` field still pointed at it -- a live
+                // dangling pointer the instant that freed memory is reused
+                // for an unrelated tensor's `new ggml_tensor_extra_gpu{}`
+                // (proven: token_embd's output-projection role ended up
+                // reading per_layer_token_embd.weight's freshly-allocated
+                // extra, which landed at the exact address just freed here).
+                // Fix: re-point the DISPLACED tensor's own extra to the
+                // WINNER instead of leaving it dangling -- both tensor
+                // objects now correctly alias the one shared extra.
+                //
+                // Deliberately NOT taking an extra retain_extra_gpu() here for
+                // loser_tensor (an earlier revision of this fix did, and
+                // leaked exactly one lease per tied pair -- caught at
+                // teardown as "weight entry still leased with NO live model
+                // owning it"). For the case actually verified here (gemma's
+                // tied token_embd/output pair, both loser_tensor and the
+                // winner routed through a GPU weights buffer): loser_tensor's
+                // own ggml_backend_sycl_buffer_init_tensor() call already gave
+                // displaced_extra a retain of its own on loser_tensor's behalf
+                // (the "reuse an existing extra" branch there: reused =>
+                // retain_extra_gpu(), then an unconditional
+                // ctx->tensor_extras.push_back({loser_tensor,
+                // displaced_extra})) -- that push recorded the pointer VALUE
+                // at push time and is not touched by this redirect, so it
+                // still correctly releases displaced_extra (not `extra`) at
+                // loser_tensor's own buffer teardown, independent of what
+                // loser_tensor->extra points to from here on. The release
+                // below (release_extra_gpu(displaced_extra)) only drops the
+                // registry's own implicit hold, which is exactly balanced by
+                // that one remaining tensor_extras-driven reference in this
+                // case -- adding a second retain on `extra` here has no
+                // corresponding release and is a pure leak, not extra safety.
+                // This specific balance argument is scoped to a loser_tensor
+                // whose own init_tensor() went through that GPU-buffer path;
+                // a host-routed loser_tensor follows a different init path
+                // not traced here and its retain bookkeeping was not
+                // separately verified -- confirmed leak-free (no leaked-lease
+                // warning at teardown) only for the GPU-buffer-routed tied
+                // pair this fix was built against.
+                ggml_tensor * loser_tensor = (existing.extra != extra) ? existing.tensor : nullptr;
                 if (existing.extra != extra) {
                     displaced_extra = existing.extra;
                 }
@@ -13312,6 +13360,10 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
                 tensor->layout = extra ? &extra->layout : nullptr;
                 if (!created_extra) {
                     retain_extra_gpu(extra);
+                }
+                if (loser_tensor && loser_tensor != tensor && extra) {
+                    loser_tensor->extra  = extra;
+                    loser_tensor->layout = &extra->layout;
                 }
             }
         } else if (!created_extra) {
@@ -42401,7 +42453,27 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                     if (src0->extra != nullptr && i >= 0 && i < GGML_SYCL_MAX_DEVICES) {
                         const auto * extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
                         const auto & handle = extra->data_handle[i];
-                        if (handle.device() == i || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
+                        // llama.cpp-dkw0 (fix for defect #3, gemma tied-embedding
+                        // garbage logits): this direct-handle consult was missing
+                        // the same trust gate ggml_sycl_resolve() applies
+                        // (common.hpp:4749, ggml_sycl_direct_handle_trust_ok) --
+                        // proven root cause via GGML_SYCL_DKW0_PTR_CHECK: for
+                        // gemma's tied token_embd/output pair, the SECOND
+                        // ggml_tensor* (output-projection role) carries a DIRECT
+                        // handle whose cached pointer was minted from a transient
+                        // staging allocation later re-dealt to a foreign tenant
+                        // (per_layer_token_embd.weight's own materialization) --
+                        // the exact llama.cpp-2gag corruption
+                        // ggml_sycl_direct_handle_trust_ok's own comment
+                        // describes. This site skipped the trust check and
+                        // returned the stale pointer instead of falling through
+                        // to this function's own next fallback branch
+                        // (ggml_sycl_get_weight_layout_ptr, below) the way
+                        // ggml_sycl_resolve() falls through to its cache lookup.
+                        // Gate identically to close the hole without touching any
+                        // other behavior in this branch.
+                        if ((handle.device() == i || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) &&
+                            ggml_sycl_direct_handle_trust_ok(src0, handle)) {
                             resolved = handle.resolve(i);
                         }
                     }
