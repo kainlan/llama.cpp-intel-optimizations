@@ -48336,10 +48336,51 @@ static bool ggml_sycl_try_cross_device_f16_attention(ggml_backend_sycl_context &
         return ggml_sycl_mul_mat_batched_f16_fallback(ctx, src0, src1, dst);
     }
 
-    ggml_tensor_extra_gpu * src0_extra = static_cast<ggml_tensor_extra_gpu *>(src0 ? src0->extra : nullptr);
-    ggml_tensor_extra_gpu * src1_extra = static_cast<ggml_tensor_extra_gpu *>(src1 ? src1->extra : nullptr);
-    ggml_tensor_extra_gpu * dst_extra  = static_cast<ggml_tensor_extra_gpu *>(dst ? dst->extra : nullptr);
+    // llama.cpp-dkw0: a genuinely host-resident (CPU-computed) attention
+    // operand -- e.g. the Q activation at a CPU/GPU layer boundary under
+    // partial offload -- never gets SYCL tensor-extra metadata, because the
+    // SYCL backend never touched its buffer. Staging below needs a home to
+    // record the recovered device handle in, so mint one lazily for whichever
+    // operand actually needs staging, instead of refusing recovery outright.
+    // Mirrors the identical pattern already used for `dst` by
+    // ggml_sycl_try_route_flash_attn_ext and the simple-consumer-routing
+    // helper elsewhere in this file.
+    auto ensure_root_extra = [&](const ggml_tensor * tensor) -> ggml_tensor_extra_gpu * {
+        ggml_tensor * root = const_cast<ggml_tensor *>(ggml_sycl_attention_root(tensor));
+        if (!root) {
+            return nullptr;
+        }
+        if (root->extra == nullptr) {
+            auto * extra = new ggml_tensor_extra_gpu{};
+            ggml_sycl_register_optimize_feature(&extra->optimized_feature);
+            root->extra = extra;
+            ctx.runtime_tensor_extras.push_back({ root, extra });
+            ggml_sycl_init_layout_info(extra, root, ctx.device, /*use_tensor_data_ptr=*/false);
+        }
+        return static_cast<ggml_tensor_extra_gpu *>(root->extra);
+    };
+
+    ggml_tensor_extra_gpu * src0_extra =
+        stage_src0 ? ensure_root_extra(src0) : static_cast<ggml_tensor_extra_gpu *>(src0 ? src0->extra : nullptr);
+    ggml_tensor_extra_gpu * src1_extra =
+        stage_src1 ? ensure_root_extra(src1) : static_cast<ggml_tensor_extra_gpu *>(src1 ? src1->extra : nullptr);
+    ggml_tensor_extra_gpu * dst_extra =
+        stage_dst ? ensure_root_extra(dst) : static_cast<ggml_tensor_extra_gpu *>(dst ? dst->extra : nullptr);
     if ((stage_src0 && !src0_extra) || (stage_src1 && !src1_extra) || (stage_dst && !dst_extra)) {
+        // llama.cpp-dkw0: this branch's own GGML_LOG_WARN was found to lose
+        // its race against common_log's background worker thread when this
+        // return immediately reaches the caller's GGML_ABORT (same-thread,
+        // near-zero elapsed time -- the worker never gets scheduled to drain
+        // it; see llama.cpp-dkw0 milestone-2 comment on this ticket). Mirror
+        // it with a raw fprintf(stderr), which is unbuffered and has been
+        // confirmed to survive that exact race, so this now-rare fallback
+        // (ensure_root_extra itself failed, e.g. no attention root) stays
+        // observable instead of presenting as a silent abort.
+        fprintf(stderr,
+                "[SYCL] F16 attention routing failed: missing tensor extra target=%d stage_src0=%d src0_extra=%p "
+                "stage_src1=%d src1_extra=%p stage_dst=%d dst_extra=%p\n",
+                target_device, stage_src0 ? 1 : 0, (void *) src0_extra, stage_src1 ? 1 : 0, (void *) src1_extra,
+                stage_dst ? 1 : 0, (void *) dst_extra);
         GGML_LOG_WARN(
             "[SYCL] F16 attention routing failed: missing tensor extra target=%d stage_src0=%d src0_extra=%p "
             "stage_src1=%d src1_extra=%p stage_dst=%d dst_extra=%p\n",
