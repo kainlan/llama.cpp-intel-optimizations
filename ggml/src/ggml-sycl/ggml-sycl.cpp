@@ -13304,6 +13304,34 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
                 ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
                                          tensor->name ? tensor->name : "unknown", (void *) existing.extra,
                                          (void *) extra);
+                // llama.cpp-dkw0: registry reconcile snapshot -- logs BOTH
+                // sides' data_handle[0] state at the exact moment of the
+                // mismatch, before `existing = new_entry` overwrites the row.
+                // Settles whether the displaced ("existing") tensor already
+                // carried a valid WEIGHT handle before this reconcile (seeded
+                // earlier during load) or is still empty here (bound later,
+                // after this point, by whatever consumes the "second"
+                // FROM_WEIGHT_LEASE_SNAPSHOT).
+                if (tensor->name && std::strstr(tensor->name, "token_embd")) {
+                    static const char * dkw0_registry_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                    if (dkw0_registry_check_env && std::atoi(dkw0_registry_check_env) != 0) {
+                        static std::atomic<int> dkw0_registry_check_count{ 0 };
+                        if (dkw0_registry_check_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+                            const auto & existing_handle = existing.extra ? existing.extra->data_handle[0] :
+                                                                            ggml_sycl::mem_handle{};
+                            const auto & new_handle       = extra ? extra->data_handle[0] : ggml_sycl::mem_handle{};
+                            fprintf(stderr,
+                                    "[DKW0-MINT-CHECK] REGISTRY_RECONCILE name=%s existing_tensor=%p "
+                                    "existing_extra=%p existing_handle_kind=%d existing_handle_valid=%d "
+                                    "new_tensor=%p new_extra=%p new_handle_kind=%d new_handle_valid=%d\n",
+                                    tensor->name, (const void *) existing.tensor, (void *) existing.extra,
+                                    existing.extra ? (int) existing_handle.kind() : -1,
+                                    existing.extra ? (existing_handle.valid() ? 1 : 0) : -1, (const void *) tensor,
+                                    (void *) extra, extra ? (int) new_handle.kind() : -1,
+                                    extra ? (new_handle.valid() ? 1 : 0) : -1);
+                        }
+                    }
+                }
                 // llama.cpp-dkw0: tied-weight aliasing fix. A name collision
                 // here means TWO DISTINCT ggml_tensor* objects reference the
                 // SAME logical weight (llama-model-loader's TENSOR_DUPLICATED
@@ -13770,6 +13798,38 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
         id.aux_id = cache_uuid;
     } else {
         id.aux_id = 0;
+    }
+
+    // llama.cpp-dkw0: token_embd.weight is tied (gemma) -- llama-model-loader
+    // creates a SECOND, distinct ggml_tensor* for the output-projection role
+    // (same name, per the fzem duplicate-tensor comment above
+    // g_sycl_host_weight_extras). The comment right above (id.name_hash "does
+    // NOT participate in equality for a GGUF-backed weight") says both
+    // instances SHOULD collapse to the same cache_id via
+    // (file_id,file_offs,nbytes,type,ne) -- but that only holds when
+    // has_gguf_identity is true for BOTH calls. If model_id/owner resolution
+    // (extra->model_id -> ggml_sycl_exact_wrapper_owner) differs between the
+    // GET_ROWS call site (embedding role, known-correct per the divergence
+    // hunt) and the MUL_MAT call site (output-projection role, proven
+    // corrupted -- device bytes are byte-exact per_layer_token_embd.weight),
+    // one of them falls into the has_gguf_identity=false / aux_id branch
+    // above and gets a DIFFERENT, non-shared cache_id -- which would explain
+    // why the two consumers of "the same" weight end up with different
+    // device data. This print settles it in one run.
+    if (tensor->name && std::strcmp(tensor->name, "token_embd.weight") == 0) {
+        static const char * dkw0_cache_id_check_env = std::getenv("GGML_SYCL_DKW0_CACHE_ID_CHECK");
+        if (dkw0_cache_id_check_env && std::atoi(dkw0_cache_id_check_env) != 0) {
+            static std::atomic<int> dkw0_cache_id_check_count{ 0 };
+            if (dkw0_cache_id_check_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                fprintf(stderr,
+                        "[DKW0-CACHE-ID-CHECK] tensor=%p name=%s extra=%p model_id=%llu "
+                        "has_gguf_identity=%d file_id=%llu file_idx=%u file_offs=%llu nbytes=%llu aux_id=%llu\n",
+                        (const void *) tensor, tensor->name, (const void *) extra,
+                        (unsigned long long) (extra ? extra->model_id : 0), has_gguf_identity ? 1 : 0,
+                        (unsigned long long) id.file_id, (unsigned) id.file_idx, (unsigned long long) id.file_offs,
+                        (unsigned long long) id.nbytes, (unsigned long long) id.aux_id);
+            }
+        }
     }
 
     return id;
@@ -31781,6 +31841,27 @@ static void ggml_sycl_preload_model_weights() {
                     auto result = ggml_sycl::unified_cache_direct_stage_weight(device, cache_key, src_ptr, src_size,
                                                                                dst_size, preload_layout, fill_fn,
                                                                                fill_ctx, s1_preload_q, &handle);
+                    // llama.cpp-dkw0: mint-time snapshot for the tied
+                    // token_embd/per_layer_token_embd bind-confusion hunt.
+                    // Captures what unified_cache_direct_stage_weight itself
+                    // returned for THIS tensor object's OWN cache_key, before
+                    // anything later (another tensor's staging call, the pin
+                    // loop) can touch it -- distinguishes "wrong from the
+                    // start" from "right here, wrong by pin time".
+                    if (tensor->name && std::strstr(tensor->name, "token_embd")) {
+                        static const char * dkw0_mint_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                        if (dkw0_mint_check_env && std::atoi(dkw0_mint_check_env) != 0) {
+                            static std::atomic<int> dkw0_mint_check_count{ 0 };
+                            if (dkw0_mint_check_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+                                fprintf(stderr,
+                                        "[DKW0-MINT-CHECK] STAGE tensor=%p extra=%p name=%s device=%d file_offs=%llu "
+                                        "src_ptr=%p result.ok=%d result.ptr=%p handle_kind=%d\n",
+                                        (const void *) tensor, (const void *) tensor->extra, tensor->name, device,
+                                        (unsigned long long) cache_key.file_offs, src_ptr, result.ok ? 1 : 0,
+                                        result.ptr, (int) handle.kind());
+                            }
+                        }
+                    }
                     if (result.ok && result.ptr) {
                         dense_cached++;
                         total_bytes += dst_size;
@@ -32272,6 +32353,30 @@ static void ggml_sycl_preload_model_weights() {
                 auto * extra = static_cast<ggml_tensor_extra_gpu *>(pin_info.tensor->extra);
                 if (extra) {
                     auto resolved = pin_info.handle.resolve(device);
+                    // llama.cpp-dkw0: WRITE-time snapshot -- this is the exact
+                    // extra->data_handle[device] assignment your ORIGIN-CHECK
+                    // traced the bad pointer to (origin=resolve_weight,
+                    // layout_source=mem_handle_exact). Compared against the
+                    // STAGE-time print above for the same tensor pointer: if
+                    // file_offs/resolved.ptr already differ from STAGE time,
+                    // something between mint and pin reassigned the handle's
+                    // bound entry; if they match here but the tensor still
+                    // reads wrong later, the corruption is in resolve()
+                    // itself or downstream of this write.
+                    if (pin_info.tensor->name && std::strstr(pin_info.tensor->name, "token_embd")) {
+                        static const char * dkw0_bind_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                        if (dkw0_bind_check_env && std::atoi(dkw0_bind_check_env) != 0) {
+                            static std::atomic<int> dkw0_bind_check_count{ 0 };
+                            if (dkw0_bind_check_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+                                fprintf(stderr,
+                                        "[DKW0-MINT-CHECK] BIND tensor=%p extra=%p name=%s device=%d file_offs=%llu "
+                                        "resolved.ptr=%p handle_kind=%d\n",
+                                        (const void *) pin_info.tensor, (const void *) extra, pin_info.tensor->name,
+                                        device, (unsigned long long) pin_info.key.file_offs, resolved.ptr,
+                                        (int) pin_info.handle.kind());
+                            }
+                        }
+                    }
                     if (resolved.ptr) {
                         extra->data_handle[device]      = pin_info.handle;
                         // llama.cpp-fzem: terminal persistent publish for these
@@ -32761,6 +32866,36 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+
+    // llama.cpp-dkw0 (worktree-only diagnostic): checksum the known-correct
+    // host bytes at upload time for the one weight under investigation, so a
+    // later dispatch-time readback (ggml_sycl_mul_mat) can be diffed against
+    // this to settle whether upload/materialization corrupts the tensor.
+    // Extended to token_embd.weight for the defect #2 hunt (final-logits
+    // MUL_MAT diverges 25x on GPU, per-element uncorrelated with CPU, while
+    // its input result_norm matches within noise -- so the defect is on the
+    // weight side of this specific dot product). Prints on EVERY call for
+    // this tensor (not just the first) since a 713MB weight may upload in
+    // multiple offset-chunked calls; cross-reference offset+size+fnv1a
+    // against the GGUF byte range offline rather than assuming one call.
+    if (tensor->name &&
+        (std::strcmp(tensor->name, "blk.0.attn_q.weight") == 0 || std::strcmp(tensor->name, "token_embd.weight") == 0)) {
+        static const char * dkw0_weight_check_env = std::getenv("GGML_SYCL_DKW0_WEIGHT_CHECK");
+        if (dkw0_weight_check_env && std::atoi(dkw0_weight_check_env) != 0) {
+            const uint8_t * dkw0_bytes    = static_cast<const uint8_t *>(data);
+            uint64_t        dkw0_checksum = 1469598103934665603ULL;
+            for (size_t i = 0; i < size; ++i) {
+                dkw0_checksum ^= dkw0_bytes[i];
+                dkw0_checksum *= 1099511628211ULL;
+            }
+            fprintf(stderr, "[DKW0-WEIGHT-CHECK] UPLOAD name=%s size=%zu offset=%zu fnv1a=0x%016llx first16=",
+                    tensor->name, size, offset, (unsigned long long) dkw0_checksum);
+            for (size_t i = 0; i < std::min<size_t>(16, size); ++i) {
+                fprintf(stderr, "%02x", dkw0_bytes[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
 
     ggml_backend_sycl_buffer_context * ctx              = (ggml_backend_sycl_buffer_context *) buffer->context;
     const bool                         is_weight_buffer = (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -41608,6 +41743,54 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                     const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
                     dequantize_row_q8_0_coalesced_to_fp16_rowmajor(q8_0_coalesced_ptr, dst_f16, blocks_per_row,
                                                                    static_cast<int>(row_diff), stream);
+                    // llama.cpp-dkw0 (worktree-only diagnostic): rather than
+                    // re-deriving the COALESCED tile/word-plane byte layout
+                    // offline (high risk of a self-inflicted transcription
+                    // bug), read back what the REAL, already-battle-tested
+                    // dequant kernel actually produced -- dst_f16 is plain
+                    // row-major [row*ne00+col], so it compares directly
+                    // against a trivial per-element dequant of the file's
+                    // AOS Q8_0 blocks (scale * int8, cast to the same f16
+                    // rounding via Python's struct 'e' format). This settles
+                    // weight-bytes-vs-kernel in one shot without needing to
+                    // trust any layout reimplementation on either side.
+                    if (src0->name && std::strcmp(src0->name, "blk.0.attn_q.weight") == 0) {
+                        static const char * dkw0_dequant_check_env = std::getenv("GGML_SYCL_DKW0_DEQUANT_CHECK");
+                        if (dkw0_dequant_check_env && std::atoi(dkw0_dequant_check_env) != 0) {
+                            static std::atomic<int> dkw0_dequant_check_count{ 0 };
+                            if (dkw0_dequant_check_count.fetch_add(1, std::memory_order_relaxed) == 0) {
+                                try {
+                                    const size_t dkw0_n_elems = static_cast<size_t>(row_diff) * static_cast<size_t>(ne00);
+                                    const size_t dkw0_bytes   = dkw0_n_elems * sizeof(sycl::half);
+                                    std::vector<sycl::half> dkw0_dequant_copy(dkw0_n_elems);
+                                    auto dkw0_dst_handle = ggml_sycl::mem_handle::from_direct(
+                                        dkw0_dequant_copy.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
+                                        ggml_sycl::mem_handle::HOST_DEVICE, dkw0_bytes);
+                                    auto dkw0_src_handle = ggml_sycl_copy_handle_for_raw_ptr(
+                                        dst_f16, GGML_LAYOUT_AOS, ctx.device, dkw0_bytes);
+                                    ggml_sycl::mem_copy(dkw0_dst_handle, dkw0_src_handle, dkw0_bytes, *stream);
+                                    stream->wait();
+                                    uint64_t dkw0_checksum = 1469598103934665603ULL;
+                                    const uint8_t * dkw0_raw = reinterpret_cast<const uint8_t *>(dkw0_dequant_copy.data());
+                                    for (size_t i = 0; i < dkw0_bytes; ++i) {
+                                        dkw0_checksum ^= dkw0_raw[i];
+                                        dkw0_checksum *= 1099511628211ULL;
+                                    }
+                                    fprintf(stderr,
+                                            "[DKW0-DEQUANT-CHECK] name=%s ne00=%lld row_diff=%lld n_elems=%zu "
+                                            "fnv1a=0x%016llx first8_f32=",
+                                            src0->name, (long long) ne00, (long long) row_diff, dkw0_n_elems,
+                                            (unsigned long long) dkw0_checksum);
+                                    for (size_t i = 0; i < std::min<size_t>(8, dkw0_n_elems); ++i) {
+                                        fprintf(stderr, "%.6f,", static_cast<float>(dkw0_dequant_copy[i]));
+                                    }
+                                    fprintf(stderr, "\n");
+                                } catch (const std::exception & e) {
+                                    fprintf(stderr, "[DKW0-DEQUANT-CHECK] readback failed: %s\n", e.what());
+                                }
+                            }
+                        }
+                    }
                 } else {
                     // CRITICAL: Pass full_tensor=false to force standard AOS dequant.
                     // src0_dd_i is an AOS data pointer. With full_tensor=true (default),
@@ -41706,6 +41889,42 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src0->type, dst, src0_full_tensor);
                 GGML_ASSERT(to_fp32_sycl != nullptr);
                 to_fp32_sycl(src0_dd_i, src0_ddq_as_f32.get(), row_diff * ne00, stream);
+            }
+            // llama.cpp-dkw0 (worktree-only diagnostic): this IS the actual
+            // legacy call site the route capture named (ggml_sycl_op_mul_mat_sycl
+            // /to_fp32_sycl) -- unlike my earlier hook in the ONEDNN_COALESCED
+            // branch, which this dispatch never reaches. Verify loop for the
+            // dequantize_row_q8_0_coalesced_to_fp32_rowmajor fix above: dump
+            // the first 8 dequantized values here, compare against the
+            // offline reference.
+            if (src0->name && std::strcmp(src0->name, "blk.0.attn_q.weight") == 0) {
+                static const char * dkw0_dequant_check_env2 = std::getenv("GGML_SYCL_DKW0_DEQUANT_CHECK");
+                if (dkw0_dequant_check_env2 && std::atoi(dkw0_dequant_check_env2) != 0) {
+                    static std::atomic<int> dkw0_dequant_check_count2{ 0 };
+                    if (dkw0_dequant_check_count2.fetch_add(1, std::memory_order_relaxed) == 0) {
+                        try {
+                            const size_t dkw0_n_elems2 = static_cast<size_t>(row_diff) * static_cast<size_t>(ne00);
+                            std::vector<float> dkw0_sample(std::min<size_t>(8, dkw0_n_elems2));
+                            auto dkw0_dst_handle2 = ggml_sycl::mem_handle::from_direct(
+                                dkw0_sample.data(), GGML_LAYOUT_AOS, /*on_device=*/false,
+                                ggml_sycl::mem_handle::HOST_DEVICE, dkw0_sample.size() * sizeof(float));
+                            auto dkw0_src_handle2 = ggml_sycl_copy_handle_for_raw_ptr(
+                                src0_ddq_as_f32.get(), GGML_LAYOUT_AOS, ctx.device,
+                                dkw0_sample.size() * sizeof(float));
+                            ggml_sycl::mem_copy(dkw0_dst_handle2, dkw0_src_handle2,
+                                               dkw0_sample.size() * sizeof(float), *stream);
+                            stream->wait();
+                            fprintf(stderr, "[DKW0-DEQUANT-CHECK] name=%s (legacy site) first8_f32=",
+                                    src0->name);
+                            for (float v : dkw0_sample) {
+                                fprintf(stderr, "%.6f,", v);
+                            }
+                            fprintf(stderr, "\n");
+                        } catch (const std::exception & e) {
+                            fprintf(stderr, "[DKW0-DEQUANT-CHECK] (legacy site) readback failed: %s\n", e.what());
+                        }
+                    }
+                }
             }
         }
         if (src1->type != GGML_TYPE_F32) {
@@ -42547,6 +42766,72 @@ static bool ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx,
                 exc_ctx.dev[i].src0_dd                = dev[i].src0_dd;
                 exc_ctx.dev[i].src0_ptr_origin        = dev[i].src0_ptr_origin;
                 exc_ctx.dev[i].src0_layout_ptr_source = dev[i].src0_layout_ptr_source;
+
+                // llama.cpp-dkw0: origin/handle discriminator for the trust-gate
+                // fix above -- if the gate is a correct no-op here (handle is
+                // not DIRECT-kind, or dev[i].src0_dd came from a different
+                // branch of the if/else-if chain entirely), this settles it in
+                // one run instead of another hypothesis cycle.
+                if (src0->name && std::strcmp(src0->name, "token_embd.weight") == 0) {
+                    static const char * dkw0_origin_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                    if (dkw0_origin_check_env && std::atoi(dkw0_origin_check_env) != 0) {
+                        static std::atomic<int> dkw0_origin_check_count{ 0 };
+                        // llama.cpp-dkw0 defect #4 (graph record/replay): raised
+                        // cap (was 8) to span a full prompt + ~15-token generation,
+                        // and tagged with g_ggml_sycl_graph_recording +
+                        // cached_is_decode. This IS the value that gets baked into
+                        // node_2071's kernel launch if this call happens while
+                        // recording -- ggml_sycl_ensure_weight_on_device's own
+                        // comment states weight pointers "must already be stable
+                        // (set during a warmup pass)" before recording; if the
+                        // tied-weight registry reconcile (this round's fix) hasn't
+                        // run yet by the time THIS call is also the recording
+                        // call, that invariant is exactly what could be violated.
+                        const int idx = dkw0_origin_check_count.fetch_add(1, std::memory_order_relaxed);
+                        if (idx < 40) {
+                            const auto * extra_dbg  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+                            const auto & handle_dbg = extra_dbg ? extra_dbg->data_handle[i] : ggml_sycl::mem_handle{};
+                            fprintf(stderr,
+                                    "[DKW0-ORIGIN-CHECK] #%d MUL_MAT tensor=%p extra=%p device=%d src0_dd=%p "
+                                    "origin=%s layout_source=%s handle_kind=%d handle_valid=%d handle_device=%d "
+                                    "trust_ok=%d recording=%d decode=%d\n",
+                                    idx, (const void *) src0, (const void *) extra_dbg, i, (void *) dev[i].src0_dd,
+                                    dev[i].src0_ptr_origin ? dev[i].src0_ptr_origin : "?",
+                                    dev[i].src0_layout_ptr_source ? dev[i].src0_layout_ptr_source : "?",
+                                    extra_dbg ? (int) handle_dbg.kind() : -1,
+                                    extra_dbg ? (handle_dbg.valid() ? 1 : 0) : -1,
+                                    extra_dbg ? handle_dbg.device() : -1,
+                                    extra_dbg ? (ggml_sycl_direct_handle_trust_ok(src0, handle_dbg) ? 1 : 0) : -1,
+                                    g_ggml_sycl_graph_recording ? 1 : 0, src1->ne[1] == 1 ? 1 : 0);
+                        }
+                    }
+                }
+
+                // llama.cpp-dkw0 defect #4: Qcur-0's MUL_MAT (attn_q.weight),
+                // the second of the two most identity-fragile layer-0 ops per
+                // the lead's assignment -- separate counter from token_embd's
+                // so both get full coverage across the same run.
+                if (src0->name && std::strcmp(src0->name, "blk.0.attn_q.weight") == 0) {
+                    static const char * dkw0_attnq_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+                    if (dkw0_attnq_check_env && std::atoi(dkw0_attnq_check_env) != 0) {
+                        static std::atomic<int> dkw0_attnq_check_count{ 0 };
+                        const int                idx = dkw0_attnq_check_count.fetch_add(1, std::memory_order_relaxed);
+                        if (idx < 40) {
+                            const auto * extra_dbg  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+                            const auto & handle_dbg = extra_dbg ? extra_dbg->data_handle[i] : ggml_sycl::mem_handle{};
+                            fprintf(stderr,
+                                    "[DKW0-LAYER0-CHECK] #%d MUL_MAT(attn_q.weight) tensor=%p extra=%p device=%d "
+                                    "src0_dd=%p origin=%s layout_source=%s handle_kind=%d handle_valid=%d "
+                                    "recording=%d decode=%d\n",
+                                    idx, (const void *) src0, (const void *) extra_dbg, i, (void *) dev[i].src0_dd,
+                                    dev[i].src0_ptr_origin ? dev[i].src0_ptr_origin : "?",
+                                    dev[i].src0_layout_ptr_source ? dev[i].src0_layout_ptr_source : "?",
+                                    extra_dbg ? (int) handle_dbg.kind() : -1,
+                                    extra_dbg ? (handle_dbg.valid() ? 1 : 0) : -1, g_ggml_sycl_graph_recording ? 1 : 0,
+                                    src1->ne[1] == 1 ? 1 : 0);
+                        }
+                    }
+                }
 
                 if (!dev[i].src0_dd) {
                     GGML_SYCL_DEBUG("[MUL_MAT] layout=%d unavailable for tensor=%s on device=%d\n", (int) src0_layout,
@@ -59066,6 +59351,72 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               ggml_tensor *               dst,
                               const layout_mode *         forced_layout = nullptr) {
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat");
+    // llama.cpp-dkw0 (worktree-only diagnostic): D2H the device copy of the
+    // one weight under investigation and checksum it the same way the
+    // upload-time hook in ggml_backend_sycl_buffer_set_tensor does, so the
+    // two can be diffed directly -- settles whether the device materialization
+    // of this tensor is byte-correct, independent of which kernel/layout path
+    // ends up consuming it. One-shot (first dispatch only) to avoid flooding.
+    // Extended to token_embd.weight for the defect #2 hunt (final-logits
+    // MUL_MAT dispatches through THIS function -- ggml_sycl_op_mul_mat_vec_q,
+    // not ggml_sycl_op_mul_mat_sycl -- so this is the one dkw0-weight-check
+    // site on the actual code path token_embd.weight's dot product takes).
+    // Separate atomic counters per tensor name so tracking one doesn't
+    // suppress the other.
+    if (src0 && src0->name &&
+        (std::strcmp(src0->name, "blk.0.attn_q.weight") == 0 || std::strcmp(src0->name, "token_embd.weight") == 0)) {
+        static const char * dkw0_weight_check_env = std::getenv("GGML_SYCL_DKW0_WEIGHT_CHECK");
+        if (dkw0_weight_check_env && std::atoi(dkw0_weight_check_env) != 0) {
+            static std::atomic<int> dkw0_weight_check_count{ 0 };
+            static std::atomic<int> dkw0_weight_check_count_embd{ 0 };
+            const bool               dkw0_is_embd = std::strcmp(src0->name, "token_embd.weight") == 0;
+            std::atomic<int> &       dkw0_counter = dkw0_is_embd ? dkw0_weight_check_count_embd : dkw0_weight_check_count;
+            if (dkw0_counter.fetch_add(1, std::memory_order_relaxed) == 0) {
+                const size_t         dkw0_nbytes = ggml_nbytes(src0);
+                std::vector<uint8_t> dkw0_host_copy(dkw0_nbytes);
+                // llama.cpp-dkw0: resolve via ggml_sycl_resolve (not
+                // ggml_sycl_resolve_tensor_ptr) specifically so we learn the
+                // ACTUAL physical layout the unified cache materialized this
+                // dense Q8_0 weight in. Assuming AOS here would be wrong for
+                // this tensor class (attention weights route to COALESCED per
+                // docs/backend/sycl-env-vars.md) and would make a legitimate
+                // COALESCED byte reordering look like corruption when diffed
+                // against the file's AOS bytes.
+                const auto dkw0_resolved = ggml_sycl_resolve(src0, ctx.device);
+                if (dkw0_resolved && dkw0_resolved.ptr) {
+                    try {
+                        auto dkw0_dst_handle =
+                            ggml_sycl::mem_handle::from_direct(dkw0_host_copy.data(), GGML_LAYOUT_AOS,
+                                                               /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE,
+                                                               dkw0_nbytes);
+                        auto dkw0_src_handle = ggml_sycl_copy_handle_for_raw_ptr(
+                            dkw0_resolved.ptr, dkw0_resolved.layout, ctx.device, dkw0_nbytes);
+                        ggml_sycl::mem_copy(dkw0_dst_handle, dkw0_src_handle, dkw0_nbytes, *ctx.stream());
+                        ctx.stream()->wait();
+                        uint64_t dkw0_checksum = 1469598103934665603ULL;
+                        for (size_t i = 0; i < dkw0_nbytes; ++i) {
+                            dkw0_checksum ^= dkw0_host_copy[i];
+                            dkw0_checksum *= 1099511628211ULL;
+                        }
+                        fprintf(stderr,
+                                "[DKW0-WEIGHT-CHECK] DISPATCH name=%s device=%d layout=%d nbytes=%zu "
+                                "fnv1a=0x%016llx first16=",
+                                src0->name, ctx.device, (int) dkw0_resolved.layout, dkw0_nbytes,
+                                (unsigned long long) dkw0_checksum);
+                        for (size_t i = 0; i < std::min<size_t>(16, dkw0_nbytes); ++i) {
+                            fprintf(stderr, "%02x", dkw0_host_copy[i]);
+                        }
+                        fprintf(stderr, "\n");
+                    } catch (const std::exception & e) {
+                        fprintf(stderr, "[DKW0-WEIGHT-CHECK] DISPATCH readback failed: %s\n", e.what());
+                    }
+                } else {
+                    fprintf(stderr, "[DKW0-WEIGHT-CHECK] DISPATCH name=%s: could not resolve device pointer\n",
+                            src0->name);
+                }
+            }
+        }
+    }
     const bool route_trace_enabled = ggml_sycl_mul_mat_route_trace_enabled();
     int        route_trace_idx     = -1;
     if (route_trace_enabled) {
@@ -92126,6 +92477,23 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         return true;
     };
 
+    // llama.cpp-dkw0 defect #4: this whitelist (GGML_TENSOR_FLAG_INPUT-gated,
+    // discovered ONCE and cached for every subsequent replay) is the entire
+    // refresh mechanism for per-token-varying leaves on the pure-replay path.
+    // A non-weight leaf that is genuinely per-token-varying but never got
+    // ggml_set_input() at model-graph construction time is silently SKIPPED
+    // here forever -- its device-resident value is whatever the first
+    // discovery pass (or record) left it at, replayed unchanged on every
+    // later token. Printing both sides of this whitelist in one run (which
+    // names get INTO cached_input_tensors vs which non-weight leaves get
+    // SKIPPED for lacking the flag) turns "is there such a leaf" into a
+    // one-run answer instead of a blind read of gemma-4's graph-construction
+    // code. Local (per-call) dedup only, separate from seen_inputs' cache-
+    // identity dedup, so a leaf referenced by many node->src[] slots in the
+    // same discovery pass is reported once, not once per reference.
+    static const char *              dkw0_input_list_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+    const bool                       dkw0_input_list_on   = dkw0_input_list_env && std::atoi(dkw0_input_list_env) != 0;
+    std::unordered_set<const ggml_tensor *> dkw0_skipped_seen;
     auto discover_input = [&](ggml_tensor * tensor) {
         if (!tensor || !tensor->data) {
             return;
@@ -92134,6 +92502,14 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
             return;
         }
         if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+            if (dkw0_input_list_on && dkw0_skipped_seen.insert(tensor).second) {
+                fprintf(stderr,
+                        "[DKW0-INPUT-LIST] SKIPPED name=%s tensor=%p op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
+                        "view_src=%p\n",
+                        tensor->name ? tensor->name : "?", (const void *) tensor, ggml_op_name(tensor->op),
+                        (int) tensor->type, (long long) tensor->ne[0], (long long) tensor->ne[1],
+                        (long long) tensor->ne[2], (long long) tensor->ne[3], (const void *) tensor->view_src);
+            }
             return;
         }
         graph_input_tensor_key key{};
@@ -92149,6 +92525,10 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         GGML_SYCL_DEBUG("[SYCL-GRAPH] discovered input %s -> %p (tensor->data=%p, %s)\n",
                         tensor->name ? tensor->name : "?", resolved_ptr, tensor->data,
                         resolved_ptr == tensor->data ? "same" : "DIFFERENT");
+        if (dkw0_input_list_on) {
+            fprintf(stderr, "[DKW0-INPUT-LIST] DISCOVERED name=%s tensor=%p resolved=%p\n",
+                    tensor->name ? tensor->name : "?", (const void *) tensor, resolved_ptr);
+        }
     };
 
     for (int i = 0; i < cgraph->n_leafs; ++i) {
@@ -99222,6 +99602,28 @@ normal_dispatch:
     GGML_SYCL_DEBUG("[SYCL-GRAPH] call #%d: use_sycl_graph=%d, async_mem=%d, n_nodes=%d, has_exec_graph=%d\n",
                     graph_call_count, use_sycl_graph, g_ggml_sycl_use_async_mem_op, cgraph->n_nodes,
                     sycl_ctx->exec_graph ? 1 : 0);
+    // llama.cpp-dkw0 defect #4: cheap, always-fires-if-enabled parallel to the
+    // line above -- GGML_SYCL_DEBUG=1 would show this too but is a firehose
+    // (thousands of lines/token across this whole 100k-line file) for a
+    // 15-token run; this is gated by our own already-in-use env var, cheap
+    // enough to leave on for the full generation, and correlatable against
+    // DKW0-LAYER0-CHECK/DKW0-ORIGIN-CHECK by wall-clock order in the same
+    // stderr stream. has_exec_graph=1 going into this call with
+    // use_sycl_graph=1 means REPLAY (no per-op host code runs, so neither of
+    // those hooks can fire for this call at all); has_exec_graph=0 with
+    // use_sycl_graph=1 means this call performs the RECORD (compute_impl()
+    // runs, so per-op hooks fire this same call with recording=1).
+    static const char * dkw0_graph_call_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+    if (dkw0_graph_call_env && std::atoi(dkw0_graph_call_env) != 0) {
+        static std::atomic<int> dkw0_graph_call_count{ 0 };
+        if (dkw0_graph_call_count.fetch_add(1, std::memory_order_relaxed) < 80) {
+            fprintf(stderr,
+                    "[DKW0-GRAPH-CALL] #%d use_sycl_graph=%d n_nodes=%d has_exec_graph=%d decode=%d "
+                    "mechanism=whole-graph\n",
+                    graph_call_count, use_sycl_graph ? 1 : 0, cgraph->n_nodes, sycl_ctx->exec_graph ? 1 : 0,
+                    cached_is_decode ? 1 : 0);
+        }
+    }
     if (ggml_sycl_graph_diag_enabled()) {
         g_graph_diag_counters.calls.fetch_add(1, std::memory_order_relaxed);
         if (cached_is_decode) {
@@ -99538,6 +99940,48 @@ normal_dispatch:
         bool       is_decode_phase = cached_is_decode;
         bool       is_prompt_phase = !cached_is_decode && cgraph->n_nodes > 0;
         const auto graph_key       = sycl_exec_graph_make_key(*sycl_ctx, cgraph, graph_hash, is_decode_phase);
+
+        // llama.cpp-dkw0 (defect #4, hypothesis b/collision): one exec_graph slot
+        // and one signature per context, but ~260 distinct tiny splits flow
+        // through it per generation. If graph_hash does NOT distinguish two
+        // different splits of identical topology+shape (it hashes op/type/ne/nb,
+        // NOT tensor name or data pointer -- see ggml_sycl_graph_signature), a
+        // "match" decision here can replay split A's recorded kernels in place of
+        // split B: wrong buffers, fully valid memory, deterministic garbage. This
+        // prints the decision plus first-node identity (both CURRENT and, on a
+        // hit, REMEMBERED-from-record-time) so a collision is visible directly:
+        // a "match" line where remembered name/op/src0-name/src0-ptr differ from
+        // current is the smoking gun.
+        static const char * dkw0_sig_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+        if (dkw0_sig_env && std::atoi(dkw0_sig_env) != 0) {
+            static std::atomic<int> dkw0_sig_check_count{ 0 };
+            int                     dkw0_sig_idx = dkw0_sig_check_count.fetch_add(1, std::memory_order_relaxed);
+            if (dkw0_sig_idx < 80) {
+                const ggml_tensor * node0      = (cgraph->n_nodes > 0) ? cgraph->nodes[0] : nullptr;
+                const ggml_tensor * node0_src0  = node0 ? node0->src[0] : nullptr;
+                const char *        decision    = sycl_ctx->exec_graph ? sycl_exec_graph_miss_reason(*sycl_ctx, graph_key)
+                                                                       : "no-graph-yet";
+                fprintf(stderr,
+                        "[DKW0-SIG] #%d decode=%d n_nodes=%d hash=%llu decision=%s cur(node0=%s op=%s "
+                        "src0=%s src0_ptr=%p)\n",
+                        dkw0_sig_idx, is_decode_phase ? 1 : 0, cgraph->n_nodes,
+                        (unsigned long long) graph_hash, decision, node0 ? node0->name : "(none)",
+                        node0 ? ggml_op_name(node0->op) : "(none)", node0_src0 ? node0_src0->name : "(none)",
+                        (void *) (node0_src0 ? node0_src0->data : nullptr));
+                if (std::strcmp(decision, "match") == 0) {
+                    fprintf(stderr,
+                            "[DKW0-SIG] #%d   remembered(node0=%s op=%s src0=%s src0_ptr=%p)\n", dkw0_sig_idx,
+                            sycl_ctx->active_exec_graph.dkw0_node0_name[0]
+                                ? sycl_ctx->active_exec_graph.dkw0_node0_name : "(unknown-legacy-key)",
+                            sycl_ctx->active_exec_graph.dkw0_node0_op >= 0
+                                ? ggml_op_name((ggml_op) sycl_ctx->active_exec_graph.dkw0_node0_op) : "(unknown)",
+                            sycl_ctx->active_exec_graph.dkw0_src0_name[0] ? sycl_ctx->active_exec_graph.dkw0_src0_name
+                                                                          : "(unknown)",
+                            sycl_ctx->active_exec_graph.dkw0_src0_data);
+                }
+            }
+        }
+
         const bool moe_segment_recording_failed_for_graph = sycl_ctx->moe_segments_failed_valid &&
                                                             sycl_ctx->moe_segments_failed_hash == graph_hash &&
                                                             sycl_ctx->moe_segments_failed_n_nodes == cgraph->n_nodes &&

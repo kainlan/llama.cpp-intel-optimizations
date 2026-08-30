@@ -78,13 +78,29 @@ static float common_ggml_get_float_value(const uint8_t * data,
 
 static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
     GGML_ASSERT(n > 0);
-    float sum = 0;
+    // llama.cpp-dkw0: sum alone is cancellation-prone -- a mixed-sign,
+    // near-zero-mean tensor (e.g. an RMS_NORM output) can carry a real
+    // per-element divergence between two runs while its SUM barely moves
+    // (positive/negative terms hide it), or conversely amplify a tiny,
+    // benign per-element difference into a large-looking relative sum
+    // delta purely from cancellation (confirmed root cause of a false
+    // divergence report during the llama.cpp-dkw0 hunt). abs_sum (L1) and
+    // sq_sum (L2 squared, i.e. sum of squares -- take sqrt(sq_sum/n) for
+    // RMS) are both monotonic in per-element magnitude and cannot be
+    // faked by sign cancellation, so a real divergence shows up in them
+    // even when sum alone looks clean, and a sum-only false alarm shows up
+    // as sum diverging while these two do not.
+    float sum     = 0;
+    float abs_sum = 0;
+    float sq_sum  = 0;
     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
-                    sum += v;
+                    sum     += v;
+                    abs_sum += std::fabs(v);
+                    sq_sum  += v * v;
                 }
             }
         }
@@ -120,6 +136,16 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
         }
         LOG(INDENT "]\n");
         LOG(INDENT "sum = %f\n", sum);
+        // llama.cpp-dkw0: cancellation-immune companions to sum -- see the
+        // comment at their accumulation above. Printed as separate lines so
+        // parsing/comparison code can read them independently. Note a plain
+        // substring grep for 'sum = ' also matches these two lines (both
+        // "abs_sum = " and "sq_sum = " contain that substring); to isolate
+        // only the original line use a word-boundary match, e.g.
+        // `grep -E '\bsum = '` (no boundary exists between the '_' and 's'
+        // in "abs_sum"/"sq_sum", so it will not match those).
+        LOG(INDENT "abs_sum = %f\n", abs_sum);
+        LOG(INDENT "sq_sum = %f\n", sq_sum);
     }
 
     if (abort_on_nan) {

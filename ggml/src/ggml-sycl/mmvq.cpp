@@ -23073,6 +23073,25 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
     if (cache && cache_key.valid) {
         view = cache->get_view(cache_key, dispatch_layout);
     }
+    // llama.cpp-dkw0: pointer-resolution discriminator, twin of the GET_ROWS
+    // hook in getrows.cpp. Same cache_key (proven), same get_view() API --
+    // logging whether get_view() itself returned a ready pointer here, and
+    // if not, what dispatch_ptr/dispatch_base (this call's own per-extra
+    // fallback) resolves to, settles whether the two consumers share one
+    // cache entry with different fallback sources, or land on two entries.
+    if (src0 && src0->name && std::strcmp(src0->name, "token_embd.weight") == 0) {
+        static const char * dkw0_ptr_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+        if (dkw0_ptr_check_env && std::atoi(dkw0_ptr_check_env) != 0) {
+            static std::atomic<int> dkw0_ptr_check_count{ 0 };
+            if (dkw0_ptr_check_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                fprintf(stderr,
+                        "[DKW0-PTR-CHECK] MUL_MAT tensor=%p view.ptr=%p (from_cache=%d) "
+                        "dispatch_ptr(src0_dd_i)=%p dispatch_base=%p layout=%d file_offs=%llu\n",
+                        (const void *) src0, view.ptr, view.ptr != nullptr ? 1 : 0, (const void *) dispatch_ptr,
+                        dispatch_base, (int) dispatch_layout, (unsigned long long) cache_key.file_offs);
+            }
+        }
+    }
     const void * view_ptr = dispatch_base ? dispatch_base : dispatch_ptr;
     if (!view.ptr) {
         view.ptr      = const_cast<void *>(view_ptr);

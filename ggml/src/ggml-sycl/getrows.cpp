@@ -2319,6 +2319,53 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
     if (cache && cache_key.valid && ggml_sycl_tensor_is_weight(src0)) {
         cache_view = cache->get_view(cache_key, layout);
 
+        // llama.cpp-dkw0: pointer-resolution discriminator (see mmvq.cpp's
+        // twin hook at the MUL_MAT-side get_view() call). The cache-id
+        // hunt proved GET_ROWS and MUL_MAT compute an IDENTICAL cache_key
+        // for token_embd.weight, yet read different device bytes -- so the
+        // divergence must be in what get_view() actually returns per call,
+        // or in the per-consumer fallback (base_ptr below) that fires when
+        // it returns empty.
+        if (src0->name && std::strcmp(src0->name, "token_embd.weight") == 0) {
+            static const char * dkw0_ptr_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+            if (dkw0_ptr_check_env && std::atoi(dkw0_ptr_check_env) != 0) {
+                static std::atomic<int> dkw0_ptr_check_count{ 0 };
+                if (dkw0_ptr_check_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    fprintf(stderr,
+                            "[DKW0-PTR-CHECK] GET_ROWS tensor=%p cache_view.ptr=%p (from_cache=%d) "
+                            "aos_base=%p layout_base=%p layout=%d file_offs=%llu\n",
+                            (const void *) src0, cache_view.ptr, cache_view.ptr != nullptr ? 1 : 0, aos_base,
+                            layout_base, (int) layout, (unsigned long long) cache_key.file_offs);
+                }
+            }
+        }
+
+        // llama.cpp-dkw0 defect #4: node_2071's output projection is now
+        // exonerated under replay (always fresh, never itself recorded, per
+        // RECTRACE) -- garbage enters inside the replayed layer-0 subgraph.
+        // node_1's GET_ROWS(per_layer_token_embd.weight) is one of the two
+        // most identity-fragile layer-0 ops (per_layer_token_embd.weight was
+        // the extra-aliasing bug's OTHER party). Tagged with
+        // g_ggml_sycl_graph_recording so a recording=1 line shows exactly
+        // what got baked at record time for this op, comparable against
+        // every later fresh (recording=0) resolve of the same tensor.
+        if (src0->name && std::strcmp(src0->name, "per_layer_token_embd.weight") == 0) {
+            static const char * dkw0_layer0_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+            if (dkw0_layer0_check_env && std::atoi(dkw0_layer0_check_env) != 0) {
+                static std::atomic<int> dkw0_layer0_check_count{ 0 };
+                const int              idx = dkw0_layer0_check_count.fetch_add(1, std::memory_order_relaxed);
+                if (idx < 40) {
+                    fprintf(stderr,
+                            "[DKW0-LAYER0-CHECK] #%d GET_ROWS(per_layer_token_embd) tensor=%p extra=%p "
+                            "cache_view.ptr=%p (from_cache=%d) aos_base=%p layout_base=%p layout=%d "
+                            "file_offs=%llu recording=%d\n",
+                            idx, (const void *) src0, (const void *) src0->extra, cache_view.ptr,
+                            cache_view.ptr != nullptr ? 1 : 0, aos_base, layout_base, (int) layout,
+                            (unsigned long long) cache_key.file_offs, g_ggml_sycl_graph_recording ? 1 : 0);
+                }
+            }
+        }
+
         const void * base_ptr = (layout == GGML_LAYOUT_AOS) ? aos_base : layout_base;
         if (!cache_view.ptr && base_ptr) {
             cache_view.ptr               = const_cast<void *>(base_ptr);

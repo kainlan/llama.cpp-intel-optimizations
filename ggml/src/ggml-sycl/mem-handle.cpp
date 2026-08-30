@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <dlfcn.h>  // llama.cpp-dkw0: dladdr() for caller-site diagnostics
 #include <exception>
 #include <iterator>
 #include <mutex>
@@ -421,6 +422,38 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
                                                   std::shared_ptr<void>     storage_owner,
                                                   bool                      has_ready_event,
                                                   const sycl::event &       ready_event) {
+    // llama.cpp-dkw0: second WEIGHT-kind mint choke point -- the lease-snapshot
+    // family (from_weight_lease_locked/from_weight_lease_by_id both delegate
+    // here), distinct from from_cache_id's fresh-construction path. Catches
+    // register_host_weight() and any acquire_weight_lease()-adjacent caller
+    // that already holds a resolved (ptr, entry) pair and wraps it -- if THAT
+    // wrap ever receives a mismatched key vs (ptr, entry) pair for our two
+    // target tensors, this is where it would show.
+    static const char * dkw0_lease_snapshot_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+    const bool           dkw0_is_target_id = key.id.file_offs == 3065622336ULL || key.id.file_offs == 70888256ULL;
+    if (dkw0_is_target_id && dkw0_lease_snapshot_check_env && std::atoi(dkw0_lease_snapshot_check_env) != 0) {
+        static std::atomic<int> dkw0_lease_snapshot_count{ 0 };
+        if (dkw0_lease_snapshot_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+            // llama.cpp-dkw0: caller identification, per lead's request -- two
+            // calls fire per weight and only one is accounted for by the
+            // matching BIND, so name each call's SITE to find where the
+            // second one's returned handle actually goes.
+            void *       ret_addr    = __builtin_return_address(0);
+            Dl_info      dl_info{};
+            const char * caller_name = "?";
+            ptrdiff_t    caller_off  = 0;
+            if (dladdr(ret_addr, &dl_info) && dl_info.dli_sname) {
+                caller_name = dl_info.dli_sname;
+                caller_off  = static_cast<const char *>(ret_addr) - static_cast<const char *>(dl_info.dli_saddr);
+            }
+            fprintf(stderr,
+                    "[DKW0-MINT-CHECK] FROM_WEIGHT_LEASE_SNAPSHOT file_offs=%llu key_nbytes=%llu ptr=%p "
+                    "entry=%p entry_ptr=%p device=%d on_device=%d caller=%s+0x%tx ret_addr=%p\n",
+                    (unsigned long long) key.id.file_offs, (unsigned long long) key.id.nbytes, ptr,
+                    (const void *) entry, entry ? entry->device_ptr : nullptr, device, on_device ? 1 : 0,
+                    caller_name, caller_off, ret_addr);
+        }
+    }
     mem_handle h;
     h.kind_   = mem_handle_kind::WEIGHT;
     // A leased entry, not the caller, is authoritative for owning device.
@@ -482,6 +515,25 @@ mem_handle mem_handle::from_weight_lease_snapshot(const unified_cache_key & key,
 }
 
 mem_handle mem_handle::from_cache_id(const ggml_sycl_cache_id & id, int device) {
+    // llama.cpp-dkw0: single choke point for every WEIGHT-kind handle mint
+    // (S1-PRELOAD's direct-stage path AND layer_weight_handles::from_weight_set()
+    // both funnel through here) -- catches whichever caller mints a handle for
+    // token_embd.weight's or per_layer_token_embd.weight's identity, regardless
+    // of which of the many call sites in ggml-sycl.cpp/mem-handle.cpp it comes
+    // from. Logs id.file_offs (the identity that determines resolve()'s target
+    // entry) and the resulting handle's device/kind so the mis-mint can be
+    // caught at its actual construction site instead of guessed at.
+    static const char * dkw0_from_cache_id_check_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
+    const bool           dkw0_is_target_id = id.file_offs == 3065622336ULL || id.file_offs == 70888256ULL;
+    if (dkw0_is_target_id && dkw0_from_cache_id_check_env && std::atoi(dkw0_from_cache_id_check_env) != 0) {
+        static std::atomic<int> dkw0_from_cache_id_count{ 0 };
+        if (dkw0_from_cache_id_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+            fprintf(stderr,
+                    "[DKW0-MINT-CHECK] FROM_CACHE_ID file_offs=%llu nbytes=%llu name_hash=%llu device=%d\n",
+                    (unsigned long long) id.file_offs, (unsigned long long) id.nbytes,
+                    (unsigned long long) id.name_hash, device);
+        }
+    }
     unified_cache_key key;
     key.type      = cache_entry_type::DENSE_WEIGHT;
     key.id        = id;
