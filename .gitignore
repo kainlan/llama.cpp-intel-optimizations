@@ -141,3 +141,6 @@ a.out.*
 
 # Beads issue tracker retired in favor of codescout task tracker
 .beads/
+
+# Obsidian UI state (Dockerized Obsidian opens .llm-wiki/wiki as a vault)
+.llm-wiki/wiki/.obsidian/

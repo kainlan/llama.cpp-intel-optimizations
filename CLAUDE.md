@@ -1268,6 +1268,11 @@ Add `ggml-ci` to commit message to trigger extended CI workloads.
 
 ## Documentation
 
+- **LLM Wiki (shared knowledge vault)**: `.llm-wiki/` — OKF v0.2, Obsidian-compatible,
+  shared across harnesses (pi/omp via `@zosmaai/pi-llm-wiki`; Claude Code via the
+  `llm-wiki` MCP server in `.mcp.json`; Obsidian UI in the `llm-wiki-obsidian`
+  container, port 3001). Conventions: `.claude/skills/llm-wiki/SKILL.md` — never edit
+  `raw/` or `meta/` by hand, search before creating pages, cite `SRC-*` ids.
 - **Build Details**: `docs/build.md`
 - **Backend SYCL**: `docs/backend/SYCL.md`
 - **SYCL memory design (unified cache + mem_handle)**: `docs/backend/sycl-memory-design.md` — includes **Path-scoped zone sizing**: how arena zones are sized from a structural `(type, ne)` classifier rather than one global max, the rule for adding a consumer, and the two separate oneDNN sizing sites

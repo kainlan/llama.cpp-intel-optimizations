@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "llm-wiki": {
+      "command": "/home/kainlan/.nvm/versions/node/v24.11.1/bin/node",
+      "args": ["/home/kainlan/.pi/agent/npm/node_modules/@zosmaai/pi-llm-wiki/dist/mcp/index.js"],
+      "env": { "WIKI_ROOT": "/Apps/llama.cpp/.llm-wiki" }
+    }
+  }
+}
