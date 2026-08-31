@@ -403,6 +403,73 @@ static bool test_materialization_descriptor_rejects_bad_scale() {
     return true;
 }
 
+// llama.cpp-jahv: D=512 (e.g. gemma-3n's 7 global-attention layers) is only
+// ever routed through this planner -- fattn.cpp has no vec/tile/XMX/ESIMD
+// kernel for D=512, so ggml_sycl_flash_attn_ext_supported() admits it only
+// when this exact plan call would return DIRECT or MATERIALIZE_REQUIRED. The
+// planner's own D range check (`ne00 > 512` rejects) has always covered
+// D==512, but nothing exercised that boundary before this pass --
+// test_planner_rejects_unsupported_d only probes from the D=1024 side. This
+// closes the D=512-exactly gap on the accept side.
+static bool test_planner_accepts_d512_with_matching_scale() {
+    fattn_params params = mha_like_params();
+    params.ne00         = 512;
+    params.ne10         = 512;
+    params.nb01         = params.ne00 * (int) sizeof(sycl::half);
+    params.nb02         = params.nb01 * params.ne01;
+    params.nb03         = params.nb02 * params.ne02;
+    params.nb11         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb12         = params.nb11 * params.ne11;
+    params.nb13         = (int64_t) params.nb12 * params.ne12;
+    params.nb21         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb22         = params.nb21 * params.ne11;
+    params.nb23         = (int64_t) params.nb22 * params.ne12;
+    params.scale        = 1.0f / std::sqrt(512.0f);
+    const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "D=512 with a standard 1/sqrt(D) scale must plan DIRECT -- the planner's own D<=512 range check "
+                "has always covered this shape, and this proves the boundary rather than just D=1024's rejection");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK, "D=512 accept should have OK reason");
+    return true;
+}
+
+// The documenting half of the D=512 story: gemma-3n hardcodes
+// hparams.f_attention_scale = 1.0f (src/models/gemma3n.cpp), exactly the
+// phi2-style pre-scaled-Q pattern this planner's SCALE_UNSUPPORTED gate
+// exists for (see test_planner_rejects_scale_not_inv_sqrt_d above). So
+// wiring D=512 into ggml_sycl_flash_attn_ext_supported()/
+// ggml_sycl_flash_attn_ext() (llama.cpp-jahv) does NOT by itself move
+// gemma-3n's global-attention layers off CPU -- they still reject here, on
+// scale, not on D. This case pins that fact so it cannot silently regress
+// into "D=512 now works, therefore gemma-3n now works" without a test
+// noticing the two are different claims.
+static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
+    fattn_params params = mha_like_params();
+    params.ne00         = 512;
+    params.ne10         = 512;
+    params.nb01         = params.ne00 * (int) sizeof(sycl::half);
+    params.nb02         = params.nb01 * params.ne01;
+    params.nb03         = params.nb02 * params.ne02;
+    params.nb11         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb12         = params.nb11 * params.ne11;
+    params.nb13         = (int64_t) params.nb12 * params.ne12;
+    params.nb21         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb22         = params.nb21 * params.ne11;
+    params.nb23         = (int64_t) params.nb22 * params.ne12;
+    params.scale        = 1.0f;  // gemma3n's hparams.f_attention_scale, NOT 1/sqrt(512)
+    const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
+                "gemma-3n's kq_scale=1.0 at D=512 must still reject oneDNN (SCALE_UNSUPPORTED), not silently "
+                "reach the compiled partition with the wrong softmax divisor");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                "reject reason should identify the scale mismatch, not e.g. UNSUPPORTED_D -- D=512 itself is fine");
+    return true;
+}
+
 static bool test_planner_rejects_unsupported_d() {
     fattn_params params = mha_like_params();
     params.ne00         = 1024;
@@ -627,6 +694,8 @@ int main() {
     ok &= test_materialization_descriptor_for_gqa_mismatch();
     ok &= test_materialization_descriptor_direct_mha_noop();
     ok &= test_materialization_descriptor_rejects_unsupported_layout();
+    ok &= test_planner_accepts_d512_with_matching_scale();
+    ok &= test_planner_rejects_d512_with_gemma3n_like_scale();
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();

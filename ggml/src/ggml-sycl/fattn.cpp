@@ -2139,6 +2139,113 @@ static int compute_sequence_boundaries_from_ids(const int32_t * q_seq_ids,   // 
 // 2 = MMA F16 kernel (scalar with SG_SIZE=16, named MMA but not using joint_matrix)
 // 3 = XMX F16 kernel (using joint_matrix for Q@K^T acceleration)
 
+#if GGML_SYCL_DNNL
+// D=512 (llama.cpp-jahv, e.g. gemma-3n's 7 global-attention layers) has no
+// native SYCL FA kernel in this fork -- fattn_vec_supports_head_dim() caps
+// at 256, and fattn-tile.hpp's D=512/576 config-table rows have no live
+// caller (out of scope for this pass, tracked as follow-up). The ONLY way
+// this backend can execute a D=512 FLASH_ATTN_EXT is the oneDNN SDPA path
+// (fattn-onednn.cpp), which is D-generic already (its own D check is
+// `ne00 > 512` -> reject, so D==512 has always been within its range).
+//
+// This function reproduces ggml_sycl_flash_attn_ext_onednn_plan()'s own
+// predicate from graph-structural metadata alone (no resolved device
+// pointers, no allocation) so this admission check and the real dispatch-time
+// plan (ggml_sycl_flash_attn_ext()'s D==512 branch, below) can never
+// disagree -- see the accepted-op-with-unsupported-src-buft-gets-silent-
+// copies lesson: a backend must never accept an op it cannot actually run.
+//
+// One planner input cannot be read from `dst` alone: `multi_seq`
+// (params.n_seqs > 1) is a live continuous-batching fact recomputed from
+// q_seq_ids/kv_seq_ids tensor CONTENT on every call, not from graph shape.
+// Whether a node carries q_seq_ids/kv_seq_ids/paged block tables AT ALL is
+// instead an exact graph-structural fact -- decided once by the model's
+// graph-builder and unchanged call to call -- so declining outright whenever
+// any of src[5..8] is present is exact, not an approximation of a moving
+// target. It costs nothing today (no D=512 model exercises those sources)
+// and avoids depending on data this function cannot see.
+static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor * dst) {
+    static const bool d512_onednn_enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
+        return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+    }();
+    if (!d512_onednn_enabled) {
+        return false;
+    }
+    init_fa_onednn_config();
+    if (!g_sycl_fa_onednn_enabled) {
+        return false;
+    }
+
+    const ggml_tensor * Q               = dst->src[0];
+    const ggml_tensor * K               = dst->src[1];
+    const ggml_tensor * V               = dst->src[2];
+    const ggml_tensor * mask            = dst->src[3];
+    const ggml_tensor * sinks           = dst->src[4];
+    const ggml_tensor * q_seq_ids       = dst->src[5];
+    const ggml_tensor * kv_seq_ids      = dst->src[6];
+    const ggml_tensor * block_table     = dst->src[7];
+    const ggml_tensor * seq_lens_tensor = dst->src[8];
+
+    // See the function comment: these are declined outright, not planned.
+    if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
+        return false;
+    }
+
+    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
+    if (use_paged_layout_i32 != 0) {
+        return false;
+    }
+
+    fattn_params params{};
+    params.Q_type    = Q->type;
+    params.K_type    = K->type;
+    params.V_type    = V->type;
+    params.mask_type = mask ? mask->type : GGML_TYPE_F32;
+    // Presence only -- the planner never dereferences params.mask/sinks, it
+    // only tests them for null (see ggml_sycl_flash_attn_ext_onednn_plan).
+    params.mask      = mask ? reinterpret_cast<const char *>(1) : nullptr;
+    params.sinks     = sinks ? reinterpret_cast<const char *>(1) : nullptr;
+
+    memcpy(&params.scale, (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&params.max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&params.logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (params.logit_softcap != 0.0f) {
+        params.scale /= params.logit_softcap;
+    }
+    params.use_paged_attn   = false;  // block_table/seq_lens already excluded above
+    params.use_paged_layout = false;  // excluded above
+
+    params.ne00 = Q->ne[0];
+    params.ne01 = Q->ne[1];
+    params.ne02 = Q->ne[2];
+    params.ne03 = Q->ne[3];
+    params.ne10 = K->ne[0];
+    params.ne11 = K->ne[1];
+    params.ne12 = K->ne[2];
+    params.ne13 = K->ne[3];
+    params.nb11 = K->nb[1];
+    params.nb21 = V->nb[1];
+    if (mask) {
+        params.ne30 = mask->ne[0];
+        params.ne31 = mask->ne[1];
+        params.ne32 = mask->ne[2];
+        params.ne33 = mask->ne[3];
+    }
+    params.kv_is_fp8 = (ggml_sycl_type_is_fp8_e4m3(K->type) && ggml_sycl_type_is_fp8_e4m3(V->type));
+    params.n_seqs    = 0;  // sequence-id arrays already excluded above
+
+    const ggml_sycl_onednn_fa_layout_plan plan =
+        ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8, /*multi_seq=*/false);
+    return plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
+           plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED;
+}
+#else
+static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
+    return false;
+}
+#endif  // GGML_SYCL_DNNL
+
 // Check if flash attention is supported for the given operation
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // Enabled by default; allow explicit disable for debugging/regressions.
@@ -2177,9 +2284,14 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
 
     // Masked flash attention is supported; keep the gate in place via GGML_SYCL_FLASH_ATTN_EXT if needed.
 
-    // Check head dimension - must be a supported size
+    // Check head dimension. {64,128,256} always have a native kernel below.
+    // D=512 is admitted only when the oneDNN SDPA path can run it (see
+    // ggml_sycl_fattn_d512_onednn_admissible above) -- there is no other
+    // kernel for it, so ggml_sycl_flash_attn_ext() must never see a D=512 op
+    // this function declined would-be-oneDNN-eligible for, nor accept one it
+    // is not.
     const int D = Q->ne[0];
-    if (!fattn_vec_supports_head_dim(D)) {
+    if (!fattn_vec_supports_head_dim(D) && !(D == 512 && ggml_sycl_fattn_d512_onednn_admissible(dst))) {
         return false;
     }
 
@@ -3490,6 +3602,55 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     params.kv_base_pos        = 0;
 
     const int D = Q->ne[0];
+
+    // ==========================================================================
+    // D=512 route: oneDNN SDPA only (llama.cpp-jahv). D=512 has no vec/tile/
+    // XMX/ESIMD kernel in this fork -- fattn-tile.hpp's D=512/576 config-table
+    // rows have no live caller (out of scope for this pass). This branch must
+    // come before the paged-V2 and Standard Dispatch switches below: neither
+    // has a `case 512` (paged-V2's scalar switch GGML_ABORTs on an unhandled
+    // D, the Standard Dispatch switches do too), and dispatch_ncols<D,...> is
+    // never instantiated for D=512 (no vec/tile kernel body to instantiate
+    // it against).
+    //
+    // ggml_sycl_flash_attn_ext_supported() (this file) only accepts a D=512
+    // op when ggml_sycl_fattn_d512_onednn_admissible() -- an exact replica of
+    // the plan check below, evaluated from graph-structural metadata alone --
+    // already agrees oneDNN can run it. So the plan/execute pair here should
+    // never fail for an op this backend accepted; GGML_ABORT rather than a
+    // silent CPU-shaped fallback is deliberate, per the accepted-op-with-
+    // unsupported-src-buft-gets-silent-copies lesson: a backend must not
+    // accept an op and then quietly fail to run it.
+    if (D == 512) {
+#if GGML_SYCL_DNNL
+        static const bool d512_onednn_enabled = []() {
+            const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
+            return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+        }();
+        if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
+            const bool                            multi_seq = (params.n_seqs > 1);
+            const ggml_sycl_onednn_fa_layout_plan plan      = ggml_sycl_flash_attn_ext_onednn_plan(
+                params, params.ne02 /* H_q */, params.ne12 /* H_kv */, params.kv_is_fp8, multi_seq);
+            if ((plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
+                 plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) &&
+                ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                    fprintf(stderr,
+                            "[SYCL] fattn selected [d512] onednn D=%d ne01=%d ne11=%d H_q=%d H_kv=%d "
+                            "materialize=%d\n",
+                            D, params.ne01, params.ne11, params.ne02, params.ne12,
+                            (int) (plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED));
+                }
+                return;
+            }
+        }
+#endif  // GGML_SYCL_DNNL
+        GGML_ABORT(
+            "D=512 flash attention has no SYCL kernel outside the oneDNN SDPA path (GGML_SYCL_FA_ONEDNN / "
+            "GGML_SYCL_FA_ONEDNN_D512). ggml_sycl_flash_attn_ext_supported() should have declined this op "
+            "otherwise -- this indicates a supports_op/dispatch inconsistency, not a shape this backend can "
+            "fall back on.");
+    }
 
 #if GGML_SYCL_FA_V2_ENABLED
     // ==========================================================================
