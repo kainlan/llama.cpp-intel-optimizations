@@ -1,7 +1,7 @@
-// Host-only unit tests for the index math backing k_get_rows_q8_0_aos_v2
+// Host-only unit tests for the index math backing k_get_rows_q8_0_aos_pair
 // (ggml/src/ggml-sycl/getrows.cpp, llama.cpp-go37). No GPU, no allocation,
-// no SYCL runtime -- it calls q8_0_aos_v2_block_index() and
-// q8_0_aos_v2_row_out_of_range() directly from getrows.hpp, the SAME
+// no SYCL runtime -- it calls q8_0_aos_pair_block_index() and
+// q8_0_aos_pair_row_out_of_range() directly from getrows.hpp, the SAME
 // functions the device kernel calls (not a re-implemented copy that could
 // silently drift from the kernel).
 //
@@ -50,7 +50,7 @@ static bool test_block_index_stays_within_one_block_for_even_i00() {
     for (int64_t i00 = 0; i00 < 256; i00 += 2) {
         int ib  = -1;
         int iqs = -1;
-        q8_0_aos_v2_block_index(i00, ib, iqs);
+        q8_0_aos_pair_block_index(i00, ib, iqs);
         TEST_ASSERT(ib == static_cast<int>(i00 / 32), "block index must be i00/QK8_0");
         TEST_ASSERT(iqs == static_cast<int>(i00 % 32), "quant index must be i00%QK8_0");
         TEST_ASSERT(iqs % 2 == 0, "iqs must be even for a 2-elements/thread launch");
@@ -67,7 +67,7 @@ static bool test_block_index_matches_gemma_per_layer_embd_row_width() {
     const int64_t last_pair_i00 = ne00 - 2;  // 10750
     int           ib            = -1;
     int           iqs           = -1;
-    q8_0_aos_v2_block_index(last_pair_i00, ib, iqs);
+    q8_0_aos_pair_block_index(last_pair_i00, ib, iqs);
     TEST_ASSERT(ib == 335, "10750/32 must select the last of 336 blocks");
     TEST_ASSERT(iqs == 30, "10750%32 must select the last in-block pair (30,31)");
     return true;
@@ -77,11 +77,12 @@ static bool test_block_index_matches_gemma_per_layer_embd_row_width() {
 // every value in [0, ne01) must not be.
 static bool test_row_out_of_range_boundaries() {
     const int64_t ne01 = 262144;  // per_layer_token_embd.weight's row count
-    TEST_ASSERT(q8_0_aos_v2_row_out_of_range(-1, ne01), "negative row index must be out of range");
-    TEST_ASSERT(q8_0_aos_v2_row_out_of_range(ne01, ne01), "row index == ne01 (one past the end) must be out of range");
-    TEST_ASSERT(q8_0_aos_v2_row_out_of_range(ne01 + 1000, ne01), "row index far past ne01 must be out of range");
-    TEST_ASSERT(!q8_0_aos_v2_row_out_of_range(0, ne01), "row index 0 must be in range");
-    TEST_ASSERT(!q8_0_aos_v2_row_out_of_range(ne01 - 1, ne01), "the last valid row index must be in range");
+    TEST_ASSERT(q8_0_aos_pair_row_out_of_range(-1, ne01), "negative row index must be out of range");
+    TEST_ASSERT(q8_0_aos_pair_row_out_of_range(ne01, ne01),
+                "row index == ne01 (one past the end) must be out of range");
+    TEST_ASSERT(q8_0_aos_pair_row_out_of_range(ne01 + 1000, ne01), "row index far past ne01 must be out of range");
+    TEST_ASSERT(!q8_0_aos_pair_row_out_of_range(0, ne01), "row index 0 must be in range");
+    TEST_ASSERT(!q8_0_aos_pair_row_out_of_range(ne01 - 1, ne01), "the last valid row index must be in range");
     return true;
 }
 

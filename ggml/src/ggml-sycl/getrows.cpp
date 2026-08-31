@@ -1787,6 +1787,16 @@ static void get_rows_q8_0_aos_sycl(ggml_backend_sycl_context & ctx,
 // reimplementing d*q inline, so Q8_0 AoS GET_ROWS is no longer the one
 // quantized type in this file with a bespoke dequant path.
 //
+// Precision consequence, intentional: reusing dequantize_q8_0() means this
+// path now follows the dfloat/dfloat2 typedef -- sycl::half under the
+// default -DGGML_SYCL_F16=ON build, float otherwise -- exactly like its
+// Q4_0/Q4_1/Q5_0/Q5_1 AoS siblings via k_get_rows(). k_get_rows_q8_0_aos
+// above hard-coded f32 math (d and q both promoted to float before
+// multiplying); it was the one quantized GET_ROWS type NOT following the
+// shared half-precision convention. This convergence is verified, not
+// incidental: the L2 scan (joined=1120, diverging=0) and identical digit
+// gates in c-m6hd cover exactly this precision path.
+//
 // The originating ticket suspected this kernel of costing real PP time
 // (OP_TIMING drain-mode attributed 25.2%/15.55ms-per-call to it). An
 // interleaved A/B on both cards (tracker llama.cpp-go37, comment c-m6hd)
@@ -1795,24 +1805,24 @@ static void get_rows_q8_0_aos_sycl(ggml_backend_sycl_context & ctx,
 // MUL_MAT in the pipelined graph. Do not re-derive a perf task from this
 // kernel's shape without a fresh A/B or device-event confirmation.
 // Toggle: GGML_SYCL_GETROWS_Q8_OPT=0 restores the scalar kernel above.
-static void k_get_rows_q8_0_aos_v2(const void *             src0,
-                                   const int32_t *          src1,
-                                   float *                  dst,
-                                   int64_t                  ne00,
-                                   int64_t                  ne10,
-                                   int64_t                  ne11,
-                                   int64_t                  ne01,
-                                   int64_t                  ne12,
-                                   size_t                   s1,
-                                   size_t                   s2,
-                                   size_t                   s3,
-                                   size_t                   nb01,
-                                   size_t                   nb02,
-                                   size_t                   nb03,
-                                   size_t                   s10,
-                                   size_t                   s11,
-                                   size_t                   s12,
-                                   const sycl::nd_item<3> & item_ct1) {
+static void k_get_rows_q8_0_aos_pair(const void *             src0,
+                                     const int32_t *          src1,
+                                     float *                  dst,
+                                     int64_t                  ne00,
+                                     int64_t                  ne10,
+                                     int64_t                  ne11,
+                                     int64_t                  ne01,
+                                     int64_t                  ne12,
+                                     size_t                   s1,
+                                     size_t                   s2,
+                                     size_t                   s3,
+                                     size_t                   nb01,
+                                     size_t                   nb02,
+                                     size_t                   nb03,
+                                     size_t                   s10,
+                                     size_t                   s11,
+                                     size_t                   s12,
+                                     const sycl::nd_item<3> & item_ct1) {
     const int64_t i00 = (item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2)) * 2;
     const int64_t i10 = item_ct1.get_group(1);
     const int64_t i11 = item_ct1.get_group(0) / ne12;
@@ -1825,7 +1835,7 @@ static void k_get_rows_q8_0_aos_v2(const void *             src0,
     float * dst_row = dst + i10 * s1 + i11 * s2 + i12 * s3;
 
     const int64_t i01 = static_cast<int64_t>(src1[i10 * s10 + i11 * s11 + i12 * s12]);
-    if (q8_0_aos_v2_row_out_of_range(i01, ne01)) {
+    if (q8_0_aos_pair_row_out_of_range(i01, ne01)) {
         dst_row[i00]     = 0.0f;
         dst_row[i00 + 1] = 0.0f;
         return;
@@ -1834,7 +1844,7 @@ static void k_get_rows_q8_0_aos_v2(const void *             src0,
     const char * src0_row = static_cast<const char *>(src0) + i01 * nb01 + i11 * nb02 + i12 * nb03;
     int          ib;
     int          iqs;
-    q8_0_aos_v2_block_index(i00, ib, iqs);
+    q8_0_aos_pair_block_index(i00, ib, iqs);
 
     dfloat2 v;
     dequantize_q8_0(src0_row, ib, iqs, v);
@@ -1843,18 +1853,19 @@ static void k_get_rows_q8_0_aos_v2(const void *             src0,
     dst_row[i00 + 1] = static_cast<float>(v.y());
 }
 
-static void get_rows_q8_0_aos_v2_sycl(ggml_backend_sycl_context & ctx,
-                                      const ggml_tensor *         src0,
-                                      const ggml_tensor *         src1,
-                                      ggml_tensor *               dst,
-                                      const void *                src0_dd,
-                                      const int32_t *             src1_dd,
-                                      float *                     dst_dd,
-                                      queue_ptr                   stream) {
+static void get_rows_q8_0_aos_pair_sycl(ggml_backend_sycl_context & ctx,
+                                        const ggml_tensor *         src0,
+                                        const ggml_tensor *         src1,
+                                        ggml_tensor *               dst,
+                                        const void *                src0_dd,
+                                        const int32_t *             src1_dd,
+                                        float *                     dst_dd,
+                                        queue_ptr                   stream) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // QK8_0 (32) is itself even, so this implies ne00 % 2 == 0 -- no separate
+    // assert needed for the 2-elements/thread pairing below.
     GGML_ASSERT(ne00 % QK8_0 == 0);
-    GGML_ASSERT(ne00 % 2 == 0);
 
     const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
     const int            block_num_x = (ne00 + 2 * SYCL_GET_ROWS_BLOCK_SIZE - 1) / (2 * SYCL_GET_ROWS_BLOCK_SIZE);
@@ -1869,8 +1880,8 @@ static void get_rows_q8_0_aos_v2_sycl(ggml_backend_sycl_context & ctx,
     const size_t s12 = nb12 / ggml_element_size(src1);
 
     stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
-        k_get_rows_q8_0_aos_v2(src0_dd, src1_dd, dst_dd, ne00, ne10, ne11, ne01, ne12, s1, s2, s3, nb01, nb02, nb03,
-                               s10, s11, s12, item_ct1);
+        k_get_rows_q8_0_aos_pair(src0_dd, src1_dd, dst_dd, ne00, ne10, ne11, ne01, ne12, s1, s2, s3, nb01, nb02, nb03,
+                                 s10, s11, s12, item_ct1);
     });
 
     GGML_UNUSED(ctx);
@@ -3039,7 +3050,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tens
                                               dst->name ? dst->name : "?", (long long) n_rows_total,
                                               (long long) src0->ne[0], src0_d, (const void *) src1_i32, dst_d);
                     if (ggml_sycl_getrows_q8_0_opt_enabled()) {
-                        get_rows_q8_0_aos_v2_sycl(ctx, src0, dst->src[1], dst, src0_d, src1_i32, dst_d, ctx.stream());
+                        get_rows_q8_0_aos_pair_sycl(ctx, src0, dst->src[1], dst, src0_d, src1_i32, dst_d, ctx.stream());
                     } else {
                         get_rows_q8_0_aos_sycl(ctx, src0, dst->src[1], dst, src0_d, src1_i32, dst_d, ctx.stream());
                     }
