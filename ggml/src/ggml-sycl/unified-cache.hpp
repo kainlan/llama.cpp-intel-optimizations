@@ -4581,6 +4581,15 @@ enum class offload_phase : uint8_t {
 // subsequent read of `baseline` (e.g. for logging) -- two separately-locked
 // accesses can race and report a torn/inconsistent baseline even though each
 // individual access was "safe".
+//
+// One instance tracks exactly one timeline of (phase, bytes) observations.
+// It has no device field and does not compare across callers, so a caller
+// whose `bytes` values are per-device (as zero_alloc_check's are) MUST hold
+// one instance per device rather than sharing a single instance across
+// devices -- sharing one instance across devices reintroduces the same
+// "compared against a foreign baseline" failure this tracker exists to fix,
+// just triggered by a device switch instead of a never-rebaselined phase
+// (llama.cpp-pip4, rev-final follow-up A).
 struct zero_alloc_baseline_tracker {
     offload_phase last_phase    = offload_phase::UNKNOWN;
     size_t        baseline      = 0;

@@ -29,6 +29,17 @@
 // delta arithmetic is exact regardless of what the baseline units mean; if
 // a unit-sensitive threshold is ever moved into observe() itself, these
 // fixtures would need to switch to genuine bytes throughout.
+//
+// test_two_devices_alternating_same_phase_stay_independent covers a second,
+// later-found defect (llama.cpp-pip4, rev-final follow-up A): the
+// production call site used to share ONE tracker across every device, while
+// the bytes it feeds the tracker are per-device -- so two devices with
+// different flat totals in the same phase would compare against each
+// other's baseline. The fix is per-device tracker instances; the test
+// exercises that directly by driving two instances (standing in for two
+// devices) with interleaved, differently-sized streams and checking both
+// stay silent, plus a positive control showing a single shared instance
+// would not have.
 
 #include "ggml-sycl/unified-cache.hpp"
 
@@ -170,6 +181,50 @@ static bool test_have_baseline_flag_is_load_bearing_not_just_last_phase() {
     return true;
 }
 
+// llama.cpp-pip4 (rev-final follow-up A): zero_alloc_check's production call
+// site used to feed per-device bytes into ONE shared tracker instance. Two
+// devices with different (but individually flat) steady-state totals would
+// then be compared against whichever device's baseline the shared instance
+// happened to hold, reproducing the "constant delta forever" false-warning
+// shape dcx6 fixed for phase. The fix is per-device instances -- one tracker
+// per device, never shared. This models that directly: two independent
+// tracker objects (standing in for two devices) are fed interleaved,
+// differently-sized-but-individually-flat byte streams in the SAME phase.
+// Sharing one instance across both streams would warn as soon as the smaller
+// stream's bytes were compared against the larger stream's baseline (or vice
+// versa); two separate instances must both stay silent.
+static bool test_two_devices_alternating_same_phase_stay_independent() {
+    zero_alloc_baseline_tracker device0;
+    zero_alloc_baseline_tracker device1;
+    size_t                      delta = 0;
+
+    // Establish each device's own baseline in the same phase. Deliberately
+    // different totals -- e.g. an unpinned iGPU-inclusive run vs a discrete
+    // card -- so a cross-device compare would visibly misfire.
+    TEST_ASSERT(!device0.observe(offload_phase::TG, 2000000, delta), "device0's first observation must not warn");
+    TEST_ASSERT(!device1.observe(offload_phase::TG, 9000000, delta), "device1's first observation must not warn");
+
+    // Alternate calls across devices, each device flat at its own total.
+    for (int i = 0; i < 10; ++i) {
+        TEST_ASSERT(!device0.observe(offload_phase::TG, 2000000, delta),
+                    "device0 flat at its own baseline must never warn, regardless of device1's activity");
+        TEST_ASSERT(!device1.observe(offload_phase::TG, 9000000, delta),
+                    "device1 flat at its own baseline must never warn, regardless of device0's activity");
+    }
+
+    // Sanity: this is not vacuous -- had these two streams instead shared one
+    // tracker instance, device1's very first call (9000000) would already
+    // have warned against device0's baseline (2000000).
+    zero_alloc_baseline_tracker shared;
+    size_t                      shared_delta = 0;
+    (void) shared.observe(offload_phase::TG, 2000000, shared_delta);
+    const bool shared_would_warn = shared.observe(offload_phase::TG, 9000000, shared_delta);
+    TEST_ASSERT(shared_would_warn,
+                "positive control: a single shared instance WOULD warn on this exact input, "
+                "confirming per-device separation is what prevents the false warning above");
+    return true;
+}
+
 int main() {
     bool ok = true;
     ok &= test_first_observation_never_warns();
@@ -179,6 +234,7 @@ int main() {
     ok &= test_shrink_within_phase_never_warns();
     ok &= test_transition_through_other_phases_rebaselines();
     ok &= test_have_baseline_flag_is_load_bearing_not_just_last_phase();
+    ok &= test_two_devices_alternating_same_phase_stay_independent();
     std::printf("SYCL zero-alloc-check baseline tracker tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

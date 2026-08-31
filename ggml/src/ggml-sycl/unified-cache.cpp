@@ -2060,6 +2060,11 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
 // established -- so a real allocation appearing mid-phase still raises a
 // warning on the very next call.
 //
+// llama.cpp-pip4 (rev-final follow-up A): a single shared tracker had the
+// same "compared against the wrong baseline" shape as the bug above, just
+// triggered by device instead of by phase -- see the per-device map below
+// and the contract note on zero_alloc_baseline_tracker in the header.
+//
 // SEMANTIC DECISION (llama.cpp-dcx6, GPU-verified 2026-08-30): a handful of
 // "pp phase" warnings during a process's FIRST PP execution are EXPECTED and
 // intentionally NOT suppressed. Verified on gemma: 4 warnings
@@ -2103,19 +2108,35 @@ void zero_alloc_check(const char * tag, int device) {
 
     const size_t runtime_bytes = unified_cache_get_runtime_bytes(device);
 
-    // Guards the tracker's compound read-compare-update; observe() is not
+    // Guards the tracker map's compound read-compare-update; observe() is not
     // safe to call concurrently on its own (transition detection has to
     // read last_phase and conditionally write both fields atomically as a
     // unit, which independent atomics cannot express).
-    static std::mutex                  s_tracker_mutex;
-    static zero_alloc_baseline_tracker s_tracker;
-    size_t                             delta    = 0;
-    size_t                             baseline = 0;
-    bool                               warn     = false;
+    //
+    // llama.cpp-pip4 (rev-final follow-up A): this used to be ONE
+    // process-global tracker keyed on phase alone, but the bytes it compares
+    // are already per-device (unified_cache_get_runtime_bytes(device) above)
+    // while offload_phase is a process-global atomic shared by every device.
+    // On a multi-device run (e.g. ONEAPI_DEVICE_SELECTOR=level_zero:0,1) a
+    // call for device 1 could land while the single shared baseline was
+    // still device 0's, so device 1's (generally different) steady-state
+    // total compared against a foreign baseline -- reproducing the exact
+    // "constant delta forever" signature llama.cpp-dcx6 diagnosed, just
+    // triggered by a device switch instead of a never-rebaselined phase.
+    // Keying by device gives each device its own independent
+    // zero_alloc_baseline_tracker (and therefore its own phase-transition
+    // state machine), matching the fact that "runtime_bytes" and "baseline"
+    // are only ever meaningfully compared within one device.
+    static std::mutex                                 s_tracker_mutex;
+    static std::map<int, zero_alloc_baseline_tracker> s_trackers;
+    size_t                                            delta    = 0;
+    size_t                                            baseline = 0;
+    bool                                              warn     = false;
     {
-        std::lock_guard<std::mutex> lock(s_tracker_mutex);
-        warn     = s_tracker.observe(phase, runtime_bytes, delta);
-        baseline = s_tracker.baseline;
+        std::lock_guard<std::mutex>   lock(s_tracker_mutex);
+        zero_alloc_baseline_tracker & tracker = s_trackers[device];
+        warn                                  = tracker.observe(phase, runtime_bytes, delta);
+        baseline                              = tracker.baseline;
     }
     if (!warn) {
         return;
