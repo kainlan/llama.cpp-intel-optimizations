@@ -2319,12 +2319,13 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
 //      DV=512 -- so a softcapped D=512 op would silently produce a stale/
 //      garbage dst if admitted. Same failure class as the dead-macro
 //      finding, through a different door.
-//  (b) K/V type: flash_attn_tile hardcodes `reinterpret_cast<const
-//      sycl::half2 *>` loads for K and V. The generic supports_op check
-//      above this function admits F16 OR FP8 E4M3 K/V; do not inherit FP8
-//      safety from whatever guards it elsewhere in the file (this
-//      function's contract must hold on its own, not depend on another
-//      admission path staying broken/absent) -- require F16 explicitly.
+//  (b) K/V type: flash_attn_tile hardcodes `(const sycl::half2 *)` C-style
+//      casts for K and V (fattn-tile.hpp, K_h2/V_h2). The generic
+//      supports_op check above this function admits F16 OR FP8 E4M3 K/V;
+//      do not inherit FP8 safety from whatever guards it elsewhere in the
+//      file (this function's contract must hold on its own, not depend on
+//      another admission path staying broken/absent) -- require F16
+//      explicitly.
 //  (c) V->ne[0] (DV) == 512: this function is only reached when
 //      Q->ne[0] (D/DKQ) == 512, but DKQ and DV are logically independent
 //      (the config table's 576/512 rows exist for exactly this split) and
@@ -3807,6 +3808,20 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 #endif  // GGML_SYCL_DNNL
 
         if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
+            // The <true> (softcap) arm is unreachable from any op that
+            // passed supports_op: ggml_sycl_fattn_d512_tile_admissible()'s
+            // logit_softcap != 0 screen (F1(a) above) guarantees
+            // params.logit_softcap == 0.0f here. Retained intentionally
+            // rather than collapsed to an unconditional <false> call
+            // (spec review rev-dtpk-spec2, N4) -- this mirrors the
+            // explicit if/else every other DISPATCH_NCOLS-style call site
+            // in this file uses, keeps the launcher generic if the
+            // predicate's softcap screen is ever relaxed, and a future
+            // supports_op/dispatch disagreement here fails by launching
+            // the CORRECT (softcap-aware) kernel variant for whatever
+            // params.logit_softcap actually is, rather than silently
+            // ignoring a nonzero softcap the <false> variant doesn't
+            // apply.
             if (params.logit_softcap == 0.0f) {
                 launch_fattn_tile_d512<false>(params, stream);
             } else {

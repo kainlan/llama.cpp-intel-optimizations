@@ -63,12 +63,18 @@ namespace syclex = sycl::ext::oneapi::experimental;
 // vec_dot_fattn_vec_KQ_f16 (fattn-common.hpp: `sum += x.x()*y.x() +
 // x.y()*y.y()`), and against the canonical in-tree reference for the same
 // primitive under its original name, ggml_cuda_mad
-// (ggml/src/ggml-cuda/common.cuh:744-771) -- its float/float2 overloads use
-// the identical `acc += v*u` / `acc += v.x*u.x; acc += v.y*u.y` shape (the
-// half2 overload additionally branches on hardware dot-product
-// availability, not needed here since this fork always resolves the
+// (ggml/src/ggml-cuda/common.cuh:743-769). Attribution is per branch, not
+// per type name: this file's non-FAST_FP16 float overload matches
+// ggml_cuda_mad's plain `(float, float, float)` overload (`acc += v*u`,
+// common.cuh:744-746); this file's SYCL_FAST_FP16 half2 overload matches
+// ggml_cuda_mad's `(float, float2, float2)` overload's FORMULA (`acc +=
+// v.x*u.x; acc += v.y*u.y`, common.cuh:748-750) rather than its `(float,
+// half2, half2)` overload (common.cuh:757-769) -- that one additionally
+// branches on hardware dot-product availability (AMD `v_dot2_f32_f16` /
+// `FAST_FP16_AVAILABLE`), which this file's fattn_tile_mad does not
+// replicate and does not need to: this fork always resolves the
 // SYCL_FAST_FP16 config table per fast_fp16_available()'s unconditional
-// `true`).
+// `true`, so there is no hardware-capability branch to make here.
 static __dpct_inline__ sycl::half2 fattn_tile_make_half2(float x, float y) {
     return sycl::half2(x, y);
 }
@@ -1445,5 +1451,14 @@ extern DECL_FATTN_TILE_CASE(128, 128);
 extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
+
+// Scope SYCL_FLASH_ATTN/SYCL_FAST_FP16 to this header (spec review
+// rev-dtpk-spec2, N1): fattn.cpp now includes this file in addition to
+// fattn-tile.cpp, and these macros have no reason to stay defined for the
+// several thousand lines of unrelated code that follow this include in
+// that translation unit -- undef them here rather than let them leak,
+// completing the hygiene pair with the file-scoped helper renames above.
+#undef SYCL_FLASH_ATTN
+#undef SYCL_FAST_FP16
 
 #endif // GGML_SYCL_FATTN_TILE_HPP

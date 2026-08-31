@@ -802,11 +802,11 @@ static bool test_supports_op_declines_d512_tile_with_logit_softcap() {
     ggml_context * ctx = ggml_init(iparams);
     TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile logit_softcap decline case");
 
-    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
-    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
-    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
-    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
-                                            /*logit_softcap=*/30.0f);
+    ggml_tensor * q        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
+    ggml_tensor * k        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * dst      = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+                                                 /*logit_softcap=*/30.0f);
     const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
@@ -833,11 +833,11 @@ static bool test_supports_op_declines_d512_tile_with_dv_mismatch() {
     ggml_context * ctx = ggml_init(iparams);
     TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile DV-mismatch decline case");
 
-    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
-    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
-    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 256, 2, 1);  // DV=256 != DKQ=512
-    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
-                                            /*logit_softcap=*/0.0f);
+    ggml_tensor * q        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
+    ggml_tensor * k        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 256, 2, 1);  // DV=256 != DKQ=512
+    ggml_tensor * dst      = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+                                                 /*logit_softcap=*/0.0f);
     const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
