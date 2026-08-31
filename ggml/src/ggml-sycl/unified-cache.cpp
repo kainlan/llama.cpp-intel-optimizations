@@ -2089,7 +2089,12 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
 // self-quieting signal for a blind spot. The Mistral canonical completion
 // gate was re-verified clean (zero warnings) against this fix; GPT-OSS was
 // not re-run post-fix as of this writing. The residual gemma warnings are
-// this model's own warm-up cost, not a defect in the check.
+// this model's own warm-up cost, not a defect in the check. Because
+// GGML_SYCL_ZERO_ALLOC_CHECK=2 bypasses the 1 MiB tolerance entirely (see
+// the zero_alloc_mode check below), these four warm-up warnings mean abort
+// mode is currently unusable against a cold gemma process -- it would abort
+// on ordinary, expected warm-up growth. Warn mode (the default) is the
+// supported way to run this check on gemma today.
 void zero_alloc_check(const char * tag, int device) {
     static const int zero_alloc_mode = []() {
         const char * env = std::getenv("GGML_SYCL_ZERO_ALLOC_CHECK");

@@ -87827,7 +87827,16 @@ gpu_dispatch:
                 if (i == cgraph->n_nodes - 1) {
                     op_graph_count++;
                     graphs_in_window++;
-                    // Skip first 2 graphs (warmup), then print every 5th
+                    // Nothing is skipped -- op_stats accumulates from graph 1
+                    // regardless of this condition (see the comment above
+                    // graphs_in_window). Only the PRINT is deferred: it waits
+                    // until 3 graphs have accumulated, then prints every 5th
+                    // graph thereafter, folding whatever accumulated since
+                    // the previous print (llama.cpp-pip4, rev-final follow-up
+                    // C -- the old "skip first 2 graphs" wording implied
+                    // those graphs' stats were dropped, which the header this
+                    // print emits already disproves: it reports
+                    // graphs_in_window==3 for the first window).
                     if (op_graph_count > 2 && (op_graph_count % 5) == 3) {
                         double graph_total = 0;
                         for (auto & [op, stats] : op_stats) {
