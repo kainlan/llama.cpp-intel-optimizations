@@ -31,6 +31,18 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 bool ggml_sycl_fa_onednn_d512_enabled();
 #endif
 
+// Live (non-cached) parse of GGML_SYCL_FA_TILE_D512 -- the kill switch for
+// routing D=512 FLASH_ATTN_EXT through the tile path (llama.cpp-dtpk).
+// Shared by ggml_sycl_fattn_d512_tile_admissible() (fattn.cpp, caching it in
+// its own function-local static) and the host-only gate tests, which need
+// the live value on every call to stay state-aware -- mirrors
+// ggml_sycl_fa_onednn_d512_enabled()'s shape exactly (spec review
+// rev-dtpk-qual, F2: a duplicated inline parse in the test file was a
+// dual-parse drift risk the same way a third hand-rolled copy would have
+// been for the oneDNN switch). Declared unconditionally, unlike the oneDNN
+// accessor above: the tile route has no GGML_SYCL_DNNL dependency.
+bool ggml_sycl_fa_tile_d512_enabled();
+
 // Pre-allocate V2 partition buffers before SYCL graph recording.
 // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
 // Should be called before graph recording starts.

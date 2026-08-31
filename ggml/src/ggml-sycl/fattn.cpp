@@ -2157,6 +2157,28 @@ bool ggml_sycl_fa_onednn_d512_enabled() {
     return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
 }
 
+// Shared "declined outright, not planned" screen for paged/multi-seq
+// sources and the paged-layout flag (spec review rev-dtpk-qual, F3): both
+// D=512 admissibility helpers below (this one and the tile route's, later
+// in this file) exclude the identical src[5..8]/op_params[4] set for the
+// identical reason (see the comment on ggml_sycl_fattn_d512_onednn_
+// admissible below for why src[5..8] presence is an exact graph-structural
+// fact rather than an approximation of a moving target) -- previously
+// duplicated inline in both, folded into one place here. Declared ahead of
+// both admissibility functions since the oneDNN one is defined first in
+// this file and needs it too.
+static bool ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(const ggml_tensor * dst) {
+    const ggml_tensor * q_seq_ids       = dst->src[5];
+    const ggml_tensor * kv_seq_ids      = dst->src[6];
+    const ggml_tensor * block_table     = dst->src[7];
+    const ggml_tensor * seq_lens_tensor = dst->src[8];
+    if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
+        return true;
+    }
+    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
+    return use_paged_layout_i32 != 0;
+}
+
 // D=512 (llama.cpp-jahv, e.g. gemma-3n's 7 global-attention layers) has no
 // native SYCL FA kernel in this fork -- fattn_vec_supports_head_dim() caps
 // at 256, and fattn-tile.hpp's D=512/576 config-table rows have no live
@@ -2216,23 +2238,14 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor * dst) {
         return false;
     }
 
-    const ggml_tensor * Q               = dst->src[0];
-    const ggml_tensor * K               = dst->src[1];
-    const ggml_tensor * V               = dst->src[2];
-    const ggml_tensor * mask            = dst->src[3];
-    const ggml_tensor * sinks           = dst->src[4];
-    const ggml_tensor * q_seq_ids       = dst->src[5];
-    const ggml_tensor * kv_seq_ids      = dst->src[6];
-    const ggml_tensor * block_table     = dst->src[7];
-    const ggml_tensor * seq_lens_tensor = dst->src[8];
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     // See the function comment: these are declined outright, not planned.
-    if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
-        return false;
-    }
-
-    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
-    if (use_paged_layout_i32 != 0) {
+    if (ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)) {
         return false;
     }
 
@@ -2285,6 +2298,16 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
 }
 #endif  // GGML_SYCL_DNNL
 
+// Shared parse for GGML_SYCL_FA_TILE_D512 (llama.cpp-dtpk), declared in
+// fattn.hpp -- mirrors ggml_sycl_fa_onednn_d512_enabled()'s shape exactly.
+// Used by the admissibility helper below and the host-only test suite
+// (spec review rev-dtpk-qual, F2: the test file previously hand-rolled its
+// own copy of this exact parse, a dual-parse drift risk).
+bool ggml_sycl_fa_tile_d512_enabled() {
+    const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
+    return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+}
+
 // D=512 tile-path admissibility (llama.cpp-dtpk) -- the gemma-viable route.
 // Unlike oneDNN's compiled-partition-baked sqrt(D) divisor,
 // fattn-tile.hpp's flash_attn_tile<> takes scale as a runtime value, so it
@@ -2333,28 +2356,16 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
 //      submit_fattn_tile_d512<512, 512, ...> -- an op with DKQ==512 but
 //      DV!=512 would silently read/write the wrong number of V elements.
 static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
-    static const bool tile_d512_enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
-        return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
-    }();
+    static const bool tile_d512_enabled = ggml_sycl_fa_tile_d512_enabled();
     if (!tile_d512_enabled) {
         return false;
     }
 
-    const ggml_tensor * Q               = dst->src[0];
-    const ggml_tensor * K               = dst->src[1];
-    const ggml_tensor * V               = dst->src[2];
-    const ggml_tensor * q_seq_ids       = dst->src[5];
-    const ggml_tensor * kv_seq_ids      = dst->src[6];
-    const ggml_tensor * block_table     = dst->src[7];
-    const ggml_tensor * seq_lens_tensor = dst->src[8];
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
 
-    if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
-        return false;
-    }
-
-    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
-    if (use_paged_layout_i32 != 0) {
+    if (ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(dst)) {
         return false;
     }
 
@@ -2380,6 +2391,18 @@ static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
         return false;
     }
 
+    // Not screened, and worth naming rather than leaving implicit (spec
+    // review rev-dtpk-qual, F4): this route ignores ggml_flash_attn_ext_
+    // get_prec(dst)/params.prec entirely -- submit_fattn_tile_d512 never
+    // reads it, and flash_attn_tile<>'s VKQ accumulator is always
+    // sycl::half2 under SYCL_FAST_FP16 (always true in this build), with no
+    // float-accumulator specialization the way the XMX-v2 dispatcher has
+    // for GGML_PREC_F32. A GGML_PREC_F32 D=512 op is reachable here (the
+    // ALiBi max_bias>0 case forces the ncols2==1 fallback, which does not
+    // otherwise exclude a precision hint) and would get half2 accumulation
+    // silently. Not a regression -- no SYCL D=512 path existed before this
+    // ticket for a PREC_F32 request to reach -- but a documented gap, not
+    // an oversight.
     return true;
 }
 
@@ -3781,6 +3804,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // supports_op admitted -- a genuine predicate disagreement in one of
     // the two admissibility helpers.
     if (D == 512) {
+        // Latched once per process rather than a fresh getenv() on every
+        // D=512 dispatch (spec review rev-dtpk-qual, F7: this branch is a
+        // genuine hot path -- every D=512 layer of every token -- unlike
+        // the debug prints elsewhere in this file that fire once per
+        // graph_compute; mirrors the debug_limit-style latching at the top
+        // of ggml_sycl_flash_attn_ext_dispatch_ncols). Shared by both the
+        // oneDNN and tile debug prints below.
+        static const bool d512_dispatch_debug_enabled = std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") != nullptr;
 #if GGML_SYCL_DNNL
         static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
         if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
@@ -3790,7 +3821,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             if (plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
                 plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
                 if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
-                    if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                    if (d512_dispatch_debug_enabled) {
                         fprintf(stderr,
                                 "[SYCL] fattn selected [d512] onednn D=%d ne01=%d ne11=%d H_q=%d H_kv=%d "
                                 "materialize=%d\n",
@@ -3808,26 +3839,42 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 #endif  // GGML_SYCL_DNNL
 
         if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
-            // The <true> (softcap) arm is unreachable from any op that
-            // passed supports_op: ggml_sycl_fattn_d512_tile_admissible()'s
-            // logit_softcap != 0 screen (F1(a) above) guarantees
-            // params.logit_softcap == 0.0f here. Retained intentionally
-            // rather than collapsed to an unconditional <false> call
-            // (spec review rev-dtpk-spec2, N4) -- this mirrors the
-            // explicit if/else every other DISPATCH_NCOLS-style call site
-            // in this file uses, keeps the launcher generic if the
-            // predicate's softcap screen is ever relaxed, and a future
-            // supports_op/dispatch disagreement here fails by launching
-            // the CORRECT (softcap-aware) kernel variant for whatever
-            // params.logit_softcap actually is, rather than silently
-            // ignoring a nonzero softcap the <false> variant doesn't
-            // apply.
-            if (params.logit_softcap == 0.0f) {
-                launch_fattn_tile_d512<false>(params, stream);
-            } else {
-                launch_fattn_tile_d512<true>(params, stream);
+            // Correction of record (spec review rev-dtpk-qual, F1): the
+            // previous version of this branch kept a `<true>` (softcap)
+            // launch arm here with a comment claiming it "fails by
+            // launching the CORRECT (softcap-aware) kernel variant". That
+            // was factually backwards, and 81fa31626's commit message
+            // repeated the same wrong claim -- see this commit's message
+            // for the correction of record. flash_attn_tile<>'s own
+            // early-out (fattn-tile.hpp, `use_logit_softcap && !(DV == 128
+            // || DV == 256)`) returns WITHOUT writing dst for any DV
+            // outside {128,256}, exactly this kernel's DV=512. A `<true>`
+            // launch here would be a SILENT NO-OP, not a softcap-aware
+            // fallback -- the same failure class as the dead-macro finding
+            // earlier in this ticket, through yet another door.
+            //
+            // ggml_sycl_fattn_d512_tile_admissible()'s logit_softcap != 0
+            // screen (F1(a), previous round) guarantees params.logit_softcap
+            // == 0.0f whenever this branch is reached through supports_op,
+            // so the check below is unreachable while that screen holds.
+            // Matching this file's convention for a genuine supports_op/
+            // dispatch predicate disagreement (see the GGML_ABORT a few
+            // lines below, and jahv's identical treatment of the oneDNN
+            // route's own predicate-disagreement case): abort loudly with
+            // an honest message if it is ever hit, rather than silently
+            // launching a kernel that would leave dst stale.
+            if (params.logit_softcap != 0.0f) {
+                GGML_ABORT(
+                    "D=512 tile flash attention: logit_softcap=%.6f but "
+                    "ggml_sycl_fattn_d512_tile_admissible() should have declined this op -- its "
+                    "logit_softcap != 0 screen exists for exactly this reason, since flash_attn_tile<>'s "
+                    "DV=512 has no softcap-capable kernel variant, only a silent early-out that leaves dst "
+                    "unwritten. This is a genuine supports_op/dispatch predicate disagreement in "
+                    "ggml_sycl_fattn_d512_tile_admissible() -- please file it as a bug.",
+                    (double) params.logit_softcap);
             }
-            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+            launch_fattn_tile_d512<false>(params, stream);
+            if (d512_dispatch_debug_enabled) {
                 fprintf(stderr, "[SYCL] fattn selected [d512] tile_d512 D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D,
                         params.ne01, params.ne11, params.ne02, params.ne12);
             }

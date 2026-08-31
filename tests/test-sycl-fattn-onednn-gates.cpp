@@ -528,6 +528,18 @@ static ggml_tensor * build_d512_flash_attn_ext_op(ggml_context * ctx, float scal
 // oneDNN-disable to GGML_SYCL_FA_ONEDNN=0 and would false-red here the same
 // way if left out.
 static bool d512_route_expected_admitted() {
+    // Backported from tile_d512_route_expected_enabled() below (spec review
+    // rev-dtpk-qual, F6): GGML_SYCL_FLASH_ATTN_EXT is
+    // ggml_sycl_flash_attn_ext_supported()'s master switch, checked before
+    // D==512 admission is ever reached -- omitting it here false-reds this
+    // helper's callers under GGML_SYCL_FLASH_ATTN_EXT=0 for a reason that
+    // has nothing to do with the oneDNN route, the same false-red class
+    // spec review rev-jahv-spec2 already found and fixed for this
+    // function's other four gates (c-362a).
+    const char * fa_ext_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");
+    if (fa_ext_env && (std::strcmp(fa_ext_env, "0") == 0 || std::strcmp(fa_ext_env, "false") == 0)) {
+        return false;
+    }
     if (!ggml_sycl_fa_onednn_d512_enabled()) {
         return false;
     }
@@ -629,15 +641,20 @@ static bool test_supports_op_declines_d512_with_gemma3n_like_scale() {
 // ---------------------------------------------------------------------------
 
 // D=512, F32 Q (matches what build_attn_mha's per-op cast bypass produces
-// for this D -- see llama-graph.cpp), standard GQA (default H_q=4, H_kv=2,
-// ratio 2), no mask, no paged/seq-id sources. ne01/h_q/h_kv are parameters
-// so callers can probe the decode shape and other GQA ratios without a
-// second near-duplicate builder.
-static ggml_tensor * build_d512_tile_flash_attn_ext_op(ggml_context * ctx, float scale, int32_t ne01_q = 8,
-                                                        int32_t h_q = 4, int32_t h_kv = 2) {
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, ne01_q, h_q, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, h_kv, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, h_kv, 1);
+// for this D -- see llama-graph.cpp), fixed standard GQA (H_q=4, H_kv=2,
+// ratio 2), no mask, no paged/seq-id sources. ne01 is a parameter so
+// callers can probe the decode shape without a second near-duplicate
+// builder. H_q/H_kv were originally parameters too, for a planned
+// non-integer-GQA-ratio negative test -- dropped (spec review
+// rev-dtpk-qual, F5) once that case turned out to be unconstructible via
+// this public factory at all (ggml_flash_attn_ext()'s own
+// GGML_ASSERT(ggml_can_mul_mat(k, q)) forbids it -- see the note above
+// build_d512_tile_flash_attn_ext_op's callers), since no case here has ever
+// called this with anything but the defaults.
+static ggml_tensor * build_d512_tile_flash_attn_ext_op(ggml_context * ctx, float scale, int32_t ne01_q = 8) {
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, ne01_q, 4, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
     return ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
 }
 
@@ -658,8 +675,12 @@ static bool tile_d512_route_expected_enabled() {
     if (fa_ext_env && (std::strcmp(fa_ext_env, "0") == 0 || std::strcmp(fa_ext_env, "false") == 0)) {
         return false;
     }
-    const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
-    return !(env && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0));
+    // ggml_sycl_fa_tile_d512_enabled() (fattn.hpp/fattn.cpp), not a second
+    // hand-rolled parse of GGML_SYCL_FA_TILE_D512 (spec review
+    // rev-dtpk-qual, F2) -- a duplicated inline parse here was a
+    // dual-parse drift risk the same way a third hand-rolled copy would
+    // have been for the oneDNN switch's own accessor.
+    return ggml_sycl_fa_tile_d512_enabled();
 }
 
 static bool test_supports_op_admits_d512_tile_with_gemma_like_scale() {
