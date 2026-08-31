@@ -2140,6 +2140,22 @@ static int compute_sequence_boundaries_from_ids(const int32_t * q_seq_ids,   // 
 // 3 = XMX F16 kernel (using joint_matrix for Q@K^T acceleration)
 
 #if GGML_SYCL_DNNL
+// Shared parse for GGML_SYCL_FA_ONEDNN_D512 (llama.cpp-jahv). Declared in
+// fattn.hpp and used from three places that used to each hand-roll this same
+// getenv/strcmp pair (spec review llama.cpp-jahv/c-362a, optional nit): the
+// admissibility helper and the dispatch branch below, plus the host-only
+// test suite (test-sycl-fattn-onednn-gates.cpp). Deliberately NOT itself
+// cached in a static -- the two production call sites each cache the result
+// in their own function-local `static const bool`, matching every other
+// env-var gate in this file (g_sycl_fa_onednn_enabled, onednn_min_ncols,
+// etc.); the test suite instead wants the LIVE value on every call, to stay
+// state-aware the way its GGML_SYCL_FA_ONEDNN_MATERIALIZE-tracking cases
+// already are.
+bool ggml_sycl_fa_onednn_d512_enabled() {
+    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
+    return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+}
+
 // D=512 (llama.cpp-jahv, e.g. gemma-3n's 7 global-attention layers) has no
 // native SYCL FA kernel in this fork -- fattn_vec_supports_head_dim() caps
 // at 256, and fattn-tile.hpp's D=512/576 config-table rows have no live
@@ -2180,10 +2196,7 @@ static int compute_sequence_boundaries_from_ids(const int32_t * q_seq_ids,   // 
 // target. It costs nothing today (no D=512 model exercises those sources)
 // and avoids depending on data this function cannot see.
 static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor * dst) {
-    static const bool d512_onednn_enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
-        return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
-    }();
+    static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
     if (!d512_onednn_enabled) {
         return false;
     }
@@ -3656,10 +3669,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // below are written to tell the two apart rather than conflating them.
     if (D == 512) {
 #if GGML_SYCL_DNNL
-        static const bool d512_onednn_enabled = []() {
-            const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
-            return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
-        }();
+        static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
         if (d512_onednn_enabled && g_sycl_fa_onednn_enabled && !g_sycl_paged_v2_enabled) {
             const bool                            multi_seq = (params.n_seqs > 1);
             const ggml_sycl_onednn_fa_layout_plan plan      = ggml_sycl_flash_attn_ext_onednn_plan(
@@ -3692,16 +3702,17 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                     (int) plan.kind);
             }
         }
-#endif  // GGML_SYCL_DNNL                                                        \
-    // Neither of the above executed oneDNN at all: either the D=512 route       \
-    // is disabled (GGML_SYCL_FA_ONEDNN_D512=0, GGML_SYCL_FA_ONEDNN=0, or        \
-    // paged-v2 is active) -- in which case ggml_sycl_flash_attn_ext_supported() \
-    // should already have declined this op before SYCL ever saw it -- or        \
-    // the oneDNN plan REJECTed this exact shape despite the admissibility       \
-    // replica agreeing it should be DIRECT/MATERIALIZE_REQUIRED. Either         \
-    // way this genuinely is a supports_op/dispatch predicate disagreement       \
-    // (unlike the execute-time decline above), and is the case that             \
-    // should be reported as a bug in ggml_sycl_fattn_d512_onednn_admissible().
+#endif  // GGML_SYCL_DNNL
+
+        // Neither of the above executed oneDNN at all: either the D=512 route
+        // is disabled (GGML_SYCL_FA_ONEDNN_D512=0, GGML_SYCL_FA_ONEDNN=0, or
+        // paged-v2 is active) -- in which case ggml_sycl_flash_attn_ext_supported()
+        // should already have declined this op before SYCL ever saw it -- or
+        // the oneDNN plan REJECTed this exact shape despite the admissibility
+        // replica agreeing it should be DIRECT/MATERIALIZE_REQUIRED. Either
+        // way this genuinely is a supports_op/dispatch predicate disagreement
+        // (unlike the execute-time decline above), and is the case that
+        // should be reported as a bug in ggml_sycl_fattn_d512_onednn_admissible().
         GGML_ABORT(
             "D=512 flash attention has no SYCL kernel outside the oneDNN SDPA path, and the path was not taken "
             "(disabled via GGML_SYCL_FA_ONEDNN_D512/GGML_SYCL_FA_ONEDNN, paged-v2 active, or the oneDNN plan "

@@ -477,11 +477,24 @@ static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
 // ggml_sycl_flash_attn_ext_onednn_plan() directly, so they pass unchanged on
 // the parent commit and do not guard ggml_sycl_fattn_d512_onednn_admissible()
 // or the D==512 admission branch in ggml_sycl_flash_attn_ext_supported()
-// (fattn.cpp) that this commit actually adds. These two build a real
-// GGML_OP_FLASH_ATTN_EXT tensor via the public ggml_flash_attn_ext() factory
-// (the same one llama.cpp's graph builder uses) and call
-// ggml_sycl_flash_attn_ext_supported() itself, so a deletion of the new
-// admission code turns these red.
+// (fattn.cpp) that this commit actually adds. The two cases below build a
+// real GGML_OP_FLASH_ATTN_EXT tensor via the public ggml_flash_attn_ext()
+// factory (the same one llama.cpp's graph builder uses) and call
+// ggml_sycl_flash_attn_ext_supported() itself instead.
+//
+// Only the FIRST of the two (test_supports_op_d512_admission_follows_
+// onednn_d512_state) actually guards the new code against deletion: it
+// expects D=512 to be ADMITTED in the default state, so reverting to the
+// parent commit's unconditional `if (!fattn_vec_supports_head_dim(D)) return
+// false;` turns it red. The SECOND case (test_supports_op_declines_d512_
+// with_gemma3n_like_scale) asserts a decline, and the parent commit already
+// declines every D=512 op unconditionally -- so it stays GREEN whether or
+// not the new admission code exists. This was stated the other way
+// ("both would go red") until spec review re-review llama.cpp-jahv/c-362a
+// caught it by actually re-running the suite under D=512 disabled. It is
+// still worth keeping: it is the one place this file pins that gemma-3n's
+// specific scale is declined all the way through the real supports_op entry
+// point, not merely the planner underneath it -- just not a deletion guard.
 // ---------------------------------------------------------------------------
 
 // D=512, MHA (H_q==H_kv so ggml_can_mul_mat's broadcast check is trivially
@@ -496,15 +509,50 @@ static ggml_tensor * build_d512_flash_attn_ext_op(ggml_context * ctx, float scal
 }
 
 // Mirrors materialize_enabled()'s pattern: ggml_sycl_fattn_d512_onednn_admissible()
-// latches GGML_SYCL_FA_ONEDNN_D512 into a function-local static on its first
-// call, once per process (same reason the oneDNN gates above are three
-// separate ctest runs rather than one). So this reads the actual current
-// state rather than assuming unset/default, and the assertion below tracks
-// whichever state the process is actually in -- exactly like this file's
-// existing MATERIALIZE-state-aware cases.
-static bool d512_onednn_kill_switch_enabled() {
-    const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
-    return !(e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "false") == 0));
+// latches its env-var reads into function-local statics on first call, once
+// per process (same reason the oneDNN gates above are three separate ctest
+// runs rather than one). So this reads the actual current state rather than
+// assuming unset/default, and the assertion below tracks whichever state the
+// process is actually in -- exactly like this file's existing
+// MATERIALIZE-state-aware cases.
+//
+// Spec review re-review llama.cpp-jahv/c-362a, finding 2: the first version
+// of this helper checked ONLY GGML_SYCL_FA_ONEDNN_D512 and assumed accept
+// otherwise, which FALSE-REDS under three other legitimate states measured
+// on the built binary -- GGML_SYCL_FA_ONEDNN=0, GGML_SYCL_PAGED_V2=1, and
+// GGML_SYCL_FA_ONEDNN_MIN_NCOLS=16 (our fixed test shape's ne01=8 then falls
+// below threshold) -- because the real admissibility helper checks four
+// independent gates, not one. This now mirrors all four; GGML_SYCL_FA_NO_XMX=1
+// is included too even though the reviewer's measurement didn't name it,
+// because init_fa_onednn_config() (fattn.cpp) treats it as an equivalent
+// oneDNN-disable to GGML_SYCL_FA_ONEDNN=0 and would false-red here the same
+// way if left out.
+static bool d512_route_expected_admitted() {
+    if (!ggml_sycl_fa_onednn_d512_enabled()) {
+        return false;
+    }
+    const char * onednn_env = std::getenv("GGML_SYCL_FA_ONEDNN");
+    if (onednn_env && (std::strcmp(onednn_env, "0") == 0 || std::strcmp(onednn_env, "false") == 0)) {
+        return false;
+    }
+    const char * no_xmx_env = std::getenv("GGML_SYCL_FA_NO_XMX");
+    if (no_xmx_env && std::atoi(no_xmx_env) != 0) {
+        return false;
+    }
+    const char * paged_v2_env = std::getenv("GGML_SYCL_PAGED_V2");
+    if (paged_v2_env && (std::strcmp(paged_v2_env, "1") == 0 || std::strcmp(paged_v2_env, "true") == 0)) {
+        return false;
+    }
+    // Matches ggml_sycl_flash_attn_ext_onednn_plan()'s own parse
+    // (fattn-onednn.cpp): getenv, atoi, default 8. build_d512_flash_attn_ext_op()
+    // fixes ne01=8, so any threshold above 8 rejects it via BELOW_MIN_NCOLS,
+    // independent of D=512 admission entirely.
+    const char * min_ncols_env = std::getenv("GGML_SYCL_FA_ONEDNN_MIN_NCOLS");
+    const int    min_ncols     = min_ncols_env ? std::atoi(min_ncols_env) : 8;
+    if (8 < min_ncols) {
+        return false;
+    }
+    return true;
 }
 
 static bool test_supports_op_d512_admission_follows_onednn_d512_state() {
@@ -520,15 +568,18 @@ static bool test_supports_op_d512_admission_follows_onednn_d512_state() {
     const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
-    if (d512_onednn_kill_switch_enabled()) {
+    if (d512_route_expected_admitted()) {
         TEST_ASSERT(accepted,
                     "a real FLASH_ATTN_EXT op at D=512 with a standard 1/sqrt(D) scale, no mask, no paged/seq-id "
                     "sources, must be admitted by ggml_sycl_flash_attn_ext_supported() when the D=512 oneDNN "
                     "route is enabled (default)");
     } else {
         TEST_ASSERT(!accepted,
-                    "GGML_SYCL_FA_ONEDNN_D512=0 must decline even an otherwise fully-eligible D=512 op -- the "
-                    "kill switch must be observable from supports_op, not only from the dispatch branch");
+                    "the current environment disables the D=512 oneDNN route (GGML_SYCL_FA_ONEDNN_D512=0, "
+                    "GGML_SYCL_FA_ONEDNN=0/GGML_SYCL_FA_NO_XMX=1, GGML_SYCL_PAGED_V2=1, or "
+                    "GGML_SYCL_FA_ONEDNN_MIN_NCOLS above this shape's ne01=8) -- ggml_sycl_flash_attn_ext_supported() "
+                    "must decline even an otherwise fully-eligible D=512 op in that state, not only the dispatch "
+                    "branch");
     }
     return true;
 }

@@ -20,6 +20,17 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst);
 // Execute flash attention operation
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst);
 
+#if GGML_SYCL_DNNL
+// Live (non-cached) parse of GGML_SYCL_FA_ONEDNN_D512 -- the kill switch for
+// routing D=512 FLASH_ATTN_EXT through oneDNN SDPA (llama.cpp-jahv). Shared
+// by ggml_sycl_flash_attn_ext_supported()'s D=512 admissibility helper, the
+// D==512 dispatch branch in ggml_sycl_flash_attn_ext() (both fattn.cpp,
+// each caching it in their own function-local static), and the host-only
+// gate tests, which need the live value on every call to stay
+// state-aware.
+bool ggml_sycl_fa_onednn_d512_enabled();
+#endif
+
 // Pre-allocate V2 partition buffers before SYCL graph recording.
 // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
 // Should be called before graph recording starts.
