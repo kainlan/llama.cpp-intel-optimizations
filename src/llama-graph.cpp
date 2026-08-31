@@ -2585,12 +2585,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             // as a first-class input and materializes it to F16 internally
             // when needed (ggml_sycl_flash_attn_ext_onednn_materialize_q_f32,
             // fattn-onednn.cpp) -- its own admissibility check rejects only
-            // types that are neither F16 nor F32 -- so leaving Q at F32 for
-            // D=512 costs that route nothing. D<=256 is unaffected: the cast
-            // there is a pure performance choice (every D<=256 kernel family
-            // already takes a Q_type template parameter and handles either
-            // type generically), so this changes behavior for exactly one
-            // head dimension that has no working F16 consumer today.
+            // types that are neither F16 nor F32. That materialize step is
+            // NOT free, though (spec review rev-dtpk-spec, F3, correcting
+            // this comment's earlier "costs that route nothing" claim): it
+            // does a per-op GRAPH_TMP device allocation, dispatches a
+            // conversion kernel, and synchronously wait_and_throw()s before
+            // oneDNN's execute can proceed, and it unconditionally rejects
+            // ne03 != 1 (batch dim above 1) -- a future batched, standard-
+            // scale D=512 model would hit that decline where F16 Q might not
+            // have needed materializing at all. Neither cost applies to
+            // gemma today (its D=512 layers reject oneDNN on scale before Q
+            // dtype is even considered), but they are real for the
+            // standard-scale audience oneDNN's D=512 route targets.
+            // D<=256 is unaffected: the cast there is a pure performance
+            // choice (every D<=256 kernel family already takes a Q_type
+            // template parameter and handles either type generically), so
+            // this changes behavior for exactly one head dimension that has
+            // no working F16 consumer today.
             if (q->ne[0] != 512 && q->type != sycl_q_type) {
                 q = ggml_cast(ctx0, q, sycl_q_type);
             }
