@@ -37,36 +37,52 @@ namespace syclex = sycl::ext::oneapi::experimental;
 #define SYCL_FAST_FP16 1
 
 // Missing dpct-migration utilities (llama.cpp-dtpk): flash_attn_tile<>'s
-// body calls these three CUDA-intrinsic-named helpers, none of which exist
-// anywhere in this fork (confirmed by a whole-tree grep) -- another
-// consequence of this file never having compiled before (see the
-// SYCL_FLASH_ATTN/SYCL_FAST_FP16 comment above; this was found only once
-// the macros above let the compiler actually reach these call sites for the
-// first time). make_half2/make_float2 are exactly what this same file
-// already spells out inline elsewhere as sycl::half2(a,b)/sycl::float2(a,b)
-// constructor calls (e.g. the `KQ_max_scale_h2 = sycl::half2(...)` pattern
-// further down) -- these are thin aliases for that constructor, the one
-// call site that was never converted off its CUDA name. ggml_sycl_mad is a
-// half2-dot-into-float / float-FMA accumulate, inferred from its two call
-// shapes at the single site that uses it (K_k/Q_k are sycl::half2 under
-// SYCL_FAST_FP16, plain float otherwise) and cross-checked against this
-// file's own already-working, already-compiling scalar half2-dot-product
-// pattern in vec_dot_fattn_vec_KQ_f16 (fattn-common.hpp): `sum +=
-// x.x()*y.x() + x.y()*y.y()`, same accumulation shape.
-static __dpct_inline__ sycl::half2 make_half2(float x, float y) {
+// body called three CUDA-intrinsic-named helpers (make_half2, make_float2,
+// ggml_sycl_mad) that existed nowhere in this fork under any name
+// (confirmed by a whole-tree grep) -- another consequence of this file
+// never having compiled before (see the SYCL_FLASH_ATTN/SYCL_FAST_FP16
+// comment above; this was found only once those macros let the compiler
+// actually reach these call sites for the first time). Defined here with a
+// file-scoped `fattn_tile_` prefix (spec review rev-dtpk-spec nit) rather
+// than the original CUDA names, both to read as this file's own utilities
+// and to avoid ever colliding with a same-named helper landing elsewhere in
+// this translation unit (fattn.cpp now includes this header too).
+//
+// fattn_tile_make_half2/fattn_tile_make_float2 are exactly what this same
+// file already spells out inline elsewhere as
+// sycl::half2(a,b)/sycl::float2(a,b) constructor calls (e.g. the
+// `KQ_max_scale_h2 = sycl::half2(...)` pattern further down) -- these are
+// thin aliases for that constructor, the one call site that was never
+// converted off its CUDA name.
+//
+// fattn_tile_mad is a half2-dot-into-float / float-FMA accumulate, inferred
+// from its two call shapes at the single site that uses it (K_k/Q_k are
+// sycl::half2 under SYCL_FAST_FP16, plain float otherwise) and
+// cross-checked two ways: against this file's own already-working,
+// already-compiling scalar half2-dot-product pattern in
+// vec_dot_fattn_vec_KQ_f16 (fattn-common.hpp: `sum += x.x()*y.x() +
+// x.y()*y.y()`), and against the canonical in-tree reference for the same
+// primitive under its original name, ggml_cuda_mad
+// (ggml/src/ggml-cuda/common.cuh:744-771) -- its float/float2 overloads use
+// the identical `acc += v*u` / `acc += v.x*u.x; acc += v.y*u.y` shape (the
+// half2 overload additionally branches on hardware dot-product
+// availability, not needed here since this fork always resolves the
+// SYCL_FAST_FP16 config table per fast_fp16_available()'s unconditional
+// `true`).
+static __dpct_inline__ sycl::half2 fattn_tile_make_half2(float x, float y) {
     return sycl::half2(x, y);
 }
 
-static __dpct_inline__ sycl::float2 make_float2(float x, float y) {
+static __dpct_inline__ sycl::float2 fattn_tile_make_float2(float x, float y) {
     return sycl::float2(x, y);
 }
 
-static __dpct_inline__ void ggml_sycl_mad(float & acc, const sycl::half2 & a, const sycl::half2 & b) {
+static __dpct_inline__ void fattn_tile_mad(float & acc, const sycl::half2 & a, const sycl::half2 & b) {
     acc += static_cast<float>(a.x()) * static_cast<float>(b.x()) +
            static_cast<float>(a.y()) * static_cast<float>(b.y());
 }
 
-static __dpct_inline__ void ggml_sycl_mad(float & acc, const float & a, const float & b) {
+static __dpct_inline__ void fattn_tile_mad(float & acc, const float & a, const float & b) {
     acc += a * b;
 }
 
@@ -444,7 +460,7 @@ static __dpct_inline__ void flash_attn_tile_iter_KQ(T_vec_dot * const Q_tmp,
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
 #pragma unroll
                 for (int k = 0; k < cpy_ne; ++k) {
-                    ggml_sycl_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
+                    fattn_tile_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
             }
         }
@@ -898,7 +914,7 @@ static void flash_attn_tile(const char *  Q,
                 __dpct_align__(16) sycl::half2 tmp_h2[cpy_ne_D / 2];
 #pragma unroll
                 for (int i1 = 0; i1 < cpy_ne_D; i1 += 2) {
-                    tmp_h2[i1/2] = make_half2(tmp_f[i1 + 0], tmp_f[i1 + 1]);
+                    tmp_h2[i1/2] = fattn_tile_make_half2(tmp_f[i1 + 0], tmp_f[i1 + 1]);
 #if defined(SYCL_FAST_FP16) && !defined(GGML_SYCL_F16)
                     // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
                     // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
@@ -1113,7 +1129,7 @@ static void flash_attn_tile(const char *  Q,
 #endif // SYCL_FAST_FP16
 
         if (item_ct1.get_group_range(1) != 1 && item_ct1.get_local_id(2) == 0) {
-            dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
+            dst_meta[j_dst_unrolled] = fattn_tile_make_float2(KQ_max[jc0], KQ_sum[jc0]);
         }
     }
 #else

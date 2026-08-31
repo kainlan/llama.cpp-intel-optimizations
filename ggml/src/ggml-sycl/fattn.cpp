@@ -2308,6 +2308,29 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
 // build_attn_mha() skips the blanket GGML_SYCL_FATTN_Q_TYPE(=F16) cast
 // specifically for D=512, so Q should already be F32 for any real op that
 // reaches here -- checked anyway as a defensive backstop.
+//
+// Three more screens (spec review rev-dtpk-spec, F1), each currently
+// unreachable by any real op but latent -- the kernel would rather decline
+// than silently mis-execute if one of these assumptions were ever violated
+// by a future caller:
+//  (a) logit_softcap != 0: flash_attn_tile's own early-out (fattn-tile.hpp,
+//      `use_logit_softcap && !(DV == 128 || DV == 256)`) returns WITHOUT
+//      writing dst for any DV outside {128,256} -- exactly this kernel's
+//      DV=512 -- so a softcapped D=512 op would silently produce a stale/
+//      garbage dst if admitted. Same failure class as the dead-macro
+//      finding, through a different door.
+//  (b) K/V type: flash_attn_tile hardcodes `reinterpret_cast<const
+//      sycl::half2 *>` loads for K and V. The generic supports_op check
+//      above this function admits F16 OR FP8 E4M3 K/V; do not inherit FP8
+//      safety from whatever guards it elsewhere in the file (this
+//      function's contract must hold on its own, not depend on another
+//      admission path staying broken/absent) -- require F16 explicitly.
+//  (c) V->ne[0] (DV) == 512: this function is only reached when
+//      Q->ne[0] (D/DKQ) == 512, but DKQ and DV are logically independent
+//      (the config table's 576/512 rows exist for exactly this split) and
+//      nothing upstream of here pins DV. The launcher hardcodes
+//      submit_fattn_tile_d512<512, 512, ...> -- an op with DKQ==512 but
+//      DV!=512 would silently read/write the wrong number of V elements.
 static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
     static const bool tile_d512_enabled = []() {
         const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
@@ -2319,6 +2342,7 @@ static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
 
     const ggml_tensor * Q               = dst->src[0];
     const ggml_tensor * K               = dst->src[1];
+    const ggml_tensor * V               = dst->src[2];
     const ggml_tensor * q_seq_ids       = dst->src[5];
     const ggml_tensor * kv_seq_ids      = dst->src[6];
     const ggml_tensor * block_table     = dst->src[7];
@@ -2330,6 +2354,20 @@ static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
 
     const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
     if (use_paged_layout_i32 != 0) {
+        return false;
+    }
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        return false;
+    }
+
+    if (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    if (V->ne[0] != 512) {
         return false;
     }
 

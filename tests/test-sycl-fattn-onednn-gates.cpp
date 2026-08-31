@@ -641,11 +641,23 @@ static ggml_tensor * build_d512_tile_flash_attn_ext_op(ggml_context * ctx, float
     return ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
 }
 
-// Mirrors ggml_sycl_fattn_d512_tile_admissible()'s own state-dependent gate
-// -- its only one; every other condition it checks is a pure shape/type
-// test a fixed synthetic op either satisfies or doesn't, unlike the
-// oneDNN helper's four independent env gates.
+// Mirrors both state-dependent gates a positive tile case actually passes
+// through: ggml_sycl_fattn_d512_tile_admissible()'s own env kill switch
+// (its only one; every other condition it checks is a pure shape/type test
+// a fixed synthetic op either satisfies or doesn't, unlike the oneDNN
+// helper's four independent env gates), AND
+// ggml_sycl_flash_attn_ext_supported()'s own master switch
+// (GGML_SYCL_FLASH_ATTN_EXT), checked before D==512 admission is ever
+// reached. Omitting the second one would repeat the exact false-red class
+// spec review rev-jahv-spec2 found and fixed for the oneDNN cases (c-362a):
+// setting GGML_SYCL_FLASH_ATTN_EXT=0 to debug something unrelated would
+// make every positive case here go red for a reason that has nothing to do
+// with the tile route.
 static bool tile_d512_route_expected_enabled() {
+    const char * fa_ext_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");
+    if (fa_ext_env && (std::strcmp(fa_ext_env, "0") == 0 || std::strcmp(fa_ext_env, "false") == 0)) {
+        return false;
+    }
     const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
     return !(env && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0));
 }
@@ -773,6 +785,80 @@ static bool test_supports_op_declines_d512_tile_with_paged_sources() {
                 "submit_fattn_tile_d512 has no paged-layout support");
     return true;
 }
+
+// Spec review rev-dtpk-spec, F1(a): flash_attn_tile<>'s own early-out
+// (fattn-tile.hpp, `use_logit_softcap && !(DV == 128 || DV == 256)`)
+// returns WITHOUT writing dst for any DV outside {128,256} -- exactly
+// this kernel's DV=512. Unreachable today (nothing constructs a softcapped
+// D=512 op), but a real, silent-garbage-class bug if it were ever admitted
+// -- pinned as a test, not left as prose the way the commit message
+// describes it.
+static bool test_supports_op_declines_d512_tile_with_logit_softcap() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile logit_softcap decline case");
+
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+                                            /*logit_softcap=*/30.0f);
+    const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    TEST_ASSERT(!accepted,
+                "a D=512 op with logit_softcap != 0 must be declined by the tile route -- flash_attn_tile's own "
+                "early-out returns without writing dst for any DV outside {128,256} when use_logit_softcap is "
+                "true, which would silently no-op a softcapped D=512 call if admitted");
+    return true;
+}
+
+// Spec review rev-dtpk-spec, F1(c): the launcher hardcodes
+// submit_fattn_tile_d512<512, 512, ...>, but DKQ (Q/K's ne[0]) and DV
+// (V's ne[0]) are logically independent -- the config table's 576/512 rows
+// exist for exactly this split, and ggml_flash_attn_ext() (ggml.c) asserts
+// no relationship between them (dst's ne[0] is set from v->ne[0] alone).
+// An op with DKQ==512 but DV!=512 would silently process the wrong number
+// of V elements if the tile route admitted it.
+static bool test_supports_op_declines_d512_tile_with_dv_mismatch() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile DV-mismatch decline case");
+
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 256, 2, 1);  // DV=256 != DKQ=512
+    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+                                            /*logit_softcap=*/0.0f);
+    const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    TEST_ASSERT(!accepted,
+                "a D=512 op whose V head dim (256) differs from Q/K's (512) must be declined by the tile route "
+                "-- submit_fattn_tile_d512 hardcodes DV=512 and has no DKQ!=DV support");
+    return true;
+}
+
+// Spec review rev-dtpk-spec, F1(b) is NOT present as a test here, and that
+// is a deliberate finding rather than an omission: ggml_sycl_type_is_fp8_
+// e4m3() (common.hpp) is a stub that unconditionally `return`s `false`
+// regardless of its argument, so kv_is_fp8 is always false in this build --
+// there is no ggml_type value that makes it true, and therefore no way to
+// construct a synthetic op that reaches ggml_sycl_fattn_d512_tile_
+// admissible() with K/V considered FP8 by anything in this tree today. The
+// F16-type check the review asked for is real, correct defensive code
+// against a future state where that stub is implemented, but is
+// consequently untestable via a synthetic op the way every other case here
+// is -- the same shape of finding as the non-integer-GQA case noted above
+// build_d512_tile_flash_attn_ext_op.
 
 static bool test_planner_rejects_unsupported_d() {
     fattn_params params = mha_like_params();
@@ -1006,6 +1092,8 @@ int main() {
     ok &= test_supports_op_admits_d512_tile_decode_shape();
     ok &= test_supports_op_declines_d512_tile_with_f16_q();
     ok &= test_supports_op_declines_d512_tile_with_paged_sources();
+    ok &= test_supports_op_declines_d512_tile_with_logit_softcap();
+    ok &= test_supports_op_declines_d512_tile_with_dv_mismatch();
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();
