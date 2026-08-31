@@ -519,15 +519,18 @@ static bool test_planner_accepts_d512_with_matching_scale() {
 }
 
 // The documenting half of the D=512 story: gemma-3n hardcodes
-// hparams.f_attention_scale = 1.0f (src/models/gemma3n.cpp), exactly the
-// phi2-style pre-scaled-Q pattern this planner's SCALE_UNSUPPORTED gate
-// exists for (see test_planner_rejects_scale_not_inv_sqrt_d above). So
-// wiring D=512 into ggml_sycl_flash_attn_ext_supported()/
+// hparams.f_attention_scale = 1.0f (src/models/gemma3n.cpp), the same
+// phi2-style pre-scaled-Q pattern as test_planner_accepts_prescaled_q_at_d80
+// / _at_d256 above -- but D=512 is a different outcome. llama.cpp-p0f5's
+// relaxation is deliberately scoped to D<=256 (see the CONSERVATIVE SCOPE
+// comment in ggml_sycl_flash_attn_ext_onednn_plan), so gemma-3n's D=512
+// global-attention layers still reject on scale here, unlike phi2/gemma4 at
+// D<=256. So wiring D=512 into ggml_sycl_flash_attn_ext_supported()/
 // ggml_sycl_flash_attn_ext() (llama.cpp-jahv) does NOT by itself move
 // gemma-3n's global-attention layers off CPU -- they still reject here, on
 // scale, not on D. This case pins that fact so it cannot silently regress
-// into "D=512 now works, therefore gemma-3n now works" without a test
-// noticing the two are different claims.
+// into "D=512 now works, therefore gemma-3n now works", and so the D<=256
+// relaxation cannot silently widen to D=512, without a test noticing either.
 static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
     fattn_params params = mha_like_params();
     params.ne00         = 512;

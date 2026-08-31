@@ -879,6 +879,18 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
         throw std::runtime_error("oneDNN SDPA: scale buffer is not host-pinned USM");
     }
 
+    // Local defense: the finite/nonzero invariant on `key.scale` is enforced
+    // by the planner gate (SCALE_UNSUPPORTED, ggml_sycl_flash_attn_ext_onednn_
+    // plan above) and re-checked by the runtime backstop assertion at execute
+    // time -- both of which run at call sites OTHER than this one. This
+    // function has no caller-independent guarantee of its own, so assert here
+    // too, BEFORE the division below computes anything from key.scale (an
+    // inequality/finiteness check after the fact would let the optimizer
+    // treat the divide-by-zero/NaN as already having happened and drop the
+    // check -- see the assertion-order lesson elsewhere in this codebase).
+    GGML_ASSERT(key.scale != 0.0f && std::isfinite(key.scale) &&
+                "oneDNN SDPA: build_and_compile_sdpa called with a zero/non-finite scale -- the planner gate "
+                "(SCALE_UNSUPPORTED) should have rejected this shape before it ever reached compile");
     // We build the graph with op::kind::Divide (see div_op above, matching
     // oneDNN's canonical SDPA pattern), so the scalar written here must be the
     // RECIPROCAL of the runtime scale, not the scale itself.
