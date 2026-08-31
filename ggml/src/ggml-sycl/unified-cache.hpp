@@ -4574,6 +4574,13 @@ enum class offload_phase : uint8_t {
 // call within an unchanged phase compares against the baseline that phase
 // already established, so a real allocation appearing mid-phase still
 // raises `delta` on the very next call.
+//
+// NOT thread-safe on its own: observe() is a compound read-last_phase/write-
+// all-three-fields operation, so a caller with multiple threads reaching the
+// same instance must hold one lock across BOTH the observe() call and any
+// subsequent read of `baseline` (e.g. for logging) -- two separately-locked
+// accesses can race and report a torn/inconsistent baseline even though each
+// individual access was "safe".
 struct zero_alloc_baseline_tracker {
     offload_phase last_phase    = offload_phase::UNKNOWN;
     size_t        baseline      = 0;

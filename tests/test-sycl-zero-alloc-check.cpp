@@ -17,6 +17,18 @@
 // phase already established. These cases assert both halves: a transition
 // must never warn by itself, and a real allocation appearing mid-phase must
 // still be caught on the very next call.
+//
+// A NOTE ON THE NUMBERS BELOW: fixture values like 8402800 are the gemma
+// hardware evidence's MB figure (8402.8 MB, from dcx6-gem.err) scaled x1000,
+// chosen so the test reads directly against that log rather than an
+// unrelated round number. They are NOT real byte counts -- observe() itself
+// is unit-agnostic (it only ever compares two same-scale values), and the
+// 1 MiB significance floor is applied by the caller (zero_alloc_check), not
+// here. test_real_midphase_growth_still_warns deliberately mixes this scaled
+// baseline with a real byte-sized increment (6 * 1024 * 1024) to prove the
+// delta arithmetic is exact regardless of what the baseline units mean; if
+// a unit-sensitive threshold is ever moved into observe() itself, these
+// fixtures would need to switch to genuine bytes throughout.
 
 #include "ggml-sycl/unified-cache.hpp"
 
@@ -64,8 +76,8 @@ static bool test_phase_transition_rebaselines_without_warning() {
     size_t                      delta = 0;
 
     // Baseline for PP, then PP grows during warm-up (multiple ubatches).
-    TEST_ASSERT(!t.observe(offload_phase::PP, 8396800000ull / 1000, delta), "PP entry must not warn");
-    (void) t.observe(offload_phase::PP, 8667600000ull / 1000, delta);  // PP warm-up growth, same phase
+    TEST_ASSERT(!t.observe(offload_phase::PP, 8396800, delta), "PP entry must not warn");
+    (void) t.observe(offload_phase::PP, 8667600, delta);  // PP warm-up growth, same phase
 
     // Transition PP -> TG: total actually DROPS (8667.6 -> 8402.8 MB) but is
     // still above the ORIGINAL PP baseline. The old design would compare
@@ -140,6 +152,24 @@ static bool test_transition_through_other_phases_rebaselines() {
     return true;
 }
 
+// A default-constructed tracker's last_phase happens to equal
+// offload_phase::UNKNOWN, so a naive `phase != last_phase` transition check
+// would (wrongly, by luck) already treat a first observation in UNKNOWN as a
+// transition even without the `have_baseline` flag. This case makes
+// have_baseline load-bearing under test by observing UNKNOWN twice: the
+// second call must still be recognized as "same phase as before" and warn on
+// growth, which only holds if have_baseline (not merely a last_phase
+// mismatch) is what the first call actually sets.
+static bool test_have_baseline_flag_is_load_bearing_not_just_last_phase() {
+    zero_alloc_baseline_tracker t;
+    size_t                      delta = 0;
+    TEST_ASSERT(!t.observe(offload_phase::UNKNOWN, 1000, delta), "first observation, even in UNKNOWN, must not warn");
+    const bool warn = t.observe(offload_phase::UNKNOWN, 1500, delta);
+    TEST_ASSERT(warn, "a second UNKNOWN-phase call with the same phase as before must warn on growth");
+    TEST_ASSERT(delta == 500, "delta must be measured against the first UNKNOWN call's baseline");
+    return true;
+}
+
 int main() {
     bool ok = true;
     ok &= test_first_observation_never_warns();
@@ -148,6 +178,7 @@ int main() {
     ok &= test_real_midphase_growth_still_warns();
     ok &= test_shrink_within_phase_never_warns();
     ok &= test_transition_through_other_phases_rebaselines();
+    ok &= test_have_baseline_flag_is_load_bearing_not_just_last_phase();
     std::printf("SYCL zero-alloc-check baseline tracker tests: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
