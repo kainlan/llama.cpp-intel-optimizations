@@ -29,6 +29,17 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
 // gate tests, which need the live value on every call to stay
 // state-aware.
 bool ggml_sycl_fa_onednn_d512_enabled();
+
+// Live (non-cached) parse of GGML_SYCL_FA_ONEDNN_D512_SCALE -- llama.cpp-bn5k
+// item 2 measurement hatch (default OFF) that relaxes the "CONSERVATIVE
+// SCOPE, D > 256" scale check in ggml_sycl_flash_attn_ext_onednn_plan
+// (fattn-onednn.cpp, which also defines this function -- it is that plan
+// function's sole production caller). Deliberately a DIFFERENT switch from
+// ggml_sycl_fa_onednn_d512_enabled() above (that one gates whether D=512
+// reaches the planner at all; this one only changes what the planner does
+// with the scale once asked). Shared with the host-only gate tests for the
+// same dual-parse-drift reason as the accessor above.
+bool ggml_sycl_fa_onednn_d512_scale_relaxed();
 #endif
 
 // Live (non-cached) parse of GGML_SYCL_FA_TILE_D512 -- the kill switch for

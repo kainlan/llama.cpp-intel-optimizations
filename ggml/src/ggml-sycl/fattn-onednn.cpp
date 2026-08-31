@@ -71,6 +71,34 @@ class onednn_fa_materialize_v_kernel;
 class onednn_fa_materialize_q_f32_kernel;
 class onednn_fa_materialized_release_marker_kernel;
 
+// Live (non-cached) parse of GGML_SYCL_FA_ONEDNN_D512_SCALE -- llama.cpp-bn5k
+// item 2, a measurement hatch (default OFF) for the "CONSERVATIVE SCOPE,
+// D > 256" gate below: when set, D>256 (i.e. D=512, since D>512 is rejected
+// earlier by UNSUPPORTED_D) is screened by the same finite&&nonzero check
+// D<=256 already uses, instead of the strict 1/sqrt(D) requirement, so
+// gemma-3n's D=512 global layers (kq_scale=1.0) can be A/B'd against
+// tile-d512 (llama.cpp-dtpk) without a code change. Declared in fattn.hpp and
+// defined here (its only production call site is the plan() function below)
+// so the host-only test suite can read the same parse rather than
+// hand-rolling a second copy -- the dual-parse drift risk spec review
+// already flagged for GGML_SYCL_FA_ONEDNN_D512 and GGML_SYCL_FA_TILE_D512
+// (fattn.cpp). Deliberately NOT cached here, matching those two: the sole
+// production caller below caches the result in its own function-local
+// static, and the test suite wants the live value on every call to stay
+// state-aware.
+//
+// Name chosen to avoid a near-anagram collision with the pre-existing
+// GGML_SYCL_FA_ONEDNN_D512 kill switch (fattn.hpp) -- that variable gates
+// whether D=512 traffic reaches this planner AT ALL; this one only changes
+// what the planner does with the scale once asked. "GGML_SYCL_ONEDNN_FA_
+// D512" (transposing FA/ONEDNN) was considered and rejected for exactly that
+// reason: two independently-acting switches whose names differ only in
+// token order is a footgun for anyone typing an A/B script by hand.
+bool ggml_sycl_fa_onednn_d512_scale_relaxed() {
+    const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_D512_SCALE");
+    return e ? (std::atoi(e) != 0) : false;
+}
+
 ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn_params & params,
                                                                      int                  H_q,
                                                                      int                  H_kv,
@@ -151,15 +179,34 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     // Letting D=512 traffic newly fall onto oneDNN here would be a second,
     // untested change this ticket does not evaluate or regression-test, so
     // D>256 (i.e. exactly D=512, since D>512 is already rejected above by
-    // UNSUPPORTED_D) keeps the OLD strict 1/sqrt(D) requirement. Lifting this
-    // for D=512 -- after its own regression battery -- is tracked as
-    // follow-up, not bundled here. See ggml_sycl_fattn_d512_onednn_admissible
-    // (fattn.cpp), which inherits this scope unchanged because it calls this
-    // same plan function and has no separate scale screen of its own.
+    // UNSUPPORTED_D) keeps the OLD strict 1/sqrt(D) requirement BY DEFAULT.
+    // Lifting this for D=512 -- after its own regression battery -- is
+    // tracked as follow-up, not bundled here. See
+    // ggml_sycl_fattn_d512_onednn_admissible (fattn.cpp), which inherits this
+    // scope unchanged because it calls this same plan function and has no
+    // separate scale screen of its own.
+    //
+    // GGML_SYCL_FA_ONEDNN_D512_SCALE=1 (llama.cpp-bn5k item 2, measurement
+    // hatch, default OFF): lets D>256 reach the SAME finite&&nonzero screen
+    // D<=256 already uses above, instead of the strict 1/sqrt(D) check below
+    // -- so gemma-3n's D=512 global layers can be A/B'd against tile-d512
+    // (llama.cpp-dtpk) without a code change. Deliberately a DIFFERENT switch
+    // from GGML_SYCL_FA_ONEDNN_D512 (fattn.hpp/fattn.cpp, ggml_sycl_fa_onednn_
+    // d512_enabled()): that one gates whether D=512 traffic reaches this
+    // planner AT ALL (vs. tile-d512/CPU); this one only changes what the
+    // planner does with the scale once it is asked. Turning this hatch on
+    // does NOT by itself move the default -- see ggml_sycl_fa_onednn_d512_
+    // scale_relaxed()'s doc comment for why this is not cached at that
+    // accessor and why the name was deliberately NOT the near-anagram of the
+    // D512 kill switch's name (GGML_SYCL_FA_ONEDNN_D512 vs. ...D512_SCALE):
+    // a name differing only in whether "FA"/"ONEDNN" are transposed would be
+    // a live footgun for anyone typing an A/B script by hand.
     if (params.scale == 0.0f || !std::isfinite(params.scale)) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED);
     }
-    if (params.ne00 > 256 && std::fabs(1.0f / params.scale - sqrtf(static_cast<float>(params.ne00))) >= 1e-3f) {
+    static const bool onednn_d512_scale_relaxed = ggml_sycl_fa_onednn_d512_scale_relaxed();
+    if (params.ne00 > 256 && !onednn_d512_scale_relaxed &&
+        std::fabs(1.0f / params.scale - sqrtf(static_cast<float>(params.ne00))) >= 1e-3f) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED);
     }
     if (params.ne11 <= 0) {

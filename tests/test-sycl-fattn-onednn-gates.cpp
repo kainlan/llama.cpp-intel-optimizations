@@ -371,8 +371,9 @@ static bool test_planner_accepts_prescaled_q_at_d80() {
 // census attributed ~56% of a gemma-4-E4B pp512 pass to the native xmx_v2
 // kernel these 35 SWA layers were forced onto by the old sqrt(D)-only gate.
 // D=256 sits inside the relaxed D<=256 scope (D=512 stays on the strict
-// check -- see test_planner_rejects_d512_with_gemma3n_like_scale below and
-// the CONSERVATIVE SCOPE comment in ggml_sycl_flash_attn_ext_onednn_plan).
+// check BY DEFAULT -- see test_planner_d512_gemma3n_scale_follows_relax_hatch
+// below and the CONSERVATIVE SCOPE comment in
+// ggml_sycl_flash_attn_ext_onednn_plan).
 static bool test_planner_accepts_prescaled_q_at_d256() {
     fattn_params params = mha_like_params();
     params.ne00         = 256;
@@ -521,17 +522,21 @@ static bool test_planner_accepts_d512_with_matching_scale() {
 // The documenting half of the D=512 story: gemma-3n hardcodes
 // hparams.f_attention_scale = 1.0f (src/models/gemma3n.cpp), the same
 // phi2-style pre-scaled-Q pattern as test_planner_accepts_prescaled_q_at_d80
-// / _at_d256 above -- but D=512 is a different outcome. llama.cpp-p0f5's
-// relaxation is deliberately scoped to D<=256 (see the CONSERVATIVE SCOPE
-// comment in ggml_sycl_flash_attn_ext_onednn_plan), so gemma-3n's D=512
-// global-attention layers still reject on scale here, unlike phi2/gemma4 at
-// D<=256. So wiring D=512 into ggml_sycl_flash_attn_ext_supported()/
-// ggml_sycl_flash_attn_ext() (llama.cpp-jahv) does NOT by itself move
-// gemma-3n's global-attention layers off CPU -- they still reject here, on
-// scale, not on D. This case pins that fact so it cannot silently regress
-// into "D=512 now works, therefore gemma-3n now works", and so the D<=256
-// relaxation cannot silently widen to D=512, without a test noticing either.
-static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
+// / _at_d256 above -- but D=512 is a different outcome BY DEFAULT.
+// llama.cpp-p0f5's relaxation is scoped to D<=256 (see the CONSERVATIVE
+// SCOPE comment in ggml_sycl_flash_attn_ext_onednn_plan), so gemma-3n's
+// D=512 global-attention layers reject on scale here unless the
+// llama.cpp-bn5k item 2 measurement hatch (GGML_SYCL_FA_ONEDNN_D512_SCALE)
+// is explicitly turned on. So wiring D=512 into
+// ggml_sycl_flash_attn_ext_supported()/ggml_sycl_flash_attn_ext()
+// (llama.cpp-jahv) does NOT by itself move gemma-3n's global-attention
+// layers off CPU -- in the default state they still reject here, on scale,
+// not on D. This case pins that fact so the D<=256 relaxation cannot
+// silently widen to D=512 unnoticed, AND that the hatch actually works when
+// deliberately enabled -- both directions state-aware, mirroring
+// d512_route_expected_admitted()'s pattern below rather than assuming the
+// default.
+static bool test_planner_d512_gemma3n_scale_follows_relax_hatch() {
     fattn_params params = mha_like_params();
     params.ne00         = 512;
     params.ne10         = 512;
@@ -548,11 +553,22 @@ static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
     const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                /*multi_seq=*/false);
 
-    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
-                "gemma-3n's kq_scale=1.0 at D=512 must still reject oneDNN (SCALE_UNSUPPORTED), not silently "
-                "reach the compiled partition with the wrong softmax divisor");
-    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
-                "reject reason should identify the scale mismatch, not e.g. UNSUPPORTED_D -- D=512 itself is fine");
+    if (ggml_sycl_fa_onednn_d512_scale_relaxed()) {
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                    "GGML_SYCL_FA_ONEDNN_D512_SCALE=1 (llama.cpp-bn5k measurement hatch) must let gemma-3n's "
+                    "kq_scale=1.0 at D=512 reach oneDNN via the same finite&&nonzero screen D<=256 already "
+                    "uses, not the strict 1/sqrt(D) check");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK,
+                    "D=512 relaxed-scale accept should have OK reason");
+    } else {
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
+                    "gemma-3n's kq_scale=1.0 at D=512 must still reject oneDNN (SCALE_UNSUPPORTED) when "
+                    "GGML_SYCL_FA_ONEDNN_D512_SCALE is off (default) -- not silently reach the compiled "
+                    "partition with the wrong softmax divisor");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                    "reject reason should identify the scale mismatch, not e.g. UNSUPPORTED_D -- D=512 itself is "
+                    "fine");
+    }
     return true;
 }
 
@@ -566,19 +582,24 @@ static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
 // factory (the same one llama.cpp's graph builder uses) and call
 // ggml_sycl_flash_attn_ext_supported() itself instead.
 //
-// Only the FIRST of the two (test_supports_op_d512_admission_follows_
-// onednn_d512_state) actually guards the new code against deletion: it
-// expects D=512 to be ADMITTED in the default state, so reverting to the
-// parent commit's unconditional `if (!fattn_vec_supports_head_dim(D)) return
-// false;` turns it red. The SECOND case (test_supports_op_declines_d512_
-// with_gemma3n_like_scale) asserts a decline, and the parent commit already
-// declines every D=512 op unconditionally -- so it stays GREEN whether or
-// not the new admission code exists. This was stated the other way
-// ("both would go red") until spec review re-review llama.cpp-jahv/c-362a
-// caught it by actually re-running the suite under D=512 disabled. It is
-// still worth keeping: it is the one place this file pins that gemma-3n's
-// specific scale is declined all the way through the real supports_op entry
-// point, not merely the planner underneath it -- just not a deletion guard.
+// The FIRST of the two (test_supports_op_d512_admission_follows_
+// onednn_d512_state) guards the new code against deletion: it expects D=512
+// to be ADMITTED in the default state, so reverting to the parent commit's
+// unconditional `if (!fattn_vec_supports_head_dim(D)) return false;` turns
+// it red. The SECOND case
+// (test_supports_op_d512_gemma3n_scale_follows_relax_hatch, llama.cpp-bn5k)
+// used to assert an unconditional decline -- against the p0f5 parent commit
+// that stayed GREEN whether or not the new admission code existed, since
+// that commit declined every D=512 op unconditionally regardless of scale
+// (spec review re-review llama.cpp-jahv/c-362a caught the original "both
+// would go red" claim this way, by actually re-running the suite under
+// D=512 disabled). llama.cpp-bn5k's GGML_SYCL_FA_ONEDNN_D512_SCALE hatch
+// makes it a REAL deletion guard too, but only in the hatch-ON state: with
+// the hatch enabled, a plan that has not wired the relaxation through to
+// this supports_op level stays declined and the test goes red. In the
+// hatch-OFF (default) state it still only pins that gemma-3n's specific
+// scale is declined all the way through the real supports_op entry point,
+// not merely the planner underneath it.
 // ---------------------------------------------------------------------------
 
 // D=512, MHA (H_q==H_kv so ggml_can_mul_mat's broadcast check is trivially
@@ -680,23 +701,37 @@ static bool test_supports_op_d512_admission_follows_onednn_d512_state() {
     return true;
 }
 
-static bool test_supports_op_declines_d512_with_gemma3n_like_scale() {
+// State-aware across BOTH gates that must be open for admission:
+// d512_route_expected_admitted() (GGML_SYCL_FA_ONEDNN_D512 and its three
+// sibling switches, plus MIN_NCOLS) and the llama.cpp-bn5k
+// GGML_SYCL_FA_ONEDNN_D512_SCALE hatch this ticket adds. Either gate closed
+// must decline; both open must admit.
+static bool test_supports_op_d512_gemma3n_scale_follows_relax_hatch() {
     struct ggml_init_params iparams = {
         /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
     ggml_context * ctx = ggml_init(iparams);
-    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the supports_op D=512 scale-decline case");
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the supports_op D=512 scale-relax-hatch case");
 
     ggml_tensor * dst      = build_d512_flash_attn_ext_op(ctx, 1.0f);  // gemma-3n's actual kq_scale
     const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
-    TEST_ASSERT(!accepted,
-                "a real FLASH_ATTN_EXT op at D=512 with gemma-3n's kq_scale=1.0 must be declined by "
-                "ggml_sycl_flash_attn_ext_supported() (falls back to CPU) in every GGML_SYCL_FA_ONEDNN_D512 "
-                "state, not just at the bare planner level");
+    const bool expect_admitted = d512_route_expected_admitted() && ggml_sycl_fa_onednn_d512_scale_relaxed();
+    if (expect_admitted) {
+        TEST_ASSERT(accepted,
+                    "a real FLASH_ATTN_EXT op at D=512 with gemma-3n's kq_scale=1.0 must be admitted by "
+                    "ggml_sycl_flash_attn_ext_supported() when both the D=512 oneDNN route is enabled AND "
+                    "GGML_SYCL_FA_ONEDNN_D512_SCALE is on");
+    } else {
+        TEST_ASSERT(!accepted,
+                    "a real FLASH_ATTN_EXT op at D=512 with gemma-3n's kq_scale=1.0 must be declined by "
+                    "ggml_sycl_flash_attn_ext_supported() (falls back to CPU) whenever the D=512 oneDNN route "
+                    "is disabled OR GGML_SYCL_FA_ONEDNN_D512_SCALE is off (default) -- both gates must be open, "
+                    "not just the bare planner level");
+    }
     return true;
 }
 
@@ -776,27 +811,39 @@ static bool test_supports_op_admits_d512_tile_with_gemma_like_scale() {
     ggml_context * ctx = ggml_init(iparams);
     TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile-admission gemma-scale case");
 
-    // scale=1.0 -- oneDNN's own admissibility helper rejects this
-    // (SCALE_UNSUPPORTED; test_supports_op_declines_d512_with_gemma3n_like_
-    // scale above proves it, using F16 Q at the same scale, unconditionally
-    // declined). This op differs only in Q's type (F32, matching what
-    // build_attn_mha's D=512 cast bypass produces) -- so this being GREEN
-    // while that one stays RED demonstrates the tile route performs real,
-    // distinct admission, not merely agreeing with oneDNN's answer.
+    // scale=1.0 -- oneDNN's own admissibility helper rejects this in the
+    // default state (SCALE_UNSUPPORTED;
+    // test_supports_op_d512_gemma3n_scale_follows_relax_hatch above proves
+    // it, using F16 Q at the same scale, declined whenever
+    // GGML_SYCL_FA_ONEDNN_D512_SCALE is off). This op differs only in Q's
+    // type (F32, matching what build_attn_mha's D=512 cast bypass produces)
+    // -- so this being GREEN while that one stays RED (in the default,
+    // hatch-off state) demonstrates the tile route performs real, distinct
+    // admission, not merely agreeing with oneDNN's answer.
+    //
+    // llama.cpp-bn5k item 2: unlike the F16-Q and DV-mismatch decline cases
+    // above, this op has NOTHING else oneDNN would reject it on (F32 Q is
+    // fine, DKQ==DV==512 is fine) -- scale was its only oneDNN blocker. So
+    // with GGML_SYCL_FA_ONEDNN_D512_SCALE=1 AND tile disabled
+    // (GGML_SYCL_FA_TILE_D512=0), oneDNN itself can now admit this exact
+    // shape; the `else` branch below must account for that or it false-reds
+    // under that combination (caught live: forgetting this turned up as a
+    // real failure the first time the hatch was tested here).
     ggml_tensor * dst      = build_d512_tile_flash_attn_ext_op(ctx, 1.0f);
     const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
-    if (tile_d512_route_expected_enabled()) {
+    const bool onednn_could_admit_too = d512_route_expected_admitted() && ggml_sycl_fa_onednn_d512_scale_relaxed();
+    if (tile_d512_route_expected_enabled() || onednn_could_admit_too) {
         TEST_ASSERT(accepted,
                     "a real FLASH_ATTN_EXT op at D=512 with gemma's non-standard scale=1.0, F32 Q, an integer "
                     "GQA ratio, and no paged/seq-id sources must be admitted via the tile route when "
-                    "GGML_SYCL_FA_TILE_D512 is not disabled -- this is the shape oneDNN structurally cannot "
-                    "serve");
+                    "GGML_SYCL_FA_TILE_D512 is not disabled, OR via oneDNN when GGML_SYCL_FA_ONEDNN_D512_SCALE "
+                    "is on -- at least one of the two routes must be able to serve this shape");
     } else {
         TEST_ASSERT(!accepted,
-                    "GGML_SYCL_FA_TILE_D512=0/false must decline this op -- neither route can serve gemma's "
-                    "scale with the tile route disabled");
+                    "with the tile route disabled AND the oneDNN scale-relax hatch off (or oneDNN's D=512 route "
+                    "otherwise disabled), NEITHER route can serve gemma's scale -- this op must be declined");
     }
     return true;
 }
@@ -848,18 +895,33 @@ static bool test_supports_op_declines_d512_tile_with_f16_q() {
     // F32 (no Q_type template, unlike every sibling kernel family);
     // admitting F16 Q here would let dispatch reach a kernel that misreads
     // its own input rather than declining to CPU.
+    //
+    // Uses scale=0.0 rather than gemma's actual 1.0 (llama.cpp-bn5k item 2):
+    // oneDNN accepts F16 Q just as readily as F32 (Q_TYPE_UNSUPPORTED allows
+    // both), so this op's only would-be oneDNN blocker was ever the scale --
+    // and GGML_SYCL_FA_ONEDNN_D512_SCALE=1 relaxes exactly that gate for
+    // D=512. With scale=1.0 kept, this test would silently start reaching
+    // ggml_sycl_flash_attn_ext_onednn() and pass for the WRONG reason (or
+    // start failing) whenever that measurement hatch is on, without ever
+    // exercising the tile route's F16-Q rejection this test exists to pin.
+    // scale=0.0 hits the planner's unconditional zero/non-finite check
+    // (fattn-onednn.cpp), which the hatch does not touch, so oneDNN declines
+    // in every hatch state and this stays a pure test of the tile route.
+    // Mirrors the identical fix already applied for the p0f5 scale
+    // generalization (see test_planner_rejects_scale_before_materialization
+    // above).
     ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 8, 4, 1);
     ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
     ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
-    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/0.0f, /*max_bias=*/0.0f,
                                             /*logit_softcap=*/0.0f);
     const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
 
     TEST_ASSERT(!accepted,
-                "an F16-Q D=512 op with gemma's scale must be declined -- oneDNN rejects the scale, and the "
-                "tile route must reject the Q dtype (its kernel has no Q_type template and hardcodes F32) "
-                "regardless of GGML_SYCL_FA_TILE_D512's state");
+                "an F16-Q D=512 op must be declined -- oneDNN rejects an unusable (zero) scale unconditionally, "
+                "and the tile route must reject the Q dtype (its kernel has no Q_type template and hardcodes "
+                "F32) regardless of GGML_SYCL_FA_TILE_D512's state");
     return true;
 }
 
@@ -938,10 +1000,21 @@ static bool test_supports_op_declines_d512_tile_with_dv_mismatch() {
     ggml_context * ctx = ggml_init(iparams);
     TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile DV-mismatch decline case");
 
+    // Uses scale=0.0 rather than gemma's 1.0 (llama.cpp-bn5k item 2): oneDNN's
+    // dense GEMM-based SDPA graph does not share the tile kernel's hardcoded
+    // DKQ==DV assumption (its QK^T and softmax@V stages are independently
+    // shaped), so a DKQ/DV mismatch is not itself an oneDNN blocker -- scale
+    // was. GGML_SYCL_FA_ONEDNN_D512_SCALE=1 relaxes exactly that gate, which
+    // would let this op start reaching oneDNN instead of exercising the tile
+    // route's own DV-mismatch guard this test exists to pin. scale=0.0 hits
+    // the planner's unconditional zero/non-finite check, unaffected by the
+    // hatch, so oneDNN declines in every hatch state. Same fix as the F16-Q
+    // case above and the p0f5-era test_planner_rejects_scale_before_
+    // materialization.
     ggml_tensor * q        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, 8, 4, 1);
     ggml_tensor * k        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
     ggml_tensor * v        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, 256, 2, 1);  // DV=256 != DKQ=512
-    ggml_tensor * dst      = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+    ggml_tensor * dst      = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/0.0f, /*max_bias=*/0.0f,
                                                  /*logit_softcap=*/0.0f);
     const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
     ggml_free(ctx);
@@ -1190,9 +1263,9 @@ int main() {
     ok &= test_materialization_descriptor_direct_mha_noop();
     ok &= test_materialization_descriptor_rejects_unsupported_layout();
     ok &= test_planner_accepts_d512_with_matching_scale();
-    ok &= test_planner_rejects_d512_with_gemma3n_like_scale();
+    ok &= test_planner_d512_gemma3n_scale_follows_relax_hatch();
     ok &= test_supports_op_d512_admission_follows_onednn_d512_state();
-    ok &= test_supports_op_declines_d512_with_gemma3n_like_scale();
+    ok &= test_supports_op_d512_gemma3n_scale_follows_relax_hatch();
     ok &= test_supports_op_admits_d512_tile_with_gemma_like_scale();
     ok &= test_supports_op_admits_d512_tile_decode_shape();
     ok &= test_supports_op_declines_d512_tile_with_f16_q();

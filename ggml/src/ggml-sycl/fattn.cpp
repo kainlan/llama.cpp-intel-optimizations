@@ -2225,13 +2225,18 @@ static bool ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(const ggml_tensor
 // SCALE_UNSUPPORTED gate was generalized from "must equal 1/sqrt(D)" to "must
 // be finite and nonzero" to unblock pre-scaled-Q models at D<=256 (gemma4's
 // SWA layers, the hardware-evidence case). D=512 was deliberately EXCLUDED
-// from that relaxation (see the "CONSERVATIVE SCOPE, D > 256" comment in
-// ggml_sycl_flash_attn_ext_onednn_plan) and still requires the exact
-// historical 1/sqrt(D) scale, so this function's admissibility for D=512
-// gemma-3n-like inputs (kq_scale=1.0) is UNCHANGED by that generalization --
-// it still declines, and dispatch still falls through to tile-d512
+// from that relaxation BY DEFAULT (see the "CONSERVATIVE SCOPE, D > 256"
+// comment in ggml_sycl_flash_attn_ext_onednn_plan) and still requires the
+// exact historical 1/sqrt(D) scale, so this function's admissibility for
+// D=512 gemma-3n-like inputs (kq_scale=1.0) is UNCHANGED in the default
+// state -- it still declines, and dispatch still falls through to tile-d512
 // (llama.cpp-dtpk), which was just verified as gemma's D=512 route.
-// Relaxing D=512 too is tracked as deliberate follow-up, not bundled here.
+//
+// llama.cpp-bn5k item 2 added GGML_SYCL_FA_ONEDNN_D512_SCALE as a measurement
+// hatch on that same shared plan function -- default OFF, so this function's
+// behavior is unchanged unless a caller has deliberately set it for an A/B.
+// This admissibility helper needed no code change to pick that up: it calls
+// the plan function unmodified and just reflects whatever it returns.
 static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor * dst) {
     static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
     if (!d512_onednn_enabled) {
