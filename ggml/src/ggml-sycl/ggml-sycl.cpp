@@ -87786,7 +87786,14 @@ gpu_dispatch:
 
                 // Accumulate per-op-type statistics
                 static thread_local std::unordered_map<int, std::pair<double, int>> op_stats;
-                static thread_local int                                             op_graph_count = 0;
+                static thread_local int                                             op_graph_count   = 0;
+                // Number of individual graph_compute() calls folded into the
+                // current op_stats window -- op_stats is only cleared right
+                // after a print (below), and prints happen every 5th graph
+                // after an initial 3, so a "summary" spans several graphs'
+                // worth of calls, not one. Report that multiplicity honestly
+                // instead of letting the printed x-counts read as per-graph.
+                static thread_local int                                             graphs_in_window = 0;
                 if (!residual_add_id_skipped) {
                     auto & [total_ms, count] = op_stats[node->op];
                     total_ms += op_ms;
@@ -87818,25 +87825,30 @@ gpu_dispatch:
                 // Dump summary at end of graph (last node)
                 if (i == cgraph->n_nodes - 1) {
                     op_graph_count++;
+                    graphs_in_window++;
                     // Skip first 2 graphs (warmup), then print every 5th
                     if (op_graph_count > 2 && (op_graph_count % 5) == 3) {
                         double graph_total = 0;
                         for (auto & [op, stats] : op_stats) {
                             graph_total += stats.first;
                         }
-                        fprintf(stderr, "\n[OP-TIMING] === Graph %d summary (%.1f ms total) ===\n", op_graph_count,
-                                graph_total);
+                        fprintf(stderr,
+                                "\n[OP-TIMING] === %d graphs aggregated through graph #%d (%.1f ms total, "
+                                "%.1f ms/graph avg) ===\n",
+                                graphs_in_window, op_graph_count, graph_total, graph_total / graphs_in_window);
                         // Sort by total time descending
                         std::vector<std::pair<int, std::pair<double, int>>> sorted(op_stats.begin(), op_stats.end());
                         std::sort(sorted.begin(), sorted.end(),
                                   [](auto & a, auto & b) { return a.second.first > b.second.first; });
                         for (auto & [op, stats] : sorted) {
-                            fprintf(stderr, "[OP-TIMING]   %6.1f ms (%5.1f%%)  %-20s  x%d  (%.3f ms/call)\n",
+                            fprintf(stderr,
+                                    "[OP-TIMING]   %6.1f ms (%5.1f%%)  %-20s  x%-6d (%.3f ms/call, %.1f calls/graph)\n",
                                     stats.first, 100.0 * stats.first / graph_total, ggml_op_name((ggml_op) op),
-                                    stats.second, stats.first / stats.second);
+                                    stats.second, stats.first / stats.second, (double) stats.second / graphs_in_window);
                         }
                         fprintf(stderr, "\n");
                         op_stats.clear();
+                        graphs_in_window = 0;
                     }
                 }
             }
