@@ -291,7 +291,7 @@ if [[ "$RUN_PROFILE" == "1" ]]; then
         grep '\[MXFP4-MOE-TG-PROFILE\]' "$profile_log" | tail -8 || true
         echo
         echo "== OP timing tail =="
-        grep -A14 '\[OP-TIMING\] === Graph' "$profile_log" | tail -90 || true
+        grep -A14 '\[OP-TIMING\] ===' "$profile_log" | tail -90 || true
         echo
         echo "== MoE profile summary =="
         grep -A45 'Averages across' "$profile_log" || true
