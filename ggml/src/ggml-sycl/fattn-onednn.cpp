@@ -109,46 +109,57 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     if (params.ne00 > 512) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::UNSUPPORTED_D);
     }
-    // The compiled partition bakes the softmax divisor into a per-shape scalar
-    // derived from D alone (`sqrt(D)`, see build_and_compile_sdpa), so the graph
-    // is only valid for models that supply params.scale == 1/sqrt(D). phi2 does
-    // not: it pre-scales Q by 1/sqrt(n_embd_head) in the graph and hands
-    // build_attn a kq_scale of 1.0 (src/models/phi2.cpp), so oneDNN would divide
-    // by sqrt(D) a SECOND time. Reject here and let dispatch fall back to a
-    // native kernel — every one of those reads params.scale at runtime, and none
-    // of them bakes in a scale (there is no sqrt anywhere in the native FA
-    // kernels; the only ones in this backend are in THIS file).
+    // GENERALIZED (llama.cpp-p0f5): the compiled partition's softmax divisor
+    // used to be derived from D alone (`sqrt(D)`, see build_and_compile_sdpa),
+    // so the graph was only valid for models supplying params.scale ==
+    // 1/sqrt(D). phi2 does not: it pre-scales Q by 1/sqrt(n_embd_head) in the
+    // graph and hands build_attn a kq_scale of 1.0 (src/models/phi2.cpp) --
+    // and it is not alone. SEVEN in-tree archs pre-scale Q the same way: phi2,
+    // gemma2, gemma3, gemma-embedding, gemma3n, gemma4, gemma4-assistant.
+    // gemma4's D=256 SWA layers are the hardware-evidence case for this ticket
+    // (llama.cpp-p0f5 c-bnd0): forced onto a native kernel by this gate, they
+    // measured ~56% of a gemma-4-E4B pp512 pass on the B50.
     //
-    // This is not a phi2 quirk. SEVEN in-tree archs pre-scale Q and pass a
-    // kq_scale of 1.0: phi2, gemma2, gemma3, gemma-embedding, gemma3n, gemma4,
-    // gemma4-assistant. All but phi2 sit after it in test-llama-archs' sweep and
-    // had never been reached. Do not "fix" this by special-casing phi2.
+    // The fix (see build_and_compile_sdpa and sdpa_shape_key::scale) writes
+    // the REAL runtime divisor 1/params.scale into scale_usm at partition-
+    // build time instead of assuming sqrt(D), and keys the compiled-partition
+    // cache on the scale so two models with different scales never reuse each
+    // other's baked divisor. That makes the only requirement left here that
+    // the value is usable as a divisor at all: finite and nonzero. Zero would
+    // divide-by-zero and non-finite (NaN/Inf) would poison every downstream
+    // element; both are rejected here rather than at the Divide op.
     //
     // ---- Why the check sits HERE, and not earlier ----------------------------
-    // Both reasons are invisible from the call site, so moving this block for
-    // tidiness silently reintroduces a bug:
+    // It must stay AFTER the softcap check. ggml_sycl_flash_attn_ext does
+    // `scale /= logit_softcap` when a softcap is set (fattn.cpp, where
+    // params.scale is filled in), so a softcap model's params.scale is ALREADY
+    // divided by the time it gets here -- screening softcap out first keeps
+    // that adjustment intact for whatever reads params.scale next. (The old
+    // "must stay after the D range check" reason no longer applies: this
+    // predicate does not read params.ne00 any more.)
     //
-    //   * It must stay AFTER the softcap check. ggml_sycl_flash_attn_ext does
-    //     `scale /= logit_softcap` when a softcap is set (fattn.cpp, where
-    //     params.scale is filled in), so a softcap model's params.scale is
-    //     ALREADY divided by the time it gets here. Screening softcap out first
-    //     means this gate only ever sees an undivided scale; ahead of it, the
-    //     comparison below would be against a value that was never meant to
-    //     equal 1/sqrt(D), and every softcap model would reject for the wrong
-    //     reason.
-    //   * It must stay AFTER the D range check. It reads params.ne00, and
-    //     ordering it first would report SCALE_UNSUPPORTED for an out-of-range D
-    //     whose scale is perfectly fine — which is both a misleading diagnostic
-    //     and a test failure (test_planner_rejects_unsupported_d).
+    // ggml_sycl_flash_attn_ext_onednn asserts a related invariant at execute
+    // time -- not this formula, but that the cached entry it is about to use
+    // was compiled for a bit-identical scale (see the assertion there and
+    // sdpa_compiled_entry::scale). That assertion is a defensive backstop
+    // against a cache bug, not a second copy of this check.
     //
-    // ggml_sycl_flash_attn_ext_onednn asserts this same invariant at execute
-    // time; that assertion is the backstop and must stay. This gate is what
-    // keeps it unreached, and its predicate is deliberately identical (accept
-    // iff |1/scale - sqrt(D)| < 1e-3f) so a plan this function accepts can never
-    // trip it. Tolerance rationale is documented at that assertion: reciprocal
-    // rounding for a legitimate 1/sqrt(D) drifts ~1e-6 at D=64/128/256, while a
-    // different formula differs macroscopically (1.0 vs 8.94 at phi2's D=80).
-    if (params.scale == 0.0f || std::fabs(1.0f / params.scale - sqrtf(static_cast<float>(params.ne00))) >= 1e-3f) {
+    // CONSERVATIVE SCOPE, D > 256: gemma-3n's D=512 global-attention layers
+    // are pre-scaled-Q too (f_attention_scale=1.0, same pattern), but D=512
+    // has no fallback kernel of its own other than tile-d512 (llama.cpp-dtpk),
+    // which was JUST verified as gemma's correctness-checked D=512 route.
+    // Letting D=512 traffic newly fall onto oneDNN here would be a second,
+    // untested change this ticket does not evaluate or regression-test, so
+    // D>256 (i.e. exactly D=512, since D>512 is already rejected above by
+    // UNSUPPORTED_D) keeps the OLD strict 1/sqrt(D) requirement. Lifting this
+    // for D=512 -- after its own regression battery -- is tracked as
+    // follow-up, not bundled here. See ggml_sycl_fattn_d512_onednn_admissible
+    // (fattn.cpp), which inherits this scope unchanged because it calls this
+    // same plan function and has no separate scale screen of its own.
+    if (params.scale == 0.0f || !std::isfinite(params.scale)) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED);
+    }
+    if (params.ne00 > 256 && std::fabs(1.0f / params.scale - sqrtf(static_cast<float>(params.ne00))) >= 1e-3f) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED);
     }
     if (params.ne11 <= 0) {
@@ -835,11 +846,13 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     // (inside build_and_compile_sdpa, which the caller invokes under the
     // cache mutex) means the buffer is published as part of the entry only
     // after it is fully initialised — no write-site remains on the execute
-    // path. The value is derived from `key.D`, not from any per-call scale
-    // input: the oneDNN SDPA path requires scale == 1/sqrt(D) (enforced by
-    // a runtime assertion at dispatch), so the divisor sqrt(D) is shape-
-    // determined and a single buffer per compiled partition is correct for
-    // all calls that reuse the partition.
+    // path. The value is derived from `key.scale` (llama.cpp-p0f5): the
+    // runtime softmax scale supplied by the call that missed the cache and
+    // triggered this compile. `sdpa_shape_key::scale` is part of the cache
+    // key, so a single buffer per compiled partition is still correct for
+    // every future call that reuses it — any call with a different scale
+    // misses the cache and compiles (and populates) its own entry instead of
+    // reusing this one.
     const size_t scale_bytes = (q_dt == dt::f32) ? sizeof(float) : sizeof(sycl::half);
     const int    device      = ggml_sycl_get_device_id_from_queue(*stream);
 
@@ -866,11 +879,15 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
         throw std::runtime_error("oneDNN SDPA: scale buffer is not host-pinned USM");
     }
 
-    void * scale_usm = scale_r.ptr;
+    // We build the graph with op::kind::Divide (see div_op above, matching
+    // oneDNN's canonical SDPA pattern), so the scalar written here must be the
+    // RECIPROCAL of the runtime scale, not the scale itself.
+    void *      scale_usm = scale_r.ptr;
+    const float divisor   = 1.0f / key.scale;
     if (q_dt == dt::f32) {
-        *static_cast<float *>(scale_usm) = sqrtf(static_cast<float>(key.D));
+        *static_cast<float *>(scale_usm) = divisor;
     } else {
-        *static_cast<sycl::half *>(scale_usm) = static_cast<sycl::half>(sqrtf(static_cast<float>(key.D)));
+        *static_cast<sycl::half *>(scale_usm) = static_cast<sycl::half>(divisor);
     }
 
     build_result r;
@@ -1004,6 +1021,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     key.H_kv      = H_kv;
     key.has_mask  = (active_params.mask != nullptr);
     key.is_gqa    = (H_q != H_kv);
+    key.scale     = active_params.scale;
 
     key.Q_type    = (int) active_params.Q_type;
     key.K_type    = (int) active_params.K_type;
@@ -1076,6 +1094,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                 // releases the allocation when the last shared_ptr drops.
                 ent->scale_owner = std::move(r.scale_owner);
                 ent->scale_usm   = r.scale_usm;
+                ent->scale       = key.scale;
                 r.scale_usm      = nullptr;
                 // Store under the key, retain our own shared_ptr copy for use
                 // below (entry survives any future cache mutation).
@@ -1101,30 +1120,23 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     dnnl::engine eng = ctx.engine_dnnl(stream);
 
     // We build the graph with op::kind::Divide (to match oneDNN's canonical
-    // SDPA pattern), so the scalar is the DIVISOR. The value stored in
-    // `entry->scale_usm` is sqrt(D), pre-computed from `key.D` at partition
-    // compile time. This path ASSERTS the invariant that ggml supplies
-    // params.scale == 1/sqrt(D); any future model that deviates from it
-    // needs a different fattn path (e.g. per-op scalar input) and should
-    // fail loudly here rather than silently producing wrong outputs.
-    //
-    // Epsilon rationale: this assertion compares two f32 values
-    // (`inv_scale = 1.0f/params.scale` and `sqrt_D = sqrtf(D)`). Drift
-    // between them for a legitimate 1/sqrt(D) scale comes from reciprocal
-    // rounding at ULP level (~1e-6 at target Ds 64/128/256), well below
-    // 1e-3f. Wrong-formula bugs produce macroscopic diffs that this
-    // tolerance catches easily (e.g. 1/D vs 1/sqrt(D) differ by ~11 at
-    // D=128). The f16 narrowing happens elsewhere — at the STORE of
-    // `*scale_usm` in build_and_compile_sdpa — and is separate from this
-    // comparison.
-    if (active_params.scale == 0.0f) {
-        return false;  // zero scale would divide-by-zero; upstream never sends this
+    // SDPA pattern), so the scalar in `entry->scale_usm` is the DIVISOR
+    // 1/scale, computed from `entry->scale` at build_and_compile_sdpa time
+    // (llama.cpp-p0f5; historically sqrt(D), which only covered the 1/sqrt(D)
+    // convention). `sdpa_shape_key::scale` is part of the cache key, so a
+    // cache HIT is only possible when active_params.scale is bit-identical to
+    // the value the entry was compiled for — there is no reuse-across-
+    // different-scales hazard left to assert against here. This assertion is
+    // a defensive backstop against a hash-table bug (e.g. a collision, or a
+    // key field silently dropped in a future edit) rather than a per-model
+    // formula check: unlike the old 1/sqrt(D)-only invariant, it must hold for
+    // every finite nonzero scale, not just the historical one.
+    if (active_params.scale == 0.0f || !std::isfinite(active_params.scale)) {
+        return false;  // the planner gate should have rejected this already; defensive only
     }
-    const float inv_scale  = 1.0f / active_params.scale;
-    const float sqrt_D     = sqrtf(static_cast<float>(D));
-    const float scale_diff = std::fabs(inv_scale - sqrt_D);
-    GGML_ASSERT(scale_diff < 1e-3f &&
-                "oneDNN SDPA: params.scale deviates from 1/sqrt(D) — model needs a different fattn path");
+    GGML_ASSERT(active_params.scale == entry->scale &&
+                "oneDNN SDPA: cached partition's baked scale does not match the runtime scale (cache key/scale "
+                "mismatch)");
 
     const auto & in_ports  = entry->in_ports;
     const auto & out_ports = entry->out_ports;

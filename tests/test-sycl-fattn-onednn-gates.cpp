@@ -92,6 +92,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -342,26 +343,103 @@ static fattn_params phi2_like_params() {
     return params;
 }
 
-// The oneDNN partition bakes sqrt(D) in as the softmax divisor, so a model whose
-// scale is not 1/sqrt(D) must never reach it. The execute path asserts this; the
-// planner has to reject first or that assert aborts the process.
-static bool test_planner_rejects_scale_not_inv_sqrt_d() {
+// llama.cpp-p0f5: the oneDNN partition's softmax divisor is no longer baked
+// from D alone -- it is 1/scale, taken from the runtime call and keyed into
+// the compiled-partition cache (sdpa_shape_key::scale). phi2's pre-scaled-Q
+// pattern (kq_scale=1.0 instead of 1/sqrt(D)) is exactly the case this
+// generalizes: D=80 <= 256 is within this ticket's relaxed scope (see the
+// CONSERVATIVE SCOPE comment on the planner's scale gate), so phi2 must now
+// reach oneDNN instead of being rejected. This test used to assert the
+// opposite (SCALE_UNSUPPORTED) -- that was correct for the old sqrt(D)-only
+// contract and is the exact thing this ticket changes; flipping it here
+// rather than deleting it keeps the phi2 shape under coverage.
+static bool test_planner_accepts_prescaled_q_at_d80() {
     fattn_params params = phi2_like_params();
     const auto   plan   = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
                                                                /*multi_seq=*/false);
 
-    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
-                "params.scale != 1/sqrt(D) (phi2) must reject oneDNN, not abort at execute time");
-    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
-                "scale reject reason should be explicit");
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "phi2's pre-scaled-Q kq_scale=1.0 at D=80 must now reach oneDNN (llama.cpp-p0f5), not reject on "
+                "the old sqrt(D)-only formula");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK, "D=80 pre-scaled-Q accept should have OK reason");
+    return true;
+}
+
+// gemma4's SWA layers are D=256 with the same pre-scaled-Q pattern (kq_scale
+// hardcoded to 1.0, see phi2_like_params above) -- this is the actual
+// hardware-evidence shape from llama.cpp-p0f5 (c-bnd0): a B50 device-event
+// census attributed ~56% of a gemma-4-E4B pp512 pass to the native xmx_v2
+// kernel these 35 SWA layers were forced onto by the old sqrt(D)-only gate.
+// D=256 sits inside the relaxed D<=256 scope (D=512 stays on the strict
+// check -- see test_planner_rejects_d512_with_gemma3n_like_scale below and
+// the CONSERVATIVE SCOPE comment in ggml_sycl_flash_attn_ext_onednn_plan).
+static bool test_planner_accepts_prescaled_q_at_d256() {
+    fattn_params params = mha_like_params();
+    params.ne00         = 256;
+    params.ne10         = 256;
+    params.nb01         = params.ne00 * (int) sizeof(sycl::half);
+    params.nb02         = params.nb01 * params.ne01;
+    params.nb03         = params.nb02 * params.ne02;
+    params.nb11         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb12         = params.nb11 * params.ne11;
+    params.nb13         = (int64_t) params.nb12 * params.ne12;
+    params.nb21         = params.ne10 * (int) sizeof(sycl::half);
+    params.nb22         = params.nb21 * params.ne11;
+    params.nb23         = (int64_t) params.nb22 * params.ne12;
+    params.scale        = 1.0f;  // gemma4's kq_scale, NOT 1/sqrt(256)
+    const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "gemma4's pre-scaled-Q kq_scale=1.0 at D=256 must reach oneDNN (llama.cpp-p0f5) -- this is the "
+                "SWA-layer shape the hardware evidence in c-bnd0 measured at ~56% of a gemma-4-E4B pp512 pass");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK,
+                "D=256 pre-scaled-Q accept should have OK reason");
+    return true;
+}
+
+// Zero and non-finite scales remain unusable as a Divide-op divisor no matter
+// how far the formula requirement is relaxed -- this is the invariant that
+// actually survives the generalization (see the planner's scale gate).
+static bool test_planner_rejects_nonfinite_scale() {
+    {
+        fattn_params params = phi2_like_params();
+        params.scale        = 0.0f;
+        const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                                   /*multi_seq=*/false);
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT, "scale=0.0 must still reject oneDNN");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                    "scale=0.0 reject reason should be explicit");
+    }
+    {
+        fattn_params params = phi2_like_params();
+        params.scale        = std::numeric_limits<float>::quiet_NaN();
+        const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                                   /*multi_seq=*/false);
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT, "scale=NaN must still reject oneDNN");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                    "scale=NaN reject reason should be explicit");
+    }
+    {
+        fattn_params params = phi2_like_params();
+        params.scale        = std::numeric_limits<float>::infinity();
+        const auto plan     = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                                   /*multi_seq=*/false);
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT, "scale=Inf must still reject oneDNN");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED,
+                    "scale=Inf reject reason should be explicit");
+    }
     return true;
 }
 
 // Same shape family, but GQA with a non-dense K/V stride — the plan kind that
 // would otherwise be MATERIALIZE_REQUIRED. The scale gate must win over it,
-// because the execute-time assert sits AFTER materialization.
+// because the execute-time assert sits AFTER materialization. Uses scale=0.0
+// rather than phi2_like_params' inherited 1.0, which is now admissible
+// (llama.cpp-p0f5) and would no longer exercise this precedence at all.
 static bool test_planner_rejects_scale_before_materialization() {
     fattn_params params = phi2_like_params();
+    params.scale        = 0.0f;                                        // genuinely unusable, not phi2's admissible 1.0
     params.ne12         = 8;                                           // GQA
     params.nb11         = 4 * params.ne10 * (int) sizeof(sycl::half);  // nc_stride != D
     params.nb12         = params.nb11 * params.ne11;
@@ -395,8 +473,11 @@ static bool test_planner_accepts_inv_sqrt_d_at_odd_d() {
 
 // The materialization descriptor is a second entry point into the planner; a
 // rejected plan must not hand back a descriptor that invites the caller in.
+// Uses scale=0.0 rather than phi2_like_params' inherited 1.0, which is now
+// admissible (llama.cpp-p0f5) and would no longer be a "bad scale" at all.
 static bool test_materialization_descriptor_rejects_bad_scale() {
-    fattn_params                             params = phi2_like_params();
+    fattn_params params = phi2_like_params();
+    params.scale        = 0.0f;
     ggml_sycl_onednn_fa_materialization_desc desc{};
     const bool ok = ggml_sycl_flash_attn_ext_onednn_materialization_desc(params, params.ne02, params.ne12,
                                                                          /*target_device=*/0, &desc);
@@ -1118,7 +1199,9 @@ int main() {
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();
-    ok &= test_planner_rejects_scale_not_inv_sqrt_d();
+    ok &= test_planner_accepts_prescaled_q_at_d80();
+    ok &= test_planner_accepts_prescaled_q_at_d256();
+    ok &= test_planner_rejects_nonfinite_scale();
     ok &= test_planner_rejects_scale_before_materialization();
     ok &= test_planner_accepts_inv_sqrt_d_at_odd_d();
     ok &= test_materialization_descriptor_rejects_bad_scale();

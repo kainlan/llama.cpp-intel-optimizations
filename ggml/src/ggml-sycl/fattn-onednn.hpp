@@ -34,15 +34,29 @@ struct ggml_sycl_onednn_fa_materialized_kv {
 // Strides + dtypes are part of the key because two calls with identical logical
 // shapes but different memory layouts (e.g. permuted Q) or different mask dtypes
 // must NOT share a compiled partition.
+//
+// `scale` (llama.cpp-p0f5): the compiled partition's softmax divisor is no
+// longer derived from D alone (the historical sqrt(D) assumption) -- it is
+// 1/scale, baked in at build_and_compile_sdpa() time from THIS field. Keying
+// on it is what makes that safe: two calls with the same (D, ncols, ne11, ...)
+// but different runtime scales (e.g. a standard 1/sqrt(D) model and a
+// pre-scaled-Q model like gemma4, which hands build_attn a flat kq_scale of
+// 1.0) can never collide on the same cache entry and reuse the wrong baked
+// divisor. Compared bit-for-bit via `==`, not a tolerance -- the value stored
+// here is always the literal params.scale of the call that built or looked up
+// the entry, so an exact compare is correct and a NaN can never reach this
+// key (the planner's SCALE_UNSUPPORTED gate rejects non-finite/zero scales
+// before a key is ever constructed).
 struct sdpa_shape_key {
-    int  device_id;
-    int  D;
-    int  ncols;  // ne01 (query count)
-    int  ne11;   // KV length
-    int  H_q;
-    int  H_kv;
-    bool has_mask;
-    bool is_gqa;  // H_q != H_kv
+    int   device_id;
+    int   D;
+    int   ncols;  // ne01 (query count)
+    int   ne11;   // KV length
+    int   H_q;
+    int   H_kv;
+    bool  has_mask;
+    bool  is_gqa;  // H_q != H_kv
+    float scale;   // runtime softmax scale this partition's divisor (1/scale) was built for
 
     // Source tensor types (ggml_type ids) — mask may be f16 or f32 depending
     // on whether flash_attn is set (ggml casts kq_mask to f16 in that case).
@@ -61,11 +75,11 @@ struct sdpa_shape_key {
 
     bool operator==(const sdpa_shape_key & o) const {
         return device_id == o.device_id && D == o.D && ncols == o.ncols && ne11 == o.ne11 && H_q == o.H_q &&
-               H_kv == o.H_kv && has_mask == o.has_mask && is_gqa == o.is_gqa && Q_type == o.Q_type &&
-               K_type == o.K_type && V_type == o.V_type && mask_type == o.mask_type && q_nb1 == o.q_nb1 &&
-               q_nb2 == o.q_nb2 && q_nb3 == o.q_nb3 && k_nb1 == o.k_nb1 && k_nb2 == o.k_nb2 && k_nb3 == o.k_nb3 &&
-               v_nb1 == o.v_nb1 && v_nb2 == o.v_nb2 && v_nb3 == o.v_nb3 && m_nb1 == o.m_nb1 && m_nb2 == o.m_nb2 &&
-               m_nb3 == o.m_nb3;
+               H_kv == o.H_kv && has_mask == o.has_mask && is_gqa == o.is_gqa && scale == o.scale &&
+               Q_type == o.Q_type && K_type == o.K_type && V_type == o.V_type && mask_type == o.mask_type &&
+               q_nb1 == o.q_nb1 && q_nb2 == o.q_nb2 && q_nb3 == o.q_nb3 && k_nb1 == o.k_nb1 && k_nb2 == o.k_nb2 &&
+               k_nb3 == o.k_nb3 && v_nb1 == o.v_nb1 && v_nb2 == o.v_nb2 && v_nb3 == o.v_nb3 && m_nb1 == o.m_nb1 &&
+               m_nb2 == o.m_nb2 && m_nb3 == o.m_nb3;
     }
 };
 
@@ -82,6 +96,7 @@ struct sdpa_shape_key_hash {
         h        = mix(h, std::hash<int>{}(k.H_kv));
         h        = mix(h, std::hash<bool>{}(k.has_mask));
         h        = mix(h, std::hash<bool>{}(k.is_gqa));
+        h        = mix(h, std::hash<float>{}(k.scale));
         h        = mix(h, std::hash<int>{}(k.Q_type));
         h        = mix(h, std::hash<int>{}(k.K_type));
         h        = mix(h, std::hash<int>{}(k.V_type));
@@ -111,11 +126,14 @@ struct sdpa_shape_key_hash {
 // exactly once inside build_and_compile_sdpa() — which runs under the cache
 // mutex — so the execute path only READS it; there is no WRITE race.
 //
-// The value stored is the divisor sqrt(D) derived from `key.D` at compile
-// time. A runtime assertion at dispatch verifies that 1/params.scale matches
-// sqrt(key.D) within a tight epsilon, so any future model that does NOT
-// follow the 1/sqrt(D) convention fails loudly instead of silently producing
-// wrong outputs.
+// The value stored in `scale_usm` is the divisor 1/`scale` (llama.cpp-p0f5;
+// historically sqrt(key.D), which only held for the 1/sqrt(D) convention).
+// `scale` records the exact params.scale this entry was compiled for --
+// `sdpa_shape_key::scale` is now part of the cache key, so a lookup can only
+// HIT an entry built for a bit-identical scale, and this copy lets the
+// execute path assert that invariant defensively (a hash collision or a
+// missed key field would be the only way it could ever fire) instead of
+// checking a per-model formula that no longer generalizes.
 //
 // `scale_owner` holds the unified-cache allocation alive for the full lifetime
 // of the entry.
@@ -125,6 +143,7 @@ struct sdpa_compiled_entry {
     std::vector<dnnl::graph::logical_tensor> out_ports;
     ggml_sycl::mem_handle                    scale_owner;
     void *                                   scale_usm = nullptr;
+    float                                    scale     = 0.0f;
 
     sdpa_compiled_entry()                                        = default;
     sdpa_compiled_entry(const sdpa_compiled_entry &)             = delete;

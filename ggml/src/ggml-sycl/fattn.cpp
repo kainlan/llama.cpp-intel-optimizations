@@ -2218,6 +2218,20 @@ static bool ggml_sycl_fattn_d512_has_paged_or_multiseq_sources(const ggml_tensor
 // any of src[5..8] is present is exact, not an approximation of a moving
 // target. It costs nothing today (no D=512 model exercises those sources)
 // and avoids depending on data this function cannot see.
+//
+// llama.cpp-p0f5 DECISION (documented here because this function has no scale
+// screen of its own -- it delegates entirely to
+// ggml_sycl_flash_attn_ext_onednn_plan()): that shared plan function's
+// SCALE_UNSUPPORTED gate was generalized from "must equal 1/sqrt(D)" to "must
+// be finite and nonzero" to unblock pre-scaled-Q models at D<=256 (gemma4's
+// SWA layers, the hardware-evidence case). D=512 was deliberately EXCLUDED
+// from that relaxation (see the "CONSERVATIVE SCOPE, D > 256" comment in
+// ggml_sycl_flash_attn_ext_onednn_plan) and still requires the exact
+// historical 1/sqrt(D) scale, so this function's admissibility for D=512
+// gemma-3n-like inputs (kq_scale=1.0) is UNCHANGED by that generalization --
+// it still declines, and dispatch still falls through to tile-d512
+// (llama.cpp-dtpk), which was just verified as gemma's D=512 route.
+// Relaxing D=512 too is tracked as deliberate follow-up, not bundled here.
 static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor * dst) {
     static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
     if (!d512_onednn_enabled) {
