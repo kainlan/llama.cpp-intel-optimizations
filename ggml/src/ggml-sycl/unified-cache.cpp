@@ -2059,6 +2059,32 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
 // comparing same-phase calls against the baseline that phase already
 // established -- so a real allocation appearing mid-phase still raises a
 // warning on the very next call.
+//
+// SEMANTIC DECISION (llama.cpp-dcx6, GPU-verified 2026-08-30): a handful of
+// "pp phase" warnings during a process's FIRST PP execution are EXPECTED and
+// intentionally NOT suppressed. Verified on gemma: 4 warnings
+// (+240.8/+270.8/+177.8/+177.8 MB against the phase's own baseline of
+// 8396.8 MB, moving in both directions -- allocation and reclaim), then
+// zero warnings for the rest of that same PP phase and all of TG. This is
+// the SCRATCH/RUNTIME zone allocator finding its steady per-batch working
+// set across the first few graph_compute calls of a cold process -- real,
+// truthful data movement, not a misattributed frozen number. It is
+// distinguished from the bug this tracker fixes by one property: it is
+// BOUNDED and SELF-QUIETING -- exactly 4 warnings, then permanent silence
+// for the rest of that phase and all of TG, whereas the old design never
+// stopped for the life of the process. (Magnitude does not reliably tell
+// the two apart on its own: two of the four gemma warnings are bit-for-bit
+// identical, +177.8 MB against a total of 8574.6 MB, so "the numbers keep
+// changing" is not a safe test here -- go by whether it stops, not by
+// whether consecutive values happen to repeat.) Silencing this with a
+// fixed first-N-graphs grace window was considered and rejected: N is not
+// derivable from first principles (it depends on prompt length and ubatch
+// count), and it would mask a genuine
+// leak occurring within the grace window -- trading a truthful, bounded,
+// self-quieting signal for a blind spot. The Mistral canonical completion
+// gate was re-verified clean (zero warnings) against this fix; GPT-OSS was
+// not re-run post-fix as of this writing. The residual gemma warnings are
+// this model's own warm-up cost, not a defect in the check.
 void zero_alloc_check(const char * tag, int device) {
     static const int zero_alloc_mode = []() {
         const char * env = std::getenv("GGML_SYCL_ZERO_ALLOC_CHECK");
