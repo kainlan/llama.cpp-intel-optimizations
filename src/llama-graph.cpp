@@ -2575,7 +2575,23 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #ifdef GGML_USE_SYCL
         {
             const enum ggml_type sycl_q_type = (enum ggml_type) GGML_SYCL_FATTN_Q_TYPE;
-            if (q->type != sycl_q_type) {
+            // D=512 (llama.cpp-dtpk): skip the blanket F16 cast for this one
+            // head dimension. The SYCL tile-path FA kernel D=512 routes to
+            // (fattn-tile.hpp's flash_attn_tile<>) hardcodes its Q load as
+            // F32 -- unlike every other SYCL FA kernel family, it has no
+            // Q_type template parameter, and its vectorized load isn't a
+            // simple generalization (see the llama.cpp-dtpk design note).
+            // The D=512 oneDNN route (llama.cpp-jahv) already accepts F32 Q
+            // as a first-class input and materializes it to F16 internally
+            // when needed (ggml_sycl_flash_attn_ext_onednn_materialize_q_f32,
+            // fattn-onednn.cpp) -- its own admissibility check rejects only
+            // types that are neither F16 nor F32 -- so leaving Q at F32 for
+            // D=512 costs that route nothing. D<=256 is unaffected: the cast
+            // there is a pure performance choice (every D<=256 kernel family
+            // already takes a Q_type template parameter and handles either
+            // type generically), so this changes behavior for exactly one
+            // head dimension that has no working F16 consumer today.
+            if (q->ne[0] != 512 && q->type != sycl_q_type) {
                 q = ggml_cast(ctx0, q, sycl_q_type);
             }
         }
