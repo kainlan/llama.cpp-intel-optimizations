@@ -87787,12 +87787,13 @@ gpu_dispatch:
                 // Accumulate per-op-type statistics
                 static thread_local std::unordered_map<int, std::pair<double, int>> op_stats;
                 static thread_local int                                             op_graph_count   = 0;
-                // Number of individual graph_compute() calls folded into the
-                // current op_stats window -- op_stats is only cleared right
-                // after a print (below), and prints happen every 5th graph
-                // after an initial 3, so a "summary" spans several graphs'
-                // worth of calls, not one. Report that multiplicity honestly
-                // instead of letting the printed x-counts read as per-graph.
+                // Number of graph completions that reached this summary site,
+                // folded into the current op_stats window -- op_stats is only
+                // cleared right after a print (below), and prints happen every
+                // 5th graph after an initial 3, so a "summary" spans several
+                // graphs' worth of calls, not one. Report that multiplicity
+                // honestly instead of letting the printed x-counts read as
+                // per-graph.
                 static thread_local int                                             graphs_in_window = 0;
                 if (!residual_add_id_skipped) {
                     auto & [total_ms, count] = op_stats[node->op];
