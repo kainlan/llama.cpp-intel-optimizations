@@ -2089,12 +2089,15 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
 // self-quieting signal for a blind spot. The Mistral canonical completion
 // gate was re-verified clean (zero warnings) against this fix; GPT-OSS was
 // not re-run post-fix as of this writing. The residual gemma warnings are
-// this model's own warm-up cost, not a defect in the check. Because
-// GGML_SYCL_ZERO_ALLOC_CHECK=2 bypasses the 1 MiB tolerance entirely (see
-// the zero_alloc_mode check below), these four warm-up warnings mean abort
-// mode is currently unusable against a cold gemma process -- it would abort
-// on ordinary, expected warm-up growth. Warn mode (the default) is the
-// supported way to run this check on gemma today.
+// this model's own warm-up cost, not a defect in the check.
+// GGML_SYCL_ZERO_ALLOC_CHECK=2 aborts on any warning at all -- the
+// zero_alloc_mode check below only skips sub-1-MiB deltas when mode < 2, so
+// mode 2 skips nothing -- and additionally bypasses the 1 MiB tolerance, so
+// even sub-MiB warm-up growth would abort. These four warm-up warnings
+// (already well above 1 MiB) mean abort mode is currently unusable against a
+// cold gemma process -- it would abort on ordinary, expected warm-up growth.
+// Warn mode (the default) is the supported way to run this check on gemma
+// today.
 void zero_alloc_check(const char * tag, int device) {
     static const int zero_alloc_mode = []() {
         const char * env = std::getenv("GGML_SYCL_ZERO_ALLOC_CHECK");
@@ -2127,11 +2130,16 @@ void zero_alloc_check(const char * tag, int device) {
     // still device 0's, so device 1's (generally different) steady-state
     // total compared against a foreign baseline -- reproducing the exact
     // "constant delta forever" signature llama.cpp-dcx6 diagnosed, just
-    // triggered by a device switch instead of a never-rebaselined phase.
-    // Keying by device gives each device its own independent
-    // zero_alloc_baseline_tracker (and therefore its own phase-transition
-    // state machine), matching the fact that "runtime_bytes" and "baseline"
-    // are only ever meaningfully compared within one device.
+    // triggered by a device switch instead of a never-rebaselined phase. The
+    // failure isn't only false warns: a device whose bytes sit BELOW the
+    // foreign baseline it's compared against is silently masked -- real
+    // mid-phase growth on that device goes unreported until it crosses the
+    // foreign baseline. Keying by device gives each device its own
+    // independent zero_alloc_baseline_tracker (and therefore its own
+    // phase-transition state machine), matching the fact that
+    // "runtime_bytes" and "baseline" are only ever meaningfully compared
+    // within one device -- this fixes both the false-warn and the
+    // masked-growth direction at once.
     static std::mutex                                 s_tracker_mutex;
     static std::map<int, zero_alloc_baseline_tracker> s_trackers;
     size_t                                            delta    = 0;

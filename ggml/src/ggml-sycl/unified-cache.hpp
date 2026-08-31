@@ -4589,7 +4589,13 @@ enum class offload_phase : uint8_t {
 // devices -- sharing one instance across devices reintroduces the same
 // "compared against a foreign baseline" failure this tracker exists to fix,
 // just triggered by a device switch instead of a never-rebaselined phase
-// (llama.cpp-pip4, rev-final follow-up A).
+// (llama.cpp-pip4, rev-final follow-up A). This cuts both ways: a device
+// whose bytes sit ABOVE the foreign baseline false-warns forever (the
+// symptom that surfaces the bug), but a device whose bytes sit BELOW the
+// foreign baseline is silently masked -- it never warns even on genuine
+// mid-phase growth, until that growth crosses the foreign baseline it is
+// being wrongly compared against. Per-device instances fix both directions
+// at once: false warns and hidden real growth are the same root cause.
 struct zero_alloc_baseline_tracker {
     offload_phase last_phase    = offload_phase::UNKNOWN;
     size_t        baseline      = 0;
