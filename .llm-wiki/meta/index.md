@@ -182,6 +182,7 @@
 
 ## Sources
 
+- [[sources/gemma4-e4b-sycl-perf-attribution-2026-08]] — gemma-4-E4B SYCL perf: measured attribution and D=512 route map *(created: 2026-08-31)*
 - [[sources/multi-source-ingest-fragmentation-dedup-pass]] — Multi-source background ingest fragments entities; run a dedup pass after *(created: 2026-08-29)*
 - [[sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor]] — Observation: Wiki rebuild/lint results post async — verify file state before reacting to error toasts *(created: 2026-08-29)*
 - [[sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-]] — Observation: Dockerized Obsidian (LinuxServer/Selkies) serves the LLM Wiki on LAN port 3001 *(created: 2026-08-30)*
@@ -191,4 +192,4 @@
 - [[sources/SRC-2026-08-29-004]] — sycl-env-vars.md *(created: unknown)*
 
 ---
-*Last updated: 2026-08-30T01:16:29.481Z* | *Total pages: 179*
+*Last updated: 2026-08-31T09:06:43.884Z* | *Total pages: 180*

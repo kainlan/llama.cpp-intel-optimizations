@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-08-30T01:16:29.481Z",
+  "last_updated": "2026-08-31T09:06:43.884Z",
   "pages": {
     "concepts/ab-harness-tracecompare": {
       "type": "concept",
@@ -1245,6 +1245,15 @@
       "format": "markdown",
       "captured": "2026-08-29",
       "updated": "2026-08-29"
+    },
+    "sources/gemma4-e4b-sycl-perf-attribution-2026-08": {
+      "type": "source",
+      "title": "gemma-4-E4B SYCL perf: measured attribution and D=512 route map",
+      "category": "architecture",
+      "status": "insight",
+      "slug": "gemma4-e4b-sycl-perf-attribution-2026-08",
+      "created": "2026-08-31",
+      "updated": "2026-08-31"
     },
     "sources/multi-source-ingest-fragmentation-dedup-pass": {
       "type": "source",

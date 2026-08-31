@@ -50,3 +50,6 @@
 ## [2026-08-30T00:04:41.342Z] observe
 - slug: "obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-", title: "Dockerized Obsidian (LinuxServer/Selkies) serves the LLM Wiki on LAN port 3001", relevance: "high"
 
+## [2026-08-31T09:06:43.848Z] retro
+- slug: "gemma4-e4b-sycl-perf-attribution-2026-08", title: "gemma-4-E4B SYCL perf: measured attribution and D=512 route map", category: "architecture"
+

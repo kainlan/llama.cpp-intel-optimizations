@@ -14,3 +14,4 @@
 {"slug":"multi-source-ingest-fragmentation-dedup-pass","title":"Multi-source background ingest fragments entities; run a dedup pass after","category":"workflow","timestamp":"2026-08-29T20:43:50.955Z","kind":"retro"}
 {"slug":"obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor","title":"Wiki rebuild/lint results post async — verify file state before reacting to error toasts","relevance":"medium","timestamp":"2026-08-29T22:42:17.597Z","kind":"observe"}
 {"slug":"obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-","title":"Dockerized Obsidian (LinuxServer/Selkies) serves the LLM Wiki on LAN port 3001","relevance":"high","timestamp":"2026-08-30T00:04:41.342Z","kind":"observe"}
+{"slug":"gemma4-e4b-sycl-perf-attribution-2026-08","title":"gemma-4-E4B SYCL perf: measured attribution and D=512 route map","category":"architecture","timestamp":"2026-08-31T09:06:43.848Z","kind":"retro"}

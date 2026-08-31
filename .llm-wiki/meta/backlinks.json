@@ -755,6 +755,7 @@
     "entities/oneapi-20253",
     "entities/test-thread-safety"
   ],
+  "sources/gemma4-e4b-sycl-perf-attribution-2026-08": [],
   "sources/multi-source-ingest-fragmentation-dedup-pass": [],
   "sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor": [],
   "sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-": []
