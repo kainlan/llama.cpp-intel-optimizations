@@ -2169,6 +2169,32 @@ if(GGML_SYCL)
     )
 endif()
 
+# test-sycl-getrows-q8-0-index-math: llama.cpp-go37 -- the 2-elements/thread
+# Q8_0 AoS GET_ROWS kernel's index math (block/quant-index split, row-bounds
+# guard). Host-only: calls the pure functions the device kernel calls
+# directly, no device, no allocation.
+if(GGML_SYCL)
+    add_executable(test-sycl-getrows-q8-0-index-math test-sycl-getrows-q8-0-index-math.cpp)
+    target_link_libraries(test-sycl-getrows-q8-0-index-math PRIVATE ggml)
+    if (NOT GGML_BACKEND_DL)
+        target_link_libraries(test-sycl-getrows-q8-0-index-math PRIVATE ggml-cpu)
+    endif()
+    target_include_directories(test-sycl-getrows-q8-0-index-math PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-getrows-q8-0-index-math PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-getrows-q8-0-index-math PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-getrows-q8-0-index-math PRIVATE "-fsycl")
+    install(TARGETS test-sycl-getrows-q8-0-index-math RUNTIME)
+    add_test(NAME test-sycl-getrows-q8-0-index-math COMMAND $<TARGET_FILE:test-sycl-getrows-q8-0-index-math>)
+    set_tests_properties(test-sycl-getrows-q8-0-index-math PROPERTIES
+        LABELS "sycl;getrows;gates"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
