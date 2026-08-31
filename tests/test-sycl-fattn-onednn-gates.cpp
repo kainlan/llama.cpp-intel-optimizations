@@ -85,10 +85,12 @@
 // ---------------------------------------------------------------------------
 
 #include "ggml-sycl/fattn.hpp"
+#include "ggml.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -470,6 +472,87 @@ static bool test_planner_rejects_d512_with_gemma3n_like_scale() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// spec review llama.cpp-jahv/c-c3y6, finding (d): the two cases above call
+// ggml_sycl_flash_attn_ext_onednn_plan() directly, so they pass unchanged on
+// the parent commit and do not guard ggml_sycl_fattn_d512_onednn_admissible()
+// or the D==512 admission branch in ggml_sycl_flash_attn_ext_supported()
+// (fattn.cpp) that this commit actually adds. These two build a real
+// GGML_OP_FLASH_ATTN_EXT tensor via the public ggml_flash_attn_ext() factory
+// (the same one llama.cpp's graph builder uses) and call
+// ggml_sycl_flash_attn_ext_supported() itself, so a deletion of the new
+// admission code turns these red.
+// ---------------------------------------------------------------------------
+
+// D=512, MHA (H_q==H_kv so ggml_can_mul_mat's broadcast check is trivially
+// satisfied), no mask -- ggml_sycl_flash_attn_ext_supported() does not
+// require one. ne01=8 meets GGML_SYCL_FA_ONEDNN_MIN_NCOLS' default threshold
+// (prefill-shaped), which is required for the planner to even consider it.
+static ggml_tensor * build_d512_flash_attn_ext_op(ggml_context * ctx, float scale) {
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 8, 4, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 16, 4, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 16, 4, 1);
+    return ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+}
+
+// Mirrors materialize_enabled()'s pattern: ggml_sycl_fattn_d512_onednn_admissible()
+// latches GGML_SYCL_FA_ONEDNN_D512 into a function-local static on its first
+// call, once per process (same reason the oneDNN gates above are three
+// separate ctest runs rather than one). So this reads the actual current
+// state rather than assuming unset/default, and the assertion below tracks
+// whichever state the process is actually in -- exactly like this file's
+// existing MATERIALIZE-state-aware cases.
+static bool d512_onednn_kill_switch_enabled() {
+    const char * e = std::getenv("GGML_SYCL_FA_ONEDNN_D512");
+    return !(e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "false") == 0));
+}
+
+static bool test_supports_op_d512_admission_follows_onednn_d512_state() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the supports_op D=512 accept/kill-switch case");
+
+    ggml_tensor * dst      = build_d512_flash_attn_ext_op(ctx, 1.0f / std::sqrt(512.0f));
+    const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    if (d512_onednn_kill_switch_enabled()) {
+        TEST_ASSERT(accepted,
+                    "a real FLASH_ATTN_EXT op at D=512 with a standard 1/sqrt(D) scale, no mask, no paged/seq-id "
+                    "sources, must be admitted by ggml_sycl_flash_attn_ext_supported() when the D=512 oneDNN "
+                    "route is enabled (default)");
+    } else {
+        TEST_ASSERT(!accepted,
+                    "GGML_SYCL_FA_ONEDNN_D512=0 must decline even an otherwise fully-eligible D=512 op -- the "
+                    "kill switch must be observable from supports_op, not only from the dispatch branch");
+    }
+    return true;
+}
+
+static bool test_supports_op_declines_d512_with_gemma3n_like_scale() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the supports_op D=512 scale-decline case");
+
+    ggml_tensor * dst      = build_d512_flash_attn_ext_op(ctx, 1.0f);  // gemma-3n's actual kq_scale
+    const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    TEST_ASSERT(!accepted,
+                "a real FLASH_ATTN_EXT op at D=512 with gemma-3n's kq_scale=1.0 must be declined by "
+                "ggml_sycl_flash_attn_ext_supported() (falls back to CPU) in every GGML_SYCL_FA_ONEDNN_D512 "
+                "state, not just at the bare planner level");
+    return true;
+}
+
 static bool test_planner_rejects_unsupported_d() {
     fattn_params params = mha_like_params();
     params.ne00         = 1024;
@@ -696,6 +779,8 @@ int main() {
     ok &= test_materialization_descriptor_rejects_unsupported_layout();
     ok &= test_planner_accepts_d512_with_matching_scale();
     ok &= test_planner_rejects_d512_with_gemma3n_like_scale();
+    ok &= test_supports_op_d512_admission_follows_onednn_d512_state();
+    ok &= test_supports_op_declines_d512_with_gemma3n_like_scale();
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();
