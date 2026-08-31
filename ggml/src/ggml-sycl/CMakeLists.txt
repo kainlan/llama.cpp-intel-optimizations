@@ -535,11 +535,22 @@ else()
     target_compile_options(ggml-sycl PRIVATE "-Wno-narrowing")
 endif()
 
-# Battlemage (B580/G21) AOT avoids first-run JIT overhead, but requires Intel's
-# offline compiler (ocloc). GGML_SYCL_BMG_AOT=AUTO (default) enables AOT when
-# ocloc is present (dev hosts with the GPU compute runtime) and falls back to
-# JIT-only (spir64) otherwise, so compiler-only environments such as the SYCL CI
-# runners (which ship icpx but not ocloc) still link. Set ON/OFF to force.
+# Battlemage (G21/B580-B50, G31/B70) AOT avoids first-run JIT overhead, but
+# requires Intel's offline compiler (ocloc). GGML_SYCL_BMG_AOT=AUTO (default)
+# enables AOT when ocloc is present (dev hosts with the GPU compute runtime)
+# and falls back to JIT-only (spir64) otherwise, so compiler-only environments
+# such as the SYCL CI runners (which ship icpx but not ocloc) still link. Set
+# ON/OFF to force.
+#
+# Both Battlemage dies are AOT-targeted together (there is no per-die
+# GGML_SYCL_BMG_AOT toggle) because a G31-only host with no G21 present would
+# otherwise cold-JIT every kernel on first use just as a G21-only host would
+# for G31: measured on this fork's G31 (Arc Pro B70) under driver 26.31, the
+# JIT compiler is pathologically slow enough that the default SYCL watchdog
+# (GGML_SYCL_OP_TIMEOUT_MS) kills the process mid-compile, which reads as a
+# permanent device hang rather than a one-time warm-up cost (llama.cpp-u1pn).
+# ocloc accepts both device targets in one AOT invocation, so this costs
+# extra device-link time but no extra runtime dependency.
 set(GGML_SYCL_BMG_AOT "AUTO" CACHE STRING "Battlemage AOT: ON, OFF, or AUTO (detect ocloc)")
 if (GGML_SYCL_BMG_AOT STREQUAL "AUTO")
     find_program(GGML_SYCL_OCLOC ocloc)
@@ -554,8 +565,8 @@ else()
     set(GGML_SYCL_BMG_AOT_ENABLED OFF)
 endif()
 if (GGML_SYCL_BMG_AOT_ENABLED)
-    message(STATUS "ggml-sycl: Battlemage AOT enabled (-fsycl-targets=intel_gpu_bmg_g21,spir64)")
-    set(GGML_SYCL_INTEL_TARGETS "intel_gpu_bmg_g21,spir64")
+    message(STATUS "ggml-sycl: Battlemage AOT enabled (-fsycl-targets=intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64)")
+    set(GGML_SYCL_INTEL_TARGETS "intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64")
 else()
     message(STATUS "ggml-sycl: Battlemage AOT disabled; JIT only (-fsycl-targets=spir64) [ocloc not found or GGML_SYCL_BMG_AOT=OFF]")
     set(GGML_SYCL_INTEL_TARGETS "spir64")
@@ -566,12 +577,15 @@ endif()
 # over monolithic esimd::barrier() by overlapping compute with synchronization.
 # Required for: __spirv_ControlBarrierArriveINTEL / __spirv_ControlBarrierWaitINTEL
 # The BMG per-target translator opts are added only when AOT is enabled (the
-# intel_gpu_bmg_g21 target only exists in -fsycl-targets in that case).
+# intel_gpu_bmg_g21/g31 targets only exist in -fsycl-targets in that case), and
+# each AOT target needs its own -Xspirv-translator invocation -- the translator
+# option is not itself comma-list-aware across -fsycl-targets entries.
 target_link_options(ggml-sycl PRIVATE
     "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier")
 if (GGML_SYCL_BMG_AOT_ENABLED)
     target_link_options(ggml-sycl PRIVATE
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier")
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g31 -spirv-ext=+SPV_INTEL_split_barrier")
 endif()
 
 # Link against oneDNN (primary math backend for Intel targets)
@@ -859,7 +873,7 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML
     # Common SYCL compile/link options for tests
     set(XMX_TEST_SYCL_OPTIONS
         "-fsycl"
-        "-fsycl-targets=intel_gpu_bmg_g21,spir64"
+        "-fsycl-targets=intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64"
         "-Wno-narrowing"
     )
 
@@ -925,6 +939,7 @@ if (GGML_SYCL_BUILD_XMX_TESTS AND GGML_SYCL_TARGET STREQUAL "INTEL" AND NOT GGML
     set(SYCL_UNIFIED_KERNEL_TEST_LINK_OPTIONS
         ${XMX_TEST_SYCL_OPTIONS}
         "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g31 -spirv-ext=+SPV_INTEL_split_barrier"
         "SHELL:-Xspirv-translator=spir64 -spirv-ext=+SPV_INTEL_split_barrier"
     )
 
@@ -1791,7 +1806,8 @@ target_link_options(test-fattn-packed-k-lifecycle PRIVATE
 )
 if (GGML_SYCL_BMG_AOT_ENABLED)
     target_link_options(test-fattn-packed-k-lifecycle PRIVATE
-        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier")
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g21 -spirv-ext=+SPV_INTEL_split_barrier"
+        "SHELL:-Xspirv-translator=intel_gpu_bmg_g31 -spirv-ext=+SPV_INTEL_split_barrier")
 endif()
 target_compile_definitions(test-fattn-packed-k-lifecycle PRIVATE
     GGML_SYCL_WARP_SIZE=32

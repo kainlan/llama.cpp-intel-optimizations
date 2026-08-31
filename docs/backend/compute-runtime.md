@@ -129,6 +129,106 @@ bug. Do not enable direct peer-copy or shared-context transfer paths by default
 unless a runtime check confirms they are safe on the active hardware, kernel, and
 driver.
 
+## Cold JIT on a non-AOT device reads as a permanent hang (2026-08-30, llama.cpp-u1pn/0oad)
+
+`ggml/src/ggml-sycl/CMakeLists.txt`'s `GGML_SYCL_BMG_AOT` option ahead-of-time
+compiles SPIR-V kernels via `ocloc` for the Battlemage device targets named in
+`-fsycl-targets` (`intel_gpu_bmg_g21` for the B50/G21 die,
+`intel_gpu_bmg_g31` for the B70/G31 die — both as of this fix; previously only
+`g21`, see below). A device whose target string is **not** in that AOT list
+still runs — the SYCL runtime falls back to compiling its SPIR-V kernels via
+its own JIT compiler the first time each kernel is launched — but that JIT
+compile has to happen at all, on the critical path of the first real
+inference call, rather than at build time.
+
+**This was the root cause of an apparent B70 hang, and it cost a full
+misdiagnosis cycle before the actual mechanism was found.** Investigation
+timeline (`llama.cpp-u1pn`):
+
+1. Every SYCL workload on the B70 (`level_zero:0`) — regardless of model size,
+   down to the 19 MB `stories15M` — stalled with zero visible progress until
+   the `[SYCL-WATCHDOG]` forced `_Exit(1)` at 30s/60s/120s timeouts alike.
+   `journalctl` showed no kernel-level GPU errors (no GT reset, no `guc_id`);
+   the card was idle and had 31 GB free VRAM. This pattern (silent stall,
+   clean kernel log, watchdog-only failure) initially read as a **userspace
+   device wedge** requiring a reboot — the fork's established recovery for
+   that failure class.
+2. **The hang survived a reboot**, which should have been the first
+   contradiction of the wedge theory (a genuinely wedged device state does not
+   survive a power cycle). It was still initially treated as consistent with a
+   driver-stack issue, since driver 26.31 was a comparatively recent,
+   never-previously-B70-tested load-bearing change (see "Loader state
+   correction" below) — a plausible confound, but not the actual cause.
+3. **The decisive run disabled the watchdog instead of tolerating it**:
+   `GGML_SYCL_OP_TIMEOUT_MS=480000` on the *same* 19 MB model that had
+   "hung" at every prior timeout. It completed in **~61s**, pegging ~100% of
+   one host CPU core for nearly the entire duration — a JIT compiler running,
+   not a stalled device. Inference itself was instant once the compile
+   finished. A second run against the same process image completed in **~2s**
+   (the compiled kernels were now cached — see below).
+
+**Why every prior probe reinforced the wrong theory:** each one used a
+timeout at or below the default and killed the process mid-compile. That
+looks identical to a true hang from the outside (silent stall, then a forced
+exit) and it also does not "fail faster" as more aggressive settings are
+tried — a 30s and a 120s timeout both terminate mid-JIT if the true compile
+time is longer than both. Nothing about *how* it failed distinguished cold
+JIT from a wedge; only removing the timeout did.
+
+**Why only the B70 was affected:** before this fix, `GGML_SYCL_INTEL_TARGETS`
+included only `intel_gpu_bmg_g21` (the B50) in its AOT list, so every kernel
+image shipped in `libggml-sycl.so` was pre-compiled for G21 and for generic
+`spir64` — the latter being a portable-but-still-JIT-at-first-use fallback
+target that the DPC++ runtime still has to specialize for the actual device
+at load time. The B50 (G21) hit its AOT image directly and paid no JIT cost;
+the B70 (G31) fell through to the `spir64` JIT path for every kernel. Driver
+26.31's JIT is measured (this investigation) to be slow enough that the
+default watchdog cannot outlast a cold compile — this is a magnitude problem
+introduced or worsened by that driver revision, not a correctness bug in the
+watchdog or the JIT path itself.
+
+**The fix**: `ggml/src/ggml-sycl/CMakeLists.txt` now AOT-compiles for both
+Battlemage dies unconditionally under `GGML_SYCL_BMG_AOT=AUTO/ON` — there is
+no per-die toggle, since a host with only the B70 present would hit the exact
+same failure mode in reverse. `ocloc` accepts multiple device targets in one
+AOT invocation (`-fsycl-targets=intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64`),
+at the cost of a longer device-link step; each AOT target additionally needs
+its own `-Xspirv-translator=<target> ...` invocation, since that translator
+flag is not itself comma-list-aware the way `-fsycl-targets` is. This does not
+eliminate JIT for architectures outside this fork's two known cards (e.g. the
+Arrow Lake-S iGPU, or any future non-Battlemage device) — the same failure
+mode remains latent for any device whose architecture is not in the AOT list.
+
+**Operational takeaway — treat a silent stall as possible cold JIT before
+treating it as a device wedge**, specifically when:
+- it is the *first* SYCL workload run against a newly built binary, a newly
+  changed driver, or a device/architecture combination that has not
+  previously been exercised on this host, and
+- the kernel log (`journalctl -k`, per the unprivileged-`dmesg` rule in
+  `CLAUDE.md`) shows nothing — no GT reset, no `guc_id`, no CAT error.
+
+Diagnostic/workaround: re-run with `GGML_SYCL_OP_TIMEOUT_MS=0` (or a large
+value, e.g. `480000`) and watch host CPU usage — near-100% single-core
+utilization for tens of seconds with no GPU activity is the JIT signature.
+Do **not** treat this as the routine fix for a slow first run in general use;
+it is a diagnostic escape hatch, and disabling the watchdog forfeits the
+protection it exists for (an actual GPU-side hang would then block
+indefinitely instead of forcing an exit).
+
+**Persistent cache caveat:** the second run above (~2s) implies the compiled
+kernel images were cached somewhere and reused by the next process, not just
+within one process's lifetime. `docs/backend/SYCL.md`'s existing FAQ entry on
+`SYCL_CACHE_PERSISTENT` (search that file for the variable) describes an
+*explicit* opt-in on-disk cache at `~/.cache/libsycl_cache/` and warns it can
+itself cause crashes if stale — that entry predates this investigation and its
+crash warning has not been re-examined against driver 26.31. Whether this
+host's default caching behavior (unset `SYCL_CACHE_PERSISTENT`) already
+persists JIT images to disk, or whether the fast second run instead reflects
+some other reuse path, was not established here — do not assume either
+answer. If a rebuild or driver change appears not to take effect on a
+JIT-only architecture, clearing `~/.cache/libsycl_cache/` is a reasonable
+first thing to try before assuming the change itself is wrong.
+
 ## Loader state correction (2026-08-30, llama.cpp-09um)
 
 A one-way PPA upgrade on 2026-08-18 moved the loaded driver to **26.31**
