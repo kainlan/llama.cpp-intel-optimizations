@@ -2143,6 +2143,32 @@ if(GGML_SYCL)
     )
 endif()
 
+# test-sycl-zero-alloc-check: llama.cpp-dcx6 -- the zero-alloc-check baseline
+# tracker must re-baseline on phase transitions, not on every call. Host-only:
+# it drives the pure state machine directly with plain (phase, bytes) pairs,
+# no device, no allocation, no oneDNN.
+if(GGML_SYCL)
+    add_executable(test-sycl-zero-alloc-check test-sycl-zero-alloc-check.cpp)
+    target_link_libraries(test-sycl-zero-alloc-check PRIVATE ggml)
+    if (NOT GGML_BACKEND_DL)
+        target_link_libraries(test-sycl-zero-alloc-check PRIVATE ggml-cpu)
+    endif()
+    target_include_directories(test-sycl-zero-alloc-check PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-zero-alloc-check PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    target_compile_options(test-sycl-zero-alloc-check PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-zero-alloc-check PRIVATE "-fsycl")
+    install(TARGETS test-sycl-zero-alloc-check RUNTIME)
+    add_test(NAME test-sycl-zero-alloc-check COMMAND $<TARGET_FILE:test-sycl-zero-alloc-check>)
+    set_tests_properties(test-sycl-zero-alloc-check PROPERTIES
+        LABELS "sycl;zero-alloc;gates"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

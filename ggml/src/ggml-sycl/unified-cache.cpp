@@ -2045,6 +2045,20 @@ static std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> offloa
 
 // Standalone zero-alloc check — runs even when offload stats are disabled.
 // GGML_SYCL_ZERO_ALLOC_CHECK: 0=off, 1=warn (default), 2=abort
+//
+// llama.cpp-dcx6: the baseline used to be captured ONCE, on the very first
+// PP/TG call in the process's life, and never re-established. Every model
+// tested (gemma, Mistral, GPT-OSS) steps its non-weight arena footprint once
+// during PP warm-up or on the PP->TG transition and then holds flat -- but
+// the old single frozen baseline meant that one-time, expected step got
+// reported as "runtime allocation detected" on every single call for the
+// rest of the run (verified: the `total=` field was bit-identical across
+// dozens of consecutive prints, proving no repeated allocation was actually
+// happening). zero_alloc_baseline_tracker fixes this by re-baselining on
+// every phase transition (including the very first call), while still
+// comparing same-phase calls against the baseline that phase already
+// established -- so a real allocation appearing mid-phase still raises a
+// warning on the very next call.
 void zero_alloc_check(const char * tag, int device) {
     static const int zero_alloc_mode = []() {
         const char * env = std::getenv("GGML_SYCL_ZERO_ALLOC_CHECK");
@@ -2063,33 +2077,36 @@ void zero_alloc_check(const char * tag, int device) {
 
     const size_t runtime_bytes = unified_cache_get_runtime_bytes(device);
 
-    // Baseline snapshot: captured once on first PP/TG check.
-    // All pre-existing runtime allocations (KV cache, graph buffers, etc.)
-    // are expected and should not trigger warnings.
-    static std::atomic<size_t> s_baseline{ 0 };
-    static std::atomic<bool>   s_baseline_set{ false };
-    if (!s_baseline_set.load(std::memory_order_relaxed)) {
-        s_baseline.store(runtime_bytes, std::memory_order_relaxed);
-        s_baseline_set.store(true, std::memory_order_relaxed);
-        return;  // First call — just record baseline
+    // Guards the tracker's compound read-compare-update; observe() is not
+    // safe to call concurrently on its own (transition detection has to
+    // read last_phase and conditionally write both fields atomically as a
+    // unit, which independent atomics cannot express).
+    static std::mutex                  s_tracker_mutex;
+    static zero_alloc_baseline_tracker s_tracker;
+    size_t                             delta    = 0;
+    size_t                             baseline = 0;
+    bool                               warn     = false;
+    {
+        std::lock_guard<std::mutex> lock(s_tracker_mutex);
+        warn     = s_tracker.observe(phase, runtime_bytes, delta);
+        baseline = s_tracker.baseline;
+    }
+    if (!warn) {
+        return;
     }
 
-    const size_t baseline = s_baseline.load(std::memory_order_relaxed);
-    if (runtime_bytes > baseline) {
-        const size_t delta = runtime_bytes - baseline;
-        if (zero_alloc_mode < 2 && delta < 1024 * 1024) {
-            return;
-        }
-        const char * phase_name = offload_phase_name(phase);
-        GGML_LOG_WARN(
-            "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: +%.1f MB "
-            "(total %.1f MB, baseline %.1f MB). "
-            "Expected zero new allocations during steady-state inference.\n",
-            tag ? tag : "graph", phase_name, delta / (1024.0 * 1024.0), runtime_bytes / (1024.0 * 1024.0),
-            baseline / (1024.0 * 1024.0));
-        if (zero_alloc_mode >= 2) {
-            GGML_ASSERT(false && "ZERO_ALLOC_CHECK: runtime allocation during inference");
-        }
+    if (zero_alloc_mode < 2 && delta < 1024 * 1024) {
+        return;
+    }
+    const char * phase_name = offload_phase_name(phase);
+    GGML_LOG_WARN(
+        "[SYCL-ZERO-ALLOC-CHECK] %s: runtime allocation detected during %s phase: +%.1f MB "
+        "(total %.1f MB, baseline %.1f MB). "
+        "Expected zero new allocations during steady-state inference.\n",
+        tag ? tag : "graph", phase_name, delta / (1024.0 * 1024.0), runtime_bytes / (1024.0 * 1024.0),
+        baseline / (1024.0 * 1024.0));
+    if (zero_alloc_mode >= 2) {
+        GGML_ASSERT(false && "ZERO_ALLOC_CHECK: runtime allocation during inference");
     }
 }
 

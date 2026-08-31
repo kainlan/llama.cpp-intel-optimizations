@@ -4562,6 +4562,41 @@ enum class offload_phase : uint8_t {
     TG      = 4,
 };
 
+// Pure phase-transition-aware baseline tracker backing zero_alloc_check
+// (llama.cpp-dcx6). Deliberately holds no SYCL/device state so it can be
+// driven and unit-tested with plain (phase, bytes) sequences.
+//
+// A phase change resets the baseline to the bytes observed on entry to the
+// new phase and never warns for that call: entering PP or TG is expected to
+// step the non-weight arena footprint once (KV/graph buffer warm-up, a
+// lazily-created persistent-TG buffer, etc.), and that one-time step must
+// not be reported as a leak on every subsequent call in the new phase. A
+// call within an unchanged phase compares against the baseline that phase
+// already established, so a real allocation appearing mid-phase still
+// raises `delta` on the very next call.
+struct zero_alloc_baseline_tracker {
+    offload_phase last_phase    = offload_phase::UNKNOWN;
+    size_t        baseline      = 0;
+    bool          have_baseline = false;
+
+    // Returns true and sets `delta` (bytes over baseline) when `bytes`
+    // exceeds the current phase's baseline. Resets and returns false on the
+    // first observation ever, and on every phase transition.
+    bool observe(offload_phase phase, size_t bytes, size_t & delta) {
+        if (!have_baseline || phase != last_phase) {
+            baseline      = bytes;
+            last_phase    = phase;
+            have_baseline = true;
+            return false;
+        }
+        if (bytes > baseline) {
+            delta = bytes - baseline;
+            return true;
+        }
+        return false;
+    }
+};
+
 bool                   offload_stats_enabled();
 void                   offload_stats_reset();
 void                   offload_stats_set_phase(offload_phase phase);
