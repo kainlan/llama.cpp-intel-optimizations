@@ -1,3 +1,9 @@
+// This file previously had no include guard because only fattn-tile.cpp
+// included it. llama.cpp-dtpk adds a second includer (fattn.cpp, for the
+// D=512 launcher below), so guard it now against any future diamond include.
+#ifndef GGML_SYCL_FATTN_TILE_HPP
+#define GGML_SYCL_FATTN_TILE_HPP
+
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include "dpct/helper.hpp"
@@ -8,6 +14,61 @@
 #include <float.h>
 
 namespace syclex = sycl::ext::oneapi::experimental;
+
+// SYCL_FLASH_ATTN / SYCL_FAST_FP16 (llama.cpp-dtpk): this file was dpct-
+// migrated from an upstream CUDA kernel that gated its body behind
+// capability macros neither of which this fork ever defined anywhere
+// (verified: a whole-tree grep finds only this guard's own #ifdef/#endif
+// pairs below). Left undefined, every instantiation of flash_attn_tile<>
+// compiled to a silent no-op -- GGML_UNUSED_VARS on every parameter, dst
+// never written, no crash, no abort. Defined here because this file's
+// kernel is getting a real caller for the first time (D=512 tile-path FA,
+// the gemma-viable route jahv's oneDNN wiring cannot serve). FAST_FP16 is
+// unconditional -- not tied to GGML_SYCL_F16 -- to stay consistent with
+// fast_fp16_available()'s own unconditional `return true` (common.hpp):
+// that function drives the RUNTIME (cc-taking) overload of
+// ggml_sycl_fattn_tile_get_nthreads() that any launcher uses to size its
+// nd_range, while this macro drives the COMPILE-TIME-only overload the
+// kernel body uses internally to size its own local-memory layout: tying
+// FAST_FP16 to a build flag fast_fp16_available() ignores would let those
+// two disagree in a GGML_SYCL_F16=OFF build, mismatching the launched
+// work-group shape against the kernel's actual SLM allocation.
+#define SYCL_FLASH_ATTN 1
+#define SYCL_FAST_FP16 1
+
+// Missing dpct-migration utilities (llama.cpp-dtpk): flash_attn_tile<>'s
+// body calls these three CUDA-intrinsic-named helpers, none of which exist
+// anywhere in this fork (confirmed by a whole-tree grep) -- another
+// consequence of this file never having compiled before (see the
+// SYCL_FLASH_ATTN/SYCL_FAST_FP16 comment above; this was found only once
+// the macros above let the compiler actually reach these call sites for the
+// first time). make_half2/make_float2 are exactly what this same file
+// already spells out inline elsewhere as sycl::half2(a,b)/sycl::float2(a,b)
+// constructor calls (e.g. the `KQ_max_scale_h2 = sycl::half2(...)` pattern
+// further down) -- these are thin aliases for that constructor, the one
+// call site that was never converted off its CUDA name. ggml_sycl_mad is a
+// half2-dot-into-float / float-FMA accumulate, inferred from its two call
+// shapes at the single site that uses it (K_k/Q_k are sycl::half2 under
+// SYCL_FAST_FP16, plain float otherwise) and cross-checked against this
+// file's own already-working, already-compiling scalar half2-dot-product
+// pattern in vec_dot_fattn_vec_KQ_f16 (fattn-common.hpp): `sum +=
+// x.x()*y.x() + x.y()*y.y()`, same accumulation shape.
+static __dpct_inline__ sycl::half2 make_half2(float x, float y) {
+    return sycl::half2(x, y);
+}
+
+static __dpct_inline__ sycl::float2 make_float2(float x, float y) {
+    return sycl::float2(x, y);
+}
+
+static __dpct_inline__ void ggml_sycl_mad(float & acc, const sycl::half2 & a, const sycl::half2 & b) {
+    acc += static_cast<float>(a.x()) * static_cast<float>(b.x()) +
+           static_cast<float>(a.y()) * static_cast<float>(b.y());
+}
+
+static __dpct_inline__ void ggml_sycl_mad(float & acc, const float & a, const float & b) {
+    acc += a * b;
+}
 
 #define GGML_SYCL_FATTN_TILE_CONFIG_CASE(DKQ_, DV_, ncols_, nthreads, occupancy, nbatch_fa, nbatch_K) \
     if (DKQ == (DKQ_) && DV == (DV_) && ncols == (ncols_)) {                                          \
@@ -1068,6 +1129,131 @@ static void flash_attn_tile(const char *  Q,
 #endif // SYCL_FLASH_ATTN
 }
 
+// =============================================================================
+// Fork-native D=512 launcher (llama.cpp-dtpk)
+// =============================================================================
+// NOT part of the launch_fattn_tile_switch_ncols1/ncols2/
+// ggml_sycl_flash_attn_ext_tile_case scaffolding below, which depends on a
+// generic launch_fattn<D,ncols1,ncols2,KERNEL,warp_size> template that was
+// never ported into this fork (see the llama.cpp-dtpk design note). This
+// calls flash_attn_tile<> directly and replicates only what gemma's
+// DKQ==DV==512 shape needs:
+//  - no KV_max/dst_meta split-KV partitioning -- this fork's other kernel
+//    families (xmx-v2, esimd, tile-f16) don't use it either; single
+//    partition only (grid dim1 == 1, KV_max == nullptr, dst_meta == nullptr,
+//    matching how flash_attn_tile itself falls back to k_VKQ_max = ne11 and
+//    a direct 1/KQ_sum write when item.get_group_range(1) == 1).
+//  - no DKQ != DV (576,512) MLA support.
+//  - the GQA-grouping ncols1/ncols2 selection ported as plain runtime logic,
+//    reproducing exactly what launch_fattn_tile_switch_ncols2/ncols1's
+//    DV==512 branch below would select (traced by hand -- for DV==512 the
+//    DV<512 tier in switch_ncols1 is dead and DKQ==DV rules out the
+//    576-only tiers, so only the ncols2<=4 / ncols2<=2 / fallback tiers
+//    there, plus switch_ncols2's own gqa_limit==INT_MAX-unconditionally
+//    branch for DV>256, are reachable -- both are folded in below).
+//  - Q is F32 at this call site by construction: llama.cpp-dtpk also
+//    patched llama-graph.cpp's build_attn_mha() to skip the blanket
+//    GGML_SYCL_FATTN_Q_TYPE(=F16) cast specifically for D=512, since this
+//    kernel (unlike every sibling family) has no Q_type template parameter
+//    and reads Q as raw F32 unconditionally. Do not call this with F16 Q.
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, int warp_size>
+static void submit_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr stream) {
+    static_assert(DKQ == DV, "submit_fattn_tile_d512 only covers the DKQ==DV config rows");
+    constexpr int ncols  = ncols1 * ncols2;
+    constexpr int nwarps = ggml_sycl_fattn_tile_get_nthreads(DKQ, DV, ncols) / warp_size;
+    static_assert(ggml_sycl_fattn_tile_get_config(DKQ, DV, ncols) != 0, "kernel config not defined");
+
+    // Grid dim0 selects (sequence, head-group); dim1 is the KV-partition
+    // index (fixed at 1 -- no split-KV, see above); dim2 selects the
+    // Q-column block. Matches flash_attn_tile's own indexing exactly:
+    // sequence = get_group(0) / (ne02/ncols2), head0 = get_group(0)*ncols2 - sequence*ne02.
+    const int n_query_blocks = (params.ne01 + ncols1 - 1) / ncols1;
+    sycl::range<3> block(1, nwarps, warp_size);
+    sycl::range<3> grid(params.ne03 * (params.ne02 / ncols2), 1, n_query_blocks);
+
+    const char *   Q_ptr         = params.Q;
+    const char *   K_ptr         = params.K;
+    const char *   V_ptr         = params.V;
+    const char *   mask_ptr      = params.mask;
+    const char *   sinks_ptr     = params.sinks;
+    float *        dst_ptr       = params.dst;
+    const float    scale_v       = params.scale;
+    const float    max_bias_v    = params.max_bias;
+    const float    m0_v          = params.m0;
+    const float    m1_v          = params.m1;
+    const uint32_t n_head_log2_v = params.n_head_log2;
+    const float    logit_sc_v    = params.logit_softcap;
+    const int32_t  ne00_v = params.ne00, ne02_v = params.ne02, ne03_v = params.ne03;
+    const sycl::uint3 ne01_fd = init_fastdiv_values((uint32_t) params.ne01);
+    const int32_t  nb01_v = params.nb01, nb02_v = params.nb02, nb03_v = params.nb03;
+    const int32_t  ne10_v = params.ne10, ne11_v = params.ne11, ne12_v = params.ne12, ne13_v = params.ne13;
+    const int32_t  nb11_v = params.nb11;
+    const int32_t  nb12_v = params.nb12;
+    const int64_t  nb13_v = params.nb13;
+    const int32_t  nb21_v = params.nb21, nb22_v = params.nb22;
+    const int64_t  nb23_v = params.nb23;
+    const int32_t  ne31_v = params.ne31, ne32_v = params.ne32, ne33_v = params.ne33;
+    const int32_t  nb31_v = params.nb31, nb32_v = params.nb32;
+    const int64_t  nb33_v = params.nb33;
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(grid * block, block),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(warp_size)]] {
+                flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>(
+                    Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, /*KV_max=*/nullptr, dst_ptr,
+                    /*dst_meta=*/nullptr, scale_v, max_bias_v, m0_v, m1_v, n_head_log2_v, logit_sc_v,
+                    ne00_v, ne01_fd, ne02_v, ne03_v, nb01_v, nb02_v, nb03_v,
+                    ne10_v, ne11_v, ne12_v, ne13_v, nb11_v, nb12_v, nb13_v,
+                    nb21_v, nb22_v, nb23_v, ne31_v, ne32_v, ne33_v, nb31_v, nb32_v, nb33_v);
+            });
+    });
+}
+
+// Entry point: selects (ncols1, ncols2) at runtime -- see the derivation in
+// the block comment above.
+template <bool use_logit_softcap>
+static void launch_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr stream) {
+    constexpr int warp_size = WARP_32_SIZE;  // can't support WARP_16_SIZE, matches switch_ncols1's own comment
+    constexpr int DKQ = 512;
+    constexpr int DV  = 512;
+
+    GGML_ASSERT(params.ne02 % params.ne12 == 0);
+    const int gqa_ratio = params.ne02 / params.ne12;
+    const int ne01      = params.ne01;
+    // DV==512 forces launch_fattn_tile_switch_ncols2's own
+    // `gqa_ratio<=4 && DV<=256 ? 16 : INT_MAX` ternary to INT_MAX
+    // unconditionally (the DV<=256 half is always false here) -- so unlike
+    // the D<=256 kernels, ne01 never gates GQA-grouping eligibility at D=512.
+    const bool use_gqa_opt =
+        params.mask != nullptr && params.max_bias == 0.0f && (params.ne11 % FATTN_KQ_STRIDE == 0);
+
+    if (use_gqa_opt && gqa_ratio % 16 == 0) {
+        submit_fattn_tile_d512<DKQ, DV, 2, 16, use_logit_softcap, warp_size>(params, stream);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio % 4 == 0) {
+        submit_fattn_tile_d512<DKQ, DV, 1, 4, use_logit_softcap, warp_size>(params, stream);
+        return;
+    }
+    if (use_gqa_opt && gqa_ratio % 2 == 0) {
+        if (ne01 >= 2) {
+            submit_fattn_tile_d512<DKQ, DV, 2, 2, use_logit_softcap, warp_size>(params, stream);
+        } else {
+            submit_fattn_tile_d512<DKQ, DV, 1, 2, use_logit_softcap, warp_size>(params, stream);
+        }
+        return;
+    }
+    // ncols2 == 1 fallback -- always reachable when the above don't apply,
+    // matching launch_fattn_tile_switch_ncols2's unconditional final branch
+    // for DKQ==DV.
+    if (ne01 >= 3) {
+        submit_fattn_tile_d512<DKQ, DV, 4, 1, use_logit_softcap, warp_size>(params, stream);
+    } else {
+        submit_fattn_tile_d512<DKQ, DV, 2, 1, use_logit_softcap, warp_size>(params, stream);
+    }
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1244,3 +1430,4 @@ extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
 
+#endif // GGML_SYCL_FATTN_TILE_HPP

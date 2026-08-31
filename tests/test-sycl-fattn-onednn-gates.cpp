@@ -604,6 +604,176 @@ static bool test_supports_op_declines_d512_with_gemma3n_like_scale() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// D=512 TILE-PATH gates (llama.cpp-dtpk) -- the gemma-viable route. These
+// probe ggml_sycl_flash_attn_ext_supported()'s tile-admissibility clause
+// specifically, using shapes the oneDNN route above structurally cannot
+// serve: a non-standard scale (gemma's kq_scale=1.0) and a decode-shaped
+// call (ne01=1, below oneDNN's MIN_NCOLS regardless of scale). The tile
+// route's env kill switch (GGML_SYCL_FA_TILE_D512) is read into a
+// function-local static latched once per process (same reason
+// materialize_enabled()/d512_route_expected_admitted() above are
+// state-aware, not by-design-red), so the positive cases here are
+// state-aware against the current process's env too.
+//
+// One case from the ticket's own plan is NOT present here: a non-integer
+// GQA ratio (e.g. H_q=5, H_kv=2). ggml_flash_attn_ext()'s own factory
+// (ggml.c) asserts ggml_can_mul_mat(k, q), which already forbids
+// constructing such an op through the public API at all -- attempting it
+// aborts the process, not the assertion this file wants to make. The
+// integer-ratio check in ggml_sycl_fattn_d512_tile_admissible() is real
+// defensive code (matches this fork's decline-not-assert convention) but is
+// consequently untestable via a synthetic op built the way every other case
+// here is; ggml core itself is the thing guaranteeing the invariant for any
+// real op.
+// ---------------------------------------------------------------------------
+
+// D=512, F32 Q (matches what build_attn_mha's per-op cast bypass produces
+// for this D -- see llama-graph.cpp), standard GQA (default H_q=4, H_kv=2,
+// ratio 2), no mask, no paged/seq-id sources. ne01/h_q/h_kv are parameters
+// so callers can probe the decode shape and other GQA ratios without a
+// second near-duplicate builder.
+static ggml_tensor * build_d512_tile_flash_attn_ext_op(ggml_context * ctx, float scale, int32_t ne01_q = 8,
+                                                        int32_t h_q = 4, int32_t h_kv = 2) {
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 512, ne01_q, h_q, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, h_kv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, h_kv, 1);
+    return ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+}
+
+// Mirrors ggml_sycl_fattn_d512_tile_admissible()'s own state-dependent gate
+// -- its only one; every other condition it checks is a pure shape/type
+// test a fixed synthetic op either satisfies or doesn't, unlike the
+// oneDNN helper's four independent env gates.
+static bool tile_d512_route_expected_enabled() {
+    const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
+    return !(env && (std::strcmp(env, "0") == 0 || std::strcmp(env, "false") == 0));
+}
+
+static bool test_supports_op_admits_d512_tile_with_gemma_like_scale() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile-admission gemma-scale case");
+
+    // scale=1.0 -- oneDNN's own admissibility helper rejects this
+    // (SCALE_UNSUPPORTED; test_supports_op_declines_d512_with_gemma3n_like_
+    // scale above proves it, using F16 Q at the same scale, unconditionally
+    // declined). This op differs only in Q's type (F32, matching what
+    // build_attn_mha's D=512 cast bypass produces) -- so this being GREEN
+    // while that one stays RED demonstrates the tile route performs real,
+    // distinct admission, not merely agreeing with oneDNN's answer.
+    ggml_tensor * dst      = build_d512_tile_flash_attn_ext_op(ctx, 1.0f);
+    const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    if (tile_d512_route_expected_enabled()) {
+        TEST_ASSERT(accepted,
+                    "a real FLASH_ATTN_EXT op at D=512 with gemma's non-standard scale=1.0, F32 Q, an integer "
+                    "GQA ratio, and no paged/seq-id sources must be admitted via the tile route when "
+                    "GGML_SYCL_FA_TILE_D512 is not disabled -- this is the shape oneDNN structurally cannot "
+                    "serve");
+    } else {
+        TEST_ASSERT(!accepted,
+                    "GGML_SYCL_FA_TILE_D512=0/false must decline this op -- neither route can serve gemma's "
+                    "scale with the tile route disabled");
+    }
+    return true;
+}
+
+static bool test_supports_op_admits_d512_tile_decode_shape() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile-admission decode-shape case");
+
+    // ne01=1 (decode), standard 1/sqrt(D) scale -- even a scale oneDNN
+    // would otherwise accept can never reach it here: oneDNN's own
+    // GGML_SYCL_FA_ONEDNN_MIN_NCOLS default (8) rejects any ne01<8
+    // regardless of scale. This is gemma's actual per-token decode shape
+    // for its D=512 global layers, and the reason the tile route matters
+    // beyond prefill.
+    ggml_tensor * dst      = build_d512_tile_flash_attn_ext_op(ctx, 1.0f / std::sqrt(512.0f), /*ne01_q=*/1);
+    const bool    accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    if (tile_d512_route_expected_enabled()) {
+        TEST_ASSERT(accepted,
+                    "a decode-shaped (ne01=1) D=512 FLASH_ATTN_EXT op, F32 Q, standard scale, must be admitted "
+                    "via the tile route -- oneDNN's MIN_NCOLS floor can never serve decode at any scale, so "
+                    "this shape has no route but tile");
+    } else {
+        TEST_ASSERT(!accepted, "GGML_SYCL_FA_TILE_D512=0/false must decline the decode shape too");
+    }
+    return true;
+}
+
+static bool test_supports_op_declines_d512_tile_with_f16_q() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile F16-Q decline case");
+
+    // Same shape as the gemma-scale acceptance case above, except Q is F16.
+    // llama-graph.cpp's per-op cast bypass should never produce this for a
+    // real D=512 op, but ggml_sycl_fattn_d512_tile_admissible() must not
+    // trust that invariant blindly -- it is a defensive backstop, pinned as
+    // a test rather than left as prose. flash_attn_tile<> hardcodes Q as
+    // F32 (no Q_type template, unlike every sibling kernel family);
+    // admitting F16 Q here would let dispatch reach a kernel that misreads
+    // its own input rather than declining to CPU.
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 8, 4, 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 512, 256, 2, 1);
+    ggml_tensor * dst = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, /*scale=*/1.0f, /*max_bias=*/0.0f,
+                                            /*logit_softcap=*/0.0f);
+    const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    TEST_ASSERT(!accepted,
+                "an F16-Q D=512 op with gemma's scale must be declined -- oneDNN rejects the scale, and the "
+                "tile route must reject the Q dtype (its kernel has no Q_type template and hardcodes F32) "
+                "regardless of GGML_SYCL_FA_TILE_D512's state");
+    return true;
+}
+
+static bool test_supports_op_declines_d512_tile_with_paged_sources() {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ggml_tensor_overhead() * 10 + 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(iparams);
+    TEST_ASSERT(ctx != nullptr, "ggml_init failed for the tile paged-source decline case");
+
+    ggml_tensor * dst = build_d512_tile_flash_attn_ext_op(ctx, 1.0f);
+    // Same conservative exclusion as ggml_sycl_fattn_d512_onednn_admissible:
+    // any of src[5..8] present declines outright rather than being planned,
+    // because submit_fattn_tile_d512 doesn't implement paged-block-table or
+    // continuous-batching seq-id skipping. Poke src[7] (block_table)
+    // directly -- there is no public setter exercised by this synthetic op,
+    // and dst->src[] is a plain public array ggml_flash_attn_ext() leaves
+    // nullptr past index 4.
+    ggml_tensor * block_table = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+    dst->src[7]                = block_table;
+    const bool accepted = ggml_sycl_flash_attn_ext_supported(dst);
+    ggml_free(ctx);
+
+    TEST_ASSERT(!accepted,
+                "a D=512 op carrying a paged block_table (src[7]) must be declined by the tile route -- "
+                "submit_fattn_tile_d512 has no paged-layout support");
+    return true;
+}
+
 static bool test_planner_rejects_unsupported_d() {
     fattn_params params = mha_like_params();
     params.ne00         = 1024;
@@ -832,6 +1002,10 @@ int main() {
     ok &= test_planner_rejects_d512_with_gemma3n_like_scale();
     ok &= test_supports_op_d512_admission_follows_onednn_d512_state();
     ok &= test_supports_op_declines_d512_with_gemma3n_like_scale();
+    ok &= test_supports_op_admits_d512_tile_with_gemma_like_scale();
+    ok &= test_supports_op_admits_d512_tile_decode_shape();
+    ok &= test_supports_op_declines_d512_tile_with_f16_q();
+    ok &= test_supports_op_declines_d512_tile_with_paged_sources();
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();

@@ -13,6 +13,7 @@
 #include "fattn-mma.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-tile-f16.hpp"
+#include "fattn-tile.hpp"
 #include "fattn-v2-esimd.hpp"
 #include "fattn-v2-partition.hpp"
 #include "fattn-vec-f16.hpp"
@@ -2284,6 +2285,65 @@ static bool ggml_sycl_fattn_d512_onednn_admissible(const ggml_tensor *) {
 }
 #endif  // GGML_SYCL_DNNL
 
+// D=512 tile-path admissibility (llama.cpp-dtpk) -- the gemma-viable route.
+// Unlike oneDNN's compiled-partition-baked sqrt(D) divisor,
+// fattn-tile.hpp's flash_attn_tile<> takes scale as a runtime value, so it
+// serves any scale (including gemma's kq_scale=1.0 that SCALE_UNSUPPORTED-
+// rejects the oneDNN route above), and unlike oneDNN's MIN_NCOLS=8 it also
+// serves decode (ne01=1). Metadata-only, mirrors the oneDNN helper's shape
+// (graph-structural facts only, no resolved pointers) so supports_op and
+// dispatch-time reality can't disagree.
+//
+// Declined outright rather than planned (same rationale as the oneDNN
+// helper's src[5..8] exclusion): paged/multi-seq sources, since the new
+// D=512 launcher (submit_fattn_tile_d512, fattn-tile.hpp) doesn't implement
+// paged-block-table or continuous-batching seq-id skipping -- can be
+// relaxed in a follow-up if a shape needs it. A non-integer GQA ratio is
+// also declined here rather than left to submit_fattn_tile_d512's own
+// GGML_ASSERT(ne02 % ne12 == 0) -- decline, not assert, for anything
+// supports_op can see structurally, matching this file's convention.
+//
+// Q dtype: the launcher requires F32 Q (flash_attn_tile has no Q_type
+// template, unlike every sibling kernel family). llama-graph.cpp's
+// build_attn_mha() skips the blanket GGML_SYCL_FATTN_Q_TYPE(=F16) cast
+// specifically for D=512, so Q should already be F32 for any real op that
+// reaches here -- checked anyway as a defensive backstop.
+static bool ggml_sycl_fattn_d512_tile_admissible(const ggml_tensor * dst) {
+    static const bool tile_d512_enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_FA_TILE_D512");
+        return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+    }();
+    if (!tile_d512_enabled) {
+        return false;
+    }
+
+    const ggml_tensor * Q               = dst->src[0];
+    const ggml_tensor * K               = dst->src[1];
+    const ggml_tensor * q_seq_ids       = dst->src[5];
+    const ggml_tensor * kv_seq_ids      = dst->src[6];
+    const ggml_tensor * block_table     = dst->src[7];
+    const ggml_tensor * seq_lens_tensor = dst->src[8];
+
+    if (q_seq_ids || kv_seq_ids || block_table || seq_lens_tensor) {
+        return false;
+    }
+
+    const int32_t use_paged_layout_i32 = ((const int32_t *) dst->op_params)[4];
+    if (use_paged_layout_i32 != 0) {
+        return false;
+    }
+
+    if (Q->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 // Check if flash attention is supported for the given operation
 bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // Enabled by default; allow explicit disable for debugging/regressions.
@@ -2323,13 +2383,13 @@ bool ggml_sycl_flash_attn_ext_supported(const ggml_tensor * dst) {
     // Masked flash attention is supported; keep the gate in place via GGML_SYCL_FLASH_ATTN_EXT if needed.
 
     // Check head dimension. {64,128,256} always have a native kernel below.
-    // D=512 is admitted only when the oneDNN SDPA path can run it (see
-    // ggml_sycl_fattn_d512_onednn_admissible above) -- there is no other
-    // kernel for it, so ggml_sycl_flash_attn_ext() must never see a D=512 op
-    // this function declined would-be-oneDNN-eligible for, nor accept one it
-    // is not.
+    // D=512 is admitted when EITHER the oneDNN SDPA path (llama.cpp-jahv) or
+    // the tile path (llama.cpp-dtpk) can run it -- there is no other kernel
+    // for it, so ggml_sycl_flash_attn_ext() must never see a D=512 op this
+    // function declined both routes for, nor accept one neither route is.
     const int D = Q->ne[0];
-    if (!fattn_vec_supports_head_dim(D) && !(D == 512 && ggml_sycl_fattn_d512_onednn_admissible(dst))) {
+    if (!fattn_vec_supports_head_dim(D) &&
+        !(D == 512 && (ggml_sycl_fattn_d512_onednn_admissible(dst) || ggml_sycl_fattn_d512_tile_admissible(dst)))) {
         return false;
     }
 
@@ -3642,31 +3702,45 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     const int D = Q->ne[0];
 
     // ==========================================================================
-    // D=512 route: oneDNN SDPA only (llama.cpp-jahv). D=512 has no vec/tile/
-    // XMX/ESIMD kernel in this fork -- fattn-tile.hpp's D=512/576 config-table
-    // rows have no live caller (out of scope for this pass). This branch must
-    // come before the paged-V2 and Standard Dispatch switches below: neither
-    // has a `case 512` (paged-V2's scalar switch GGML_ABORTs on an unhandled
-    // D, the Standard Dispatch switches do too), and dispatch_ncols<D,...> is
-    // never instantiated for D=512 (no vec/tile kernel body to instantiate
-    // it against).
+    // D=512 route: oneDNN-if-admissible, else TILE-if-admissible, else abort
+    // (llama.cpp-jahv + llama.cpp-dtpk). D has no vec/XMX/ESIMD kernel at
+    // 512 in this fork. This branch must come before the paged-V2 and
+    // Standard Dispatch switches below: neither has a `case 512` (paged-V2's
+    // scalar switch GGML_ABORTs on an unhandled D, the Standard Dispatch
+    // switches do too), and dispatch_ncols<D,...> is never instantiated for
+    // D=512 (no vec kernel body to instantiate it against).
+    //
+    // Route composition rationale (llama.cpp-dtpk design note): oneDNN is a
+    // vendor-tuned GEMM-based SDPA, plausibly faster for standard-scale
+    // prefill than a hand-rolled kernel, so it's tried first for the
+    // audience it targets. Tile serves what oneDNN structurally cannot --
+    // non-standard scale (gemma's kq_scale=1.0, SCALE_UNSUPPORTED-rejected
+    // by oneDNN's baked sqrt(D) divisor) and decode (ne01=1 < oneDNN's
+    // MIN_NCOLS=8) -- via a kernel that takes scale as a runtime value and
+    // has no ne01 floor.
     //
     // ggml_sycl_flash_attn_ext_supported() only accepts a D=512 op when
-    // ggml_sycl_fattn_d512_onednn_admissible() -- a replica of the plan check
-    // below plus the same static/global gates -- already agrees. That replica
-    // is NOT a complete predictor of what happens here, though (spec review
-    // llama.cpp-jahv/c-c3y6, finding A2): oneDNN's own execute path can still
-    // decline for reasons only visible at dispatch time from resolved
-    // pointers and live global state -- SYCL command graph recording in
-    // progress, Q/K/V being host-pinned (a real state under this fork's
-    // placement-decides-the-executor architecture: GGML_SYCL_KV_HOST,
-    // host-resident weight streaming, warmup), or a materialization
-    // allocation/repack failure. D<=256 tolerates every one of these by
-    // falling through to a native kernel; D=512 has none, so this branch has
-    // no fallback left when they occur and must GGML_ABORT. That is a known,
-    // documented limitation of an oneDNN-only D=512 route -- not evidence of
-    // a supports_op/dispatch predicate bug -- and the two abort messages
-    // below are written to tell the two apart rather than conflating them.
+    // EITHER ggml_sycl_fattn_d512_onednn_admissible() or
+    // ggml_sycl_fattn_d512_tile_admissible() -- each a metadata-only replica
+    // of what its own route can actually run -- already agrees. Neither
+    // replica is a complete predictor of dispatch-time reality for oneDNN
+    // (spec review llama.cpp-jahv/c-c3y6, finding A2): its own execute path
+    // can still decline for reasons only visible at dispatch time from
+    // resolved pointers and live global state -- SYCL command graph
+    // recording in progress, Q/K/V being host-pinned (a real state under
+    // this fork's placement-decides-the-executor architecture:
+    // GGML_SYCL_KV_HOST, host-resident weight streaming, warmup), or a
+    // materialization allocation/repack failure. D<=256 tolerates every one
+    // of these by falling through to a native kernel; D=512's oneDNN route
+    // alone has none -- but unlike jahv's original wiring, that case no
+    // longer aborts unconditionally here: it falls through to the tile
+    // route below, which has no such execute-time-only declines (it's this
+    // fork's own kernel, using the same pointer-resolution path as every
+    // other native FA kernel, not an external library with graph-
+    // recording/host-pinned exclusions). The abort at the end of this
+    // branch is now reserved for the case neither route actually ran an op
+    // supports_op admitted -- a genuine predicate disagreement in one of
+    // the two admissibility helpers.
     if (D == 512) {
 #if GGML_SYCL_DNNL
         static const bool d512_onednn_enabled = ggml_sycl_fa_onednn_d512_enabled();
@@ -3687,38 +3761,41 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                     return;
                 }
                 // The plan accepted this shape; the execute call declined it
-                // anyway. This is the A2 case documented above -- a runtime
-                // condition the admissibility replica cannot see, not a
-                // predicate mismatch.
-                GGML_ABORT(
-                    "D=512 flash attention: oneDNN planned this shape as runnable (kind=%d) but its execute "
-                    "path declined at dispatch time. D=512 has no native kernel to fall back to, so this is "
-                    "fatal. Likely causes: SYCL command graph recording in progress, a host-pinned Q/K/V "
-                    "source (GGML_SYCL_KV_HOST / host-resident weight streaming / warmup -- see "
-                    "GGML_SYCL_FA_DISPATCH_DEBUG=1 for which one), or a materialization allocation/repack "
-                    "failure. This is a known limitation of the oneDNN-only D=512 route (llama.cpp-jahv), not "
-                    "a supports_op/dispatch predicate bug. Set GGML_SYCL_FA_ONEDNN_D512=0 to force D=512 back "
-                    "to the CPU fallback until a non-fatal path exists.",
-                    (int) plan.kind);
+                // anyway (the A2 case documented above). Fall through to the
+                // tile route below instead of aborting -- do not return or
+                // break, the tile-admissibility check still needs to run.
             }
         }
 #endif  // GGML_SYCL_DNNL
 
-        // Neither of the above executed oneDNN at all: either the D=512 route
-        // is disabled (GGML_SYCL_FA_ONEDNN_D512=0, GGML_SYCL_FA_ONEDNN=0, or
-        // paged-v2 is active) -- in which case ggml_sycl_flash_attn_ext_supported()
-        // should already have declined this op before SYCL ever saw it -- or
-        // the oneDNN plan REJECTed this exact shape despite the admissibility
-        // replica agreeing it should be DIRECT/MATERIALIZE_REQUIRED. Either
-        // way this genuinely is a supports_op/dispatch predicate disagreement
-        // (unlike the execute-time decline above), and is the case that
-        // should be reported as a bug in ggml_sycl_fattn_d512_onednn_admissible().
+        if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
+            if (params.logit_softcap == 0.0f) {
+                launch_fattn_tile_d512<false>(params, stream);
+            } else {
+                launch_fattn_tile_d512<true>(params, stream);
+            }
+            if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
+                fprintf(stderr, "[SYCL] fattn selected [d512] tile_d512 D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D,
+                        params.ne01, params.ne11, params.ne02, params.ne12);
+            }
+            return;
+        }
+
+        // Neither route executed this op, despite
+        // ggml_sycl_flash_attn_ext_supported() admitting it via one of
+        // ggml_sycl_fattn_d512_onednn_admissible()/
+        // ggml_sycl_fattn_d512_tile_admissible(). This is a genuine
+        // supports_op/dispatch predicate disagreement in whichever helper
+        // over-admitted -- please file it as a bug. (oneDNN's
+        // accepted-then-declined-at-execute case, A2 above, falls through
+        // to the tile check rather than reaching here, so it is not what
+        // this abort reports.)
         GGML_ABORT(
-            "D=512 flash attention has no SYCL kernel outside the oneDNN SDPA path, and the path was not taken "
-            "(disabled via GGML_SYCL_FA_ONEDNN_D512/GGML_SYCL_FA_ONEDNN, paged-v2 active, or the oneDNN plan "
-            "REJECTed this exact shape) despite ggml_sycl_flash_attn_ext_supported() admitting it. This is a "
-            "genuine supports_op/dispatch predicate disagreement in ggml_sycl_fattn_d512_onednn_admissible() -- "
-            "please file it as a bug, it is not the same as the oneDNN-accepted-but-declined-at-execute case.");
+            "D=512 flash attention: neither the oneDNN SDPA route (llama.cpp-jahv) nor the tile route "
+            "(llama.cpp-dtpk) executed this op, despite ggml_sycl_flash_attn_ext_supported() admitting it. Set "
+            "GGML_SYCL_FA_DISPATCH_DEBUG=1 and re-run to see which admissibility checks disagreed with dispatch-"
+            "time reality; GGML_SYCL_FA_ONEDNN_D512=0 / GGML_SYCL_FA_TILE_D512=0 force either route off "
+            "individually if you need to isolate one.");
     }
 
 #if GGML_SYCL_FA_V2_ENABLED
