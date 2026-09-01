@@ -11,6 +11,7 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
+#    include <chrono>
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
@@ -1252,10 +1253,39 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         // ggml_sycl_flash_attn_ext_onednn_materialize_kv and
         // _materialize_q_f32) are threaded in as `deps` so the SDPA
         // partition waits on-device instead of the host blocking before
-        // every execute; the event execute() hands back is both the real
-        // device timing for the profiler (replacing the old host-span
-        // stand-in below) and the terminal event the materialized buffers'
-        // mem_handles are retained against, a few lines down.
+        // every execute; the event execute() hands back is the terminal
+        // event the materialized buffers' mem_handles are retained against,
+        // a few lines down.
+        //
+        // PROFILING CAVEAT (found in GPU verification, llama.cpp-hhbb
+        // c-xqi6): the returned event's device profiling window covers only
+        // the compiled partition's LAST kernel (~0.4 ms), not the whole
+        // fused 5-op SDPA pattern (bmm1 -> divide -> [mask] -> softmax ->
+        // bmm2) -- oneDNN Graph does not expose per-op or whole-partition
+        // timestamps through this API. Recording only that event would
+        // under-report per-call cost by roughly an order of magnitude and
+        // make this stage look free when it isn't. Do NOT "fix" this with an
+        // ext_oneapi_submit_barrier() bracket: this backend has hit real
+        // Level-Zero event-state corruption from that call before (see
+        // docs/plans/2026-03-01-moe-expert-parallelism-impl.md,
+        // tests/e1-rca/probe-barrier-bug.cpp) and its events carry no
+        // profiling info anyway (artifacts/perf-recovery/
+        // alt6-pp-gap-attribution.md), so it could not supply a real start
+        // timestamp even if it were safe. So both are recorded, matching
+        // ggml_sycl_kernel_profile_record_host_span's documented purpose
+        // ("For call sites that have no sycl::event to attach to... use
+        // ggml_sycl_kernel_profile_record_event whenever the call site
+        // returns a sycl::event; reach for this only when it does not" --
+        // here we have a real but PARTIAL event, so both apply): the host
+        // span brackets the whole synchronous host-side cost of the call
+        // (which per S4/llama.cpp-jmc5 is where the real ~2.7 ms/call
+        // actually lives -- oneDNN's per-execute scratch allocate/free
+        // through the SYCL runtime, not GPU kernel time) and the device
+        // event supplies the real, if partial, device timestamp for the
+        // tail kernel. The profiler already keeps the two kinds of rows
+        // distinguishable via timestamp_status ("host_span_only" vs a real
+        // device timestamp), so recording both under the same label is the
+        // documented, not a workaround.
         std::vector<sycl::event> deps;
         deps.reserve(3);
         if (materialized.Q.valid()) {
@@ -1268,10 +1298,20 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
             deps.push_back(materialized.v_evt);
         }
 
+        const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
+        const uint64_t host_begin_us =
+            profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                        std::chrono::steady_clock::now().time_since_epoch())
+                                                        .count()) :
+                              0;
+
         sycl::event exec_event =
             dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);
 
-        if (ggml_sycl_kernel_profile_enabled()) {
+        if (profile_enabled) {
+            const uint64_t host_end_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                                   .count());
             ggml_sycl_profile_label profile_label{};
             profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
             profile_label.category             = "fattn";
@@ -1283,6 +1323,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
             profile_label.metadata = profile_metadata.c_str();
             profile_label.device   = ctx.device;
             ggml_sycl_kernel_profile_record_event(profile_label, exec_event);
+            ggml_sycl_kernel_profile_record_host_span(profile_label, host_begin_us, host_end_us);
         }
 
         if (materialized.Q.valid() || materialized.K.valid() || materialized.V.valid()) {
