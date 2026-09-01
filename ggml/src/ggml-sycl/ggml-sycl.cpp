@@ -42100,7 +42100,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                               (src0_pp_scratch ? src0_pp_scratch : src0_as_f16.get());
             DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
-                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc);
+                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
         }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
@@ -42239,7 +42239,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
 
         DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
                                   src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
-                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc);
+                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
             const float alpha = 1.0f;

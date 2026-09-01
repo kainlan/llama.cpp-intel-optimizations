@@ -297,7 +297,23 @@ class DnnlGemmWrapper {
         }
     }
 
-    static void gemm(ggml_backend_sycl_context & ctx,
+    // llama.cpp-qmen (S6/I1 profiler completeness): this is the un-batched
+    // oneDNN matmul primitive -- the shared choke point reached by row_gemm()
+    // (the Q8_0/Q4_0 weight-only-quant MUL_MAT path: weights dequantized to
+    // F16/F32 by the caller, then GEMM'd here) as well as outprod.cpp's
+    // OUT_PROD and ggml-sycl.cpp's F16 batch-GEMM launcher. Before this task
+    // it was the one oneDNN matmul executor with NO kernel-profiler wrap at
+    // all -- gemm_batch_strided (below) already carries mulmat.onednn_gemm.
+    // execute; this one is why 219/237 Q8_0 M=512 GEMMs per pp512 ubatch were
+    // dark to the profiler (kprof-pp-b70.csv). `op_context` is an optional
+    // short tag (e.g. ggml_type_name(src0->type)) callers that know the
+    // originating ggml tensor type can pass for a richer metadata string;
+    // callers that don't (outprod.cpp, the batch launcher) leave it null and
+    // get an m/variant-only tag. `deps` mirrors gemm_batch_strided's pattern
+    // (SYCL events this GEMM must wait on) even though no caller populates it
+    // today -- the event-form execute() needs the parameter to exist either
+    // way, and every other executor in this file already writes it this way.
+    static sycl::event gemm(ggml_backend_sycl_context & ctx,
                      int                         m,
                      int                         n,
                      int                         k,
@@ -316,7 +332,9 @@ class DnnlGemmWrapper {
                      const queue_ptr &           q,
                      dnnl_dim_t                  batches_a,
                      dnnl_dim_t                  batches_b,
-                     int                         ldc = -1) {
+                     int                         ldc = -1,
+                     const std::vector<sycl::event> & deps = {},
+                     const char *                op_context = nullptr) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -390,8 +408,18 @@ class DnnlGemmWrapper {
                 }
                 matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
-            matmul_prim.execute(stream, matmul_args);
-            return;
+            ggml_sycl_profile_label gemm_label{};
+            gemm_label.name       = "mulmat.onednn_woq.execute";
+            gemm_label.category   = "mulmat";
+            gemm_label.queue_kind = "compute";
+            gemm_label.device     = ctx.device;
+            const std::string label_metadata = op_context ?
+                (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=fallback_create") :
+                (std::string("m=") + std::to_string(m) + ";variant=fallback_create");
+            gemm_label.metadata = label_metadata.c_str();
+            return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+                return dnnl::sycl_interop::execute(matmul_prim, stream, matmul_args, deps);
+            });
         }
 
         // Use cached primitive - only memory binding and execute (graph-compatible)
@@ -412,10 +440,21 @@ class DnnlGemmWrapper {
             matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
         }
 
-        cached->primitive.execute(stream, matmul_args);
+        ggml_sycl_profile_label gemm_label{};
+        gemm_label.name       = "mulmat.onednn_woq.execute";
+        gemm_label.category   = "mulmat";
+        gemm_label.queue_kind = "compute";
+        gemm_label.device     = ctx.device;
+        const std::string label_metadata = op_context ?
+            (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=cached") :
+            (std::string("m=") + std::to_string(m) + ";variant=cached");
+        gemm_label.metadata = label_metadata.c_str();
+        return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+            return dnnl::sycl_interop::execute(cached->primitive, stream, matmul_args, deps);
+        });
     }
 
-    static void row_gemm(ggml_backend_sycl_context & ctx,
+    static sycl::event row_gemm(ggml_backend_sycl_context & ctx,
                          int                         m,
                          int                         n,
                          int                         k,
@@ -426,8 +465,10 @@ class DnnlGemmWrapper {
                          void *                      c,
                          dt                          ct,
                          const queue_ptr &           q,
-                         int                         ldc = -1) {
-        gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, ldc);
+                         int                         ldc = -1,
+                         const char *                op_context = nullptr) {
+        return gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, ldc, /* deps = */ {},
+                    op_context);
     }
 
     // WoQ GEMM for Q4_0 weights (s4) with grouped scales/zero-points.
