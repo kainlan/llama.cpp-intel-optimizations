@@ -27,6 +27,18 @@ struct ggml_sycl_onednn_fa_materialized_kv {
     ggml_sycl::mem_handle           Q;
     ggml_sycl::mem_handle           K;
     ggml_sycl::mem_handle           V;
+    // Completion events for the repack kernels that filled Q/K/V above.
+    // llama.cpp-hhbb (S3): the caller no longer wait_and_throw()s these on the
+    // host -- it threads them into dnnl::graph::sycl_interop::execute(...,
+    // deps) so the SDPA partition itself waits on-device, and reuses the
+    // execute() call's own returned event to keep these mem_handles alive
+    // (see ggml_sycl_flash_attn_ext_onednn). Only meaningful when the
+    // corresponding handle above is valid(); a handle that was never
+    // materialized leaves its event default-constructed (never submitted, so
+    // never a dependency).
+    sycl::event                     q_evt;
+    sycl::event                     k_evt;
+    sycl::event                     v_evt;
 };
 
 // Cache key for oneDNN graph compiled_partition.

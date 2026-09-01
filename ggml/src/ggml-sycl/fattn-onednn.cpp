@@ -11,7 +11,6 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
-#    include <chrono>
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
@@ -70,7 +69,6 @@ static ggml_sycl_onednn_fa_layout_plan ggml_sycl_onednn_fa_reject(ggml_sycl_oned
 class onednn_fa_materialize_k_kernel;
 class onednn_fa_materialize_v_kernel;
 class onednn_fa_materialize_q_f32_kernel;
-class onednn_fa_materialized_release_marker_kernel;
 
 // Live (non-cached) parse of GGML_SYCL_FA_ONEDNN_D512_SCALE -- llama.cpp-bn5k
 // item 2, a measurement hatch (default OFF) for the "CONSERVATIVE SCOPE,
@@ -473,22 +471,26 @@ static bool ggml_sycl_flash_attn_ext_onednn_materialize_q_f32(const fattn_params
     const int64_t src_nb1 = params.nb01;
     const int64_t src_nb2 = params.nb02;
 
+    // llama.cpp-hhbb (S3): no host wait here -- the repack event is threaded
+    // into dnnl::graph::sycl_interop::execute(..., deps) by the caller
+    // instead (see ggml_sycl_flash_attn_ext_onednn). The try/catch still
+    // guards synchronous submission failure (e.g. a queue already in an
+    // error state); an async device-side fault in the kernel body is not
+    // observable here without a wait, matching the no-host-waits convention
+    // used elsewhere in this backend (see e.g. ggml_sycl_graph_safe_memcpy).
     try {
-        stream
-            .parallel_for<onednn_fa_materialize_q_f32_kernel>(
-                sycl::range<3>((size_t) H_q, (size_t) n_q, (size_t) D),
-                [=](sycl::id<3> idx) {
-                    const int64_t h = (int64_t) idx[0];
-                    const int64_t t = (int64_t) idx[1];
-                    const int64_t d = (int64_t) idx[2];
-                    const size_t  src_off =
-                        (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(float);
-                    const size_t dst_off =
-                        (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
-                    reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
-                        static_cast<sycl::half>(reinterpret_cast<const float *>(src + src_off)[0]);
-                })
-            .wait_and_throw();
+        out->q_evt = stream.parallel_for<onednn_fa_materialize_q_f32_kernel>(
+            sycl::range<3>((size_t) H_q, (size_t) n_q, (size_t) D), [=](sycl::id<3> idx) {
+                const int64_t h = (int64_t) idx[0];
+                const int64_t t = (int64_t) idx[1];
+                const int64_t d = (int64_t) idx[2];
+                const size_t  src_off =
+                    (size_t) h * (size_t) src_nb2 + (size_t) t * (size_t) src_nb1 + (size_t) d * sizeof(float);
+                const size_t dst_off =
+                    (size_t) h * (size_t) dst_nb2 + (size_t) t * (size_t) dst_nb1 + (size_t) d * sizeof(sycl::half);
+                reinterpret_cast<sycl::half *>(dst + dst_off)[0] =
+                    static_cast<sycl::half>(reinterpret_cast<const float *>(src + src_off)[0]);
+            });
     } catch (const std::exception & e) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized Q repack failed: %s\n", e.what());
@@ -552,13 +554,14 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
         return false;
     }
 
+    // llama.cpp-hhbb (S3): no host wait here -- both repack events are
+    // threaded into dnnl::graph::sycl_interop::execute(..., deps) by the
+    // caller instead of being drained on the host before every SDPA execute.
     try {
-        sycl::event k_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.K, static_cast<char *>(k_resolved.ptr),
-                                                                desc, /*value_tensor=*/false);
-        sycl::event v_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.V, static_cast<char *>(v_resolved.ptr),
-                                                                desc, /*value_tensor=*/true);
-        v_evt.wait_and_throw();
-        k_evt.wait_and_throw();
+        out->k_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.K, static_cast<char *>(k_resolved.ptr), desc,
+                                                          /*value_tensor=*/false);
+        out->v_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.V, static_cast<char *>(v_resolved.ptr), desc,
+                                                          /*value_tensor=*/true);
     } catch (const std::exception & e) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed: %s\n", e.what());
@@ -1235,29 +1238,40 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
 
-        // P4 TG-cost-visibility (llama.cpp-os8k): this is the oneDNN SDPA
-        // GRAPH execute -- the materialized flash-attention path CLAUDE.md
-        // documents as ON by default for GQA shapes (Mistral included), and
-        // previously completely dark to the kernel profiler. Unlike
-        // gemm.hpp's dnnl::sycl_interop::execute (matmul primitive API),
-        // dnnl::graph::sycl_interop::execute returns void, not a
-        // sycl::event, so there is no event to hand ggml_sycl_profile_submit
-        // -- record a HOST wall-clock span instead via
-        // ggml_sycl_kernel_profile_record_host_span (see its declaration
-        // comment for the host-vs-device-time caveat this implies).
-        const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
-        const uint64_t host_begin_us =
-            profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                        std::chrono::steady_clock::now().time_since_epoch())
-                                                        .count()) :
-                              0;
+        // llama.cpp-hhbb (S3): this is the oneDNN SDPA GRAPH execute -- the
+        // materialized flash-attention path CLAUDE.md documents as ON by
+        // default for GQA shapes (Mistral included). A prior revision of
+        // this comment claimed dnnl::graph::sycl_interop::execute() returns
+        // void; that was wrong -- the bundled oneDNN header
+        // (dnnl_graph_sycl.hpp:93) declares
+        //   sycl::event execute(compiled_partition &, stream &,
+        //       const std::vector<tensor> & inputs, std::vector<tensor> & outputs,
+        //       const std::vector<sycl::event> & deps = {})
+        // so this is wired both directions: the Q/K/V materialization events
+        // (produced without a host wait -- see
+        // ggml_sycl_flash_attn_ext_onednn_materialize_kv and
+        // _materialize_q_f32) are threaded in as `deps` so the SDPA
+        // partition waits on-device instead of the host blocking before
+        // every execute; the event execute() hands back is both the real
+        // device timing for the profiler (replacing the old host-span
+        // stand-in below) and the terminal event the materialized buffers'
+        // mem_handles are retained against, a few lines down.
+        std::vector<sycl::event> deps;
+        deps.reserve(3);
+        if (materialized.Q.valid()) {
+            deps.push_back(materialized.q_evt);
+        }
+        if (materialized.K.valid()) {
+            deps.push_back(materialized.k_evt);
+        }
+        if (materialized.V.valid()) {
+            deps.push_back(materialized.v_evt);
+        }
 
-        dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
+        sycl::event exec_event =
+            dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);
 
-        if (profile_enabled) {
-            const uint64_t host_end_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                                   .count());
+        if (ggml_sycl_kernel_profile_enabled()) {
             ggml_sycl_profile_label profile_label{};
             profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
             profile_label.category             = "fattn";
@@ -1268,7 +1282,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
                                                  ";H_q=" + std::to_string(H_q) + ";H_kv=" + std::to_string(H_kv);
             profile_label.metadata = profile_metadata.c_str();
             profile_label.device   = ctx.device;
-            ggml_sycl_kernel_profile_record_host_span(profile_label, host_begin_us, host_end_us);
+            ggml_sycl_kernel_profile_record_event(profile_label, exec_event);
         }
 
         if (materialized.Q.valid() || materialized.K.valid() || materialized.V.valid()) {
@@ -1283,8 +1297,11 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
             if (materialized.V.valid()) {
                 retained.push_back(std::move(materialized.V));
             }
-            sycl::event done = ggml_sycl_submit_marker<onednn_fa_materialized_release_marker_kernel>(*stream);
-            ggml_sycl::retain_handles_until_event(std::move(retained), std::move(done));
+            // exec_event IS the terminal event for these buffers -- they are
+            // execute()'s own inputs, chained in via `deps` above -- so
+            // retain directly against it instead of submitting a separate
+            // marker kernel to approximate completion.
+            ggml_sycl::retain_handles_until_event(std::move(retained), exec_event);
         }
     } catch (std::exception & e) {
         fprintf(stderr, "[SYCL] oneDNN SDPA execute failed: %s\n", e.what());
