@@ -111,9 +111,9 @@ int main() {
     // without needing a real SYCL device.
     {
         ggml_init_params params2 = {
-            /*.mem_size   =*/ 4 * 1024 * 1024,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
+            /*.mem_size   =*/4 * 1024 * 1024,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
         };
         ggml_context * ctx2 = ggml_init(params2);
         if (!ctx2) {
