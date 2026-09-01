@@ -4520,6 +4520,35 @@ inline const void * ggml_sycl_host_data(const ggml_tensor * tensor) {
     return tensor ? tensor->data : nullptr;
 }
 
+// llama.cpp-kmeq: pure predicate, no allocation -- true iff a BF16->F32
+// materialization route (ggml_sycl_bf16_weight_materialize_f32, in
+// ggml-sycl.cpp) could be used for this tensor on this device.
+// ggml_backend_sycl_device_supports_op() calls this and must never allocate
+// or mutate cache state from inside it.
+//
+// Declared inline here (not `static` in ggml-sycl.cpp) specifically so a
+// host-side test can call the SAME function production dispatch uses,
+// mirroring the fattn.hpp pattern (declare in a header, define once,
+// production and tests both link the one definition) rather than a test
+// re-implementing the predicate's logic and drifting from it. See
+// tests/test-sycl-tensor-usage.cpp for the coverage.
+//
+// Requires ggml_is_contiguous(): the materialize path treats tensor->data
+// as a flat, packed run of n = ggml_nelements(tensor) BF16 values
+// (ggml_bf16_to_fp32_row / the on-device conversion kernel both index
+// linearly), and the retyped F32 copy's nb[] is recomputed from ne[]
+// assuming that same packed layout. A permuted or viewed BF16 weight would
+// silently read/produce wrong strides -- a wrong answer, not a decline --
+// so decline it here and let it fall back to CPU exactly as an
+// unclassified BF16 weight did before this fix existed. No supported
+// architecture currently creates a non-contiguous BF16 weight tensor, so
+// this narrows nothing reachable today; it only removes a latent trap for
+// one that might.
+inline bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
+    return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
+           tensor->name[0] != '\0' && ggml_is_contiguous(tensor) && ggml_sycl_host_data(tensor) != nullptr;
+}
+
 inline void * ggml_sycl_resolve_or_host_tensor_ptr(const ggml_tensor * tensor, int device) {
     void * resolved = ggml_sycl_resolve_tensor_ptr(tensor, device);
     if (resolved != nullptr) {

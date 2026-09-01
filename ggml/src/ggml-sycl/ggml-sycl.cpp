@@ -13703,19 +13703,35 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 // its entries (and the mem_handle leases they hold) would sit unreferenced
 // forever, exactly the "ownerless leaked lease" class the unified cache's
 // own strict-lease checking (GGML_SYCL_STRICT_LEASES=1) exists to catch.
-static std::mutex                                             g_sycl_bf16_materialize_mutex;
-static std::unordered_map<std::string, ggml_sycl::mem_handle> g_sycl_bf16_materialize_cache;
+// g_sycl_bf16_materialize_mutex guards both maps below. It is held only for
+// O(1) map lookups/inserts/erases -- never across the slow materialization
+// work (allocation, host conversion, device copy) -- so concurrent
+// materialization of DIFFERENT weights never blocks on it. Per-key
+// serialization for the SAME weight (see ggml_sycl_bf16_weight_materialize_f32)
+// uses the per-key mutex in g_sycl_bf16_materialize_locks instead, held only
+// by racers for that one key.
+static std::mutex                                                   g_sycl_bf16_materialize_mutex;
+static std::unordered_map<std::string, ggml_sycl::mem_handle>       g_sycl_bf16_materialize_cache;
+static std::unordered_map<std::string, std::shared_ptr<std::mutex>> g_sycl_bf16_materialize_locks;
 
-// Prunes every cache entry owned by `owner`. Keyed the same way
-// ggml_sycl_erase_weight_identities_for_owner()'s other maps are (an
+// Prunes every cache entry (and its per-key lock) owned by `owner`. Keyed the
+// same way ggml_sycl_erase_weight_identities_for_owner()'s other maps are (an
 // "owner_name_key(...)" prefix, matched via ggml_sycl_owner_name_key_matches()
 // which parses only the "model:load:slot:generation:" prefix and does not
 // care what follows it) -- this cache's keys append "|dev<N>" after the
-// name, which the matcher's prefix-only parse ignores correctly.
+// name, which the matcher's prefix-only parse ignores correctly. Erasing a
+// g_sycl_bf16_materialize_locks entry that a racer still holds a shared_ptr
+// to is safe: the entry is just this map's OWN reference to the
+// std::shared_ptr<std::mutex>, and refcounting keeps the mutex alive for
+// whoever is still using it until they release their copy.
 static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
     std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
     for (auto it = g_sycl_bf16_materialize_cache.begin(); it != g_sycl_bf16_materialize_cache.end();) {
         it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_bf16_materialize_cache.erase(it) :
+                                                                  std::next(it);
+    }
+    for (auto it = g_sycl_bf16_materialize_locks.begin(); it != g_sycl_bf16_materialize_locks.end();) {
+        it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_bf16_materialize_locks.erase(it) :
                                                                   std::next(it);
     }
 }
@@ -13729,36 +13745,41 @@ static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, in
     return key;
 }
 
-// Pure predicate, no allocation: true iff a BF16->F32 materialization
-// route could be used for this tensor on this device. supports_op calls
-// this and must never allocate or mutate cache state from inside it.
-//
-// Requires ggml_is_contiguous(): the materialize path treats tensor->data
-// as a flat, packed run of n = ggml_nelements(tensor) BF16 values
-// (ggml_bf16_to_fp32_row / the on-device conversion kernel both index
-// linearly), and the retyped F32 copy's nb[] is recomputed from ne[]
-// assuming that same packed layout. A permuted or viewed BF16 weight would
-// silently read/produce wrong strides -- a wrong answer, not a decline --
-// so decline it here and let it fall back to CPU exactly as an
-// unclassified BF16 weight did before this fix existed. No supported
-// architecture currently creates a non-contiguous BF16 weight tensor, so
-// this narrows nothing reachable today; it only removes a latent trap for
-// one that might.
-static bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
-    return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
-           tensor->name[0] != '\0' && ggml_is_contiguous(tensor) && ggml_sycl_host_data(tensor) != nullptr;
-}
+// ggml_sycl_bf16_weight_dispatch_available() now lives in common.hpp (an
+// inline, externally-linked function, not `static` here) specifically so a
+// host-side test can call the exact same predicate production code uses --
+// see its definition there, next to ggml_sycl_host_data(), for the full
+// rationale and the fattn.hpp-style pattern it mirrors.
 
 // Returns the resolved device pointer to a cached F32 materialization of
 // a BF16 weight, creating and uploading it on first use. Returns nullptr
 // if materialization is not possible or fails -- the caller must then
 // treat the op as genuinely unsupported.
+//
+// TOCTOU note: CLAUDE.md documents real host-submission overlap across
+// calls on this backend's direct/fallback dispatch paths, so two threads
+// reaching this function for the SAME weight at the SAME time is not
+// theoretical. The naive "check cache, materialize if miss, write cache"
+// sequence has an unlocked window between the check and the write: both
+// racers would see a miss, both would allocate+convert+upload, and the
+// second one's `g_sycl_bf16_materialize_cache[key] = std::move(handle)`
+// would destroy the FIRST racer's mem_handle while its raw pointer might
+// already be feeding a live GEMM on another queue -- a use-after-free, not
+// just wasted work. Fixed by claiming a per-key std::mutex (in
+// g_sycl_bf16_materialize_locks) under the map lock BEFORE doing any slow
+// work, then doing the slow work (and the final cache write) under that
+// per-key lock instead of the map lock -- so a second racer for the SAME
+// key blocks until the first finishes and then finds the cache already
+// populated (the re-check just inside the per-key lock, below), while
+// concurrent materialization of DIFFERENT keys never contends at all.
 static void * ggml_sycl_bf16_weight_materialize_f32(const ggml_tensor * tensor, int device) {
     if (!ggml_sycl_bf16_weight_dispatch_available(tensor, device)) {
         return nullptr;
     }
 
     const std::string key = ggml_sycl_bf16_materialize_key(tensor, device);
+
+    std::shared_ptr<std::mutex> key_lock;
     {
         std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
         auto                        it = g_sycl_bf16_materialize_cache.find(key);
@@ -13770,6 +13791,28 @@ static void * ggml_sycl_bf16_weight_materialize_f32(const ggml_tensor * tensor, 
             // Stale/invalid entry -- re-materialize below rather than hand
             // back a dead pointer.
             g_sycl_bf16_materialize_cache.erase(it);
+        }
+        auto lock_it = g_sycl_bf16_materialize_locks.find(key);
+        if (lock_it == g_sycl_bf16_materialize_locks.end()) {
+            lock_it = g_sycl_bf16_materialize_locks.emplace(key, std::make_shared<std::mutex>()).first;
+        }
+        key_lock = lock_it->second;
+    }
+
+    // Serializes only racers for THIS key. Held across all the slow work
+    // below (and the final cache write), never across the map lock above.
+    std::lock_guard<std::mutex> materialize_lock(*key_lock);
+    {
+        // Re-check: another racer may have finished materializing this
+        // exact key while we were waiting for the map lock and then this
+        // per-key lock.
+        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
+        auto                        it = g_sycl_bf16_materialize_cache.find(key);
+        if (it != g_sycl_bf16_materialize_cache.end()) {
+            auto resolved = it->second.resolve(device);
+            if (resolved && resolved.on_device) {
+                return resolved.ptr;
+            }
         }
     }
 
@@ -59598,18 +59641,50 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
     // layering violation: it only affects lookups keyed by this exact string
     // for the lifetime of this one call, the original name is never mutated
     // (src0_f32 is a local copy), and nothing else in the codebase has a
-    // reason to look up "<name>.kmeq_f32". It is not a substitute for making
-    // the cache dtype-aware. The long-term fix, if a second BF16-like
-    // materialized-dtype case shows up, is to extend the cache key (or the
-    // `layout_mode` enum used throughout ggml_sycl_get_weight_layout_ptr) with
-    // an explicit dtype/materialization component, so a retyped view gets a
-    // distinct cache slot under its OWN name instead of needing one.
+    // reason to look up "<name>.bf16_materialized_f32". It is not a
+    // substitute for making the cache dtype-aware. The long-term fix, if a
+    // second BF16-like materialized-dtype case shows up, is to extend the
+    // cache key (or the `layout_mode` enum used throughout
+    // ggml_sycl_get_weight_layout_ptr) with an explicit dtype/materialization
+    // component, so a retyped view gets a distinct cache slot under its OWN
+    // name instead of needing one.
+    //
+    // `.buffer` is the ONE identity field deliberately left stale (not
+    // cleared like `.extra`/`.layout`): ggml_sycl_mul_mat's own full-dispatch
+    // path unconditionally dereferences it twice more below via
+    // ggml_backend_buffer_is_sycl_split(src0->buffer) -- reached for every
+    // mul_mat regardless of type, not gated behind the TG-fast-path's
+    // ggml_is_quantized() check -- and that function does
+    // `buffer->buft->iface.get_name` with NO null guard, an unconditional
+    // segfault (not even a clean GGML_ASSERT) on a null buffer. Leaving
+    // `.buffer` pointing at the original tensor's buffer object is safe
+    // TODAY because every predicate this codebase currently queries through
+    // it (is_sycl_split, is_host, usage==WEIGHTS) describes a property of
+    // the placement CLASS this weight belongs to -- small, single-device,
+    // non-tensor-split, SYCL-owned -- which the materialized F32 copy
+    // genuinely shares; nothing downstream currently asks "is the buffer
+    // backing *this exact tensor's current ->data*". If a future consumer
+    // needs `.buffer` to reflect the F32 materialization's own placement
+    // (e.g. a host-vs-device distinction that could differ from the
+    // original's), this assumption breaks, and the fix is to give the
+    // materialized allocation a real backing buffer object (or route that
+    // consumer through supports_op's dtype-aware path), not to null the
+    // field -- nulling it crashes the two call sites above outright.
     if (src0 && src0->type == GGML_TYPE_BF16) {
         void * f32_ptr = ggml_sycl_bf16_weight_materialize_f32(src0, ctx.device);
         if (!f32_ptr) {
+            // supports_op's admission predicate (ggml_sycl_bf16_weight_dispatch_available)
+            // is allocation-free -- it only checks type/weight/contiguity/host-byte
+            // reachability -- so if it accepted this op, materialization failing
+            // here is a genuine runtime condition (allocation exhaustion, a
+            // conversion/copy failure) that arose AFTER admission, not evidence
+            // the predicate itself is wrong. There is no clean decline this deep
+            // (the op is already committed to this backend), so this stays an
+            // abort, but says what it actually is.
             GGML_ABORT(
-                "%s: BF16 weight %s has no F32 materialization available; supports_op should not have "
-                "accepted this op",
+                "%s: BF16 weight %s passed supports_op's admission check but its F32 "
+                "materialization failed at dispatch time (allocation or conversion "
+                "failure, not a supports_op logic error)",
                 __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)");
         }
         ggml_tensor src0_f32 = *src0;
@@ -59625,7 +59700,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         // (ggml_backend_sycl_get_weight_cache_key hashes tensor->name) misses
         // the original BF16 entry cleanly instead of returning its pointer.
         // See the comment above this block for the full resolution chain.
-        std::snprintf(src0_f32.name, sizeof(src0_f32.name), "%s.kmeq_f32", src0->name);
+        std::snprintf(src0_f32.name, sizeof(src0_f32.name), "%s.bf16_materialized_f32", src0->name);
         ggml_sycl_mul_mat(ctx, &src0_f32, src1, dst, forced_layout);
         return;
     }
