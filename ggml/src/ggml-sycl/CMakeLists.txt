@@ -2293,7 +2293,10 @@ target_link_libraries(test-sycl-layout-choice PRIVATE ggml-sycl-private-fixtures
 add_test(NAME sycl-layout-choice COMMAND test-sycl-layout-choice)
 set_tests_properties(sycl-layout-choice PROPERTIES
     LABELS "sycl;layout;planner;tdd"
-    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # GGML_SYCL_Q8_DENSE_AOS=1 is a supported opt-in that legitimately flips the
+    # Q8_0 EMBEDDING/OUTPUT_WEIGHT policy answers this test pins; keep the test
+    # deterministic regardless of the ambient shell.
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_Q8_DENSE_AOS=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
 )
 

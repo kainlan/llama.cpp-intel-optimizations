@@ -26261,14 +26261,13 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
         // reorder-staged at all, before this task widened EMBEDDING's Q8_0
         // layout choice (unified-cache.cpp direct_stage_weight, "[DIRECT-STAGE]
         // dense fill failed ... reorder staging allocation failed"). Scope the
-        // non-AOS attempt to the exact canonical tied-embedding tensor name;
+        // non-AOS attempt to the exact canonical tied-embedding tensor name
+        // (ggml_sycl_is_canonical_tied_embedding_name, shared with the planner);
         // every other EMBEDDING-classified Q8_0 tensor keeps the AOS behavior
         // it always had. OUTPUT_WEIGHT is not re-gated here: its own name
         // check in infer_tensor_usage() (exact "output.weight" or a
         // ".output.weight" suffix) is already precise, not a loose substring.
-        const bool is_canonical_tied_embedding =
-            usage == tensor_usage::EMBEDDING && std::strcmp(tensor->name, "token_embd.weight") == 0;
-        if (usage == tensor_usage::EMBEDDING && !is_canonical_tied_embedding) {
+        if (usage == tensor_usage::EMBEDDING && !ggml_sycl_is_canonical_tied_embedding_name(tensor->name)) {
             resolved = GGML_LAYOUT_AOS;
         } else {
             const int64_t ncols          = tensor->ne[0];
