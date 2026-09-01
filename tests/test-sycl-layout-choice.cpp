@@ -1657,6 +1657,16 @@ static bool run_tied_embedding_output_layout_test() {
     // the "token_embd" substring is forced back to AOS regardless of what
     // layout_policy::get_optimal() alone would pick.
     {
+        // The scoping predicate both the runtime adjust site and the planner
+        // consult, asserted directly so the two cannot drift apart silently.
+        if (!ggml_sycl_is_canonical_tied_embedding_name("token_embd.weight") ||
+            ggml_sycl_is_canonical_tied_embedding_name("per_layer_token_embd.weight") ||
+            ggml_sycl_is_canonical_tied_embedding_name("blk.0.token_embd.weight") ||
+            ggml_sycl_is_canonical_tied_embedding_name(nullptr)) {
+            printf("FAIL: ggml_sycl_is_canonical_tied_embedding_name must accept exactly \"token_embd.weight\"\n");
+            return false;
+        }
+
         ggml_tensor vocab_embd{};
         vocab_embd.type  = GGML_TYPE_Q8_0;
         vocab_embd.ne[0] = 2560;
@@ -1666,13 +1676,12 @@ static bool run_tied_embedding_output_layout_test() {
         ggml_set_name(&vocab_embd, "token_embd.weight");
         const layout_mode vocab_layout =
             ggml_sycl_adjust_layout_for_tensor(&vocab_embd, GGML_LAYOUT_COALESCED, /*device=*/-1);
-        // K=2560 is not a multiple of the coalesced warp tile (blocks_per_row
-        // 80 % 32 != 0), so the tile-alignment safety net still applies and
-        // lands this on SOA, not COALESCED -- see that guard's own comment.
-        // The point of this assertion is that it is NOT forced to AOS.
-        if (vocab_layout != GGML_LAYOUT_SOA) {
-            printf("FAIL: canonical token_embd.weight should reach SOA (tile-misaligned COALESCED fallback), got %d\n",
-                   (int) vocab_layout);
+        // The point of this assertion is only that the canonical head is no
+        // longer forced to AOS. Which non-AOS layout it lands on (SOA today,
+        // via the tile-alignment net: blocks_per_row 80 % 32 != 0) is that
+        // guard's own tradeoff and deliberately not pinned here.
+        if (vocab_layout == GGML_LAYOUT_AOS) {
+            printf("FAIL: canonical token_embd.weight must not be forced to AOS at the adjust site\n");
             return false;
         }
 
