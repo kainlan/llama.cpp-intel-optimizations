@@ -1661,11 +1661,45 @@ struct layout_policy {
             }
         }
 
-        // Embedding weights are consumed by GET_ROWS row gather.  Keep the
-        // canonical layout row-contiguous so token lookup does not need a
-        // split-layout gather path. Output projection weights are handled by
-        // tensor_usage::OUTPUT_WEIGHT above and can still use matmul layouts.
+        // Embedding weights are consumed by GET_ROWS row gather.
+        //
+        // llama.cpp-os8k: this comment used to read "Keep the canonical layout
+        // row-contiguous so token lookup does not need a split-layout gather
+        // path" and forced AOS unconditionally -- that was true when it was
+        // written, but getrows.cpp has since grown a dedicated
+        // GGML_LAYOUT_COALESCED gather kernel per type (get_rows_q8_0_coalesced_sycl
+        // et al., getrows.cpp ~2198-2216; also present for Q4_0/Q6_K), so the
+        // split-layout gather path this comment said didn't exist now does.
+        // Forcing AOS here stopped being a GET_ROWS *requirement* and became a
+        // silent floor on any tensor this policy classifies EMBEDDING -- which
+        // includes a tied output head (gemma4's output.weight reuses
+        // token_embd.weight; infer_tensor_usage() has no way to see that THIS
+        // dispatch is the MUL_MAT consumer, not the GET_ROWS one, so it always
+        // resolves to EMBEDDING per the tensor's literal name; see the caller
+        // rationale one layer up in ggml_sycl_get_tensor_usage()). Measured on
+        // a B70 (llama.cpp-os8k, gemma4-E4B-it Q8_0, tg64): this tensor's MUL_MAT
+        // ran mulmat.mmvq.q8_0_**aos**, 3.49x its own bandwidth floor, while
+        // every FFN/attention Q8_0 weight in the same model ran COALESCED
+        // at-or-under its floor -- i.e. the coalesced kernel is proven healthy
+        // on this exact card/quant-type, just never reached for this weight.
+        //
+        // Route it through the SAME is_coalesced_supported() gate the
+        // ATTENTION/FFN/OUTPUT_WEIGHT branches above already use, so a
+        // hardware/config reason to decline coalesced is still respected here.
+        // ggml_sycl_adjust_layout_for_tensor() (ggml-sycl.cpp) still applies its
+        // own downstream tile-alignment safety net specifically for
+        // EMBEDDING/OUTPUT_WEIGHT usage (falls back further to SOA when
+        // blocks_per_row isn't a multiple of the warp tile) -- for gemma4's
+        // K=2560 output head that guard is expected to land this on SOA, not
+        // COALESCED (AOS->SOA, not AOS->COALESCED); left untouched here since
+        // it is a separate, deliberately-tuned tradeoff this task did not
+        // re-verify. Scoped to Q8_0 only -- Q4_0/Q6_K embedding tables keep
+        // their prior AOS behavior pending the same kind of measurement this
+        // one got.
         if (usage == tensor_usage::EMBEDDING) {
+            if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
+                return GGML_LAYOUT_COALESCED;
+            }
             if (ggml_is_quantized(qtype)) {
                 return GGML_LAYOUT_AOS;
             }

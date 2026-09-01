@@ -21498,6 +21498,20 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
     return planner_layout_bytes_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], layout, fallback_bytes);
 }
 
+// llama.cpp-os8k: mirrors ggml_sycl_adjust_layout_for_tensor's identically-
+// named guard in ggml-sycl.cpp -- infer_tensor_usage()'s EMBEDDING match is a
+// bare strstr(name, "token_embd") substring, so it also covers
+// "per_layer_token_embd.weight" (gemma3n/gemma4's per-layer-embedding
+// table), a different, much larger tensor with no tied-output role. Keeping
+// this planning-time decision in sync with the runtime one matters here
+// specifically: a mismatch would have the planner reserve/charge VRAM for a
+// layout the runtime then refuses to materialize (AOS instead of
+// SOA/COALESCED), which is a capacity-accounting bug even where it happens
+// not to crash.
+static bool planner_layout_is_canonical_tied_embedding(const std::string & name) {
+    return name == "token_embd.weight";
+}
+
 static ggml_layout_mode planner_default_device_layout(const placement_tensor_info & tensor,
                                                       tensor_usage                  usage,
                                                       int                           device_id) {
@@ -21520,6 +21534,10 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
     }
     if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
         usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT) {
+        if (usage == tensor_usage::EMBEDDING && tensor.type == GGML_TYPE_Q8_0 &&
+            !planner_layout_is_canonical_tied_embedding(tensor.name)) {
+            return GGML_LAYOUT_AOS;
+        }
         const ggml_layout_mode layout = layout_policy::get_optimal(tensor.type, usage, device_id);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
@@ -21546,6 +21564,10 @@ static ggml_layout_mode planner_default_device_layout(const placement_entry & en
     const tensor_usage usage = infer_tensor_usage(entry.name.c_str());
     if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT ||
         usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT) {
+        if (usage == tensor_usage::EMBEDDING && entry.type == GGML_TYPE_Q8_0 &&
+            !planner_layout_is_canonical_tied_embedding(entry.name)) {
+            return GGML_LAYOUT_AOS;
+        }
         const ggml_layout_mode layout = layout_policy::get_optimal(entry.type, usage, device_id);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;

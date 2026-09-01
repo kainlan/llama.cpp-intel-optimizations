@@ -1575,6 +1575,127 @@ static bool run_fused_gate_up_role_test() {
     return true;
 }
 
+// llama.cpp-os8k (P4 launch-overhead, phase 1): regression guard for the
+// tied-embedding output-head layout fix.
+//
+// Root cause: infer_tensor_usage() classifies purely by tensor NAME.  A
+// non-tied model has two distinct tensors ("token_embd.weight" and
+// "output.weight"), so EMBEDDING (row-gather-optimized) and OUTPUT_WEIGHT
+// (matmul-optimized) never collide.  A TIED-embedding model (gemma4 among
+// others) reuses the SAME tensor -- named "token_embd.weight" -- for BOTH
+// the GET_ROWS lookup AND the final MUL_MAT projection, so at the MUL_MAT
+// dispatch call site ggml_sycl_get_tensor_usage() still sees the literal
+// name "token_embd.weight" and resolves EMBEDDING, never reaching the
+// OUTPUT_WEIGHT branch at all -- regardless of which op is actually
+// consuming it on this call. Measured on a B70 (gemma4-E4B-it Q8_0, tg64):
+// this cost the tied output head its coalesced-layout MUL_MAT kernel,
+// landing it on AOS at 3.49x its own bandwidth floor while every other
+// Q8_0 dense weight in the model (classified FFN_WEIGHT/ATTENTION_WEIGHT,
+// never touching this EMBEDDING branch) ran COALESCED at-or-under floor.
+//
+// The fix routes EMBEDDING through the same is_coalesced_supported() gate
+// OUTPUT_WEIGHT already used, scoped to Q8_0 only (getrows.cpp has a
+// production GGML_LAYOUT_COALESCED gather kernel for Q8_0 --
+// get_rows_q8_0_coalesced_sycl -- so this is not asking GET_ROWS to do
+// something it cannot; Q4_0/Q6_K keep their prior AOS embedding behavior
+// pending the same kind of measurement this one got).
+static bool run_tied_embedding_output_layout_test() {
+    // Documents WHY the collision happens: a literal "token_embd.weight"
+    // name is EMBEDDING regardless of which op dispatches it -- this is the
+    // fact that makes the MUL_MAT-context call site indistinguishable from
+    // the GET_ROWS-context one by name alone.
+    if (infer_tensor_usage("token_embd.weight") != tensor_usage::EMBEDDING) {
+        printf("FAIL: token_embd.weight must infer as EMBEDDING (this is the root cause, not the fix)\n");
+        return false;
+    }
+
+    // The fix: a Q8_0 EMBEDDING-classified tensor (which is what a tied
+    // output head resolves to) is no longer locked out of the
+    // matmul-optimal layout its MUL_MAT consumer needs.
+    if (layout_policy::get_optimal(GGML_TYPE_Q8_0, tensor_usage::EMBEDDING) != GGML_LAYOUT_COALESCED) {
+        printf("FAIL: Q8_0 EMBEDDING should resolve to COALESCED after the tied-output-head fix\n");
+        return false;
+    }
+
+    // Regression guard: OUTPUT_WEIGHT's own (pre-existing, untouched) branch
+    // must still resolve identically -- a non-tied model's separate
+    // "output.weight" tensor must not regress.
+    if (layout_policy::get_optimal(GGML_TYPE_Q8_0, tensor_usage::OUTPUT_WEIGHT) != GGML_LAYOUT_COALESCED) {
+        printf("FAIL: Q8_0 OUTPUT_WEIGHT must remain COALESCED (unrelated branch, must not regress)\n");
+        return false;
+    }
+
+    // Scope guard: the fix is Q8_0-only. Q4_0's EMBEDDING path (which also
+    // has a getrows.cpp COALESCED kernel, get_rows_sycl reorder path) was
+    // deliberately left untouched pending its own measurement, and must
+    // still return AOS -- this pins the scope so a future edit cannot widen
+    // it silently.
+    if (layout_policy::get_optimal(GGML_TYPE_Q4_0, tensor_usage::EMBEDDING) != GGML_LAYOUT_AOS) {
+        printf("FAIL: Q4_0 EMBEDDING must remain AOS (fix is scoped to Q8_0 only)\n");
+        return false;
+    }
+
+    // Non-quantized embeddings (F32/F16 token_embd, common on small models)
+    // must be unaffected -- the fix only touches the ggml_is_quantized(qtype)
+    // arm of the EMBEDDING branch.
+    if (layout_policy::get_optimal(GGML_TYPE_F32, tensor_usage::EMBEDDING) != GGML_LAYOUT_AOS) {
+        printf("FAIL: non-quantized EMBEDDING must remain AOS\n");
+        return false;
+    }
+
+    // Regression guard for the scope leak this fix's first GPU verification
+    // round caught: infer_tensor_usage()'s EMBEDDING match is a bare
+    // strstr(name, "token_embd"), so it also matches
+    // "per_layer_token_embd.weight" (gemma3n/gemma4's per-layer-embedding
+    // table) -- a different, much larger tensor (K=10752 vs 2560 for
+    // gemma4-E4B's true vocab table) with no tied-output role. Letting THAT
+    // tensor reach non-AOS aborted model load: its CPU reorder-staging
+    // request (~2.79 GB) exceeded what ggml_sycl_staging_pool() had ever been
+    // asked for, since it had always been AOS (and thus never reorder-staged)
+    // before this fix widened EMBEDDING's Q8_0 layout choice. Pin both sides:
+    // the canonical name stays eligible for non-AOS, everything else sharing
+    // the "token_embd" substring is forced back to AOS regardless of what
+    // layout_policy::get_optimal() alone would pick.
+    {
+        ggml_tensor vocab_embd{};
+        vocab_embd.type  = GGML_TYPE_Q8_0;
+        vocab_embd.ne[0] = 2560;
+        vocab_embd.ne[1] = 262144;
+        vocab_embd.ne[2] = 1;
+        vocab_embd.ne[3] = 1;
+        ggml_set_name(&vocab_embd, "token_embd.weight");
+        const layout_mode vocab_layout =
+            ggml_sycl_adjust_layout_for_tensor(&vocab_embd, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        // K=2560 is not a multiple of the coalesced warp tile (blocks_per_row
+        // 80 % 32 != 0), so the tile-alignment safety net still applies and
+        // lands this on SOA, not COALESCED -- see that guard's own comment.
+        // The point of this assertion is that it is NOT forced to AOS.
+        if (vocab_layout != GGML_LAYOUT_SOA) {
+            printf("FAIL: canonical token_embd.weight should reach SOA (tile-misaligned COALESCED fallback), got %d\n",
+                   (int) vocab_layout);
+            return false;
+        }
+
+        ggml_tensor per_layer_embd{};
+        per_layer_embd.type  = GGML_TYPE_Q8_0;
+        per_layer_embd.ne[0] = 10752;
+        per_layer_embd.ne[1] = 262144;
+        per_layer_embd.ne[2] = 1;
+        per_layer_embd.ne[3] = 1;
+        ggml_set_name(&per_layer_embd, "per_layer_token_embd.weight");
+        const layout_mode per_layer_layout =
+            ggml_sycl_adjust_layout_for_tensor(&per_layer_embd, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (per_layer_layout != GGML_LAYOUT_AOS) {
+            printf("FAIL: per_layer_token_embd.weight must be forced to AOS (scope-leak guard), got %d\n",
+                   (int) per_layer_layout);
+            return false;
+        }
+    }
+
+    printf("PASS: tied-embedding Q8_0 output head now reaches COALESCED, scope and non-quantized paths unchanged\n");
+    return true;
+}
+
 // llama.cpp-o3h1: unit coverage for compute_vram_budget_authority(), THE
 // single source of truth six previously-independent sites (placement
 // planning, arena_reserve()'s physical budget, arena_reserve()'s own since-
@@ -1863,6 +1984,9 @@ static bool run_resource_exhaustion_message_test() {
 
 int main() {
     if (!run_fused_gate_up_role_test()) {
+        return 1;
+    }
+    if (!run_tied_embedding_output_layout_test()) {
         return 1;
     }
     if (!run_resource_exhaustion_error_code_test()) {

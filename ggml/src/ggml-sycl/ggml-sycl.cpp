@@ -26248,13 +26248,37 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
     const tensor_usage usage = ggml_sycl_get_tensor_usage(tensor);
     if (resolved == GGML_LAYOUT_COALESCED && tensor->type == GGML_TYPE_Q8_0 &&
         (usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT)) {
-        const int64_t ncols          = tensor->ne[0];
-        const int64_t blocks_per_row = ncols > 0 ? ncols / QK8_0 : 0;
-        if (blocks_per_row <= 0 || (ncols % QK8_0) != 0 || (blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS) != 0) {
-            // Q8_0 coalesced kernels support padded tail tiles, but the large
-            // decode output projection pays for the padded K tile every token.
-            // Keep embedding/output weights on SOA unless the row is naturally tile-aligned.
-            resolved = GGML_LAYOUT_SOA;
+        // llama.cpp-os8k: infer_tensor_usage() classifies EMBEDDING with a
+        // bare strstr(name, "token_embd") substring match, so it also
+        // catches "per_layer_token_embd.weight" (gemma3n/gemma4's
+        // per-layer-embedding table) -- a DIFFERENT tensor from the vocab
+        // table/tied output head this task's layout fix targets, with a much
+        // larger K (10752 vs 2560 for gemma4-E4B) and no MUL_MAT-tied-output
+        // role. Letting it reach a non-AOS layout aborted model load: its CPU
+        // reorder-staging request (~2.79 GB for its [10752,262144] Q8_0
+        // shape) exceeds anything ggml_sycl_staging_pool() has ever been
+        // asked for -- this tensor was AOS-only, and therefore never
+        // reorder-staged at all, before this task widened EMBEDDING's Q8_0
+        // layout choice (unified-cache.cpp direct_stage_weight, "[DIRECT-STAGE]
+        // dense fill failed ... reorder staging allocation failed"). Scope the
+        // non-AOS attempt to the exact canonical tied-embedding tensor name;
+        // every other EMBEDDING-classified Q8_0 tensor keeps the AOS behavior
+        // it always had. OUTPUT_WEIGHT is not re-gated here: its own name
+        // check in infer_tensor_usage() (exact "output.weight" or a
+        // ".output.weight" suffix) is already precise, not a loose substring.
+        const bool is_canonical_tied_embedding =
+            usage == tensor_usage::EMBEDDING && std::strcmp(tensor->name, "token_embd.weight") == 0;
+        if (usage == tensor_usage::EMBEDDING && !is_canonical_tied_embedding) {
+            resolved = GGML_LAYOUT_AOS;
+        } else {
+            const int64_t ncols          = tensor->ne[0];
+            const int64_t blocks_per_row = ncols > 0 ? ncols / QK8_0 : 0;
+            if (blocks_per_row <= 0 || (ncols % QK8_0) != 0 || (blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS) != 0) {
+                // Q8_0 coalesced kernels support padded tail tiles, but the large
+                // decode output projection pays for the padded K tile every token.
+                // Keep embedding/output weights on SOA unless the row is naturally tile-aligned.
+                resolved = GGML_LAYOUT_SOA;
+            }
         }
     }
     if (resolved == GGML_LAYOUT_SOA && !ggml_sycl_layout_supports_soa(tensor->type)) {
