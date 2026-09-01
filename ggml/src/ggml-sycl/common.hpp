@@ -1697,6 +1697,9 @@ struct layout_policy {
         // their prior AOS behavior pending the same kind of measurement this
         // one got.
         if (usage == tensor_usage::EMBEDDING) {
+            if (qtype == GGML_TYPE_Q8_0 && q8_dense_aos_cached) {
+                return GGML_LAYOUT_AOS;
+            }
             if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
             }

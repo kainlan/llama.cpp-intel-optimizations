@@ -21502,12 +21502,20 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
 // named guard in ggml-sycl.cpp -- infer_tensor_usage()'s EMBEDDING match is a
 // bare strstr(name, "token_embd") substring, so it also covers
 // "per_layer_token_embd.weight" (gemma3n/gemma4's per-layer-embedding
-// table), a different, much larger tensor with no tied-output role. Keeping
-// this planning-time decision in sync with the runtime one matters here
-// specifically: a mismatch would have the planner reserve/charge VRAM for a
-// layout the runtime then refuses to materialize (AOS instead of
-// SOA/COALESCED), which is a capacity-accounting bug even where it happens
-// not to crash.
+// table), a different, much larger tensor with no tied-output role.
+//
+// Defensive, NOT load-bearing today: dense non-layer weights never reach
+// planner_default_device_layout() -- the tensor_info overload is only called
+// for MOE_EXPERT_WEIGHT, and the entry overload's callers skip expert_id < 0
+// (p4_extract_layer_id() returns -1 for any name without "blk."), so both
+// token_embd.weight and per_layer_token_embd.weight take the hard-coded
+// `entry.layout = GGML_LAYOUT_AOS` dense path instead. That charges AOS
+// bytes, which equal SOA bytes, so nothing drifts against the runtime's SOA
+// choice for the head. The guard exists so that wiring dense weights through
+// this function later cannot re-open the per_layer_token_embd leak; whoever
+// does that must also mirror ggml_sycl_adjust_layout_for_tensor's
+// tile-alignment net here, because planner_layout_bytes_coalesced_for_dims()
+// charges whole 32-block tiles (~19% over for a K=2560 head).
 static bool planner_layout_is_canonical_tied_embedding(const std::string & name) {
     return name == "token_embd.weight";
 }
