@@ -11657,7 +11657,14 @@ static bool ggml_sycl_owner_name_key_matches(const std::string & key, ggml_sycl:
            consume_uint(owner.owner.generation) && pos < key.size() && key[pos++] == ':';
 }
 
+// llama.cpp-kmeq: defined next to g_sycl_bf16_materialize_cache itself
+// (this TU, further down); forward-declared so
+// ggml_sycl_erase_weight_identities_for_owner can call it without
+// reordering the cache's own definition.
+static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycle::ModelToken owner);
+
 static void ggml_sycl_erase_weight_identities_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
+    ggml_sycl_bf16_materialize_cache_erase_for_owner(owner);
     {
         std::lock_guard<std::mutex> lock(g_sycl_weight_identity_mutex);
         for (auto it = g_sycl_weight_identities_by_name.begin(); it != g_sycl_weight_identities_by_name.end();) {
@@ -13688,8 +13695,30 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 // cache-managed weight allocation -- see layer-streaming.cpp for the same
 // alloc_request shape) and cached by owner+name+device so a per-token
 // graph rebuild never re-converts or re-uploads.
+//
+// Cleaned up at model teardown by ggml_sycl_bf16_materialize_cache_erase_for_owner(),
+// called from ggml_sycl_erase_weight_identities_for_owner() -- without that,
+// every load/unload cycle would leak the materialized F32 buffer: owner
+// tokens are unique per load, so a freed model's keys are never reused and
+// its entries (and the mem_handle leases they hold) would sit unreferenced
+// forever, exactly the "ownerless leaked lease" class the unified cache's
+// own strict-lease checking (GGML_SYCL_STRICT_LEASES=1) exists to catch.
 static std::mutex                                             g_sycl_bf16_materialize_mutex;
 static std::unordered_map<std::string, ggml_sycl::mem_handle> g_sycl_bf16_materialize_cache;
+
+// Prunes every cache entry owned by `owner`. Keyed the same way
+// ggml_sycl_erase_weight_identities_for_owner()'s other maps are (an
+// "owner_name_key(...)" prefix, matched via ggml_sycl_owner_name_key_matches()
+// which parses only the "model:load:slot:generation:" prefix and does not
+// care what follows it) -- this cache's keys append "|dev<N>" after the
+// name, which the matcher's prefix-only parse ignores correctly.
+static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycle::ModelToken owner) {
+    std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
+    for (auto it = g_sycl_bf16_materialize_cache.begin(); it != g_sycl_bf16_materialize_cache.end();) {
+        it = ggml_sycl_owner_name_key_matches(it->first, owner) ? g_sycl_bf16_materialize_cache.erase(it) :
+                                                                  std::next(it);
+    }
+}
 
 static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
@@ -13703,9 +13732,21 @@ static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, in
 // Pure predicate, no allocation: true iff a BF16->F32 materialization
 // route could be used for this tensor on this device. supports_op calls
 // this and must never allocate or mutate cache state from inside it.
+//
+// Requires ggml_is_contiguous(): the materialize path treats tensor->data
+// as a flat, packed run of n = ggml_nelements(tensor) BF16 values
+// (ggml_bf16_to_fp32_row / the on-device conversion kernel both index
+// linearly), and the retyped F32 copy's nb[] is recomputed from ne[]
+// assuming that same packed layout. A permuted or viewed BF16 weight would
+// silently read/produce wrong strides -- a wrong answer, not a decline --
+// so decline it here and let it fall back to CPU exactly as an
+// unclassified BF16 weight did before this fix existed. No supported
+// architecture currently creates a non-contiguous BF16 weight tensor, so
+// this narrows nothing reachable today; it only removes a latent trap for
+// one that might.
 static bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
     return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
-           tensor->name[0] != '\0' && ggml_sycl_host_data(tensor) != nullptr;
+           tensor->name[0] != '\0' && ggml_is_contiguous(tensor) && ggml_sycl_host_data(tensor) != nullptr;
 }
 
 // Returns the resolved device pointer to a cached F32 materialization of
