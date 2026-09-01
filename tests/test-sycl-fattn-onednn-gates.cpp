@@ -789,6 +789,13 @@ static ggml_tensor * build_d512_tile_flash_attn_ext_op(ggml_context * ctx, float
 // setting GGML_SYCL_FLASH_ATTN_EXT=0 to debug something unrelated would
 // make every positive case here go red for a reason that has nothing to do
 // with the tile route.
+//
+// llama.cpp-bn5k item 2 quality review: the case right below this helper
+// used to be named "..._tile_with_gemma_like_scale", but gemma's scale is no
+// longer a shape only the tile route can serve -- with GGML_SYCL_FA_ONEDNN_
+// D512_SCALE=1 AND GGML_SYCL_FA_TILE_D512=0, oneDNN alone can admit the
+// identical op (see the case's own comment for why). Renamed to name the OR
+// admission honestly rather than claim a route the assertion doesn't pin.
 static bool tile_d512_route_expected_enabled() {
     const char * fa_ext_env = std::getenv("GGML_SYCL_FLASH_ATTN_EXT");
     if (fa_ext_env && (std::strcmp(fa_ext_env, "0") == 0 || std::strcmp(fa_ext_env, "false") == 0)) {
@@ -802,7 +809,7 @@ static bool tile_d512_route_expected_enabled() {
     return ggml_sycl_fa_tile_d512_enabled();
 }
 
-static bool test_supports_op_admits_d512_tile_with_gemma_like_scale() {
+static bool test_supports_op_admits_d512_gemma_scale_via_tile_or_relaxed_onednn() {
     struct ggml_init_params iparams = {
         /*.mem_size   =*/ggml_tensor_overhead() * 8 + 1024,
         /*.mem_buffer =*/nullptr,
@@ -1266,7 +1273,7 @@ int main() {
     ok &= test_planner_d512_gemma3n_scale_follows_relax_hatch();
     ok &= test_supports_op_d512_admission_follows_onednn_d512_state();
     ok &= test_supports_op_d512_gemma3n_scale_follows_relax_hatch();
-    ok &= test_supports_op_admits_d512_tile_with_gemma_like_scale();
+    ok &= test_supports_op_admits_d512_gemma_scale_via_tile_or_relaxed_onednn();
     ok &= test_supports_op_admits_d512_tile_decode_shape();
     ok &= test_supports_op_declines_d512_tile_with_f16_q();
     ok &= test_supports_op_declines_d512_tile_with_paged_sources();
