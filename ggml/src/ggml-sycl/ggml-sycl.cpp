@@ -13660,6 +13660,157 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
     return inferred;
 }
 
+// llama.cpp-kmeq: BF16 weight -> F32 materialization for MUL_MAT.
+//
+// The SYCL backend has no executable dense dispatch for BF16 (see the
+// GGML_OP_MUL_MAT case in ggml_backend_sycl_device_supports_op below) --
+// no quantized or floating-point kernel on this backend reads BF16 bit
+// patterns directly. Rather than declining every BF16 weight to CPU
+// unconditionally (upstream ships model.per_layer_model_proj in
+// gemma3n/gemma4 as BF16; llama.cpp-kmeq), materialize a device-resident
+// F32 copy once, cache it for the weight's lifetime, and let the
+// existing, fully-supported F32 dense mul_mat path run against that
+// instead. This is dtype- and support-predicate-driven, not name-keyed:
+// any BF16 weight feeding a plain MUL_MAT takes this route, not just
+// this one gemma tensor. Deliberately scoped to MUL_MAT only -- MUL_MAT_ID
+// (indexed/MoE) has its own type gate via ggml_sycl_mul_mat_type_supported()
+// and is not touched here; no supported architecture currently routes a
+// BF16 weight through it.
+//
+// Conversion runs on the HOST via ggml_bf16_to_fp32_row() -- the same
+// portable, already-correctness-tested routine every other ggml backend
+// uses for BF16 support -- reading tensor->data. For a cache-managed
+// weight that is the tensor's ORIGINAL host bytes (mmap'd or loaded
+// buffer): ggml_sycl_host_data() is a direct read of tensor->data, stable
+// regardless of where the unified cache has since staged device copies.
+// The resulting F32 buffer is allocated through the unified cache's
+// owner-first surface (alloc_role::WEIGHT, matching every other
+// cache-managed weight allocation -- see layer-streaming.cpp for the same
+// alloc_request shape) and cached by owner+name+device so a per-token
+// graph rebuild never re-converts or re-uploads.
+static std::mutex                                             g_sycl_bf16_materialize_mutex;
+static std::unordered_map<std::string, ggml_sycl::mem_handle> g_sycl_bf16_materialize_cache;
+
+static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+    const auto   owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
+    std::string  key   = ggml_sycl_owner_name_key(owner, tensor->name);
+    key += "|dev";
+    key += std::to_string(device);
+    return key;
+}
+
+// Pure predicate, no allocation: true iff a BF16->F32 materialization
+// route could be used for this tensor on this device. supports_op calls
+// this and must never allocate or mutate cache state from inside it.
+static bool ggml_sycl_bf16_weight_dispatch_available(const ggml_tensor * tensor, int device) {
+    return tensor && tensor->type == GGML_TYPE_BF16 && device >= 0 && ggml_sycl_tensor_is_weight(tensor) &&
+           tensor->name[0] != '\0' && ggml_sycl_host_data(tensor) != nullptr;
+}
+
+// Returns the resolved device pointer to a cached F32 materialization of
+// a BF16 weight, creating and uploading it on first use. Returns nullptr
+// if materialization is not possible or fails -- the caller must then
+// treat the op as genuinely unsupported.
+static void * ggml_sycl_bf16_weight_materialize_f32(const ggml_tensor * tensor, int device) {
+    if (!ggml_sycl_bf16_weight_dispatch_available(tensor, device)) {
+        return nullptr;
+    }
+
+    const std::string key = ggml_sycl_bf16_materialize_key(tensor, device);
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
+        auto                        it = g_sycl_bf16_materialize_cache.find(key);
+        if (it != g_sycl_bf16_materialize_cache.end()) {
+            auto resolved = it->second.resolve(device);
+            if (resolved && resolved.on_device) {
+                return resolved.ptr;
+            }
+            // Stale/invalid entry -- re-materialize below rather than hand
+            // back a dead pointer.
+            g_sycl_bf16_materialize_cache.erase(it);
+        }
+    }
+
+    const int64_t n = ggml_nelements(tensor);
+    if (n <= 0) {
+        return nullptr;
+    }
+
+    // Resolve the ACTUAL current source bytes the same way
+    // ggml_sycl_get_weight_layout_ptr() does -- tensor->data is only a
+    // fallback. Under tiered mode (g_tiered_enabled, on for any normal
+    // model load: see compute_vram_budget_for_plan()), a weight's real
+    // backing bytes live wherever the tiered cache has staged them (mmap,
+    // host-pinned, or already device-resident), and tensor->data can be a
+    // placeholder that reads as zero-filled memory rather than the GGUF
+    // bytes. Mirror the resolution exactly rather than re-deriving it.
+    const void *     src_ptr   = ggml_sycl_host_data(tensor);
+    sycl::usm::alloc src_alloc = sycl::usm::alloc::unknown;
+    if (tensor->name[0] != '\0' && g_tiered_enabled.load(std::memory_order_relaxed)) {
+        ggml_sycl::memory_tier tier   = ggml_sycl::memory_tier::MMAP;
+        void *                 cached = ggml_sycl_get_cached_tensor_ptr_for(tensor, device, &tier, nullptr, &src_alloc);
+        if (cached) {
+            src_ptr = cached;
+        }
+    }
+    if (!src_ptr) {
+        return nullptr;
+    }
+    if (src_alloc == sycl::usm::alloc::unknown) {
+        src_alloc = ggml_sycl_get_alloc_type(src_ptr);
+    }
+
+    const size_t             bytes = static_cast<size_t>(n) * sizeof(float);
+    sycl::queue &            q     = ggml_sycl_get_device(device).default_queue();
+    ggml_sycl::alloc_request req{};
+    req.queue                          = &q;
+    req.device                         = device;
+    req.size                           = bytes;
+    req.intent.role                    = ggml_sycl::alloc_role::WEIGHT;
+    req.intent.category                = ggml_sycl::runtime_category::OTHER;
+    req.intent.constraints.must_device = true;
+    ggml_sycl::mem_handle handle       = ggml_sycl::unified_allocate(req);
+    auto                  resolved     = handle.resolve(device);
+    if (!resolved || !resolved.on_device) {
+        GGML_LOG_WARN("[SYCL] BF16->F32 materialization failed to allocate for %s (%.1f MB)\n", tensor->name,
+                      bytes / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    if (src_alloc == sycl::usm::alloc::device) {
+        // Source bytes are already device-resident (staged there as raw
+        // BF16 by the normal weight-upload path) -- convert entirely
+        // on-device, no host round trip.
+        const auto * src_dev = static_cast<const ggml_bf16_t *>(src_ptr);
+        float *      dst_dev = static_cast<float *>(resolved.ptr);
+        q.parallel_for(sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+             dst_dev[i] = sycl::bit_cast<float>(static_cast<uint32_t>(src_dev[i].bits) << 16);
+         }).wait();
+    } else {
+        // Host-accessible source (mmap, host-pinned, or plain heap) --
+        // convert on the CPU with ggml's own, already-correctness-tested
+        // routine, then upload once.
+        const auto *       host_bf16 = static_cast<const ggml_bf16_t *>(src_ptr);
+        std::vector<float> host_f32(static_cast<size_t>(n));
+        ggml_bf16_to_fp32_row(host_bf16, host_f32.data(), n);
+
+        ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
+            host_f32.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, bytes);
+        ggml_sycl::mem_copy(handle, src_handle, bytes, q);
+        q.wait();
+    }
+
+    GGML_LOG_INFO("[SYCL] materialized BF16->F32 weight %s (%.1f MB) on device %d\n", tensor->name,
+                  bytes / (1024.0 * 1024.0), device);
+
+    {
+        std::lock_guard<std::mutex> lock(g_sycl_bf16_materialize_mutex);
+        g_sycl_bf16_materialize_cache[key] = std::move(handle);
+    }
+    return resolved.ptr;
+}
+
 ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * tensor, int device) {
     ggml_sycl_cache_id id{};
     if (tensor == nullptr) {
@@ -59350,6 +59501,93 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src1,
                               ggml_tensor *               dst,
                               const layout_mode *         forced_layout = nullptr) {
+    // llama.cpp-kmeq: BF16 weights have no executable dense dispatch on this
+    // backend (see ggml_backend_sycl_device_supports_op's GGML_OP_MUL_MAT
+    // case). supports_op only lets a BF16 op reach here when
+    // ggml_sycl_bf16_weight_materialize_f32() can produce (and cache) an F32
+    // copy, so fetch/materialize it here and recurse against a shallow,
+    // F32-retyped view of src0 -- reusing the existing, fully-supported F32
+    // dense path unchanged rather than teaching every kernel/layout branch
+    // below about BF16.
+    //
+    // PRESERVING identity here (name/extra) was tried first and is WRONG --
+    // this backend's whole weight-pointer resolution chain
+    // (ggml_sycl_resolve_tensor_ptr -> ggml_sycl_get_layout_ptr_impl) is
+    // keyed on (tensor name [+ extra->model_id], layout), not on tensor->data.
+    // The ORIGINAL per_layer_model_proj tensor was already normally staged
+    // by S1-preload as its OWN (BF16) bytes under an AOS cache entry keyed
+    // by its name -- confirmed by the unified-cache inventory logging it at
+    // ~52.5MB, exactly ggml_nbytes() for BF16, not F32. A same-named shallow
+    // copy collides with that entry at EVERY level of the resolution chain:
+    // ggml_sycl_resolve_tensor_ptr's own fast path reads
+    // extra->data_handle[device] (shared, since ->extra is the SAME pointer
+    // for both tensors) before ever looking at ->data; and even with ->extra
+    // cleared, ggml_sycl_get_layout_ptr_impl's cache->lookup(key, target)
+    // resolves `key` from ggml_backend_sycl_get_weight_cache_key(tensor,
+    // device), which hashes tensor->name -- identical for both tensors
+    // regardless of ->extra. Either path hands the GEMM the raw BF16 bytes
+    // reinterpreted as F32: right pointer's worth of memory, wrong contents,
+    // which is exactly the NaN this investigation chased through three
+    // rounds of "the buffer itself is provably correct" evidence before
+    // landing here.
+    //
+    // The fix is to make src0_f32 impossible to confuse with the original:
+    // a synthesized, unique name so every name-keyed lookup above misses
+    // cleanly and falls through to ggml_sycl_get_data_ptr's own fallback,
+    // which (with ->extra cleared) resolves tensor->data via a plain
+    // alloc_registry lookup -- exactly the device pointer this function set.
+    // `.extra` and `.layout` are both explicitly CLEARED, not preserved:
+    // `.layout` is this fork's own resolved-pointer fast-path cache (a field
+    // on the core ggml_tensor struct, separate from ->extra) and would
+    // otherwise carry over whatever the untyped weight had cached there.
+    // Mirrors the existing MoE per-expert row-slicing precedent a few
+    // hundred lines down (`src0_row.layout = nullptr;` / `src1_row.extra =
+    // nullptr;`), which clears the same two fields for the same "don't let a
+    // stale cache entry outlive a reshaped view" reason -- extended here to
+    // src0's own `.extra` too, because unlike a row slice (still genuinely
+    // the same weight, same dtype) this IS a different dtype view that must
+    // not share the original's cache identity at all.
+    //
+    // FOR REVIEWERS -- this is a memory-design smell, not just a local bug:
+    // the unified cache's weight pointer tables are keyed by (name [+
+    // extra->model_id], layout) with no dtype component, so they structurally
+    // cannot distinguish "the same weight materialized in a different type"
+    // from "the same weight, same type, different layout" -- the case they
+    // were designed for. The synthesized name is a SAFE workaround, not a
+    // layering violation: it only affects lookups keyed by this exact string
+    // for the lifetime of this one call, the original name is never mutated
+    // (src0_f32 is a local copy), and nothing else in the codebase has a
+    // reason to look up "<name>.kmeq_f32". It is not a substitute for making
+    // the cache dtype-aware. The long-term fix, if a second BF16-like
+    // materialized-dtype case shows up, is to extend the cache key (or the
+    // `layout_mode` enum used throughout ggml_sycl_get_weight_layout_ptr) with
+    // an explicit dtype/materialization component, so a retyped view gets a
+    // distinct cache slot under its OWN name instead of needing one.
+    if (src0 && src0->type == GGML_TYPE_BF16) {
+        void * f32_ptr = ggml_sycl_bf16_weight_materialize_f32(src0, ctx.device);
+        if (!f32_ptr) {
+            GGML_ABORT(
+                "%s: BF16 weight %s has no F32 materialization available; supports_op should not have "
+                "accepted this op",
+                __func__, src0->name[0] != '\0' ? src0->name : "(unnamed)");
+        }
+        ggml_tensor src0_f32 = *src0;
+        src0_f32.type        = GGML_TYPE_F32;
+        src0_f32.data        = f32_ptr;
+        src0_f32.extra       = nullptr;
+        src0_f32.layout      = nullptr;
+        src0_f32.nb[0]       = sizeof(float);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            src0_f32.nb[i] = src0_f32.nb[i - 1] * src0_f32.ne[i - 1];
+        }
+        // Unique name so every name-keyed weight-cache lookup downstream
+        // (ggml_backend_sycl_get_weight_cache_key hashes tensor->name) misses
+        // the original BF16 entry cleanly instead of returning its pointer.
+        // See the comment above this block for the full resolution chain.
+        std::snprintf(src0_f32.name, sizeof(src0_f32.name), "%s.kmeq_f32", src0->name);
+        ggml_sycl_mul_mat(ctx, &src0_f32, src1, dst, forced_layout);
+        return;
+    }
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat");
     // llama.cpp-dkw0 (worktree-only diagnostic): D2H the device copy of the
     // one weight under investigation and checksum it the same way the
@@ -101369,6 +101607,66 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
 
 static int  ggml_sycl_extract_planned_layer_id(const ggml_tensor * op);
 static bool ggml_sycl_op_is_planned_on_host(const ggml_tensor * op, int device);
+static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op);
+
+// llama.cpp-kmeq: default-off diagnostic, kept permanently (not deleted post-
+// investigation) for the supports_op planner-residency decline at
+// ggml_sycl_op_is_planned_on_host() below. That predicate reports THAT an op
+// was declined (and, via ggml_sycl_extract_planned_layer_id, a layer id that
+// is -1 for any non-"blk."-indexed tensor, i.e. uninformative for exactly the
+// per-layer-embedding family this investigation concerned) but not WHICH src
+// tensor's host-planned residency triggered it. This mirrors
+// ggml_sycl_op_is_planned_on_host's own branching (MUL_MAT/MUL_MAT_ID check
+// src[0] only; every other op type covered by the layer plan checks all
+// srcs) purely to name the offending tensor for logging -- it changes no
+// decision, only what gets printed, and only when explicitly enabled.
+//
+// SCOPE, stated explicitly because getting this wrong cost a probe cycle
+// during the investigation this instrument was built for: this only fires
+// on the ggml_sycl_op_is_planned_on_host() (residency) decline branch, which
+// sits ABOVE the per-op-type dtype/shape switch in
+// ggml_backend_sycl_device_supports_op(). A decline from THAT switch (e.g.
+// the GGML_OP_MUL_MAT case's BF16 check) never reaches this code and prints
+// nothing here -- a silent run of this probe is evidence the residency
+// branch didn't fire, not evidence that supports_op accepted the op for any
+// other reason.
+static bool ggml_sycl_supports_op_debug_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_SUPPORTS_OP_DEBUG");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_sycl_supports_op_debug_log_decline(const ggml_tensor * op, int device) {
+    if (!op) {
+        return;
+    }
+    auto log_src = [&](const ggml_tensor * src, int idx, const char * reason) {
+        if (!src) {
+            return;
+        }
+        fprintf(stderr,
+                "[SYCL-SUPPORTS-OP-DEBUG] decline op=%s dst=%s reason=%s src[%d]=%s type=%s "
+                "ne=[%lld,%lld,%lld,%lld]\n",
+                ggml_op_name(op->op), op->name[0] != '\0' ? op->name : "(unnamed)", reason, idx,
+                src->name[0] != '\0' ? src->name : "(unnamed)", ggml_type_name(src->type), (long long) src->ne[0],
+                (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3]);
+    };
+    if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
+        if (op->src[0] && ggml_sycl_weight_executes_on_host(op->src[0], device)) {
+            log_src(op->src[0], 0, "mul_mat_src0_host");
+        }
+        return;
+    }
+    if (ggml_sycl_layer_plan_applies_to_op(op)) {
+        for (int s = 0; s < GGML_MAX_SRC && op->src[s] != nullptr; ++s) {
+            if (ggml_sycl_weight_executes_on_host(op->src[s], device)) {
+                log_src(op->src[s], s, "layer_plan_src_host");
+            }
+        }
+    }
+}
 
 // ADD/SUB/MUL/DIV/REPEAT are the five ggml_sycl_op_bin_bcast consumers.  Its
 // kernels index every row as `row[i0]` and turn byte strides into element
@@ -101615,6 +101913,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         GGML_SYCL_DEBUG("[SYCL-SUPPORT] planner rejects %s on SYCL backend (op=%s layer=%d)\n",
                         op && op->name[0] != '\0' ? op->name : "(unnamed)", ggml_op_name(op->op),
                         ggml_sycl_extract_planned_layer_id(op));
+        if (ggml_sycl_supports_op_debug_enabled()) {
+            ggml_sycl_supports_op_debug_log_decline(op, device);
+        }
         return false;
     }
 
@@ -101729,8 +102030,20 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 ggml_type src0_type = op->src[0]->type;
                 if (src0_type == GGML_TYPE_BF16) {
-                    // BF16 has no executable dense dispatch. Keep ggml_sycl_mul_mat_type_supported synchronized with
-                    // executable dispatch additions so newly introduced types continue to fail closed here.
+                    // BF16 has no executable dense dispatch of its own -- but a
+                    // BF16 WEIGHT can be transparently materialized to F32 once
+                    // (llama.cpp-kmeq: ggml_sycl_bf16_weight_materialize_f32,
+                    // consumed by ggml_sycl_mul_mat) and the fully-supported F32
+                    // dense path runs against that instead. Accept ONLY when
+                    // that route is actually available (a genuine, named weight
+                    // tensor with resolvable host bytes) -- a BF16 activation or
+                    // an unnamed/synthetic tensor has no dispatch and must still
+                    // fail closed here. Keep this predicate and
+                    // ggml_sycl_mul_mat_type_supported() synchronized with
+                    // executable dispatch additions.
+                    if (ggml_sycl_bf16_weight_dispatch_available(op->src[0], device)) {
+                        return true;
+                    }
                     return false;
                 }
                 // TODO: The configuration below needs more work to be supported with oneDNN
