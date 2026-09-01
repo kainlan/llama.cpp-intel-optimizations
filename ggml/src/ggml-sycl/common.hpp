@@ -1784,6 +1784,23 @@ inline tensor_usage infer_tensor_usage(const char * name) {
         return tensor_usage::OUTPUT_WEIGHT;
     }
 
+    // gemma3n/gemma4 per-layer-embedding projection (model.per_layer_model_proj,
+    // GGUF name "per_layer_model_proj.weight", no "blk." prefix since it is a
+    // single tensor shared across all layers).  It is tiny (~100-200MB f32
+    // total for typical gemma3n/gemma4 sizes) but sits in front of every
+    // layer, every token: project_per_layer_inputs() runs it once before the
+    // per-layer loop, so the whole per-layer-embedding subgraph rides on
+    // wherever this one weight lands.  Left unclassified it falls through to
+    // UNKNOWN -> FFN placement priority and competes for VRAM with the bulk
+    // of the model's real per-layer FFN/MoE weights instead of getting the
+    // "tiny, always fits" guarantee its size actually warrants -- classify it
+    // like a norm, same precedent as MOE_INTERMEDIATE above.  The name is
+    // unique to this tensor family (no other architecture uses it), so an
+    // exact substring match carries no collision risk.
+    if (strstr(name, "per_layer_model_proj")) {
+        return tensor_usage::NORM;
+    }
+
     // Embeddings
     if (strstr(name, "token_embd")) {
         return tensor_usage::EMBEDDING;

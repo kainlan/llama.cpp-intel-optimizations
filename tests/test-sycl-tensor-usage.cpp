@@ -63,6 +63,18 @@ int main() {
     ggml_tensor * t_unknown = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 32, 32);
     ggml_set_name(t_unknown, "mystery.weight");
 
+    // gemma3n/gemma4 per-layer-embedding projection (llama.cpp-kmeq): this
+    // weight has no "blk." prefix (it is shared across all layers, not
+    // per-layer) and its name matches none of the attn/ffn/moe/embedding/norm
+    // patterns above, so before the fix it fell through to UNKNOWN -> FFN
+    // placement priority, letting the SYCL placement planner's greedy
+    // VRAM-fill compete it against the model's bulk FFN/MoE weights despite
+    // being tiny -- risking eviction to host and forcing
+    // project_per_layer_inputs() onto the CPU every token. It must classify
+    // as NORM (the "tiny, always keep on device" tier).
+    ggml_tensor * t_ple_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+    ggml_set_name(t_ple_proj, "per_layer_model_proj.weight");
+
     bool ok = true;
     ok = ok && check_usage(t_attn, tensor_usage::ATTENTION_WEIGHT, "attn");
     ok = ok && check_usage(t_ffn, tensor_usage::FFN_WEIGHT, "ffn");
@@ -71,6 +83,7 @@ int main() {
     ok = ok && check_usage(t_embed, tensor_usage::EMBEDDING, "embedding");
     ok = ok && check_usage(t_norm, tensor_usage::NORM, "norm");
     ok = ok && check_usage(t_unknown, tensor_usage::UNKNOWN, "unknown");
+    ok = ok && check_usage(t_ple_proj, tensor_usage::NORM, "gemma_per_layer_model_proj");
 
     ggml_free(ctx);
     ggml_backend_free(cpu_backend);

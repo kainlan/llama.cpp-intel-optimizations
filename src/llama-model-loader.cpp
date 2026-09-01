@@ -1451,6 +1451,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 case LLM_TENSOR_NEXTN_EMBED_TOKENS:
                     return GGML_SYCL_TENSOR_USAGE_EMBEDDING;
 
+                // gemma3n/gemma4 per-layer-embedding family. PER_LAYER_PROJ and
+                // PER_LAYER_INP_GATE are per-layer dense MUL_MAT weights (same
+                // role as the FFN gate/up/down trio). PER_LAYER_MODEL_PROJ is
+                // the single (non-per-layer) projection that
+                // project_per_layer_inputs() runs once before the layer loop,
+                // every token; left unclassified it falls to UNKNOWN -> FFN
+                // placement priority and competes with the bulk of the
+                // model's real FFN/MoE weights for VRAM despite being tiny,
+                // which can push it to host and force the whole per-layer-
+                // embedding subgraph onto the CPU (see infer_tensor_usage()
+                // in ggml-sycl/common.hpp for the matching string-based
+                // classification, which is what the SYCL placement planner
+                // actually consults). PER_LAYER_PROJ_NORM/PER_LAYER_POST_NORM
+                // are norm weights; LAYER_OUT_SCALE is a per-layer {1} scalar
+                // -- both tiny, classify like other norms.
+                case LLM_TENSOR_PER_LAYER_PROJ:
+                case LLM_TENSOR_PER_LAYER_INP_GATE:
+                    return GGML_SYCL_TENSOR_USAGE_FFN_WEIGHT;
+
+                case LLM_TENSOR_PER_LAYER_MODEL_PROJ:
+                case LLM_TENSOR_PER_LAYER_PROJ_NORM:
+                case LLM_TENSOR_PER_LAYER_POST_NORM:
+                case LLM_TENSOR_LAYER_OUT_SCALE:
+                    return GGML_SYCL_TENSOR_USAGE_NORM;
+
                 case LLM_TENSOR_TOKEN_EMBD_NORM:
                 case LLM_TENSOR_OUTPUT_NORM:
                 case LLM_TENSOR_OUTPUT_NORM_LFM2:
