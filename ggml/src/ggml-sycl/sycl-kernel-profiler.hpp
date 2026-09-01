@@ -74,6 +74,19 @@ void                            ggml_sycl_kernel_profile_record_event(const ggml
                                                                       ggml_sycl::sycl_timeline_callsite callsite = {},
                                                                       uint64_t                          host_submit_begin_us = 0,
                                                                       uint64_t                          host_submit_end_us = 0);
+// For call sites that have no sycl::event to attach to (e.g. oneDNN Graph's
+// dnnl::graph::sycl_interop::execute(), which returns void): records a
+// sample using the HOST wall-clock span around the call as a stand-in
+// duration. This is NOT device execution time -- it also includes host-side
+// enqueue overhead and, if the call blocks, device time too -- so rows
+// produced by this path carry timestamp_status="host_span_only" in raw-event
+// output to keep them distinguishable from real device-event timing. Use
+// ggml_sycl_kernel_profile_record_event (device timestamps) whenever the
+// call site returns a sycl::event; reach for this only when it does not.
+void                            ggml_sycl_kernel_profile_record_host_span(const ggml_sycl_profile_label &   label,
+                                                                          uint64_t                          host_begin_us,
+                                                                          uint64_t                          host_end_us,
+                                                                          ggml_sycl::sycl_timeline_callsite callsite = {});
 void                            ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason);
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)

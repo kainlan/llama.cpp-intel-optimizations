@@ -787,6 +787,67 @@ void ggml_sycl_kernel_profile_record_event(const ggml_sycl_profile_label &   lab
     state.pending_events.push_back(std::move(pending_event));
 }
 
+void ggml_sycl_kernel_profile_record_host_span(const ggml_sycl_profile_label &   label,
+                                               uint64_t                          host_begin_us,
+                                               uint64_t                          host_end_us,
+                                               ggml_sycl::sycl_timeline_callsite callsite) {
+    if (!ggml_sycl_kernel_profile_enabled()) {
+        return;
+    }
+    if (host_end_us < host_begin_us) {
+        return;
+    }
+
+    const ggml_sycl_kernel_profile_config cfg = current_config();
+
+    profiler_state &                            state    = get_profiler_state();
+    const uint64_t                              event_id = state.next_event_id.fetch_add(1, std::memory_order_relaxed);
+    const profile_label_snapshot                label_snapshot = snapshot_label(label);
+    const callsite_snapshot                     callsite_snap  = snapshot_callsite(callsite);
+    const ggml_sycl_kernel_profile_node_context node_ctx       = snapshot_node_context();
+    const uint64_t                              duration_ns    = (host_end_us - host_begin_us) * 1000ull;
+
+    // Reuse the same host-submit-span timeline channel real events use
+    // ("sycl.submit"), so a host-only sample still shows up on the timeline.
+    if (ggml_sycl::sycl_timeline_records_spans() && host_begin_us != 0 && host_end_us != 0) {
+        std::ostringstream metadata;
+        metadata << timeline_metadata_common(label_snapshot, event_id, node_ctx);
+        const std::string metadata_string = metadata.str();
+        ggml_sycl::sycl_timeline_record_span("sycl.submit", label_snapshot.key.name.c_str(), metadata_string.c_str(),
+                                             to_timeline_callsite(callsite_snap),
+                                             steady_time_point_from_us(host_begin_us),
+                                             steady_time_point_from_us(host_end_us));
+    }
+
+    raw_profile_event raw_event;
+    raw_event.label                       = label_snapshot;
+    raw_event.event_id                    = event_id;
+    raw_event.host_submit_begin_us        = host_begin_us;
+    raw_event.host_submit_end_us          = host_end_us;
+    raw_event.timeline_graph_compute_step = ggml_sycl::sycl_timeline_current_graph_compute_step();
+    // No real device timestamps exist for this call site; stand in with the
+    // host span so duration_ns (computed as device_end-device_start by every
+    // consumer of raw_profile_event) still reflects the host-measured span.
+    // timestamp_status="host_span_only" is the tell that these are NOT SYCL
+    // event profiling timestamps.
+    raw_event.device_submit_ns            = host_begin_us * 1000ull;
+    raw_event.device_start_ns             = host_begin_us * 1000ull;
+    raw_event.device_end_ns               = host_end_us * 1000ull;
+    raw_event.timestamp_status            = "host_span_only";
+    raw_event.callsite                    = callsite_snap;
+    raw_event.node_context                = node_ctx;
+    raw_event.graph_recorded              = false;
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        add_sample_locked(state, label_snapshot, duration_ns);
+        if (cfg.raw_events) {
+            add_raw_event_locked(state, raw_event);
+        }
+    }
+    record_timeline_event_span(raw_event);
+}
+
 void ggml_sycl_kernel_profile_flush(bool wait_for_events, const char * reason) {
     if (!ggml_sycl_kernel_profile_enabled()) {
         return;

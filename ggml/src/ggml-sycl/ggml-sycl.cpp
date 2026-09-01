@@ -59620,6 +59620,30 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                               const ggml_tensor *         src1,
                               ggml_tensor *               dst,
                               const layout_mode *         forced_layout = nullptr) {
+    // P4 TG-cost-visibility (llama.cpp-os8k): unconditional entry counter,
+    // independent of which branch below actually dispatches. A B70 gemma4
+    // decode census found mmvq/mmq/unified-kernel/oneDNN-gemm/persistent-tg
+    // ALL recording zero calls despite four of those five already carrying
+    // profiler wraps before this task -- meaning either this function is
+    // never reached at all for that workload's dense MUL_MATs, or it is
+    // reached but every downstream wrapped call site is skipped by some
+    // branch none of us have traced yet. This answers "was the master
+    // dispatcher entered, how many times, for which (type, M)" without
+    // depending on any downstream branch being instrumented correctly.
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label entry_label{};
+        entry_label.name                 = "mulmat.dispatch.entry";
+        entry_label.category             = "mulmat_route";
+        entry_label.queue_kind           = "host";
+        const std::string entry_metadata = std::string("src0_type=") + (src0 ? ggml_type_name(src0->type) : "?") +
+                                           ";M=" + std::to_string(src1 ? src1->ne[1] : -1);
+        entry_label.metadata  = entry_metadata.c_str();
+        entry_label.device    = ctx.device;
+        const uint64_t now_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        ggml_sycl_kernel_profile_record_host_span(entry_label, now_us, now_us);
+    }
     // llama.cpp-kmeq: BF16 weights have no executable dense dispatch on this
     // backend (see ggml_backend_sycl_device_supports_op's GGML_OP_MUL_MAT
     // case). supports_op only lets a BF16 op reach here when
@@ -80082,6 +80106,25 @@ static void ggml_sycl_mul_mat_with_rmsnorm(ggml_backend_sycl_context & ctx,
                                            ggml_tensor *               dst,    // Output
                                            float                       eps     // RMSNorm epsilon
 ) {
+    // P4 TG-cost-visibility (llama.cpp-os8k): this fused entry point is
+    // reached from graph_compute's fusion detection, NOT from
+    // ggml_sycl_mul_mat -- it needs its own counter for the same reason
+    // that function got one just above. See that comment for the census
+    // finding this responds to.
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label entry_label{};
+        entry_label.name       = "mulmat.dispatch.rmsnorm_fused_entry";
+        entry_label.category   = "mulmat_route";
+        entry_label.queue_kind = "host";
+        const std::string entry_metadata =
+            std::string("W_type=") + (W ? ggml_type_name(W->type) : "?") + ";M=" + std::to_string(x ? x->ne[1] : -1);
+        entry_label.metadata  = entry_metadata.c_str();
+        entry_label.device    = ctx.device;
+        const uint64_t now_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        ggml_sycl_kernel_profile_record_host_span(entry_label, now_us, now_us);
+    }
     const int64_t                    nrows        = x->ne[1];                  // Batch size (M)
     const int64_t                    ncols        = x->ne[0];                  // Hidden dim (K)
     // Must use MATRIX_ROW_PADDING (512) to match MMQ expectations, not QK8_1 (32)
@@ -86013,6 +86056,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     } moe_precomputed_skip_graph_scope_;
 
     ggml_sycl::sycl_timeline_note_graph_compute();
+    // P4 TG-cost-visibility (llama.cpp-os8k): flush the PREVIOUS
+    // graph_compute's accumulated e2e host/device stage split here, at the
+    // same per-graph-compute boundary the timeline uses above -- see the
+    // declaration comment for why the old moe_calls>=72 gate silently never
+    // fired for a dense/non-MoE model (Mistral, gemma).
+    ggml_sycl::e2e_tg_profile_note_new_graph_compute();
     const bool timeline_spans_enabled = ggml_sycl::sycl_timeline_records_spans();
 
     struct timeline_graph_span_flag_guard {

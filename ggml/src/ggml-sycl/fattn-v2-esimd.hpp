@@ -8,9 +8,11 @@
 #define GGML_SYCL_FATTN_V2_ESIMD_HPP
 
 #include "fattn-common.hpp"
-#include <sycl/sycl.hpp>
+
 #include <cfloat>
 #include <cmath>
+#include <string>
+#include <sycl/sycl.hpp>
 #include <type_traits>  // For std::is_same_v
 
 // Check for ESIMD support
@@ -129,10 +131,23 @@ void launch_v2_esimd_attention(
         v2_debug_shown = true;
     }
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * block, block),
-            [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+    // Wrapped for P4 TG-cost-visibility (llama.cpp-os8k): the V2 paged-
+    // attention ESIMD decode path (long-sequence / paged KV), previously
+    // dark to the kernel profiler entirely, same as the other esimd
+    // launchers in fattn-esimd-f16.hpp.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "fattn.decode.esimd_v2_paged";
+    profile_label.category             = "fattn";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "D=" + std::to_string(D) + ";num_seqs=" + std::to_string(num_seqs) +
+                                         ";num_heads=" + std::to_string(num_heads) +
+                                         ";num_kv_heads=" + std::to_string(num_kv_heads);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
                 using namespace esimd;
 
                 // Initialize SLM for reduction
@@ -394,6 +409,7 @@ void launch_v2_esimd_attention(
                     }
                 }
             });
+        });
     });
 }
 

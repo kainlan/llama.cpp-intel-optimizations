@@ -11,6 +11,7 @@
 
 #include <cfloat>
 #include <cmath>  // For std::max, std::tanh
+#include <string>
 #include <sycl/sycl.hpp>
 
 // Check for ESIMD support
@@ -150,9 +151,24 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
     constexpr size_t slm_sum_offset = slm_max_offset + ESIMD_PARTITIONS * sizeof(float);
     constexpr size_t slm_size       = slm_sum_offset + ESIMD_PARTITIONS * sizeof(float);
 
-    stream.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<fattn_esimd_f16_kernel_name<D, use_logit_softcap, Q_type>>(
-            sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+    // Wrapped for P4 TG-cost-visibility (llama.cpp-os8k): this is the
+    // partitioned ESIMD decode kernel, the main non-batched (ne01<=1) FA
+    // decode path -- previously dark to the kernel profiler entirely.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "fattn.decode.esimd_partitioned";
+    profile_label.category   = "fattn";
+    profile_label.queue_kind = "compute";
+    const std::string profile_metadata =
+        "D=" + std::to_string(D) + ";softcap=" + std::to_string((int) use_logit_softcap) +
+        ";ne01=" + std::to_string(ne01) + ";ne02=" + std::to_string(ne02) + ";ne03=" + std::to_string(ne03);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(stream);
+
+    (void) ggml_sycl_profile_submit(stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<fattn_esimd_f16_kernel_name<
+                D, use_logit_softcap, Q_type>>(sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3>
+                                                                                               item) SYCL_ESIMD_KERNEL {
                 using namespace esimd;
 
                 // Initialize SLM for reduction
@@ -423,6 +439,7 @@ void launch_fattn_esimd_f16_optimized(const fattn_params & params, sycl::queue &
 
 #    undef COMPUTE_KV_PTRS
             });
+        });
     });
 }
 
@@ -494,9 +511,26 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
     constexpr size_t key_slm_offset   = 0;
     constexpr size_t value_slm_offset = ESIMD_GS * D * sizeof(sycl::half);
 
-    stream.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<fattn_esimd_f16_fp8_kernel_name<D, use_logit_softcap, Q_type>>(
-            sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+    // Wrapped for P4 TG-cost-visibility (llama.cpp-os8k); see the
+    // _optimized variant above for rationale. This launcher (single-work-
+    // item SLM version) is not currently reached from the fattn_esimd_f16
+    // dispatch entry point (only _optimized/_batched are), so a nonzero
+    // sample here would itself be a finding.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "fattn.decode.esimd_singlewi";
+    profile_label.category   = "fattn";
+    profile_label.queue_kind = "compute";
+    const std::string profile_metadata =
+        "D=" + std::to_string(D) + ";softcap=" + std::to_string((int) use_logit_softcap) +
+        ";ne01=" + std::to_string(ne01) + ";ne02=" + std::to_string(ne02) + ";ne03=" + std::to_string(ne03);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(stream);
+
+    (void) ggml_sycl_profile_submit(stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<fattn_esimd_f16_fp8_kernel_name<
+                D, use_logit_softcap, Q_type>>(sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3>
+                                                                                               item) SYCL_ESIMD_KERNEL {
                 using namespace esimd;
 
                 // Initialize SLM
@@ -784,6 +818,7 @@ void launch_fattn_esimd_f16(const fattn_params & params, sycl::queue & stream) {
                     block_store(out_base, result);
                 }
             });
+        });
     });
 }
 
@@ -856,9 +891,25 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
     constexpr size_t slm_sum_offset = slm_max_offset + ESIMD_BATCHED_PARTITIONS * ncols * sizeof(float);
     constexpr size_t slm_size       = slm_sum_offset + ESIMD_BATCHED_PARTITIONS * ncols * sizeof(float);
 
-    stream.submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<fattn_esimd_f16_batched_kernel_name<D, ncols, use_logit_softcap, Q_type>>(
-            sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
+    // Wrapped for P4 TG-cost-visibility (llama.cpp-os8k); see the
+    // _optimized variant above for rationale. This is the batched
+    // (ne01>1, multi-token decode / speculative decode / PP) ESIMD path.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "fattn.decode.esimd_batched";
+    profile_label.category             = "fattn";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "D=" + std::to_string(D) + ";ncols=" + std::to_string(ncols) +
+                                         ";softcap=" + std::to_string((int) use_logit_softcap) +
+                                         ";ne01=" + std::to_string(ne01) + ";ne02=" + std::to_string(ne02) +
+                                         ";ne03=" + std::to_string(ne03);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(stream);
+
+    (void) ggml_sycl_profile_submit(stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<fattn_esimd_f16_batched_kernel_name<
+                D, ncols, use_logit_softcap,
+                Q_type>>(sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL {
                 using namespace esimd;
 
                 // Initialize SLM for reduction
@@ -1224,6 +1275,7 @@ void launch_fattn_esimd_f16_batched(const fattn_params & params, sycl::queue & s
                     }
                 }
             });
+        });
     });
 }
 

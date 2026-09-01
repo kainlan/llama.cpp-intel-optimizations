@@ -350,8 +350,24 @@ struct mmq_bench_event_scope {
     ~mmq_bench_event_scope() { g_mmq_bench_events = prev; }
 };
 
+// Single choke point for every mmq.cpp kernel launch (all quant types x
+// persistent/coalesced/soa variants -- ~37 call sites below all route
+// through here), so wrapping just this one function gives aggregate
+// visibility into the whole file's device time without touching each call
+// site (P4 TG-cost-visibility, llama.cpp-os8k). The label is necessarily
+// generic ("mulmat.mmq") since the quant type/variant isn't threaded through
+// this shared helper; per-kernel-class attribution is a follow-up if the
+// aggregate here proves to be a meaningful share of the ~30ms token.
 template <typename SubmitFunc> static sycl::event mmq_submit(const dpct::queue_ptr & stream, SubmitFunc && fn) {
-    sycl::event ev = stream->submit(std::forward<SubmitFunc>(fn));
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "mulmat.mmq";
+    profile_label.category   = "mulmat";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = "path=mmq_generic";
+    profile_label.device     = ggml_sycl_get_device_id_from_queue(*stream);
+
+    sycl::event ev = ggml_sycl_profile_submit(
+        *stream, profile_label, [&](sycl::queue &) { return stream->submit(std::forward<SubmitFunc>(fn)); });
     if (g_mmq_bench_events) {
         g_mmq_bench_events->push_back(ev);
     }

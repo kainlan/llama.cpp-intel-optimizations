@@ -3531,14 +3531,27 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q8_0>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
-                    vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
-                    fused_add_row_base);
-            });
+    // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
+    // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
+    // further down this file) comment for the full rationale.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q8_0_soa";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                        vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0,
+                        fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -4135,13 +4148,26 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_coalesced_kernel_name<GGML_TYPE_Q8_0>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q8_0_coalesced(vx, vy, dst, ncols, nrows, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
-                                           fused_add_row_base);
-            });
+    // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
+    // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
+    // sibling) comment above for the full rationale.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q8_0_coalesced";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_coalesced_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q8_0_coalesced(vx, vy, dst, ncols, nrows, nd_item, fused_add, fused_add_ne0,
+                                               fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -4748,19 +4774,38 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const int slm_y_qs_size  = blocks_per_row * MMVQ_SLM_Y_QS_STRIDE;
     const int slm_y_ds_size  = blocks_per_row + 1;  // +1 for padding
 
-    stream->submit([&](sycl::handler & cgh) {
-        // Allocate SLM for Y-vector (shared across all rows in work-group)
-        sycl::local_accessor<int, 1>         slm_y_qs(slm_y_qs_size, cgh);
-        sycl::local_accessor<sycl::half2, 1> slm_y_ds(slm_y_ds_size, cgh);
+    // P4 TG-cost-visibility (llama.cpp-os8k): this is the AOS Q8_0 decode
+    // kernel -- the dominant TG-fast-path launch for a Q8_0-quantized dense
+    // model (gemma4 E4B), 259 calls/token per a B70 census, previously
+    // discarding its submit event entirely (no profiler wrap of any kind).
+    // Its two siblings just below (coalesced_/reorder_ variants, the
+    // COALESCED/SOA layout arms of the same GGML_TYPE_Q8_0 switch case in
+    // ggml_sycl_mmvq_dispatch) get the identical treatment for the same
+    // reason -- which of the three actually fires depends on this weight's
+    // resolved layout, not knowable from this function alone.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q8_0_aos";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
 
-        cgh.parallel_for<mmvq_multirow_kernel_name<GGML_TYPE_Q8_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_multirow<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1_slm,
-                                       NROWS_PER_WG>(vx, vy, dst, ncols, nrows, item_ct1, slm_y_qs.get_pointer(),
-                                                     slm_y_ds.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0,
-                                                     fused_add_row_base);
-            });
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            // Allocate SLM for Y-vector (shared across all rows in work-group)
+            sycl::local_accessor<int, 1>         slm_y_qs(slm_y_qs_size, cgh);
+            sycl::local_accessor<sycl::half2, 1> slm_y_ds(slm_y_ds_size, cgh);
+
+            cgh.parallel_for<mmvq_multirow_kernel_name<GGML_TYPE_Q8_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_multirow<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1_slm,
+                                           NROWS_PER_WG>(vx, vy, dst, ncols, nrows, item_ct1, slm_y_qs.get_pointer(),
+                                                         slm_y_ds.get_pointer(), fused_add, fused_add_ne0,
+                                                         fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -22967,7 +23012,31 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx,
                                 const int64_t               src1_ncols,
                                 const int64_t               src1_padded_col_size,
                                 const dpct::queue_ptr &     stream) {
-    GGML_SYCL_PROFILE_SCOPE_MMVQ("mmvq");
+    GGML_SYCL_PROFILE_SCOPE_MMVQ("mmvq");  // ITT/VTune only (GGML_SYCL_PROFILE build flag) -- no-op
+                                           // otherwise, NOT the GGML_SYCL_KERNEL_PROFILE instrument
+                                           // this file otherwise uses.
+
+    // P4 TG-cost-visibility (llama.cpp-os8k): unconditional entry counter for
+    // the actual function the TG fast-path calls (ggml-sycl.cpp's
+    // ggml_sycl_mul_mat has its own entry counter; this brackets the gap
+    // between "dispatcher was entered" and "the TG-fast mmvq branch was
+    // actually taken" -- a B70 gemma4 decode census found every
+    // ggml_sycl_profile_submit-wrapped launch further down this function
+    // recording zero calls.
+    if (ggml_sycl_kernel_profile_enabled()) {
+        ggml_sycl_profile_label entry_label{};
+        entry_label.name                 = "mulmat.mmvq.entry";
+        entry_label.category             = "mulmat_route";
+        entry_label.queue_kind           = "host";
+        const std::string entry_metadata = std::string("src0_type=") + (src0 ? ggml_type_name(src0->type) : "?") +
+                                           ";src1_ncols=" + std::to_string(src1_ncols);
+        entry_label.metadata  = entry_metadata.c_str();
+        entry_label.device    = ggml_sycl_get_device_id_from_queue(*stream);
+        const uint64_t now_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        ggml_sycl_kernel_profile_record_host_span(entry_label, now_us, now_us);
+    }
 
     static bool mmvq_inner_timing_checked = false;
     static bool mmvq_inner_timing         = false;

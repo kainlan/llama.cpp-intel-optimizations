@@ -11,6 +11,7 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
+#    include <chrono>
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
@@ -1233,7 +1234,43 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
     try {
         dnnl::stream dnnl_stream = ctx.stream_dnnl(stream);
+
+        // P4 TG-cost-visibility (llama.cpp-os8k): this is the oneDNN SDPA
+        // GRAPH execute -- the materialized flash-attention path CLAUDE.md
+        // documents as ON by default for GQA shapes (Mistral included), and
+        // previously completely dark to the kernel profiler. Unlike
+        // gemm.hpp's dnnl::sycl_interop::execute (matmul primitive API),
+        // dnnl::graph::sycl_interop::execute returns void, not a
+        // sycl::event, so there is no event to hand ggml_sycl_profile_submit
+        // -- record a HOST wall-clock span instead via
+        // ggml_sycl_kernel_profile_record_host_span (see its declaration
+        // comment for the host-vs-device-time caveat this implies).
+        const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
+        const uint64_t host_begin_us =
+            profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                        std::chrono::steady_clock::now().time_since_epoch())
+                                                        .count()) :
+                              0;
+
         dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors);
+
+        if (profile_enabled) {
+            const uint64_t host_end_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                                   .count());
+            ggml_sycl_profile_label profile_label{};
+            profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
+            profile_label.category             = "fattn";
+            profile_label.queue_kind           = "compute";
+            const std::string profile_metadata = "D=" + std::to_string(D) +
+                                                 ";ne01=" + std::to_string(active_params.ne01) +
+                                                 ";ne11=" + std::to_string(active_params.ne11) +
+                                                 ";H_q=" + std::to_string(H_q) + ";H_kv=" + std::to_string(H_kv);
+            profile_label.metadata = profile_metadata.c_str();
+            profile_label.device   = ctx.device;
+            ggml_sycl_kernel_profile_record_host_span(profile_label, host_begin_us, host_end_us);
+        }
+
         if (materialized.Q.valid() || materialized.K.valid() || materialized.V.valid()) {
             std::vector<ggml_sycl::mem_handle> retained;
             retained.reserve(3);

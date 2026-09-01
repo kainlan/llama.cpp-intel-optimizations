@@ -38,6 +38,15 @@ struct e2e_tg_profile_snapshot {
     uint64_t                                                                 tokens    = 0;
     uint64_t                                                                 ops       = 0;
     uint64_t                                                                 moe_calls = 0;
+    // P4 TG-cost-visibility (llama.cpp-os8k): wall-clock time between this
+    // graph_compute's start and the PREVIOUS one's start, i.e. one full
+    // token's (TG) or one ubatch's (PP) host-observed wall time -- distinct
+    // from `stages[*].host_us`, which sums only the e2e_tg_scope-bracketed
+    // host spans and can be less than true wall time (unbracketed work,
+    // scheduling gaps between them) or double-count (nested scopes). Zero
+    // on the very first graph_compute of a run (no previous timestamp to
+    // diff against).
+    double                                                                   wall_us   = 0.0;
     std::array<e2e_tg_stage_accum, static_cast<size_t>(e2e_tg_stage::COUNT)> stages{};
 };
 
@@ -54,6 +63,18 @@ void         e2e_tg_profile_record(e2e_tg_stage stage,
 void         e2e_tg_profile_record_cache_event(const char * path, uint64_t bytes, double host_us);
 void         e2e_tg_profile_record_transfer(const char * path, uint64_t bytes, double host_us, double device_us);
 void         e2e_tg_profile_flush_if_ready(FILE * out = stderr);
+// P4 TG-cost-visibility (llama.cpp-os8k): call once at the START of every
+// ggml_backend_sycl_graph_compute() (same call site as
+// sycl_timeline_note_graph_compute()) to flush the PREVIOUS graph's
+// accumulated per-stage host/device split before the next one starts
+// accumulating. Unlike e2e_tg_profile_flush_if_ready (gated on
+// moe_calls>=72, so it never fires mid-run for a dense/non-MoE model --
+// Mistral, gemma -- silently making "tokens" and per-token arithmetic wrong
+// by the whole run's token count), this is model-shape-independent: one
+// graph_compute call is one token during TG and one ubatch during PP, so
+// each flush corresponds to exactly one of those. No-op (and no snapshot
+// copy) when the profile is disabled.
+void         e2e_tg_profile_note_new_graph_compute(FILE * out = stderr);
 void         e2e_tg_profile_force_flush(FILE * out = stderr);
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 void         e2e_tg_profile_reset_for_tests();

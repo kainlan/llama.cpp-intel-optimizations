@@ -27,6 +27,7 @@
 #include "mem-ops.hpp"
 
 #include <algorithm>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -348,27 +349,42 @@ sycl::event launch_persistent_tg_kernel(sycl::queue &                           
     sycl::range<1>    local_range(config.workgroup_size);
     sycl::nd_range<1> nd_range(global_range, local_range);
 
-    // Submit the persistent kernel
-    sycl::event e = q.submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<float, 1> slm(slm_floats, cgh);
+    // Submit the persistent kernel. Wrapped for P4 TG-cost-visibility
+    // (llama.cpp-os8k): this is the single launch site for the persistent
+    // DMMV decode kernel -- previously dark to the kernel profiler entirely.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.persistent_tg_dmmv";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "n_layers=" + std::to_string(args.n_layers) +
+                                         ";n_workgroups=" + std::to_string(config.n_workgroups) +
+                                         ";workgroup_size=" + std::to_string(config.workgroup_size);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(q);
+    profile_label.bytes    = weights_bytes;
 
-        auto args_copy   = resolved_args;
-        auto config_copy = config;
+    sycl::event e = ggml_sycl_profile_submit(q, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> slm(slm_floats, cgh);
 
-        cgh.parallel_for(nd_range, [=](sycl::nd_item<1> item) {
-            if (config_copy.workgroup_size == 256) {
-                PersistentDMMVKernel<256> kernel(args_copy, config_copy, slm, item);
-                kernel.run();
-            } else if (config_copy.workgroup_size == 512) {
-                PersistentDMMVKernel<512> kernel(args_copy, config_copy, slm, item);
-                kernel.run();
-            } else if (config_copy.workgroup_size == 128) {
-                PersistentDMMVKernel<128> kernel(args_copy, config_copy, slm, item);
-                kernel.run();
-            } else {
-                PersistentDMMVKernel<256> kernel(args_copy, config_copy, slm, item);
-                kernel.run();
-            }
+            auto args_copy   = resolved_args;
+            auto config_copy = config;
+
+            cgh.parallel_for(nd_range, [=](sycl::nd_item<1> item) {
+                if (config_copy.workgroup_size == 256) {
+                    PersistentDMMVKernel<256> kernel(args_copy, config_copy, slm, item);
+                    kernel.run();
+                } else if (config_copy.workgroup_size == 512) {
+                    PersistentDMMVKernel<512> kernel(args_copy, config_copy, slm, item);
+                    kernel.run();
+                } else if (config_copy.workgroup_size == 128) {
+                    PersistentDMMVKernel<128> kernel(args_copy, config_copy, slm, item);
+                    kernel.run();
+                } else {
+                    PersistentDMMVKernel<256> kernel(args_copy, config_copy, slm, item);
+                    kernel.run();
+                }
+            });
         });
     });
 

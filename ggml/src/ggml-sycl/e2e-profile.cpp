@@ -7,7 +7,11 @@
 namespace ggml_sycl {
 namespace {
 
-thread_local e2e_tg_profile_snapshot g_e2e_tg_profile;
+thread_local e2e_tg_profile_snapshot               g_e2e_tg_profile;
+// P4 TG-cost-visibility (llama.cpp-os8k): start-to-start timestamp used to
+// derive g_e2e_tg_profile.wall_us -- see that field's declaration comment.
+thread_local std::chrono::steady_clock::time_point g_e2e_last_graph_compute_start{};
+thread_local bool                                  g_e2e_has_last_graph_compute_start = false;
 
 bool tensor_name_contains(const char * name, const char * needle) {
     return name && needle && std::strstr(name, needle) != nullptr;
@@ -133,10 +137,27 @@ void e2e_tg_profile_force_flush(FILE * out) {
         return;
     }
     g_e2e_tg_profile.tokens += 1;
-    std::fprintf(out,
-                 "[SYCL-E2E-TG-PROFILE] tokens=%llu ops=%llu moe_calls=%llu total_host=%.3f ms total_device=%.3f ms\n",
-                 (unsigned long long) g_e2e_tg_profile.tokens, (unsigned long long) g_e2e_tg_profile.ops,
-                 (unsigned long long) g_e2e_tg_profile.moe_calls, total_host_us / 1000.0, total_device_us / 1000.0);
+    // P4 TG-cost-visibility (llama.cpp-os8k): host_gap_ms is wall time NOT
+    // accounted for by any profiled device kernel -- host-side stalls,
+    // submission backpressure, unprofiled work. Zero/omitted on the first
+    // token of a run (wall_us has no previous timestamp to diff against, see
+    // e2e_tg_profile_note_new_graph_compute) rather than printed as a
+    // misleadingly negative or zero number.
+    if (g_e2e_tg_profile.wall_us > 0.0) {
+        const double host_gap_ms = (g_e2e_tg_profile.wall_us / 1000.0) - (total_device_us / 1000.0);
+        std::fprintf(out,
+                     "[SYCL-E2E-TG-PROFILE] tokens=%llu ops=%llu moe_calls=%llu wall=%.3f ms total_host=%.3f ms "
+                     "total_device=%.3f ms host_gap=%.3f ms\n",
+                     (unsigned long long) g_e2e_tg_profile.tokens, (unsigned long long) g_e2e_tg_profile.ops,
+                     (unsigned long long) g_e2e_tg_profile.moe_calls, g_e2e_tg_profile.wall_us / 1000.0,
+                     total_host_us / 1000.0, total_device_us / 1000.0, host_gap_ms);
+    } else {
+        std::fprintf(out,
+                     "[SYCL-E2E-TG-PROFILE] tokens=%llu ops=%llu moe_calls=%llu wall=n/a(first_token) "
+                     "total_host=%.3f ms total_device=%.3f ms host_gap=n/a\n",
+                     (unsigned long long) g_e2e_tg_profile.tokens, (unsigned long long) g_e2e_tg_profile.ops,
+                     (unsigned long long) g_e2e_tg_profile.moe_calls, total_host_us / 1000.0, total_device_us / 1000.0);
+    }
     for (size_t i = 0; i < static_cast<size_t>(e2e_tg_stage::COUNT); ++i) {
         const auto & stage_accum = g_e2e_tg_profile.stages[i];
         if (stage_accum.calls == 0) {
@@ -155,6 +176,29 @@ void e2e_tg_profile_flush_if_ready(FILE * out) {
     if (g_e2e_tg_profile.moe_calls >= 72) {
         e2e_tg_profile_force_flush(out);
     }
+}
+
+void e2e_tg_profile_note_new_graph_compute(FILE * out) {
+    if (!e2e_tg_profile_enabled()) {
+        return;
+    }
+    // Start-to-start delta: the PREVIOUS graph_compute's total wall time is
+    // (this call's timestamp) - (that previous call's timestamp), since
+    // graph_compute calls are serial on this thread. Computed BEFORE
+    // force_flush() below, which is what attaches wall_us to the flushed
+    // (previous) token's stats and then resets the snapshot.
+    const auto now = std::chrono::steady_clock::now();
+    if (g_e2e_has_last_graph_compute_start) {
+        g_e2e_tg_profile.wall_us =
+            std::chrono::duration<double, std::micro>(now - g_e2e_last_graph_compute_start).count();
+    }
+    g_e2e_last_graph_compute_start     = now;
+    g_e2e_has_last_graph_compute_start = true;
+
+    // force_flush() itself already no-ops when ops==0 (see the guard at its
+    // top), so calling this unconditionally at every graph_compute() entry
+    // is safe even on the very first call (nothing accumulated yet).
+    e2e_tg_profile_force_flush(out);
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
