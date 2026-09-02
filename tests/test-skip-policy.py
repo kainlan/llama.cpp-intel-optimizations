@@ -95,7 +95,8 @@ LITERAL_SKIP_EXIT_RE = re.compile(r"\breturn\s+77\s*;" r"|\b(?:std::)?_?[Ee]xit\
 # distinguishable from an argument or a sentinel value, and this scan already
 # has zero real array-size-shaped occurrences to generalize from. A real one
 # is allowlisted by entry (file + line-content regex), the same as every
-# other non-exit literal below -- see test_int_array_size_shape_needs_an_allowlist_entry.
+# other non-exit literal below -- see the array-size-shape assertion inside
+# test_broad_literal_77_regex_has_controls.
 BROAD_LITERAL_77_RE = re.compile(r"\b77\b(?!\.\d)")
 
 # Small, explicit, re-verified allowlist of genuine non-exit uses of the
@@ -141,7 +142,16 @@ ALLOWED_NON_EXIT_77 = (
 )
 
 
-def _strip_comments(text: str) -> str:
+# A raw string literal's introducer: an optional encoding prefix (u8/u/U/L),
+# then `R"`, then a delimiter of up to 16 chars drawn from the C++ standard's
+# d-char set (anything but space, `(`, `)`, backslash, or a control char),
+# then the `(` that starts the literal's body. Matched at a fixed position
+# (via .match(text, pos), not .search) so it only fires exactly where a raw
+# string literal actually starts.
+_RAW_STRING_START_RE = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n]{0,16})\(')
+
+
+def _strip_comments(text: str, _return_spans: bool = False):
     """Blank out // and /* */ comments, character-for-character in place.
 
     Every character that is not part of a comment keeps its original
@@ -151,20 +161,56 @@ def _strip_comments(text: str) -> str:
     stripper deleted block comments instead of blanking them, so offender
     line numbers reported after a multi-line comment were wrong).
 
-    A small hand-written scanner, not a full tokenizer, but string- and
-    char-literal aware (finding 4): it skips over "..." and '...' literals
-    whole, honouring backslash escapes, BEFORE it ever considers whether `/`
-    starts a comment. So a `//` or a `/*` inside a string literal cannot
-    swallow the rest of the line (or file) the way a plain
-    `re.sub(r"//.*", ...)` would -- see
-    test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal.
+    A small hand-written scanner, not a full tokenizer, but literal-aware:
+    it skips over "...", '...' and RAW string literals (finding 4, then
+    llama.cpp-g290 round 3) whole, BEFORE it ever considers whether `/`
+    starts a comment, so a `//` or `/*` inside one of them cannot swallow
+    real code the way a plain `re.sub(r"//.*", ...)` would -- see
+    test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal
+    and test_strip_comments_is_raw_string_aware.
+
+    Raw string literals (`R"delim(...)delim"`) need their own handling
+    because, unlike a plain "..." literal, their body can contain an
+    unescaped `"` -- e.g. `R"({"text": ...)"` in
+    tests/peg-parser/test-json-parser.cpp -- which desyncs the plain
+    quote-tracker: it closes the "string" early at that embedded `"`, then
+    resumes in what it thinks is code state at the wrong offset. Depending
+    on parity that either blanks real code following a later `//`/`*/` that
+    now looks like it starts inside a "string" (a false negative on this
+    very scan -- `R"(x " // y)"; return 77;` used to lose its
+    `return 77;`), or leaves a genuine comment unstripped because the
+    scanner (wrongly) still thinks it is inside a literal (the observed
+    case, in tests/peg-parser/test-json-parser.cpp:85-86). A raw string's
+    body is found by its own `)delim"` terminator, is never re-entered by
+    the plain quote/comment checks below, and -- unlike a plain "..."
+    literal -- is allowed to span real newlines, matching what raw strings
+    are for.
+
+    With `_return_spans=True`, also returns the list of (start, end) offsets
+    into `text` that this scan itself classified as "inside a literal"
+    (string, char, or raw string), so a caller can tell a `//`/`/*` that
+    legitimately survives inside a preserved literal apart from one that
+    survived because the scanner desynchronised -- see
+    test_strip_comments_marks_every_surviving_slash_as_inside_a_literal.
     """
     out = list(text)
     i = 0
     n = len(text)
+    literal_spans = []
     while i < n:
+        raw_match = _RAW_STRING_START_RE.match(text, i)
+        if raw_match:
+            delim = raw_match.group(1)
+            terminator = ")" + delim + '"'
+            body_start = raw_match.end()
+            end = text.find(terminator, body_start)
+            end = end + len(terminator) if end != -1 else n
+            literal_spans.append((raw_match.start(), end))
+            i = end
+            continue
         c = text[i]
         if c == '"' or c == "'":
+            start = i
             quote = c
             j = i + 1
             while j < n:
@@ -177,6 +223,7 @@ def _strip_comments(text: str) -> str:
                 if text[j] == "\n":
                     break  # unterminated literal on this line; stop here
                 j += 1
+            literal_spans.append((start, j))
             i = j
             continue
         if c == "/" and i + 1 < n and text[i + 1] == "/":
@@ -195,7 +242,10 @@ def _strip_comments(text: str) -> str:
             i = end
             continue
         i += 1
-    return "".join(out)
+    stripped = "".join(out)
+    if _return_spans:
+        return stripped, literal_spans
+    return stripped
 
 
 def _iter_test_sources():
@@ -395,6 +445,74 @@ def test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal() -
         f"was {stripped!r}. The comment stripper must skip whole string "
         "literals before looking for // or /* inside them."
     )
+
+
+def test_strip_comments_is_raw_string_aware() -> None:
+    # llama.cpp-g290 round 3 spec review, finding 1: a raw string literal
+    # (`R"delim(...)delim"`) can embed an unescaped `"` -- the plain
+    # quote-tracker (finding 4's fix) is not enough, because IT is what
+    # desyncs on that embedded `"`. Observed for real at
+    # tests/peg-parser/test-json-parser.cpp:85-86 (two genuine // comments
+    # left unstripped, harmlessly there); the dangerous direction is a false
+    # negative, reproduced by the fixture below (blanks a real `return 77;`).
+    dangerous = 'const char * s = R"(x " // y)"; return 77;'
+    stripped = _strip_comments(dangerous)
+    assert LITERAL_SKIP_EXIT_RE.search(stripped) and BROAD_LITERAL_77_RE.search(stripped), (
+        f"a `\"` embedded in a raw string literal desynchronised the "
+        f"scanner and hid `return 77;`: stripped output was {stripped!r}. "
+        "_RAW_STRING_START_RE / the raw-string branch in _strip_comments "
+        "must treat the whole R\"(...)\" as one opaque literal."
+    )
+
+    # A raw string body containing what LOOK like a block comment and a line
+    # comment must not desync either -- both must stay inert (part of the
+    # literal), and the real code after the literal must still be seen.
+    fake_comments = 'const char * s = R"(/* not a comment */ // also not)"; return 77;'
+    stripped = _strip_comments(fake_comments)
+    assert LITERAL_SKIP_EXIT_RE.search(stripped), (
+        f"a `/*` or `//` inside a raw string body was treated as a real "
+        f"comment marker: stripped output was {stripped!r}."
+    )
+
+    # A custom delimiter (R"xy(...)xy") whose body contains a bare `)"` must
+    # not terminate the literal early -- only the literal's OWN `)xy"`
+    # terminator may end it.
+    custom_delim = 'const char * s = R"xy(some )" text)xy"; return 77;'
+    stripped = _strip_comments(custom_delim)
+    assert LITERAL_SKIP_EXIT_RE.search(stripped), (
+        f"a bare `)\"` inside a custom-delimiter raw string body terminated "
+        f"the literal early: stripped output was {stripped!r}."
+    )
+
+
+def test_strip_comments_marks_every_surviving_slash_as_inside_a_literal() -> None:
+    # Whole-tree self-check for the raw-string desync above (llama.cpp-g290
+    # round 3, finding 1). If the raw-string handling ever regresses, the
+    # scanner can desync and either blank real code (a false negative,
+    # reproduced synthetically above) or fail to blank a genuine comment
+    # because it wrongly believes it is still inside a literal (the form
+    # actually observed, in tests/peg-parser/test-json-parser.cpp). Both
+    # failure modes show up here the same way: a `//` or `/*` survives in
+    # the STRIPPED text at a position the scanner did NOT itself record as
+    # inside a string/char/raw-string literal. A `//` or `/*` that
+    # legitimately lives inside a preserved literal is exactly what
+    # string-awareness must NOT strip, so this only flags one that escaped
+    # the scanner's own bookkeeping -- an assertion that "found nothing"
+    # would not have caught the peg-parser desync (it found two survivors,
+    # both correctly inside a literal span; a regression would put one
+    # outside).
+    for path in _iter_test_sources():
+        original = path.read_text(encoding="utf-8", errors="replace")
+        stripped, literal_spans = _strip_comments(original, _return_spans=True)
+        for m in re.finditer(r"//|/\*", stripped):
+            pos = m.start()
+            assert any(a <= pos < b for a, b in literal_spans), (
+                f"{path.relative_to(ROOT)}: a {m.group(0)!r} survived "
+                f"stripping at offset {pos}, outside every span the scanner "
+                "itself classified as inside a string/raw-string literal -- "
+                "the comment stripper desynchronised (llama.cpp-g290 round 3 "
+                "spec review, finding 1)."
+            )
 
 
 def test_broad_literal_77_regex_has_controls() -> None:
