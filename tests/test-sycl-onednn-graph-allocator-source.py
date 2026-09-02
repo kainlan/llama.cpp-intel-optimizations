@@ -110,22 +110,36 @@ COMMON_HPP_CODE = strip_comments(COMMON_HPP)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
 
-FREE_BODY_RAW = extract_function_body(CACHE_CPP, "void unified_cache::onednn_graph_scratch_free(")
-FREE_BODY_CODE = strip_comments(FREE_BODY_RAW)
-ALLOC_BODY_CODE = strip_comments(extract_function_body(CACHE_CPP, "void * unified_cache::onednn_graph_scratch_alloc("))
-FLOOR_BODY_CODE = strip_comments(
-    extract_function_body(CACHE_CPP, "static size_t onednn_graph_scratch_zone_floor_bytes()")
-)
+# Comments are stripped from the WHOLE file FIRST, and every function body is
+# then extracted from that already-stripped text -- never the other order
+# (llama.cpp-gwno spec-review round 3, finding 4). extract_function_body()'s
+# brace count is naive: run on the RAW source, a comment containing a stray
+# '{' or '}' (a code snippet in prose, say) can desync it and extract the
+# wrong span before strip_comments() ever runs on the result. Stripping first
+# turns every such character to whitespace before the scan starts, so the
+# scan cannot be confused by comment content at all. (Verified inert against
+# today's five function bodies either way -- none currently contains a brace
+# inside a comment -- which is exactly why the wrong order was invisible
+# until reviewed for it.)
+FREE_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_free(")
+ALLOC_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_alloc(")
+FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes()")
+MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 
 
 def test_onednn_graph_allocator_source_contract() -> None:
     checks = {}
 
+    # All four of these are about make_engine()'s own behavior, so all four
+    # are scoped to its extracted body (llama.cpp-gwno spec-review round 3,
+    # nit 9) rather than searched across the whole ~7000-line common.hpp,
+    # where a same-named call or string could exist elsewhere by coincidence.
+    #
     # The engine must actually be built WITH an allocator, not the bare
     # dnnl::sycl_interop::make_engine() this whole change exists to stop
     # using as the default path.
     checks["engine built with allocator"] = (
-        "dnnl::graph::sycl_interop::make_engine_with_allocator(dev, ctx, alloc)" in COMMON_HPP_CODE
+        "dnnl::graph::sycl_interop::make_engine_with_allocator(dev, ctx, alloc)" in MAKE_ENGINE_BODY_CODE
     )
     # Whitespace-insensitive: this call is the one most likely to get
     # re-wrapped by clang-format when an unrelated edit changes the
@@ -133,10 +147,12 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # exact-text check without the call itself having changed.
     checks["allocator constructed from the two callbacks"] = (
         "dnnl::graph::sycl_interop::make_allocator( ggml_sycl::onednn_graph_sycl_malloc, "
-        "ggml_sycl::onednn_graph_sycl_free)" in normalize_ws(COMMON_HPP_CODE)
+        "ggml_sycl::onednn_graph_sycl_free)" in normalize_ws(MAKE_ENGINE_BODY_CODE)
     )
-    checks["opt-out env var gates it"] = "onednn_graph_allocator_enabled()" in COMMON_HPP_CODE
-    checks["raw allocator engine kept as the fallback"] = "dnnl::sycl_interop::make_engine(dev, ctx)" in COMMON_HPP_CODE
+    checks["opt-out env var gates it"] = "onednn_graph_allocator_enabled()" in MAKE_ENGINE_BODY_CODE
+    checks["raw allocator engine kept as the fallback"] = (
+        "dnnl::sycl_interop::make_engine(dev, ctx)" in MAKE_ENGINE_BODY_CODE
+    )
 
     # Callback signatures declared as free functions (no user-data slot in
     # the oneDNN C API to carry a `this` -- see the header comment).
@@ -200,6 +216,18 @@ def test_onednn_graph_allocator_source_contract() -> None:
         "ggml_sycl_get_tp_queue(" in FREE_BODY_CODE and "enqueue_deferred_zone_free(" in FREE_BODY_CODE
     )
 
+    # reserve_onednn_scratch's growth guard must compare total_needed (the
+    # primitive-API pair's own requirement, never including the Graph floor)
+    # against the STORED getter, not the with-floor one -- comparing against
+    # the with-floor reading lets the floor silently absorb the pair's growth
+    # signal (llama.cpp-gwno spec-review round 3, finding 3).
+    checks["growth guard reads the stored (bare) getter"] = (
+        "unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id) < total_needed" in CACHE_CPP_CODE
+    )
+    checks["growth guard does not read the with-floor getter"] = (
+        "unified_cache_get_planned_onednn_scratchpad_bytes(dev_id) < total_needed" not in CACHE_CPP_CODE
+    )
+
     # Env-tunable floor for the concurrent within-ubatch demand, additive on
     # top of the primitive-API pair (see unified_cache_get_planned_onednn_scratchpad_bytes).
     checks["graph scratch zone floor is additive"] = "bytes += onednn_graph_scratch_zone_floor_bytes()" in CACHE_CPP_CODE
@@ -230,8 +258,10 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # standalone USM allocation.
     # strip_literals too: both branches log a WARN that NAMES the raw call they
     # refuse to make, and a negative check must read code, not messages.
-    malloc_fn_code = strip_literals(strip_comments(extract_function_body(CACHE_CPP, "void * onednn_graph_sycl_malloc(")))
-    free_fn_code = strip_literals(strip_comments(extract_function_body(CACHE_CPP, "void onednn_graph_sycl_free(")))
+    # Extracted from the already comment-stripped CACHE_CPP_CODE (finding 4;
+    # see the module-level comment above the other extractions).
+    malloc_fn_code = strip_literals(extract_function_body(CACHE_CPP_CODE, "void * onednn_graph_sycl_malloc("))
+    free_fn_code = strip_literals(extract_function_body(CACHE_CPP_CODE, "void onednn_graph_sycl_free("))
     checks["malloc no-cache branch does not allocate cache-external memory"] = (
         "sycl::aligned_alloc_device" not in malloc_fn_code
     )

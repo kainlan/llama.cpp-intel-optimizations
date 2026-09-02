@@ -5580,6 +5580,15 @@ struct ggml_backend_sycl_context {
                     "[SYCL] oneDNN Graph allocator engine construction failed (%s); falling back to oneDNN's "
                     "default allocator -- GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0 silences this by opting out\n",
                     e.what());
+            } catch (...) {
+                // Not every failure mode here throws dnnl::error -- a
+                // sycl::exception or std::bad_alloc from inside the C API
+                // call is equally possible and must reach the same fallback,
+                // not propagate out of make_engine() uncaught.
+                GGML_LOG_WARN(
+                    "[SYCL] oneDNN Graph allocator engine construction failed (non-dnnl exception); falling back "
+                    "to oneDNN's default allocator -- GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0 silences this by opting "
+                    "out\n");
             }
         }
         return dnnl::sycl_interop::make_engine(dev, ctx);

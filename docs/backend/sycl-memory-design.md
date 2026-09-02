@@ -187,56 +187,82 @@ Those two methods serve requests from the **same ONEDNN zone** the
 primitive-API pair already uses (`zone_alloc`/`zone_free` — host-side TLSF
 suballocation, no device syscall) rather than a separate reservation.
 
-**The zone-backed path reclaims a freed buffer immediately, with no
-completion-event check at all** — this was not the original design, and
-getting it wrong once already cost most of the win. oneDNN hands the free
-callback a completion event, and the compiled partition's kernels may still
-be reading the buffer when the callback fires (it is called at submission,
-not at completion), so a first version of this allocator gated every
-`free()` (and every `alloc()`'s opportunistic drain) on
-`event.get_info<command_execution_status>()`. That call **blocks** rather
-than polls on a profiling-enabled queue (every backend compute queue is one;
-see `get_dma_queue()`'s comment in `unified-cache.hpp`) — and the event this
-allocator receives always comes from that same compute queue. The result was
-that every `free()` became a synchronous wait for that op's device
-completion, undoing most of the host-time win the allocator existed to
-deliver (measured: attention host stage stuck at 52 ms/ubatch instead of the
-expected drop). The fix removes the event check for the zone path entirely
-and reclaims synchronously, justified by construction rather than by a host
-wait: the *only* consumer of a Graph-scratch buffer is a
-`dnnl::graph::sycl_interop::execute()` call built on `stream_dnnl(qptr)`,
-where `qptr == ctx.stream()` — the same in-order compute queue for every
-SDPA call, every layer, every ubatch. A later `zone_alloc()` handing the same
-block to a new `execute()` submits that execute's kernels on the identical
-queue, so the device enforces "finish reading the old contents before
-writing the new ones" via plain in-order submission order — the same
-guarantee an event wait would have bought, already free. This assumption
-(every consumer stays on `ctx.stream()`) is documented at the free-path call
-site; if it ever stops holding, the fix is a genuinely non-blocking check,
-not the blocking one this replaced — the `dma_queue_` pattern is the
-template (a dedicated non-profiling queue whose events *can* be polled).
-Confirmed on hardware: attention host stage 52 → 12.3 ms/ubatch, pp512 +15%.
+The free path resolves to one of **three branches**, not two — getting this
+down to two once already cost most of the win, and a second gap (TP) closed
+it back to three:
 
-If the zone has no room (an under-sized plan, or the arena not yet active),
-the allocator falls back to a real `mem_handle`-owned `unified_alloc()`. This
-DIRECT-fallback path is genuinely event-deferred, via
-`retain_handles_until_event()` — unlike the zone path, immediate reuse here
-is *not* backed by the in-order-queue argument (a released DIRECT block goes
-back to the unified cache's general pool, not straight into this allocator's
-own reuse loop, so nothing pins its next consumer to the same queue as its
-last one) — correctness-preserving, but it reintroduces the round trip this
-change exists to avoid, so it is logged once, not per-call.
+1. **Zone-backed, TP not active — reclaim immediately, no completion-event
+   check at all.** oneDNN hands the free callback a completion event, and the
+   compiled partition's kernels may still be reading the buffer when the
+   callback fires (it is called at submission, not at completion), so a first
+   version of this allocator gated every `free()` (and every `alloc()`'s
+   opportunistic drain) on `event.get_info<command_execution_status>()`. That
+   call **blocks** rather than polls on a profiling-enabled queue (every
+   backend compute queue is one; see `get_dma_queue()`'s comment in
+   `unified-cache.hpp`) — and the event this allocator receives always comes
+   from that same compute queue. The result was that every `free()` became a
+   synchronous wait for that op's device completion, undoing most of the
+   host-time win the allocator existed to deliver (measured: attention host
+   stage stuck at 52 ms/ubatch instead of the expected drop). The fix removes
+   the event check for this branch entirely and reclaims synchronously,
+   justified by construction rather than by a host wait: the *only* consumer
+   of a Graph-scratch buffer is a `dnnl::graph::sycl_interop::execute()` call
+   built on `stream_dnnl(qptr)`, where `qptr == ctx.stream()` — the same
+   in-order compute queue for every SDPA call, every layer, every ubatch. A
+   later `zone_alloc()` handing the same block to a new `execute()` submits
+   that execute's kernels on the identical queue, so the device enforces
+   "finish reading the old contents before writing the new ones" via plain
+   in-order submission order — the same guarantee an event wait would have
+   bought, already free. Confirmed on hardware: attention host stage
+   52 → 12.3 ms/ubatch, pp512 +15%.
+
+2. **Zone-backed, TP active — defer via `enqueue_deferred_zone_free()`.** The
+   branch above rests on one assumption: every consumer stays on
+   `ctx.stream()`. `ggml_backend_sycl_context::stream()` (`common.hpp`)
+   breaks that assumption under Tensor Parallelism — it returns the TP
+   shared-context queue *ahead of* the unified-cache queue whenever TP is
+   enabled for the device, so the queue `dnnl::graph::sycl_interop::execute()`
+   actually submits on is not necessarily the queue this allocator's
+   `malloc()` callback bound the engine to. Immediate reclaim would then be a
+   real race, not a documented-but-safe one, so this branch fails closed
+   instead: `ggml_sycl_get_tp_queue(device) != nullptr` routes to
+   `enqueue_deferred_zone_free()` (the zone-suballocation analog of
+   `retain_handles_until_event()` — that call takes a `mem_handle`, which a
+   zone suballocation does not have; `enqueue_deferred_zone_free()` is the
+   same primitive `reserve_onednn_scratch`'s own `defer_published_zone_release`
+   already uses for exactly this "zone pointer, need an event-gated release"
+   shape), gated on the real completion event (or a fresh barrier if none was
+   supplied).
+
+3. **DIRECT-fallback — always event-deferred, via
+   `retain_handles_until_event()`.** If the zone has no room (an under-sized
+   plan, or the arena not yet active), the allocator falls back to a real
+   `mem_handle`-owned `unified_alloc()`. Unlike either zone branch above,
+   immediate reuse here is *not* backed by the in-order-queue argument (a
+   released DIRECT block goes back to the unified cache's general pool, not
+   straight into this allocator's own reuse loop, so nothing pins its next
+   consumer to the same queue as its last one) — correctness-preserving, but
+   it reintroduces the round trip this change exists to avoid, so it is
+   logged once, not per-call.
 
 `unified_cache_get_planned_onednn_scratchpad_bytes()` adds a flat,
 env-tunable floor (`GGML_SYCL_ONEDNN_GRAPH_ZONE_MB`) on top of the
 primitive-API estimate at planning time, additive since both can be
-resident at once. **Default 64 MiB**, not the 512 MiB the allocator
-shipped with initially: that number was sized for many buffers concurrently
-outstanding across a ubatch, which was only ever true while the free path
-above deferred reclaim on the completion event — once reclaim is immediate,
-at most ~1 buffer is outstanding at a time. Measured high-water
-(`onednn_graph_scratch_high_water_bytes()`, logged once at cache teardown):
-12.0 MB on a B70 gemma4 pp512 run, 3.0 MB on a two-model
+resident at once — that with-floor getter is deliberately distinct from
+`unified_cache_get_planned_onednn_scratchpad_bytes_stored()` (the bare
+primitive-API-pair value with no floor added): `reserve_onednn_scratch`'s own
+growth guard must compare against the stored form, or the floor silently
+absorbs the pair's growth signal (every caller of either getter states in a
+comment which one it wants). **Default 64 MiB**, not the 512 MiB the
+allocator shipped with initially: that number was sized for many buffers
+concurrently outstanding across a ubatch, which was only ever true while
+branch 1 above deferred reclaim on the completion event — once reclaim is
+immediate, at most ~1 buffer is outstanding at a time in the common case (TP
+excepted, branch 2). Measured high-water (`onednn_graph_scratch_high_water_bytes()`,
+logged once at cache teardown, at `GGML_LOG_WARN` — `GGML_LOG_INFO` is
+dropped at default verbosity in every tool, see CLAUDE.md's "llama-bench
+traps" section, so nothing lower than WARN would reach a normal run's log at
+all): 12.0 MB on a B70 gemma4 pp512 run, 3.0 MB on a two-model
 `GGML_SYCL_STRICT_LEASES=1` run. The old 512 MiB default was not just
 wasteful — it was a landing blocker: a second model's load-time zone-growth
 request could exceed what the arena can grow into while the first model's
