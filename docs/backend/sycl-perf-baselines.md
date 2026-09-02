@@ -231,6 +231,39 @@ Two things worth noting:
 Mistral is also far steadier than GPT-OSS on the B70 (tg cv 1.0% vs 3.3%), so it
 is the better workload for detecting small changes on that card.
 
+> ⚠️ **SUPERSEDED FOR GATING BY THE 26.31 DRIVER — do not gate on the B70 row
+> above.** The table stays as the record of what 26.27 measured; it is no longer
+> what this host produces. Re-measured 2026-09-02 on compute-runtime **26.31**
+> (`libze_intel_gpu.so.1.17.39395`, the one-way PPA upgrade of 2026-08-18),
+> 5 interleaved B70 pairs + 3 B50, quiet host, `throttle/status` and `act_freq`
+> sampled before every run:
+>
+> | Device | PP512 (26.27 → 26.31) | TG128 (26.27 → 26.31) |
+> |---|---|---|
+> | B70 | 2495 → **2956** (+18%) | 107.66 → **88.20** (−18%) |
+> | B50 | 1188 → **1297** (+9%) | 46.53 → **46.04** (−1%, noise) |
+>
+> The `~108` B70 tg figure is **unreachable on this host** and gating against it
+> reads as a phantom ~19% regression — which is exactly what happened on
+> 2026-09-02 before this note existed (`llama.cpp-r3f1`). The `~2495` pp figure
+> is stale in the other direction: it is now a floor a healthy host clears by 18%,
+> so it will not catch a real prefill regression either.
+>
+> This is attributed to the driver, not to any code change, by a **controlled**
+> comparison rather than by inference: a pre-wave0 binary (`fed0b58e2`, built
+> 2026-09-01) and current master measure the same tg on the same host
+> (88.20 vs 87.98), so nothing landed in between caused it. Note the driver's
+> effect is not uniform — it cost the B70 18% of decode while leaving the B50's
+> decode untouched, and lifted prefill on both.
+>
+> **Method note, because it changes what counts as a valid B70 measurement:**
+> within-arm spreads here were 0.1–1.8%, close to the documented cv. A concurrent
+> session measuring the same axis while its own GPU queue was running saw ±15%
+> and nearly concluded the B70 tg axis was unmeasurable. It is measurable to ~2%;
+> the wide spread was host load. Check for competing GPU work before treating B70
+> tg noise as inherent. One B50 run read `throttle/status = 1` with in-line
+> numbers, so the throttle bit alone is not grounds to discard a reading.
+
 ### Correctness gates — all PASS on both devices
 
 Same build, both selectors, **both configurations** — 8 of 8 pass:
