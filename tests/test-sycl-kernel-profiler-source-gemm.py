@@ -26,14 +26,10 @@ def test_unbatched_gemm_execute_sites_are_wrapped_and_wait_free() -> None:
     # ggml_sycl_op_mul_mat_sycl -- llama.cpp-qmen (S6/I1), the profiler
     # completeness task that closed kprof-pp-b70.csv's 219/237 dark GEMMs.
     gemm = GEMM.read_text(encoding="utf-8")
-    # "static sycl::event gemm(" (not "row_gemm(") -- word-boundary anchored
-    # so clang-format's column realignment of the parameter list (it varies
-    # the whitespace before `ctx` based on the longest type in the list)
-    # can't desync this slice's start point.
-    begin = re.search(r"static sycl::event gemm\(", gemm)
-    assert begin is not None
-    body = slice_between(gemm, gemm[begin.start():begin.start() + 40], "static sycl::event row_gemm(")
-    assert body.count('"mulmat.onednn_woq.execute"') == 2
+    # "static sycl::event gemm(" is distinct from "static sycl::event row_gemm("
+    # and contains no variable whitespace, so the literal anchors the slice.
+    body = slice_between(gemm, "static sycl::event gemm(", "static sycl::event row_gemm(")
+    assert body.count('"mulmat.onednn_gemm.unbatched"') == 2
     assert body.count("ggml_sycl_profile_submit(*q,") == 2
     assert body.count("dnnl::sycl_interop::execute(") == 2
     assert "variant=fallback_create" in body

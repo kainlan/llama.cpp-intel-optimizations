@@ -409,18 +409,13 @@ class DnnlGemmWrapper {
                 matmul_args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
             }
             ggml_sycl_profile_label gemm_label{};
-            gemm_label.name       = "mulmat.onednn_woq.execute";
+            gemm_label.name       = "mulmat.onednn_gemm.unbatched";
             gemm_label.category   = "mulmat";
             gemm_label.queue_kind = "compute";
             gemm_label.device     = ctx.device;
-            // llama.cpp-qmen (spec-review fix round, finding 6): built only
-            // under the profiler gate -- otherwise this is a heap
-            // allocation on every call even with the profiler off, which
-            // is what the docs/backend/sycl-env-vars.md row's "zero
-            // overhead when unset" claim requires. gemm_label.metadata
-            // defaults to "" (ggml_sycl_profile_label's member
-            // initializer), so leaving it untouched when disabled is
-            // already correct.
+            // Metadata is built only under the profiler gate: unconditionally
+            // it is a heap allocation per call with the profiler off, and
+            // gemm_label.metadata already defaults to "".
             std::string label_metadata;
             if (ggml_sycl_kernel_profile_enabled()) {
                 label_metadata =
@@ -453,13 +448,11 @@ class DnnlGemmWrapper {
         }
 
         ggml_sycl_profile_label gemm_label{};
-        gemm_label.name       = "mulmat.onednn_woq.execute";
+        gemm_label.name       = "mulmat.onednn_gemm.unbatched";
         gemm_label.category   = "mulmat";
         gemm_label.queue_kind = "compute";
         gemm_label.device     = ctx.device;
-        // llama.cpp-qmen (spec-review fix round, finding 6): see the
-        // fallback-create arm above for the rationale -- same gate, same
-        // "" default when disabled.
+        // Same gating as the fallback-create arm above.
         std::string label_metadata;
         if (ggml_sycl_kernel_profile_enabled()) {
             label_metadata      = op_context ?

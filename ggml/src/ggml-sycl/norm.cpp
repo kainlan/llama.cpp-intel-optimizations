@@ -882,8 +882,7 @@ static void norm_f32_sycl(const float * x,
     norm_label.category   = "norm";
     norm_label.queue_kind = "compute";
     norm_label.device     = device;
-    // (spec-review fix round, finding 6): metadata built only under the
-    // gate -- see rms_norm_f32_sycl below for the full rationale.
+    // Metadata only under the profiler gate (see rms_norm_f32_sycl).
     std::string norm_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
@@ -937,8 +936,7 @@ static void group_norm_f32_sycl(const float * x,
     group_norm_label.category   = "norm";
     group_norm_label.queue_kind = "compute";
     group_norm_label.device     = device;
-    // (spec-review fix round, finding 6): metadata built only under the
-    // gate -- see rms_norm_f32_sycl below for the full rationale.
+    // Metadata only under the profiler gate (see rms_norm_f32_sycl).
     std::string group_norm_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         group_norm_metadata = "num_groups=" + std::to_string(num_groups) + ";group_size=" + std::to_string(group_size);
@@ -1007,16 +1005,12 @@ static void rms_norm_f32_sycl(const float * x,
     rms_norm_label.category   = "norm";
     rms_norm_label.queue_kind = "compute";
     rms_norm_label.device     = device;
-    // (spec-review fix round, finding 6): the metadata string is built
-    // ONLY under the profiler gate. ggml_sycl_profile_label::metadata
-    // defaults to "" (its member initializer), so leaving it untouched
-    // when disabled is already correct -- the alternative (building it
-    // unconditionally, as this task's first version and the older
-    // mxfp4.pp.gemm.execute 2-D loop in gemm.hpp both do) is a real heap
-    // allocation on every RMS_NORM call even with the profiler off,
-    // which contradicts docs/backend/sycl-env-vars.md's "zero overhead
-    // when unset" claim for this instrument -- ~300 such calls/decode
-    // token across the whole RMS_NORM family, not a rounding error.
+    // The metadata string is built only under the profiler gate:
+    // unconditionally it is a heap allocation on every RMS_NORM call with the
+    // profiler off (~300 launches per decode token across this family), which
+    // would falsify the "zero overhead when unset" contract in
+    // docs/backend/sycl-env-vars.md. ggml_sycl_profile_label::metadata
+    // defaults to "", so leaving it untouched when disabled is correct.
     std::string rms_norm_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         rms_norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
@@ -1092,8 +1086,7 @@ static void rms_norm_mul_f32_sycl(const float * x,
     rms_norm_mul_label.category   = "norm";
     rms_norm_mul_label.queue_kind = "compute";
     rms_norm_mul_label.device     = device;
-    // (spec-review fix round, finding 6): metadata built only under the
-    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    // Metadata only under the profiler gate (see rms_norm_f32_sycl).
     std::string rms_norm_mul_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         rms_norm_mul_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
@@ -1201,8 +1194,7 @@ static void rms_norm_mul_add_f32_sycl(const float * x,
     rms_norm_mul_add_label.category   = "norm";
     rms_norm_mul_add_label.queue_kind = "compute";
     rms_norm_mul_add_label.device     = device;
-    // (spec-review fix round, finding 6): metadata built only under the
-    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    // Metadata only under the profiler gate (see rms_norm_f32_sycl).
     std::string rms_norm_mul_add_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         rms_norm_mul_add_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
@@ -1309,8 +1301,7 @@ static void add_rms_norm_f32_sycl(const float * x,
     add_rms_norm_label.category   = "norm";
     add_rms_norm_label.queue_kind = "compute";
     add_rms_norm_label.device     = device;
-    // (spec-review fix round, finding 6): metadata built only under the
-    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    // Metadata only under the profiler gate (see rms_norm_f32_sycl).
     std::string add_rms_norm_metadata;
     if (ggml_sycl_kernel_profile_enabled()) {
         add_rms_norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);

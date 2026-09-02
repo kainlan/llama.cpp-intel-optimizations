@@ -108,8 +108,7 @@ def test_plain_norm_and_group_norm_submits_are_also_wrapped() -> None:
 
 
 def test_metadata_construction_is_gated_for_every_wrapped_norm_function() -> None:
-    # Spec-review fix round, finding 6: each of the 6 wrapped functions'
-    # metadata std::string must be built ONLY under
+    # Each of the 6 wrapped functions' metadata std::string must be built ONLY under
     # ggml_sycl_kernel_profile_enabled() -- building it unconditionally is
     # a heap allocation on every launch even with the profiler off
     # (~300/decode token across this family), which contradicts
@@ -126,8 +125,20 @@ def test_metadata_construction_is_gated_for_every_wrapped_norm_function() -> Non
         decl = f"std::string {metadata_var};"
         assert decl in norm, decl
         gate = norm.index("if (ggml_sycl_kernel_profile_enabled()) {", norm.index(decl))
-        gate_close = norm.index("\n    }", gate)
-        gated = norm[gate:gate_close]
+        # Match the gate's own closing brace by depth, not by indentation, so
+        # a reformat cannot move the slice boundary.
+        brace_open = norm.index("{", gate)
+        depth = 0
+        i = brace_open
+        while True:
+            if norm[i] == "{":
+                depth += 1
+            elif norm[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        gated = norm[brace_open:i]
         assert re.search(rf"{metadata_var}\s*=", gated), metadata_var
         assert re.search(rf"{label_var}\.metadata\s*=\s*{metadata_var}\.c_str\(\);", gated), label_var
 

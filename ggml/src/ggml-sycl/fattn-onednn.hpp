@@ -27,21 +27,18 @@ struct ggml_sycl_onednn_fa_materialized_kv {
     ggml_sycl::mem_handle           Q;
     ggml_sycl::mem_handle           K;
     ggml_sycl::mem_handle           V;
-    // Completion events for the repack kernels that filled Q/K/V above.
-    // llama.cpp-hhbb (S3): the caller no longer wait_and_throw()s these on the
-    // host -- it threads them into dnnl::graph::sycl_interop::execute(...,
-    // deps) so the SDPA partition itself waits on-device, and reuses the
-    // execute() call's own returned event to keep these mem_handles alive
-    // (see ggml_sycl_flash_attn_ext_onednn). Only meaningful when the
-    // corresponding handle above is valid(); a handle that was never
-    // materialized leaves its event default-constructed (never submitted, so
-    // never a dependency).
+    // Completion events for the repack kernels that filled Q/K/V above. They
+    // are never waited on by the host: the caller chains them into
+    // dnnl::graph::sycl_interop::execute(..., deps) and retains the handles
+    // against execute()'s returned event (see ggml_sycl_flash_attn_ext_onednn).
+    // A default-constructed sycl::event is a valid, already-complete event, so
+    // event state alone cannot say whether a kernel was submitted: V and Q are
+    // submitted exactly when their handle is valid() (their materializers reset
+    // the handle on every pre-submit failure), while K can be valid() with its
+    // kernel not yet submitted -- `k_submitted` says which.
     sycl::event                     q_evt;
     sycl::event                     k_evt;
     sycl::event                     v_evt;
-    // True once K's repack kernel has been submitted: on a later submit
-    // failure inside materialize_kv, K's buffer must be retained against
-    // k_evt rather than released (ggml_sycl_flash_attn_ext_onednn_materialize_kv).
     bool                            k_submitted = false;
 };
 

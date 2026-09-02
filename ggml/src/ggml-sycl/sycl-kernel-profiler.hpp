@@ -86,12 +86,11 @@ void                            ggml_sycl_kernel_profile_record_event(const ggml
 // ggml_sycl_kernel_profile_record_event -- and when you also want the host
 // span alongside a real (if partial) device event, pass it its
 // host_submit_begin_us/host_submit_end_us parameters rather than calling
-// this function separately: that records ONE sample carrying both, instead
-// of two samples under the same label that double the aggregate row's count
-// and blend device+host time into one total_ns (see fattn-onednn.cpp's
-// oneDNN SDPA execute() call, where the returned event covers only the
-// compiled partition's last kernel -- not void, as an earlier revision of
-// this comment incorrectly claimed, but not the whole call's cost either).
+// this function separately: that records ONE sample carrying both, whereas
+// two samples under the same label double the aggregate row's count and
+// blend device+host time into one total_ns. fattn-onednn.cpp's oneDNN SDPA
+// execute() is the reference case: its returned event covers only the
+// compiled partition's last kernel, so the host span carries the real cost.
 void                            ggml_sycl_kernel_profile_record_host_span(const ggml_sycl_profile_label &   label,
                                                                           uint64_t                          host_begin_us,
                                                                           uint64_t                          host_end_us,

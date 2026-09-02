@@ -29,41 +29,23 @@ enum class e2e_tg_stage : uint8_t {
 struct e2e_tg_stage_accum {
     uint64_t    calls     = 0;
     double      host_us   = 0.0;
-    // llama.cpp-qmen (S6/I1 profiler completeness, spike S6 of
-    // docs/plans/2026-09-01-sycl-utilization-plan.md; corrected in the
-    // spec-review fix round, finding 5 -- the first version of this
-    // comment claimed "every production call site passes a literal 0.0",
-    // which was false): the ACCUMULATOR and its printed field are real and
-    // tested (test-sycl-e2e-profile.cpp feeds and reads back a non-zero
-    // value end to end) -- what is missing is a DEVICE-timestamp producer.
-    // No call site supplies one; the one non-zero producer in the tree is
-    // a HOST-CLOCK measurement (a chrono span around a host-mediated peer-
-    // link bounce copy, not a SYCL device event) passed through as
-    // `device_us` at ggml-sycl.cpp:22472
-    // (e2e_tg_profile_record_transfer("peer_host_bounce_measure", bytes,
-    // /*host_us=*/0.0, link.host_bounce_us)) -- so this field is not
-    // universally 0.0, but it is universally NOT a device timestamp. That
-    // is NOT fixable by reading `sycl::event::get_profiling_info<command_start/
-    // command_end>` at the call sites that matter most (the per-op
-    // `e2e_tg_scope` bracket in ggml_sycl_compute_forward, which accounts
-    // for the bulk of dispatched ops): querying profiling info on an event
-    // that has not yet completed is an IMPLICIT HOST WAIT (see the
-    // `mxfp4_pp_batched_profile_enabled()` comment in ggml-sycl.cpp, which
-    // explicitly disables that instrument during graph recording for this
-    // reason), and the no-host-waits architecture rule (CLAUDE.md's "No
-    // host waits -- event-chain everything") forbids adding one to the
-    // hot per-op dispatch path -- confirmed live by the `assert_no_waits`
-    // guards in tests/test-sycl-e2e-profile-compute-forward-source.py and
-    // -fattn-source.py, which fail this exact region on any `.wait(`-family
-    // call. GGML_SYCL_KERNEL_PROFILE (sycl-kernel-profiler.hpp) solves the
-    // same problem correctly by deferring the get_profiling_info() read to
-    // its own flush/drain point instead of the submit site; this instrument
-    // has no such deferred/pending-event mechanism, and adding one is a
-    // real redesign, not a light touch -- out of scope for this task. Read
-    // GGML_SYCL_KERNEL_PROFILE for genuine per-kernel device time (now
-    // covering the oneDNN WOQ GEMM and RMS_NORM family as of this task);
-    // treat every `device_us` value here as 0.0/host-only unless a specific
-    // caller is documented otherwise.
+    // HOST-ONLY INSTRUMENT: no call site supplies a device timestamp. The
+    // accumulator and its printed field work (test-sycl-e2e-profile.cpp feeds
+    // and reads back a non-zero value), and the one non-zero producer in the
+    // tree is a host-clock span -- e2e_tg_profile_record_transfer(
+    // "peer_host_bounce_measure", ...) passes the chrono time of a
+    // host-mediated peer-link bounce copy as `device_us` -- so this field is
+    // not universally 0.0, but it is never a SYCL device timestamp. Reading
+    // sycl::event::get_profiling_info<command_start/command_end> at the
+    // per-op e2e_tg_scope bracket would be an implicit host wait on an
+    // incomplete event, which the no-host-waits rule forbids on the dispatch
+    // path (the assert_no_waits source guards in
+    // tests/test-sycl-e2e-profile-compute-forward-source.py and
+    // -fattn-source.py fail that region on any wait). GGML_SYCL_KERNEL_PROFILE
+    // (sycl-kernel-profiler.hpp) gets real device time by deferring the
+    // profiling read to its own flush point; this instrument has no such
+    // mechanism. Use the kernel profiler for device time; treat `device_us`
+    // here as host-only unless a caller documents otherwise.
     double      device_us = 0.0;
     uint64_t    bytes     = 0;
     std::string last_path = "unknown";
@@ -89,12 +71,11 @@ bool         e2e_tg_profile_enabled_from_env(const char * env);
 bool         e2e_tg_profile_enabled();
 const char * e2e_tg_stage_name(e2e_tg_stage stage);
 e2e_tg_stage e2e_tg_stage_from_op(ggml_op op, const char * tensor_name);
-// `device_us`: see e2e_tg_stage_accum::device_us above -- every current
-// production caller passes 0.0 (the default). The parameter and its
-// accumulation are exercised end to end by test-sycl-e2e-profile.cpp with a
-// synthetic non-zero value, so a future caller that has a legitimately
-// non-blocking way to measure device time (e.g. a deferred/pending-event
-// flush like the kernel profiler's) can supply one without further plumbing.
+// `device_us`: see e2e_tg_stage_accum::device_us above -- no caller supplies
+// a device timestamp today (the one non-zero producer forwards a host chrono
+// span through e2e_tg_profile_record_transfer). A future caller with a
+// non-blocking way to measure device time (a deferred/pending-event flush
+// like the kernel profiler's) can supply one without further plumbing.
 void         e2e_tg_profile_record(e2e_tg_stage stage,
                                    const char * path,
                                    double       host_us,
