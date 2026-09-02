@@ -68,6 +68,17 @@ printf '%s\n' b50-mistral-1.log b50-mistral-2.log b50-mistral-3.log \
 diff "$TMP/expected-files.txt" "$TMP/actual-files.txt" || { echo "FAIL: outdir file list wrong"; exit 1; }
 echo "outdir-file-list ok"
 
+# --- .complete manifest CONTENT: existence alone is not enough -- a
+# touch-only manifest or one missing the sha256 lines both pass the file-list
+# check above, so assert the pairs=N line and the stubs' REAL sha256s ---
+manifest="$TMP/logs/b50-mistral.complete"
+grep -qF "pairs=3" "$manifest" || { echo "FAIL: manifest missing pairs=3"; exit 1; }
+grep -qF "a_bin_sha256=$(sha256sum "$TMP/pre-bench" | awk '{print $1}')" "$manifest" \
+    || { echo "FAIL: manifest missing correct a_bin_sha256"; exit 1; }
+grep -qF "b_bin_sha256=$(sha256sum "$TMP/cand-bench" | awk '{print $1}')" "$manifest" \
+    || { echo "FAIL: manifest missing correct b_bin_sha256"; exit 1; }
+echo "manifest-content ok"
+
 # --- refuse to run into a non-empty outdir: a second run into the same
 # --outdir would otherwise silently merge into the existing logs and corrupt
 # the matrix ---
@@ -77,6 +88,8 @@ out=$(bash "$R" --arm b50-mistral --a-bin "$TMP/pre-bench" --b-bin "$TMP/cand-be
 [ "$rc" -eq 2 ] || { echo "FAIL: rerun into existing outdir returned $rc, want 2"; exit 1; }
 grep -qF -- "already exists" <<<"$out" || { echo "FAIL: existing-logs refusal missing message"; exit 1; }
 grep -qF -- "b50-mistral-1.log" <<<"$out" || { echo "FAIL: existing-logs refusal does not name the offending file"; exit 1; }
+grep -qF -- "remove this arm's prior output" <<<"$out" || { echo "FAIL: existing-logs refusal missing the per-arm-rm remedy text"; exit 1; }
+if grep -qF -- "use a fresh --outdir" <<<"$out"; then echo "FAIL: existing-logs refusal still suggests a fresh --outdir"; exit 1; fi
 echo "refuse-existing-logs ok"
 
 # --- unknown arm -> exit 2, with the exact refusal message ---
@@ -112,6 +125,16 @@ out=$(bash "$R" --arm b50-mistral --a-bin "$TMP/pre-bench" --b-bin "$TMP/cand-be
 grep -qF -- "--budget must be a positive integer" <<<"$out" || { echo "FAIL: --budget abc refusal missing message"; exit 1; }
 echo "invalid-budget ok"
 
+# --- zero --budget -> exit 2 with the same message. "0" matches the digits
+# case pattern (only non-digit strings are rejected there), so this exercises
+# the separate `-ge 1` check, distinct from the non-numeric case above ---
+rc=0
+out=$(bash "$R" --arm b50-mistral --a-bin "$TMP/pre-bench" --b-bin "$TMP/cand-bench" \
+    --outdir "$TMP/budget-0" --budget 0 --bench-wrap "$TMP/mock-wrap" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: --budget 0 returned $rc, want 2"; exit 1; }
+grep -qF -- "--budget must be a positive integer" <<<"$out" || { echo "FAIL: --budget 0 refusal missing message"; exit 1; }
+echo "invalid-budget-zero ok"
+
 # --- --a-bin/--b-bin must be executable ---
 touch "$TMP/not-executable"
 rc=0
@@ -138,7 +161,7 @@ n=0
 n=$((n+1))
 echo "$n" > "$MOCK_COUNT_FILE"
 if [ "$n" -eq 4 ]; then
-    echo "mock-wrap-fail4: simulated failure on call $n" >&2
+    echo "mock-wrap-fail4: [EXPECTED] simulated failure on call $n (mid-arm fail-fast test)" >&2
     exit 3
 fi
 touch "$log"
@@ -146,9 +169,11 @@ EOF
 chmod +x "$TMP/mock-wrap-fail4"
 
 rc=0
-bash "$R" --arm b50-mistral --a-bin "$TMP/pre-bench" --b-bin "$TMP/cand-bench" \
-    --outdir "$TMP/fail-outdir" --pairs 3 --bench-wrap "$TMP/mock-wrap-fail4" || rc=$?
-[ "$rc" -eq 3 ] || { echo "FAIL: mid-arm failure returned $rc, want 3"; exit 1; }
+out=$(bash "$R" --arm b50-mistral --a-bin "$TMP/pre-bench" --b-bin "$TMP/cand-bench" \
+    --outdir "$TMP/fail-outdir" --pairs 3 --bench-wrap "$TMP/mock-wrap-fail4" 2>&1) || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: mid-arm failure returned $rc, want 3: $out"; exit 1; }
+grep -qF -- "mock-wrap-fail4: [EXPECTED] simulated failure on call 4" <<<"$out" \
+    || { echo "FAIL: mid-arm failure output missing the labeled EXPECTED stderr line: $out"; exit 1; }
 find "$TMP/fail-outdir" -maxdepth 1 -type f -printf '%f\n' | sort > "$TMP/fail-actual.txt"
 printf '%s\n' b50-mistral-1.log b50-mistral-pre-1.log b50-mistral-pre-2.log | sort > "$TMP/fail-expected.txt"
 diff "$TMP/fail-expected.txt" "$TMP/fail-actual.txt" || { echo "FAIL: mid-arm outdir contents wrong"; exit 1; }
