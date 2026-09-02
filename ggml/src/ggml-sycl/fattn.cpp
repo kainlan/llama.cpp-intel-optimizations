@@ -3844,6 +3844,26 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // supports_op admitted -- a genuine predicate disagreement in one of
     // the two admissibility helpers.
     if (D == 512) {
+        // llama.cpp-dyi3 ROUND 2 FIX: this whole D=512 branch (gemma4's
+        // global-attention layers; D=512 has no vec/XMX/ESIMD kernel in
+        // this fork, so it can NEVER reach fattn_esimd_f16) is a SEPARATE
+        // code path from ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> --
+        // ncols<D> is never instantiated for D=512 -- so it previously
+        // never went through dispatch_debug_kernel's observation, leaving
+        // ctx.fa_decode_kernel_obs blind to it. The graph-replay AUTO gate
+        // in ggml-sycl.cpp then saw "35 esimd_partitioned observations, 0
+        // other" from the SWA (D=256) layers alone and wrongly concluded
+        // the whole decode graph was replay-safe, engaging the graph while
+        // these 7 unverified D=512 (oneDNN or tile_d512) dispatches also
+        // ran inside it every token -- the oracle then failed (root cause
+        // still under investigation; see task comment log). Record here
+        // unconditionally so "every observed decode-shape FA dispatch
+        // reached esimd_partitioned" can no longer be true while any
+        // D=512 layer is live, regardless of which of the two routes
+        // below actually executes.
+        if (params.ne01 <= 1) {
+            ctx.fa_decode_kernel_obs.other_kernel_count++;
+        }
         // Latched once per process rather than a fresh getenv() on every
         // D=512 dispatch (spec review rev-dtpk-qual, F7: this branch is a
         // genuine hot path -- every D=512 layer of every token -- unlike
