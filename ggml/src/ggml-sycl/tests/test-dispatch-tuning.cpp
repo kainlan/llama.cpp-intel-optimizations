@@ -165,8 +165,7 @@ static bool test_mmvq_soa_mapping() {
 // branch and the mmq_ soa sub-branch. Ported so deleting the twin loses no coverage.
 static bool test_onednn_mapping() {
     TEST_BEGIN("onednn_woq_gemm winner maps to ONEDNN_AOS");
-    if (!winner_maps_to("onednn_woq_gemm", ggml_sycl_mul_mat_kernel::ONEDNN_AOS,
-                        "winner did not map to ONEDNN_AOS")) {
+    if (!winner_maps_to("onednn_woq_gemm", ggml_sycl_mul_mat_kernel::ONEDNN_AOS, "winner did not map to ONEDNN_AOS")) {
         return false;
     }
     TEST_PASS();
