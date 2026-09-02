@@ -63,3 +63,10 @@ rc=0; out=$(bash "$G" --build-ninja build/build.ninja --allowlist "$STRICT_ALLOW
 grep -qF "STRICT VIOLATION: allowlisted entry missing on disk" <<<"$out" \
     || { echo "FAIL: --strict did not report the missing-on-disk violation"; exit 1; }
 echo "strict-missing ok"
+# R4 refusal: --strict with a nonexistent allowlist file must fail closed
+# (rc==2) with its own distinct message, not silently skip strict checking
+# and fall through to the unrelated rc==1/rc==0 result of the main scan.
+rc=0; out=$(bash "$G" --build-ninja build/build.ninja --strict --allowlist "$TMP/no-such-allowlist.txt" 2>&1) || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: --strict with missing allowlist returned $rc, want 2"; exit 1; }
+grep -qF "STRICT requested but allowlist missing" <<<"$out" || { echo "FAIL: missing-allowlist case did not report the R4 message"; exit 1; }
+echo "r4-missing-allowlist ok"
