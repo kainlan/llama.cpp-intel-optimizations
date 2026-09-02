@@ -1513,31 +1513,51 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
 #if GGML_SYCL_DNNL
 // llama.cpp-gwno: extra headroom for onednn_graph_scratch_alloc() (the Graph
 // API SDPA allocator, unified_cache::onednn_graph_scratch_alloc/free above),
-// ADDITIVE on top of the primitive-API weights+activations pair below --
-// both can be resident in the ONEDNN zone at once, and the weights+
-// activations pair is not released between calls once grown large enough, so
-// this cannot be a max() of the two.
+// ADDITIVE on top of the primitive-API weights+activations pair below -- both
+// can be resident in the ONEDNN zone at once, and the weights+activations
+// pair is not released between calls once grown large enough, so this cannot
+// be a max() of the two.
 //
-// Unlike the weights+activations pair, N compiled-partition scratch buffers
-// can be concurrently outstanding within a single ubatch's graph: their
-// deferred frees are drained lazily by onednn_graph_scratch_alloc/free
-// itself, but only for completed events, and (separately) in bulk by
-// ggml_backend_sycl_synchronize() -- roughly once per ubatch, not once per
-// op. So the zone must hold the ubatch's PEAK concurrent demand, not one
-// buffer. There is no cheap, GPU-verifiable way from here to derive "how many
-// attention layers can be in flight simultaneously" per model/quant (that
-// would need the same structural (type, ne) classification zone-sizing.hpp
-// already does for the primitive-API pair, extended to a new consumer this
-// change does not attempt), so this is a flat, env-tunable floor rather than
-// a model-specific formula. Default 512 MiB comfortably covers S4's measured
-// ~12 MiB/layer x <=40 layers (jmc5 c-uxch). If the lead's uprobe
-// (zeMemAllocDevice count during the benchmark phase) is still nonzero after
-// this change, raise GGML_SYCL_ONEDNN_GRAPH_ZONE_MB rather than assuming the
-// allocator itself is unwired -- check the "did not fit the ONEDNN zone"
-// warning first (unified_cache::onednn_graph_scratch_alloc).
+// Sized for at most a HANDFUL of buffers outstanding, not the whole ubatch's
+// worth. That used to be the wrong mental model here: an earlier version of
+// this comment sized the floor for N compiled-partition scratch buffers
+// concurrently outstanding across a ubatch's 35 SDPA calls (512 MiB, for
+// "~12 MiB/layer x <=40 layers"). That was true only while
+// onednn_graph_scratch_free() deferred reclaiming a buffer until its
+// completion event fired -- it no longer does. Since the fix that dropped
+// the blocking event_complete() check from the zone-backed free path (see
+// unified_cache::onednn_graph_scratch_free()'s "in-order-queue" comment),
+// zone_free()/zone_alloc() are synchronous and immediate, so at most ~1
+// buffer is outstanding at a time in practice. Measured high-water
+// (onednn_graph_scratch_high_water_bytes(), logged once at cache teardown):
+// 12.0 MB on a B70 gemma4 pp512 run, 3.0 MB on a B50 two-model
+// (gemma4-Q8_0 + mistral-Q4_0) GGML_SYCL_STRICT_LEASES=1 run. Default 64 MiB
+// is ~5 buffers of headroom over the largest of those, not 40 layers' worth.
+//
+// The old 512 MiB default was not just wasteful, it was an active landing
+// blocker: a second model's load-time zone-growth request (weights+
+// activations pair 143.5 MB + this 512 MB floor = 655.5 MB) could exceed
+// what ensure_planned_arena_zones() can grow into while the FIRST model's
+// leases are still live and pinning the arena -- aborting with "[VRAM-ARENA]
+// planned zones exceed active arena but live allocations prevent rebuild"
+// on a two-model GGML_SYCL_STRICT_LEASES=1 run that passes on master (which
+// never needs this zone to grow at all). 64 MiB clears that same run with
+// rc=0 and margin (measured high-water on it: 3.0 MB).
+//
+// There is still no cheap, GPU-verifiable way to derive an exact
+// per-model/quant floor from this call site (that would need the same
+// structural (type, ne) classification zone-sizing.hpp already does for the
+// primitive-API pair, extended to a new consumer this change does not
+// attempt), so this stays a flat, env-tunable floor. If the lead's uprobe
+// (zeMemAllocDevice count during the benchmark phase) is nonzero, or a
+// two-model/strict-leases run aborts sizing the arena, check the "did not
+// fit the ONEDNN zone" warning first (unified_cache::onednn_graph_scratch_alloc)
+// before raising GGML_SYCL_ONEDNN_GRAPH_ZONE_MB back up -- a nonzero uprobe
+// count or a sizing abort means the zone genuinely doesn't fit this
+// workload's outstanding-buffer count, not that the allocator is unwired.
 static size_t onednn_graph_scratch_zone_floor_bytes() {
     static const size_t floor_bytes = [] {
-        size_t       mb  = 512;
+        size_t       mb  = 64;
         const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
         if (env && env[0] != '\0') {
             long parsed = std::atol(env);
