@@ -22,6 +22,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -270,6 +272,20 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
         // (resolve(1) needs a valid device_id to check against).
         fprintf(stderr, "  [NOTE] wrong-device resolve(1) skipped — fewer than 2 GPUs\n");
     } else {
+        // ⚠️ KNOWN-BROKEN on a real >=2-GPU run (llama.cpp-os9t, found while
+        // widening this test's registration for llama.cpp-9trn): this handle
+        // is HOST-PINNED (from unified_cache_host_zone_alloc(SCRATCH, ...)
+        // above), and mem_handle::resolve(int) deliberately skips the
+        // wrong-device check for non-device-resident pointers ("Host-pinned/
+        // host-mmap pointers are device-agnostic from the dispatcher's
+        // perspective" — mem-handle.cpp comment above resolve(int)). So
+        // resolve(1) legitimately returns the pointer here; the assertion
+        // below is unsound as written and fails whenever n_gpu_devices >= 2.
+        // It has never fired on this host because the registration pins a
+        // single device (level_zero:1), so n_gpu_devices is always < 2 here.
+        // Do not "fix" this by weakening mem_handle::resolve(int)'s check —
+        // that check is correct by design. See llama.cpp-os9t for the fix.
+        //
         // Wrong-device resolve must return null (explicit-fail policy).
         // handle's device_=0 != caller device_id=1, so the check fires and returns null.
         ggml_sycl::resolved_ptr r1 = chunk_slice.resolve(1);
@@ -839,9 +855,15 @@ int main(int argc, char ** argv) {
             all_passed &= test_arena_slice_generation_and_bounds(q);
             all_passed &= test_retention_transitions_and_exhaustion(q);
         } catch (const sycl::exception & e) {
+            // Not routed through the TEST_SKIP() macro (there is no live test_*()
+            // frame to call it from -- queue construction itself threw), so count
+            // it here: otherwise a queue failure on a >=2-GPU host could leave
+            // g_tests_skipped at 0 while two cases silently never ran.
+            g_tests_skipped++;
             fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
         }
     } else {
+        g_tests_skipped++;
         fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: no GPU device\n");
     }
 
@@ -851,6 +873,14 @@ int main(int argc, char ** argv) {
     if (!all_passed) {
         fprintf(stderr, "SOME TESTS FAILED\n");
         return 1;
+    }
+    if (g_tests_skipped > 0) {
+        // At least one case did not run -- this binary did not verify everything
+        // it could have (typically: fewer than 2 GPU devices visible under the
+        // current ONEAPI_DEVICE_SELECTOR). 77 is ctest's SKIP_RETURN_CODE, so a
+        // run like this reports as Skipped, never as Passed. See llama.cpp-9trn.
+        fprintf(stderr, "SKIP: %d case(s) did not run -- NOT verified.\n", g_tests_skipped);
+        return LLAMA_TEST_EXIT_SKIP;
     }
     fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;
