@@ -1804,19 +1804,20 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
-    # DECLINED, with reasons (llama.cpp-0igs).  Four sibling .py gates in this
-    # directory are deliberately left unregistered.  Registering them would put
-    # four permanently-red lines in ctest for reasons that are NOT code
-    # defects, and a suite with known-red lines in it stops being read.
+    # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
+    # directory that are deliberately left unregistered.  Registering them would
+    # put permanently-red lines in ctest for reasons that are NOT code defects,
+    # and a suite with known-red lines in it stops being read.
     #
     #   test-sycl-end-to-end-profiling-docs.py
     #   test-sycl-mxfp4-tg-speedup-docs.py
-    #       Both assert on files that HAVE NEVER EXISTED in this repository:
-    #       `research.md` at the root, and
+    #       DELETED (llama.cpp-zxlp).  Both asserted on files that HAVE NEVER
+    #       EXISTED in this repository: `research.md` at the root, and
     #       `activation/sycl-mxfp4-tg-speedup-final-review-20260707.md`.
-    #       `git log --all --` on either path returns nothing, so these are not
-    #       deleted artifacts, they were never committed.  Unpassable as
-    #       written; they need rewriting or removing, not registering.
+    #       `git log --all --` on either path returned nothing, so they were not
+    #       deleted artifacts, they were never committed (and no renamed
+    #       in-tree equivalent was found).  Unpassable as written, so removed
+    #       rather than registered; the deletion commit carries the reasoning.
     #
     #   test-sycl-moe-multirhs-gateup-source.py
     #       Asserts the literal "multi_rhs_gateup = false".  The field IS
@@ -1833,7 +1834,7 @@ if (NOT WIN32)
     #       strings moved out of the section the test slices.
     #
     # All four were RUN, not guessed: 62 of the 66 unregistered pytest-style
-    # files in tests/ pass, and these are the 4 that do not.
+    # files in tests/ passed, and these were the 4 that did not.
 endif()
 
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
