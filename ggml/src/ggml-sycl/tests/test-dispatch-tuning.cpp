@@ -99,8 +99,9 @@ static bool test_unified_matmul_mapping() {
     return true;
 }
 
-// Shared body for the mmvq cases: the winner string is the only variable, so a
-// difference in outcome can only come from the winner parser.
+// Shared body for the winner-mapping cases: the winner string is the only
+// variable, so a difference in outcome can only come from the winner parser.
+// (The quant/dims in the fixture are irrelevant to map_winner_to_kernel().)
 static bool mmvq_winner_maps_to(const std::string &      winner,
                                 ggml_sycl_mul_mat_kernel expected,
                                 const char *             mismatch_msg) {
@@ -158,11 +159,35 @@ static bool test_mmvq_soa_mapping() {
     return true;
 }
 
+// The two assertions the unregistered repo-root twin (tests/test-dispatch-tuning.cpp,
+// deleted under llama.cpp-la7d) carried that this file did not: the onednn_ prefix
+// branch and the mmq_ soa sub-branch. Ported so deleting the twin loses no coverage.
+static bool test_onednn_mapping() {
+    TEST_BEGIN("onednn_woq_gemm winner maps to ONEDNN_AOS");
+    if (!mmvq_winner_maps_to("onednn_woq_gemm", ggml_sycl_mul_mat_kernel::ONEDNN_AOS,
+                             "winner did not map to ONEDNN_AOS")) {
+        return false;
+    }
+    TEST_PASS();
+    return true;
+}
+
+static bool test_mmq_soa_mapping() {
+    TEST_BEGIN("mmq_soa winner maps to MMQ_SOA");
+    if (!mmvq_winner_maps_to("mmq_soa", ggml_sycl_mul_mat_kernel::MMQ_SOA, "winner did not map to MMQ_SOA")) {
+        return false;
+    }
+    TEST_PASS();
+    return true;
+}
+
 int main() {
     bool ok = true;
     ok = test_unified_matmul_mapping() && ok;
     ok = test_mmvq_coalesced_mapping() && ok;
     ok = test_mmvq_soa_mapping() && ok;
+    ok = test_onednn_mapping() && ok;
+    ok = test_mmq_soa_mapping() && ok;
 
     if (!ok || g_tests_passed != g_tests_run) {
         fprintf(stderr, "\n[TEST SUMMARY] %d/%d tests passed\n", g_tests_passed, g_tests_run);

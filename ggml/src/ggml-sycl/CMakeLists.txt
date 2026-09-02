@@ -1532,7 +1532,10 @@ set(SYCL_LINK_ONLY_TEST_OPTIONS
 # the production definitions -- it needs -fsycl and the SYCL include dir, which
 # this target deliberately lacked, but no extra link dependency.
 
-# unified_matmul winners map to the orchestrator entrypoint. Host-only.
+# Winner-string -> kernel mapping for the dispatch-tuning JSON loader:
+# unified_matmul, mmvq_coalesced/mmvq_soa, onednn_*, mmq_soa (llama.cpp-bqtu,
+# llama.cpp-la7d). Host-only. The repo-root tests/test-dispatch-tuning.cpp twin
+# was an unregistered duplicate and is gone (llama.cpp-la7d).
 add_executable(test-sycl-dispatch-tuning
     tests/test-dispatch-tuning.cpp
     dispatch-tuning.cpp
