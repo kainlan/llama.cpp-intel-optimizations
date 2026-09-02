@@ -26,12 +26,27 @@
 //
 // Notes for future modifiers:
 //
-//   * Budget is 16 MB per test, not 1 MB.  The unified_cache's VRAM arena
-//     reserves ~1 GB of minimum zones (scratch+runtime+oneDNN) up-front,
-//     so very small budgets push entries to host-pinned where the evict
-//     path is quieter and the test loses coverage.  16 MB is large enough
-//     that `malloc_device_raw` at unified-cache.cpp:1852 is exercised and
-//     the entries land on device.
+//   * Budget is 16 MB for the per-entry cases (not 1 MB): 16 MB is large
+//     enough that `malloc_device_raw` at unified-cache.cpp:1852 is
+//     exercised and the entries land on device.  This is NOT the same
+//     thing as reserving the VRAM arena -- at 16 MB the arena is not
+//     reserved at all: arena_reserve()'s single-chunk admission check
+//     (unified-cache.cpp ~19222-19236, refusal logged at :19231) requires
+//     alloc_size >= tail_bytes (oneDNN+RUNTIME+SCRATCH zone bytes) +
+//     k_min_shared_bytes (16 MB), and default tail_bytes alone is already
+//     ~1280 MB, so a 16 MB cache always falls back to per-entry allocation
+//     with no arena at all (`arena_active()` false) -- it does not become
+//     an active arena with small zones.  A prior version of this note
+//     claimed the opposite ("reserves ~1 GB up-front ... small budgets
+//     push entries to host-pinned") and that false premise produced a
+//     test that could never execute (see the arena chunk-lease case's own
+//     block comment for the incident).
+//     test_in_flight_kernel_arena_chunk_lease_blocks_replan and
+//     test_device_publication_fault_phases are the two cases in this file
+//     that actually need an active arena;
+//     both size their budget (or pin GGML_SYCL_COMPUTE_ARENA_MB /
+//     GGML_SYCL_RUNTIME_ARENA_MB down first) against that same admission
+//     floor -- see their own comments for the exact arithmetic each uses.
 //
 //   * After `cache.ensure_cached()`, entries start in state IN_PROGRESS
 //     (unified-cache.cpp:1908) while the H2D copy event drains.
@@ -110,9 +125,9 @@ static int g_tests_skipped = 0;
 // was not a completed run of the case's logic -- so "N run, M passed,
 // K skipped" always satisfies N == M + (failures) with skips counted
 // separately, matching test-mem-handle-wrong-device.cpp's TEST_SKIP.
-#define TEST_SKIP(reason)                        \
-    do {                                         \
-        g_tests_skipped++;                       \
+#define TEST_SKIP(reason)                         \
+    do {                                          \
+        g_tests_skipped++;                        \
         g_tests_run--;                            \
         fprintf(stderr, "SKIPPED: %s\n", reason); \
         return true;                              \
@@ -1439,34 +1454,48 @@ static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
 //      budget: arena_reserve()'s single-chunk admission check (unified-
 //      cache.cpp ~19222-19236) refuses unless
 //        alloc_size >= tail_bytes + k_min_shared_bytes
-//      where tail_bytes = oneDNN + RUNTIME + SCRATCH zone bytes (defaults
-//      256 + 512 + 512 MB unless GGML_SYCL_ONEDNN/RUNTIME/COMPUTE_ARENA_MB
-//      override them) and k_min_shared_bytes = 16 MB -- i.e. roughly
-//      1296 MB, not this file's usual 16 MB per-entry-cache budget (the
-//      N-chunk fallback at ~19348/~19367-19372 refuses on the same shape
-//      of arithmetic against per_chunk_cap).  A prior version of this case
-//      used the 16 MB budget and silently [SKIP]ped on every run as a
-//      result -- caught in spec review.  budget below is sized with ~750 MB
-//      of headroom over that ~1296 MB floor (live zone sizes are read back
-//      via zone_capacity() rather than assumed, so this also tolerates an
-//      externally-set GGML_SYCL_*_ARENA_MB or a planner-raised oneDNN
-//      zone).  arena_active() is asserted, not skipped, below: with this
-//      budget a false reading is a test bug, not an environment condition.
+//      where tail_bytes = oneDNN + RUNTIME + SCRATCH zone bytes and
+//      k_min_shared_bytes = 16 MiB.  At production defaults (256 + 512 +
+//      512 MiB) that floor is ~1296 MiB, which a small per-entry-cache
+//      budget was never going to clear -- an earlier version of this case
+//      used exactly that shape and silently [SKIP]ped on every run as a
+//      result (caught in spec review).  This case instead pins
+//      GGML_SYCL_COMPUTE_ARENA_MB=1 and GGML_SYCL_RUNTIME_ARENA_MB=1
+//      before construction, mirroring test_device_publication_fault_phases
+//      (:653-682): oneDNN has no env override in ensure_planned_arena_zones()
+//      (only a planner-raise upward from its 256 MiB floor, which nothing
+//      in this standalone binary triggers), so with both pinned,
+//      tail_bytes = 1 + 256 + 1 = 258 MiB and the admission floor is
+//      258 + 16 = 274 MiB -- a 512 MiB budget (the same value that sibling
+//      test uses) clears it with margin.  512 MiB also keeps this case in
+//      the single-chunk admission arm specifically: try_single_chunk is
+//      alloc_size <= per_chunk_cap (unified-cache.cpp ~19151/19164-19166,
+//      per_chunk_cap = 0.95 x max_mem_alloc_size, on the order of >1 GiB on
+//      this fork's hardware), and 512 MiB is comfortably under that. The
+//      OTHER arm (N-chunk, engaged when alloc_size > per_chunk_cap) has its
+//      own, different admission check -- per_chunk_cap >= tail_bytes +
+//      k_min_shared_bytes (~19348, refusal at ~19367-19372) -- which this
+//      budget never has to clear because it never reaches that arm.
+//      arena_active() is asserted after construction; see that assertion's
+//      message for the environment conditions (not just a test bug) that
+//      can legitimately make it false.
 //   2. arena_acquire_chunk_lease(base) leases that chunk; submit a kernel
 //      that spins on a host-USM gate, then reads a few bytes at the base
 //      pointer into an output buffer -- proof the chunk is in use by
 //      in-flight device work, mirroring the WEIGHT-lease kernel.
-//   3. Raise GGML_SYCL_RUNTIME_ARENA_MB by 1 MB over THIS cache's own
-//      current zone_capacity(RUNTIME) -- independent of whatever any
-//      earlier case in this binary already left in the environment, and
-//      deliberately a 1 MB step rather than a large one: the positive
-//      control in step 5 re-runs arena_reserve() at this raised target
-//      after arena_destroy(), so it is bound by the SAME admission
-//      arithmetic as step 1 (tail_bytes + k_min_shared_bytes <= budget) --
-//      a large step could blow that budget and turn the positive control
-//      red for a reason unrelated to the lease.  Then call
-//      ensure_planned_arena_zones() again while the chunk lease (and the
-//      kernel) are still live: must return false (refused).
+//   3. Re-pin GGML_SYCL_COMPUTE_ARENA_MB=1 (restored to its external value
+//      right after construction, per step 1 -- see the code comment where
+//      it is re-pinned for why) and raise GGML_SYCL_RUNTIME_ARENA_MB by
+//      1 MB over THIS cache's own current zone_capacity(RUNTIME) --
+//      independent of whatever any earlier case in this binary already
+//      left in the environment, and deliberately a 1 MB step rather than a
+//      large one: the positive control in step 5 re-runs arena_reserve()
+//      at this raised target after arena_destroy(), so it is bound by the
+//      SAME admission arithmetic as step 1 (tail_bytes + k_min_shared_bytes
+//      <= budget) -- a large step could blow that budget and turn the
+//      positive control red for a reason unrelated to the lease.  Then
+//      call ensure_planned_arena_zones() again while the chunk lease (and
+//      the kernel) are still live: must return false (refused).
 //   4. Open the gate; wait the event; release the chunk lease.
 //   5. Call ensure_planned_arena_zones() again with the same raised target:
 //      must now return true -- the positive control showing step 3's refusal
@@ -1480,15 +1509,44 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
             "memory_scope::system not in atomic_memory_scope_capabilities)");
     }
 
-    // See the block comment above for the arena_reserve() admission
-    // arithmetic this budget must clear (~1296 MB floor with default zone
-    // sizes); 2048 MB leaves ~750 MB of margin.
-    constexpr size_t         budget     = 2048ull * 1024 * 1024;
+    // Pin the SAME small-zone geometry test_device_publication_fault_phases
+    // uses (:653-682); see the block comment above for the admission
+    // arithmetic this achieves (~274 MiB floor against a 512 MiB budget,
+    // single-chunk arm).  Captured once and reused for BOTH restore points
+    // below (immediately after construction, and again at the end of this
+    // function after the replan section re-pins them).
+    const char *      old_compute   = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    const char *      old_runtime   = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB");
+    const bool        had_compute   = old_compute != nullptr;
+    const bool        had_runtime   = old_runtime != nullptr;
+    const std::string saved_compute = old_compute ? old_compute : "";
+    const std::string saved_runtime = old_runtime ? old_runtime : "";
+#if defined(_WIN32)
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", "1");
+    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", "1");
+#else
+    setenv("GGML_SYCL_COMPUTE_ARENA_MB", "1", 1);
+    setenv("GGML_SYCL_RUNTIME_ARENA_MB", "1", 1);
+#endif
+    constexpr size_t         budget     = 512ull * 1024 * 1024;
     const uint32_t           spin_bound = kInFlightKernelSpinBound;
     ggml_sycl::unified_cache cache(q, budget);
+#if defined(_WIN32)
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", had_compute ? saved_compute.c_str() : "");
+    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", had_runtime ? saved_runtime.c_str() : "");
+#else
+    had_compute ? (void) setenv("GGML_SYCL_COMPUTE_ARENA_MB", saved_compute.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    had_runtime ? (void) setenv("GGML_SYCL_RUNTIME_ARENA_MB", saved_runtime.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_RUNTIME_ARENA_MB");
+#endif
     TEST_ASSERT(cache.arena_active(),
-                "arena must be active at this budget (see the admission arithmetic in the block comment above); "
-                "a false reading here is a test bug, not an environment condition");
+                "arena must be active with COMPUTE/RUNTIME pinned to 1 MiB and a 512 MiB budget (see the "
+                "admission arithmetic in the block comment above); a false reading here is not necessarily a "
+                "test bug -- it can legitimately mean less than ~280 MiB of free VRAM (below the ~274 MiB "
+                "admission floor), or GGML_SYCL_VRAM_ARENA=0 in the environment (ensure_planned_arena_zones() "
+                "then returns true without reserving anything, unified-cache.cpp ~3508-3510, leaving "
+                "arena_active() false)");
 
     void * arena_ptr = cache.arena_base();
     TEST_ASSERT(arena_ptr != nullptr, "an active arena must have a base pointer");
@@ -1508,7 +1566,7 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
     *gate = 0;
     q.memset(out, 0, 2 * sizeof(uint32_t)).wait();
 
-    constexpr size_t      read_bytes  = 4096;  // arbitrary "in use" touch, well inside the ~1GB+ default arena
+    constexpr size_t      read_bytes  = 4096;  // arbitrary "in use" touch, well inside the reserved arena
     const unsigned char * data        = static_cast<const unsigned char *>(arena_ptr);
     const auto            submit_time = std::chrono::steady_clock::now();
     sycl::event           ev          = q.submit([&](sycl::handler & h) {
@@ -1529,25 +1587,38 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
         });
     });
 
-    // Force the next ensure_planned_arena_zones() call to see insufficient
-    // zones regardless of what any earlier case in this binary left in the
-    // environment: target strictly above THIS cache's own current RUNTIME
-    // zone capacity, not a hardcoded absolute value.  +1 MB, not a larger
-    // step: see the block comment above this function -- the positive
-    // control at step 5 must clear the SAME tail_bytes + k_min_shared_bytes
-    // <= budget admission check this cache's own construction did, and a
-    // large step risks failing that arithmetic against `budget` for a
-    // reason unrelated to the lease.
-    const size_t      current_runtime_mb = cache.zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) / (1024 * 1024);
-    const size_t      target_runtime_mb  = current_runtime_mb + 1;
-    const char *      old_runtime_env    = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB");
-    const bool        had_runtime_env    = old_runtime_env != nullptr;
-    const std::string saved_runtime_env  = old_runtime_env ? old_runtime_env : "";
-    char              target_buf[32];
+    // current_runtime_mb reads the cache's own COMMITTED zone capacity, not
+    // the environment -- unaffected by the restore-then-re-pin sequence
+    // around it, so this read is safe regardless of ordering.  Restoring
+    // GGML_SYCL_RUNTIME_ARENA_MB to its external value happened above,
+    // right after construction; the target below is computed against the
+    // live value read here, then the env var is re-pinned (see the setenv
+    // block just below) before ensure_planned_arena_zones() is called
+    // again.
+    //
+    // +1 MB, not a larger step: see the block comment above this function
+    // -- the positive control at step 5 must clear the SAME
+    // tail_bytes + k_min_shared_bytes <= budget admission check this
+    // cache's own construction did, and a large step risks failing that
+    // arithmetic against `budget` for a reason unrelated to the lease.
+    //
+    // Re-pin GGML_SYCL_COMPUTE_ARENA_MB=1 here too, not just RUNTIME:
+    // ensure_planned_arena_zones() re-reads BOTH env vars fresh on every
+    // call (verified, not cached), so leaving COMPUTE at its restored
+    // external value would mean this call sees the default 512 MiB
+    // scratch zone instead of the 1 MiB this cache was actually built
+    // with -- inflating tail_bytes past what the 512 MiB budget can admit
+    // and turning the positive control in step 5 red for a reason that has
+    // nothing to do with the chunk lease.
+    const size_t current_runtime_mb = cache.zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) / (1024 * 1024);
+    const size_t target_runtime_mb  = current_runtime_mb + 1;
+    char         target_buf[32];
     std::snprintf(target_buf, sizeof(target_buf), "%zu", target_runtime_mb);
 #if defined(_WIN32)
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", "1");
     _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", target_buf);
 #else
+    setenv("GGML_SYCL_COMPUTE_ARENA_MB", "1", 1);
     setenv("GGML_SYCL_RUNTIME_ARENA_MB", target_buf, 1);
 #endif
 
@@ -1591,12 +1662,17 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
 
     const bool replanned_after_release = cache.ensure_planned_arena_zones();
 
-    // Restore the environment for later cases in this binary.
+    // Restore both env vars to their external values for later cases in
+    // this binary (the same had_compute/saved_compute/had_runtime/
+    // saved_runtime captured before construction above).
 #if defined(_WIN32)
-    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", had_runtime_env ? saved_runtime_env.c_str() : "");
+    _putenv_s("GGML_SYCL_COMPUTE_ARENA_MB", had_compute ? saved_compute.c_str() : "");
+    _putenv_s("GGML_SYCL_RUNTIME_ARENA_MB", had_runtime ? saved_runtime.c_str() : "");
 #else
-    had_runtime_env ? (void) setenv("GGML_SYCL_RUNTIME_ARENA_MB", saved_runtime_env.c_str(), 1) :
-                      (void) unsetenv("GGML_SYCL_RUNTIME_ARENA_MB");
+    had_compute ? (void) setenv("GGML_SYCL_COMPUTE_ARENA_MB", saved_compute.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_COMPUTE_ARENA_MB");
+    had_runtime ? (void) setenv("GGML_SYCL_RUNTIME_ARENA_MB", saved_runtime.c_str(), 1) :
+                  (void) unsetenv("GGML_SYCL_RUNTIME_ARENA_MB");
 #endif
 
     TEST_ASSERT(host_side_latency < std::chrono::seconds(5),
