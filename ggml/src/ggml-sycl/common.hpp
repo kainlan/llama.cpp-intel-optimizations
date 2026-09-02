@@ -6730,23 +6730,77 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
-    // llama.cpp-dyi3: OBSERVED (not predicted) FA-kernel-family selection
-    // for decode-shape (ne01<=1) FLASH_ATTN_EXT dispatches, updated by the
-    // real dispatcher in fattn.cpp (ggml_sycl_flash_attn_ext_dispatch_ncols's
-    // dispatch_debug_kernel lambda) every time it selects a kernel. The
-    // SYCL-graph gate reads this instead of re-deriving eligibility from
-    // tensor shape in a second, independently-maintained classifier --
-    // "one check, one authority" (see the file's own dkw0/one-check-cannot-
-    // serve-two-authorities lesson). Monotonic and never reset: once any
-    // non-ESIMD-partitioned kernel is observed for a decode-shape FA op,
-    // auto-engagement stays disabled for the rest of this context's life
-    // (fail closed), matching FA graph replay having been verified only for
-    // the ESIMD partitioned decode kernel family.
+    // llama.cpp-dyi3/86a7: OBSERVED (not predicted) FA-kernel-family
+    // selection for decode-shape (ne01<=1) FLASH_ATTN_EXT dispatches,
+    // updated by the real dispatcher in fattn.cpp every time it selects a
+    // kernel (ggml_sycl_flash_attn_ext_dispatch_ncols's dispatch_debug_kernel
+    // lambda for D<=256; the D==512 branch's own two dispatch exit points
+    // for D=512). The SYCL-graph gate reads this instead of re-deriving
+    // eligibility from tensor shape in a second, independently-maintained
+    // classifier -- "one check, one authority" (see the file's own dkw0/
+    // one-check-cannot-serve-two-authorities lesson). Monotonic and never
+    // reset: once any kernel outside the verified-safe set below is
+    // observed for a decode-shape FA op, auto-engagement stays disabled for
+    // the rest of this context's life (fail closed).
+    //
+    // llama.cpp-86a7: this is a POSITIVE ALLOWLIST of individually-verified
+    // kernel families, not a threshold or a count of exceptions. Adding a
+    // newly-verified kernel means adding an enumerator here and a
+    // classification case in classify() below -- an unrecognized kernel
+    // name (a real future kernel this task never looked at, or a typo)
+    // falls to OTHER and correctly keeps AUTO disabled, the same
+    // fail-closed default as before either family existed in this set.
     struct fa_decode_kernel_observation {
+        enum class kernel_family : uint8_t {
+            // Native ESIMD kernel, D<=256 decode -- llama.cpp-dyi3's original verified route.
+            ESIMD_PARTITIONED,
+            // Native tile_d512 kernel, D=512 decode (gemma4 global-attention layers) -- llama.cpp-86a7:
+            // same graph-safe launch idiom as ESIMD_PARTITIONED (no wait()/malloc at submission, pointer
+            // resolution via the shared graph-input-staging mechanism in fattn.cpp), verified individually
+            // rather than inherited from D<=256's clearance.
+            D512_TILE,
+            // Anything else (oneDNN SDPA, VEC safe-decode, XMX, ...): unverified, keeps auto-engagement
+            // disabled.
+            OTHER,
+        };
+
         uint64_t esimd_partitioned_count = 0;
+        uint64_t d512_tile_count         = 0;
         uint64_t other_kernel_count      = 0;
 
-        bool all_esimd_partitioned() const { return esimd_partitioned_count > 0 && other_kernel_count == 0; }
+        static kernel_family classify(const char * kernel) {
+            if (std::strcmp(kernel, "esimd_f16") == 0) {
+                return kernel_family::ESIMD_PARTITIONED;
+            }
+            if (std::strcmp(kernel, "d512_tile") == 0) {
+                return kernel_family::D512_TILE;
+            }
+            return kernel_family::OTHER;
+        }
+
+        // Classify and record in one call so every observation site shares
+        // exactly one classifier -- see the "one check, one authority" note
+        // above.
+        void observe(const char * kernel) {
+            switch (classify(kernel)) {
+                case kernel_family::ESIMD_PARTITIONED:
+                    esimd_partitioned_count++;
+                    break;
+                case kernel_family::D512_TILE:
+                    d512_tile_count++;
+                    break;
+                case kernel_family::OTHER:
+                    other_kernel_count++;
+                    break;
+            }
+        }
+
+        // True once at least one decode-shape FA dispatch has been observed
+        // and every one of them reached a kernel in the verified-safe
+        // allowlist above.
+        bool all_verified_safe() const {
+            return (esimd_partitioned_count + d512_tile_count) > 0 && other_kernel_count == 0;
+        }
     };
     fa_decode_kernel_observation fa_decode_kernel_obs;
 

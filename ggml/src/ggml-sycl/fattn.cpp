@@ -2580,11 +2580,7 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
         // independently-derived eligibility classifier that could drift
         // from this dispatcher's real decisions.
         if (ne01 <= 1) {
-            if (std::strcmp(kernel, "esimd_f16") == 0) {
-                ctx.fa_decode_kernel_obs.esimd_partitioned_count++;
-            } else {
-                ctx.fa_decode_kernel_obs.other_kernel_count++;
-            }
+            ctx.fa_decode_kernel_obs.observe(kernel);
         }
         if (dispatch_debug_enabled) {
             // ne11 (KV length) and the mask extents are the shape terms that
@@ -3846,26 +3842,39 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // supports_op admitted -- a genuine predicate disagreement in one of
     // the two admissibility helpers.
     if (D == 512) {
-        // llama.cpp-dyi3 ROUND 2 FIX: this whole D=512 branch (gemma4's
-        // global-attention layers; D=512 has no vec/XMX/ESIMD kernel in
-        // this fork, so it can NEVER reach fattn_esimd_f16) is a SEPARATE
-        // code path from ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> --
-        // ncols<D> is never instantiated for D=512 -- so it previously
-        // never went through dispatch_debug_kernel's observation, leaving
-        // ctx.fa_decode_kernel_obs blind to it. The graph-replay AUTO gate
-        // in ggml-sycl.cpp then saw "35 esimd_partitioned observations, 0
-        // other" from the SWA (D=256) layers alone and wrongly concluded
-        // the whole decode graph was replay-safe, engaging the graph while
-        // these 7 unverified D=512 (oneDNN or tile_d512) dispatches also
-        // ran inside it every token -- the oracle then failed (root cause
-        // still under investigation; see task comment log). Record here
-        // unconditionally so "every observed decode-shape FA dispatch
-        // reached esimd_partitioned" can no longer be true while any
-        // D=512 layer is live, regardless of which of the two routes
-        // below actually executes.
-        if (params.ne01 <= 1) {
-            ctx.fa_decode_kernel_obs.other_kernel_count++;
-        }
+        // llama.cpp-dyi3 ROUND 2 FIX / llama.cpp-86a7: this whole D=512
+        // branch (gemma4's global-attention layers; D=512 has no vec/XMX/
+        // ESIMD kernel in this fork, so it can NEVER reach fattn_esimd_f16)
+        // is a SEPARATE code path from
+        // ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> -- ncols<D> is
+        // never instantiated for D=512 -- so it previously never went
+        // through dispatch_debug_kernel's observation, leaving
+        // ctx.fa_decode_kernel_obs blind to it. Round 2 closed that blind
+        // spot with an unconditional "record other_kernel_count++
+        // regardless of which route runs" -- correct for its original
+        // purpose (stop AUTO from trusting an unseen route based on the
+        // SWA D=256 layers alone; the oracle failure that motivated it is
+        // root-caused now, dyi3 round 6, and was unrelated to D=512), but
+        // too coarse to ever let D=512 into the allowlist.
+        //
+        // llama.cpp-86a7 replaces it with a route-AWARE observation,
+        // recorded AFTER dispatch at each of this branch's two successful
+        // exit points below, classified by fa_decode_kernel_observation::
+        // observe() the same way dispatch_debug_kernel already does for
+        // D<=256. tile_d512 is a native kernel using the identical
+        // graph-safe launch idiom already trusted for esimd_partitioned (no
+        // wait()/malloc at submission, pointer resolution via the shared
+        // graph-input-staging mechanism above), verified individually and
+        // added to the allowlist by name ("d512_tile"). The oneDNN exit
+        // stays classified as OTHER (unverified) even though it structurally
+        // cannot be reached at ne01<=1 today -- fattn-onednn.cpp rejects any
+        // decode-shape dispatch via BELOW_MIN_NCOLS before its own
+        // g_ggml_sycl_graph_recording self-exclusion is even reached -- because
+        // GGML_SYCL_FA_ONEDNN_MIN_NCOLS=0 can lift that floor, and oneDNN's
+        // decode/recording interaction has not been individually verified;
+        // an unknown future path through it must still exclude, not
+        // silently inherit tile_d512's clearance.
+        const bool        d512_observe                = params.ne01 <= 1;
         // Latched once per process rather than a fresh getenv() on every
         // D=512 dispatch (spec review rev-dtpk-qual, F7: this branch is a
         // genuine hot path -- every D=512 layer of every token -- unlike
@@ -3883,6 +3892,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             if (plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT ||
                 plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
                 if (ggml_sycl_flash_attn_ext_onednn(ctx, params)) {
+                    if (d512_observe) {
+                        ctx.fa_decode_kernel_obs.observe("onednn_d512");
+                    }
                     if (d512_dispatch_debug_enabled) {
                         fprintf(stderr,
                                 "[SYCL] fattn selected [d512] onednn D=%d ne01=%d ne11=%d H_q=%d H_kv=%d "
@@ -3936,6 +3948,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                     (double) params.logit_softcap);
             }
             launch_fattn_tile_d512<false>(params, stream);
+            if (d512_observe) {
+                ctx.fa_decode_kernel_obs.observe("d512_tile");
+            }
             if (d512_dispatch_debug_enabled) {
                 fprintf(stderr, "[SYCL] fattn selected [d512] tile_d512 D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D,
                         params.ne01, params.ne11, params.ne02, params.ne12);

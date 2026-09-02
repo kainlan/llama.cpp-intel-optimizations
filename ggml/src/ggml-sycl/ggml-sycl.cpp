@@ -100510,16 +100510,21 @@ normal_dispatch:
 
     const bool decode_has_flash_attn_ext = cached_is_decode && ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT);
     if (use_sycl_graph && decode_has_flash_attn_ext) {
-        // llama.cpp-dyi3: default-engage the graph for FA, but ONLY when
-        // every decode-shape FA dispatch this context has observed reached
-        // the ESIMD partitioned decode kernel -- the sole kernel family this
-        // task verified replay-safe (dynamic mask/idx refresh, drift
-        // detector dims-checks mask+sinks; see task comment c-wbw9). Any
-        // other observed kernel (oneDNN SDPA, tile_d512, VEC safe-decode,
-        // XMX, ...) keeps the exclusion, same as before this task, unless
-        // explicitly forced with GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1.
-        const ggml_sycl_fa_graph_allow_mode allow_mode         = ggml_sycl_flash_attn_graph_allow_mode();
-        const bool                          observed_all_esimd = sycl_ctx->fa_decode_kernel_obs.all_esimd_partitioned();
+        // llama.cpp-dyi3/86a7: default-engage the graph for FA, but ONLY
+        // when every decode-shape FA dispatch this context has observed
+        // reached a kernel in the verified-safe allowlist --
+        // fa_decode_kernel_observation::kernel_family (common.hpp):
+        // ESIMD_PARTITIONED (dyi3's original verified route; dynamic
+        // mask/idx refresh, drift detector dims-checks mask+sinks; see task
+        // comment c-wbw9) and D512_TILE (gemma4's D=512 global-attention
+        // layers, verified individually in llama.cpp-86a7 -- same
+        // graph-safe launch idiom as ESIMD_PARTITIONED, oneDNN structurally
+        // excluded from decode entirely). Any other observed kernel (oneDNN
+        // SDPA outside decode's reach, VEC safe-decode, XMX, ...) keeps the
+        // exclusion, same as before this task, unless explicitly forced
+        // with GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1.
+        const ggml_sycl_fa_graph_allow_mode allow_mode = ggml_sycl_flash_attn_graph_allow_mode();
+        const bool observed_all_verified_safe          = sycl_ctx->fa_decode_kernel_obs.all_verified_safe();
         // Coverage guard only needs to run before a (re-)record decision --
         // once exec_graph exists, replay-time correctness for this call is
         // already governed by graph_fa_ptrs_match's pointer+shape drift
@@ -100527,22 +100532,27 @@ normal_dispatch:
         // plus the standard input-refresh mechanism, so re-scanning every
         // node on the steady-state replay hot path would be pure overhead.
         const bool coverage_ok = sycl_ctx->exec_graph != nullptr || ggml_sycl_fa_mask_sinks_refresh_safe(cgraph);
-        const bool engage      = allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
-                            (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO && observed_all_esimd && coverage_ok);
+        const bool engage =
+            allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
+            (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO && observed_all_verified_safe && coverage_ok);
         if (!engage) {
             const bool               has_moe_ops = ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
             static std::atomic<bool> logged{ false };
             if (!logged.exchange(true, std::memory_order_acq_rel)) {
                 GGML_LOG_INFO(
                     "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of SYCL command "
-                    "graphs (mode=%s observed_all_esimd=%d coverage_ok=%d esimd=%llu other=%llu). Verified "
-                    "replay-safe only for the ESIMD partitioned decode kernel; set "
-                    "GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 to force other shapes for controlled diagnostics, or =0 to "
-                    "force this off.\n",
+                    "graphs (mode=%s observed_all_verified_safe=%d coverage_ok=%d esimd_partitioned=%llu "
+                    "d512_tile=%llu other=%llu%s). Verified replay-safe only for the ESIMD-partitioned and "
+                    "D512-tile decode kernels; set GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 to force other shapes for "
+                    "controlled diagnostics, or =0 to force this off.\n",
                     allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_OFF ? "force-off" : "auto",
-                    (int) observed_all_esimd, (int) coverage_ok,
+                    (int) observed_all_verified_safe, (int) coverage_ok,
                     (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count,
-                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.other_kernel_count);
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.d512_tile_count,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.other_kernel_count,
+                    sycl_ctx->fa_decode_kernel_obs.other_kernel_count > 0 ?
+                        " -- the 'other' family is what is blocking engagement here" :
+                        "");
             }
             if (has_moe_ops) {
                 sycl_ctx->moe_graph_rerecord = true;
@@ -100554,9 +100564,10 @@ normal_dispatch:
             if (!logged_auto.exchange(true, std::memory_order_acq_rel)) {
                 GGML_LOG_INFO(
                     "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; engaging SYCL command graph replay "
-                    "(GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=auto observed esimd_partitioned=%llu, no other kernel "
-                    "seen)\n",
-                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count);
+                    "(GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=auto observed esimd_partitioned=%llu d512_tile=%llu, no "
+                    "other kernel seen)\n",
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.d512_tile_count);
             }
         }
     }
