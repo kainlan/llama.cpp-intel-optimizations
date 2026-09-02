@@ -1889,6 +1889,13 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmvq-event-duration-guard.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
 
     # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
     # directory that are deliberately left unregistered.  Registering them would
