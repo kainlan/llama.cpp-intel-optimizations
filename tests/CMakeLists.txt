@@ -686,7 +686,6 @@ endif()
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
-
 # NOTE (llama.cpp-u7vj): this test used to pin GGML_SYCL_DISABLE_GRAPH=1 here.
 # That pin was a workaround for a production defect, and the comment justifying
 # it blamed the wrong mechanism -- it read as though graph replay itself held
@@ -711,8 +710,13 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 # full-sweep form excludes `-LE 'residency|mem-handle|cache'` and runs that
 # family serially -- an unlabelled model-loading test slips past that filter.
 # The selector pin is what keeps the iGPU out of the run (llama.cpp-403s).
-# Guarded by GGML_SYCL (precedent: test-sycl-model-lifecycle-hooks below) so a
-# CPU-only build does not register a test that can only pass vacuously.
+# Guarded by GGML_SYCL so a build without the SYCL backend compiled in never
+# tries to build/register this test at all (precedent:
+# test-sycl-model-lifecycle-hooks below). That is all this CMake guard claims:
+# a SYCL build that enumerates no GPU device, or whose backend init silently
+# falls back to CPU, is instead caught at RUNTIME by the
+# llama_supports_gpu_offload() check inside the test itself, which exits 77
+# (skip) rather than passing vacuously.
 if (GGML_SYCL)
     llama_build_and_test(test-sycl-two-context-ownership.cpp ARGS "${MODEL_DEST}" -ngl 99 --ctx-a 256 --ctx-b 512)
     set_tests_properties(test-sycl-two-context-ownership PROPERTIES

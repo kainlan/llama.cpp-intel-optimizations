@@ -494,7 +494,7 @@ Owned per inference context; reset between requests or at context free:
 | RUNTIME compute buffers | `vram_zone_id::RUNTIME` | `arena_reserve` at graph compute boundary |
 | SCRATCH per-token buffers | `vram_zone_id::SCRATCH` | Each graph compute step (`ggml-sycl.cpp:86003`) |
 | oneDNN scratch | `vram_zone_id::ONEDNN` | Acquired/released per graph compute |
-| `g_layer_on_cpu` | `ggml-sycl.cpp:6201` | Recomputed at each graph build |
+| `g_layer_on_cpu` (process-scoped despite the per-graph reset below -- no model/context key; see the ownership table's `docs/design/sycl-memory-ownership-table.md` §6 row for the full risk analysis) | `ggml-sycl.cpp:15328` | Recomputed at each graph build |
 | MoE routing buffers | RUNTIME zone | Per-inference reset |
 | Staging / DMA buffers | HOST / RUNTIME | Per-weight-stream event |
 

@@ -30,7 +30,9 @@ a line looks stale.
 (no reset/reap as a fix for unsafe global state — propose the missing scoping
 key instead) govern every row below. Where a global lacks a
 model_id/context_id/slot_id/device_id key, the "Risk" column states the missing
-key and a follow-up bead is filed (§ Follow-up beads) — never a proposed reset.
+key, and either a follow-up bead is filed (§7) or the row is explicitly
+deferred to orchestrator triage with its own stated reason (§7.4) — never a
+proposed reset.
 
 ## Legend
 
@@ -104,7 +106,7 @@ key and a follow-up bead is filed (§ Follow-up beads) — never a proposed rese
 | `g_placement_kv_info` | process, plain mutated global (`ggml_sycl::placement_kv_info`, `ggml-sycl.cpp:14158`) | Cleared at `:14236`, populated during model load (same load path as `g_tensor_inventory`) | Model-load path only | Whatever the most recent model load wrote | Same pattern as `g_tensor_inventory`: missing model_id key, no snapshot protection. No new bead filed; flagged for orchestrator triage. |
 | `g_model_n_layer` | process, plain mutated global (`uint32_t`, `ggml-sycl.cpp:14157`) | Set from `publication.model_n_layer` at `:14815` (mirrors the snapshot at publish time), also written independently at `:15440`, reset to 0 at `:14235`/`:15576` | Model-load / model-unload path | Whatever the most recent model load wrote | Same missing-model_id-key pattern as the two rows above; it mirrors `g_placement_publication` at publish time but is a separate plain global, so it can be read stale or torn independent of the snapshot pointer atomicity. No new bead filed; flagged for orchestrator triage. |
 | `g_layer_on_cpu` | process (despite canonical doc §5.2 listing it under "context/slot-scoped state" — see Risk) | `static std::vector<bool>` (`ggml-sycl.cpp:15328`) | Rebuilt from scratch at each graph build via `.assign()`/per-layer writes (`:76874`, `:76925`, `:76944`), guarded by a dedicated mutex during incremental classification (`:76892`) | Only valid for the duration of the graph build that most recently wrote it | **No model_id/context_id key.** The "recomputed at each graph build" reset-boundary text for this global in canonical doc §5.2 describes WHEN it resets, not what key protects it between two contexts overlapping graph builds; the global itself is process-wide. Safe today only because of the documented single-active-context-per-device constraint (canonical doc §5.3); becomes a correctness hazard the moment that constraint is lifted. No new bead filed here — tracked as part of the same "context-keyed KV/RUNTIME arena reservation" gap canonical doc §5.3 already names as open; flagged for orchestrator triage. |
-| `g_sycl_weight_identities_unowned` | process, keyed by **bare tensor name only**, no owner/model_id component (`unordered_map<string, ggml_sycl_weight_identity>`, `ggml-sycl.cpp:10913`) | Written only when a caller passes a NONZERO `model_id` while no load transaction is open (`:13490-13511`; production never satisfies this, see Risk); read at `:13988-13989`, gated to fire only inside the branch where the owner of the tensor cannot be resolved at all (no load in flight, no published plan, no model named by the extra); and at `:23978`, which runs unconditionally in its function and IS itself the guard — it returns false (refuses) the instant a name match is found, independent of any owner state | **Never erased** — verified: exactly one write site, two read sites, zero erase sites in the whole file | Indefinite — entries persist for the process lifetime once written | Last-write-wins on name collision, zero owner scoping — the pattern the SYCL Memory Ownership rules in `CLAUDE.md` restrict, applied here to a metadata table rather than a raw allocation. The in-source design comment (`ggml-sycl.cpp:10895-10911`) and the code agree, read the right way round: the production loader passes `model_id == 0` at its one call site (`src/llama-model-loader.cpp:1370`), and `ggml-sycl.cpp:13493` (`if (model_id == 0) { return; }`) refuses to write when that is true and no load transaction is open — so nothing in a real model load ever writes here. The only way to reach the write at `:13511` is a caller passing a NONZERO `model_id` while no load transaction is open, a combination that does not occur in production, which is exactly what makes it "test-only in practice." That argument is a documented invariant, not something a dedicated test currently verifies. No new bead filed; flagged for orchestrator triage as a candidate for either a regression test of the "test-only in practice" invariant, or removal if genuinely dead in production. |
+| `g_sycl_weight_identities_unowned` | process, keyed by **bare tensor name only**, no owner/model_id component (`unordered_map<string, ggml_sycl_weight_identity>`, `ggml-sycl.cpp:10913`) | Write site `:13511` inside the `:13490-13511` block (see Risk for the exact write-gating condition); read at `:13988-13989` (gated on an unresolved owner) and `:23978` (unconditional in its function, itself the guard) | **Never erased** — verified: exactly one write site, two read sites, zero erase sites in the whole file | Indefinite — entries persist for the process lifetime once written | Last-write-wins on name collision, zero owner scoping — the pattern the SYCL Memory Ownership rules in `CLAUDE.md` restrict, applied here to a metadata table rather than a raw allocation. The in-source design comment (`ggml-sycl.cpp:10895-10911`) and the code agree, read the right way round: the production loader passes `model_id == 0` at its one call site (`src/llama-model-loader.cpp:1370`), and `ggml-sycl.cpp:13493` (`if (model_id == 0) { return; }`) refuses to write when that is true and no load transaction is open — so nothing in a real model load ever writes here. The only way to reach the write at `:13511` is a caller passing a NONZERO `model_id` while no load transaction is open, a combination that does not occur in production, which is exactly what makes it "test-only in practice." That argument is a documented invariant, not something a dedicated test currently verifies. No new bead filed; flagged for orchestrator triage as a candidate for either a regression test of the "test-only in practice" invariant, or removal if genuinely dead in production. |
 
 ### Reconciliation with the 2026-04 finding
 
@@ -149,7 +151,10 @@ against current HEAD, per item:
 
 4. **`ggml-sycl.cpp:41455-41457`, "resets scratch and host zones at graph
    compute boundaries"** — that citation was already stale in April:
-   `:41455-41457` lands on the head of `argsort_f32_i32_sycl` (`:41455` is a blank line, `:41456` is the `static void argsort_f32_i32_sycl(` signature), unrelated to any zone reset.
+   `:41455-41457` lands on the head of `argsort_f32_i32_sycl`
+   (`:41455` is a blank line, `:41456` is the
+   `static void argsort_f32_i32_sycl(` signature), unrelated to any zone
+   reset.
    The real graph-boundary sites today are
    `ggml_sycl::unified_cache_arena_reset(d)` (`ggml-sycl.cpp:86003`, inside
    `ggml_sycl_graph_boundary_reset_arenas`, which itself calls
@@ -199,22 +204,78 @@ blocked-by each bead).
 **Already tracked, not duplicated**: `llama.cpp-mhyw` (open, epic
 `llama.cpp-rg2ft`) already covers the `graph_unwaitable`/
 `release_graph_retained_handles()` cross-context release described in §5.
+`llama.cpp-mg359` (open, epic `llama.cpp-rg2ft`) already covers the two
+raw-`void*`-keyed maps in §6, `g_runtime_alloc_registry` and
+`g_offload_pool_slots` (its Problem section names "cache maps or pointer
+tables acting as if they own placement identity" as in-scope, and its
+acceptance bar is exactly the missing property those two maps lack).
+
+### 7.4 — Deferred to orchestrator triage, no bead filed
+
+These six §6 rows have a missing-key Risk finding but no filed bead, because
+each is either a different-shaped fix than "add a scoping key", or is not yet
+confirmed to have a live reader that would observe the gap. Per ruling 3 this
+is a stated deferral, not a silent gap:
+
+- **`g_placement_publication`**: already an atomic-published-snapshot design;
+  the residual risk is unqualified (non-snapshot-capturing) reads racing a
+  second model's publish, which is a narrower defect than a missing key and
+  may be better fixed by requiring callers to capture the snapshot, not by
+  adding a model_id to the pointer itself. Deferred pending a design decision
+  on whether unqualified reads should be disallowed outright.
+- **`g_tensor_inventory`**: same missing-model_id-key shape as
+  `g_placement_kv_info`/`g_model_n_layer` below, but no confirmed concurrent
+  reader exists in the current single-active-load codebase. Deferred pending
+  confirmation a reader can actually observe the race.
+- **`g_placement_kv_info`**: same reasoning as `g_tensor_inventory`.
+- **`g_model_n_layer`**: same reasoning as `g_tensor_inventory`; also
+  partially mirrors `g_placement_publication` at publish time without sharing
+  its snapshot protection.
+- **`g_layer_on_cpu`**: **not** a KV/RUNTIME arena reservation gap, despite
+  sitting next to §4/§5 rows that are — it is process-global *layer-CPU
+  placement classification* consumed during graph build, a different kind of
+  state than a VRAM/host zone. "Same reservation gap" would misdescribe it.
+  It is safe today only because of the single-active-context-per-device
+  constraint (canonical doc §5.3); closing it needs the same foundational
+  context-keyed-execution work that constraint depends on, not a standalone
+  scoping-key bead. Deferred pending that foundation work, not filed as an
+  independent bead so as not to duplicate its scope.
+- **`g_sycl_weight_identities_unowned`**: the identified risk is a write path
+  that is test-only in practice (§6 Risk cell), not a missing scoping key —
+  there is nothing to key, because production never reaches the write. The
+  actionable follow-up is a regression test proving that unreachability, or
+  removing the path, neither of which is "add a model_id"; deferred pending
+  an owner decision on which.
 
 ## 8. Two-context proof
 
 See `tests/test-sycl-two-context-ownership.cpp` (registered in
 `tests/CMakeLists.txt` as `test-sycl-two-context-ownership`, label `cache`,
-selector pinned to `level_zero:1`, fixture `test-download-model`). The test
-loads one model, creates two `llama_context` objects with different `n_ctx`
-(256 and 512 under ctest; `--ctx-a`/`--ctx-b` override) against it, interleaves
-decode A -> B -> A -> B, and checks every step's logits against a
-single-context reference run of the same token script: argmax equal and
-max |diff| within `--tol` (default 0.05). The two prompts differ in content and
-length so a KV clobber cannot be byte-identical (vacuous-pass guard: the
-reference first-step logits of A and B must themselves differ by more than
-`tol`). A final step clears B's memory and checks A still matches its reference,
-proving B's teardown did not overwrite A's KV/runtime memory. Exit 0 pass,
-1 fail, 77 skip (no model).
+selector pinned to `level_zero:1`, fixture `test-download-model`, guarded by
+`if (GGML_SYCL)` so a non-SYCL build never registers it). Runtime-skips (exit
+77) if `llama_supports_gpu_offload()` is false, so a SYCL build with no GPU
+device or a backend init failure that fell back to CPU cannot pass vacuously.
+Four-part structure:
+
+1. **References** — a single fresh context decodes each prompt's full script
+   (P_A then c1..c4, P_B then c1..c3) before any two-context state exists.
+2. **Interleaved proof** — creates two `llama_context` objects with different
+   `n_ctx` (256 and 512 under ctest; `--ctx-a`/`--ctx-b` override), keeps both
+   alive, and interleaves decode A -> B -> A -> B, checking every step's
+   logits against the matching reference step: argmax equal and max |diff|
+   within `--tol` (default 0.05). The two prompts differ in content and length
+   so a KV clobber cannot be byte-identical (vacuous-pass guard: the reference
+   first-step logits of A and B must themselves differ by more than `tol`).
+3. **Clear + replay on A** — clears B's memory, then replays A's held-back
+   continuation token and checks A still matches its reference, proving B's
+   KV clear did not disturb A's KV/runtime memory.
+4. **Positive control (replay on B)** — replays B's own prompt after the same
+   clear and checks it reproduces B's fresh single-context reference. This is
+   what step 3 alone cannot prove: that the clear actually emptied B's KV
+   rather than being a silent no-op that would leave A looking undisturbed
+   either way.
+
+Exit 0 pass, 1 fail, 77 skip (no model file, or no GPU backend registered).
 
 ```bash
 source /opt/intel/oneapi/setvars.sh --force

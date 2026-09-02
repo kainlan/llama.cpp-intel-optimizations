@@ -18,10 +18,14 @@
 //      begins, so no reference run ever overlaps with a live A/B pair -- the
 //      reference itself never has two (let alone three) contexts alive.
 //   2. Proof: create A (n_ctx_a) and B (n_ctx_b) and keep BOTH alive.
-//      Interleave: A(P_A) B(P_B) A(c1) B(c1) A(c2) B(c2) A(c3) B(c3), clear
-//      B's memory, then replay c4 on A alone.  Every step's logits must match
-//      the reference step for that context (A's c4 step matches R_A's c4
-//      step, computed before A/B ever existed).
+//      Interleave: A(P_A) B(P_B) A(c1) B(c1) A(c2) B(c2) A(c3) B(c3).  Then two
+//      more parts: (a) clear B's memory and replay c4 on A alone -- A must
+//      still match its reference (R_A's c4 step, computed before A/B ever
+//      existed), proving B's clear did not disturb A; (b) POSITIVE CONTROL --
+//      replay P_B on B after the same clear -- B must reproduce ref_b[0] (B
+//      decoding P_B fresh), which holds only if the clear actually emptied
+//      B's KV rather than being a silent no-op that (a) alone could not
+//      detect.
 //
 // The prompts differ in content AND length on purpose: with identical prompts
 // a KV overwrite would replace A's history with byte-identical content and the
@@ -37,7 +41,7 @@
 // the registration's ENVIRONMENT (tests/CMakeLists.txt); a direct invocation
 // must set ONEAPI_DEVICE_SELECTOR itself (CLAUDE.md, llama.cpp-403s).
 //
-// Exit codes: 0 pass, 1 fail, 77 skip (no model).
+// Exit codes: 0 pass, 1 fail, 77 skip (no model file, or no GPU backend registered).
 
 #include "llama.h"
 #include "test-skip.h"
@@ -147,6 +151,24 @@ int main(int argc, char ** argv) {
             tol = (float) std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
             n_gpu = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            model_path = argv[++i];
+        } else if (argv[i][0] == '-') {
+            // Reject unknown flags rather than silently swallowing them into
+            // model_path -- a typo'd flag used to fall through to fopen()
+            // failing, which exits 77 (skip) and reads as "no model provided"
+            // instead of "bad arguments".
+            fprintf(stderr,
+                    "[TWO-CTX] usage: %s [-m <model.gguf>] [--ctx-a N] [--ctx-b N] [--tol F] [-ngl N] "
+                    "[<model.gguf>]\n[TWO-CTX] unrecognised argument: %s\n",
+                    argv[0], argv[i]);
+            return 1;
+        } else if (model_path) {
+            fprintf(stderr,
+                    "[TWO-CTX] usage: %s [-m <model.gguf>] [--ctx-a N] [--ctx-b N] [--tol F] [-ngl N] "
+                    "[<model.gguf>]\n[TWO-CTX] unexpected extra positional argument: %s\n",
+                    argv[0], argv[i]);
+            return 1;
         } else {
             model_path = argv[i];
         }
@@ -167,6 +189,16 @@ int main(int argc, char ** argv) {
     }
 
     llama_backend_init();
+
+    if (!llama_supports_gpu_offload()) {
+        // A GGML_SYCL build with no device enumerated, or a backend init
+        // failure that silently fell back to CPU, must not be allowed to pass
+        // by proving nothing: this test's whole point is a GPU-backend memory
+        // ownership property.
+        fprintf(stderr, "[TWO-CTX] no GPU backend registered; this test proves nothing on CPU\n");
+        llama_backend_free();
+        return LLAMA_TEST_EXIT_SKIP;
+    }
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers       = n_gpu;
@@ -248,15 +280,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    step_logits s;
-    ok = ok && decode_tokens(ctx_a, prompt_a, "A(P_A)", s) && compare_step(s, ref_a[0], "A step0", tol);
-    ok = ok && decode_tokens(ctx_b, prompt_b, "B(P_B)", s) && compare_step(s, ref_b[0], "B step0", tol);
+    step_logits got;
+    ok = ok && decode_tokens(ctx_a, prompt_a, "A step0", got) && compare_step(got, ref_a[0], "A step0", tol);
+    ok = ok && decode_tokens(ctx_b, prompt_b, "B step0", got) && compare_step(got, ref_b[0], "B step0", tol);
     for (size_t i = 0; i < cont.size(); ++i) {
         char tag[64];
         std::snprintf(tag, sizeof(tag), "A step%zu", i + 1);
-        ok = ok && decode_tokens(ctx_a, { cont[i] }, tag, s) && compare_step(s, ref_a[1 + i], tag, tol);
+        ok = ok && decode_tokens(ctx_a, { cont[i] }, tag, got) && compare_step(got, ref_a[1 + i], tag, tol);
         std::snprintf(tag, sizeof(tag), "B step%zu", i + 1);
-        ok = ok && decode_tokens(ctx_b, { cont[i] }, tag, s) && compare_step(s, ref_b[1 + i], tag, tol);
+        ok = ok && decode_tokens(ctx_b, { cont[i] }, tag, got) && compare_step(got, ref_b[1 + i], tag, tol);
     }
 
     // 3. Clearing B's memory must not disturb A: A continues to match. The
@@ -264,8 +296,18 @@ int main(int argc, char ** argv) {
     //    already computed in step 1, before ctx_a/ctx_b existed -- no new
     //    reference context is created here.
     llama_memory_clear(llama_get_memory(ctx_b), true);
-    ok = ok && decode_tokens(ctx_a, { cont_ext.back() }, "A after B clear", s) &&
-         compare_step(s, ref_a.back(), "A step after B clear", tol);
+    ok = ok && decode_tokens(ctx_a, { cont_ext.back() }, "A after B clear", got) &&
+         compare_step(got, ref_a.back(), "A step after B clear", tol);
+
+    // 3b. POSITIVE CONTROL: without this, step 3 above could pass vacuously if
+    //     llama_memory_clear() were a silent no-op -- A would look undisturbed
+    //     either way, since nothing checks that B's KV was actually emptied.
+    //     Replaying P_B on B after the clear must reproduce ref_b[0] (B
+    //     decoding P_B fresh); it would NOT match ref_b[0] if the clear did
+    //     not happen, since B would then be decoding P_B on top of its
+    //     existing (uncleared) KV history instead of from empty.
+    ok = ok && decode_tokens(ctx_b, prompt_b, "B step0 replay after clear", got) &&
+         compare_step(got, ref_b[0], "B step0 replay after clear", tol);
 
     llama_synchronize(ctx_a);
     llama_synchronize(ctx_b);
