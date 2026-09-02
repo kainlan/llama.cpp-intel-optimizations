@@ -525,6 +525,36 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# oneDNN int8-with-grouped-scales matmul probe + microbench (track prefill of
+# epic llama.cpp-xihy, llama.cpp-ovkn): a capability/perf probe, NOT a
+# correctness gate and NOT a ctest -- it opens a GPU device and must never run
+# inside a ctest sweep, so add_executable only (no llama_build_and_test, no
+# add_test). Standalone like test-onednn-woq-mxfp4 above (dnnl + sycl headers
+# only, no ggml/backend deps), so it needs the same directory-local
+# find_package(DNNL) re-issue and IntelSYCL::SYCL_CXX/-fsycl fallback --
+# copied from that block -- plus GGML_SYCL_DNNL=1 so the file's `#if
+# GGML_SYCL_DNNL` guard compiles the real probe body instead of the SKIP
+# stub. Build with `./scripts/sycl-build.sh test-sycl-onednn-int8-grouped-
+# probe` and run manually (see the file header for the full command, device
+# selector required).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-onednn-int8-grouped-probe test-sycl-onednn-int8-grouped-probe.cpp)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-int8-grouped-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-int8-grouped-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-int8-grouped-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-int8-grouped-probe PRIVATE "-fsycl")
+    endif()
+    find_package(DNNL QUIET)
+    if (TARGET DNNL::dnnl)
+        target_link_libraries(test-sycl-onednn-int8-grouped-probe PRIVATE DNNL::dnnl)
+        target_compile_definitions(test-sycl-onednn-int8-grouped-probe PRIVATE GGML_SYCL_DNNL=1)
+    else()
+        message(WARNING "test-sycl-onednn-int8-grouped-probe: DNNL::dnnl not found in this directory scope; the target will fail to link")
+    endif()
+endif()
+
 # Custom PP GEMM activation-format microbench (llama.cpp-iikr, stage 1):
 # same rationale as the repack bench above -- a device-event throughput
 # measurement, not a correctness gate, so add_executable directly. Build
