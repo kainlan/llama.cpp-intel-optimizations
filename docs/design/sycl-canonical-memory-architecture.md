@@ -515,14 +515,31 @@ Keep these cases separate:
 - Multiple model or context objects may remain alive. Their ownership records
   and leases must coexist without one model load or teardown reclaiming another
   live model's weights.
-- Object coexistence does not imply execution concurrency. Each server slot
-  would need a distinct context and context-keyed KV/RUNTIME arena reservation;
-  that ownership is not implemented yet. `32dg8.15.10` is historical proof/fix
-  work and is superseded as a live owner: foundation `1q72` owns registry
-  primitives and foundation `o6jx` owns drain/reset/teardown callers.
+- Object coexistence does not imply execution concurrency. `32dg8.15.1`'s
+  ownership table (`docs/design/sycl-memory-ownership-table.md`) is the
+  authoritative per-object inventory this section used to gesture at; read it
+  for the full list, this paragraph only summarizes the verdict. Foundation
+  `1q72` (merged `4bd4211e8`) landed a context-keyed registry
+  (`ggml_sycl::execution::Registry`, one `ContextId` per `llama_context`) and
+  foundation `o6jx` (merged `606e252b0`) landed owner-targeted drain/teardown
+  on top of it — so context identity and owner-targeted teardown are
+  implemented today, not open. What remains NOT implemented is a
+  **context-keyed KV/RUNTIME arena reservation**: the VRAM/host zones in §5.1
+  (`KV`, `RUNTIME`, `SCRATCH`) stay one instance per device with no
+  context/session partition, so two contexts sharing a device still rely on
+  the `zone_settle`/`host_zone_settle` live-allocation refusal (§5.1) rather
+  than on a reservation that keeps their memory apart by construction. The
+  ownership table's §4 and §7 further identify `g_kv_tier_managers`
+  (device-only, not context-keyed; bead `llama.cpp-c781`) and the TP per-layer
+  caches (layer-only keyed, not model/context-keyed; bead `llama.cpp-mgi7`) as
+  the concrete gaps behind that summary, plus an already-open bug
+  (`llama.cpp-mhyw`) for a confirmed cross-context free in graph-retained-handle
+  teardown. `32dg8.15.10` is historical proof/fix work and is superseded as a
+  live owner.
   `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
   the process-global `g_graph_compute_active` eviction guard
-  (`unified-cache.cpp:303`). It is not per-device or per-context state.
+  (`unified-cache.cpp:719`, setter at `unified-cache.cpp:13899`). It is not
+  per-device or per-context state (bead `llama.cpp-2mt5`).
 - Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
   the current graph-compute entry point (`ggml-sycl.cpp:91438`) but does not
   universally serialize submission. Direct/fallback paths explicitly release it
