@@ -575,7 +575,16 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
     // override those defaults) so this census does not have to be
     // re-derived by hand; this does not fix anything by itself, it only
     // names the suspects for round 3c to check individually.
-    if (ggml_sycl_graph_recording_active()) {
+    // llama.cpp-dyi3 round 7: this census used to fire unconditionally, so any
+    // model whose SYCL command graph engages at all printed it in ordinary
+    // runs. Gate it behind an explicit opt-in -- it stays a WARN once enabled,
+    // since a non-capturable copy during recording is still a real hazard for
+    // whoever asked to look.
+    static const bool census_enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_GRAPH_CENSUS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (census_enabled && ggml_sycl_graph_recording_active()) {
         static std::unordered_set<std::string> warned_sites;
         static std::mutex                      warned_sites_mutex;
         char                                   site[256];

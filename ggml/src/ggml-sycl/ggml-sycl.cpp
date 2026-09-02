@@ -899,8 +899,23 @@ static void ggml_sycl_graph_replay_probe_dump(ggml_backend_sycl_context * ctx,
         }
         std::vector<uint8_t> host_buf(nbytes);
         try {
-            q->memcpy(host_buf.data(), dev_ptr, nbytes).wait_and_throw();
-        } catch (const sycl::exception & exc) {
+            // llama.cpp-dyi3 round 7: was a raw q->memcpy(...).wait_and_throw(),
+            // which bypasses the unified cache's ownership surfaces and makes
+            // tests/test-sycl-alloc-policy.sh RED. Route through the sanctioned
+            // mem_handle form instead, mirroring the llama.cpp-dkw0 diagnostic
+            // a few thousand lines below (~line 60149): wrap the host buffer as
+            // a DIRECT handle, get a non-owning handle for the already-resolved
+            // device pointer, let ggml_sycl::mem_copy submit the copy, then wait
+            // on the queue directly -- a diagnostic readback may legitimately
+            // block; a raw queue memcpy is not guaranteed to exist outside the
+            // unified cache.
+            ggml_sycl::mem_handle host_handle = ggml_sycl::mem_handle::from_direct(
+                host_buf.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
+            ggml_sycl::mem_handle dev_handle =
+                ggml_sycl_copy_handle_for_raw_ptr(dev_ptr, GGML_LAYOUT_AOS, ctx->device, nbytes);
+            ggml_sycl::mem_copy(host_handle, dev_handle, nbytes, *q);
+            q->wait();
+        } catch (const std::exception & exc) {
             fprintf(stderr, "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s: readback failed: %s\n",
                     call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op), exc.what());
             return;
@@ -100502,8 +100517,9 @@ normal_dispatch:
             static std::atomic<bool> logged_auto{ false };
             if (!logged_auto.exchange(true, std::memory_order_acq_rel)) {
                 GGML_LOG_INFO(
-                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; engaging SYCL command graph replay by "
-                    "default (observed esimd_partitioned=%llu, no other kernel seen)\n",
+                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; engaging SYCL command graph replay "
+                    "(GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=auto observed esimd_partitioned=%llu, no other kernel "
+                    "seen)\n",
                     (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count);
             }
         }
