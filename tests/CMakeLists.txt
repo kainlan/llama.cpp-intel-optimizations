@@ -703,6 +703,30 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 # failure of every context after the first. Do not re-add the pin to make a
 # failure go away -- it would hide exactly the defect this test now covers.
 
+# Two live contexts on one model, different n_ctx, interleaved decodes, each
+# step compared against a single-context reference (llama.cpp-32dg8.15.1). This
+# is the executable half of docs/design/sycl-memory-ownership-table.md. It
+# LOADS A MODEL, so it carries the "cache" label on purpose: CLAUDE.md's
+# full-sweep form excludes `-LE 'residency|mem-handle|cache'` and runs that
+# family serially -- an unlabelled model-loading test slips past that filter.
+# The selector pin is what keeps the iGPU out of the run (llama.cpp-403s).
+# Guarded by GGML_SYCL so a build without the SYCL backend compiled in never
+# tries to build/register this test at all (precedent:
+# test-sycl-model-lifecycle-hooks below). That is all this CMake guard claims:
+# a SYCL build that enumerates no GPU device, or whose backend init silently
+# falls back to CPU, is instead caught at RUNTIME by the
+# llama_supports_gpu_offload() check inside the test itself, which exits 77
+# (skip) rather than passing vacuously.
+if (GGML_SYCL)
+    llama_build_and_test(test-sycl-two-context-ownership.cpp ARGS "${MODEL_DEST}" -ngl 99 --ctx-a 256 --ctx-b 512)
+    set_tests_properties(test-sycl-two-context-ownership PROPERTIES
+        FIXTURES_REQUIRED test-download-model
+        LABELS "main;sycl;cache;ownership;two-context"
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
@@ -2511,4 +2535,19 @@ if (GGML_SYCL)
         SKIP_RETURN_CODE 77
         TIMEOUT 120
     )
+endif()
+
+# llama.cpp-qq19: divergence guard for the single owner-resolution authority
+# ggml_sycl_resolve_tensor_owner() -- asserts the "resolve owner from tensor
+# extra->model_id via registry, else fall back to the identity plan" block
+# exists exactly once and every former inline site (and any future one) calls
+# it rather than copying it. Host-only -- reads ggml-sycl.cpp as text, builds
+# nothing, touches no device. Mirrors test-sycl-device-uuid-source's
+# llama_test_pytest registration shape.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-resolve-tensor-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-resolve-tensor-owner-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
 endif()

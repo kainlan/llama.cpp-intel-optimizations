@@ -2766,6 +2766,20 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t m
     return state->token;
 }
 
+// llama.cpp-qq19: the SINGLE authority for resolving a tensor's owner. Owner
+// resolution IS identity resolution (ruling 2), so every call site that needs
+// "who owns this tensor" must come through here -- resolve extra->model_id via
+// the registry when the wrapper names one, else fall back to the
+// published/identity plan -- rather than re-inlining
+// ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0) itself. A FUTURE
+// FOURTH (or Nth) SITE MUST CALL THIS, NOT COPY THE BLOCK; see the divergence
+// guard in tests/test-sycl-resolve-tensor-owner-source.py, which fails if the
+// pattern is re-inlined anywhere outside this function's body.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_resolve_tensor_owner(const ggml_tensor * tensor) noexcept {
+    const auto * extra = tensor ? static_cast<const ggml_tensor_extra_gpu *>(tensor->extra) : nullptr;
+    return ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
+}
+
 static bool ggml_sycl_host_row_authorized(const ggml_sycl::lifecycle::ModelToken & owner) noexcept {
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate) {
@@ -9110,8 +9124,7 @@ static std::string ggml_sycl_canonical_checksum_key(const ggml_tensor * tensor) 
     if (!name || name[0] == '\0') {
         return {};
     }
-    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-    const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
+    const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
     return ggml_sycl_owner_name_key(owner, name);
 }
 
@@ -13944,9 +13957,8 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-        const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
-        const std::string key = ggml_sycl_owner_name_key(owner, name);
+        const auto        owner = ggml_sycl_resolve_tensor_owner(tensor);
+        const std::string key   = ggml_sycl_owner_name_key(owner, name);
         if (!key.empty()) {
             std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
             auto                        it = g_sycl_weight_usages.find(key);
@@ -14038,9 +14050,8 @@ static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycl
 }
 
 static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {
-    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-    const auto   owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
-    std::string  key   = ggml_sycl_owner_name_key(owner, tensor->name);
+    const auto  owner = ggml_sycl_resolve_tensor_owner(tensor);
+    std::string key   = ggml_sycl_owner_name_key(owner, tensor->name);
     key += "|dev";
     key += std::to_string(device);
     return key;
@@ -14272,8 +14283,7 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
         // one that is not published would otherwise find no identity at all and
         // silently drop to the fallback UUID path.  Same lookup order as
         // ggml_sycl_get_tensor_usage().
-        const uint64_t extra_model_id = extra ? extra->model_id : 0;
-        const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
+        const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
 
         if (owner.model.value != 0) {
             auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
@@ -14364,7 +14374,8 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     // instances SHOULD collapse to the same cache_id via
     // (file_id,file_offs,nbytes,type,ne) -- but that only holds when
     // has_gguf_identity is true for BOTH calls. If model_id/owner resolution
-    // (extra->model_id -> ggml_sycl_exact_wrapper_owner) differs between the
+    // (ggml_sycl_resolve_tensor_owner, extra->model_id -> ggml_sycl_exact_wrapper_owner)
+    // differs between the
     // GET_ROWS call site (embedding role, known-correct per the divergence
     // hunt) and the MUL_MAT call site (output-projection role, proven
     // corrupted -- device bytes are byte-exact per_layer_token_embd.weight),
@@ -22104,8 +22115,9 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
     // Canonical MoE identity is minted only from the exact lifecycle owner and
     // the registered GGUF parent slice.  Wrapper addresses, allocation ids,
     // cache UUIDs and graph-local extras are observations, never identity.
-    const uint64_t extra_model_id = extra ? extra->model_id : 0;
-    const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
+    // `extra` here is always the caller's own static_cast<...>(tensor->extra),
+    // so resolving through the tensor gives the identical answer.
+    const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
     if (owner.model.value == 0 || owner.load.value == 0 ||
         owner.owner.slot == ggml_sycl::lifecycle::no_model_slot || owner.owner.generation == 0) {
         return id; // fail closed on a partial owner

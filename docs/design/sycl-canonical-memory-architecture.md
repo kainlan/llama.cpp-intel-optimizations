@@ -492,9 +492,9 @@ Owned per inference context; reset between requests or at context free:
 | KV cache buffers | `vram_zone_id::KV` | Context free or `llama_kv_cache_clear` |
 | KV host fallback buffers | Host zone / `kv_host_bytes` | Context free |
 | RUNTIME compute buffers | `vram_zone_id::RUNTIME` | `arena_reserve` at graph compute boundary |
-| SCRATCH per-token buffers | `vram_zone_id::SCRATCH` | Each graph compute step (`ggml-sycl.cpp:41455`) |
+| SCRATCH per-token buffers | `vram_zone_id::SCRATCH` | Each graph compute step (`ggml-sycl.cpp:86003`) |
 | oneDNN scratch | `vram_zone_id::ONEDNN` | Acquired/released per graph compute |
-| `g_layer_on_cpu` | `ggml-sycl.cpp:6201` | Recomputed at each graph build |
+| `g_layer_on_cpu` (process-scoped despite the per-graph reset in this row's Reset boundary column -- no model/context key; see the ownership table's `docs/design/sycl-memory-ownership-table.md` §6 row for the full risk analysis) | `ggml-sycl.cpp:15328` | Recomputed at each graph build |
 | MoE routing buffers | RUNTIME zone | Per-inference reset |
 | Staging / DMA buffers | HOST / RUNTIME | Per-weight-stream event |
 
@@ -502,9 +502,14 @@ Owned per inference context; reset between requests or at context free:
 for the owning device's cache. A reset proceeds only when the target zone has no
 live registered allocations; otherwise the reset is refused and existing
 allocations are preserved. It must not reset another context's zones. The
-historical `32dg8.2` is preload/placement work, not context-ownership work;
-until foundation owner `1q72` adds explicit context/session ownership keys, callers
-must ensure single-active-context per device.
+historical `32dg8.2` is preload/placement work, not context-ownership work.
+Foundation `1q72` (merged `4bd4211e8`) already landed the context registry
+(`ggml_sycl::execution::Registry`, one `ContextId` per `llama_context`); what
+remains missing is the context-keyed KV/RUNTIME arena reservation for the
+zones above (see §5.3, and bead `llama.cpp-c781` for the KV tier manager
+instance of the same gap) — callers must still ensure single-active-context
+per device for that reason, not because context identity itself is
+unimplemented.
 
 ### 5.3 Multiple models, contexts, and server slots
 
@@ -515,22 +520,50 @@ Keep these cases separate:
 - Multiple model or context objects may remain alive. Their ownership records
   and leases must coexist without one model load or teardown reclaiming another
   live model's weights.
-- Object coexistence does not imply execution concurrency. Each server slot
-  would need a distinct context and context-keyed KV/RUNTIME arena reservation;
-  that ownership is not implemented yet. `32dg8.15.10` is historical proof/fix
-  work and is superseded as a live owner: foundation `1q72` owns registry
-  primitives and foundation `o6jx` owns drain/reset/teardown callers.
+- Object coexistence does not imply execution concurrency. `32dg8.15.1`'s
+  ownership table (`docs/design/sycl-memory-ownership-table.md`) is the
+  authoritative per-object inventory this section used to gesture at; read it
+  for the full list, this paragraph only summarizes the verdict. Foundation
+  `1q72` (merged `4bd4211e8`) landed a context-keyed registry
+  (`ggml_sycl::execution::Registry`, one `ContextId` per `llama_context`) and
+  foundation `o6jx` (merged `606e252b0`) landed owner-targeted drain/teardown
+  on top of it — so context identity and owner-targeted teardown are
+  implemented today, not open. What remains NOT implemented is a
+  **context-keyed KV/RUNTIME arena reservation**: the VRAM/host zones in §5.2
+  (`KV`, `RUNTIME`, `SCRATCH`) stay one instance per device with no
+  context/session partition, so two contexts sharing a device still rely on
+  the `zone_settle`/`host_zone_settle` live-allocation refusal (§5.2) rather
+  than on a reservation that keeps their memory apart by construction. The
+  ownership table's §4 and §7 further identify `g_kv_tier_managers`
+  (device-only, not context-keyed; bead `llama.cpp-c781`) and the TP per-layer
+  caches (layer-only keyed, not model/context-keyed; bead `llama.cpp-mgi7`) as
+  the concrete gaps behind that summary, plus an already-open bug
+  (`llama.cpp-mhyw`) for a confirmed cross-context free in graph-retained-handle
+  teardown. `32dg8.15.10` is historical proof/fix work and is superseded as a
+  live owner.
   `unified_cache_set_graph_compute_active(bool)` has no device argument and sets
   the process-global `g_graph_compute_active` eviction guard
-  (`unified-cache.cpp:303`). It is not per-device or per-context state.
-- Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
-  the current graph-compute entry point (`ggml-sycl.cpp:91438`) but does not
-  universally serialize submission. Direct/fallback paths explicitly release it
-  before `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). In contrast,
-  persistent-TG and deferred-copy paths submit while it remains held
-  (`ggml-sycl.cpp:91978`, `92084`, `92101`, `92159`), as do command-graph
-  record/replay paths (`ggml-sycl.cpp:92700`, `93161`, `93188`, `93298`).
-  Completion may still outlive the lock where a path permits deferred exit.
+  (`unified-cache.cpp:719`, setter at `unified-cache.cpp:13899`). It is not
+  per-device or per-context state (bead `llama.cpp-2mt5`).
+- Independently, the process-global `g_sycl_graph_compute_mutex` has exactly one
+  acquisition site, the current graph-compute entry point
+  (`ggml-sycl.cpp:99095`, `std::unique_lock<std::mutex>
+  global_graph_lock(g_sycl_graph_compute_mutex)`), but it does not
+  universally serialize submission. `ggml-sycl.cpp:99285-99286`
+  (`if (global_graph_lock.owns_lock()) global_graph_lock.unlock();`) is the
+  ONLY unlock site in the whole function, and it lives inside the
+  `compute_impl_unlocked` lambda — direct/fallback paths that call that lambda
+  release the lock before compute submission. The persistent-TG split path
+  (`:99806`) and the single-device persistent-TG path (`:99881`) each return
+  `GGML_STATUS_SUCCESS` directly, after their own `execute_deferred_copies()`
+  calls (`:99789`, `:99848` respectively), without ever calling
+  `compute_impl_unlocked` — so those two paths hold the lock through
+  submission by construction, not by inference from the assert below.
+  Separately, the command-graph `use_sycl_graph` path is corroborated by
+  `GGML_ASSERT(global_graph_lock.owns_lock())` on entry to that block
+  (`:100415`), which would fire were the lock ever released early on that
+  specific path. Completion may still outlive the lock where a path permits
+  deferred exit.
   Thus host submission can overlap across graph-compute calls on direct/fallback
   paths, and device execution may overlap across calls and devices; pure-GPU
   decode may also return with kernels still in flight. Do not infer supported
