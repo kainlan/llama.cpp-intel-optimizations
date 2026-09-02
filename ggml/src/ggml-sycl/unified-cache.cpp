@@ -9563,7 +9563,9 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // on this queue -- see below -- turning every free() into a synchronous
     // wait for that op's device completion; that defeated much of the point
     // of this whole change and is why this function no longer touches an
-    // event at all on this path).
+    // event at all on this path) -- UNLESS TP is active for this device, in
+    // which case the argument below does not hold and this falls back to an
+    // event-deferred release instead. See that branch first.
     //
     // This is safe by construction, not by omission: the ONLY consumer of a
     // Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
@@ -9590,6 +9592,51 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // every other backend stream (profiling-enabled, where that same query
     // blocks instead of polling -- the exact hazard this function used to
     // walk into).
+    //
+    // THE ASSUMPTION IS ALREADY KNOWN TO BREAK UNDER TP: ggml_backend_sycl_context::
+    // stream()/ctx.stream() (common.hpp) returns the TP shared-context queue
+    // AHEAD of the unified-cache queue whenever TP is enabled for this
+    // device ("In TP mode, ALWAYS use the shared-context queue" -- checked
+    // every call, since TP may be enabled after queues were first accessed).
+    // So under TP the queue dnnl::graph::sycl_interop::execute() actually
+    // submits on is NOT necessarily cache->get_queue(), the queue this
+    // allocator's malloc() callback (onednn_graph_sycl_malloc) bound the
+    // engine to -- the in-order-queue argument above no longer names the
+    // real consumer, and immediate reuse would be a genuine race, not a
+    // documented-but-safe one. Fail closed instead of trying to re-derive
+    // in-order safety for a queue this allocator does not control: defer via
+    // the zone's existing event-gated release path (the zone-suballocation
+    // analog of retain_handles_until_event used by the DIRECT case above --
+    // that call takes a mem_handle, which a zone suballocation does not
+    // have, so enqueue_deferred_zone_free() is the equivalent primitive
+    // reserve_onednn_scratch's own defer_published_zone_release already uses
+    // for exactly this "zone pointer, need an event-gated release" shape),
+    // same as the primitive-API scratch pair does when TP is not even a
+    // factor for it.
+    const int device_id_for_tp_check = ggml_sycl_get_device_id_from_queue(queue_);
+    if (ggml_sycl_get_tp_queue(device_id_for_tp_check) != nullptr) {
+        const size_t deferred_size = zone_it->second;
+        note_onednn_graph_scratch_free_locked(deferred_size);
+        onednn_graph_scratch_zone_sizes_.erase(zone_it);
+        // oneDNN's SYCL interop always supplies an event for a real free();
+        // event == nullptr here would mean that guarantee has changed. Fall
+        // back to a fresh barrier on this same defensive path
+        // defer_published_zone_release() (reserve_onednn_scratch, above)
+        // already uses when it has no natural event to defer on -- releasing
+        // immediately would silently reopen the exact race this branch
+        // exists to close.
+        try {
+            const sycl::event barrier = event ? *event : submit_barrier_all();
+            enqueue_deferred_zone_free(vram_zone_id::ONEDNN, ptr, deferred_size, barrier);
+        } catch (...) {
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] oneDNN Graph allocator: TP active for device %d and no event/barrier available "
+                "to defer ptr=%p -- releasing immediately, which may race an in-flight TP consumer\n",
+                device_id_for_tp_check, ptr);
+            zone_free(vram_zone_id::ONEDNN, ptr);
+        }
+        return;
+    }
     note_onednn_graph_scratch_free_locked(zone_it->second);
     onednn_graph_scratch_zone_sizes_.erase(zone_it);
     zone_free(vram_zone_id::ONEDNN, ptr);
@@ -9628,17 +9675,30 @@ void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev,
         return nullptr;
     }
     try {
-        const sycl::device &  sycl_dev  = *static_cast<const sycl::device *>(dev);
-        const sycl::context & sycl_ctx  = *static_cast<const sycl::context *>(ctx);
-        const int             device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
-        unified_cache *       cache     = get_existing_unified_cache_for_device(device_id);
+        const sycl::device & sycl_dev  = *static_cast<const sycl::device *>(dev);
+        const int            device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
+        unified_cache *      cache     = get_existing_unified_cache_for_device(device_id);
         if (!cache) {
-            // No cache yet for this device (should not happen in practice --
-            // the engine that reaches this callback is built from a queue the
-            // cache already owns -- but fail safe rather than dereference a
-            // null cache): fall back to a raw USM allocation against oneDNN's
-            // own device+context so correctness is preserved.
-            return sycl::aligned_alloc_device(alignment ? alignment : 256, size, sycl_dev, sycl_ctx);
+            // No cache yet for this device -- should not happen in practice
+            // (the engine that reaches this callback is built from a queue
+            // the cache already owns), but this is exactly the condition
+            // that must fail LOUDLY rather than quietly stepping around the
+            // cache. An earlier version of this branch allocated a raw
+            // sycl::aligned_alloc_device() here "so correctness is
+            // preserved" -- that is cache-external memory the unified cache
+            // never tracks, which is precisely what CLAUDE.md's SYCL memory
+            // ownership rule (every backend allocation flows through the
+            // unified cache) forbids. Refuse instead: return nullptr and let
+            // oneDNN's own error handling take it from here, same as any
+            // other allocation failure it already has to tolerate.
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] oneDNN Graph allocator: no unified_cache for device %d -- refusing to "
+                    "allocate cache-external memory, returning nullptr (only logged once)\n",
+                    device_id);
+            }
+            return nullptr;
         }
         return cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
     } catch (...) {
@@ -9651,26 +9711,39 @@ void onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void
         return;
     }
     try {
-        const sycl::event *   ev        = static_cast<const sycl::event *>(event);
-        const sycl::device &  sycl_dev  = *static_cast<const sycl::device *>(dev);
-        const sycl::context & sycl_ctx  = *static_cast<const sycl::context *>(ctx);
-        const int             device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
-        unified_cache *       cache     = get_existing_unified_cache_for_device(device_id);
+        const sycl::event *  ev        = static_cast<const sycl::event *>(event);
+        const sycl::device & sycl_dev  = *static_cast<const sycl::device *>(dev);
+        const int            device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
+        unified_cache *      cache     = get_existing_unified_cache_for_device(device_id);
         if (!cache) {
-            // Mirrors the malloc() fallback above: this pointer can only have
-            // come from that same sycl::aligned_alloc_device() branch (the
-            // cache path allocates all its own pointers, tracked internally).
-            // Wait for the event before freeing -- there is no owning cache
-            // to defer the release for us, and freeing memory the compiled
-            // partition may still be reading would corrupt results.
-            if (ev) {
-                try {
-                    sycl::event ev_copy = *ev;  // sycl::event::wait() is non-const
-                    ev_copy.wait();
-                } catch (...) {
-                }
+            // The real invariant, now that onednn_graph_sycl_malloc() above
+            // never mints a pointer when no cache exists (it returns nullptr
+            // instead of a raw sycl::aligned_alloc_device() allocation):
+            // under normal operation this branch is unreachable, because a
+            // `buf` this callback is asked to free must have come from a
+            // prior malloc() that succeeded, and malloc() only ever succeeds
+            // through the cache path.
+            //
+            // The one residual case this branch still has to handle is cache
+            // TEARDOWN between the matching alloc() and this free(): `buf` is
+            // a genuine zone-backed or DIRECT-fallback pointer minted while
+            // the cache existed, but the cache has since been destroyed. It
+            // is NOT safe to call sycl::free() on it here (the previous
+            // version of this branch did, on the false premise stated
+            // above) -- a zone-backed buf may be an offset into a TLSF arena
+            // block, not a standalone USM allocation, and freeing a
+            // non-base pointer is undefined behavior, not a graceful no-op.
+            // Warn loudly and leak instead: a leaked allocation on a device
+            // whose cache is already gone dies with the context; corrupting
+            // the allocator does not recover.
+            static std::atomic<bool> warned{ false };
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] oneDNN Graph allocator: free() for device %d with no unified_cache -- the "
+                    "cache was torn down between this buffer's alloc() and free(); leaking rather than risking "
+                    "sycl::free() on a possible TLSF sub-allocation offset (only logged once)\n",
+                    device_id);
             }
-            sycl::free(buf, sycl_ctx);
             return;
         }
         cache->onednn_graph_scratch_free(buf, ev);
@@ -15030,12 +15103,21 @@ bool unified_cache::reserve_onednn_scratch(size_t weights_size, size_t activatio
         // the real per-pointer release that replaces the bulk zone_settle()
         // (named zone_reset() before llama.cpp-37ba's rename) this function
         // used to depend on as its ONLY reclaim path (iiff Option C step 3,
-        // llama.cpp-67c2). Nothing else ever allocates from
-        // vram_zone_id::ONEDNN (grep-verified: the four zone_alloc(ONEDNN, ...)
-        // call sites in reserve_onednn_scratch are the sole users of this zone
-        // in the whole backend), so freeing exactly the two pointers this
-        // reservation previously handed out is a complete reclaim, not a
-        // partial one. Unlike C1's ring (many interchangeable regions,
+        // llama.cpp-67c2). The four zone_alloc(ONEDNN, ...) call sites in
+        // reserve_onednn_scratch are NOT the sole users of this zone anymore
+        // -- unified_cache::onednn_graph_scratch_alloc() (llama.cpp-gwno) is
+        // a fifth, zone_alloc(vram_zone_id::ONEDNN, size, align) for the
+        // Graph API SDPA allocator's per-execute scratch. That does not
+        // invalidate the reclaim right below: it only ever frees the exact
+        // two pointers THIS reservation previously handed out (a point
+        // release, not a bulk one), so it stays correct regardless of what
+        // else is live in the zone. What it does invalidate is treating this
+        // reclaim as evidence the zone is now empty -- a FUTURE zone-wide or
+        // bulk reclaim of vram_zone_id::ONEDNN must treat Graph-scratch
+        // allocations as live too (query onednn_graph_scratch_high_water_bytes()
+        // or equivalent, not just this reservation's two fields), or it will
+        // free bytes a Graph-scratch buffer is still using. Unlike C1's ring
+        // (many interchangeable regions,
         // address-range lookup) or C2's TLSF population (many registered
         // records), there is nothing here to rotate through or look up: it is
         // a live count of at most 1 per named pointer, so the "epoch" is
