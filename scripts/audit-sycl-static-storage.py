@@ -4,6 +4,18 @@
 Pinned parser dependencies:
   tree-sitter==0.25.2
   tree-sitter-language-pack==1.8.1 (C++ grammar ABI 15)
+
+Exit codes: 0 = census/self-test succeeded (--check: inventory matches HEAD);
+1 = --check found the inventory stale (regenerate without --check); 2 = the
+fail-closed recovery-coverage census rejected the parse (a declaration the
+parser cannot prove safe -- read the printed file:line:reason and either fix
+the declaration or extend the recognized recovery patterns).
+
+Do NOT pipe --check into `tail`/`head`/etc: `$?` after a pipe reports the
+LAST command's exit status, not this script's, so `--check | tail` silently
+reads rc=0 even on a real rc=1/2 rejection. Capture the exit code directly
+(`--check; echo rc=$?`) or read `${PIPESTATUS[0]}` (bash) if a pipe is
+unavoidable.
 """
 from __future__ import annotations
 
@@ -694,13 +706,23 @@ def is_defaulted_const_reference_recovery(source_b: bytes, gap):
         return False
     parameter_list = parent(parameter)
     function = parent(parameter_list) if parameter_list is not None else None
+    # "function_definition" is deliberately absent: a gap under a
+    # function_definition ancestor is already classified earlier, in
+    # recovery_coverage()'s parsed_function_context() branch (as
+    # function-signature-non-storage or function-body-storage-proven), before
+    # this predicate is ever reached -- that check walks the gap's own
+    # ancestors, and `function` here is one of them, so this predicate can
+    # only run when no function_definition ancestor exists. Adding it back
+    # would be unreachable dead code, not a behavior change.
+    # Guarded on both sides by self_test: fixture
+    # "defaulted-const-reference-out-of-container" fails closed if this set is
+    # widened past {declaration, field_declaration}; the positive class-member
+    # fixture in defaulted_reference_source (below) fails if field_declaration
+    # is narrowed back out.
     return (
         parameter_list is not None and kind(parameter_list) == "parameter_list"
         and function is not None and kind(function) == "function_declarator"
-        and any(
-            kind(item) in {"declaration", "field_declaration", "function_definition"}
-            for item in ancestors(function)
-        )
+        and any(kind(item) in {"declaration", "field_declaration"} for item in ancestors(function))
     )
 
 
@@ -1074,7 +1096,8 @@ void lifecycle_stage_no_placement_plan(unsigned long long load_txn_id,
                                        unsigned model_n_layer = 0);
 struct field_owner {
     // Class member prototype form (field_declaration, not declaration):
-    // llama.cpp-qqs2 -- unified-cache.hpp:2129 is exactly this shape.
+    // llama.cpp-qqs2 -- unified_cache::direct_stage_expert's `deps`
+    // parameter (unified-cache.hpp) is exactly this shape.
     void direct_stage_field(const placement_kv_info & kv_info = {},
                             unsigned model_n_layer = 0);
 };
@@ -1082,9 +1105,11 @@ struct field_owner {
     _, defaulted_rows, defaulted_gaps, defaulted_categories, defaulted_failures = parse_source(
         parser, defaulted_reference_source
     )
-    assert not defaulted_rows and not defaulted_failures
-    assert len(defaulted_gaps) == 3
-    assert defaulted_categories == Counter({"defaulted-const-reference-parameter": 3})
+    assert not defaulted_rows and not defaulted_failures, (
+        "defaulted_reference_source (free + field_declaration forms) must produce no rows/failures"
+    )
+    assert len(defaulted_gaps) == 3, f"expected 3 defaulted-const-reference gaps, got {len(defaulted_gaps)}"
+    assert defaulted_categories == Counter({"defaulted-const-reference-parameter": 3}), defaulted_categories
 
     same_rows = by_name["same"]
     lines = source.splitlines()
@@ -1119,25 +1144,16 @@ struct field_owner {
         "defaulted-const-pointer": "struct T {}; void f(const T * value = {});",
         "defaulted-const-rvalue-reference": "struct T {}; void f(const T && value = {});",
         "defaulted-const-reference-nonempty": "struct T { T(int); }; void f(const T & value = {1});",
-        # llama.cpp-qqs2: the class-member (field_declaration) form of the
-        # recovery pattern must still fail closed when the default value is
-        # non-empty -- proves the fix is scoped to `= {}`, not to any
-        # defaulted reference parameter inside a class body.
-        "defaulted-const-reference-class-member-nonempty":
-            "struct T { T(int); }; struct H { void f(const T & value = {1}); };",
-        # llama.cpp-qqs2 spec review (c-71ud): the class-member-nonempty
-        # fixture above bails three predicate steps BEFORE the ancestor-kind
-        # check the fix touched (the initializer-list-must-be-"{}" gate), so
-        # it cannot detect an over-widened ancestor set -- replacing that
-        # check with `True` still passes --self-test with only that fixture
-        # present. This one reaches the ancestor check with a matched,
-        # empty-initializer `const T & v = {}` default whose function_declarator
-        # sits under parameter_declaration/template_parameter_list/
-        # template_declaration, not declaration/field_declaration/
-        # function_definition, so it is the fixture that actually exercises
-        # the set this task's fix changed.
-        "defaulted-const-reference-out-of-container":
-            "struct T {}; template<int (*F)(const T & v = {})> struct H {};",
+        # llama.cpp-qqs2 (spec review c-71ud): reaches the ancestor-kind check
+        # with a fully-matched, empty-initializer `const T & v = {}` default
+        # (every earlier predicate in is_defaulted_const_reference_recovery
+        # passes) whose function_declarator sits under
+        # parameter_declaration/template_parameter_list/template_declaration,
+        # not declaration/field_declaration -- the one fixture that actually
+        # exercises the accepted-ancestor set this task's fix changed, rather
+        # than bailing at an earlier predicate the way
+        # defaulted-const-reference-nonempty above does.
+        "defaulted-const-reference-out-of-container": "struct T {}; template<int (*F)(const T & v = {})> struct H {};",
     }
     alias_failures = {
         "function-alias-array", "unproved-function-alias", "unknown-qualified-alias", "alias-template",
@@ -1209,9 +1225,25 @@ namespace recovered_tail_namespace { static int recovered_namespace_tail; }
 
 def main():
     parser, parser_name = get_parser_checked()
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "Generate/verify the parser-grade SYCL static-storage census. "
+            "Exit codes: 0 success, 1 --check found stale inventory, 2 fail-closed "
+            "recovery-coverage rejection. Do not pipe --check into tail/head -- "
+            "`$?` after a pipe reports the pipeline's LAST command, not this "
+            "script's; capture `--check; echo rc=$?` or read ${PIPESTATUS[0]} instead."
+        )
+    )
     ap.add_argument("--output", default="docs/backend/sycl-static-storage-inventory.csv")
-    ap.add_argument("--check", action="store_true")
+    ap.add_argument(
+        "--check", action="store_true",
+        help=(
+            "Verify the checked-in inventory matches a fresh parse; do not write. "
+            "rc=0 current, rc=1 stale, rc=2 fail-closed rejection. Never pipe this "
+            "invocation (e.g. into tail/head) without reading ${PIPESTATUS[0]} -- "
+            "`$?` after a pipe is the last pipeline command's status, not this one's."
+        ),
+    )
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     args = ap.parse_args()
