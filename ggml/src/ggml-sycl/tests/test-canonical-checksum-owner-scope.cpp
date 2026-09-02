@@ -37,6 +37,7 @@
 // All names are synthetic ("zzz_ckchk_*") and cannot collide with a real GGUF
 // tensor name, so nothing below can be satisfied by a real model's capture.
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
@@ -48,7 +49,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "GGML_USE_SYCL not enabled; skipping test.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

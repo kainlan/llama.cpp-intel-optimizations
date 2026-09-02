@@ -9,6 +9,8 @@
 // and quietly select a reference implementation, so each arm reports
 // per-iteration time and the ratio is the load-bearing output (a
 // green-but-slow strided arm FAILS option A).
+#include "test-skip.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -492,6 +494,6 @@ int main() {
         return 43;
     } catch (const sycl::exception & e) {
         std::printf("SKIP: no SYCL GPU (%s)\n", e.what());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 }

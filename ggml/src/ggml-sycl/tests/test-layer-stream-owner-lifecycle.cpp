@@ -62,6 +62,7 @@
 //         -> 7a 7b 7c 7d   (4 checks) and nothing else. This is the RED for the
 //            teardown case.
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../layer-streaming.hpp"
 #include "../model-lifecycle.hpp"
 
@@ -74,7 +75,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this proves NOTHING about layer-stream ownership.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

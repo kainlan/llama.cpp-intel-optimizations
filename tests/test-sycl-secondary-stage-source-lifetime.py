@@ -46,9 +46,22 @@ def verify(source: str) -> None:
     require(handoff, "owners.emplace_back()", "destination owner slot is not preconstructed")
 
     helper = function_body(source, "ggml_sycl_retain_direct_stage_owners(")
-    require(helper,
-            "retain_handles_until_event(handoff.owners, result.event, std::move(handoff.publish_ticket))",
-            "successful stage does not use the ticketed retained publication overload")
+    # 93af46468 ("make retained publication transactional") replaced the
+    # ticket-taking retain_handles_until_event(..., std::move(ticket)) overload at
+    # this call site with retain_handles_until_event_transactional(..., ticket),
+    # which keeps the ticket alive by reference across the call so a throw during
+    # publication still leaves it active for the catch block's drain -- landed
+    # after this test's last update, so the check kept asserting the retired
+    # overload's exact text. Match on whitespace-normalized text: the call is long
+    # enough that clang-format wraps it across lines, and a literal embedded
+    # newline/indent would be exactly the drifting-literal fragility this ticket
+    # (llama.cpp-1s31) exists to close, not just re-pin.
+    require(
+        " ".join(helper.split()),
+        "ggml_sycl::retain_handles_until_event_transactional(handoff.owners, result.event, "
+        "handoff.publish_ticket)",
+        "successful stage does not use the ticketed transactional retained publication overload",
+    )
     require(helper, "catch (...) {\n            ggml_sycl_drain_direct_stage_queue(queue);",
             "publication allocation/worker-start failure does not drain the exact queue")
     # Passing a copy keeps handoff.owners alive if the by-value publication API

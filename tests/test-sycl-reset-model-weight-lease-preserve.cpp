@@ -97,6 +97,7 @@
 #include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -114,7 +115,7 @@ int main() {
     fprintf(stderr,
             "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about weight\n"
             "      ownership at a model-load boundary.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -913,7 +914,7 @@ int main() {
                 "SKIP: no SYCL GPU devices available; this run proves NOTHING about weight\n"
                 "      ownership at a model-load boundary. Source oneAPI and re-run.\n"
                 "      (source /opt/intel/oneapi/setvars.sh --force)\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // devices[0] exists, so this cannot hit the default-selector throw. Note

@@ -3,6 +3,7 @@
 // Usage:
 //   LLAMA_SYCL_TEST_MODEL=/path/to/model.gguf ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-model-repro
 
+#include "test-skip.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,7 +75,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr,
                      "SKIP: model not found (set LLAMA_SYCL_TEST_MODEL or pass --model) "
                      "-- NO MODEL WAS LOADED AND NOTHING WAS VERIFIED.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     llama_backend_init();

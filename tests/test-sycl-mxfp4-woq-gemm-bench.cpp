@@ -67,6 +67,7 @@
 
 #include "ggml-common.h"
 #include "ggml-sycl/common.hpp"
+#include "test-skip.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1057,7 +1058,7 @@ int main() {
             sycl::property_list{ sycl::property::queue::enable_profiling{}, sycl::property::queue::in_order{} });
     } catch (const sycl::exception & ex) {
         std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     sycl::queue & q = *q_opt;
 

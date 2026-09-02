@@ -126,6 +126,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <algorithm>
 #include <cmath>
@@ -510,14 +511,14 @@ int main() {
     ggml_backend_t cpu_backend = ggml_backend_cpu_init();
     if (!cpu_backend) {
         std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: no CPU backend\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
         std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: no SYCL device available\n");
         ggml_backend_free(cpu_backend);
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::mt19937                          rng(0xC0FFEE);
@@ -578,7 +579,7 @@ int main() {
             std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: trial %d produced no data (compute failure)\n", trial);
             ggml_backend_free(sycl_backend);
             ggml_backend_free(cpu_backend);
-            return 77;
+            return LLAMA_TEST_EXIT_SKIP;
         }
         if (cpu.ids.size() != sycl.ids.size() || cpu.probs.size() != sycl.probs.size()) {
             std::fprintf(stderr, "[MOE-ROUTING-ORACLE] FAIL: trial %d size mismatch\n", trial);
@@ -674,7 +675,7 @@ int main() {
 
     if (trials_run == 0) {
         std::fprintf(stderr, "[MOE-ROUTING-ORACLE] SKIP: zero trials ran -- this run proves nothing\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // GATE LINE for stage (ii): read id_mismatch_tokens off this line

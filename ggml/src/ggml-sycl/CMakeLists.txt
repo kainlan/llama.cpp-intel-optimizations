@@ -1532,7 +1532,13 @@ set(SYCL_LINK_ONLY_TEST_OPTIONS
 # the production definitions -- it needs -fsycl and the SYCL include dir, which
 # this target deliberately lacked, but no extra link dependency.
 
-# unified_matmul winners map to the orchestrator entrypoint. Host-only.
+# Winner-string -> kernel mapping for the dispatch-tuning JSON loader:
+# unified_matmul, mmvq_coalesced/mmvq_soa, onednn_*, mmq_soa (llama.cpp-bqtu,
+# llama.cpp-la7d), plus a multi-entry case that loads one JSON with several
+# distinct (type,m,n,k) keys into one cache and asserts lookup discriminates
+# between them (llama.cpp-la7d). Host-only. The repo-root
+# tests/test-dispatch-tuning.cpp twin was an unregistered duplicate and is
+# gone (llama.cpp-la7d).
 add_executable(test-sycl-dispatch-tuning
     tests/test-dispatch-tuning.cpp
     dispatch-tuning.cpp
@@ -2120,7 +2126,30 @@ endif()
 add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
 set_tests_properties(mem-handle-wrong-device PROPERTIES
     LABELS "sycl;handle;device-identity;tdd"
+    # llama.cpp-9trn: two of this binary's eleven cases (test_wrong_device_
+    # direct_resolve_fails and test_wrong_device_weight_handle_fails, each a
+    # TEST_SKIP("fewer than 2 GPU devices available")), plus the wrong-device
+    # resolve(1) half of test_chunk_lease_tripwire_and_wrong_device_resolve,
+    # require a second visible GPU. Pinned to this single device, they
+    # silently TEST_SKIP'd every run -- proving nothing. This host DOES have
+    # two discrete cards (B70=level_zero:0, B50=level_zero:1; the iGPU must
+    # never be admitted), so widening to level_zero:0,1 was tried. It does
+    # NOT work today: with two real devices visible, the CHUNK_LEASE
+    # wrong-device assertion ("wrong-device CHUNK_LEASE slice resolve must
+    # return null") fails -- not a production bug, but a pre-existing test
+    # defect (that assertion targets a HOST-PINNED CHUNK_LEASE handle, and
+    # mem_handle::resolve(int) deliberately treats host-pinned/host-mmap
+    # pointers as device-agnostic -- see the comment above resolve(int) in
+    # mem-handle.cpp -- so resolve(1) legitimately succeeds and the assertion
+    # of null is unsound). It was never caught because it only executes when
+    # n_gpu_devices >= 2, which this registration never provided. Filed as
+    # llama.cpp-os9t; do not re-widen until that lands. Until then the two
+    # 2-GPU-only cases stay exit-77-skipped here -- honest, not silently
+    # green (that was the bug).
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    # Without this, ctest renders a 77 exit (any case skipped -- see the exit
+    # path in test-mem-handle-wrong-device.cpp) as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 

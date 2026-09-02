@@ -35,7 +35,8 @@ total=$(jq 'length' <<<"$json" 2>/dev/null) \
 [ -n "$total" ] || { echo "check-fork-workflows-disabled: empty workflow listing payload" >&2; exit 2; }
 [ "$total" -gt 0 ] || { echo "EMPTY workflow listing -- refusing to pass vacuously" >&2; exit 2; }
 [ "$total" -lt "$LIMIT" ] || { echo "check-fork-workflows-disabled: listing hit the --limit $LIMIT cap; raise it" >&2; exit 2; }
-active=$(jq -r '.[] | select(.state != "disabled_manually") | "\(.id)\t\(.state)\t\(.name)"' <<<"$json")
+active=$(jq -r '.[] | select(.state != "disabled_manually") | "\(.id)\t\(.state)\t\(.name)"' <<<"$json" 2>/dev/null) \
+    || { echo "check-fork-workflows-disabled: jq could not extract workflow states (wrong shape?)" >&2; exit 2; }
 echo "workflows: $total total"
 if [ -n "$active" ]; then printf 'NOT DISABLED:\n%s\n' "$active"; exit 1; fi
 echo "all $total workflows disabled_manually"

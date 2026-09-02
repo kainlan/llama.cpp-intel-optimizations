@@ -339,6 +339,84 @@ sycl_tools_dl_block_match = re.search(
 # Empty when the guard itself is gone, so losing the guard reports as a named
 # RED check rather than an extraction crash.
 sycl_tools_dl_block = sycl_tools_dl_block_match.group(1) if sycl_tools_dl_block_match else ""
+
+
+def _reset_moe_module_state_body(source):
+    """Extract ggml_sycl_reset_moe_module_state()'s own body (not just a
+    file-wide substring hit), so a mutant that only touches this function
+    is what the predicate below actually depends on."""
+    m = re.search(r"static void ggml_sycl_reset_moe_module_state\(\) \{.*?^}\n", source, re.S | re.M)
+    return m.group(0) if m else ""
+
+
+def _moe_hybrid_init_once_body(source):
+    """Extract moe_hybrid_init_once()'s own body, so the swap-idiom check is
+    scoped to the function that actually republishes the registries rather
+    than any file-wide occurrence of the same two lines."""
+    m = re.search(
+        r"static void moe_hybrid_init_once\(ggml_backend_sycl_context & ctx, ggml_cgraph \* cgraph\) \{.*?^}\n",
+        source, re.S | re.M)
+    return m.group(0) if m else ""
+
+
+def nodelete_moe_state_reset_ok(source, wrapper_source):
+    """NODELETE-on-reset contract for the two module/model-bound MoE registries.
+
+    (ggml-sycl.cpp line numbers below are as of fed0b58e2 -- re-verify with
+    `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n <symbol>` if they drift;
+    the function/symbol names, not the numbers, are what this predicate
+    itself depends on.)
+
+    What this proves: ggml_sycl_reset_moe_module_state() (called once, from
+    module shutdown, immediately before shutdown_unified_cache() -- an exact
+    two-line adjacency match, not merely earlier-in-file) still (a) calls
+    install_fresh() -- the routine whose own comment documents that
+    g_moe_expert_meta/g_expert_groups are "value-only and intentionally
+    survive teardown" rather than being cleared in place -- and (b) the
+    registries are still republished, not permanently stale, via the
+    build-new-then-swap idiom this predicate finds scoped inside
+    moe_hybrid_init_once(). Three structural anchors, each checked inside the
+    specific function body that must contain it, replace the two removed
+    literal g_moe_expert_meta.clear()/g_expert_groups.clear() calls that no
+    longer exist anywhere in the file.
+
+    What this does NOT prove, so a reader does not over-read a green here:
+    it does NOT prove every reader of g_moe_expert_meta/g_expert_groups is
+    gated on g_moe_hybrid_init_success[d] -- it is not; the read sites at
+    ggml-sycl.cpp:3729, 3807, 4063, 5138, 5521, 5625, 6580, 6910, 6990, 7017
+    and 7409 (moe_snapshot_registries, is_expert_resident, and the direct
+    iterations/uses of g_moe_expert_meta/g_expert_groups) take only the
+    registries' own mutexes and read unconditionally, and
+    g_moe_hybrid_init_success[dev] only gates whether moe_hybrid_init_once()
+    re-runs on a given device, not whether the registries it publishes are
+    trusted downstream. It also does NOT prove the success flag itself is
+    immune to survivorship: at ggml-sycl.cpp:99259-99264,
+    `!g_expert_groups.empty()` can be satisfied by a PRIOR model's
+    un-swapped-out entries whenever the current call to
+    moe_hybrid_init_once() returns without publishing (the dense-model early
+    return at ggml-sycl.cpp:7671-7674, or the std::bad_alloc catch at
+    ggml-sycl.cpp:7817-7819) -- a real gap in the production trust
+    derivation, tracked as llama.cpp-maet and NOT fixed by this test change.
+    """
+    reset_body = _reset_moe_module_state_body(source)
+    init_once_body = _moe_hybrid_init_once_body(source)
+    return (
+        "ggml_sycl_reset_moe_module_state()" in source
+        and bool(reset_body)
+        and "g_moe_live_discovery.install_fresh();" in reset_body
+        and "g_moe_hybrid_init_success[d].store(false" in source
+        and bool(init_once_body)
+        and "g_moe_expert_meta.swap(new_expert_meta);" in init_once_body
+        and "g_expert_groups.swap(new_expert_groups);" in init_once_body
+        and "intentionally survive" in source
+        and "g_expert_popularity.clear()" in source
+        and "g_adaptive_prestage.reset_after_stop()" in source
+        and "g_expert_predictors[d].reset()" in source
+        and "ggml_sycl_reset_moe_module_state();\n    if (!ggml_sycl::shutdown_unified_cache())" in source
+        and "NODELETE reload retained model-bound MoE state" in wrapper_source
+    )
+
+
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -965,15 +1043,8 @@ checks = {
     and "post-hook logical reload retry failed" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "barrier models a cross-thread dependency" in registry_backend,
-    "NODELETE MoE state reset": "ggml_sycl_reset_moe_module_state()" in backend
-    and "g_moe_hybrid_init_success[d].store(false" in backend
-    and "g_moe_expert_meta.clear()" in backend
-    and "g_expert_groups.clear()" in backend
-    and "g_expert_popularity.clear()" in backend
-    and "g_adaptive_prestage.reset_after_stop()" in backend
-    and "g_expert_predictors[d].reset()" in backend
-    and "NODELETE reload retained model-bound MoE state" in
-        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "NODELETE MoE state reset": nodelete_moe_state_reset_ok(
+        backend, (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()),
     "process pinned raw handle lifetime": "Generic raw-handle policy: pin" in registry_backend
     and "dl_pin_library(handle.get(), path)" in registry_backend
     and "g_backend_raw_handle_leases" not in registry_backend
@@ -1339,35 +1410,72 @@ checks = {
     and "M7_SUBMIT_RELEASES_DEVICES_EARLY" in execution,
 }
 failed = [name for name, ok in checks.items() if not ok]
-if failed:
-    print("lifecycle source contract failed: " + ", ".join(failed), file=sys.stderr)
+
+# Mutant/self-test negative controls run on EVERY invocation, not only under
+# --self-test. The ctest registration (ggml/src/ggml-sycl/CMakeLists.txt)
+# invokes this script with no arguments, so gating these behind --self-test
+# left them unreachable under `ctest -R sycl-lifecycle-source-contract` --
+# and doubly so once `if failed: raise SystemExit(1)` ran first on any red
+# check, since Python never reaches code after a raised SystemExit. Running
+# them unconditionally, before any exit, is what makes "the predicate can
+# fail" itself part of the registered gate rather than an opt-in extra.
+mutants = (
+    ("raw lambda/thread escape", "backend", raw_snapshot_reader_allowlist[0],
+     raw_snapshot_reader_allowlist[0] + "\n    auto * escaped_plan = cached.get();\n"
+     "    std::thread escaped_worker([escaped_plan] { (void) escaped_plan; });"),
+    ("raw return escape", "backend", raw_snapshot_reader_allowlist[0],
+     raw_snapshot_reader_allowlist[0] + "\n    return cached.get();"),
+    ("retirement helper early storage release", "cache",
+     "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {",
+     "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {\n"
+     "    entry.storage_owner.reset();"),
+)
+mutant_failures = []
+for name, target, anchor, replacement in mutants:
+    original = backend if target == "backend" else cache_cpp
+    if anchor not in original:
+        mutant_failures.append(name + ": anchor missing")
+        continue
+    mutated = original.replace(anchor, replacement, 1)
+    caught = (_raw_snapshot_escape_failures(mutated) if target == "backend"
+              else _retirement_storage_release_failures(mutated))
+    if not caught:
+        mutant_failures.append(name + ": bypass was not detected")
+
+# Negative controls for "NODELETE MoE state reset". Three structural anchors
+# feed the predicate (see nodelete_moe_state_reset_ok's docstring); each
+# mutant below deletes exactly one of them from an in-memory copy of the
+# real source and asserts the predicate goes False -- proving it is not
+# vacuously true rather than merely trusting the anchors are meaningful.
+wrapper_text = (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+nodelete_mutants = (
+    ("NODELETE MoE state reset: swap republish removed",
+     "        g_moe_expert_meta.swap(new_expert_meta);\n"
+     "        g_expert_groups.swap(new_expert_groups);\n",
+     "        // NODELETE-MUTANT: swap republish removed\n"),
+    ("NODELETE MoE state reset: install_fresh() removed from reset function",
+     "    g_moe_live_discovery.install_fresh();\n",
+     "    // NODELETE-MUTANT: install_fresh() removed\n"),
+    ("NODELETE MoE state reset: reset call removed from shutdown",
+     "    ggml_sycl_reset_moe_module_state();\n    if (!ggml_sycl::shutdown_unified_cache())",
+     "    // NODELETE-MUTANT: reset call removed\n    if (!ggml_sycl::shutdown_unified_cache())"),
+)
+for name, anchor, replacement in nodelete_mutants:
+    if anchor not in backend:
+        mutant_failures.append(name + ": anchor missing")
+        continue
+    nodelete_mutated = backend.replace(anchor, replacement, 1)
+    if nodelete_moe_state_reset_ok(nodelete_mutated, wrapper_text):
+        mutant_failures.append(name + ": bypass was not detected")
+
+if failed or mutant_failures:
+    if failed:
+        print("lifecycle source contract failed: " + ", ".join(failed), file=sys.stderr)
+    if mutant_failures:
+        print("lifecycle source self-test failed: " + ", ".join(mutant_failures), file=sys.stderr)
     raise SystemExit(1)
 
 if "--self-test" in sys.argv:
-    mutants = (
-        ("raw lambda/thread escape", "backend", raw_snapshot_reader_allowlist[0],
-         raw_snapshot_reader_allowlist[0] + "\n    auto * escaped_plan = cached.get();\n"
-         "    std::thread escaped_worker([escaped_plan] { (void) escaped_plan; });"),
-        ("raw return escape", "backend", raw_snapshot_reader_allowlist[0],
-         raw_snapshot_reader_allowlist[0] + "\n    return cached.get();"),
-        ("retirement helper early storage release", "cache",
-         "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {",
-         "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {\n"
-         "    entry.storage_owner.reset();"),
-    )
-    mutant_failures = []
-    for name, target, anchor, replacement in mutants:
-        original = backend if target == "backend" else cache_cpp
-        if anchor not in original:
-            mutant_failures.append(name + ": anchor missing")
-            continue
-        mutated = original.replace(anchor, replacement, 1)
-        caught = (_raw_snapshot_escape_failures(mutated) if target == "backend"
-                  else _retirement_storage_release_failures(mutated))
-        if not caught:
-            mutant_failures.append(name + ": bypass was not detected")
-    if mutant_failures:
-        print("lifecycle source self-test failed: " + ", ".join(mutant_failures), file=sys.stderr)
-        raise SystemExit(1)
-    print("lifecycle source contract: self-test PASS (3 bypass insertion mutants)")
+    print("lifecycle source contract: self-test PASS (3 bypass insertion mutants, "
+          "3 NODELETE MoE reset negative controls)")
 print("lifecycle source contract: PASS")

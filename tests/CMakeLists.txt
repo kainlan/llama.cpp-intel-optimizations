@@ -909,6 +909,68 @@ if (NOT WIN32)
     )
 endif()
 
+# sycl-canonical-gates (llama.cpp-rou3): the two prose gates in CLAUDE.md
+# ("Verification Commands & Correctness Gates" -- the Mistral completion gate
+# and the GPT-OSS chat gate) as ONE executable, ctest-registered runner. Not
+# guarded by `if (GGML_SYCL)`: the whole point of the script's own
+# CMakeCache/ldd precondition check is to catch a build where GGML_SYCL was
+# silently reset OFF (CLAUDE.md: this happened 2026-07-25 and the Mistral
+# gate still passed, on the CPU fallback, at ~8.38 tok/s instead of ~108). If
+# registration itself were gated on the CMake-configure-time GGML_SYCL
+# variable, that exact scenario would make this test vanish from `ctest -N`
+# instead of failing loudly -- so it is registered unconditionally (mirroring
+# the test-sycl-*-policy.sh family above) and fails closed (rc=1) at runtime
+# instead.
+#
+# LABELS "gpu;model-loading": this test loads two real models on a real GPU
+# (llama-completion, llama-cli), which the never-loop / GPU-serialization
+# rules in CLAUDE.md forbid running unpinned, in a subagent, or concurrently
+# with any other GPU-allocating test. Neither "gpu" nor "model-loading" is in
+# CLAUDE.md's documented safe-sweep denylist (`-LE
+# 'residency|mem-handle|cache'`) as written today -- that denylist must grow
+# a `|gpu` term before any documented "safe" sweep can be trusted not to
+# schedule this test (flagged on the tracking epic, llama.cpp-97yn).
+# RESOURCE_LOCK gpu-ttm-memory: llama.cpp-ezfm's fail-closed GPU/TTM
+# serialization policy had not landed a shared resource-lock name as of this
+# commit; adopt ezfm's wrapper here once it exists instead of this literal.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${PROJECT_SOURCE_DIR}/scripts/sycl-canonical-gates.sh
+             --build-dir ${CMAKE_BINARY_DIR} --gate all --selector level_zero:1
+    )
+    set_tests_properties(sycl-canonical-gates PROPERTIES
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK gpu-ttm-memory
+        ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1
+        TIMEOUT 1800
+        LABELS "gpu;model-loading"
+    )
+endif()
+
+# sycl-canonical-gates-script: the stub-driven unit test of the gate script's
+# OWN logic (tests/test-sycl-canonical-gates-script.sh) -- fail-closed
+# preconditions, the no-device probe, and both pass/fail digit checks, all
+# against fake llama-completion/llama-cli executables. CPU-only, no GPU
+# label: this is what stops the gate script itself from being decorative,
+# and it must run in every sweep that the real gpu-labelled test above is
+# excluded from.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-gates-script.sh
+    )
+    set_tests_properties(sycl-canonical-gates-script PROPERTIES
+        LABELS "sycl;policy"
+        TIMEOUT 120
+    )
+endif()
+
 if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
@@ -1804,19 +1866,20 @@ if (NOT WIN32)
         TIMEOUT 120
     )
 
-    # DECLINED, with reasons (llama.cpp-0igs).  Four sibling .py gates in this
-    # directory are deliberately left unregistered.  Registering them would put
-    # four permanently-red lines in ctest for reasons that are NOT code
-    # defects, and a suite with known-red lines in it stops being read.
+    # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
+    # directory that are deliberately left unregistered.  Registering them would
+    # put permanently-red lines in ctest for reasons that are NOT code defects,
+    # and a suite with known-red lines in it stops being read.
     #
     #   test-sycl-end-to-end-profiling-docs.py
     #   test-sycl-mxfp4-tg-speedup-docs.py
-    #       Both assert on files that HAVE NEVER EXISTED in this repository:
-    #       `research.md` at the root, and
+    #       DELETED (llama.cpp-zxlp).  Both asserted on files that HAVE NEVER
+    #       EXISTED in this repository: `research.md` at the root, and
     #       `activation/sycl-mxfp4-tg-speedup-final-review-20260707.md`.
-    #       `git log --all --` on either path returns nothing, so these are not
-    #       deleted artifacts, they were never committed.  Unpassable as
-    #       written; they need rewriting or removing, not registering.
+    #       `git log --all --` on either path returned nothing, so they were not
+    #       deleted artifacts, they were never committed (and no renamed
+    #       in-tree equivalent was found).  Unpassable as written, so removed
+    #       rather than registered; the deletion commit carries the reasoning.
     #
     #   test-sycl-moe-multirhs-gateup-source.py
     #       Asserts the literal "multi_rhs_gateup = false".  The field IS
@@ -1833,7 +1896,7 @@ if (NOT WIN32)
     #       strings moved out of the section the test slices.
     #
     # All four were RUN, not guessed: 62 of the 66 unregistered pytest-style
-    # files in tests/ pass, and these are the 4 that do not.
+    # files in tests/ passed, and these were the 4 that did not.
 endif()
 
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
@@ -2428,4 +2491,24 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# Regression gate for llama.cpp-1lrh: a SYCL backend *registration* query
+# (ggml_backend_reg_by_name("SYCL")) must report zero devices rather than
+# abort the process when platform enumeration finds none. Forces the
+# zero-device condition on every host via ONEAPI_DEVICE_SELECTOR=level_zero:99
+# (an out-of-range device index -- verified empirically to resolve to "zero
+# devices enumerated", not a selector parse error) so the property is
+# exercised unconditionally rather than only on device-less runners. See
+# test-sycl-registration-no-device.cpp for the full rationale.
+if (GGML_SYCL)
+    llama_build(test-sycl-registration-no-device.cpp)
+    target_link_libraries(test-sycl-registration-no-device PRIVATE ggml-sycl)
+    llama_test(test-sycl-registration-no-device LABEL "main")
+    set_tests_properties(test-sycl-registration-no-device PROPERTIES
+        LABELS "sycl;env"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:99"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
 endif()

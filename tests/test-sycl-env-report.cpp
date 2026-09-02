@@ -17,6 +17,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -89,7 +90,7 @@ int main() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("SYCL");
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
         std::fprintf(stderr, "SKIP: no SYCL device available\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
