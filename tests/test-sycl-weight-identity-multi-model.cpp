@@ -16,7 +16,7 @@
 // falls back to the published-plan snapshot when extra->model_id is 0 (no
 // owner known):
 //
-//     ggml/src/ggml-sycl/ggml-sycl.cpp:13975-13976
+//     ggml/src/ggml-sycl/ggml-sycl.cpp:13974-13975
 //         const uint64_t extra_model_id = extra ? extra->model_id : 0;
 //         const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
 //
@@ -77,7 +77,7 @@
 // (registry.find(model_id)), which is everything ggml_sycl_exact_wrapper_owner()
 // consults for a nonzero model id.
 //
-// Mutation control: temporarily change ggml-sycl.cpp:13976 from
+// Mutation control: temporarily change ggml-sycl.cpp:13975 from
 //     const auto owner = ggml_sycl_exact_wrapper_owner(extra_model_id);
 // to
 //     const auto owner = ggml_sycl_exact_wrapper_owner(0);
@@ -102,8 +102,7 @@
 //     the mutation, since the mutated owner is zero rather than A's real
 //     token.
 // This test's file_offs/has_gguf checks in round 1 and round 2's second
-// query are therefore genuinely RED under the mutation; see the task
-// comment log for the captured before/after output of this control.
+// query are therefore genuinely RED under the mutation.
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
