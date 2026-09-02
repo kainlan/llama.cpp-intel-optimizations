@@ -65,6 +65,7 @@
 // BUILT (compiled) by anyone, but RUN only by the lead session, serially,
 // with the standard Shmem/MemAvailable sampling around it.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-common.h"
 #include "ggml-sycl/common.hpp"
 
@@ -1057,7 +1058,7 @@ int main() {
             sycl::property_list{ sycl::property::queue::enable_profiling{}, sycl::property::queue::in_order{} });
     } catch (const sycl::exception & ex) {
         std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     sycl::queue & q = *q_opt;
 

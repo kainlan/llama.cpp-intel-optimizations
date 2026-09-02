@@ -15,6 +15,7 @@
 //
 // Exits 77 (ctest SKIP_RETURN_CODE) when no SYCL device is present.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml.h"
 
@@ -89,7 +90,7 @@ int main() {
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("SYCL");
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
         std::fprintf(stderr, "SKIP: no SYCL device available\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);

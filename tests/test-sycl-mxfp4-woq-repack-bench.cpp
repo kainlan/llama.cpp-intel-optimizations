@@ -31,6 +31,7 @@
 // all n_slots, divided by the measured device time -- i.e. total HBM
 // traffic for the logical repack, matching how the task's static
 // attribution (comment c-ajw4) phrases "effective bandwidth".
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-common.h"
 #include "ggml-sycl/convert.hpp"
 
@@ -498,6 +499,6 @@ int main() {
         return 0;
     } catch (const sycl::exception & ex) {
         std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 }

@@ -84,6 +84,7 @@
 // it goes red it is a real finding in every state.
 // ---------------------------------------------------------------------------
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml.h"
 
@@ -103,7 +104,7 @@ int main() {
     // so this must not read as a pass.  A green skip is the exact defect class
     // this file's own comment is about (llama.cpp-ay8c).
     std::fprintf(stderr, "SKIP: GGML SYCL oneDNN not enabled; no gate was evaluated.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

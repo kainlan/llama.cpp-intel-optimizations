@@ -7,6 +7,7 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mxfp4-xmx-tiled
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,7 +22,7 @@
 #if !SYCL_XMX_MOE_AVAILABLE
 int main() {
     fprintf(stderr, "SKIP: SYCL XMX matrix extension is unavailable in this build.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -78,13 +79,13 @@ int main() {
         // 77 (ctest SKIP_RETURN_CODE), not 0: nothing was verified, so this must not
         // report success. See llama.cpp-k208.
         fprintf(stderr, "SKIP: no SYCL devices available -- NO DEVICE WORK WAS PERFORMED.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     const int device_id = 0;
     if (!info.devices[device_id].xmx_caps.supported) {
         fprintf(stderr, "SKIP: selected SYCL device does not support XMX.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     moe_xmx_fused::MXFPXMXConfig cfg = moe_xmx_fused::MXFPXMXConfig::from_device(device_id);

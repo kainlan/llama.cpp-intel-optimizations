@@ -91,6 +91,7 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-reset-model-weight-lease-preserve
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
@@ -114,7 +115,7 @@ int main() {
     fprintf(stderr,
             "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about weight\n"
             "      ownership at a model-load boundary.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -913,7 +914,7 @@ int main() {
                 "SKIP: no SYCL GPU devices available; this run proves NOTHING about weight\n"
                 "      ownership at a model-load boundary. Source oneAPI and re-run.\n"
                 "      (source /opt/intel/oneapi/setvars.sh --force)\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // devices[0] exists, so this cannot hit the default-selector throw. Note

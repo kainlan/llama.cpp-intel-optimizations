@@ -26,6 +26,7 @@
 // logical + representation identity keys), llama.cpp-twc (the original expert
 // identity collision).
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +46,7 @@ int main() {
     // tested nothing as a pass -- see CLAUDE.md, "a SKIP line with status 0 is
     // not a pass".
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about cache identity.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

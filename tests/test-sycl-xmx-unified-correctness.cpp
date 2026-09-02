@@ -17,6 +17,7 @@
 // this test asserts did not hold, 77 = a capability or configuration it needs
 // is genuinely absent (ctest SKIP_RETURN_CODE).  Never collapse 77 into 0.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +40,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     std::fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about the XMX path\n");
-    return 77;  // ctest SKIP_RETURN_CODE -- a skip must not read as a pass
+    return LLAMA_TEST_EXIT_SKIP;  // ctest SKIP_RETURN_CODE -- a skip must not read as a pass
 }
 #else
 
@@ -159,7 +160,7 @@ static void build_case(matmul_case & tc) {
 // A run has three outcomes, and collapsing them into one bool is what made this
 // test report `FAIL: SYCL backend run failed` for a compute that returned
 // GGML_STATUS_SUCCESS.  SKIPPED means a capability or configuration the test
-// needs is genuinely absent (ctest scores it skipped via exit 77); FAILED means
+// needs is genuinely absent (ctest scores it skipped via exit LLAMA_TEST_EXIT_SKIP); FAILED means
 // a property the test asserts did not hold.
 enum class run_status {
     OK,

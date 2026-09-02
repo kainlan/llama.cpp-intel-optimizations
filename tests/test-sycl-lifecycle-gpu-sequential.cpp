@@ -1,3 +1,4 @@
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "llama-ext.h"
@@ -232,7 +233,7 @@ int main(int argc, char ** argv) {
     const char * oneapi  = std::getenv("ONEAPI_DEVICE_SELECTOR");
     const char * logical = std::getenv("GGML_SYCL_DEVICE");
     if (!oneapi || std::string(oneapi) != k_oneapi_selector || !logical || std::string(logical) != k_logical_selector) {
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     llama_backend_init();
@@ -241,7 +242,7 @@ int main(int argc, char ** argv) {
     std::string        uuid;
     if (!llama_supports_gpu_offload() || !selected_device(selected, uuid)) {
         llama_backend_free();
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::vector<std::pair<const char *, std::vector<llama_token>>> runs;

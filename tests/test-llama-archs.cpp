@@ -1,3 +1,4 @@
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "common.h"
 #include "log.h"
 #include "ggml-backend.h"
@@ -1160,9 +1161,9 @@ static int test_backends(const llm_arch                target_arch,
     archs_table::emit(table.footer(nmse_gate, n_bitdiff));
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
     if (n_measured == 0) {
-        // Exit 77 (the project's SKIP_RETURN_CODE) rather than 0: this harness compared
-        // nothing, so there is no result to report either way. `all_ok` is initialised true,
-        // so without this the run would report success it did not earn.
+        // Exit skip (LLAMA_TEST_EXIT_SKIP -- see tests/test-skip.h) rather than 0: this
+        // harness compared nothing, so there is no result to report either way. `all_ok`
+        // is initialised true, so without this the run would report success it did not earn.
         //
         // Unconditional, deliberately. This used to be guarded by `target_arch !=
         // LLM_ARCH_UNKNOWN`, on the reasoning that "77 is unreachable from the registered
@@ -1210,7 +1211,7 @@ static int test_backends(const llm_arch                target_arch,
                     "that the run was not cut short before the first comparison.\n%s",
                     __func__, excluded_note.c_str());
         }
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     return all_ok ? 0 : 1;
 }

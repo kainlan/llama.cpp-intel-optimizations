@@ -13,6 +13,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <atomic>
 #include <algorithm>
 #include <cassert>
@@ -893,7 +894,7 @@ int main() {
     const char * env = std::getenv("GGML_SYCL_UNIFIED_DISPATCH");
     if (env && std::atoi(env) == 0) {
         fprintf(stderr, "SKIP: GGML_SYCL_UNIFIED_DISPATCH is explicitly disabled.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     fprintf(stderr, "\n=== Unified Dispatch Integration Tests ===\n\n");

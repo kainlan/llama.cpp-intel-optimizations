@@ -94,6 +94,7 @@
 // tests/test-sycl-reset-model-weight-lease-preserve.cpp's job, and the two are
 // the two halves of one claim.  Neither is sufficient alone.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/model-lifecycle-probe.hpp"

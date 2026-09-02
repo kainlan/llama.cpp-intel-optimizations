@@ -11,6 +11,7 @@
 // Run:
 //   ONEAPI_DEVICE_SELECTOR='level_zero:0;level_zero:1' ./test-expert-routing-roundtrip
 //
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <sycl/sycl.hpp>
 #include <cstdio>
 #include <cstring>
@@ -46,7 +47,7 @@ int main() {
         // exit 1 makes that read as a broken multi-GPU path. 77 is the project's
         // SKIP_RETURN_CODE.
         printf("SKIP: need 2 Level Zero GPUs, found %zu -- NO DEVICE WORK WAS PERFORMED.\n", gpus.size());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     sycl::context ctx({gpus[0], gpus[1]});

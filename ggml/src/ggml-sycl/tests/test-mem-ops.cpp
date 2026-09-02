@@ -1,3 +1,4 @@
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../common.hpp"
 #include "../mem-handle.hpp"
 #include "../mem-ops.hpp"
@@ -57,7 +58,7 @@ int main() {
                      "SKIP: no SYCL GPU devices available -- NO DEVICE WORK WAS PERFORMED.\n"
                      "      On a machine that has a GPU this means the oneAPI runtime was not on the\n"
                      "      library path: source /opt/intel/oneapi/setvars.sh --force and re-run.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     sycl::queue      q(gpus.front(), sycl::property::queue::in_order{});

@@ -1,6 +1,7 @@
 // XMX GEMM host weight streaming test: compare CPU vs SYCL for Q4_0 weights.
 // Ensures unified cache DMA streaming path works for XMX GEMM with host-resident weights.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -18,7 +19,7 @@
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled\n");
-    return 77;  // ctest SKIP_RETURN_CODE -- see the note above main() below
+    return LLAMA_TEST_EXIT_SKIP;  // ctest SKIP_RETURN_CODE -- see the note above main() below
 }
 #else
 

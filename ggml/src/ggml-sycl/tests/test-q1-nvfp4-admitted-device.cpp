@@ -1,4 +1,5 @@
 // BUILD_TESTING-only live regression for the closed Q1/NVFP4 production MMID route.
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "q1-nvfp4-production-route-test-seam.hpp"
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -334,7 +335,7 @@ int main() {
     try {
         bool have_gpu = false;
         for (const auto & device : sycl::device::get_devices()) have_gpu |= device.is_gpu();
-        if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return 77; }
+        if (!have_gpu) { std::cerr << "SKIP: no usable SYCL GPU\n"; return LLAMA_TEST_EXIT_SKIP; }
         { lifecycle_fixture life; graph_churn_regression(life, GGML_TYPE_Q1_0, 1);
           graph_churn_regression(life, GGML_TYPE_Q1_0, 3);
           graph_churn_regression(life, GGML_TYPE_NVFP4, 1);
@@ -343,6 +344,6 @@ int main() {
         injected_failure_case(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_POST_MARK, true);
         injected_async_terminal_failure_case();
         std::cout << "Q1/NVFP4 scoped production-route lifecycle: PASS\n"; return 0;
-    } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return 77; }
+    } catch (const sycl::exception & e) { std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n'; return LLAMA_TEST_EXIT_SKIP; }
       catch (const std::exception & e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

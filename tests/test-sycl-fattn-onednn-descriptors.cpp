@@ -1,3 +1,4 @@
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend-impl.h"
 #include "ggml-sycl/fattn-onednn.hpp"
 
@@ -16,7 +17,7 @@
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
     std::printf("SKIP: GGML SYCL oneDNN was not compiled in.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -381,13 +382,13 @@ static int run_descriptor_tests() {
     }
     if (gpus.empty()) {
         std::printf("SKIP: no SYCL GPU device is available.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     const sycl::device & device = gpus.front();
     if (!device.has(sycl::aspect::usm_device_allocations) || !device.has(sycl::aspect::fp16)) {
         std::printf("SKIP: SYCL GPU lacks device USM or fp16 required by the oneDNN path.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     bool ok = true;

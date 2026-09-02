@@ -1,3 +1,4 @@
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <level_zero/ze_api.h>
 
 #include <cstdio>
@@ -41,7 +42,7 @@ static const char * ze_result_name(ze_result_t result) {
 // ggml/src/ggml-sycl/CMakeLists.txt:1519 does not yet (tracked with llama.cpp-k208).
 static int skip_result(const char * message, ze_result_t result) {
     std::printf("SKIP: %s: %s (%d)\n", message, ze_result_name(result), static_cast<int>(result));
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 
 static int fail_result(const char * message, ze_result_t result) {
@@ -62,7 +63,7 @@ int main() {
     }
     if (driver_count == 0) {
         std::puts("SKIP: no Level Zero driver");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     // Past this point Level Zero is present and reported at least one driver, so a

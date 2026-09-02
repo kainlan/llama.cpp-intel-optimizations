@@ -12,6 +12,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -527,21 +528,16 @@ int main(int argc, char ** argv) {
     }
 
     if (devices.empty()) {
-        // Exit 77, not 1. "No device" is not a test result in either direction:
-        // returning 1 renders a legitimately CPU-only runner as a hard FAILURE,
-        // which is the mirror image of the exit-0 vacuous pass this family is named
-        // for (llama.cpp-k208) -- same root confusion, opposite symptom. 77 is
-        // ctest's SKIP_RETURN_CODE, so ctest reports *skipped* rather than passed or
-        // failed, and a bare shell run still gets a non-zero status. The point is to
-        // make the skip visible AS a skip, never to forbid skipping: a CPU-only
-        // runner still legitimately lands here. The registration in
-        // ggml/src/ggml-sycl/CMakeLists.txt carries the matching SKIP_RETURN_CODE 77;
-        // without it ctest renders 77 as FAILED.
+        // Exit skip, not failure: a CPU-only runner legitimately lands here, and the
+        // mirror-image bug (exit 1) would render that a hard FAILURE. See
+        // tests/test-skip.h for what LLAMA_TEST_EXIT_SKIP means and why. The
+        // registration in ggml/src/ggml-sycl/CMakeLists.txt carries the matching
+        // SKIP_RETURN_CODE 77; without it ctest renders this as FAILED.
         fprintf(stderr,
                 "SKIP: no SYCL GPU devices available; this run proves NOTHING "
                 "about XMX dispatch. Source oneAPI and re-run to actually test it.\n"
                 "      (source /opt/intel/oneapi/setvars.sh --force)\n");
-        return 77;  // ctest SKIP_RETURN_CODE -- a skip must be visible AS a skip
+        return LLAMA_TEST_EXIT_SKIP;  // see tests/test-skip.h
     }
 
     // devices[0] exists, so this cannot hit the default-selector throw described

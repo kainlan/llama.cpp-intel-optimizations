@@ -1,4 +1,5 @@
 // Executable device regression test for the allocation-free admitted adapter.
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "mmvq.hpp"
 #include "convert.hpp"
 #include "unified-cache.hpp"
@@ -375,7 +376,7 @@ int main() {
         return 0;
     } catch (const sycl::exception & e) {
         std::cerr << "SKIP: no usable SYCL GPU: " << e.what() << '\n';
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     } catch (const std::exception & e) {
         std::cerr << "FAIL: " << e.what() << '\n';
         return 1;

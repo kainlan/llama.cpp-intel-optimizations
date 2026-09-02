@@ -6,6 +6,7 @@
 
 // Integration contract for the current-model planner-placement verdict.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl.h"
 #include "ggml-sycl/tiered-plan-clear.hpp"
 #include "ggml.h"
@@ -164,13 +165,13 @@ bool arena_contract_available() {
 
 int main() {
     if (!arena_contract_available()) {
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     const int device_count = ggml_backend_sycl_get_device_count();
     if (device_count <= 0) {
         std::fprintf(stderr, "SKIP: no SYCL device\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
@@ -206,7 +207,7 @@ int main() {
     if (over_budget_tensor > std::numeric_limits<size_t>::max() / over_budget_count) {
         ggml_backend_free(backend);
         std::fprintf(stderr, "SKIP: aggregate device capacity cannot be exceeded by a representable fixture\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     run_placement_case(backend, "over-budget-second", over_budget_count, over_budget_tensor, true);
     run_placement_case(backend, "all-device-third", 4, 4096, false);

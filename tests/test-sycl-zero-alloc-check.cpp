@@ -41,6 +41,7 @@
 // stay silent, plus a positive control showing a single shared instance
 // would not have.
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl/unified-cache.hpp"
 
 #include <cstdio>
@@ -50,7 +51,7 @@ int main() {
     // 77 (ctest SKIP_RETURN_CODE), not 0: no gate was evaluated in this
     // build, so this must not read as a pass.
     std::fprintf(stderr, "SKIP: GGML SYCL not enabled; no gate was evaluated.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
