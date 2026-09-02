@@ -2888,6 +2888,30 @@ class unified_cache {
 
     size_t onednn_activations_scratch_size() const { return onednn_activations_scratch_size_; }
 
+#if GGML_SYCL_DNNL
+    // oneDNN Graph SYCL allocator backing (llama.cpp-gwno / S4 root cause,
+    // jmc5 c-uxch): the compiled SDPA partition's ~12 MiB scratch is allocated
+    // by oneDNN itself on every dnnl::graph::sycl_interop::execute() unless
+    // the engine is built with a dnnl::graph::allocator (see make_engine() in
+    // common.hpp). These two serve that allocator's malloc/free callbacks
+    // (onednn_graph_sycl_malloc/free, declared above) from the SAME ONEDNN
+    // VRAM zone reserve_onednn_scratch() already uses for the primitive-API
+    // path, so a request is a host-side TLSF suballocation, not a
+    // zeMemAllocDevice/xe_vm_bind round trip. Falls back to a real
+    // mem_handle-owned allocation only if the zone has no room.
+    void * onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q);
+    // `event` is the completion event oneDNN hands back for the compiled
+    // partition's submission (may be null in principle; oneDNN's SYCL interop
+    // always supplies one for a real execute). The physical release -- back to
+    // the ONEDNN zone's TLSF free list, or the mem_handle's own release for
+    // the direct-fallback case -- is deferred until it completes, mirroring
+    // reserve_onednn_scratch's defer_published_zone_release /
+    // defer_published_direct_release (llama.cpp-ndn9): a following
+    // onednn_graph_scratch_alloc() must not hand this memory to a new compiled
+    // partition while this one's kernels may still be reading it.
+    void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
+#endif
+
     struct pp_moe_onednn_scratch_slot {
         uint32_t   slot            = std::numeric_limits<uint32_t>::max();
         uint64_t   generation      = 0;
@@ -3541,6 +3565,47 @@ class unified_cache {
     uint64_t                onednn_scratch_generation_ = 0;
     uint32_t                onednn_scratch_refcount_   = 0;
 
+#if GGML_SYCL_DNNL
+    // State for onednn_graph_scratch_alloc/free() (llama.cpp-gwno). Separate
+    // mutex from onednn_scratch_mutex_ above: that one guards the
+    // weights+activations PAIR reservation (locked for the whole duration of a
+    // GEMM call via lock_onednn_scratch()); this one only ever guards a quick
+    // map lookup/insert around a zone_alloc/zone_free call, and the two must
+    // not become the same lock or a Graph SDPA call inside a locked GEMM
+    // region (or vice versa) would self-deadlock.
+    std::mutex                             onednn_graph_scratch_mutex_;
+    // Pointers currently on loan to oneDNN's Graph allocator that came from a
+    // DIRECT (non-arena) unified_alloc() fallback -- i.e. the ONEDNN zone had
+    // no room when they were allocated. Absence from this map means the
+    // pointer (if non-null and ours) came from the zone instead. Empty at
+    // steady state; only ever populated if the zone is under-sized for this
+    // model's concurrent within-ubatch Graph-scratch demand.
+    std::unordered_map<void *, mem_handle> onednn_graph_scratch_direct_owners_;
+    // Zone-backed pointers on loan, so free() knows the zone TLSF free list
+    // (not the direct-owner map) is where this pointer belongs -- zone_free()
+    // itself needs no size (TLSF recovers it from the block header), this is
+    // purely presence tracking.
+    std::unordered_set<void *>             onednn_graph_scratch_zone_ptrs_;
+
+    // Freed by oneDNN but not yet safe to hand back to the zone: the
+    // completion event has not fired as of the free() call. Drained lazily —
+    // opportunistically, on the next onednn_graph_scratch_alloc()/free() —
+    // rather than via a background poll, because polling
+    // command_execution_status on a profiling-enabled queue (every backend
+    // compute queue is one — see get_dma_queue()'s comment above) BLOCKS
+    // instead of returning immediately, and this state must not add a host
+    // stall of its own to the path it exists to unblock.
+    struct onednn_graph_pending_free {
+        void *      ptr;
+        sycl::event event;
+    };
+
+    std::vector<onednn_graph_pending_free> onednn_graph_scratch_pending_;
+
+    // Caller must hold onednn_graph_scratch_mutex_.
+    void drain_pending_onednn_graph_scratch_locked();
+#endif
+
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_retired_slots_;
     size_t                                  pp_moe_onednn_weight_slot_size_     = 0;
@@ -3888,6 +3953,25 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // Use from destructors and shutdown paths where creating a new cache would
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
+
+#if GGML_SYCL_DNNL
+// oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not
+// unified_cache members: dnnl_graph_sycl_interop_allocator_create() takes only
+// two bare function pointers -- no user-data slot to carry a `this` -- so
+// these resolve the owning unified_cache themselves (via the device oneDNN
+// hands back) and forward to unified_cache::onednn_graph_scratch_alloc/free().
+// Signatures match dnnl_graph_sycl_allocate_f / dnnl_graph_sycl_deallocate_f
+// (oneapi/dnnl/dnnl_graph_sycl.h) exactly; declared with the raw signature
+// here so this header does not need to include the dnnl Graph headers itself
+// -- only common.hpp, where they are actually passed to
+// dnnl::graph::sycl_interop::make_allocator(), needs those.
+void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev, const void * ctx);
+void   onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void * event);
+
+// GGML_SYCL_ONEDNN_CACHE_ALLOCATOR opt-out (default enabled). Checked once and
+// cached; see unified-cache.cpp for the env parse.
+bool onednn_graph_allocator_enabled();
+#endif
 
 // Overload with device memory hints — avoids ggml_sycl_info() reentry
 // deadlock when called from within ggml_sycl_init() static initialization.

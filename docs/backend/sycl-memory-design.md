@@ -159,6 +159,59 @@ The older `unified_alloc(req, &alloc_handle)` / `unified_free(handle)` pair
 machinery; `unified_allocate` is the smart-pointer front that most callers
 should use. `alloc_handle::as_mem_handle()` bridges the two.
 
+### oneDNN Graph allocations are a cache consumer too (llama.cpp-gwno)
+
+The primitive-API scratchpad (`gemm.hpp`'s `scratchpad_mode::user` +
+`get_scratchpad_mem()`) already routed through `unified_alloc()` into the
+ONEDNN VRAM zone. Until llama.cpp-gwno, the **Graph API** did not: the
+compiled SDPA partition's ~12 MiB scratch/intermediate was allocated by
+oneDNN's own default SYCL allocator (`sycl::aligned_alloc_device`) on every
+`dnnl::graph::sycl_interop::execute()` — a real `zeMemAllocDevice`/
+`xe_vm_bind` round trip, invisible to the unified cache's own traces, firing
+35x per ubatch on the B70 pp512 and blocking the dispatch thread ~2.7 ms each
+time (S4 root cause, `llama.cpp-jmc5` comment `c-uxch`).
+
+The fix builds the oneDNN engine (`ggml_backend_sycl_context::make_engine()`,
+`common.hpp`) with a `dnnl::graph::allocator`
+(`dnnl::graph::sycl_interop::make_allocator()` +
+`make_engine_with_allocator()`). Since `dnnl::graph::engine` is literally
+`dnnl::engine`, one engine object backs both the primitive API and the Graph
+API, so this one change reaches both. The allocator's two C callbacks
+(`ggml_sycl::onednn_graph_sycl_malloc/free`, `unified-cache.cpp`) have no
+user-data slot to carry a `this` — the oneDNN C API doesn't offer one — so
+they resolve the owning `unified_cache` themselves from the `sycl::device`
+oneDNN hands back (`ggml_sycl_get_device_id_from_device()`) and forward to
+`unified_cache::onednn_graph_scratch_alloc/free()`.
+
+Those two methods serve requests from the **same ONEDNN zone** the
+primitive-API pair already uses (`zone_alloc`/`zone_free` — host-side TLSF
+suballocation, no device syscall) rather than a separate reservation. A
+buffer freed by oneDNN is not immediately eligible for reuse: oneDNN hands the
+free callback a completion event, and the compiled partition's kernels may
+still be reading the buffer when the callback fires (it is called at
+submission, not at completion). The buffer is held in a small pending list and
+reclaimed lazily — on the next `alloc()`/`free()` call, never a background
+poll — because `event.get_info<command_execution_status>()` **blocks** on a
+profiling-enabled queue instead of polling (every backend compute queue is
+one; see `get_dma_queue()`'s comment in `unified-cache.hpp`), so a busy-poll
+here would reintroduce a host stall of its own. If the zone has no room (an
+under-sized plan, or the arena not yet active), the allocator falls back to a
+real `mem_handle`-owned `unified_alloc()`, deferred via the existing
+`retain_handles_until_event()` mechanism — correctness-preserving, but it
+reintroduces the very round trip this change exists to avoid, so it is logged
+once, not per-call.
+
+Unlike the primitive-API pair (one reservation, reused across calls), many
+Graph-scratch buffers can be concurrently outstanding within a single
+ubatch's graph — their deferred frees are only bulk-drained by
+`ggml_backend_sycl_synchronize()`, roughly once per ubatch, not once per op.
+`unified_cache_get_planned_onednn_scratchpad_bytes()` therefore adds a flat,
+env-tunable floor (`GGML_SYCL_ONEDNN_GRAPH_ZONE_MB`, default 512 MiB) on top
+of the primitive-API estimate at planning time, rather than a per-model
+formula — there is no cheap way to derive "how many attention layers can be
+concurrently in flight" from this call site. `GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0`
+opts out of the whole allocator (back to oneDNN's default, for A/B).
+
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 
 `unified_cache::ensure_cached_alloc()` is the single allocation path that
