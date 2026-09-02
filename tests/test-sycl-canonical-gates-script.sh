@@ -17,11 +17,24 @@
 #        (rc!=0, empty stdout, "SYCL" text only on stderr)   -> rc 77 (SKIP)
 #   (d2) --list-devices: the FUTURE llama.cpp-1lrh graceful shape
 #        (rc=0, stdout "Available devices:\n  (none)\n")     -> rc 77 (SKIP)
+#   (d3) --list-devices: non-zero rc WITH a valid device line on stdout
+#        -> rc 77 (SKIP) -- isolates the rc!=0 clause on its own (round-2
+#        minor finding 2 in c-u3ji)
 #   (e)  missing binary                               -> rc 1
 #   (f)  CMakeCache GGML_SYCL:BOOL=OFF                 -> rc 1
 #   (oneapi-sourcing) real /opt/intel/oneapi/setvars.sh survives under
 #        `set -euo pipefail` (B1 finding: it used to die silently, rc=127,
 #        zero output, on OCL_ICD_FILENAMES under `set -u`)
+#   (oneapi-clobber) a FAKE, hostile setvars.sh that exports empty/wrong
+#        values for SELECTOR/GATE/BUILD_DIR/BIN_DIR must not move the
+#        selector actually used or the gate actually run (round-2 blocker
+#        in c-u3ji: BUILD_DIR/GATE/SELECTOR are parsed BEFORE the source,
+#        so they need an explicit snapshot-and-restore, not just "assign
+#        after" like every other derived variable)
+#   (stderr-only-mistral) correct digits on STDERR only, nothing on stdout
+#        -> FAIL (round-2 minor finding 1: the check must read .out, not
+#        a combined stream)
+#   (stderr-only-gptoss)  same, GPT-OSS side                -> FAIL
 #
 # Run directly: bash tests/test-sycl-canonical-gates-script.sh; echo rc=$?
 
@@ -84,6 +97,15 @@ if [ "${1:-}" = "--list-devices" ]; then
             printf "Check ONEAPI_DEVICE_SELECTOR environment variable and available SYCL runtimes.\n" >&2
             exit 134
             ;;
+        rc-nonzero-with-device)
+            # Contradictory-looking on purpose: a valid device line on
+            # stdout, but the process itself still exits non-zero. Isolates
+            # the "non-zero probe rc is authoritative" clause from the
+            # "no matching stdout line" clause -- a mutant that drops the
+            # rc check would read this as device-present.
+            printf "Available devices:\n  SYCL0: Fake Battlemage (16384 MiB, 16384 MiB free)\n"
+            exit 3
+            ;;
         *)
             echo "unknown STUB_DEVICE_MODE: ${STUB_DEVICE_MODE:-}" >&2
             exit 1
@@ -102,6 +124,12 @@ case "${STUB_MISTRAL_MODE:-pass}" in
         ;;
     mid-line)
         printf "> some other text 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 trailing\n"
+        exit 0
+        ;;
+    stderr-only)
+        # Correct digits, but on STDERR, not stdout. The pass check must
+        # read the .out file, not a combined/either stream.
+        printf "1, 2, 3, 4, 5, 6, 7, 8, 9, 10\n" >&2
         exit 0
         ;;
     wrong)
@@ -126,6 +154,10 @@ case "${STUB_GPTOSS_MODE:-pass}" in
         ;;
     prompt-echo)
         printf "> Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5\n"
+        exit 0
+        ;;
+    stderr-only)
+        printf "1, 2, 3, 4, 5\n" >&2
         exit 0
         ;;
     *)
@@ -201,6 +233,30 @@ touch_fake_models() {
     local dir="$1"
     : > "$dir/fake-mistral.gguf"
     : > "$dir/fake-gptoss.gguf"
+}
+
+# A hostile, FAKE setvars.sh: exports empty/wrong values for every name this
+# script parses from argv (SELECTOR, GATE, BUILD_DIR) plus the one already-
+# proven collision (BIN_DIR), simulating the worst case an oneAPI component
+# could do. Round-2 blocker (c-u3ji): BUILD_DIR/GATE/SELECTOR are consumed
+# from argv BEFORE the source call, so "assign after sourcing" alone (which
+# is sufficient for BIN_DIR and friends) does not protect them -- they need
+# an explicit snapshot-and-restore, and this is what proves it.
+FAKE_HOSTILE_SETVARS='#!/usr/bin/env bash
+export SELECTOR=
+export GATE=
+export BUILD_DIR=/nonexistent
+export BIN_DIR=bin64
+'
+
+# Forcibly unsets ONEAPI_ROOT and SYCL_GATES_SKIP_ONEAPI_SOURCE (so the real
+# sourcing branch is always taken) and points SYCL_GATES_SETVARS at the
+# hostile fake above instead of the real oneAPI install.
+run_gates_fake_setvars() {
+    local dir="$1" gate="$2" selector="$3"
+    shift 3
+    write_exec "$dir/hostile-setvars.sh" "$FAKE_HOSTILE_SETVARS"
+    env -u ONEAPI_ROOT -u SYCL_GATES_SKIP_ONEAPI_SOURCE         SYCL_GATES_BIN_DIR="$dir/bin"         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt"         SYCL_GATES_LDD_CMD="$dir/ldd"         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf"         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf"         SYCL_GATES_SETTLE_SECONDS=0         SYCL_GATES_SETVARS="$dir/hostile-setvars.sh"         "$GATES_SCRIPT" --build-dir "$dir/build" --gate "$gate" --selector "$selector" "$@"
 }
 
 # --- (a) correct digits -> PASS rc=0 ---------------------------------------
@@ -309,6 +365,33 @@ else
     echo "PASS: (d2) --list-devices graceful '(none)' shape (rc=0, no SYCL line) -> rc=77 SKIP"
 fi
 
+# --- (d3) --list-devices: non-zero rc WITH a valid device line -> rc 77 ---
+# Round-2 minor finding 2 (c-u3ji): isolates the "non-zero probe rc is
+# authoritative" clause on its own -- (d) alone is caught by the empty-
+# stdout half too, so a mutant that drops the `LIST_DEVICES_RC -ne 0` check
+# but keeps the stdout-line grep would still pass (d). This case has a
+# VALID "  SYCL0: ..." line on stdout, so only the rc check can catch it.
+case_d3_dir="$TMP/d3"
+setup_case_dir "$case_d3_dir"
+touch_fake_models "$case_d3_dir"
+out="$(STUB_DEVICE_MODE=rc-nonzero-with-device run_gates "$case_d3_dir" all 2>"$TMP/d3.err")"
+rc=$?
+if [ "$rc" -ne 77 ]; then
+    fail "(d3) expected rc=77, got rc=$rc; stdout:
+$out
+stderr:
+$(cat "$TMP/d3.err")"
+elif ! grep -q '^SKIP:' "$TMP/d3.err"; then
+    fail "(d3) expected a 'SKIP: ...' line on stderr; got:
+$(cat "$TMP/d3.err")"
+elif ! printf '%s
+' "$out" | grep -qE '^GATE mistral SKIP rc=77 '; then
+    fail "(d3) expected a 'GATE mistral SKIP rc=77' line; got:
+$out"
+else
+    echo "PASS: (d3) --list-devices non-zero rc despite a valid device line -> rc=77 SKIP"
+fi
+
 # --- (e) missing binary -> rc 1 ---------------------------------------------
 case_e_dir="$TMP/e"
 setup_case_dir "$case_e_dir"
@@ -394,6 +477,70 @@ if [ -f /opt/intel/oneapi/setvars.sh ]; then
     fi
 else
     echo "SKIP: (oneapi-sourcing) /opt/intel/oneapi/setvars.sh not present on this host -- B1's fix is untestable here"
+fi
+
+# --- (oneapi-clobber) a hostile setvars.sh must not move SELECTOR/GATE/BUILD_DIR
+# Round-2 blocker (c-u3ji): BUILD_DIR/GATE/SELECTOR are parsed from argv
+# BEFORE the oneAPI source runs, so "assign after sourcing" (sufficient for
+# BIN_DIR and friends) does not protect them on its own -- they need an
+# explicit snapshot-and-restore. The fake setvars here exports SELECTOR=
+# (empty), GATE= (empty), BUILD_DIR=/nonexistent, BIN_DIR=bin64. Passing
+# --selector level_zero:0 (neither the default level_zero:1 NOR the fake's
+# empty clobber) makes an unrestored SELECTOR unambiguous in the GATE line.
+case_clobber_dir="$TMP/clobber"
+setup_case_dir "$case_clobber_dir"
+touch_fake_models "$case_clobber_dir"
+out="$(STUB_MISTRAL_MODE=pass run_gates_fake_setvars "$case_clobber_dir" mistral level_zero:0 2>"$TMP/clobber.err")"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    fail "(oneapi-clobber) expected rc=0, got rc=$rc; stdout:
+$out
+stderr:
+$(cat "$TMP/clobber.err")"
+elif ! printf '%s
+' "$out" | grep -qE '^GATE mistral PASS rc=0 selector=level_zero:0 '; then
+    fail "(oneapi-clobber) expected 'GATE mistral PASS rc=0 selector=level_zero:0' (the gate we asked for, the selector we passed) -- a hostile setvars.sh must not move either; got stdout:
+$out
+stderr:
+$(cat "$TMP/clobber.err")"
+else
+    echo "PASS: (oneapi-clobber) hostile setvars.sh cannot move the selector, the gate, or the binary directory"
+fi
+
+# --- (stderr-only-mistral) correct digits on STDERR only -> FAIL -----------
+# Round-2 minor finding 1: the pass check must read the .out file, not a
+# combined or either stream.
+case_serr_m_dir="$TMP/serr-m"
+setup_case_dir "$case_serr_m_dir"
+touch_fake_models "$case_serr_m_dir"
+out="$(STUB_MISTRAL_MODE=stderr-only run_gates "$case_serr_m_dir" mistral)"
+rc=$?
+if [ "$rc" -ne 1 ]; then
+    fail "(stderr-only-mistral) expected rc=1, got rc=$rc; output:
+$out"
+elif ! printf '%s
+' "$out" | grep -qE '^GATE mistral FAIL rc=0 '; then
+    fail "(stderr-only-mistral) expected 'GATE mistral FAIL rc=0' (correct digits on stderr must not satisfy the stdout-only check); got:
+$out"
+else
+    echo "PASS: (stderr-only-mistral) correct digits on stderr only -> FAIL"
+fi
+
+# --- (stderr-only-gptoss) correct digits on STDERR only -> FAIL ------------
+case_serr_g_dir="$TMP/serr-g"
+setup_case_dir "$case_serr_g_dir"
+touch_fake_models "$case_serr_g_dir"
+out="$(STUB_GPTOSS_MODE=stderr-only run_gates "$case_serr_g_dir" gptoss)"
+rc=$?
+if [ "$rc" -ne 1 ]; then
+    fail "(stderr-only-gptoss) expected rc=1, got rc=$rc; output:
+$out"
+elif ! printf '%s
+' "$out" | grep -qE '^GATE gptoss FAIL rc=0 '; then
+    fail "(stderr-only-gptoss) expected 'GATE gptoss FAIL rc=0' (correct digits on stderr must not satisfy the stdout-only check); got:
+$out"
+else
+    echo "PASS: (stderr-only-gptoss) correct digits on stderr only -> FAIL"
 fi
 
 echo "---"

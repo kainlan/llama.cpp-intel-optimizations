@@ -82,21 +82,41 @@ case "$GATE" in
         ;;
 esac
 
+# BUILD_DIR/GATE/SELECTOR are the one set of this script's own variables that
+# MUST be known before we can even decide what/whether to source below (and
+# argv parsing itself must happen before sourcing, or `source FILE --force`
+# would clobber THIS script's own positional parameters). So they cannot be
+# computed strictly after sourcing the way every other derived variable
+# below is. Snapshot them into a distinctly-prefixed name (vanishingly
+# unlikely for any oneAPI component to also use) immediately after parsing,
+# then restore from the snapshot immediately after sourcing -- this makes
+# the "our assignments always win" property true for these three as well,
+# not just for the ones that happen to already be assigned after the source
+# call.
+GATES_ARG_BUILD_DIR="$BUILD_DIR"
+GATES_ARG_GATE="$GATE"
+GATES_ARG_SELECTOR="$SELECTOR"
+
 # --- source oneAPI if it is not already active ---------------------------
-# Deliberately BEFORE resolving any of this script's own derived variables
-# below (BIN_DIR, CACHE_FILE, ...), not just before using them. Sourcing
-# setvars.sh pulls in every installed oneAPI component's env/vars.sh into
-# THIS shell (no subshell isolation), and at least one of them assigns a
-# plain, unprefixed scratch variable that collides with a name this script
-# used to compute first and rely on afterwards: advisor/vtune's vars.sh sets
-# a bare `BIN_DIR=bin64` for their own internal use. Sourced AFTER our own
-# BIN_DIR was assigned, that silently overwrote it (verified: `need_bin`
-# then resolved to the literal path "bin64/llama-completion" and failed
-# closed with a "missing binary" it never should have hit). There is no way
-# to enumerate every such name in advance -- a future oneAPI component could
-# collide with a different one of our names -- so the general fix is
-# ordering: source first, and let every one of our own assignments below
-# execute AFTER, so ours always wins whatever the environment set.
+# Deliberately as early as this script's own logic allows (right after the
+# argv snapshot above), so every one of this script's own derived variables
+# computed below executes strictly AFTER sourcing and so wins any collision.
+# Sourcing setvars.sh pulls every installed oneAPI component's env/vars.sh
+# into THIS shell (no subshell isolation), and at least one of them assigns
+# a plain, unprefixed scratch variable that collides with a name this
+# script used to compute first and rely on afterwards: advisor/vtune's
+# vars.sh sets a bare `BIN_DIR=bin64` for their own internal use. Sourced
+# after our own BIN_DIR was assigned, that used to silently overwrite it
+# (verified: `need_bin` resolved to the literal path
+# "bin64/llama-completion" and failed closed with a "missing binary" it
+# never should have hit). There is no way to enumerate every such name in
+# advance -- a future oneAPI component could collide with a different one
+# of our names -- so the general fix is ordering: source as early as
+# possible, and compute everything else after, so ours always wins
+# regardless of what the environment set. This is why BUILD_DIR/GATE/
+# SELECTOR are snapshotted above rather than simply left to be recomputed
+# after sourcing -- unlike every other variable below, they are consumed
+# by the sourcing decision itself and by argv parsing that must run before it.
 #
 # setvars.sh also sources compiler/latest/env/vars.sh, which reads
 # ${OCL_ICD_FILENAMES} (no ":-" default) after deliberately unsetting it a
@@ -104,12 +124,26 @@ esac
 # SOURCED file, which kills THIS script, not a subshell; `|| true` cannot
 # save it because bash's `set -u` error is not a normal command failure.
 # set +u only around the source, restored immediately after.
-if [ -z "${SYCL_GATES_SKIP_ONEAPI_SOURCE:-}" ] && [ -z "${ONEAPI_ROOT:-}" ] && [ -f /opt/intel/oneapi/setvars.sh ]; then
+#
+# SYCL_GATES_SETVARS overrides the setvars.sh path itself (default
+# /opt/intel/oneapi/setvars.sh) so the stub test can point this script at a
+# fake, hostile setvars.sh that exports wrong/empty values for every name
+# this script cares about, without needing the real oneAPI install.
+SETVARS_PATH="${SYCL_GATES_SETVARS:-/opt/intel/oneapi/setvars.sh}"
+if [ -z "${SYCL_GATES_SKIP_ONEAPI_SOURCE:-}" ] && [ -z "${ONEAPI_ROOT:-}" ] && [ -f "$SETVARS_PATH" ]; then
     set +u
-    # shellcheck disable=SC1091
-    source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+    # shellcheck disable=SC1090,SC1091
+    source "$SETVARS_PATH" --force >/dev/null 2>&1 || true
     set -u
 fi
+
+# Restore from the pre-source snapshot: whatever the source above did to
+# BUILD_DIR/GATE/SELECTOR (or even to the GATES_ARG_* names -- essentially
+# impossible given the distinct prefix, but the snapshot is worthless if it
+# is not what we read from here on), this is authoritative from here on.
+BUILD_DIR="$GATES_ARG_BUILD_DIR"
+GATE="$GATES_ARG_GATE"
+SELECTOR="$GATES_ARG_SELECTOR"
 
 # --- resolve paths (all overridable for the CPU-only stub test) ---------
 # Assigned AFTER the oneAPI source above -- see the comment there.
