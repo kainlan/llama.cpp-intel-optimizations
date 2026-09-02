@@ -80474,7 +80474,8 @@ static bool ggml_sycl_fusion_operand_view_offset_safe(const ggml_tensor * operan
 static bool ggml_sycl_can_fuse_rmsnorm_mulmat(const ggml_tensor * rms_norm,
 
                                               const ggml_tensor * mul,
-                                              const ggml_tensor * mulmat) {
+                                              const ggml_tensor * mulmat,
+                                              int                 device) {
     // Skip fusion for small batch sizes (token generation) where overhead hurts performance
     const int64_t nrows = rms_norm->src[0]->ne[1];
     if (nrows < 8) {
@@ -80515,6 +80516,34 @@ static bool ggml_sycl_can_fuse_rmsnorm_mulmat(const ggml_tensor * rms_norm,
     // Gamma dimensions must match
     const ggml_tensor * gamma = get_mul_weight(mul, rms_norm);
     if (gamma->ne[0] != ncols) {
+        return false;
+    }
+    // llama.cpp-1etg: decline whenever the UNFUSED MUL_MAT for (W, x) would
+    // take the oneDNN PP route instead of mmq_generic. Measured (S6/qmen
+    // profiler coverage, 2026-09-01, gemma4 B70 pp512): this fusion's own
+    // GEMM runs on mmq_generic at ~1.82 ms each (18 GEMMs/ubatch), 7.7x
+    // slower than the 0.235 ms the identical m=10240 shape takes UNFUSED
+    // through oneDNN WOQ (~114 TFLOPS) -- the "fusion" was costing ~29 ms
+    // of a 197 ms ubatch by displacing a route 7.7x faster than the one it
+    // lands on. mulmat->src[1] is the exact tensor the unfused MUL_MAT
+    // would consume as its activation operand (fusion changes only
+    // execution, not this graph edge -- mulmat->src[1] is already `mul`'s
+    // output), so probing it through the SAME admission check the unfused
+    // dispatcher itself uses (ggml_sycl_onednn_pp_candidate, "one check,
+    // one authority" -- do not re-derive the oneDNN-PP-eligible conditions
+    // here) tells us exactly what the unfused path would have chosen.
+    //
+    // This decline is ROUTE-CONDITIONAL, not permanent: it exists only
+    // because the f16 oneDNN WOQ route cannot consume this fusion's Q8_1
+    // quantized product without a dequant. When an int8 grouped-scale GEMM
+    // lands (llama.cpp-nz1k) it will be able to consume Q8_1 directly, and
+    // this decline should be lifted for that specific route at that point
+    // -- the fusion itself, and the mmq_generic kernel it uses today, are
+    // not the defect; landing on mmq_generic INSTEAD OF a route 7.7x
+    // faster, silently, is. Fusion for M in [8,16) and for weight types
+    // oneDNN PP skips is deliberately preserved by reusing the exact
+    // candidacy predicate rather than a blanket mask/threshold.
+    if (ggml_sycl_onednn_pp_candidate(mulmat->src[0], mulmat->src[1], mulmat, device)) {
         return false;
     }
     return true;
@@ -80695,6 +80724,17 @@ static bool can_fuse_all_projections(const ggml_tensor * rms_norm,
     }
     // DISABLED: Per-projection fusion causes numerical differences
     // TODO: Investigate root cause
+    //
+    // llama.cpp-1etg (c-min9): whoever re-enables this, first apply the
+    // SAME fix ggml_sycl_can_fuse_rmsnorm_mulmat got for the identical
+    // defect -- its executor, execute_per_projection_fusion, also feeds a
+    // Q8_1 quantized product to ggml_sycl_op_mul_mat_q (mmq_generic),
+    // ~7.7x slower than the oneDNN WOQ route it would displace for
+    // M>=onednn_pp_min_batch. Gate this function's admission the same way:
+    // decline for any consumer where ggml_sycl_onednn_pp_candidate(mulmat->
+    // src[0], mulmat->src[1], mulmat, device) is true, so it falls back to
+    // an unfused MUL_MAT -> oneDNN/XMX instead of silently landing every
+    // projection on mmq_generic again.
 
     return false;
     // Skip fusion for small batches (token generation)
@@ -87837,7 +87877,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     ggml_tensor * mul_node    = cgraph->nodes[i + 1];
                     ggml_tensor * mulmat_node = cgraph->nodes[i + 2];
 
-                    if (ggml_sycl_can_fuse_rmsnorm_mulmat(node, mul_node, mulmat_node)) {
+                    if (ggml_sycl_can_fuse_rmsnorm_mulmat(node, mul_node, mulmat_node, sycl_ctx->device)) {
                         // Get original input, gamma, and GEMM weights
                         ggml_tensor * x = node->src[0];                        // Pre-RMSNorm input
 
