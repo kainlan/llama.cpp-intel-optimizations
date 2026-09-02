@@ -510,7 +510,9 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
 
     if (ggml_sycl_graph_recording_active() && src1 && src1->name && src1->name[0] != '\0') {
         void * staged_ptr = nullptr;
-        if (ctx.graph_input_stage_lookup(src1->name, bytes, ctx.device, &out_handle, &staged_ptr) && staged_ptr) {
+        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+        // comment on graph_input_staging in common.hpp.
+        if (ctx.graph_input_stage_lookup(src1, bytes, ctx.device, &out_handle, &staged_ptr) && staged_ptr) {
             out_publish_ticket = ggml_sycl::terminal_retention_ticket::prepare({}, { out_handle });
             out_device_ptr     = static_cast<const int32_t *>(staged_ptr);
             if (ggml_sycl_get_rows_trace_enabled()) {

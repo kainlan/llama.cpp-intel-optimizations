@@ -3487,8 +3487,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             return nullptr;
         }
         void * staged_ptr = nullptr;
-        if (ctx.graph_input_stage_lookup(tensor->name, ggml_nbytes(tensor), device, nullptr, &staged_ptr) &&
-            staged_ptr) {
+        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+        // comment on graph_input_staging in common.hpp.
+        if (ctx.graph_input_stage_lookup(tensor, ggml_nbytes(tensor), device, nullptr, &staged_ptr) && staged_ptr) {
             return static_cast<const char *>(staged_ptr);
         }
         return nullptr;

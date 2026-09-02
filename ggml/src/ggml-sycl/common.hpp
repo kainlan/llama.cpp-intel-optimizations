@@ -5951,23 +5951,41 @@ struct ggml_backend_sycl_context {
     // The ggml allocator may reassign tensor->data between iterations, but L0 graph
     // replay bakes USM pointers at finalize time. The staging allocation is owned by
     // a mem_handle so lifetime/refcount/free still flow through unified_alloc().
-    // Key: tensor name (stable across iterations). Value: {handle, capacity}.
+    //
+    // Key: llama.cpp-dyi3 -- previously keyed on tensor NAME alone. gemma4's
+    // build_attn_inp_kv_iswa() builds a base (global) mask and a SWA (local)
+    // mask via the same helper, which unconditionally names every mask
+    // tensor "attn_inp_kq_mask" (llama-graph.cpp). Both are genuinely
+    // per-token-varying INPUT leaves that are NOT sycl::usm::alloc::device
+    // in some configurations (contrary to this task's earlier round-1
+    // assumption -- confirmed live via GGML_SYCL_GRAPH_DIAG:
+    // "[GRAPH-PRESTAGE] INPUT staged ... attn_inp_kq_mask (data=0x...203840)
+    // -> dev 0x...a600000" followed by a SECOND, different-source-address
+    // mask staged to the SAME dev slot), so both DID take this staging path
+    // and collided under the old name-only key: last writer wins, so one
+    // layer class silently replayed the OTHER layer class's mask every
+    // token. The tensor's own struct pointer (NOT tensor->data, which the
+    // comment above already documents as unstable across iterations) is
+    // stable for as long as the owning ggml_cgraph is reused (llama_context's
+    // own "graphs reused" contract) and is naturally distinct per logical
+    // input regardless of a shared name, so it is the correct identity to
+    // key on. Value: {handle, capacity}.
     struct graph_input_staging_entry {
         ggml_sycl::mem_handle handle{};
         size_t                capacity = 0;
     };
 
-    std::unordered_map<std::string, graph_input_staging_entry> graph_input_staging;
+    std::unordered_map<const ggml_tensor *, graph_input_staging_entry> graph_input_staging;
 
-    bool graph_input_stage_lookup(const char *            name,
+    bool graph_input_stage_lookup(const ggml_tensor *     owner,
                                   size_t                  nbytes,
                                   int                     dev_id,
                                   ggml_sycl::mem_handle * out_handle,
                                   void **                 out_device_ptr) {
-        if (!name || name[0] == '\0' || nbytes == 0) {
+        if (!owner || nbytes == 0) {
             return false;
         }
-        auto it = graph_input_staging.find(name);
+        auto it = graph_input_staging.find(owner);
         if (it == graph_input_staging.end() || it->second.capacity < nbytes || !it->second.handle.valid()) {
             return false;
         }
@@ -5986,14 +6004,20 @@ struct ggml_backend_sycl_context {
 
     // Look up or create a stable device staging buffer for an INPUT tensor.
     // Returns a device pointer that persists across graph iterations.
-    void * graph_input_stage(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {
+    // `owner` is the tensor's own struct pointer -- the staging identity;
+    // `host_data` is `owner->data`, the current (possibly reassigned since
+    // last call) source bytes to copy from.
+    void * graph_input_stage(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
+        if (!owner) {
+            return nullptr;
+        }
         int dev_id = -1;
         try {
             dev_id = ggml_sycl_get_device_id_from_queue(q);
         } catch (...) {
         }
 
-        auto it = graph_input_staging.find(name);
+        auto it = graph_input_staging.find(owner);
         if (it != graph_input_staging.end() && it->second.capacity >= nbytes) {
             auto resolved = it->second.handle.resolve(dev_id);
             if (resolved.ptr && resolved.on_device) {
@@ -6035,11 +6059,11 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
-        graph_input_staging[name] = { std::move(handle), nbytes };
-        return graph_input_staging[name].handle.resolve(dev_id).ptr;
+        graph_input_staging[owner] = { std::move(handle), nbytes };
+        return graph_input_staging[owner].handle.resolve(dev_id).ptr;
     }
 
-    bool graph_input_refresh(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {
+    bool graph_input_refresh(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
         int dev_id = -1;
         try {
             dev_id = ggml_sycl_get_device_id_from_queue(q);
@@ -6048,7 +6072,7 @@ struct ggml_backend_sycl_context {
 
         ggml_sycl::mem_handle dst_handle{};
         void *                dst_ptr = nullptr;
-        if (!graph_input_stage_lookup(name, nbytes, dev_id, &dst_handle, &dst_ptr) || !dst_ptr || !host_data) {
+        if (!graph_input_stage_lookup(owner, nbytes, dev_id, &dst_handle, &dst_ptr) || !dst_ptr || !host_data) {
             return false;
         }
 
@@ -6058,6 +6082,13 @@ struct ggml_backend_sycl_context {
         return true;
     }
 
+    // llama.cpp-dyi3: was previously defined but never called anywhere --
+    // graph_input_staging accumulated entries for the process lifetime with
+    // no reset across exec_graph re-records/invalidations. Now wired into
+    // sycl_exec_graph_clear_active() alongside the other per-generation
+    // input caches it already resets (cached_input_tensors, moe phase
+    // layout cache) -- a rare phase-boundary event, not a hot path, per
+    // that function's own comment.
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
