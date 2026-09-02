@@ -1188,8 +1188,22 @@ namespace dpct
             // cpu_device(), select_device()) already throws std::runtime_error
             // via check_id()/the _cpu_device==-1 check when asked for a device
             // that does not exist, so a genuine attempt to USE a device still
-            // fails loudly -- it just does so as an exception at the point of
-            // use, not as an abort during discovery.
+            // fails loudly, never silently -- but NOT as a caught exception at
+            // the call site a caller might expect. Measured for
+            // ggml_backend_sycl_init(device) with 0 registered devices
+            // (ggml-sycl.cpp): the ggml_backend_reg_dev_get() call it makes to
+            // build the backend struct reaches
+            // ggml_backend_sycl_reg_get_device()'s
+            // GGML_ASSERT(index < ctx->devices.size()), which is unconditional
+            // (unlike a bare assert(), it is NOT compiled out under -DNDEBUG)
+            // and aborts the process before that function's own
+            // catch(std::exception&) (which turns a genuine std::exception,
+            // e.g. one of the throws above reached some other way, into a
+            // logged "backend construction failed" error and a null return)
+            // ever gets a chance to run -- a hard abort is a signal, not a
+            // C++ exception. So a use attempt fails either by aborting or by
+            // a logged null return; see tests/test-sycl-registration-no-device.cpp
+            // for both paths verified with a fork()+waitpid() harness.
             if (!default_device.has_value()) {
                 fprintf(stderr, "SYCL device manager initialization: no devices found on any platform.\n");
                 fprintf(stderr, "Check ONEAPI_DEVICE_SELECTOR environment variable and available SYCL runtimes.\n");
