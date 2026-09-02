@@ -14,9 +14,10 @@
 // Companion to llama.cpp-goegc.1 ("stale pointer after eviction"): this test
 // covers the PRIMARY goegc.1 failure mode — key-based lookup returning null
 // for an evicted key rather than a stale device pointer.  The kernel-args-
-// in-flight variant (a kernel already submitted with an evicted VRAM ptr
-// baked into its arg buffer) is the residual concern and needs its own
-// test when goegc.1's fix lands.
+// in-flight variant (a kernel already submitted with A's VRAM ptr baked into
+// its arg buffer while an eviction runs) is covered by
+// test_in_flight_kernel_lease_blocks_eviction (llama.cpp-goegc.1 residual,
+// absorbing llama.cpp-32dg8.15.3).
 //
 // Notes for future modifiers:
 //
@@ -1019,6 +1020,154 @@ static bool test_retained_publication_failure_is_transactional(sycl::queue & q) 
 }
 
 // =============================================================================
+// Test: in-flight kernel + event-bound lease blocks eviction (llama.cpp-goegc.1,
+// residual case; absorbs llama.cpp-32dg8.15.3).
+//
+// The kernel-args-in-flight hazard: a kernel has been submitted with entry A's
+// raw VRAM pointer baked into its argument buffer, and an eviction runs before
+// the kernel's event completes.  The contract (Ruling 2, canonical §12.6) is
+// that the submitter retains a WEIGHT-lease handle copy until the event
+// completes (retain_handles_until_event), and evict_one() skips any entry whose
+// in_use_count > 0 -- so eviction is DEFERRED, never a wait() and never a free.
+//
+// Shape:
+//   1. ensure_cached(A) -> READY; acquire_weight_lease(A) and package it into a
+//      WEIGHT-kind mem_handle (from_weight_lease_locked transfers the bump).
+//   2. Submit a kernel that spins on a host-USM gate, then sums A's bytes into
+//      an output buffer.  While it spins the kernel is provably in flight.
+//   3. retain_handles_until_event({copy of handle}, event); drop the local
+//      handle.  The retained copy is now the ONLY lease.
+//   4. cache.evict() must not remove A: get_weight_ptr(A) still resolves to the
+//      same pointer and cache_generation() is unchanged.
+//   5. Open the gate; drain_retained_handles(true) waits for the event and
+//      releases the copy.  The kernel must have read A's ORIGINAL bytes.
+//   6. Now cache.evict() removes A and bumps the generation -- proving step 4
+//      was the lease, not some unrelated ineligibility.
+//
+// Steps 4 and 6 together are the discriminating pair: 6 is the positive control
+// that shows the eviction path WOULD have freed A absent the retained lease.
+//
+// Scope note: this exercises the unified_cache entry lease (in_use_count).  The
+// arena CHUNK_LEASE path (from_chunk_ptr -> arena_acquire_chunk_lease) is a
+// separate counter and is NOT exercised here; it remains a documented gap.
+// =============================================================================
+static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
+    TEST_BEGIN("in_flight_kernel_lease_blocks_eviction");
+
+    constexpr size_t         entry_bytes = 4 * 1024;
+    constexpr size_t         budget      = 16 * 1024 * 1024;
+    constexpr uint32_t       spin_bound  = 400000000u;
+    ggml_sycl::unified_cache cache(q, budget);
+    const int                dev = ggml_sycl_get_device_id_from_queue(q);
+
+    void * src_host = sycl::malloc_host(entry_bytes, q);
+    TEST_ASSERT(src_host != nullptr, "malloc_host for src should succeed");
+    std::memset(src_host, 0x5A, entry_bytes);
+    ggml_sycl_cache_id key = make_test_cache_id(900, 1, entry_bytes);
+
+    void * ptr = cache.ensure_cached(key, src_host, entry_bytes, ggml_sycl::cache_entry_type::DENSE_WEIGHT, -1, -1,
+                                     GGML_LAYOUT_AOS, false);
+    TEST_ASSERT(ptr != nullptr, "ensure_cached(A) should succeed");
+    q.wait();
+    TEST_ASSERT(cache.get(key, GGML_LAYOUT_AOS) == ptr, "cache.get() should drive A to READY");
+
+    // Package the lease into a handle whose dtor releases it (Ruling 2: the
+    // handle, not the caller, is the release point).
+    auto lease = cache.acquire_weight_lease(key);
+    TEST_ASSERT(lease.ptr == ptr && lease.entry != nullptr, "acquire_weight_lease(A) must resolve with an entry");
+    ggml_sycl::mem_handle handle = ggml_sycl::mem_handle::from_weight_lease_locked(key, dev, lease.ptr, lease.layout,
+                                                                                    lease.on_device, lease.entry);
+    TEST_ASSERT(handle.valid(), "lease-backed handle must be valid");
+    TEST_ASSERT(lease.entry->in_use_count.load() == 1, "exactly one lease outstanding after packaging");
+
+    // Gate in host USM so the host can open it while the kernel is resident.
+    int *      gate = sycl::malloc_host<int>(1, q);
+    uint32_t * out  = sycl::malloc_device<uint32_t>(2, q);
+    TEST_ASSERT(gate != nullptr && out != nullptr, "gate/out allocation should succeed");
+    *gate = 0;
+    q.memset(out, 0, 2 * sizeof(uint32_t)).wait();
+
+    const unsigned char * data = static_cast<const unsigned char *>(ptr);
+    sycl::event           ev   = q.submit([&](sycl::handler & h) {
+        h.single_task([=]() {
+            sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                             sycl::access::address_space::global_space>
+                g(*gate);
+            // Bounded spin: a stuck gate ends the kernel instead of wedging the
+            // card (GT reset cascade); the host-side assertion then fails loudly.
+            uint32_t spins = 0;
+            while (g.load() == 0 && spins < spin_bound) {
+                ++spins;
+            }
+            uint32_t sum = 0;
+            for (size_t i = 0; i < entry_bytes; ++i) {
+                sum += data[i];
+            }
+            out[0] = sum;
+            out[1] = spins;
+        });
+    });
+
+    // Hand the lease to the event: this is the production shape for every
+    // async submit (canonical §12.6).  The local handle is dropped so the
+    // retained copy is the only thing keeping in_use_count > 0.
+    {
+        std::vector<ggml_sycl::mem_handle> retained;
+        retained.push_back(handle);
+        ggml_sycl::retain_handles_until_event(std::move(retained), ev);
+    }
+    handle = ggml_sycl::mem_handle{};
+    const uint32_t leases_retained = lease.entry->in_use_count.load();
+
+    // Step 4: eviction while the kernel is in flight must be deferred.
+    const uint64_t gen_before = ggml_sycl::cache_generation();
+    const size_t   freed_live = cache.evict(entry_bytes * 2);
+    const uint64_t gen_live   = ggml_sycl::cache_generation();
+    bool           still_there;
+    void *         ptr_live;
+    {
+        auto r      = cache.get_weight_ptr(key);
+        still_there = static_cast<bool>(r);
+        ptr_live    = r.ptr;
+    }
+    // Open the gate BEFORE any assertion returns, so a failed assertion cannot
+    // leave a spinning kernel behind.
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel, sycl::memory_scope::system,
+                     sycl::access::address_space::global_space>
+        host_gate(*gate);
+    host_gate.store(1);
+
+    TEST_ASSERT(leases_retained == 1, "retained copy must hold exactly one lease");
+    TEST_ASSERT(freed_live == 0, "evict() must free nothing while the entry is leased by in-flight work");
+    TEST_ASSERT(still_there && ptr_live == ptr, "A must still resolve to the same pointer during in-flight work");
+    TEST_ASSERT(gen_live == gen_before, "cache_generation must not bump while eviction is deferred");
+
+    // Step 5: the event completes, the drain worker drops the retained copy.
+    const bool drained = ggml_sycl::drain_retained_handles(true, 10000);
+    ev.wait_and_throw();
+    TEST_ASSERT(drained, "drain_retained_handles must clear once the kernel event completes");
+
+    uint32_t out_host[2] = { 0, 0 };
+    q.memcpy(out_host, out, sizeof(out_host)).wait();
+    TEST_ASSERT(out_host[1] < spin_bound, "kernel must have observed the gate open (not the spin bound)");
+    TEST_ASSERT(out_host[0] == 0x5Au * entry_bytes, "kernel must have read A's original bytes, not freed memory");
+
+    // Step 6: positive control -- with the lease gone the same eviction frees A.
+    TEST_ASSERT(lease.entry->in_use_count.load() == 0, "drain must have released the retained lease");
+    (void) cache.evict(entry_bytes * 2);
+    (void) cache.finalize_evictions();
+    const uint64_t gen_after = ggml_sycl::cache_generation();
+    TEST_ASSERT(gen_after > gen_before, "positive control: eviction must proceed once the lease is released");
+    TEST_ASSERT(!cache.get_weight_ptr(key), "positive control: A must be gone after the lease is released");
+
+    sycl::free(out, q);
+    sycl::free(gate, q);
+    sycl::free(src_host, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1070,6 +1219,7 @@ int main(int argc, char ** argv) {
     all_passed &= test_explicit_evict_bumps_gen_and_removes_entry(q);
     all_passed &= test_reinsert_after_evict_recovers_lookup(q);
     all_passed &= test_async_eviction_finalize_bumps_gen(q);
+    all_passed &= test_in_flight_kernel_lease_blocks_eviction(q);
     all_passed &= test_expert_retirement_with_live_lease(q);
     all_passed &= test_expert_publication_retirement_linearization(q);
     all_passed &= test_host_publication_fault_is_transactional(q);
