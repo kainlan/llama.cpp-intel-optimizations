@@ -77,6 +77,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 
 #include <algorithm>
 #include <chrono>
@@ -105,8 +106,9 @@ constexpr size_t operator""_GB(unsigned long long n) {
 }
 
 // ctest's SKIP_RETURN_CODE: a skip must be visible AS a skip, so it can never
-// be read as "this run validated the unified memory system".
-static const int k_exit_skip = 77;
+// be read as "this run validated the unified memory system". Aliases
+// LLAMA_TEST_EXIT_SKIP (tests/test-skip.h), the one definition of the value.
+static const int k_exit_skip = LLAMA_TEST_EXIT_SKIP;
 
 // A subcase either verified its property, disproved it, or could not run.
 enum class test_result {

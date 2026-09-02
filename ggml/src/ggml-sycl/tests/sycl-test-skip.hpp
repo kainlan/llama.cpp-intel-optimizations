@@ -41,22 +41,19 @@
 // ⚠️ Do NOT "align" a fixed test back to the surrounding convention. In this
 // directory the surrounding convention is the bug.
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+
 #include <sycl/sycl.hpp>
 
 #include <cstdio>
 #include <optional>
 #include <vector>
 
-// ctest's SKIP_RETURN_CODE. Every registration in ggml/src/ggml-sycl/CMakeLists.txt
-// whose test can return this MUST carry `SKIP_RETURN_CODE 77`; without it ctest
-// renders 77 as FAILED rather than the intended Skipped.
-//
-// 77 rather than 0 or 1 because "no device" is not a test result in either
-// direction: exit 0 is a vacuous pass that reads as verification (a CPU-only
-// runner reporting SKIP and exit 0 proves nothing, yet goes green), and exit 1
-// renders a legitimately CPU-only runner as a hard failure. The goal is to make a
-// skip visible AS a skip, never to forbid skipping.
-static const int SYCL_TEST_SKIP = 77;
+// Every registration in ggml/src/ggml-sycl/CMakeLists.txt whose test can return
+// this MUST carry `SKIP_RETURN_CODE 77`; without it ctest renders 77 as FAILED
+// rather than the intended Skipped. Kept as SYCL_TEST_SKIP so this directory's
+// 16 consumers need no edit; see tests/test-skip.h for the rationale.
+static const int SYCL_TEST_SKIP = LLAMA_TEST_EXIT_SKIP;
 
 // Enumerate GPU devices, treating an enumeration failure as "none". Never throws.
 static inline std::vector<sycl::device> sycl_test_gpu_devices() {

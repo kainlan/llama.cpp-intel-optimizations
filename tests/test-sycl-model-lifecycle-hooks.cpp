@@ -109,7 +109,8 @@
 #endif
 
 // ctest's SKIP_RETURN_CODE.  Never 0: a skip that exits 0 reads as verification.
-static const int EXIT_SKIP = 77;
+// Aliases LLAMA_TEST_EXIT_SKIP (tests/test-skip.h), the one definition of the value.
+static const int EXIT_SKIP = LLAMA_TEST_EXIT_SKIP;
 
 static int g_failures = 0;
 

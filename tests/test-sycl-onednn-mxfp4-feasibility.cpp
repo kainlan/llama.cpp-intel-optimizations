@@ -4,6 +4,8 @@
 #    include <sycl/sycl.hpp>
 #endif
 
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+
 #include <cstdio>
 #include <exception>
 
@@ -98,12 +100,12 @@ static void probe_s4_woq_matmul(dnnl::engine & eng) {
 // functions report what the installed oneDNN supports and no observed answer is
 // wrong. Until llama.cpp-u2mz it returned 0 from every path including engine
 // creation failure, so "oneDNN could not be reached at all" was reported as a
-// pass. It now exits 77 (ctest SKIP_RETURN_CODE) whenever it could not probe.
+// pass. It now exits LLAMA_TEST_EXIT_SKIP (ctest SKIP_RETURN_CODE) whenever it
+// could not probe.
 //
 // The support matrix it prints is still informational -- pinning it as an
 // expectation, so that a oneDNN upgrade which changes the answer goes red,
 // needs one recorded run to establish the current matrix first.
-static constexpr int EXIT_SKIP = 77;
 
 int main() {
 #if GGML_SYCL_DNNL
@@ -115,15 +117,15 @@ int main() {
         probe_s4_woq_matmul(eng);
     } catch (const dnnl::error & e) {
         std::printf("SKIP: onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     } catch (const std::exception & e) {
         std::printf("SKIP: onednn.mxfp4.probe setup_failed reason=%s\n", e.what());
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     std::puts("PASS: onednn.mxfp4.probe completed (3 probes reported)");
     return 0;
 #else
     std::puts("SKIP: onednn.mxfp4.probe GGML_SYCL_DNNL=0");
-    return EXIT_SKIP;
+    return LLAMA_TEST_EXIT_SKIP;
 #endif
 }

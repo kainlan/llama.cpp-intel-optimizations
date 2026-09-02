@@ -13,17 +13,12 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-quants.h"
-
-// ctest SKIP_RETURN_CODE (house convention, matching the test-sycl-*-policy.sh
-// family). Every skip path in this file exits with this instead of 0 so that a
-// skip is VISIBLE as a skip: llama.cpp-v9ue found that returning 0 from a skip
-// made every historical green indistinguishable from a real comparison.
-#define TEST_EXIT_SKIP 77
+#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
     fprintf(stderr, "SKIP: GGML_USE_SYCL not enabled; this run proves NOTHING about the SYCL MoE graph path.\n");
-    return TEST_EXIT_SKIP;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -310,7 +305,7 @@ int main() {
         fprintf(stderr,
                 "SKIP: could not initialize SYCL backend (no device, or oneAPI not sourced);"
                 " this run proves NOTHING about the SYCL MoE graph path.\n");
-        return TEST_EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -355,7 +350,7 @@ int main() {
         fprintf(stderr,
                 "SKIP: SYCL graph path unavailable or disabled;"
                 " this run proves NOTHING about MoE graph correctness.\n");
-        return TEST_EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     if (cpu_out.size() != sycl_out.size()) {

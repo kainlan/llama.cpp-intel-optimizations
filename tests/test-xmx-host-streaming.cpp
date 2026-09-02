@@ -214,14 +214,13 @@ static bool run_sycl_case(ggml_backend_t sycl_backend,
 // GGML_SYCL_XMX_GEMM / GGML_SYCL_MMQ_XMX to this target -- they are set
 // `target_compile_definitions(ggml-sycl PRIVATE ...)` on the library, so no
 // -D a user passes to the build ever reached this TU.
-static constexpr int EXIT_SKIP = 77;
 
 int main() {
 #if !defined(GGML_SYCL_XMX_GEMM) || !defined(GGML_SYCL_MMQ_XMX)
     fprintf(stderr,
             "SKIP: XMX GEMM not enabled at build time "
             "(configure with -DGGML_SYCL_XMX_GEMM=ON -DGGML_SYCL_MMQ_XMX=ON)\n");
-    return EXIT_SKIP;
+    return LLAMA_TEST_EXIT_SKIP;
 #else
     setenv("GGML_SYCL_DMA_SLICE_MB", "1", 1);
     setenv("GGML_SYCL_DMA_BUFFERS", "2", 1);
@@ -233,7 +232,7 @@ int main() {
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(0);
     if (!sycl_backend) {
         fprintf(stderr, "SKIP: Could not initialize SYCL backend\n");
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     int xmx_m = 0, xmx_n = 0, xmx_k = 0;
@@ -241,7 +240,7 @@ int main() {
     if (xmx_m == 0 || xmx_n == 0 || xmx_k == 0 || !ggml_sycl_xmx_supports_type(GGML_TYPE_Q4_0)) {
         fprintf(stderr, "SKIP: Device does not support XMX INT8/Q4_0\n");
         ggml_backend_free(sycl_backend);
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

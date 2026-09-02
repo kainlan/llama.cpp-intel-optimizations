@@ -528,10 +528,6 @@ static run_status run_backend_matmul(ggml_backend_t       backend,
     return finish(run_status::OK);
 }
 
-// ctest's SKIP_RETURN_CODE: a skip must be visible AS a skip, so it can never be
-// read as "this run verified the XMX path".
-static const int TEST_SKIP_RC = 77;
-
 int main() {
     // Enable XMX unified path BEFORE any can_use_xmx() checks.
     setenv("GGML_SYCL_XMX_UNIFIED", "1", 1);
@@ -544,7 +540,7 @@ int main() {
         ggml_backend_t cpu_backend = ggml_backend_cpu_init();
         if (!cpu_backend) {
             std::fprintf(stderr, "SKIP: CPU backend unavailable; this run proves NOTHING about the XMX path\n");
-            return TEST_SKIP_RC;
+            return LLAMA_TEST_EXIT_SKIP;
         }
         const run_status cpu_status = run_backend_matmul(cpu_backend, tc, false, cpu_out);
         ggml_backend_free(cpu_backend);
@@ -557,7 +553,7 @@ int main() {
     ggml_backend_t sycl_backend = ggml_backend_sycl_init(SYCL_DEVICE_INDEX);
     if (!sycl_backend) {
         std::fprintf(stderr, "SKIP: SYCL backend unavailable; this run proves NOTHING about the XMX path\n");
-        return TEST_SKIP_RC;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::vector<float> sycl_out;
@@ -567,7 +563,7 @@ int main() {
         // The reason was already printed at the point it was detected.  Exiting
         // 77 rather than 1 keeps an unavailable capability from masquerading as
         // a correctness failure -- and rather than 0, from masquerading as a pass.
-        return TEST_SKIP_RC;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     if (sycl_status != run_status::OK) {
         return 1;
