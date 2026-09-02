@@ -987,7 +987,34 @@ endif()
 # RESOURCE_LOCK gpu-ttm-memory: llama.cpp-ezfm's fail-closed GPU/TTM
 # serialization policy had not landed a shared resource-lock name as of this
 # commit; adopt ezfm's wrapper here once it exists instead of this literal.
-if (NOT WIN32)
+#
+# OPT-IN (llama.cpp-9hz0, 2026-09-02). The paragraph above correctly identified
+# that neither of this test's labels is in CLAUDE.md's documented safe-sweep
+# denylist, and deferred the fix. Deferring it shipped the hazard: a plain
+# `ctest --test-dir build` or the documented "safe" form
+# (-LE 'residency|mem-handle|cache' -E '^test-backend-ops$') selected this test
+# and started TWO real model loads, and scripts/check-ctest-safety-net.sh --
+# which exists to police exactly this -- checks only for backend-ops and then
+# prints "safety net intact". CLAUDE.md measures a single model-loading test at
+# 195-206 GB of 255 GB and states that two do not fit; this host has been
+# OOM-killed by that class twice.
+#
+# So registration is now behind an explicit opt-in that defaults OFF. This
+# preserves the fail-loudly-on-a-CPU-fallback-build intent above: the script's
+# own CMakeCache/ldd precondition check still runs and still fails closed --
+# it simply only runs for someone who asked for it, e.g.
+#     cmake -B build -DLLAMA_SYCL_CANONICAL_GATES=ON && ctest -R sycl-canonical-gates
+# The proper fix is to make the denylist label-driven (add gpu|model-loading to
+# CLAUDE.md's documented sweep AND to check-ctest-safety-net.sh, and make that
+# script fail when any GPU-labelled test survives the documented sweep). That
+# edits an owner-owned file, so it is tracked on llama.cpp-9hz0 rather than done
+# here. Note the stub test sycl-canonical-gates-script below is UNAFFECTED and
+# still runs in every sweep -- it is CPU-only and is what keeps the gate script
+# itself from being decorative.
+option(LLAMA_SYCL_CANONICAL_GATES
+       "Register the canonical Mistral/GPT-OSS gates as a ctest test (loads two real models on a real GPU; off by default so no sweep can schedule it)"
+       OFF)
+if (NOT WIN32 AND LLAMA_SYCL_CANONICAL_GATES)
     llama_test_cmd(
         bash
         NAME sycl-canonical-gates
