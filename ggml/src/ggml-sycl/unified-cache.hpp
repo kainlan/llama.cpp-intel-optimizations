@@ -1280,7 +1280,29 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
 size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
 void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+// The primitive-API weights+activations pair's own planned requirement,
+// WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
+// round 3, spec-review finding 3). Two getters exist because they answer
+// different questions and must not be used interchangeably:
+//   - unified_cache_get_planned_onednn_scratchpad_bytes() (with-floor):
+//     "how big must the ONEDNN zone actually be" -- used to size the real
+//     physical zone (unified-cache.cpp's zone-capacity-raise site) and to
+//     predict it for a pre-arena diagnostic (the "will this fit" WARN in
+//     the tensor-inventory plan). Both need the floor included, because the
+//     zone genuinely has to hold both consumers.
+//   - unified_cache_get_planned_onednn_scratchpad_bytes_stored() (bare):
+//     "what does the primitive-API pair alone need" -- used by
+//     reserve_onednn_scratch's growth guard, which compares against
+//     total_needed (weights_size + activations_size, itself never includes
+//     the floor). Comparing that against the WITH-FLOOR getter is a
+//     latent bug: the floor pads every read by >= GGML_SYCL_ONEDNN_GRAPH_ZONE_MB,
+//     so the guard can read "already big enough" even when the pair's own
+//     stored requirement is stale and needs raising -- the floor silently
+//     absorbs the pair's growth signal instead of the guard ever recording
+//     it. Every future caller of either getter must say, in a comment,
+//     which question it is asking.
 size_t   unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
+size_t   unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,
                                                          size_t   activation_slot_bytes,
@@ -2894,18 +2916,21 @@ class unified_cache {
     // by oneDNN itself on every dnnl::graph::sycl_interop::execute() unless
     // the engine is built with a dnnl::graph::allocator (see make_engine() in
     // common.hpp). These two serve that allocator's malloc/free callbacks
-    // (onednn_graph_sycl_malloc/free, declared above) from the SAME ONEDNN
-    // VRAM zone reserve_onednn_scratch() already uses for the primitive-API
-    // path, so a request is a host-side TLSF suballocation, not a
-    // zeMemAllocDevice/xe_vm_bind round trip. Falls back to a real
+    // (onednn_graph_sycl_malloc/free, declared further below) from the SAME
+    // ONEDNN VRAM zone reserve_onednn_scratch() already uses for the
+    // primitive-API path, so a request is a host-side TLSF suballocation,
+    // not a zeMemAllocDevice/xe_vm_bind round trip. Falls back to a real
     // mem_handle-owned allocation only if the zone has no room.
     void * onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q);
     // `event` is the completion event oneDNN hands back for the compiled
     // partition's submission (may be null in principle; oneDNN's SYCL interop
-    // always supplies one for a real execute). See the .cpp definition for why
-    // the ONEDNN-zone case reclaims immediately (in-order-queue safety) while
-    // the DIRECT-fallback case still defers via retain_handles_until_event --
-    // the two paths are NOT symmetric, and that's deliberate.
+    // always supplies one for a real execute). See the .cpp definition for
+    // the three reclaim branches this resolves to and why they are NOT
+    // symmetric: ONEDNN-zone with TP inactive reclaims immediately
+    // (in-order-queue safety), ONEDNN-zone with TP active defers via
+    // enqueue_deferred_zone_free() (the in-order-queue argument does not
+    // hold under TP), and DIRECT-fallback always defers via
+    // retain_handles_until_event().
     void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
 
     // Peak bytes concurrently outstanding across every onednn_graph_scratch_alloc()
@@ -3600,9 +3625,11 @@ class unified_cache {
     // combined) and its running peak, both updated under
     // onednn_graph_scratch_mutex_ in lock-step with the two maps above.
     // Exposed via onednn_graph_scratch_high_water_bytes() and logged once at
-    // cache teardown (shutdown_resources()) so a normal run answers "did the
-    // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB floor actually cover the concurrent
-    // demand" without a special env var or a live debugger.
+    // cache teardown (shutdown_resources()), at GGML_LOG_WARN specifically
+    // (GGML_LOG_INFO is dropped at default verbosity in every tool -- see
+    // CLAUDE.md's "llama-bench traps" section) so a normal run's log answers
+    // "did the GGML_SYCL_ONEDNN_GRAPH_ZONE_MB floor actually cover the
+    // concurrent demand" without a special env var or a live debugger.
     size_t onednn_graph_scratch_outstanding_bytes_ = 0;
     size_t onednn_graph_scratch_high_water_bytes_  = 0;
 
