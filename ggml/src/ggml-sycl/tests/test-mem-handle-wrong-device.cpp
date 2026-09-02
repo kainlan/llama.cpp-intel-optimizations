@@ -285,9 +285,6 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
         // single device (level_zero:1), so n_gpu_devices is always < 2 here.
         // Do not "fix" this by weakening mem_handle::resolve(int)'s check —
         // that check is correct by design. See llama.cpp-os9t for the fix.
-        //
-        // Wrong-device resolve must return null (explicit-fail policy).
-        // handle's device_=0 != caller device_id=1, so the check fires and returns null.
         ggml_sycl::resolved_ptr r1 = chunk_slice.resolve(1);
         TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK_LEASE slice resolve must return null");
     }
@@ -852,18 +849,55 @@ int main(int argc, char ** argv) {
     if (n_gpu_devices > 0) {
         try {
             sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order{});
-            all_passed &= test_arena_slice_generation_and_bounds(q);
-            all_passed &= test_retention_transitions_and_exhaustion(q);
+
+            // Each call gets its own try/catch (not one try around both) so a
+            // sycl::exception from the first call cannot swallow the second, and
+            // so the SKIPPED line names the specific case that actually threw --
+            // not "both cases, blamed on whichever name happened to be printed".
+            //
+            // Not routed through the TEST_SKIP() macro (there is no guarantee
+            // TEST_BEGIN() ran before the throw), so accounting is done here via
+            // a run-count delta rather than assuming a fixed increment: if
+            // TEST_BEGIN() already fired for this case (g_tests_run moved),
+            // undo that phantom "run" the same way TEST_SKIP() would, so the
+            // case doesn't end up counted as run-but-neither-passed-nor-failed-
+            // nor-skipped; if the exception preempted TEST_BEGIN() entirely (it
+            // never got called), there's nothing to undo -- just count the skip.
+            const int run_before_arena = g_tests_run;
+            try {
+                all_passed &= test_arena_slice_generation_and_bounds(q);
+            } catch (const sycl::exception & e) {
+                if (g_tests_run > run_before_arena) {
+                    g_tests_run--;
+                }
+                g_tests_skipped++;
+                fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: %s\n", e.what());
+            }
+
+            const int run_before_retention = g_tests_run;
+            try {
+                all_passed &= test_retention_transitions_and_exhaustion(q);
+            } catch (const sycl::exception & e) {
+                if (g_tests_run > run_before_retention) {
+                    g_tests_run--;
+                }
+                g_tests_skipped++;
+                fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
+            }
         } catch (const sycl::exception & e) {
-            // Not routed through the TEST_SKIP() macro (there is no live test_*()
-            // frame to call it from -- queue construction itself threw), so count
-            // it here: otherwise a queue failure on a >=2-GPU host could leave
-            // g_tests_skipped at 0 while two cases silently never ran.
-            g_tests_skipped++;
+            // Queue construction itself threw -- both calls above are entirely
+            // inside this try, so neither one's TEST_BEGIN() ever ran. Nothing
+            // to undo (unlike the inner catches); just count both as skipped and
+            // name both, so a queue failure on a >=2-GPU host doesn't leave
+            // g_tests_skipped at 0 -- or leave only one of the two named -- while
+            // two cases silently never ran.
+            g_tests_skipped += 2;
+            fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: %s\n", e.what());
             fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
         }
     } else {
-        g_tests_skipped++;
+        g_tests_skipped += 2;
+        fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: no GPU device\n");
         fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: no GPU device\n");
     }
 
