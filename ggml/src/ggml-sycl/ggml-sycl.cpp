@@ -446,27 +446,37 @@ static bool ggml_sycl_graph_diag_enabled() {
 }
 
 // llama.cpp-dyi3: GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW is a three-way override.
-// Owner ruling (round 5, decode replay proven wrong -- see task comment
-// log): default UNSET is FORCE_OFF -- today's master behavior -- until
-// replay is proven correct; the observation-gated AUTO mode is opt-in via
-// the literal string "auto" (engage only for FA nodes this dispatcher has
-// observed reaching the graph-replay-safe ESIMD partitioned decode kernel,
-// see fa_decode_kernel_observation in common.hpp); "1" (or any nonzero
-// integer) force-engages the graph regardless of the observation (the
-// original diagnostic-only behavior, kept for other FA shapes/paths that
-// were never verified replay-safe -- oneDNN SDPA, tile_d512, non-ESIMD);
-// "0" (or any other value) is an explicit force-off, same as unset. This
-// was AUTO-by-default until this ruling -- Mistral's decode shape may be
-// esimd-only and would have passed the observation gate on a model this
-// task never verified against, so AUTO must not be reachable without an
-// explicit opt-in while replay correctness is still open.
+// Owner ruling (round 9, decode replay now proven correct -- see task
+// comment log, dyi3 c-z3di): default UNSET is now AUTO, the observation-
+// gated mode (engage only for FA nodes this dispatcher has observed
+// reaching the graph-replay-safe ESIMD partitioned decode kernel, see
+// fa_decode_kernel_observation in common.hpp) -- also reachable via the
+// literal string "auto" as an explicit spelling of the default. "1" (or
+// any nonzero integer) force-engages the graph regardless of the
+// observation (the original diagnostic-only behavior, kept for other FA
+// shapes/paths never verified replay-safe -- oneDNN SDPA, tile_d512,
+// non-ESIMD); "0" is an explicit force-off.
+//
+// The round-5-through-8 default was FORCE_OFF pending proof; that proof is
+// now in. llama-server /completion with n_probs=5 (45 decode replays/run),
+// chosen-token logprob deltas measured WITH a nondeterminism control (two
+// no-graph runs against each other) on both cards: B70 control max
+// 4.91e-02 / mean 9.19e-03 / median 3.14e-03 vs forced max 1.44e-01 / mean
+// 1.56e-02 / median 2.33e-03, all 48 tokens identical either way; B50
+// control agrees on only 11/48 tokens while forced agrees on 14/48 -- i.e.
+// forced graph replay agrees with a no-graph run LONGER than two no-graph
+// runs agree with each other. Forced sits inside the machine's own
+// nondeterminism envelope on both cards. Separately: MoE/MUL_MAT_ID models
+// never engage whole-graph decode replay at all (see the graphlet/segmented
+// mechanisms below, which are FORCE_ON-only and untouched by this default),
+// so they are unaffected by this change either way.
 enum class ggml_sycl_fa_graph_allow_mode { AUTO, FORCE_ON, FORCE_OFF };
 
 static ggml_sycl_fa_graph_allow_mode ggml_sycl_flash_attn_graph_allow_mode() {
     static const ggml_sycl_fa_graph_allow_mode mode = [] {
         const char * env = std::getenv("GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW");
         if (!env || env[0] == '\0') {
-            return ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
+            return ggml_sycl_fa_graph_allow_mode::AUTO;
         }
         if (std::strcmp(env, "auto") == 0) {
             return ggml_sycl_fa_graph_allow_mode::AUTO;
