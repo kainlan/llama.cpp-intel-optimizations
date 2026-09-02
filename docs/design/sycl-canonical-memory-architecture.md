@@ -502,9 +502,14 @@ Owned per inference context; reset between requests or at context free:
 for the owning device's cache. A reset proceeds only when the target zone has no
 live registered allocations; otherwise the reset is refused and existing
 allocations are preserved. It must not reset another context's zones. The
-historical `32dg8.2` is preload/placement work, not context-ownership work;
-until foundation owner `1q72` adds explicit context/session ownership keys, callers
-must ensure single-active-context per device.
+historical `32dg8.2` is preload/placement work, not context-ownership work.
+Foundation `1q72` (merged `4bd4211e8`) already landed the context registry
+(`ggml_sycl::execution::Registry`, one `ContextId` per `llama_context`); what
+remains missing is the context-keyed KV/RUNTIME arena reservation for the
+zones above (see §5.3, and bead `llama.cpp-c781` for the KV tier manager
+instance of the same gap) — callers must still ensure single-active-context
+per device for that reason, not because context identity itself is
+unimplemented.
 
 ### 5.3 Multiple models, contexts, and server slots
 
@@ -524,10 +529,10 @@ Keep these cases separate:
   foundation `o6jx` (merged `606e252b0`) landed owner-targeted drain/teardown
   on top of it — so context identity and owner-targeted teardown are
   implemented today, not open. What remains NOT implemented is a
-  **context-keyed KV/RUNTIME arena reservation**: the VRAM/host zones in §5.1
+  **context-keyed KV/RUNTIME arena reservation**: the VRAM/host zones in §5.2
   (`KV`, `RUNTIME`, `SCRATCH`) stay one instance per device with no
   context/session partition, so two contexts sharing a device still rely on
-  the `zone_settle`/`host_zone_settle` live-allocation refusal (§5.1) rather
+  the `zone_settle`/`host_zone_settle` live-allocation refusal (§5.2) rather
   than on a reservation that keeps their memory apart by construction. The
   ownership table's §4 and §7 further identify `g_kv_tier_managers`
   (device-only, not context-keyed; bead `llama.cpp-c781`) and the TP per-layer
@@ -540,8 +545,10 @@ Keep these cases separate:
   the process-global `g_graph_compute_active` eviction guard
   (`unified-cache.cpp:719`, setter at `unified-cache.cpp:13899`). It is not
   per-device or per-context state (bead `llama.cpp-2mt5`).
-- Independently, the process-global `g_sycl_graph_compute_mutex` is acquired at
-  the current graph-compute entry point (`ggml-sycl.cpp:91438`) but does not
+- Independently, the process-global `g_sycl_graph_compute_mutex` has exactly one
+  acquisition site, the current graph-compute entry point
+  (`ggml-sycl.cpp:99095`, `std::unique_lock<std::mutex>
+  global_graph_lock(g_sycl_graph_compute_mutex)`), but it does not
   universally serialize submission. Direct/fallback paths explicitly release it
   before `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). In contrast,
   persistent-TG and deferred-copy paths submit while it remains held

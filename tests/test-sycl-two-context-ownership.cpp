@@ -10,13 +10,18 @@
 // decode would attend over B's tokens and its logits would diverge from a
 // single-context reference run of the same token sequence.  So:
 //
-//   1. Reference: fresh context R_A decodes P_A then c1 then c2; record the
-//      logits after each step.  Same for R_B with a DIFFERENT prompt P_B.
-//      (Each reference context is freed before the next is created, so the
-//      reference itself never has two contexts alive.)
+//   1. Reference: fresh context R_A decodes P_A then c1, c2, c3, c4 (c4 is the
+//      token later replayed on A after B's memory is cleared); record the
+//      logits after each step.  Same for R_B with a DIFFERENT prompt P_B and
+//      just c1, c2, c3 (B is never replayed post-clear).  Every reference
+//      context is created AND freed here, before the two-context proof phase
+//      begins, so no reference run ever overlaps with a live A/B pair -- the
+//      reference itself never has two (let alone three) contexts alive.
 //   2. Proof: create A (n_ctx_a) and B (n_ctx_b) and keep BOTH alive.
-//      Interleave: A(P_A) B(P_B) A(c1) B(c1) A(c2) B(c2).  Every step's
-//      logits must match the reference step for that context.
+//      Interleave: A(P_A) B(P_B) A(c1) B(c1) A(c2) B(c2) A(c3) B(c3), clear
+//      B's memory, then replay c4 on A alone.  Every step's logits must match
+//      the reference step for that context (A's c4 step matches R_A's c4
+//      step, computed before A/B ever existed).
 //
 // The prompts differ in content AND length on purpose: with identical prompts
 // a KV overwrite would replace A's history with byte-identical content and the
@@ -193,10 +198,16 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
 
-    // 1. References, each in its own single live context.
+    // 1. References, each in its own single live context, computed entirely
+    //    before ctx_a/ctx_b exist (see header comment). ref_a's script
+    //    includes the extra post-clear continuation token up front so no
+    //    later reference run needs to happen while A/B are alive.
+    std::vector<llama_token> cont_ext = cont;
+    cont_ext.push_back((llama_token) (1 + 4242 % (n_vocab - 1)));
+
     std::vector<step_logits> ref_a;
     std::vector<step_logits> ref_b;
-    ok = ok && run_reference(model, n_ctx_a, prompt_a, cont, "ref-A", ref_a);
+    ok = ok && run_reference(model, n_ctx_a, prompt_a, cont_ext, "ref-A", ref_a);
     ok = ok && run_reference(model, n_ctx_b, prompt_b, cont, "ref-B", ref_b);
     if (!ok) {
         fprintf(stderr, "[TWO-CTX] FAIL: reference runs did not complete\n");
@@ -248,18 +259,13 @@ int main(int argc, char ** argv) {
         ok = ok && decode_tokens(ctx_b, { cont[i] }, tag, s) && compare_step(s, ref_b[1 + i], tag, tol);
     }
 
-    // 3. Clearing B's memory must not disturb A: A continues to match.
+    // 3. Clearing B's memory must not disturb A: A continues to match. The
+    //    reference for this step (ref_a.back(), i.e. ref_a's c4 entry) was
+    //    already computed in step 1, before ctx_a/ctx_b existed -- no new
+    //    reference context is created here.
     llama_memory_clear(llama_get_memory(ctx_b), true);
-    {
-        // Re-run A's script in a third fresh context to extend the reference by
-        // one more continuation token after the clear.
-        std::vector<llama_token> cont_ext = cont;
-        cont_ext.push_back((llama_token) (1 + 4242 % (n_vocab - 1)));
-        std::vector<step_logits> ref_a_ext;
-        ok = ok && run_reference(model, n_ctx_a, prompt_a, cont_ext, "ref-A-ext", ref_a_ext);
-        ok = ok && decode_tokens(ctx_a, { cont_ext.back() }, "A after B clear", s) &&
-             compare_step(s, ref_a_ext.back(), "A step after B clear", tol);
-    }
+    ok = ok && decode_tokens(ctx_a, { cont_ext.back() }, "A after B clear", s) &&
+         compare_step(s, ref_a.back(), "A step after B clear", tol);
 
     llama_synchronize(ctx_a);
     llama_synchronize(ctx_b);

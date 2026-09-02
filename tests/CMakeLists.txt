@@ -687,23 +687,6 @@ endif()
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Two live contexts on one model, different n_ctx, interleaved decodes, each
-# step compared against a single-context reference (llama.cpp-32dg8.15.1). This
-# is the executable half of docs/design/sycl-memory-ownership-table.md. It
-# LOADS A MODEL, so it carries the "cache" label on purpose: CLAUDE.md's
-# full-sweep form excludes `-LE 'residency|mem-handle|cache'` and runs that
-# family serially -- an unlabelled model-loading test slips past that filter.
-# The selector pin is what keeps the iGPU out of the run (llama.cpp-403s).
-llama_build_and_test(test-sycl-two-context-ownership.cpp ARGS "${MODEL_DEST}" -ngl 99 --ctx-a 256 --ctx-b 512)
-set_tests_properties(test-sycl-two-context-ownership PROPERTIES
-    FIXTURES_REQUIRED test-download-model
-    LABELS "main;sycl;cache;ownership;two-context"
-    RUN_SERIAL TRUE
-    TIMEOUT 300)
-if (GGML_SYCL)
-    set_tests_properties(test-sycl-two-context-ownership PROPERTIES
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
-endif()
 # NOTE (llama.cpp-u7vj): this test used to pin GGML_SYCL_DISABLE_GRAPH=1 here.
 # That pin was a workaround for a production defect, and the comment justifying
 # it blamed the wrong mechanism -- it read as though graph replay itself held
@@ -720,6 +703,25 @@ endif()
 # for that fix: a regression reappears as "error=DEVICE_BUSY" in the log and a
 # failure of every context after the first. Do not re-add the pin to make a
 # failure go away -- it would hide exactly the defect this test now covers.
+
+# Two live contexts on one model, different n_ctx, interleaved decodes, each
+# step compared against a single-context reference (llama.cpp-32dg8.15.1). This
+# is the executable half of docs/design/sycl-memory-ownership-table.md. It
+# LOADS A MODEL, so it carries the "cache" label on purpose: CLAUDE.md's
+# full-sweep form excludes `-LE 'residency|mem-handle|cache'` and runs that
+# family serially -- an unlabelled model-loading test slips past that filter.
+# The selector pin is what keeps the iGPU out of the run (llama.cpp-403s).
+# Guarded by GGML_SYCL (precedent: test-sycl-model-lifecycle-hooks below) so a
+# CPU-only build does not register a test that can only pass vacuously.
+if (GGML_SYCL)
+    llama_build_and_test(test-sycl-two-context-ownership.cpp ARGS "${MODEL_DEST}" -ngl 99 --ctx-a 256 --ctx-b 512)
+    set_tests_properties(test-sycl-two-context-ownership PROPERTIES
+        FIXTURES_REQUIRED test-download-model
+        LABELS "main;sycl;cache;ownership;two-context"
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
