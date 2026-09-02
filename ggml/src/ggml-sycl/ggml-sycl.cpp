@@ -33272,6 +33272,41 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
             dst_size = src_size;
         }
     }
+    // llama.cpp-dyi3 round 6 (root cause, task comment log): this fast path
+    // used to live AFTER the recording gate below, only reachable on the
+    // non-recording side. gemma4's kmeq BF16->F32 materialization
+    // (~line 60095, "<name>.bf16_materialized_f32") builds a stack-local
+    // alias tensor with extra=nullptr and data pointing at the already-
+    // materialized F32 device buffer, keyed under a synthesized cache name
+    // that is DESIGNED to miss cache->get_view() (kmeq's own comment).
+    // Under recording the old gate below tried only get_view(), missed by
+    // design, and returned nullptr -- silently failing MUL_MAT dispatch for
+    // gemma4's per-layer-embedding projection on every recorded/replayed
+    // decode token. This rule is the correct, general answer regardless of
+    // recording state: a device-resident, non-host-preferred source is
+    // already directly usable, no allocation or cache entry needed. Placed
+    // ahead of the "Host placement" block below, so used_host_layout is
+    // trivially false here -- it can only become true when !src_is_device
+    // (line ~33306's own guard), which is mutually exclusive with this
+    // rule's src_is_device requirement, so the ordering does not change
+    // which case reaches the host-placement branch versus this one.
+    if (src_is_device && !request_prefer_host) {
+        if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
+                extra->layout.device_id == device && extra->layout.size >= dst_size) {
+                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
+                                                   extra->layout.size, xmx_info, onednn_pack_m);
+                return extra->layout.data_ptr;
+            }
+        }
+        if (resolved == GGML_LAYOUT_AOS) {
+            if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, const_cast<void *>(src_ptr),
+                                                   src_size, xmx_info, onednn_pack_m);
+            }
+            return const_cast<void *>(src_ptr);
+        }
+    }
     if (ggml_sycl_graph_recording_active()) {
         ggml_sycl::cache_ptr_view view = cache->get_view(cache_key, resolved);
         if (view.ptr) {
@@ -33359,26 +33394,6 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
                         host_pinned ? 1 : 0);
                 }
             }
-        }
-    }
-    // Fast path: if the tensor is already device-resident in the requested layout,
-    // reuse that storage directly instead of creating a duplicate unified-cache entry.
-    // Duplicating pre-transformed weights can exhaust VRAM before warmup/decode.
-    if (!used_host_layout && src_is_device && !request_prefer_host) {
-        if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
-                extra->layout.device_id == device && extra->layout.size >= dst_size) {
-                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
-                                                   extra->layout.size, xmx_info, onednn_pack_m);
-                return extra->layout.data_ptr;
-            }
-        }
-        if (resolved == GGML_LAYOUT_AOS) {
-            if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, const_cast<void *>(src_ptr),
-                                                   src_size, xmx_info, onednn_pack_m);
-            }
-            return const_cast<void *>(src_ptr);
         }
     }
     // Direct layout-specific lookup — all weights should be staged by S1-PRELOAD.
@@ -62255,6 +62270,26 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 return;
             }
             trace_decision("dispatch-legacy-failed", decision);
+            // llama.cpp-dyi3 round 6: a fallback decline is normal during
+            // ordinary per-op dispatch (a cache miss just falls through to
+            // BLAS below), but during SYCL graph recording it is the one
+            // mode where a "fall through and hope the next route works"
+            // decline cannot be trusted -- this exact chain (legacy decline
+            // -> generic BLAS fallback -> its own silent failure) is how
+            // gemma4's per-layer-embedding projection went missing under
+            // recording. Once per tensor name, not per call.
+            if (ggml_sycl_graph_recording_active()) {
+                static std::unordered_set<std::string> warned_tensors;
+                static std::mutex                      warned_tensors_mutex;
+                const char *                           name = src0->name ? src0->name : "?";
+                std::lock_guard<std::mutex>            lock(warned_tensors_mutex);
+                if (warned_tensors.insert(name).second) {
+                    GGML_LOG_WARN(
+                        "[MUL_MAT] legacy dispatch declined for %s during SYCL graph recording -- falling through "
+                        "to a route not verified for this recording state; see llama.cpp-dyi3\n",
+                        name);
+                }
+            }
         }
 
         if (forced_layout && *forced_layout == GGML_LAYOUT_AOS && ggml_sycl_supports_mmq(src0->type) &&
@@ -62340,7 +62375,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             // This triggers weight eviction if needed, freeing physical VRAM
             // so the pool allocator inside ggml_sycl_op_mul_mat_sycl can succeed.
             const size_t f16_bytes = src0->ne[0] * src0->ne[1] * sizeof(sycl::half);
-            ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, GGML_LAYOUT_AOS);
+            // llama.cpp-dyi3 round 6 (root cause, task comment log): this
+            // call's return value used to be discarded -- a false return
+            // (e.g. the weight's layout pointer could not be resolved) left
+            // dst silently unwritten instead of producing an error. That is
+            // exactly how gemma4's per-layer-embedding projection went
+            // silently missing under SYCL graph recording before this
+            // round's fix to ggml_sycl_get_weight_layout_ptr: a discarded
+            // false here would have masked the same class of bug again.
+            // This is the last fallback in the dispatch chain, so a false
+            // return here means the op genuinely did not run -- a crash is
+            // strictly better than deterministic wrong output that survives
+            // every other instrument, which is what happened.
+            if (!ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl,
+                                                        GGML_LAYOUT_AOS)) {
+                GGML_ABORT(
+                    "[MUL_MAT] generic BLAS fallback did not compute %s (type=%d, recording=%d) -- dst was left "
+                    "unwritten instead of silently succeeding; see llama.cpp-dyi3",
+                    src0->name ? src0->name : "?", (int) src0->type, ggml_sycl_graph_recording_active() ? 1 : 0);
+            }
             return;
         }
         GGML_LOG_ERROR("[MUL_MAT] No eligible kernel variant for %s (type=%d)\n", src0->name ? src0->name : "?",

@@ -1707,6 +1707,13 @@ if (NOT WIN32)
     )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-weight-layout-fallback-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;graph;mul-mat;mutation"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-universal-provenance-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;provenance;lifecycle;mutation"
