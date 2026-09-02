@@ -1125,6 +1125,19 @@ struct field_owner {
         # defaulted reference parameter inside a class body.
         "defaulted-const-reference-class-member-nonempty":
             "struct T { T(int); }; struct H { void f(const T & value = {1}); };",
+        # llama.cpp-qqs2 spec review (c-71ud): the class-member-nonempty
+        # fixture above bails three predicate steps BEFORE the ancestor-kind
+        # check the fix touched (the initializer-list-must-be-"{}" gate), so
+        # it cannot detect an over-widened ancestor set -- replacing that
+        # check with `True` still passes --self-test with only that fixture
+        # present. This one reaches the ancestor check with a matched,
+        # empty-initializer `const T & v = {}` default whose function_declarator
+        # sits under parameter_declaration/template_parameter_list/
+        # template_declaration, not declaration/field_declaration/
+        # function_definition, so it is the fixture that actually exercises
+        # the set this task's fix changed.
+        "defaulted-const-reference-out-of-container":
+            "struct T {}; template<int (*F)(const T & v = {})> struct H {};",
     }
     alias_failures = {
         "function-alias-array", "unproved-function-alias", "unknown-qualified-alias", "alias-template",
