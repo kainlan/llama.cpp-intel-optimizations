@@ -2422,6 +2422,8 @@ They are backend sources, outside this lane's scope:
 
 **Update (2026-09-02, `llama.cpp-eltp`):** both headers deleted under llama.cpp-eltp; `xmx-esimd-common.hpp` was NOT deleted -- it remains a live include of `test-mmq-xmx-dispatch` (default-registered) and the two gated XMX tests.
 
+**Correction:** the "reachable only through them" clause above was already false when it landed (b752806ce, 2026-08-08) -- `xmx-esimd-common.hpp` has had three *direct* includers since 2026-01-19: `test-mmq-xmx-dispatch.cpp` (5883da357) and `test-xmx-hardware-detect.cpp` (6dda458e8), plus `test-xmx-esimd-basic.cpp`. A header's liveness is decided by a live grep of its includers, never by filename-prefix association with sibling files.
+
 ## Pre-registered for the lead
 
 Nothing in this pass was built or run. In order:
