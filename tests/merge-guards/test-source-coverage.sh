@@ -70,3 +70,29 @@ rc=0; out=$(bash "$G" --build-ninja build/build.ninja --strict --allowlist "$TMP
 [ "$rc" -eq 2 ] || { echo "FAIL: --strict with missing allowlist returned $rc, want 2"; exit 1; }
 grep -qF "STRICT requested but allowlist missing" <<<"$out" || { echo "FAIL: missing-allowlist case did not report the R4 message"; exit 1; }
 echo "r4-missing-allowlist ok"
+# Item 5: the allowlist must stay newline-terminated. Both the main scan and
+# --strict read it with `while IFS= read -r`, which silently drops a final
+# line lacking a trailing newline -- so a stale entry appended without one
+# would never be validated by --strict at all: not a false pass, an INVISIBLE
+# one. Confirmed by naming a nonexistent file as an unterminated fixture
+# entry: "STRICT VIOLATION: allowlisted entry missing on disk" never fires
+# and the entry is never even named in the output -- only present once the
+# trailing newline is restored (rc alone does not discriminate this: an
+# allowlist this small also fails the UNRELATED main scan on every
+# genuinely-unbuilt file it doesn't cover, so both cases exit 1 for
+# different reasons -- grep the exact message, not the rc, the same
+# discipline the --strict tests above already use). Guard the byte
+# directly, and prove the guard itself fires: a scratch copy with the
+# trailing newline stripped must turn this arm red, and the real committed
+# file must turn it green.
+ALLOW_REAL="scripts/merge-source-coverage-allowlist.txt"
+check_allowlist_newline_terminated() { [ -z "$(tail -c1 "$1")" ]; }
+STRIPPED_ALLOW="$TMP/stripped-allow.txt"
+printf '%s' "$(cat "$ALLOW_REAL")" > "$STRIPPED_ALLOW"
+if check_allowlist_newline_terminated "$STRIPPED_ALLOW"; then
+    echo "FAIL: newline-terminated check did not go red on a stripped-trailing-newline copy"; exit 1
+fi
+echo "allowlist-newline-check red ok: fires on a stripped-trailing-newline copy"
+check_allowlist_newline_terminated "$ALLOW_REAL" \
+    || { echo "FAIL: allowlist not newline-terminated -- --strict silently drops the final entry: $ALLOW_REAL"; exit 1; }
+echo "allowlist-newline-check green ok: the real committed allowlist is newline-terminated"
