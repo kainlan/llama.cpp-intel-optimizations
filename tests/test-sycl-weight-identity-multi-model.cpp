@@ -87,9 +87,11 @@
 // (ggml/src/ggml-sycl/ggml-sycl.cpp; `cat ggml/src/ggml-sycl/ggml-sycl.cpp |
 // grep -n 'ggml_backend_sycl_get_weight_cache_key'` locates it), make the
 // owner resolution ignore extra->model_id, i.e. resolve as if
-// extra_model_id were 0. Today that is the
+// extra_model_id were 0. Today that means changing the `owner` assignment
+// line (whitespace-aligned in the source; quoted here without the
+// alignment):
 //     const auto owner = ggml_sycl_exact_wrapper_owner(extra_model_id);
-// line -- change it to
+// to
 //     const auto owner = ggml_sycl_exact_wrapper_owner(0);
 // After llama.cpp-qq19 lands, the same resolution is behind a call to
 // ggml_sycl_resolve_tensor_owner() instead, and the mutation is the
@@ -237,9 +239,12 @@ int main() {
         print_cache_id("round 1, model A", key_a);
         print_cache_id("round 1, model B", key_b);
         // id.valid is set unconditionally for any non-null tensor in
-        // ggml_backend_sycl_get_weight_cache_key() -- `grep -n 'id.valid = true'
-        // ggml/src/ggml-sycl/ggml-sycl.cpp` locates the line (14011 as of this
-        // writing) -- it cannot go false here, so it is printed
+        // ggml_backend_sycl_get_weight_cache_key() -- a plain-string grep for
+        // 'id.valid = true' matches nothing against the vertically-aligned
+        // source, so use `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -nE
+        // 'id\.valid +='` (14011 as of this writing, of three matches --
+        // disambiguate by enclosing function) -- it cannot go false here, so
+        // it is printed
         // above for context but not asserted as a counted check.
 
         check(key_a.has_gguf, "round 1: model A resolves its own GGUF identity, not the UUID fallback");
