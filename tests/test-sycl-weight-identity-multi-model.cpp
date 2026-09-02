@@ -5,7 +5,7 @@
 // verified present at HEAD fed0b58e2, inside
 // ggml_backend_sycl_get_weight_cache_key() in ggml/src/ggml-sycl/ggml-sycl.cpp --
 // locate it with
-//     cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'ggml_backend_sycl_get_weight_cache_key'
+//     cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n '^ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key'
 // rather than an absolute line number, which llama.cpp-qq19 is about to move):
 // that function used to resolve a tensor's weight-identity OWNER from the
 // PUBLISHED PLACEMENT PLAN, which names exactly one model. With two models
@@ -53,8 +53,10 @@
 //      singleton ggml-sycl.cpp itself uses via
 //      ggml_sycl::lifecycle::global_registry() -- model-lifecycle.cpp is one
 //      of the .cpp files globbed into the ggml-sycl target this binary
-//      links, and it contains zero `sycl::`/`dpct::` references anywhere in
-//      the file (grep confirms). begin_outer()/bind_candidate()/end()/
+//      links, and it has no bare `sycl::`/`dpct::` reference anywhere in the
+//      file -- only the `ggml_sycl::lifecycle` namespace name matches a naive
+//      grep; `cat ggml/src/ggml-sycl/model-lifecycle.cpp | grep -nE
+//      '(^|[^_a-zA-Z])sycl::|dpct::'` returns zero. begin_outer()/bind_candidate()/end()/
 //      unbind_candidate()/teardown() are plain mutex+map bookkeeping. This
 //      is the exact same Registry class test-sycl-lifecycle-load-txn.cpp
 //      drives standalone, linked with nothing but ggml-base.
@@ -86,7 +88,7 @@
 //
 // Mutation control: inside ggml_backend_sycl_get_weight_cache_key()
 // (ggml/src/ggml-sycl/ggml-sycl.cpp; `cat ggml/src/ggml-sycl/ggml-sycl.cpp |
-// grep -n 'ggml_backend_sycl_get_weight_cache_key'` locates it), make the
+// grep -n '^ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key'` locates it), make the
 // owner resolution ignore extra->model_id, i.e. resolve as if
 // extra_model_id were 0. Today that means changing the `owner` assignment
 // line (whitespace-aligned in the source; quoted here without the
@@ -126,7 +128,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -157,7 +158,7 @@ static void print_cache_id(const char * label, const ggml_sycl_cache_id & id) {
 int main() {
     // Never enumerate the iGPU by accident (CLAUDE.md, llama.cpp-403s) -- this
     // test is device-free by construction (see the header), but stay
-    // consistent with every other test in this family that links ggml-sycl.
+    // consistent with the common pattern among tests here that link ggml-sycl.
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0,1", 1);
     }
@@ -173,12 +174,21 @@ int main() {
     params.mem_buffer  = nullptr;
     params.no_alloc    = true;
     ggml_context * ctx = ggml_init(params);
-    check(ctx != nullptr, "ggml_init failed");
+    check(ctx != nullptr, "ggml_init returned a context");
+    if (!ctx) {
+        printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
+        return 1;
+    }
 
     ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
     ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
     ggml_tensor * tensor_c = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
-    check(tensor_a != nullptr && tensor_b != nullptr && tensor_c != nullptr, "tensor allocation failed");
+    check(tensor_a != nullptr && tensor_b != nullptr && tensor_c != nullptr, "tensors allocated");
+    if (!tensor_a || !tensor_b || !tensor_c) {
+        printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
+        ggml_free(ctx);
+        return 1;
+    }
     ggml_set_name(tensor_a, shared_name);
     ggml_set_name(tensor_b, shared_name);
     ggml_set_name(tensor_c, only_a_name);
@@ -245,8 +255,8 @@ int main() {
         // source, so use `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -nE
         // 'id\.valid +='` (14011 as of this writing, of three matches --
         // disambiguate by enclosing function) -- it cannot go false here, so
-        // it is printed
-        // above for context but not asserted as a counted check.
+        // it is printed above for context but not asserted as a counted
+        // check.
 
         check(key_a.has_gguf, "round 1: model A resolves its own GGUF identity, not the UUID fallback");
         check(key_a.file_offs == 0x1000, "round 1: model A resolves its OWN file_offs, not B's or a UUID");
@@ -278,6 +288,13 @@ int main() {
         print_cache_id("round 2, only_a_name queried under model A (its real owner)", key_c_right_owner);
         check(key_c_right_owner.has_gguf, "round 2: model A resolves the identity it actually registered");
         check(key_c_right_owner.file_offs == 0x3000, "round 2: model A resolves its OWN file_offs for only_a_name");
+
+        // extra_c_as_a is block-scoped and about to go out of scope. Clear the
+        // raw pointer rather than leave tensor_c->extra dangling -- never
+        // dereferenced again, but raw pointers must not model stale ownership
+        // state in this fork regardless (CLAUDE.md, "Raw pointers are not
+        // ownership tokens").
+        tensor_c->extra = nullptr;
     }
 
     // Registry hygiene: both synthetic models must tear down cleanly through
