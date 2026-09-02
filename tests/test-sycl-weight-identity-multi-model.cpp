@@ -2,21 +2,26 @@
 // (llama.cpp-s83n).
 //
 // Bug (found and fixed in passing by llama.cpp-n3pw, commit 6f38363f1;
-// verified present at HEAD fed0b58e2, ggml-sycl.cpp around line 13968):
-// ggml_backend_sycl_get_weight_cache_key() used to resolve a tensor's
-// weight-identity OWNER from the PUBLISHED PLACEMENT PLAN, which names
-// exactly one model. With two models loaded, whichever model was NOT
-// currently published found nothing under its own owner-scoped
-// g_sycl_weight_identities_by_name key and silently fell through to the
-// UUID/no-identity path (has_gguf=false), losing its file identity
-// entirely.
+// verified present at HEAD fed0b58e2, inside
+// ggml_backend_sycl_get_weight_cache_key() in ggml/src/ggml-sycl/ggml-sycl.cpp --
+// locate it with
+//     cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'ggml_backend_sycl_get_weight_cache_key'
+// rather than an absolute line number, which llama.cpp-qq19 is about to move):
+// that function used to resolve a tensor's weight-identity OWNER from the
+// PUBLISHED PLACEMENT PLAN, which names exactly one model. With two models
+// loaded, whichever model was NOT currently published found nothing under
+// its own owner-scoped g_sycl_weight_identities_by_name key and silently
+// fell through to the UUID/no-identity path (has_gguf=false), losing its
+// file identity entirely.
 //
 // The fix resolves the owner from the tensor's own extra->model_id FIRST --
 // the same order ggml_sycl_get_tensor_usage() already used -- and only
 // falls back to the published-plan snapshot when extra->model_id is 0 (no
-// owner known):
-//
-//     ggml/src/ggml-sycl/ggml-sycl.cpp:13974-13975
+// owner known). This lives inside ggml_backend_sycl_get_weight_cache_key()
+// (ggml/src/ggml-sycl/ggml-sycl.cpp; the grep above locates it -- a line
+// number is not cited here because llama.cpp-qq19 is about to move this
+// resolution behind a new ggml_sycl_resolve_tensor_owner() helper). Today
+// that reads:
 //         const uint64_t extra_model_id = extra ? extra->model_id : 0;
 //         const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
 //
@@ -61,10 +66,11 @@
 //      registry.acquire_load_effect()/bound_candidate() (layer 1, above),
 //      ggml_sycl::dispatch_tuning::ensure_model_loaded() (env-var gated
 //      local-file read, no device access -- dispatch-tuning.cpp:356), and
-//      sycl_module_mutation_guard (a plain mutex/counter, ggml-sycl.cpp
-//      ~11810). get_weight_cache_key()'s one branch that WOULD touch a
-//      device (ggml_backend_sycl_reg()/ggml_backend_reg_dev_get(), guarded
-//      by `!extra && tensor->buffer && ...`) is never reached here because
+//      sycl_module_mutation_guard (a plain mutex/counter in ggml-sycl.cpp;
+//      `grep -n 'class sycl_module_mutation_guard'` locates it).
+//      get_weight_cache_key()'s one branch that WOULD touch a device
+//      (ggml_backend_sycl_reg()/ggml_backend_reg_dev_get(), guarded by
+//      `!extra && tensor->buffer && ...`) is never reached here because
 //      every tensor queried below always has tensor->extra set before the
 //      query.
 //
@@ -77,14 +83,20 @@
 // (registry.find(model_id)), which is everything ggml_sycl_exact_wrapper_owner()
 // consults for a nonzero model id.
 //
-// Mutation control: temporarily change ggml-sycl.cpp:13975 from
+// Mutation control: inside ggml_backend_sycl_get_weight_cache_key()
+// (ggml/src/ggml-sycl/ggml-sycl.cpp; `cat ggml/src/ggml-sycl/ggml-sycl.cpp |
+// grep -n 'ggml_backend_sycl_get_weight_cache_key'` locates it), make the
+// owner resolution ignore extra->model_id, i.e. resolve as if
+// extra_model_id were 0. Today that is the
 //     const auto owner = ggml_sycl_exact_wrapper_owner(extra_model_id);
-// to
+// line -- change it to
 //     const auto owner = ggml_sycl_exact_wrapper_owner(0);
-// which always takes the model_id==0 "published plan" branch
-// (ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot())). Since this
-// test never publishes any plan, that branch resolves to a zeroed
-// ModelToken for every query, which falls through to the (empty)
+// After llama.cpp-qq19 lands, the same resolution is behind a call to
+// ggml_sycl_resolve_tensor_owner() instead, and the mutation is the
+// analogous change to that call. Either form always takes the model_id==0
+// "published plan" branch (ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot())).
+// Since this test never publishes any plan, that branch resolves to a
+// zeroed ModelToken for every query, which falls through to the (empty)
 // g_sycl_weight_identities_unowned map:
 //   - Round 1 (shared tensor name registered separately by A and B): BOTH
 //     key_a.has_gguf and key_b.has_gguf go false, and both file_offs checks
@@ -224,8 +236,10 @@ int main() {
         ggml_sycl_cache_id key_b = ggml_backend_sycl_get_weight_cache_key(tensor_b, 0);
         print_cache_id("round 1, model A", key_a);
         print_cache_id("round 1, model B", key_b);
-        // id.valid is set unconditionally for any non-null tensor
-        // (ggml-sycl.cpp:14011) -- it cannot go false here, so it is printed
+        // id.valid is set unconditionally for any non-null tensor in
+        // ggml_backend_sycl_get_weight_cache_key() -- `grep -n 'id.valid = true'
+        // ggml/src/ggml-sycl/ggml-sycl.cpp` locates the line (14011 as of this
+        // writing) -- it cannot go false here, so it is printed
         // above for context but not asserted as a counted check.
 
         check(key_a.has_gguf, "round 1: model A resolves its own GGUF identity, not the UUID fallback");
