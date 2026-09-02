@@ -19,7 +19,8 @@
 //
 // Per variant and shape it prints ONE line:
 //   variant=<id> shape=M<M>xN<N>xK<K> created=<Y|N> [reason=...]
-//           [any_plain=<Y|N>] us=<avg wall per exec> ev_us=<last-kernel event>
+//           [any_plain=<Y|N> any_bytes=<weights_desc size>] scratch=<bytes>
+//           us=<avg wall per exec> ev_us=<last-kernel event>
 //           tops=<2MNK/t> maxerr=<max abs err vs double ref> ref=<ref scale>
 // and exits 77 when it cannot probe (no GPU / no oneDNN), 1 when a variant
 // that CREATED produced numbers that do not match the reference (that is a
@@ -292,18 +293,24 @@ host_data make_data(const variant & v, const shape & s, std::mt19937 & rng) {
                     g = f16_round(g);
                 }
                 d.b_sc[n * KB + kb] = g;
-                // Q4_0 is stored as unsigned nibbles with an implicit -8; with a
-                // zero point we store the raw nibble and hand oneDNN zp=8 (as
-                // the WoQ arm does), without one we store the signed nibble.
-                const int zpv       = zp ? 8 : 0;
+                // dnnl_s4 is SIGNED (dnnl_common_types.h), and the WoQ arm
+                // this mirrors (onednn-woq.cpp's pack_q4_0_aos_to_s4) stores
+                // the already-signed dequant value's two's-complement nibble
+                // directly -- nib = (uint8_t)v & 0xF for v in [-8,7] -- with
+                // gemm.hpp's zero_points ALWAYS filled with 0
+                // (onednn-woq.cpp: out.zero_points.assign(..., 0)), never a
+                // non-zero offset. V3z therefore differs from V3 only in
+                // that the zero-point attribute/arg is set with value 0, not
+                // in the stored nibble or a genuine non-zero zp (that would
+                // need dt::u4, which the WoQ arm does not use either).
                 if (zp) {
-                    d.b_zp[kb * N + n] = static_cast<int8_t>(zpv);
+                    d.b_zp[kb * N + n] = 0;
                 }
                 for (int64_t j = 0; j < GROUP; ++j) {
                     const int64_t k = kb * GROUP + j;
                     if (is4) {
                         const int     q   = q4(rng);  // signed value in [-8,7]
-                        const int     nib = (q + zpv) & 0xF;
+                        const int     nib = static_cast<uint8_t>(q) & 0xF;
                         const int64_t idx = n * K + k;
                         d.b_s4[idx / 2] |= static_cast<uint8_t>(nib << ((idx & 1) ? 4 : 0));
                         d.b_real[idx] = q * g;
@@ -437,12 +444,17 @@ int run_one(sycl::queue &   q,
     std::printf("scratch=%zu ", pd.scratchpad_desc().get_size());
     std::fflush(stdout);
 
-    // ---- data
-    host_data           d = make_data(v, s, rng);
+    // ---- data. make_data() and the dnnl::matmul ctor (which triggers oneDNN
+    // kernel generation) both belong inside the try: an exception from
+    // either must be reported as exec_failed and terminate this line rather
+    // than escaping to main() and truncating every remaining row.
     std::vector<void *> owned;
-    dnnl::matmul        prim(pd);
     int                 rc = 0;
     try {
+        host_data d = make_data(v, s, rng);
+
+        dnnl::matmul prim(pd);
+
         void * a_dev =
             v.src == src_kind::f16 ? (void *) dev_upload(q, d.a_f16, owned) : (void *) dev_upload(q, d.a_s8, owned);
         void * b_dev = nullptr;
