@@ -291,8 +291,52 @@ int main(int argc, char ** argv) {
     }
 
     // 2. Two live contexts, interleaved decodes.
-    llama_context * ctx_a = make_ctx(model, n_ctx_a, 32);
-    llama_context * ctx_b = make_ctx(model, n_ctx_b, 32);
+    // DIAGNOSTIC (llama.cpp-79o5, temporary): with TWOCTX_SEPARATE_MODELS=1 the
+    // second context gets its OWN llama_model loaded from the same file, so the
+    // two contexts share NO ggml_tensor objects and therefore no tensor->extra,
+    // no layout fast-path cache, and no name-keyed process-lifetime caches keyed
+    // on those tensors.  If the corruption disappears under this flag, the carrier
+    // is shared-MODEL state mutated during graph recording, not context lifetime.
+    llama_model * model_b = model;
+    if (const char * sep = std::getenv("TWOCTX_SEPARATE_MODELS")) {
+        if (std::atoi(sep) != 0) {
+            llama_model_params mparams_b = mparams;
+            // llama.cpp-79o5 scoping: place the second model on a DIFFERENT device to
+            // test whether the defect is same-device only.  Only meaningful alongside
+            // TWOCTX_SEPARATE_MODELS, because a single model's weights live on its own
+            // device -- "two contexts on two cards" is not expressible with one model.
+            if (const char * gpu_b = std::getenv("TWOCTX_MODEL_B_GPU")) {
+                mparams_b.main_gpu = std::atoi(gpu_b);
+                fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: model_b pinned to main_gpu=%d\n", mparams_b.main_gpu);
+            }
+            model_b = llama_model_load_from_file(model_path, mparams_b);
+            if (!model_b) {
+                fprintf(stderr, "[TWO-CTX] FAIL: could not load the second model for TWOCTX_SEPARATE_MODELS\n");
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+            fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: ctx_b uses a SEPARATE llama_model (no shared tensors)\n");
+        }
+    }
+    // llama.cpp-79o5 victim-flip probe: arena_reserve()'s early return bulk-reclaims
+    // the PREVIOUS context's KV/RUNTIME zones on each new context creation ("same
+    // model, new context" -- an assumption that contexts are sequential).  If that is
+    // what selects the victim, the FIRST-created context is structurally the one that
+    // gets its blocks handed to the second, so swapping creation order must move the
+    // corruption from A to B.  If A stays the victim regardless of creation order,
+    // creation-order reclaim is not selecting the victim.
+    llama_context * ctx_a = nullptr;
+    llama_context * ctx_b = nullptr;
+    const char * b_first  = std::getenv("TWOCTX_CREATE_B_FIRST");
+    if (b_first && std::atoi(b_first) != 0) {
+        fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: creating ctx_b BEFORE ctx_a\n");
+        ctx_b = make_ctx(model_b, n_ctx_b, 32);
+        ctx_a = make_ctx(model, n_ctx_a, 32);
+    } else {
+        ctx_a = make_ctx(model, n_ctx_a, 32);
+        ctx_b = make_ctx(model_b, n_ctx_b, 32);
+    }
     if (!ctx_a || !ctx_b) {
         fprintf(stderr, "[TWO-CTX] FAIL: could not create both contexts (a=%p b=%p)\n", (void *) ctx_a, (void *) ctx_b);
         if (ctx_a) {
@@ -339,6 +383,7 @@ int main(int argc, char ** argv) {
     llama_synchronize(ctx_b);
     llama_free(ctx_a);
     llama_free(ctx_b);
+    if (model_b != model) { llama_model_free(model_b); }
     llama_model_free(model);
     llama_backend_free();
 
