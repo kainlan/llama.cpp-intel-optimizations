@@ -235,27 +235,47 @@ touch_fake_models() {
     : > "$dir/fake-gptoss.gguf"
 }
 
+# Creates a tiny, throwaway git repo -- deliberately NOT this checkout --
+# with exactly one commit, so the ROOT_DIR-clobber case below has a real
+# repository to redirect ROOT_DIR to, with its own real, DIFFERENT
+# `git rev-parse --short HEAD` to tell apart from this tree's actual HEAD.
+make_scratch_git_repo() {
+    local dir="$1"
+    mkdir -p "$dir"
+    git -C "$dir" init -q
+    git -C "$dir" config user.email "test@example.invalid"
+    git -C "$dir" config user.name "test"
+    : > "$dir/marker"
+    git -C "$dir" add marker
+    git -C "$dir" commit -q -m "scratch commit, not this checkout"
+}
+
 # A hostile, FAKE setvars.sh: exports empty/wrong values for every name this
-# script parses from argv (SELECTOR, GATE, BUILD_DIR) plus the one already-
-# proven collision (BIN_DIR), simulating the worst case an oneAPI component
-# could do. Round-2 blocker (c-u3ji): BUILD_DIR/GATE/SELECTOR are consumed
-# from argv BEFORE the source call, so "assign after sourcing" alone (which
-# is sufficient for BIN_DIR and friends) does not protect them -- they need
-# an explicit snapshot-and-restore, and this is what proves it.
-FAKE_HOSTILE_SETVARS='#!/usr/bin/env bash
+# script parses from argv (SELECTOR, GATE, BUILD_DIR) plus BIN_DIR (the
+# already-proven collision) plus ROOT_DIR (round-3 finding c-80hb: ROOT_DIR
+# is assigned before the source and consumed after it at the SHA line, so
+# it needs the same snapshot-and-restore treatment as the other three),
+# simulating the worst case an oneAPI component could do. $1 = the scratch
+# git repo dir (from make_scratch_git_repo) that a clobbered ROOT_DIR would
+# redirect the SHA computation into.
+write_hostile_setvars() {
+    local dest="$1" fake_root_dir="$2"
+    write_exec "$dest" "#!/usr/bin/env bash
 export SELECTOR=
 export GATE=
 export BUILD_DIR=/nonexistent
 export BIN_DIR=bin64
-'
+export ROOT_DIR=$fake_root_dir
+"
+}
 
 # Forcibly unsets ONEAPI_ROOT and SYCL_GATES_SKIP_ONEAPI_SOURCE (so the real
 # sourcing branch is always taken) and points SYCL_GATES_SETVARS at the
 # hostile fake above instead of the real oneAPI install.
 run_gates_fake_setvars() {
-    local dir="$1" gate="$2" selector="$3"
-    shift 3
-    write_exec "$dir/hostile-setvars.sh" "$FAKE_HOSTILE_SETVARS"
+    local dir="$1" gate="$2" selector="$3" fake_root_dir="$4"
+    shift 4
+    write_hostile_setvars "$dir/hostile-setvars.sh" "$fake_root_dir"
     env -u ONEAPI_ROOT -u SYCL_GATES_SKIP_ONEAPI_SOURCE         SYCL_GATES_BIN_DIR="$dir/bin"         SYCL_GATES_CMAKE_CACHE="$dir/CMakeCache.txt"         SYCL_GATES_LDD_CMD="$dir/ldd"         SYCL_GATES_MISTRAL_MODEL="$dir/fake-mistral.gguf"         SYCL_GATES_GPTOSS_MODEL="$dir/fake-gptoss.gguf"         SYCL_GATES_SETTLE_SECONDS=0         SYCL_GATES_SETVARS="$dir/hostile-setvars.sh"         "$GATES_SCRIPT" --build-dir "$dir/build" --gate "$gate" --selector "$selector" "$@"
 }
 
@@ -479,18 +499,29 @@ else
     echo "SKIP: (oneapi-sourcing) /opt/intel/oneapi/setvars.sh not present on this host -- B1's fix is untestable here"
 fi
 
-# --- (oneapi-clobber) a hostile setvars.sh must not move SELECTOR/GATE/BUILD_DIR
+# --- (oneapi-clobber) a hostile setvars.sh must not move SELECTOR/GATE/BUILD_DIR/ROOT_DIR
 # Round-2 blocker (c-u3ji): BUILD_DIR/GATE/SELECTOR are parsed from argv
 # BEFORE the oneAPI source runs, so "assign after sourcing" (sufficient for
 # BIN_DIR and friends) does not protect them on its own -- they need an
-# explicit snapshot-and-restore. The fake setvars here exports SELECTOR=
-# (empty), GATE= (empty), BUILD_DIR=/nonexistent, BIN_DIR=bin64. Passing
-# --selector level_zero:0 (neither the default level_zero:1 NOR the fake's
-# empty clobber) makes an unrestored SELECTOR unambiguous in the GATE line.
+# explicit snapshot-and-restore. Round-3 finding (c-80hb): ROOT_DIR has the
+# exact same shape (assigned before the source, consumed after it at the
+# SHA line) and was missed in round 2. The fake setvars here exports
+# SELECTOR= (empty), GATE= (empty), BUILD_DIR=/nonexistent, BIN_DIR=bin64,
+# and ROOT_DIR=<a scratch git repo, NOT this checkout>. Passing --selector
+# level_zero:0 (neither the default level_zero:1 NOR the fake's empty
+# clobber) makes an unrestored SELECTOR unambiguous in the GATE line; the
+# scratch repo's own distinct HEAD sha does the same for ROOT_DIR -- if
+# ROOT_DIR were left clobbered, the SHA computation would run
+# `git -C <scratch repo> rev-parse --short HEAD` and report THAT commit,
+# not this tree's.
 case_clobber_dir="$TMP/clobber"
 setup_case_dir "$case_clobber_dir"
 touch_fake_models "$case_clobber_dir"
-out="$(STUB_MISTRAL_MODE=pass run_gates_fake_setvars "$case_clobber_dir" mistral level_zero:0 2>"$TMP/clobber.err")"
+case_clobber_fake_repo="$TMP/clobber-fake-repo"
+make_scratch_git_repo "$case_clobber_fake_repo"
+real_sha="$(cd "$ROOT_DIR" && git rev-parse --short HEAD)"
+fake_sha="$(cd "$case_clobber_fake_repo" && git rev-parse --short HEAD)"
+out="$(STUB_MISTRAL_MODE=pass run_gates_fake_setvars "$case_clobber_dir" mistral level_zero:0 "$case_clobber_fake_repo" 2>"$TMP/clobber.err")"
 rc=$?
 if [ "$rc" -ne 0 ]; then
     fail "(oneapi-clobber) expected rc=0, got rc=$rc; stdout:
@@ -503,6 +534,14 @@ elif ! printf '%s
 $out
 stderr:
 $(cat "$TMP/clobber.err")"
+elif printf '%s
+' "$out" | grep -qF "sha=$fake_sha"; then
+    fail "(oneapi-clobber) GATE line reports sha=$fake_sha -- the SCRATCH repo's HEAD, not this tree's ($real_sha). ROOT_DIR was clobbered and not restored; got:
+$out"
+elif ! printf '%s
+' "$out" | grep -qF "sha=$real_sha"; then
+    fail "(oneapi-clobber) expected the GATE line to report this tree's real sha=$real_sha; got:
+$out"
 else
     echo "PASS: (oneapi-clobber) hostile setvars.sh cannot move the selector, the gate, or the binary directory"
 fi

@@ -82,20 +82,27 @@ case "$GATE" in
         ;;
 esac
 
-# BUILD_DIR/GATE/SELECTOR are the one set of this script's own variables that
-# MUST be known before we can even decide what/whether to source below (and
-# argv parsing itself must happen before sourcing, or `source FILE --force`
-# would clobber THIS script's own positional parameters). So they cannot be
-# computed strictly after sourcing the way every other derived variable
-# below is. Snapshot them into a distinctly-prefixed name (vanishingly
-# unlikely for any oneAPI component to also use) immediately after parsing,
-# then restore from the snapshot immediately after sourcing -- this makes
-# the "our assignments always win" property true for these three as well,
-# not just for the ones that happen to already be assigned after the source
-# call.
+# BUILD_DIR/GATE/SELECTOR/ROOT_DIR are EVERY variable this script assigns
+# before the source call below AND reads again after it (enumerated by
+# grepping every assignment above this point and checking each name's next
+# use): BUILD_DIR/GATE/SELECTOR come from argv, which must be parsed before
+# sourcing (`source FILE --force` would otherwise clobber THIS script's own
+# positional parameters); ROOT_DIR is derived from SCRIPT_DIR/
+# ${BASH_SOURCE[0]} and is read again at the SHA computation below.
+# SCRIPT_DIR itself is NOT in this list -- its only use is computing
+# ROOT_DIR, both above this point, so it never needs protecting. None of
+# these four can simply be recomputed after sourcing the way every other
+# derived variable below is (BIN_DIR, CACHE_FILE, ... all read
+# already-sourced env/argv state and have no earlier value to lose).
+# Snapshot each into a distinctly-prefixed name (vanishingly unlikely for
+# any oneAPI component to also use) immediately after parsing, then restore
+# from the snapshot immediately after sourcing -- this makes the "our
+# assignments always win" property true for all four, not just for the
+# ones that happen to already be assigned after the source call.
 GATES_ARG_BUILD_DIR="$BUILD_DIR"
 GATES_ARG_GATE="$GATE"
 GATES_ARG_SELECTOR="$SELECTOR"
+GATES_ARG_ROOT_DIR="$ROOT_DIR"
 
 # --- source oneAPI if it is not already active ---------------------------
 # Deliberately as early as this script's own logic allows (right after the
@@ -114,9 +121,13 @@ GATES_ARG_SELECTOR="$SELECTOR"
 # of our names -- so the general fix is ordering: source as early as
 # possible, and compute everything else after, so ours always wins
 # regardless of what the environment set. This is why BUILD_DIR/GATE/
-# SELECTOR are snapshotted above rather than simply left to be recomputed
-# after sourcing -- unlike every other variable below, they are consumed
-# by the sourcing decision itself and by argv parsing that must run before it.
+# SELECTOR/ROOT_DIR (exactly these four -- see the snapshot comment above)
+# are snapshotted above rather than simply left to be recomputed after
+# sourcing -- unlike every other variable below, they are consumed by the
+# sourcing decision itself, by argv parsing that must run before it
+# (BUILD_DIR/GATE/SELECTOR), or by a later computation with no way to
+# re-derive the pre-source value from anything computed after sourcing
+# (ROOT_DIR, used at the SHA line below).
 #
 # setvars.sh also sources compiler/latest/env/vars.sh, which reads
 # ${OCL_ICD_FILENAMES} (no ":-" default) after deliberately unsetting it a
@@ -138,12 +149,14 @@ if [ -z "${SYCL_GATES_SKIP_ONEAPI_SOURCE:-}" ] && [ -z "${ONEAPI_ROOT:-}" ] && [
 fi
 
 # Restore from the pre-source snapshot: whatever the source above did to
-# BUILD_DIR/GATE/SELECTOR (or even to the GATES_ARG_* names -- essentially
-# impossible given the distinct prefix, but the snapshot is worthless if it
-# is not what we read from here on), this is authoritative from here on.
+# BUILD_DIR/GATE/SELECTOR/ROOT_DIR (or even to the GATES_ARG_* names --
+# essentially impossible given the distinct prefix, but the snapshot is
+# worthless if it is not what we read from here on), this is authoritative
+# from here on.
 BUILD_DIR="$GATES_ARG_BUILD_DIR"
 GATE="$GATES_ARG_GATE"
 SELECTOR="$GATES_ARG_SELECTOR"
+ROOT_DIR="$GATES_ARG_ROOT_DIR"
 
 # --- resolve paths (all overridable for the CPU-only stub test) ---------
 # Assigned AFTER the oneAPI source above -- see the comment there.
