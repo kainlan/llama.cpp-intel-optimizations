@@ -549,16 +549,21 @@ Keep these cases separate:
   acquisition site, the current graph-compute entry point
   (`ggml-sycl.cpp:99095`, `std::unique_lock<std::mutex>
   global_graph_lock(g_sycl_graph_compute_mutex)`), but it does not
-  universally serialize submission. Direct/fallback paths explicitly release it
-  before compute submission, inside the `compute_impl_unlocked` lambda
-  (`ggml-sycl.cpp:99285-99286`, `if (global_graph_lock.owns_lock())
-  global_graph_lock.unlock();`). In contrast, persistent-TG, deferred-copy, and
-  command-graph record/replay paths do not take that unlock branch and submit
-  while the lock remains held — confirmed by the later
-  `GGML_ASSERT(global_graph_lock.owns_lock())` guarding the `use_sycl_graph`
-  path (`ggml-sycl.cpp:100415`), which would fire the instant any of those
-  paths released it early. Completion may still outlive the lock where a path
-  permits deferred exit.
+  universally serialize submission. `ggml-sycl.cpp:99285-99286`
+  (`if (global_graph_lock.owns_lock()) global_graph_lock.unlock();`) is the
+  ONLY unlock site in the whole function, and it lives inside the
+  `compute_impl_unlocked` lambda — direct/fallback paths that call that lambda
+  release the lock before compute submission. The persistent-TG split path
+  (`:99806`) and the single-device persistent-TG path (`:99881`) each return
+  `GGML_STATUS_SUCCESS` directly, after their own `execute_deferred_copies()`
+  calls (`:99789`, `:99848` respectively), without ever calling
+  `compute_impl_unlocked` — so those two paths hold the lock through
+  submission by construction, not by inference from the assert below.
+  Separately, the command-graph `use_sycl_graph` path is corroborated by
+  `GGML_ASSERT(global_graph_lock.owns_lock())` on entry to that block
+  (`:100415`), which would fire were the lock ever released early on that
+  specific path. Completion may still outlive the lock where a path permits
+  deferred exit.
   Thus host submission can overlap across graph-compute calls on direct/fallback
   paths, and device execution may overlap across calls and devices; pure-GPU
   decode may also return with kernels still in flight. Do not infer supported

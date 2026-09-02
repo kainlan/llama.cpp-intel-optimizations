@@ -149,7 +149,7 @@ against current HEAD, per item:
 
 4. **`ggml-sycl.cpp:41455-41457`, "resets scratch and host zones at graph
    compute boundaries"** — that citation was already stale in April:
-   `:41455` is inside `argsort_f32_i32_sycl`, unrelated to any zone reset.
+   `:41455-41457` lands on the head of `argsort_f32_i32_sycl` (`:41455` is a blank line, `:41456` is the `static void argsort_f32_i32_sycl(` signature), unrelated to any zone reset.
    The real graph-boundary sites today are
    `ggml_sycl::unified_cache_arena_reset(d)` (`ggml-sycl.cpp:86003`, inside
    `ggml_sycl_graph_boundary_reset_arenas`, which itself calls
