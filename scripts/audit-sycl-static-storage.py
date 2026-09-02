@@ -656,7 +656,13 @@ def is_preprocessor_condition_recovery(source_b: bytes, gap):
 
 
 def is_defaulted_const_reference_recovery(source_b: bytes, gap):
-    """Recognize grammar ABI 15's missing type in `const T & value = {}` only."""
+    """Recognize grammar ABI 15's missing type in `const T & value = {}` only.
+
+    Fires for both free/namespace-scope function declarations and class
+    member prototypes (`field_declaration`) -- the ERROR shape ABI 15
+    produces for this default-value form is identical in either container;
+    only the enclosing declaration node's kind differs.
+    """
     if kind(gap) != "type_identifier" or not is_missing(gap) or start_byte(gap) != end_byte(gap):
         return False
     literal = parent(gap)
@@ -691,7 +697,10 @@ def is_defaulted_const_reference_recovery(source_b: bytes, gap):
     return (
         parameter_list is not None and kind(parameter_list) == "parameter_list"
         and function is not None and kind(function) == "function_declarator"
-        and any(kind(item) in {"declaration", "function_definition"} for item in ancestors(function))
+        and any(
+            kind(item) in {"declaration", "field_declaration", "function_definition"}
+            for item in ancestors(function)
+        )
     )
 
 
@@ -1063,13 +1072,19 @@ void lifecycle_stage_placement_plan(unsigned long long load_txn_id,
 void lifecycle_stage_no_placement_plan(unsigned long long load_txn_id,
                                        const placement_kv_info & kv_info = {},
                                        unsigned model_n_layer = 0);
+struct field_owner {
+    // Class member prototype form (field_declaration, not declaration):
+    // llama.cpp-qqs2 -- unified-cache.hpp:2129 is exactly this shape.
+    void direct_stage_field(const placement_kv_info & kv_info = {},
+                            unsigned model_n_layer = 0);
+};
 """
     _, defaulted_rows, defaulted_gaps, defaulted_categories, defaulted_failures = parse_source(
         parser, defaulted_reference_source
     )
     assert not defaulted_rows and not defaulted_failures
-    assert len(defaulted_gaps) == 2
-    assert defaulted_categories == Counter({"defaulted-const-reference-parameter": 2})
+    assert len(defaulted_gaps) == 3
+    assert defaulted_categories == Counter({"defaulted-const-reference-parameter": 3})
 
     same_rows = by_name["same"]
     lines = source.splitlines()
@@ -1104,6 +1119,12 @@ void lifecycle_stage_no_placement_plan(unsigned long long load_txn_id,
         "defaulted-const-pointer": "struct T {}; void f(const T * value = {});",
         "defaulted-const-rvalue-reference": "struct T {}; void f(const T && value = {});",
         "defaulted-const-reference-nonempty": "struct T { T(int); }; void f(const T & value = {1});",
+        # llama.cpp-qqs2: the class-member (field_declaration) form of the
+        # recovery pattern must still fail closed when the default value is
+        # non-empty -- proves the fix is scoped to `= {}`, not to any
+        # defaulted reference parameter inside a class body.
+        "defaulted-const-reference-class-member-nonempty":
+            "struct T { T(int); }; struct H { void f(const T & value = {1}); };",
     }
     alias_failures = {
         "function-alias-array", "unproved-function-alias", "unknown-qualified-alias", "alias-template",
