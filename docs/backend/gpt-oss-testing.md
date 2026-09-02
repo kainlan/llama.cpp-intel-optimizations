@@ -5,6 +5,23 @@ GPT-OSS correctness gate. The operational rule and the canonical gate command
 live in `CLAUDE.md` ("Verification Commands & Correctness Gates"); this file is
 the "why" behind it.
 
+## Automated runner (llama.cpp-rou3)
+
+The Mistral completion gate and this GPT-OSS chat gate are both executable
+from `scripts/sycl-canonical-gates.sh` (`--gate mistral|gptoss|all`), ctest-
+registered as `sycl-canonical-gates` (`LABELS "gpu;model-loading"`, excluded
+from the default safe sweep -- see the label note on that registration in
+`tests/CMakeLists.txt`). It fails closed on a missing binary or a build that
+is not actually SYCL-linked, SKIPs (rc 77) when no SYCL device is enumerated
+or a model file is missing, and never runs a model-loading binary more than
+once per invocation. Its own logic (preconditions, the no-device probe, the
+digit-regex pass/fail checks) is covered without a GPU by
+`tests/test-sycl-canonical-gates-script.sh`, registered as
+`sycl-canonical-gates-script`. Command line construction for the GPT-OSS gate
+inside the script follows the post-b10630 form (no `-cnv`, `-c 4096` pinned)
+described below, not the older `-cnv` form still shown in this file's
+"Canonical B50 GPT-OSS correctness gate" section.
+
 ## The rule
 
 Use `llama-cli -cnv` so the CLI applies the model's embedded GGUF/Jinja chat

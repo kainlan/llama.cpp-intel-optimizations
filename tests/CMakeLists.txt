@@ -909,6 +909,68 @@ if (NOT WIN32)
     )
 endif()
 
+# sycl-canonical-gates (llama.cpp-rou3): the two prose gates in CLAUDE.md
+# ("Verification Commands & Correctness Gates" -- the Mistral completion gate
+# and the GPT-OSS chat gate) as ONE executable, ctest-registered runner. Not
+# guarded by `if (GGML_SYCL)`: the whole point of the script's own
+# CMakeCache/ldd precondition check is to catch a build where GGML_SYCL was
+# silently reset OFF (CLAUDE.md: this happened 2026-07-25 and the Mistral
+# gate still passed, on the CPU fallback, at ~8.38 tok/s instead of ~108). If
+# registration itself were gated on the CMake-configure-time GGML_SYCL
+# variable, that exact scenario would make this test vanish from `ctest -N`
+# instead of failing loudly -- so it is registered unconditionally (mirroring
+# the test-sycl-*-policy.sh family above) and fails closed (rc=1) at runtime
+# instead.
+#
+# LABELS "gpu;model-loading": this test loads two real models on a real GPU
+# (llama-completion, llama-cli), which the never-loop / GPU-serialization
+# rules in CLAUDE.md forbid running unpinned, in a subagent, or concurrently
+# with any other GPU-allocating test. Neither "gpu" nor "model-loading" is in
+# CLAUDE.md's documented safe-sweep denylist (`-LE
+# 'residency|mem-handle|cache'`) as written today -- that denylist must grow
+# a `|gpu` term before any documented "safe" sweep can be trusted not to
+# schedule this test (flagged on the tracking epic, llama.cpp-97yn).
+# RESOURCE_LOCK gpu-ttm-memory: llama.cpp-ezfm's fail-closed GPU/TTM
+# serialization policy had not landed a shared resource-lock name as of this
+# commit; adopt ezfm's wrapper here once it exists instead of this literal.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/sycl-canonical-gates.sh
+             --build-dir ${CMAKE_BINARY_DIR} --gate all --selector level_zero:1
+    )
+    set_tests_properties(sycl-canonical-gates PROPERTIES
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK gpu-ttm-memory
+        ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1
+        TIMEOUT 1800
+        LABELS "gpu;model-loading"
+    )
+endif()
+
+# sycl-canonical-gates-script: the stub-driven unit test of the gate script's
+# OWN logic (tests/test-sycl-canonical-gates-script.sh) -- fail-closed
+# preconditions, the no-device probe, and both pass/fail digit checks, all
+# against fake llama-completion/llama-cli executables. CPU-only, no GPU
+# label: this is what stops the gate script itself from being decorative,
+# and it must run in every sweep that the real gpu-labelled test above is
+# excluded from.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-gates-script.sh
+    )
+    set_tests_properties(sycl-canonical-gates-script PROPERTIES
+        LABELS "sycl;policy"
+        TIMEOUT 120
+    )
+endif()
+
 if (NOT WIN32)
     # Python source-assertion test for the decode-timeline profiling pipeline.
     # Registered because tasks that modify sycl-gptoss-decode-timeline-profile.sh
