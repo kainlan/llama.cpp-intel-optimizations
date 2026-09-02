@@ -492,7 +492,7 @@ Owned per inference context; reset between requests or at context free:
 | KV cache buffers | `vram_zone_id::KV` | Context free or `llama_kv_cache_clear` |
 | KV host fallback buffers | Host zone / `kv_host_bytes` | Context free |
 | RUNTIME compute buffers | `vram_zone_id::RUNTIME` | `arena_reserve` at graph compute boundary |
-| SCRATCH per-token buffers | `vram_zone_id::SCRATCH` | Each graph compute step (`ggml-sycl.cpp:41455`) |
+| SCRATCH per-token buffers | `vram_zone_id::SCRATCH` | Each graph compute step (`ggml-sycl.cpp:86003`) |
 | oneDNN scratch | `vram_zone_id::ONEDNN` | Acquired/released per graph compute |
 | `g_layer_on_cpu` | `ggml-sycl.cpp:6201` | Recomputed at each graph build |
 | MoE routing buffers | RUNTIME zone | Per-inference reset |
@@ -550,11 +550,15 @@ Keep these cases separate:
   (`ggml-sycl.cpp:99095`, `std::unique_lock<std::mutex>
   global_graph_lock(g_sycl_graph_compute_mutex)`), but it does not
   universally serialize submission. Direct/fallback paths explicitly release it
-  before `compute_impl` submission (`ggml-sycl.cpp:91627-91630`). In contrast,
-  persistent-TG and deferred-copy paths submit while it remains held
-  (`ggml-sycl.cpp:91978`, `92084`, `92101`, `92159`), as do command-graph
-  record/replay paths (`ggml-sycl.cpp:92700`, `93161`, `93188`, `93298`).
-  Completion may still outlive the lock where a path permits deferred exit.
+  before compute submission, inside the `compute_impl_unlocked` lambda
+  (`ggml-sycl.cpp:99285-99286`, `if (global_graph_lock.owns_lock())
+  global_graph_lock.unlock();`). In contrast, persistent-TG, deferred-copy, and
+  command-graph record/replay paths do not take that unlock branch and submit
+  while the lock remains held — confirmed by the later
+  `GGML_ASSERT(global_graph_lock.owns_lock())` guarding the `use_sycl_graph`
+  path (`ggml-sycl.cpp:100415`), which would fire the instant any of those
+  paths released it early. Completion may still outlive the lock where a path
+  permits deferred exit.
   Thus host submission can overlap across graph-compute calls on direct/fallback
   paths, and device execution may overlap across calls and devices; pure-GPU
   decode may also return with kernels still in flight. Do not infer supported
