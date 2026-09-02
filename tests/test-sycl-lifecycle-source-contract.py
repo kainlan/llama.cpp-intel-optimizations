@@ -362,9 +362,15 @@ def _moe_hybrid_init_once_body(source):
 def nodelete_moe_state_reset_ok(source, wrapper_source):
     """NODELETE-on-reset contract for the two module/model-bound MoE registries.
 
+    (ggml-sycl.cpp line numbers below are as of fed0b58e2 -- re-verify with
+    `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n <symbol>` if they drift;
+    the function/symbol names, not the numbers, are what this predicate
+    itself depends on.)
+
     What this proves: ggml_sycl_reset_moe_module_state() (called once, from
-    module shutdown, immediately before shutdown_unified_cache()) still (a)
-    calls install_fresh() -- the routine whose own comment documents that
+    module shutdown, immediately before shutdown_unified_cache() -- an exact
+    two-line adjacency match, not merely earlier-in-file) still (a) calls
+    install_fresh() -- the routine whose own comment documents that
     g_moe_expert_meta/g_expert_groups are "value-only and intentionally
     survive teardown" rather than being cleared in place -- and (b) the
     registries are still republished, not permanently stale, via the
@@ -390,7 +396,7 @@ def nodelete_moe_state_reset_ok(source, wrapper_source):
     moe_hybrid_init_once() returns without publishing (the dense-model early
     return at ggml-sycl.cpp:7671-7674, or the std::bad_alloc catch at
     ggml-sycl.cpp:7817-7819) -- a real gap in the production trust
-    derivation, tracked separately and NOT fixed by this test change.
+    derivation, tracked as llama.cpp-maet and NOT fixed by this test change.
     """
     reset_body = _reset_moe_module_state_body(source)
     init_once_body = _moe_hybrid_init_once_body(source)
