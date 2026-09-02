@@ -14,34 +14,100 @@
 // The fix resolves the owner from the tensor's own extra->model_id FIRST --
 // the same order ggml_sycl_get_tensor_usage() already used -- and only
 // falls back to the published-plan snapshot when extra->model_id is 0 (no
-// owner known). See the comment beginning "Resolve the owner from the
-// tensor's own extra where it has one" directly above the fix.
+// owner known):
 //
-// This test drives the real lifecycle load-transaction API
+//     ggml/src/ggml-sycl/ggml-sycl.cpp:13975-13976
+//         const uint64_t extra_model_id = extra ? extra->model_id : 0;
+//         const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
+//
+// -----------------------------------------------------------------------
+// Why this test is genuinely device-free (CLAUDE.md "GPU/model-loading work
+// is SERIALISED THROUGH THE LEAD SESSION" -- a hostonly-labelled test must
+// never enumerate a SYCL device).
+//
+// The obvious way to drive this code is the public model-load lifecycle API
 // (ggml_backend_sycl_model_load_begin/model_load_end,
-// ggml_backend_sycl_register_weight_identity) so each synthetic model gets
-// a genuine, LIVE ggml_sycl_model_token from the registry -- not an
-// arbitrary caller-chosen id -- then builds standalone tensors whose
-// extra->model_id names their own model, independent of which model's plan
-// is currently PUBLISHED (ggml_backend_sycl_activate_model_plan). Both
-// tensors must resolve their own registered file identity in every
-// published-plan configuration; neither may resolve the other's identity or
-// silently drop to a UUID.
+// ggml_backend_sycl_activate_model_plan, ggml_backend_sycl_model_unloaded_token).
+// All four call ggml_sycl_info() -- device enumeration, which GGML_ABORTs
+// with no devices present (dpct/helper.hpp ~:1186) -- somewhere in their
+// call graph:
+//   - ggml_backend_sycl_model_load_begin -> ggml_sycl_model_loading_effects(true, outer=true)
+//     -> ggml_sycl_info().total_gpu_count and get_unified_cache_for_device() per device.
+//   - ggml_backend_sycl_model_load_end -> ggml_sycl_model_loading_effects(false, outer=true)
+//     -> ggml_sycl_info().total_gpu_count to reserve a 512 MB compute arena per device
+//     -> ggml_sycl_prepare_plan_publication_locked()/publish, which touches per-device caches.
+//   - ggml_backend_sycl_activate_model_plan -> the same publish path.
+//   - ggml_backend_sycl_model_unloaded_token -> ggml_sycl_teardown_owner_effects()
+//     -> `for (int device = 0; device < ggml_sycl_info().device_count; ++device)`.
+// None of those four functions is called anywhere below.
 //
-// Mutation control (see the task report for the exact diffs and captured
-// output): reverting the owner resolution to consult the published plan
-// FIRST -- either by swapping ggml_sycl_exact_wrapper_owner(extra_model_id)
-// for ggml_sycl_exact_wrapper_owner(0) unconditionally, or by deleting the
-// `if (!name.empty() ...)` block's extra->model_id read so owner resolution
-// always starts from 0 -- makes round 1's model-A checks fail (B is
-// published after B's commit) while round 2's model-B checks fail (A is
-// published after the explicit reactivation). The round that currently
-// holds the published plan keeps passing either way, which is exactly the
-// asymmetry the bug produced: whichever model is NOT published loses its
-// identity.
+// Instead this test drives two lower layers directly, both confirmed
+// device-free by inspection:
+//   1. ggml_sycl::lifecycle::Registry (ggml-sycl/model-lifecycle.hpp,
+//      implemented in model-lifecycle.cpp) is the SAME process-wide
+//      singleton ggml-sycl.cpp itself uses via
+//      ggml_sycl::lifecycle::global_registry() -- model-lifecycle.cpp is one
+//      of the .cpp files globbed into the ggml-sycl target this binary
+//      links, and it contains zero `sycl::`/`dpct::` references anywhere in
+//      the file (grep confirms). begin_outer()/bind_candidate()/end()/
+//      unbind_candidate()/teardown() are plain mutex+map bookkeeping. This
+//      is the exact same Registry class test-sycl-lifecycle-load-txn.cpp
+//      drives standalone, linked with nothing but ggml-base.
+//   2. ggml_backend_sycl_register_weight_identity() and
+//      ggml_backend_sycl_get_weight_cache_key() (ggml-sycl.cpp) -- read in
+//      full for this test: the only calls either function makes are mutex-
+//      guarded std::unordered_map lookups (g_sycl_weight_identities_by_name,
+//      g_sycl_weight_identities_unowned, g_sycl_gguf_file_ids),
+//      registry.acquire_load_effect()/bound_candidate() (layer 1, above),
+//      ggml_sycl::dispatch_tuning::ensure_model_loaded() (env-var gated
+//      local-file read, no device access -- dispatch-tuning.cpp:356), and
+//      sycl_module_mutation_guard (a plain mutex/counter, ggml-sycl.cpp
+//      ~11810). get_weight_cache_key()'s one branch that WOULD touch a
+//      device (ggml_backend_sycl_reg()/ggml_backend_reg_dev_get(), guarded
+//      by `!extra && tensor->buffer && ...`) is never reached here because
+//      every tensor queried below always has tensor->extra set before the
+//      query.
+//
+// Bypassing the four lifecycle-API entry points means no placement plan is
+// ever staged or published (g_placement_publication stays null for the
+// whole process) and no compute arena is reserved -- this test proves only
+// the owner-resolution order inside ggml_backend_sycl_get_weight_cache_key(),
+// which is exactly what llama.cpp-s83n is about. Registry::end() alone is
+// sufficient to make a model LIVE in the Registry's own bookkeeping
+// (registry.find(model_id)), which is everything ggml_sycl_exact_wrapper_owner()
+// consults for a nonzero model id.
+//
+// Mutation control: temporarily change ggml-sycl.cpp:13976 from
+//     const auto owner = ggml_sycl_exact_wrapper_owner(extra_model_id);
+// to
+//     const auto owner = ggml_sycl_exact_wrapper_owner(0);
+// which always takes the model_id==0 "published plan" branch
+// (ggml_sycl_identity_owner(ggml_sycl_identity_plan_snapshot())). Since this
+// test never publishes any plan, that branch resolves to a zeroed
+// ModelToken for every query, which falls through to the (empty)
+// g_sycl_weight_identities_unowned map:
+//   - Round 1 (shared tensor name registered separately by A and B): BOTH
+//     key_a.has_gguf and key_b.has_gguf go false, and both file_offs checks
+//     (0x1000, 0x2000) fail -- neither model resolves anything under the
+//     mutation, which is the "whichever is not the fallback owner loses its
+//     identity" failure this test exists to catch, just simultaneously
+//     instead of alternating (there is no "published" round to alternate
+//     without going through the device-touching publish path -- see above).
+//   - Round 2's first query (model C's tensor queried under B, which never
+//     registered it) stays has_gguf=false either way -- it is a coverage
+//     check for the false branch, not a regression discriminator, and is
+//     not expected to flip.
+//   - Round 2's second query (model C's tensor queried under its real owner,
+//     model A) DOES flip: has_gguf goes false and file_offs goes to 0 under
+//     the mutation, since the mutated owner is zero rather than A's real
+//     token.
+// This test's file_offs/has_gguf checks in round 1 and round 2's second
+// query are therefore genuinely RED under the mutation; see the task
+// comment log for the captured before/after output of this control.
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
+#include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml.h"
 
 #include <cstdio>
@@ -76,13 +142,17 @@ static void print_cache_id(const char * label, const ggml_sycl_cache_id & id) {
 
 int main() {
     // Never enumerate the iGPU by accident (CLAUDE.md, llama.cpp-403s) -- this
-    // test never touches a device at all, but stay consistent with every
-    // other test in this family that links ggml-sycl.
+    // test is device-free by construction (see the header), but stay
+    // consistent with every other test in this family that links ggml-sycl.
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0,1", 1);
     }
 
+    using ggml_sycl::lifecycle::error;
+    using ggml_sycl::lifecycle::ModelToken;
+
     const char * shared_name = "zzz_s83n_shared.weight";
+    const char * only_a_name = "zzz_s83n_only_a.weight";
 
     ggml_init_params params{};
     params.mem_size    = 4 * 1024 * 1024;
@@ -93,83 +163,111 @@ int main() {
 
     ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
     ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
-    check(tensor_a != nullptr && tensor_b != nullptr, "tensor allocation failed");
+    ggml_tensor * tensor_c = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256, 64);
+    check(tensor_a != nullptr && tensor_b != nullptr && tensor_c != nullptr, "tensor allocation failed");
     ggml_set_name(tensor_a, shared_name);
     ggml_set_name(tensor_b, shared_name);
+    ggml_set_name(tensor_c, only_a_name);
 
-    // ---- Model A: register its own identity for the shared tensor name ---
-    ggml_sycl_load_txn    load_a{};
-    ggml_sycl_model_token model_a{};
-    check(ggml_backend_sycl_model_load_begin(&load_a) == GGML_SYCL_LIFECYCLE_OK, "model A lifecycle begin");
+    ggml_sycl::lifecycle::Registry & registry = ggml_sycl::lifecycle::global_registry();
+
+    // ---- Model A: a real, committed Registry model, minted and driven
+    // entirely through the Registry -- no lifecycle-API device work. Model A
+    // registers its own identity for the shared tensor name plus a name
+    // model B will never touch.
+    const auto begin_a = registry.begin_outer();
+    check(begin_a.code == error::OK, "model A begin_outer");
+    registry.bind_candidate(begin_a.txn);
     // model_id=0: adopt the load transaction's own token (see the API
     // comment on ggml_backend_sycl_register_weight_identity).
     ggml_backend_sycl_register_weight_identity(tensor_a, /*file_idx=*/0, /*file_offs=*/0x1000, ggml_nbytes(tensor_a),
                                                /*model_id=*/0);
-    check(ggml_backend_sycl_model_load_end(load_a, true, &model_a) == GGML_SYCL_LIFECYCLE_OK,
-          "model A lifecycle commit");
-    check(model_a.model_id != 0, "model A got a real, nonzero model id");
+    ggml_backend_sycl_register_weight_identity(tensor_c, /*file_idx=*/0, /*file_offs=*/0x3000, ggml_nbytes(tensor_c),
+                                               /*model_id=*/0);
+    const auto end_a = registry.end(begin_a.txn, /*success=*/true);
+    check(end_a.code == error::OK && end_a.committed, "model A commit");
+    registry.unbind_candidate(begin_a.txn);
+    const ModelToken token_a = end_a.token;
+    check(token_a.model.value != 0, "model A got a real, nonzero model id");
 
-    // ---- Model B: a second, unrelated model over the SAME tensor name ----
-    ggml_sycl_load_txn    load_b{};
-    ggml_sycl_model_token model_b{};
-    check(ggml_backend_sycl_model_load_begin(&load_b) == GGML_SYCL_LIFECYCLE_OK, "model B lifecycle begin");
+    // ---- Model B: a second, unrelated model over the SAME shared tensor
+    // name. It never registers only_a_name.
+    const auto begin_b = registry.begin_outer();
+    check(begin_b.code == error::OK, "model B begin_outer");
+    registry.bind_candidate(begin_b.txn);
     ggml_backend_sycl_register_weight_identity(tensor_b, /*file_idx=*/0, /*file_offs=*/0x2000, ggml_nbytes(tensor_b),
                                                /*model_id=*/0);
-    check(ggml_backend_sycl_model_load_end(load_b, true, &model_b) == GGML_SYCL_LIFECYCLE_OK,
-          "model B lifecycle commit");
-    check(model_b.model_id != 0 && model_b.model_id != model_a.model_id,
+    const auto end_b = registry.end(begin_b.txn, /*success=*/true);
+    check(end_b.code == error::OK && end_b.committed, "model B commit");
+    registry.unbind_candidate(begin_b.txn);
+    const ModelToken token_b = end_b.token;
+    check(token_b.model.value != 0 && token_b.model.value != token_a.model.value,
           "model B got a real, nonzero, distinct model id");
 
     // Point each tensor's extra at its own model -- this is the field
     // ggml_backend_sycl_get_weight_cache_key() must consult first.
     ggml_tensor_extra_gpu extra_a{};
-    extra_a.model_id = model_a.model_id;
+    extra_a.model_id = token_a.model.value;
     tensor_a->extra  = &extra_a;
 
     ggml_tensor_extra_gpu extra_b{};
-    extra_b.model_id = model_b.model_id;
+    extra_b.model_id = token_b.model.value;
     tensor_b->extra  = &extra_b;
 
-    // ---- Round 1: model B's load just committed, so B -- not A -- is the
-    // currently published/active plan. This is the exact configuration the
-    // bug requires: querying A's tensor while B is published.
+    // ---- Round 1: shared tensor name, registered separately by A and B.
+    // Neither model was ever "published" (no plan is ever staged or
+    // published in this test -- see the header), so this round exercises
+    // the exact-owner path for both queries and is the discriminating
+    // file_offs case: under the fix each tensor resolves its own identity
+    // regardless of the other model's existence.
     {
         ggml_sycl_cache_id key_a = ggml_backend_sycl_get_weight_cache_key(tensor_a, 0);
         ggml_sycl_cache_id key_b = ggml_backend_sycl_get_weight_cache_key(tensor_b, 0);
-        print_cache_id("round 1, model A (not published)", key_a);
-        print_cache_id("round 1, model B (published)", key_b);
+        print_cache_id("round 1, model A", key_a);
+        print_cache_id("round 1, model B", key_b);
+        // id.valid is set unconditionally for any non-null tensor
+        // (ggml-sycl.cpp:14011) -- it cannot go false here, so it is printed
+        // above for context but not asserted as a counted check.
 
-        check(key_a.valid, "round 1: model A key is valid");
         check(key_a.has_gguf, "round 1: model A resolves its own GGUF identity, not the UUID fallback");
         check(key_a.file_offs == 0x1000, "round 1: model A resolves its OWN file_offs, not B's or a UUID");
 
-        check(key_b.valid, "round 1: model B key is valid");
         check(key_b.has_gguf, "round 1: model B resolves its own GGUF identity");
         check(key_b.file_offs == 0x2000, "round 1: model B resolves its OWN file_offs");
 
         check(key_a.file_offs != key_b.file_offs, "round 1: the two models' identities are not conflated");
     }
 
-    // ---- Round 2: explicitly (re)activate A, then re-query both. If the
-    // lookup depended on which plan is currently published, this would flip
-    // the answers; it must not, because extra->model_id already names the
-    // exact owner. B is NOT published in this round, so B's checks here are
-    // the mirror image of A's checks in round 1.
-    check(ggml_backend_sycl_activate_model_plan(model_a) == GGML_SYCL_LIFECYCLE_OK, "reactivate exact model A");
+    // ---- Round 2: only_a_name was registered ONLY by model A. Querying it
+    // under model B's owner must reach the genuine has_gguf==false branch
+    // (not just "always true because both sides registered the same name",
+    // which round 1 alone cannot rule out). Querying it under model A's own
+    // owner afterwards must resolve correctly.
     {
-        ggml_sycl_cache_id key_a = ggml_backend_sycl_get_weight_cache_key(tensor_a, 0);
-        ggml_sycl_cache_id key_b = ggml_backend_sycl_get_weight_cache_key(tensor_b, 0);
-        print_cache_id("round 2, model A (published)", key_a);
-        print_cache_id("round 2, model B (not published)", key_b);
+        ggml_tensor_extra_gpu extra_c_as_b{};
+        extra_c_as_b.model_id                = token_b.model.value;
+        tensor_c->extra                      = &extra_c_as_b;
+        ggml_sycl_cache_id key_c_wrong_owner = ggml_backend_sycl_get_weight_cache_key(tensor_c, 0);
+        print_cache_id("round 2, only_a_name queried under model B (never registered it)", key_c_wrong_owner);
+        check(!key_c_wrong_owner.has_gguf,
+              "round 2: model B never registered only_a_name -- has_gguf is reachable-false");
 
-        check(key_a.has_gguf && key_a.file_offs == 0x1000,
-              "round 2: model A still resolves its own identity with A published");
-        check(key_b.has_gguf, "round 2: model B (not published) still resolves its own GGUF identity");
-        check(key_b.file_offs == 0x2000, "round 2: model B (not published) resolves its OWN file_offs, not a UUID");
+        ggml_tensor_extra_gpu extra_c_as_a{};
+        extra_c_as_a.model_id                = token_a.model.value;
+        tensor_c->extra                      = &extra_c_as_a;
+        ggml_sycl_cache_id key_c_right_owner = ggml_backend_sycl_get_weight_cache_key(tensor_c, 0);
+        print_cache_id("round 2, only_a_name queried under model A (its real owner)", key_c_right_owner);
+        check(key_c_right_owner.has_gguf, "round 2: model A resolves the identity it actually registered");
+        check(key_c_right_owner.file_offs == 0x3000, "round 2: model A resolves its OWN file_offs for only_a_name");
     }
 
-    (void) ggml_backend_sycl_model_unloaded_token(model_b);
-    (void) ggml_backend_sycl_model_unloaded_token(model_a);
+    // Registry hygiene: both synthetic models must tear down cleanly through
+    // the Registry itself (no lifecycle-API/device work -- see the header).
+    const error teardown_a = registry.teardown(token_a);
+    check(teardown_a == error::OK, "model A registry teardown succeeded");
+    const error teardown_b = registry.teardown(token_b);
+    check(teardown_b == error::OK, "model B registry teardown succeeded");
+
     ggml_free(ctx);
 
     printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
