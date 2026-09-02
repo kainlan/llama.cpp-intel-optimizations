@@ -1179,11 +1179,21 @@ namespace dpct
                 }
             }
 
-            // Fatal error: no SYCL devices available on any platform
+            // No SYCL devices available on any platform. This is NOT fatal here:
+            // dev_mgr construction backs backend *registration* (e.g.
+            // ggml_backend_reg_by_name("SYCL") / ggml_sycl_info()), and a
+            // discovery query must be able to report "zero devices" without
+            // aborting the process (llama.cpp-1lrh). Leave _devs empty and
+            // return; every accessor below (current_device(), get_device(),
+            // cpu_device(), select_device()) already throws std::runtime_error
+            // via check_id()/the _cpu_device==-1 check when asked for a device
+            // that does not exist, so a genuine attempt to USE a device still
+            // fails loudly -- it just does so as an exception at the point of
+            // use, not as an abort during discovery.
             if (!default_device.has_value()) {
-                fprintf(stderr, "SYCL device manager initialization failed: no devices found on any platform.\n");
+                fprintf(stderr, "SYCL device manager initialization: no devices found on any platform.\n");
                 fprintf(stderr, "Check ONEAPI_DEVICE_SELECTOR environment variable and available SYCL runtimes.\n");
-                GGML_ABORT("No SYCL devices available");
+                return;
             }
 
             _devs.push_back(std::make_shared<device_ext>(*default_device));

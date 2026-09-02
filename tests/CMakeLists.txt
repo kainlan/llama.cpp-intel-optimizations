@@ -2492,3 +2492,23 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Regression gate for llama.cpp-1lrh: a SYCL backend *registration* query
+# (ggml_backend_reg_by_name("SYCL")) must report zero devices rather than
+# abort the process when platform enumeration finds none. Forces the
+# zero-device condition on every host via ONEAPI_DEVICE_SELECTOR=level_zero:99
+# (an out-of-range device index -- verified empirically to resolve to "zero
+# devices enumerated", not a selector parse error) so the property is
+# exercised unconditionally rather than only on device-less runners. See
+# test-sycl-registration-no-device.cpp for the full rationale.
+if (GGML_SYCL)
+    llama_build(test-sycl-registration-no-device.cpp)
+    target_link_libraries(test-sycl-registration-no-device PRIVATE ggml-sycl)
+    llama_test(test-sycl-registration-no-device LABEL "main")
+    set_tests_properties(test-sycl-registration-no-device PROPERTIES
+        LABELS "sycl;env"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:99"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
