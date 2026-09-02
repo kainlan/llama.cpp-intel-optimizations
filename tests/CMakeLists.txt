@@ -2453,3 +2453,18 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# llama.cpp-qq19: divergence guard for the single owner-resolution authority
+# ggml_sycl_resolve_tensor_owner() -- asserts the "resolve owner from tensor
+# extra->model_id via registry, else fall back to the identity plan" block
+# exists exactly once and every former inline site (and any future one) calls
+# it rather than copying it. Host-only -- reads ggml-sycl.cpp as text, builds
+# nothing, touches no device. Mirrors test-sycl-device-uuid-source's
+# llama_test_pytest registration shape.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-resolve-tensor-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-resolve-tensor-owner-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
