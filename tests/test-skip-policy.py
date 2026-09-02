@@ -151,7 +151,7 @@ ALLOWED_NON_EXIT_77 = (
 _RAW_STRING_START_RE = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n]{0,16})\(')
 
 
-def _strip_comments(text: str, _return_spans: bool = False):
+def _strip_comments(text: str, _disable_raw_strings: bool = False) -> str:
     """Blank out // and /* */ comments, character-for-character in place.
 
     Every character that is not part of a comment keeps its original
@@ -186,45 +186,65 @@ def _strip_comments(text: str, _return_spans: bool = False):
     literal -- is allowed to span real newlines, matching what raw strings
     are for.
 
-    With `_return_spans=True`, also returns the list of (start, end) offsets
-    into `text` that this scan itself classified as "inside a literal"
-    (string, char, or raw string), so a caller can tell a `//`/`/*` that
-    legitimately survives inside a preserved literal apart from one that
-    survived because the scanner desynchronised -- see
-    test_strip_comments_marks_every_surviving_slash_as_inside_a_literal.
+    `_disable_raw_strings=True` turns the raw-string branch off (falling
+    back to the pre-round-3 behaviour, which desyncs on an embedded `"`).
+    It exists ONLY so a test can construct a deliberately-broken scanner
+    without duplicating this function -- see
+    test_the_cross_check_actually_fires, the RED control for
+    test_strip_comments_agrees_with_an_independent_implementation. It must
+    never be passed True anywhere outside a test.
     """
     out = list(text)
     i = 0
     n = len(text)
-    literal_spans = []
     while i < n:
-        raw_match = _RAW_STRING_START_RE.match(text, i)
+        raw_match = None if _disable_raw_strings else _RAW_STRING_START_RE.match(text, i)
         if raw_match:
             delim = raw_match.group(1)
             terminator = ")" + delim + '"'
             body_start = raw_match.end()
             end = text.find(terminator, body_start)
             end = end + len(terminator) if end != -1 else n
-            literal_spans.append((raw_match.start(), end))
             i = end
             continue
         c = text[i]
-        if c == '"' or c == "'":
-            start = i
-            quote = c
+        if c == '"':
             j = i + 1
             while j < n:
                 if text[j] == "\\" and j + 1 < n:
                     j += 2
                     continue
-                if text[j] == quote:
+                if text[j] == '"':
                     j += 1
                     break
                 if text[j] == "\n":
                     break  # unterminated literal on this line; stop here
                 j += 1
-            literal_spans.append((start, j))
             i = j
+            continue
+        if c == "'":
+            # A C++ character literal holds exactly one character or one
+            # backslash-escape unit -- unlike a string literal's arbitrary
+            # length. C++14 digit separators (`2'000'000'000`) are bare `'`
+            # marks between digits, NOT character literals, and a scanner
+            # that treats any `'...'` span as a literal (matching whatever
+            # `'` comes next, however far away) desyncs on them: an odd
+            # digit-separator `'` gets swallowed as an "unterminated
+            # literal" through end of line, hiding a real trailing `//`
+            # comment -- observed at tests/test-rset-release.cpp:37,
+            # `2'000'000'000); // 2GB` (found by this fix's own whole-tree
+            # cross-check against _independent_strip_comments, whose `chr`
+            # pattern is equally strict). So: only the closing `'`
+            # IMMEDIATELY after one plain character or one `\\<char>`
+            # escape counts as a char literal; anything else means this `'`
+            # is not a literal opener at all -- leave it as ordinary code.
+            if i + 3 < n and text[i + 1] == "\\" and text[i + 3] == "'":
+                i += 4
+                continue
+            if i + 2 < n and text[i + 1] != "\\" and text[i + 2] == "'":
+                i += 3
+                continue
+            i += 1
             continue
         if c == "/" and i + 1 < n and text[i + 1] == "/":
             j = i
@@ -242,10 +262,50 @@ def _strip_comments(text: str, _return_spans: bool = False):
             i = end
             continue
         i += 1
-    stripped = "".join(out)
-    if _return_spans:
-        return stripped, literal_spans
-    return stripped
+    return "".join(out)
+
+
+# A second, INDEPENDENTLY-implemented stripper with the same contract as
+# _strip_comments (llama.cpp-g290 round 4 spec review, finding 1): a single
+# alternation regex, not a hand-written char-by-char state machine, matching
+# -- in priority order at each position -- a raw string literal (via a named
+# backreference to its own delimiter, so an arbitrary delimiter's contents
+# never need escaping), a plain "..." literal (escape-aware, no embedded
+# unescaped quote or bare newline), a plain '...' literal (exactly one plain
+# character or one backslash-escape unit between the quotes -- NOT the
+# arbitrary-length `*` a string literal allows, because a C++ character
+# literal really is exactly one character, and treating it as arbitrary-
+# length is what let _strip_comments desync on a C++14 digit separator like
+# `2'000'000'000` (tests/test-rset-release.cpp:37) and swallow a real
+# trailing `//` comment -- found by this very cross-check), a //
+# line comment, or a /* */ block comment (DOTALL, non-greedy so it stops at
+# the first "*/"). Two implementations that agree are much better evidence
+# than either alone, because they are unlikely to share the same bug.
+_INDEPENDENT_TOKEN_RE = re.compile(
+    r'(?P<raw>(?:u8|u|U|L)?R"(?P<delim>[^ ()\\\t\v\f\n]{0,16})\(.*?\)(?P=delim)")'
+    r'|(?P<str>"(?:\\.|[^"\\\n])*")'
+    r'|(?P<chr>\'(?:\\.|[^\'\\\n]){1}\')'
+    r'|(?P<line>//[^\n]*)'
+    r'|(?P<block>/\*.*?\*/)',
+    re.DOTALL,
+)
+
+
+def _independent_strip_comments(text: str) -> str:
+    """Same contract as _strip_comments (blank comments to same-length
+    whitespace, newlines preserved, literals left untouched), built as a
+    single regex tokenization instead of a hand-rolled scanner. Used only
+    to cross-check _strip_comments -- see
+    test_strip_comments_agrees_with_an_independent_implementation.
+    """
+    out = list(text)
+    for m in _INDEPENDENT_TOKEN_RE.finditer(text):
+        if m.group("line") is not None or m.group("block") is not None:
+            for k in range(m.start(), m.end()):
+                if text[k] != "\n":
+                    out[k] = " "
+        # raw / str / chr: a literal, left untouched -- already correct in `out`.
+    return "".join(out)
 
 
 def _iter_test_sources():
@@ -485,34 +545,95 @@ def test_strip_comments_is_raw_string_aware() -> None:
     )
 
 
-def test_strip_comments_marks_every_surviving_slash_as_inside_a_literal() -> None:
-    # Whole-tree self-check for the raw-string desync above (llama.cpp-g290
-    # round 3, finding 1). If the raw-string handling ever regresses, the
-    # scanner can desync and either blank real code (a false negative,
-    # reproduced synthetically above) or fail to blank a genuine comment
-    # because it wrongly believes it is still inside a literal (the form
-    # actually observed, in tests/peg-parser/test-json-parser.cpp). Both
-    # failure modes show up here the same way: a `//` or `/*` survives in
-    # the STRIPPED text at a position the scanner did NOT itself record as
-    # inside a string/char/raw-string literal. A `//` or `/*` that
-    # legitimately lives inside a preserved literal is exactly what
-    # string-awareness must NOT strip, so this only flags one that escaped
-    # the scanner's own bookkeeping -- an assertion that "found nothing"
-    # would not have caught the peg-parser desync (it found two survivors,
-    # both correctly inside a literal span; a regression would put one
-    # outside).
+def test_strip_comments_agrees_with_an_independent_implementation() -> None:
+    # llama.cpp-g290 round 4 spec review, finding 1: the round-3 self-check
+    # this replaces (test_strip_comments_marks_every_surviving_slash_as_
+    # inside_a_literal) was CIRCULAR -- it validated _strip_comments'
+    # survivors against spans recorded by _strip_comments ITSELF, so a
+    # desynced scanner that mints a phantom "literal" span covering exactly
+    # its own survivors passes trivially (the reviewer confirmed this
+    # empirically: the round-2 scanner's peg-parser survivors both sat
+    # inside spans the SAME round-2 scanner had recorded). It was also
+    # blind to the opposite failure mode -- over-blanking real code -- since
+    # on `R"(x " // y)"; return 77;` the round-2 scanner leaves ZERO `//`
+    # survivors, so a check that only ever looks at survivors has nothing
+    # to examine.
+    #
+    # This is not that: _independent_strip_comments is a SEPARATE
+    # implementation (one alternation regex, not a hand-written char-by-
+    # char scanner), so a bug specific to _strip_comments' state machine
+    # (or to _independent_strip_comments' regex) is very unlikely to be
+    # shared, and the comparison is over the FULL stripped output -- code
+    # that one implementation wrongly blanks and the other does not is
+    # caught exactly as readily as a comment one wrongly leaves and the
+    # other blanks. See test_the_cross_check_actually_fires for a RED
+    # control proving this check can actually fail.
+    mismatches = []
     for path in _iter_test_sources():
         original = path.read_text(encoding="utf-8", errors="replace")
-        stripped, literal_spans = _strip_comments(original, _return_spans=True)
-        for m in re.finditer(r"//|/\*", stripped):
-            pos = m.start()
-            assert any(a <= pos < b for a, b in literal_spans), (
-                f"{path.relative_to(ROOT)}: a {m.group(0)!r} survived "
-                f"stripping at offset {pos}, outside every span the scanner "
-                "itself classified as inside a string/raw-string literal -- "
-                "the comment stripper desynchronised (llama.cpp-g290 round 3 "
-                "spec review, finding 1)."
-            )
+        by_hand_written = _strip_comments(original)
+        by_independent = _independent_strip_comments(original)
+        if by_hand_written != by_independent:
+            for offset, (a, b) in enumerate(zip(by_hand_written, by_independent)):
+                if a != b:
+                    line_no = by_hand_written.count("\n", 0, offset) + 1
+                    mismatches.append(
+                        f"{path.relative_to(ROOT)}:{line_no}: hand-written scanner produced "
+                        f"{a!r}, independent regex tokenizer produced {b!r}"
+                    )
+                    break
+
+    non_header_sources = [p for p in _iter_test_sources() if p.resolve() != SKIP_HEADER.resolve()]
+    assert non_header_sources, (
+        f"found no C/C++ test sources under {TEST_SOURCE_DIRS} to cross-check -- "
+        "this assertion would pass vacuously (nothing to compare), which is "
+        "worse than no assertion at all."
+    )
+
+    assert not mismatches, (
+        "_strip_comments and _independent_strip_comments -- two separately "
+        "implemented comment/literal scanners -- disagree on what is code "
+        "vs. comment/literal for at least one real file. One of them has a "
+        "bug (llama.cpp-g290 round 4). Mismatches:\n  " + "\n  ".join(mismatches)
+    )
+
+
+def test_the_cross_check_actually_fires() -> None:
+    # The RED control for test_strip_comments_agrees_with_an_independent_
+    # implementation, required by the round-4 spec review: a cross-check
+    # that never disagrees is exactly as suspect as the circular self-check
+    # it replaced, unless it is shown to disagree on a KNOWN-broken
+    # scanner. `_strip_comments(text, _disable_raw_strings=True)` is that
+    # known-broken scanner -- the pre-round-3 behaviour, which desyncs on
+    # an embedded `"` inside a raw string -- reached without duplicating
+    # _strip_comments' body.
+    def broken(text: str) -> str:
+        return _strip_comments(text, _disable_raw_strings=True)
+
+    dangerous = 'const char * s = R"(x " // y)"; return 77;'
+    assert broken(dangerous) != _independent_strip_comments(dangerous), (
+        "the cross-check did not fire on the dangerous fixture: the "
+        "raw-string-disabled scanner agreed with the independent parser, "
+        "which means test_strip_comments_agrees_with_an_independent_"
+        "implementation would not have caught the round-2 regression this "
+        "control exists to prove it can catch."
+    )
+
+    peg_parser_path = ROOT / "tests" / "peg-parser" / "test-json-parser.cpp"
+    assert peg_parser_path.is_file(), f"{peg_parser_path} is missing -- the real-file half of this control cannot run."
+    peg_parser_text = peg_parser_path.read_text(encoding="utf-8", errors="replace")
+    assert broken(peg_parser_text) != _independent_strip_comments(peg_parser_text), (
+        "the cross-check did not fire on the real peg-parser file: the "
+        "raw-string-disabled scanner agreed with the independent parser "
+        "there too, which would leave that real-world desync undetected."
+    )
+
+    # And the un-broken scanner must NOT disagree with the independent
+    # parser on these same two fixtures -- otherwise this control would be
+    # unable to distinguish "the check works" from "the independent parser
+    # itself is unreliable on these inputs".
+    assert _strip_comments(dangerous) == _independent_strip_comments(dangerous)
+    assert _strip_comments(peg_parser_text) == _independent_strip_comments(peg_parser_text)
 
 
 def test_broad_literal_77_regex_has_controls() -> None:
