@@ -1274,6 +1274,8 @@ existed in this repo). Confirmed both files are **not currently registered**
 in `ctest -N`, consistent with 0igs's "declined" disposition — this is not a
 live gap, just the same already-triaged finding reproduced independently.
 
+**Update (2026-09-02, `llama.cpp-zxlp`):** both files deleted -- `tests/test-sycl-end-to-end-profiling-docs.py` and `tests/test-sycl-mxfp4-tg-speedup-docs.py` are no longer in the tree; the DECLINED comment in `tests/CMakeLists.txt` was updated to say so.
+
 **Two files verified with a real, executed mutation** (not just
 code-reading), using a shadow-root technique for the one that reads real repo
 files — symlink every top-level entry to the real tree except a writable copy
@@ -1705,6 +1707,8 @@ unrelated to winner parsing).
 **Follow-up not taken by this lane:** the repo-root orphan is unbuilt and
 unrun — it is either dead code to delete or a registration to add. Left alone
 deliberately; `tests/CMakeLists.txt` is outside the row-repair scope.
+
+**Update (2026-09-02, `llama.cpp-la7d`):** the repo-root orphan `tests/test-dispatch-tuning.cpp` is deleted; the registered twin `ggml/src/ggml-sycl/tests/test-dispatch-tuning.cpp` gained the two case classes (`onednn_`/`mmq_` sub-branch mapping) the orphan covered and the registered twin didn't, so no coverage was lost.
 
 ### B2 chunk 3 — executed results (2026-08-09): 4/5 proven, 1 null mutation. BATCH B COMPLETE.
 
@@ -2415,6 +2419,8 @@ They are backend sources, outside this lane's scope:
 - `ggml/src/ggml-sycl/xmx-esimd-gemm.hpp` and `xmx-esimd-gemm-q4.hpp` were
   *already* included by nothing before this pass; `xmx-esimd-common.hpp` is
   reachable only through them
+
+**Update (2026-09-02, `llama.cpp-eltp`):** both headers deleted under llama.cpp-eltp; `xmx-esimd-common.hpp` was NOT deleted -- it remains a live include of `test-mmq-xmx-dispatch` (default-registered) and the two gated XMX tests.
 
 ## Pre-registered for the lead
 
