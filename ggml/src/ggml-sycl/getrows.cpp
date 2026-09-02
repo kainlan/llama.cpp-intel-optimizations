@@ -486,19 +486,6 @@ static size_t ggml_sycl_get_rows_index_span_bytes(const ggml_tensor * src1) {
     return max_offset + sizeof(int32_t);
 }
 
-// llama.cpp-dyi3: bisect wrapper -- see ggml_sycl_graph_record_plain_mask()
-// in common.hpp. NOT used at every recording-predicate site in this file:
-// two sites (marked below) exist specifically to AVOID an operation that is
-// illegal while a SYCL command-graph recording is genuinely active (a
-// blocking .wait()/host readback) -- bypassing those would not select a
-// different dispatch shape, it would perform that operation while the real
-// recording session is still open, which the SYCL graph extension forbids
-// and could throw or hang rather than just warn. Only the one site verified
-// safe (a plain host memcpy with no queue wait) is wired to this wrapper.
-static inline bool getrows_graph_recording_active() {
-    return ggml_sycl_graph_recording_active() && !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_GETROWS);
-}
-
 static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &              ctx,
                                              const ggml_tensor *                      src1,
                                              const int32_t *                          src,
@@ -521,12 +508,7 @@ static bool ggml_sycl_stage_get_rows_indices(ggml_backend_sycl_context &        
         return true;
     }
 
-    // llama.cpp-dyi3: bisect wrapper -- see ggml_sycl_graph_record_plain_mask()
-    // in common.hpp. Safe to bypass: the alternative on the "not recording"
-    // side is a plain host memcpy (bytes<=4096, no SYCL wait) for the sizes
-    // get_rows indices actually reach in decode; the lead's own analysis
-    // (task comment log) already covers this site specifically.
-    if (getrows_graph_recording_active() && src1 && src1->name && src1->name[0] != '\0') {
+    if (ggml_sycl_graph_recording_active() && src1 && src1->name && src1->name[0] != '\0') {
         void * staged_ptr = nullptr;
         // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
         // comment on graph_input_staging in common.hpp.
