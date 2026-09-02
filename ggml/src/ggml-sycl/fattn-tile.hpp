@@ -1218,17 +1218,38 @@ static void submit_fattn_tile_d512(const fattn_params & params, dpct::queue_ptr 
     const int32_t  nb31_v = params.nb31, nb32_v = params.nb32;
     const int64_t  nb33_v = params.nb33;
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * block, block),
-            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(warp_size)]] {
-                flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>(
-                    Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, /*KV_max=*/nullptr, dst_ptr,
-                    /*dst_meta=*/nullptr, scale_v, max_bias_v, m0_v, m1_v, n_head_log2_v, logit_sc_v,
-                    ne00_v, ne01_fd, ne02_v, ne03_v, nb01_v, nb02_v, nb03_v,
-                    ne10_v, ne11_v, ne12_v, ne13_v, nb11_v, nb12_v, nb13_v,
-                    nb21_v, nb22_v, nb23_v, ne31_v, ne32_v, ne33_v, nb31_v, nb32_v, nb33_v);
-            });
+    // Wrapped for llama.cpp-86a7: this is the tile_d512 decode kernel
+    // (gemma4's D=512 global-attention layers), previously dark to the
+    // kernel profiler entirely -- a full GGML_SYCL_KERNEL_PROFILE census of
+    // gemma4 showed zero D=512 rows even though ~7 dispatches/token reach
+    // this function, making it impossible to confirm on hardware whether
+    // these kernels are actually recorded into and replayed from a SYCL
+    // command graph rather than staying eager. Matches the
+    // esimd_partitioned/onednn_sdpa_graph wrapping pattern
+    // (fattn-esimd-f16.hpp, fattn-onednn.cpp): a distinct label name from
+    // onednn_sdpa_graph so the two D=512 routes are never conflated, even
+    // though oneDNN's own D=512 attempt already carries D in its metadata.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "fattn.decode.tile_d512";
+    profile_label.category             = "fattn";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "D=" + std::to_string(DV) + ";ncols1=" + std::to_string(ncols1) +
+                                         ";ncols2=" + std::to_string(ncols2) + ";ne01=" + std::to_string(params.ne01) +
+                                         ";ne02=" + std::to_string(ne02_v) + ";ne03=" + std::to_string(ne03_v);
+    profile_label.metadata = profile_metadata.c_str();
+    profile_label.device   = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(grid * block, block), [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(warp_size)]] {
+                    flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap, warp_size>(
+                        Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, /*KV_max=*/nullptr, dst_ptr,
+                        /*dst_meta=*/nullptr, scale_v, max_bias_v, m0_v, m1_v, n_head_log2_v, logit_sc_v, ne00_v,
+                        ne01_fd, ne02_v, ne03_v, nb01_v, nb02_v, nb03_v, ne10_v, ne11_v, ne12_v, ne13_v, nb11_v, nb12_v,
+                        nb13_v, nb21_v, nb22_v, nb23_v, ne31_v, ne32_v, ne33_v, nb31_v, nb32_v, nb33_v);
+                });
+        });
     });
 }
 
