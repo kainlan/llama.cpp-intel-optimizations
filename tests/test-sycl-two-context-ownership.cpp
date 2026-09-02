@@ -13,7 +13,9 @@
 //   1. Reference: fresh context R_A decodes P_A then c1, c2, c3, c4 (c4 is the
 //      token later replayed on A after B's memory is cleared); record the
 //      logits after each step.  Same for R_B with a DIFFERENT prompt P_B and
-//      just c1, c2, c3 (B is never replayed post-clear).  Every reference
+//      just c1, c2, c3 -- B's post-clear replay (step 3b below) re-decodes
+//      P_B itself and is checked against ref_b[0] (the prompt-decode entry,
+//      not a continuation step), so R_B needs no c4 entry.  Every reference
 //      context is created AND freed here, before the two-context proof phase
 //      begins, so no reference run ever overlaps with a live A/B pair -- the
 //      reference itself never has two (let alone three) contexts alive.
@@ -98,6 +100,14 @@ static bool compare_step(const step_logits & got, const step_logits & ref, const
     return ok;
 }
 
+static int usage_error(const char * prog, const char * detail) {
+    fprintf(stderr,
+            "[TWO-CTX] usage: %s [-m <model.gguf>] [--ctx-a N] [--ctx-b N] [--tol F] [-ngl N] "
+            "[<model.gguf>]\n[TWO-CTX] %s\n",
+            prog, detail);
+    return 1;
+}
+
 static llama_context * make_ctx(llama_model * model, uint32_t n_ctx, uint32_t n_batch) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx                = n_ctx;
@@ -143,32 +153,48 @@ int main(int argc, char ** argv) {
     float        tol        = 0.05f;
     int          n_gpu      = 99;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--ctx-a") == 0 && i + 1 < argc) {
+        // Known flags check their own value first (rather than folding
+        // "&& i + 1 < argc" into the match condition) so a recognised flag
+        // given without its value gets its own "missing value" message
+        // instead of falling through to the generic "unrecognised argument"
+        // branch below, which would misreport it as an unknown flag.
+        if (std::strcmp(argv[i], "--ctx-a") == 0) {
+            if (i + 1 >= argc) {
+                return usage_error(argv[0], "missing value for --ctx-a");
+            }
             n_ctx_a = (uint32_t) std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--ctx-b") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--ctx-b") == 0) {
+            if (i + 1 >= argc) {
+                return usage_error(argv[0], "missing value for --ctx-b");
+            }
             n_ctx_b = (uint32_t) std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--tol") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--tol") == 0) {
+            if (i + 1 >= argc) {
+                return usage_error(argv[0], "missing value for --tol");
+            }
             tol = (float) std::atof(argv[++i]);
-        } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "-ngl") == 0) {
+            if (i + 1 >= argc) {
+                return usage_error(argv[0], "missing value for -ngl");
+            }
             n_gpu = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "-m") == 0) {
+            if (i + 1 >= argc) {
+                return usage_error(argv[0], "missing value for -m");
+            }
             model_path = argv[++i];
         } else if (argv[i][0] == '-') {
             // Reject unknown flags rather than silently swallowing them into
             // model_path -- a typo'd flag used to fall through to fopen()
             // failing, which exits 77 (skip) and reads as "no model provided"
             // instead of "bad arguments".
-            fprintf(stderr,
-                    "[TWO-CTX] usage: %s [-m <model.gguf>] [--ctx-a N] [--ctx-b N] [--tol F] [-ngl N] "
-                    "[<model.gguf>]\n[TWO-CTX] unrecognised argument: %s\n",
-                    argv[0], argv[i]);
-            return 1;
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "unrecognised argument: %s", argv[i]);
+            return usage_error(argv[0], detail);
         } else if (model_path) {
-            fprintf(stderr,
-                    "[TWO-CTX] usage: %s [-m <model.gguf>] [--ctx-a N] [--ctx-b N] [--tol F] [-ngl N] "
-                    "[<model.gguf>]\n[TWO-CTX] unexpected extra positional argument: %s\n",
-                    argv[0], argv[i]);
-            return 1;
+            char detail[256];
+            std::snprintf(detail, sizeof(detail), "unexpected extra positional argument: %s", argv[i]);
+            return usage_error(argv[0], detail);
         } else {
             model_path = argv[i];
         }
