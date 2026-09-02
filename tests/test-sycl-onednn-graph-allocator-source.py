@@ -37,17 +37,36 @@ def test_onednn_graph_allocator_source_contract() -> None:
         "free method declared": "void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);" in CACHE_HPP,
         "malloc routes through the ONEDNN zone": "zone_alloc(vram_zone_id::ONEDNN, size, align)" in CACHE_CPP,
         "free routes through the ONEDNN zone": "zone_free(vram_zone_id::ONEDNN, ptr)" in CACHE_CPP,
-        # Event-deferred reclaim: a buffer freed by oneDNN must not be handed to a
-        # new compiled partition before the completion event fires (the compiled
-        # partition's kernels may still be reading it) -- see the pending-list
-        # drain, not an immediate reuse.
-        "pending list gates reuse on event completion": "event_complete(it->event)" in CACHE_CPP and "onednn_graph_scratch_pending_" in CACHE_HPP,
-        "direct fallback deferred via retain_handles_until_event": "retain_handles_until_event" in CACHE_CPP,
+        # Zone-backed reclaim is IMMEDIATE, deliberately with no event wait --
+        # device-side reuse safety comes from every Graph-scratch consumer
+        # submitting on the SAME in-order compute queue (ctx.stream()), not
+        # from a host-side completion check. This must stay documented (the
+        # assumption it rests on, and what to do if it ever stops holding),
+        # not just implemented silently.
+        "zone reclaim documents the in-order-queue assumption": "ctx.stream()" in CACHE_CPP and "in-order compute queue" in CACHE_CPP,
+        # The zone-backed free path must NOT call event_complete()/get_info on
+        # the (profiling-enabled) compute queue -- that blocks rather than
+        # polls (see get_dma_queue()'s comment), so an earlier version of this
+        # function turned every free() into a synchronous wait for that op's
+        # device completion. Only the DIRECT-fallback path (below) may still
+        # reach retain_handles_until_event(), which defers to the cache's own
+        # background drain worker instead of polling here.
+        "no event_complete call in the graph-scratch free path": not any(
+            call in CACHE_CPP.split("void unified_cache::onednn_graph_scratch_free")[1].split("\nvoid unified_cache::")[0]
+            for call in ("event_complete(*event)", "event_complete(it->", "event_complete(event")
+        ),
+        "direct fallback deferred via retain_handles_until_event": "retain_handles_until_event({ std::move(owner) }, *event);" in CACHE_CPP,
         # Env-tunable floor for the concurrent within-ubatch demand, additive on
         # top of the primitive-API pair (see unified_cache_get_planned_onednn_scratchpad_bytes).
         "graph scratch zone floor is additive": "bytes += onednn_graph_scratch_zone_floor_bytes()" in CACHE_CPP,
         "zone floor env var": "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" in CACHE_CPP,
         "allocator opt-out env var name": "GGML_SYCL_ONEDNN_CACHE_ALLOCATOR" in CACHE_CPP,
+        # High-water byte counter (llama.cpp-gwno perf follow-up): peak
+        # concurrently-outstanding bytes, exposed and logged once at teardown
+        # so a finished run's log answers "did the zone floor actually cover
+        # the concurrent demand" without a special env var.
+        "high-water getter declared": "size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }" in CACHE_HPP,
+        "high-water logged once at teardown": "oneDNN Graph scratch high-water" in CACHE_CPP,
     }
 
     failed = [name for name, ok in checks.items() if not ok]

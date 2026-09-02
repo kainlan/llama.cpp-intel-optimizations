@@ -3750,6 +3750,19 @@ bool unified_cache::shutdown_resources() {
                     ggml_sycl::zone_sizing_underestimate_count("onednn"));
     (void) ggml_sycl::zone_sizing_log_underestimate_summary();
 
+#if GGML_SYCL_DNNL
+    // llama.cpp-gwno: same "silent unless interesting" convention as the zone
+    // sizing summary just above -- absent on a run that never used the Graph
+    // allocator, present (INFO, not DEBUG, so a normal run shows it without
+    // GGML_SYCL_DEBUG=1) on any run that did, answering "did the concurrent
+    // within-ubatch demand actually fit GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" from
+    // a finished run's log alone.
+    if (onednn_graph_scratch_high_water_bytes_ > 0) {
+        GGML_LOG_INFO("[UNIFIED-CACHE] oneDNN Graph scratch high-water: %.1f MB\n",
+                      onednn_graph_scratch_high_water_bytes_ / (1024.0 * 1024.0));
+    }
+#endif
+
     // Stop the prefetch worker thread first (before any resource cleanup).
     // This is safe even if the SYCL runtime is shutting down since the worker
     // only does cache lookups and pinning, not SYCL memory operations.
@@ -9421,26 +9434,6 @@ bool unified_cache::event_complete(const sycl::event & evt) {
 // llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations
 // in unified-cache.hpp for the design rationale.
 //
-// Caller must hold onednn_graph_scratch_mutex_.
-void unified_cache::drain_pending_onednn_graph_scratch_locked() {
-    auto it = onednn_graph_scratch_pending_.begin();
-    while (it != onednn_graph_scratch_pending_.end()) {
-        if (!event_complete(it->event)) {
-            ++it;
-            continue;
-        }
-        void * ptr = it->ptr;
-        auto   dit = onednn_graph_scratch_direct_owners_.find(ptr);
-        if (dit != onednn_graph_scratch_direct_owners_.end()) {
-            onednn_graph_scratch_direct_owners_.erase(dit);  // mem_handle dtor releases through the cache
-        } else {
-            onednn_graph_scratch_zone_ptrs_.erase(ptr);
-            zone_free(vram_zone_id::ONEDNN, ptr);
-        }
-        it = onednn_graph_scratch_pending_.erase(it);
-    }
-}
-
 void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q) {
     if (size == 0 || q == nullptr) {
         return nullptr;
@@ -9449,15 +9442,9 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
 
     std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
 
-    // Opportunistically reclaim anything whose completion event has already
-    // fired, WITHOUT polling one that has not (event_complete() is a
-    // non-blocking status query, not a wait -- see the pending-list comment
-    // in unified-cache.hpp for why this must stay lazy rather than a
-    // background poll loop).
-    drain_pending_onednn_graph_scratch_locked();
-
     if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, align)) {
-        onednn_graph_scratch_zone_ptrs_.insert(ptr);
+        onednn_graph_scratch_zone_sizes_[ptr] = size;
+        note_onednn_graph_scratch_alloc_locked(size);
         return ptr;
     }
 
@@ -9501,6 +9488,8 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     }
     void * direct_ptr                               = resolved.ptr;
     onednn_graph_scratch_direct_owners_[direct_ptr] = std::move(owner);
+    onednn_graph_scratch_direct_sizes_[direct_ptr]  = size;
+    note_onednn_graph_scratch_alloc_locked(size);
     return direct_ptr;
 }
 
@@ -9511,28 +9500,90 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
 
     std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
 
-    const bool is_direct = onednn_graph_scratch_direct_owners_.count(ptr) != 0;
-    const bool is_zone   = onednn_graph_scratch_zone_ptrs_.count(ptr) != 0;
-    if (!is_direct && !is_zone) {
+    auto direct_it = onednn_graph_scratch_direct_owners_.find(ptr);
+    if (direct_it != onednn_graph_scratch_direct_owners_.end()) {
+        // DIRECT (non-arena) allocation: a real, individually mem_handle-owned
+        // allocation from unified_alloc(), not a zone suballocation -- the
+        // ONLY lifetime guard available for it is the handle itself (mirrors
+        // reserve_onednn_scratch's defer_published_direct_release,
+        // llama.cpp-ndn9). Always deferred through retain_handles_until_event():
+        // unlike the zone path below, immediate reclaim here is NOT backed by
+        // an in-order-queue argument (a DIRECT block, once released, goes back
+        // to the unified cache's general pool, not straight back into this
+        // allocator's own reuse loop, so nothing pins its next consumer to the
+        // same queue as its last one) -- so an event-gated release is the only
+        // correct option. retain_handles_until_event() hands the wait to the
+        // cache's existing background drain worker rather than polling here.
+        mem_handle owner = std::move(direct_it->second);
+        onednn_graph_scratch_direct_owners_.erase(direct_it);
+        auto size_it = onednn_graph_scratch_direct_sizes_.find(ptr);
+        if (size_it != onednn_graph_scratch_direct_sizes_.end()) {
+            note_onednn_graph_scratch_free_locked(size_it->second);
+            onednn_graph_scratch_direct_sizes_.erase(size_it);
+        }
+        if (event) {
+            retain_handles_until_event({ std::move(owner) }, *event);
+        }
+        // else: no event given -- owner destructs here, releasing immediately
+        // through the cache. oneDNN's SYCL interop always supplies an event
+        // for a real free(); this branch only matters if that ever changes.
+        return;
+    }
+
+    auto zone_it = onednn_graph_scratch_zone_sizes_.find(ptr);
+    if (zone_it == onednn_graph_scratch_zone_sizes_.end()) {
         GGML_LOG_WARN("[UNIFIED-CACHE] oneDNN Graph allocator free() for untracked pointer %p -- ignoring\n", ptr);
         return;
     }
 
-    if (event && !event_complete(*event)) {
-        // Not safe to reuse or release yet: the compiled partition's kernels
-        // may still be reading this buffer. Defer -- reclaimed lazily by the
-        // next alloc()/free() call's drain_pending_onednn_graph_scratch_locked().
-        onednn_graph_scratch_pending_.push_back({ ptr, *event });
-        return;
-    }
+    // Zone-backed suballocation: return it to the ONEDNN zone's TLSF free
+    // list IMMEDIATELY -- deliberately, with NO event wait or completion
+    // check of any kind (an earlier version of this function called
+    // event_complete() here on every free(), which BLOCKS rather than polls
+    // on this queue -- see below -- turning every free() into a synchronous
+    // wait for that op's device completion; that defeated much of the point
+    // of this whole change and is why this function no longer touches an
+    // event at all on this path).
+    //
+    // This is safe by construction, not by omission: the ONLY consumer of a
+    // Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
+    // built on stream_dnnl(qptr), where qptr == ctx.stream() == this
+    // allocator's own cache->get_queue() -- the SAME in-order compute queue
+    // for every SDPA call, every layer, every ubatch. A later zone_alloc()
+    // that hands this same block to a NEW execute() submits that execute's
+    // kernels on that identical queue, so the device enforces "finish reading
+    // the old contents before writing the new ones" via plain in-order
+    // submission order -- exactly the guarantee an event wait would have
+    // bought us, already free.
+    //
+    // THE ASSUMPTION THIS RESTS ON, AND MUST KEEP HOLDING: every consumer of
+    // a zone-backed Graph-scratch buffer submits on ctx.stream() and nothing
+    // else -- no DMA queue, no BCS queue, no second device, no second
+    // concurrent graph reading it out-of-band. If oneDNN, a future
+    // engine-construction change, or a multi-queue/multi-graph execution path
+    // ever lets a DIFFERENT queue touch one of these buffers, this reasoning
+    // breaks and immediate reuse becomes a real race -- at that point this
+    // needs a genuinely non-blocking completion check, e.g. the dma_queue_
+    // pattern (see get_dma_queue()'s comment above): a dedicated
+    // NON-profiling queue whose events CAN be polled via
+    // event.get_info<command_execution_status>() without blocking, unlike
+    // every other backend stream (profiling-enabled, where that same query
+    // blocks instead of polling -- the exact hazard this function used to
+    // walk into).
+    note_onednn_graph_scratch_free_locked(zone_it->second);
+    onednn_graph_scratch_zone_sizes_.erase(zone_it);
+    zone_free(vram_zone_id::ONEDNN, ptr);
+}
 
-    // Event already complete (or none given) -- reclaim immediately.
-    if (is_direct) {
-        onednn_graph_scratch_direct_owners_.erase(ptr);
-    } else {
-        onednn_graph_scratch_zone_ptrs_.erase(ptr);
-        zone_free(vram_zone_id::ONEDNN, ptr);
+void unified_cache::note_onednn_graph_scratch_alloc_locked(size_t size) {
+    onednn_graph_scratch_outstanding_bytes_ += size;
+    if (onednn_graph_scratch_outstanding_bytes_ > onednn_graph_scratch_high_water_bytes_) {
+        onednn_graph_scratch_high_water_bytes_ = onednn_graph_scratch_outstanding_bytes_;
     }
+}
+
+void unified_cache::note_onednn_graph_scratch_free_locked(size_t size) {
+    onednn_graph_scratch_outstanding_bytes_ -= std::min(size, onednn_graph_scratch_outstanding_bytes_);
 }
 
 bool onednn_graph_allocator_enabled() {

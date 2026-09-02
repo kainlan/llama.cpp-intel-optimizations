@@ -2902,14 +2902,18 @@ class unified_cache {
     void * onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q);
     // `event` is the completion event oneDNN hands back for the compiled
     // partition's submission (may be null in principle; oneDNN's SYCL interop
-    // always supplies one for a real execute). The physical release -- back to
-    // the ONEDNN zone's TLSF free list, or the mem_handle's own release for
-    // the direct-fallback case -- is deferred until it completes, mirroring
-    // reserve_onednn_scratch's defer_published_zone_release /
-    // defer_published_direct_release (llama.cpp-ndn9): a following
-    // onednn_graph_scratch_alloc() must not hand this memory to a new compiled
-    // partition while this one's kernels may still be reading it.
+    // always supplies one for a real execute). See the .cpp definition for why
+    // the ONEDNN-zone case reclaims immediately (in-order-queue safety) while
+    // the DIRECT-fallback case still defers via retain_handles_until_event --
+    // the two paths are NOT symmetric, and that's deliberate.
     void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
+
+    // Peak bytes concurrently outstanding across every onednn_graph_scratch_alloc()
+    // call that had not yet been freed (zone-backed and DIRECT-fallback
+    // combined), high-water rather than current -- lets the lead's teardown
+    // log answer "did N MiB actually fit in the planned zone" for a run that
+    // already finished. Zero if the allocator was never used this process.
+    size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 #endif
 
     struct pp_moe_onednn_scratch_slot {
@@ -3554,12 +3558,12 @@ class unified_cache {
     // Pre-allocated to avoid per-op allocations that cause OOM with large contexts.
     // weights_scratch_: holds dequantized weights (max N*K*2 bytes)
     // activations_scratch_: holds converted activations (max M*K*2 bytes)
-    void *     onednn_weights_scratch_          = nullptr;
-    void *     onednn_activations_scratch_      = nullptr;
-    size_t     onednn_weights_scratch_size_     = 0;
-    size_t     onednn_activations_scratch_size_ = 0;
-    mem_handle onednn_weights_scratch_owner_;
-    mem_handle onednn_activations_scratch_owner_;
+    void *                  onednn_weights_scratch_          = nullptr;
+    void *                  onednn_activations_scratch_      = nullptr;
+    size_t                  onednn_weights_scratch_size_     = 0;
+    size_t                  onednn_activations_scratch_size_ = 0;
+    mem_handle              onednn_weights_scratch_owner_;
+    mem_handle              onednn_activations_scratch_owner_;
     std::mutex              onednn_scratch_mutex_;
     std::condition_variable onednn_scratch_cv_;
     uint64_t                onednn_scratch_generation_ = 0;
@@ -3579,31 +3583,32 @@ class unified_cache {
     // no room when they were allocated. Absence from this map means the
     // pointer (if non-null and ours) came from the zone instead. Empty at
     // steady state; only ever populated if the zone is under-sized for this
-    // model's concurrent within-ubatch Graph-scratch demand.
+    // model's concurrent within-ubatch Graph-scratch demand. Sized so free()
+    // has what it needs for retain_handles_until_event() bookkeeping and the
+    // high-water counter below (mem_handle itself doesn't expose a cheap size
+    // accessor here).
     std::unordered_map<void *, mem_handle> onednn_graph_scratch_direct_owners_;
-    // Zone-backed pointers on loan, so free() knows the zone TLSF free list
-    // (not the direct-owner map) is where this pointer belongs -- zone_free()
-    // itself needs no size (TLSF recovers it from the block header), this is
-    // purely presence tracking.
-    std::unordered_set<void *>             onednn_graph_scratch_zone_ptrs_;
+    std::unordered_map<void *, size_t>     onednn_graph_scratch_direct_sizes_;
+    // Zone-backed pointers on loan: ptr -> requested size. The size is not
+    // needed by zone_free() itself (TLSF recovers it from the block header)
+    // -- it is tracked purely so free() can maintain the outstanding-bytes
+    // counter below without oneDNN having to pass it back (its free callback
+    // doesn't carry one).
+    std::unordered_map<void *, size_t>     onednn_graph_scratch_zone_sizes_;
 
-    // Freed by oneDNN but not yet safe to hand back to the zone: the
-    // completion event has not fired as of the free() call. Drained lazily —
-    // opportunistically, on the next onednn_graph_scratch_alloc()/free() —
-    // rather than via a background poll, because polling
-    // command_execution_status on a profiling-enabled queue (every backend
-    // compute queue is one — see get_dma_queue()'s comment above) BLOCKS
-    // instead of returning immediately, and this state must not add a host
-    // stall of its own to the path it exists to unblock.
-    struct onednn_graph_pending_free {
-        void *      ptr;
-        sycl::event event;
-    };
+    // Concurrently-outstanding bytes (zone-backed + DIRECT-fallback
+    // combined) and its running peak, both updated under
+    // onednn_graph_scratch_mutex_ in lock-step with the two maps above.
+    // Exposed via onednn_graph_scratch_high_water_bytes() and logged once at
+    // cache teardown (shutdown_resources()) so a normal run answers "did the
+    // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB floor actually cover the concurrent
+    // demand" without a special env var or a live debugger.
+    size_t onednn_graph_scratch_outstanding_bytes_ = 0;
+    size_t onednn_graph_scratch_high_water_bytes_  = 0;
 
-    std::vector<onednn_graph_pending_free> onednn_graph_scratch_pending_;
-
-    // Caller must hold onednn_graph_scratch_mutex_.
-    void drain_pending_onednn_graph_scratch_locked();
+    // Callers must hold onednn_graph_scratch_mutex_.
+    void note_onednn_graph_scratch_alloc_locked(size_t size);
+    void note_onednn_graph_scratch_free_locked(size_t size);
 #endif
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
