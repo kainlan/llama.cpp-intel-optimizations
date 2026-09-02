@@ -53,3 +53,36 @@
 ## [2026-08-31T09:06:43.848Z] retro
 - slug: "gemma4-e4b-sycl-perf-attribution-2026-08", title: "gemma-4-E4B SYCL perf: measured attribution and D=512 route map", category: "architecture"
 
+## [2026-09-02T01:27:38.134Z] capture
+- source_id: "SRC-2026-09-02-001", format: "markdown"
+
+## [2026-09-02T01:27:39.735Z] capture
+- source_id: "SRC-2026-09-02-002", format: "markdown"
+
+## [2026-09-02T01:29:26.847Z] capture
+- source_id: "SRC-2026-09-02-003", format: "markdown"
+
+## [2026-09-02T01:31:39.261Z] retro
+- slug: "2026-09-02-wiki-staleness-audit-driver-and-rulings", title: "Wiki staleness audit: driver pin, weight-reclaim nuance, two missing owner rulings", category: "architecture"
+
+## [2026-09-02T01:32:52.545Z] capture
+- source_id: "SRC-2026-09-02-004", format: "markdown"
+
+## [2026-09-02T04:27:17.167Z] capture
+- source_id: "SRC-2026-09-02-005", format: "json"
+
+## [2026-09-02T04:28:01.860Z] capture
+- source_id: "SRC-2026-09-02-006", format: "json"
+
+## [2026-09-02T04:28:03.416Z] capture
+- source_id: "SRC-2026-09-02-007", format: "json"
+
+## [2026-09-02T04:28:04.954Z] capture
+- source_id: "SRC-2026-09-02-008", format: "json"
+
+## [2026-09-02T04:28:06.579Z] capture
+- source_id: "SRC-2026-09-02-009", format: "json"
+
+## [2026-09-02T04:31:17.956Z] retro
+- slug: "tracker-triage-sonnet-opus-refute-design-brief", title: "Tracker triage method: sonnet triage + opus refute + design-brief rulings", category: "process"
+

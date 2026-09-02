@@ -20,3 +20,5 @@ Wherever a weight lives, it is materialized in the optimal layout for the proces
 ## Links
 
 - [SRC-2026-08-29-002](/sources/SRC-2026-08-29-002.md)
+
+**Tracked by:** `llama.cpp-30ak7`, `llama.cpp-xihy`, `one-layout-honest-routes` (new epic, no tracker id yet) — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

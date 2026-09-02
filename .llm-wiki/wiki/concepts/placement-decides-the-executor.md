@@ -20,3 +20,5 @@ The planning pass decides where data lives; inference then executes each op wher
 ## Links
 
 - [SRC-2026-08-29-002](/sources/SRC-2026-08-29-002.md)
+
+**Tracked by:** `llama.cpp-3h5gm`, `llama.cpp-ic4f`, `llama.cpp-po3nd.2` — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

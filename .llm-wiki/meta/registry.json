@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "last_updated": "2026-08-31T09:06:43.884Z",
+  "last_updated": "2026-09-02T04:31:17.970Z",
   "pages": {
     "concepts/ab-harness-tracecompare": {
       "type": "concept",
@@ -82,9 +82,9 @@
     "concepts/cross-device-in-order-dependency-fixes": {
       "type": "concept",
       "title": "Cross-device in-order dependency fixes",
-      "description": "Local compute-runtime fixes for ordering dependencies across devices, carried in the patched 26.22 build.",
+      "description": "Local compute-runtime fixes for ordering dependencies across devices, carried in the patched 26.22 build — a historical build no longer loaded on this machine.",
       "created": "2026-08-29",
-      "updated": "2026-08-29"
+      "updated": "2026-09-02"
     },
     "concepts/devicelost-on-multi-gpu-context": {
       "type": "concept",
@@ -106,6 +106,13 @@
       "description": "Coalesced dot-product kernel that is a fallback/debug path, not the production batch=1 TG kernel for reorder-eligible types.",
       "created": "2026-08-29",
       "updated": "2026-08-29"
+    },
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak": {
+      "type": "concept",
+      "title": "Efficiency goal is 80% of hardware theoretical peak",
+      "description": "Owner ruling (llama.cpp-0oad, 2026-09-01) that the ≥80% efficiency target means 80% of the card's theoretical peak — memory-bandwidth utilization for decode, INT8 XMX compute utilization for prefill — never 80% of another model's measured tok/s.",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
     },
     "concepts/epoch-refcounted-transient-zones": {
       "type": "concept",
@@ -148,6 +155,13 @@
       "description": "Transferring data device→host→device as a fallback when direct P2P is unavailable; validated via ONEAPI_DEVICE_SELECTOR=level_zero:0,1.",
       "created": "2026-08-29",
       "updated": "2026-08-29"
+    },
+    "concepts/igpu-vram-budget-must-not-count-host-ram": {
+      "type": "concept",
+      "title": "iGPU VRAM budget must not count host RAM",
+      "description": "The Arrow Lake-S iGPU reports ~231.7 GB global_mem_size, which is host RAM, not VRAM; the backend's VRAM budget calc (min(total*pct, free_at_init) at a 100% default) is correct for discrete cards but claims the whole host for an integrated GPU. Until fixed, pin ONEAPI_DEVICE_SELECTOR=level_zero:0,1 (llama.cpp-403s).",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
     },
     "concepts/interleaved-ab-design": {
       "type": "concept",
@@ -194,9 +208,9 @@
     "concepts/leases-inusecount": {
       "type": "concept",
       "title": "Leases (in_use_count)",
-      "description": "A live WEIGHT handle increments the cache entry's in_use_count; eviction may only remove entries with in_use_count == 0, so a held lease means a missing release to fix, never a forced eviction.",
+      "description": "A live WEIGHT handle increments the cache entry's in_use_count; in_use_count == 0 is necessary but not sufficient for eviction — ownership-aware reclaim (weight_entry_reclaimable()) also preserves live-model-owned and MID_LOAD_REPLAN entries.",
       "created": "2026-08-29",
-      "updated": "2026-08-29"
+      "updated": "2026-09-02"
     },
     "concepts/live-card-derivation": {
       "type": "concept",
@@ -260,6 +274,20 @@
       "description": "Opt-in multi-device path that moves expert data between cards; host-bounces here because the cards cannot DMA to each other.",
       "created": "2026-08-29",
       "updated": "2026-08-29"
+    },
+    "concepts/never-shrink-context-place-kv-instead": {
+      "type": "concept",
+      "title": "Never shrink context — place KV instead",
+      "description": "Owner ruling that default n_ctx must stay at the model's max; when KV does not fit VRAM the fix is placement (tiered KV to pinned host), never auto-shrinking n_ctx and never refusing context init. Explicit -c is the only way to get a smaller context.",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
+    },
+    "concepts/no-host-waits-event-chain-everything": {
+      "type": "concept",
+      "title": "No host waits — event-chain everything",
+      "description": "Owner ruling that SYCL dispatch paths must express ordering as event dependencies (depends_on, oneDNN sycl_interop::execute deps), never a host wait/drain per op; waits are confined to teardown, error paths, and debug/init.",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
     },
     "concepts/no-weight-streaming": {
       "type": "concept",
@@ -985,9 +1013,9 @@
     "entities/intel-compute-runtime": {
       "type": "entity",
       "title": "Intel compute-runtime",
-      "description": "Patched 26.22 Battlemage/BMG-only build installed as the system-default Level Zero driver from branch llama/26.22-cross-device.",
+      "description": "The loaded Level Zero driver is stock 26.31 since a one-way PPA upgrade on 2026-08-18; the patched 26.22 Battlemage/BMG-only build (branch llama/26.22-cross-device) is preserved on disk but no longer loaded.",
       "created": "2026-08-29",
-      "updated": "2026-08-29"
+      "updated": "2026-09-02"
     },
     "entities/level-zero": {
       "type": "entity",
@@ -1036,7 +1064,7 @@
       "title": "llama.cpp",
       "description": "Inference framework whose isolated/host-bounce multi-device path (GGML_SYCL_MOE_MULTI_GPU) is constrained by the P2P restriction.",
       "created": "2026-08-29",
-      "updated": "2026-08-29"
+      "updated": "2026-09-02"
     },
     "entities/llamacpp-sycl-fork": {
       "type": "entity",
@@ -1113,7 +1141,7 @@
       "title": "oneDNN",
       "description": "DNN library whose scratch allocations and calls flow through the unified cache; its on-device dequant (e.g. MXFP4 → f16) is a permitted format-conversion staging.",
       "created": "2026-08-29",
-      "updated": "2026-08-29"
+      "updated": "2026-09-02"
     },
     "entities/openvino": {
       "type": "entity",
@@ -1206,6 +1234,15 @@
       "created": "2026-08-29",
       "updated": "2026-08-29"
     },
+    "sources/2026-09-02-wiki-staleness-audit-driver-and-rulings": {
+      "type": "source",
+      "title": "Wiki staleness audit: driver pin, weight-reclaim nuance, two missing owner rulings",
+      "category": "architecture",
+      "status": "insight",
+      "slug": "2026-09-02-wiki-staleness-audit-driver-and-rulings",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
+    },
     "sources/SRC-2026-08-29-001": {
       "type": "source",
       "title": "sycl-perf-baselines.md",
@@ -1245,6 +1282,87 @@
       "format": "markdown",
       "captured": "2026-08-29",
       "updated": "2026-08-29"
+    },
+    "sources/SRC-2026-09-02-001": {
+      "type": "source",
+      "title": "CLAUDE.md",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-001/extracted.md",
+      "source_id": "SRC-2026-09-02-001",
+      "format": "markdown",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-002": {
+      "type": "source",
+      "title": "compute-runtime.md",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-002/extracted.md",
+      "source_id": "SRC-2026-09-02-002",
+      "format": "markdown",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-003": {
+      "type": "source",
+      "title": "2026-08-27-tkv13-b2-addendum.md",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-003/extracted.md",
+      "source_id": "SRC-2026-09-02-003",
+      "format": "markdown",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-004": {
+      "type": "source",
+      "title": "DESIGN-BRIEF.md",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-004/extracted.md",
+      "source_id": "SRC-2026-09-02-004",
+      "format": "markdown",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-005": {
+      "type": "source",
+      "title": "final.json",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-005/extracted.md",
+      "source_id": "SRC-2026-09-02-005",
+      "format": "json",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-006": {
+      "type": "source",
+      "title": "second-card-earns-its-keep.json",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-006/extracted.md",
+      "source_id": "SRC-2026-09-02-006",
+      "format": "json",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-007": {
+      "type": "source",
+      "title": "one-layout-honest-routes.json",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-007/extracted.md",
+      "source_id": "SRC-2026-09-02-007",
+      "format": "json",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-008": {
+      "type": "source",
+      "title": "op-coverage-and-upstream-ports.json",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-008/extracted.md",
+      "source_id": "SRC-2026-09-02-008",
+      "format": "json",
+      "captured": "2026-09-02"
+    },
+    "sources/SRC-2026-09-02-009": {
+      "type": "source",
+      "title": "gptoss-decode-bandwidth.json",
+      "status": "skeleton",
+      "raw_path": "raw/sources/SRC-2026-09-02-009/extracted.md",
+      "source_id": "SRC-2026-09-02-009",
+      "format": "json",
+      "captured": "2026-09-02"
     },
     "sources/gemma4-e4b-sycl-perf-attribution-2026-08": {
       "type": "source",
@@ -1296,6 +1414,22 @@
       "source_context": "Setting up Dockerized Obsidian to browse the LLM Wiki vault over the LAN",
       "created": "2026-08-30",
       "updated": "2026-08-30"
+    },
+    "sources/tracker-triage-sonnet-opus-refute-design-brief": {
+      "type": "source",
+      "title": "Tracker triage method: sonnet triage + opus refute + design-brief rulings",
+      "category": "process",
+      "status": "insight",
+      "slug": "tracker-triage-sonnet-opus-refute-design-brief",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
+    },
+    "syntheses/sycl-fork-epic-taxonomy-2026-09": {
+      "type": "synthesis",
+      "title": "SYCL fork epic taxonomy (2026-09-01 tracker triage)",
+      "description": "The 2026-09-01 codescout tracker triage closed 163 of 581 open tasks with evidence, decided 8 more via GPU gates, and organized the 396 survivors into 18 design-first epics. This page is the durable record of that taxonomy — what each epic is for, what closes it, which owner rulings bind it, and what remains unresolved.",
+      "created": "2026-09-02",
+      "updated": "2026-09-02"
     }
   }
 }

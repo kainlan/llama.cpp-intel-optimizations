@@ -20,3 +20,5 @@ Device VRAM → pinned host → mmap hierarchy that the cache must be free to mi
 ## Links
 
 - [SRC-2026-08-29-002](/sources/SRC-2026-08-29-002.md)
+
+**Tracked by:** `llama.cpp-sk1xz` — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

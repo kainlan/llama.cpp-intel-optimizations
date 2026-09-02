@@ -1,0 +1,11 @@
+{
+  "id": "SRC-2026-09-02-002",
+  "captured": "2026-09-02",
+  "packet_version": "1.0",
+  "title": "compute-runtime.md",
+  "file_path": "/Apps/llama.cpp/docs/backend/compute-runtime.md",
+  "format": "markdown",
+  "extractor": "passthrough",
+  "extraction_status": "success",
+  "content_type": "text/markdown"
+}

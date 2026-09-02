@@ -20,3 +20,5 @@ Command-graph record/replay submission path; a replay-active graph currently nev
 ## Links
 
 - [SRC-2026-08-29-004](/sources/SRC-2026-08-29-004.md)
+
+**Tracked by:** `event-ordered-graph-replay` (new epic, no tracker id yet) — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

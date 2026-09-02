@@ -20,3 +20,5 @@ Weights are handed out as WEIGHT-kind handles keyed by tensor identity that hold
 ## Links
 
 - [SRC-2026-08-29-002](/sources/SRC-2026-08-29-002.md)
+
+**Tracked by:** `llama.cpp-rg2ft`, `refcount-reclaim-no-zone-resets` (new epic, no tracker id yet) — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

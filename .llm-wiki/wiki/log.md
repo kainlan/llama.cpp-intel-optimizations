@@ -1,5 +1,19 @@
 # Wiki Update Log
 
+## 2026-09-02
+
+- **retro**: {"category":"process","slug":"tracker-triage-sonnet-opus-refute-design-brief","title":"Tracker triage method: sonnet triage + opus refute + design-brief rulings"}
+- **capture**: {"format":"json","source_id":"SRC-2026-09-02-009"}
+- **capture**: {"format":"json","source_id":"SRC-2026-09-02-008"}
+- **capture**: {"format":"json","source_id":"SRC-2026-09-02-007"}
+- **capture**: {"format":"json","source_id":"SRC-2026-09-02-006"}
+- **capture**: {"format":"json","source_id":"SRC-2026-09-02-005"}
+- **capture**: {"format":"markdown","source_id":"SRC-2026-09-02-004"}
+- **retro**: {"category":"architecture","slug":"2026-09-02-wiki-staleness-audit-driver-and-rulings","title":"Wiki staleness audit: driver pin, weight-reclaim nuance, two missing owner rulings"}
+- **capture**: {"format":"markdown","source_id":"SRC-2026-09-02-003"}
+- **capture**: {"format":"markdown","source_id":"SRC-2026-09-02-002"}
+- **capture**: {"format":"markdown","source_id":"SRC-2026-09-02-001"}
+
 ## 2026-08-31
 
 - **retro**: {"category":"architecture","slug":"gemma4-e4b-sycl-perf-attribution-2026-08","title":"gemma-4-E4B SYCL perf: measured attribution and D=512 route map"}

@@ -1,0 +1,11 @@
+{
+  "id": "SRC-2026-09-02-003",
+  "captured": "2026-09-02",
+  "packet_version": "1.0",
+  "title": "2026-08-27-tkv13-b2-addendum.md",
+  "file_path": "/Apps/llama.cpp/docs/plans/2026-08-27-tkv13-b2-addendum.md",
+  "format": "markdown",
+  "extractor": "passthrough",
+  "extraction_status": "success",
+  "content_type": "text/markdown"
+}

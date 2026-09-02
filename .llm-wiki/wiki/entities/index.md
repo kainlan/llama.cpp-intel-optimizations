@@ -60,7 +60,7 @@
 - [Intel Arc B580](intel-arc-b580.md) — Older Battlemage card removed from this machine on 2026-07-24 (replaced by the Arc Pro B70); its baselines are SUPERSEDED and gate nothing.
 - [Intel Arc Pro B50](intel-arc-pro-b50.md) — Secondary benchmark card in this machine (Battlemage G21, PCI 0000:07:00.0, level_zero:1, ~16.2 GB VRAM); unchanged through the B580→B70 swap.
 - [Intel Arc Pro B70](intel-arc-pro-b70.md) — Primary benchmark card in this machine (Battlemage G31, 256 CU, PCI 0000:03:00.0, level_zero:0, ~32.6 GB VRAM); replaced the B580 on 2026-07-24.
-- [Intel compute-runtime](intel-compute-runtime.md) — Patched 26.22 Battlemage/BMG-only build installed as the system-default Level Zero driver from branch llama/26.22-cross-device.
+- [Intel compute-runtime](intel-compute-runtime.md) — The loaded Level Zero driver is stock 26.31 since a one-way PPA upgrade on 2026-08-18; the patched 26.22 Battlemage/BMG-only build (branch llama/26.22-cross-device) is preserved on disk but no longer loaded.
 - [Level Zero](level-zero.md) — Khronos low-level GPU API whose loader, tracing, and validation libraries this machine's processes must resolve from the packaged path.
 - [libze_intel_gpu.so](libzeintelgpuso.md) — Intel's Level Zero runtime library; patched 1.15.38646 is the diverted system default, with stock 1.14.37020 and prior 26.09 builds preserved.
 - [libze_loader.so](libzeloaderso.md) — Level Zero loader whose stale copy in /usr/local/lib was quarantined so new processes resolve the packaged /usr/lib loader.

@@ -1,0 +1,11 @@
+{
+  "id": "SRC-2026-09-02-009",
+  "captured": "2026-09-02",
+  "packet_version": "1.0",
+  "title": "gptoss-decode-bandwidth.json",
+  "file_path": "/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/a05b58f2-c87b-4d2b-a510-864f61805657/scratchpad/tasks/epics/gptoss-decode-bandwidth.json",
+  "format": "json",
+  "extractor": "jsonToMarkdown",
+  "extraction_status": "success",
+  "content_type": "application/json"
+}

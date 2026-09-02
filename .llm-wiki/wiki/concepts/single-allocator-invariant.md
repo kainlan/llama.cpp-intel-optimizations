@@ -20,3 +20,5 @@ All backend allocation flows through one allocator (the unified cache) and is ow
 ## Links
 
 - [SRC-2026-08-29-002](/sources/SRC-2026-08-29-002.md)
+
+**Tracked by:** `llama.cpp-mubmt`, `llama.cpp-rg2ft` — see [SYCL fork epic taxonomy (2026-09-01 tracker triage)](/syntheses/sycl-fork-epic-taxonomy-2026-09.md)

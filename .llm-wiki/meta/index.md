@@ -19,12 +19,14 @@
 - [[concepts/devicelost-on-multi-gpu-context]] — DEVICE_LOST on multi-GPU context *(created: 2026-08-29)*
 - [[concepts/diverted-library-path-symlink-rollback]] — Diverted library path / symlink rollback *(created: 2026-08-29)*
 - [[concepts/dmmv-coalesced-fallback]] — DMMV coalesced fallback *(created: 2026-08-29)*
+- [[concepts/efficiency-goal-80pct-hardware-theoretical-peak]] — Efficiency goal is 80% of hardware theoretical peak *(created: 2026-09-02)*
 - [[concepts/epoch-refcounted-transient-zones]] — Epoch-refcounted transient zones *(created: 2026-08-29)*
 - [[concepts/fail-closed-admission-contract]] — Fail-closed admission contract *(created: 2026-08-29)*
 - [[concepts/fail-closed-contract]] — Fail-closed contract *(created: 2026-08-29)*
 - [[concepts/flag-presence-test]] — Flag presence-test *(created: 2026-08-29)*
 - [[concepts/free-vram-confound]] — Free-VRAM confound *(created: 2026-08-29)*
 - [[concepts/host-bounce]] — Host bounce *(created: 2026-08-29)*
+- [[concepts/igpu-vram-budget-must-not-count-host-ram]] — iGPU VRAM budget must not count host RAM *(created: 2026-09-02)*
 - [[concepts/interleaved-ab-design]] — Interleaved A/B design *(created: 2026-08-29)*
 - [[concepts/invalidated-vs-superseded]] — Invalidated vs superseded *(created: 2026-08-29)*
 - [[concepts/kernel-confirmation-from-output-not-setup]] — Kernel confirmation from output, not setup *(created: 2026-08-29)*
@@ -41,6 +43,8 @@
 - [[concepts/multi-context-device-contention]] — Multi-context device contention *(created: 2026-08-29)*
 - [[concepts/multi-gpu-device-collapse]] — Multi-GPU device collapse *(created: 2026-08-29)*
 - [[concepts/multi-gpu-moe-ggmlsyclmoemultigpu]] — Multi-GPU MoE (GGML_SYCL_MOE_MULTI_GPU) *(created: 2026-08-29)*
+- [[concepts/never-shrink-context-place-kv-instead]] — Never shrink context — place KV instead *(created: 2026-09-02)*
+- [[concepts/no-host-waits-event-chain-everything]] — No host waits — event-chain everything *(created: 2026-09-02)*
 - [[concepts/no-weight-streaming]] — No weight streaming *(created: 2026-08-29)*
 - [[concepts/no-zero-copy-host-reads]] — No zero-copy host reads *(created: 2026-08-29)*
 - [[concepts/non-owning-storage-handle-route]] — Non-owning storage-handle route *(created: 2026-08-29)*
@@ -182,6 +186,7 @@
 
 ## Sources
 
+- [[sources/2026-09-02-wiki-staleness-audit-driver-and-rulings]] — Wiki staleness audit: driver pin, weight-reclaim nuance, two missing owner rulings *(created: 2026-09-02)*
 - [[sources/gemma4-e4b-sycl-perf-attribution-2026-08]] — gemma-4-E4B SYCL perf: measured attribution and D=512 route map *(created: 2026-08-31)*
 - [[sources/multi-source-ingest-fragmentation-dedup-pass]] — Multi-source background ingest fragments entities; run a dedup pass after *(created: 2026-08-29)*
 - [[sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor]] — Observation: Wiki rebuild/lint results post async — verify file state before reacting to error toasts *(created: 2026-08-29)*
@@ -190,6 +195,20 @@
 - [[sources/SRC-2026-08-29-002]] — sycl-memory-design.md *(created: unknown)*
 - [[sources/SRC-2026-08-29-003]] — compute-runtime.md *(created: unknown)*
 - [[sources/SRC-2026-08-29-004]] — sycl-env-vars.md *(created: unknown)*
+- [[sources/SRC-2026-09-02-001]] — CLAUDE.md *(created: unknown)*
+- [[sources/SRC-2026-09-02-002]] — compute-runtime.md *(created: unknown)*
+- [[sources/SRC-2026-09-02-003]] — 2026-08-27-tkv13-b2-addendum.md *(created: unknown)*
+- [[sources/SRC-2026-09-02-004]] — DESIGN-BRIEF.md *(created: unknown)*
+- [[sources/SRC-2026-09-02-005]] — final.json *(created: unknown)*
+- [[sources/SRC-2026-09-02-006]] — second-card-earns-its-keep.json *(created: unknown)*
+- [[sources/SRC-2026-09-02-007]] — one-layout-honest-routes.json *(created: unknown)*
+- [[sources/SRC-2026-09-02-008]] — op-coverage-and-upstream-ports.json *(created: unknown)*
+- [[sources/SRC-2026-09-02-009]] — gptoss-decode-bandwidth.json *(created: unknown)*
+- [[sources/tracker-triage-sonnet-opus-refute-design-brief]] — Tracker triage method: sonnet triage + opus refute + design-brief rulings *(created: 2026-09-02)*
+
+## Synthesiss
+
+- [[syntheses/sycl-fork-epic-taxonomy-2026-09]] — SYCL fork epic taxonomy (2026-09-01 tracker triage) *(created: 2026-09-02)*
 
 ---
-*Last updated: 2026-08-31T09:06:43.884Z* | *Total pages: 180*
+*Last updated: 2026-09-02T04:31:17.970Z* | *Total pages: 196*

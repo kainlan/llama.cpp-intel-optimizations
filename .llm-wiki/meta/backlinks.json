@@ -20,7 +20,8 @@
   ],
   "concepts/bench-guard-preflight-refusal": [
     "concepts/bench-guard-validsuspect-verdict",
-    "sources/SRC-2026-08-29-001"
+    "sources/SRC-2026-08-29-001",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/bench-guard-validsuspect-verdict": [
     "concepts/bench-guard-preflight-refusal",
@@ -37,6 +38,7 @@
     "sources/SRC-2026-08-29-001"
   ],
   "concepts/cross-device-in-order-dependency-fixes": [
+    "entities/intel-compute-runtime",
     "sources/SRC-2026-08-29-003"
   ],
   "concepts/devicelost-on-multi-gpu-context": [
@@ -47,6 +49,9 @@
   ],
   "concepts/dmmv-coalesced-fallback": [
     "sources/SRC-2026-08-29-001"
+  ],
+  "concepts/efficiency-goal-80pct-hardware-theoretical-peak": [
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/epoch-refcounted-transient-zones": [
     "sources/SRC-2026-08-29-002"
@@ -68,6 +73,7 @@
     "entities/oneapideviceselector",
     "sources/SRC-2026-08-29-003"
   ],
+  "concepts/igpu-vram-budget-must-not-count-host-ram": [],
   "concepts/interleaved-ab-design": [
     "sources/SRC-2026-08-29-001"
   ],
@@ -79,10 +85,12 @@
     "sources/SRC-2026-08-29-004"
   ],
   "concepts/known-stale-baseline": [
-    "sources/SRC-2026-08-29-001"
+    "sources/SRC-2026-08-29-001",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/layout-follows-residency": [
-    "sources/SRC-2026-08-29-002"
+    "sources/SRC-2026-08-29-002",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/lazy-re-resolution": [
     "sources/SRC-2026-08-29-002"
@@ -119,6 +127,15 @@
   ],
   "concepts/multi-gpu-moe-ggmlsyclmoemultigpu": [
     "sources/SRC-2026-08-29-003"
+  ],
+  "concepts/never-shrink-context-place-kv-instead": [
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak",
+    "concepts/no-host-waits-event-chain-everything",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "concepts/no-host-waits-event-chain-everything": [
+    "concepts/never-shrink-context-place-kv-instead",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/no-weight-streaming": [
     "sources/SRC-2026-08-29-002"
@@ -158,13 +175,17 @@
     "sources/SRC-2026-08-29-003"
   ],
   "concepts/pl2-throttling": [
-    "sources/SRC-2026-08-29-001"
+    "sources/SRC-2026-08-29-001",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/placement-decided-once": [
     "sources/SRC-2026-08-29-002"
   ],
   "concepts/placement-decides-the-executor": [
-    "sources/SRC-2026-08-29-002"
+    "concepts/never-shrink-context-place-kv-instead",
+    "concepts/no-host-waits-event-chain-everything",
+    "sources/SRC-2026-08-29-002",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/placement-lifetime-transient-view-triad": [
     "sources/SRC-2026-08-29-002"
@@ -173,6 +194,7 @@
     "sources/SRC-2026-08-29-002"
   ],
   "concepts/pp512-tg128": [
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak",
     "sources/SRC-2026-08-29-001"
   ],
   "concepts/presence-tested-env-var": [
@@ -194,6 +216,7 @@
     "sources/SRC-2026-08-29-001"
   ],
   "concepts/shmem-ceiling": [
+    "concepts/igpu-vram-budget-must-not-count-host-ram",
     "sources/SRC-2026-08-29-001"
   ],
   "concepts/sign-flip-under-blocked-design": [
@@ -203,7 +226,8 @@
     "sources/SRC-2026-08-29-002"
   ],
   "concepts/single-allocator-invariant": [
-    "sources/SRC-2026-08-29-002"
+    "sources/SRC-2026-08-29-002",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/stableidentityhash": [
     "sources/SRC-2026-08-29-002"
@@ -215,7 +239,8 @@
     "sources/SRC-2026-08-29-001"
   ],
   "concepts/sycl-graph-replay": [
-    "sources/SRC-2026-08-29-004"
+    "sources/SRC-2026-08-29-004",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/tensor-identity-ggmlsyclcacheid": [
     "concepts/buffer-scoped-weight-provenance",
@@ -229,7 +254,8 @@
     "sources/SRC-2026-08-29-004"
   ],
   "concepts/tiered-memory-hierarchy": [
-    "sources/SRC-2026-08-29-002"
+    "sources/SRC-2026-08-29-002",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/typed-allocation-errors": [
     "sources/SRC-2026-08-29-002"
@@ -241,13 +267,16 @@
     "sources/SRC-2026-08-29-003"
   ],
   "concepts/vram-budget": [
+    "concepts/igpu-vram-budget-must-not-count-host-ram",
     "sources/SRC-2026-08-29-002"
   ],
   "concepts/vram-zone": [
     "sources/SRC-2026-08-29-002"
   ],
   "concepts/weight-handle-leases": [
-    "sources/SRC-2026-08-29-002"
+    "concepts/leases-inusecount",
+    "sources/SRC-2026-08-29-002",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "concepts/weight-memory-layouts-soa-aos-coalesced-xmxtiled": [
     "concepts/xmxtiled-grouped-dpas-route",
@@ -427,6 +456,7 @@
     "sources/SRC-2026-08-29-001"
   ],
   "entities/igc": [
+    "entities/intel-compute-runtime",
     "sources/SRC-2026-08-29-003"
   ],
   "entities/intel-arc-a580": [
@@ -458,7 +488,9 @@
     "sources/SRC-2026-08-29-004"
   ],
   "entities/intel-compute-runtime": [
-    "sources/SRC-2026-08-29-003"
+    "concepts/cross-device-in-order-dependency-fixes",
+    "sources/SRC-2026-08-29-003",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
   ],
   "entities/level-zero": [
     "sources/SRC-2026-08-29-003"
@@ -505,6 +537,7 @@
     "sources/SRC-2026-08-29-002"
   ],
   "entities/ocloc": [
+    "entities/intel-compute-runtime",
     "sources/SRC-2026-08-29-003"
   ],
   "entities/oneapi": [
@@ -566,6 +599,7 @@
   "entities/unifiedallocateowner": [
     "sources/SRC-2026-08-29-002"
   ],
+  "sources/2026-09-02-wiki-staleness-audit-driver-and-rulings": [],
   "sources/SRC-2026-08-29-001": [
     "concepts/accuracy-ratio",
     "concepts/across-process-spread",
@@ -755,8 +789,63 @@
     "entities/oneapi-20253",
     "entities/test-thread-safety"
   ],
+  "sources/SRC-2026-09-02-001": [
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak",
+    "concepts/igpu-vram-budget-must-not-count-host-ram",
+    "concepts/leases-inusecount",
+    "concepts/never-shrink-context-place-kv-instead",
+    "concepts/no-host-waits-event-chain-everything"
+  ],
+  "sources/SRC-2026-09-02-002": [
+    "concepts/cross-device-in-order-dependency-fixes",
+    "entities/intel-compute-runtime",
+    "sources/SRC-2026-08-29-003"
+  ],
+  "sources/SRC-2026-09-02-003": [
+    "concepts/never-shrink-context-place-kv-instead",
+    "concepts/no-host-waits-event-chain-everything"
+  ],
+  "sources/SRC-2026-09-02-004": [
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak",
+    "concepts/igpu-vram-budget-must-not-count-host-ram",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "sources/SRC-2026-09-02-005": [
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "sources/SRC-2026-09-02-006": [
+    "entities/llamacpp",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "sources/SRC-2026-09-02-007": [
+    "entities/onednn",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "sources/SRC-2026-09-02-008": [
+    "entities/llamacpp",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
+  "sources/SRC-2026-09-02-009": [
+    "entities/intel-compute-runtime",
+    "syntheses/sycl-fork-epic-taxonomy-2026-09"
+  ],
   "sources/gemma4-e4b-sycl-perf-attribution-2026-08": [],
   "sources/multi-source-ingest-fragmentation-dedup-pass": [],
   "sources/obs-2026-08-29-wiki-rebuild-lint-results-post-async-verify-file-state-befor": [],
-  "sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-": []
+  "sources/obs-2026-08-30-dockerized-obsidian-linuxserver-selkies-serves-the-llm-wiki-": [],
+  "sources/tracker-triage-sonnet-opus-refute-design-brief": [],
+  "syntheses/sycl-fork-epic-taxonomy-2026-09": [
+    "concepts/efficiency-goal-80pct-hardware-theoretical-peak",
+    "concepts/layout-follows-residency",
+    "concepts/never-shrink-context-place-kv-instead",
+    "concepts/no-host-waits-event-chain-everything",
+    "concepts/placement-decides-the-executor",
+    "concepts/single-allocator-invariant",
+    "concepts/sycl-graph-replay",
+    "concepts/tiered-memory-hierarchy",
+    "concepts/weight-handle-leases",
+    "entities/intel-compute-runtime",
+    "entities/llamacpp",
+    "entities/onednn"
+  ]
 }
