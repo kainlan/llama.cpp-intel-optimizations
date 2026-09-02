@@ -9,15 +9,17 @@
 #
 # Usage:
 #   sycl-canonical-gates.sh [--build-dir DIR] [--gate mistral|gptoss|all] [--selector level_zero:N]
+# Run with -h/--help for the full option list, defaults, and the
+# SYCL_GATES_* environment overrides.
 #
 # Exit codes:
 #   0  -- every requested gate PASSed.
 #   77 -- every requested gate was SKIPped (no SYCL device enumerated, or a
 #         model file is missing).
 #   1  -- anything else: a fail-closed precondition was not met (missing
-#         binary, build is not really SYCL, CPU-fallback link), a gate
-#         FAILed, or the requested gates were a PASS/SKIP mix with no
-#         outright FAIL.
+#         binary, build is not really SYCL, CPU-fallback link, a broken
+#         oneAPI/dynamic-linker failure), a gate FAILed, or the requested
+#         gates were a PASS/SKIP mix with no outright FAIL.
 #
 # Design notes:
 # - Fails closed: a missing binary or a non-SYCL build is rc=1, never a
@@ -34,13 +36,24 @@
 #   common_print_available_devices() then exit(0)) BEFORE any model file is
 #   opened -- verified by reading both functions. It does not count as
 #   "running a model-loading binary" under the never-loop rule.
-# - Every SYCL_GATES_* override below exists so
+# - Every SYCL_GATES_* override below (SYCL_GATES_BIN_DIR, _CMAKE_CACHE,
+#   _LDD_CMD, _MISTRAL_MODEL, _GPTOSS_MODEL, _SETTLE_SECONDS,
+#   _SKIP_ONEAPI_SOURCE, _SETVARS) exists so
 #   tests/test-sycl-canonical-gates-script.sh can drive this script
 #   deterministically without a GPU, real models, or a real SYCL build. They
 #   are the only reason this script has both a positive and a negative
 #   control; do not remove them "for cleanliness".
 
 set -euo pipefail
+
+# Belt-and-suspenders: this script's own logic never intentionally leaves
+# `set -u` disabled past the oneAPI-source block below, but if it is ever
+# interrupted (SIGINT/SIGTERM) inside that narrow window, restore strict
+# unset-variable checking on the way out so an interrupted run cannot leave
+# behind a subshell or trap running under looser rules than the rest of the
+# script. `set -u` is idempotent -- calling it when already active is a
+# no-op -- so this is safe to run unconditionally on every exit path.
+trap 'set -u 2>/dev/null || true' EXIT INT TERM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -57,6 +70,23 @@ Runs the canonical SYCL correctness gates documented in CLAUDE.md
 ("Verification Commands & Correctness Gates"): the Mistral completion gate
 and/or the GPT-OSS chat gate, exactly once each, with the device selector
 pinned.
+
+Options and their defaults:
+  --build-dir DIR   Build directory to read binaries/CMakeCache from and
+                     write gate logs under. Default: build
+  --gate GATE        mistral, gptoss, or all. Default: all
+  --selector SEL      ONEAPI_DEVICE_SELECTOR value pinned for the gates run
+                     under this invocation. Default: level_zero:1 (the B50 --
+                     never left unset; an unpinned selector enumerates the
+                     iGPU and OOMs the host, llama.cpp-403s).
+
+Environment overrides (all optional; used by
+tests/test-sycl-canonical-gates-script.sh to drive this script without a
+GPU, real models, or a real SYCL build -- a normal invocation needs none of
+them):
+  SYCL_GATES_BIN_DIR, SYCL_GATES_CMAKE_CACHE, SYCL_GATES_LDD_CMD,
+  SYCL_GATES_MISTRAL_MODEL, SYCL_GATES_GPTOSS_MODEL, SYCL_GATES_SETTLE_SECONDS,
+  SYCL_GATES_SKIP_ONEAPI_SOURCE, SYCL_GATES_SETVARS
 
 Exit codes: 0 = all requested gates PASS, 77 = all requested gates SKIP (no
 device enumerated / model missing), 1 = anything else (a FAIL, a
@@ -82,59 +112,66 @@ case "$GATE" in
         ;;
 esac
 
-# BUILD_DIR/GATE/SELECTOR/ROOT_DIR are EVERY variable this script assigns
-# before the source call below AND reads again after it (enumerated by
-# grepping every assignment above this point and checking each name's next
-# use): BUILD_DIR/GATE/SELECTOR come from argv, which must be parsed before
+# --- protect argv-derived state across the oneAPI source below -----------
+# Sourcing setvars.sh (below) pulls every installed oneAPI component's
+# env/vars.sh into THIS shell with no isolation, and at least one of them
+# assigns a plain, unprefixed scratch variable that collides with a name
+# this script also uses: advisor/vtune's vars.sh sets a bare `BIN_DIR=bin64`
+# for their own internal use, which used to silently overwrite this
+# script's BIN_DIR (verified: `need_bin` resolved to the literal path
+# "bin64/llama-completion" and failed closed on a bogus "missing binary").
+# There is no way to enumerate every such name in advance -- a future
+# oneAPI component could collide with a different one of our names -- so
+# the general fix is ordering: source as early as this script's own logic
+# allows, and compute every OTHER derived variable (BIN_DIR, CACHE_FILE,
+# ...) strictly after, so those assignments always execute last and win.
+#
+# BUILD_DIR/GATE/SELECTOR/ROOT_DIR are the ONLY FOUR exceptions to that
+# rule (enumerated by checking every top-level assignment above this point
+# against its next use): they are consumed by logic that must run BEFORE
+# the source call itself, so they cannot simply be recomputed afterward.
+# BUILD_DIR/GATE/SELECTOR come from argv, and argv must be parsed before
 # sourcing (`source FILE --force` would otherwise clobber THIS script's own
-# positional parameters); ROOT_DIR is derived from SCRIPT_DIR/
-# ${BASH_SOURCE[0]} and is read again at the SHA computation below.
-# SCRIPT_DIR itself is NOT in this list -- its only use is computing
-# ROOT_DIR, both above this point, so it never needs protecting. None of
-# these four can simply be recomputed after sourcing the way every other
-# derived variable below is (BIN_DIR, CACHE_FILE, ... all read
-# already-sourced env/argv state and have no earlier value to lose).
-# Snapshot each into a distinctly-prefixed name (vanishingly unlikely for
-# any oneAPI component to also use) immediately after parsing, then restore
-# from the snapshot immediately after sourcing -- this makes the "our
-# assignments always win" property true for all four, not just for the
-# ones that happen to already be assigned after the source call.
+# positional parameters). ROOT_DIR is derived from SCRIPT_DIR/
+# ${BASH_SOURCE[0]} and is read again below at the SHA computation, with no
+# way to re-derive its pre-source value from anything computed after
+# sourcing. (SCRIPT_DIR itself needs no protection -- its only use is
+# computing ROOT_DIR, both above this point.) For these four, snapshot into
+# a distinctly-prefixed name (vanishingly unlikely for any oneAPI component
+# to also use -- and the one exception to "assign after sourcing, ours
+# always wins": these snapshot names are deliberately READ again right
+# after the source, to perform the restore, not left unread), then restore
+# immediately after sourcing. That makes the "our assignments always win"
+# property hold for all four, the same way it already holds for BIN_DIR and
+# everything computed below.
 GATES_ARG_BUILD_DIR="$BUILD_DIR"
 GATES_ARG_GATE="$GATE"
 GATES_ARG_SELECTOR="$SELECTOR"
 GATES_ARG_ROOT_DIR="$ROOT_DIR"
 
 # --- source oneAPI if it is not already active ---------------------------
-# Deliberately as early as this script's own logic allows (right after the
-# argv snapshot above), so every one of this script's own derived variables
-# computed below executes strictly AFTER sourcing and so wins any collision.
-# Sourcing setvars.sh pulls every installed oneAPI component's env/vars.sh
-# into THIS shell (no subshell isolation), and at least one of them assigns
-# a plain, unprefixed scratch variable that collides with a name this
-# script used to compute first and rely on afterwards: advisor/vtune's
-# vars.sh sets a bare `BIN_DIR=bin64` for their own internal use. Sourced
-# after our own BIN_DIR was assigned, that used to silently overwrite it
-# (verified: `need_bin` resolved to the literal path
-# "bin64/llama-completion" and failed closed with a "missing binary" it
-# never should have hit). There is no way to enumerate every such name in
-# advance -- a future oneAPI component could collide with a different one
-# of our names -- so the general fix is ordering: source as early as
-# possible, and compute everything else after, so ours always wins
-# regardless of what the environment set. This is why BUILD_DIR/GATE/
-# SELECTOR/ROOT_DIR (exactly these four -- see the snapshot comment above)
-# are snapshotted above rather than simply left to be recomputed after
-# sourcing -- unlike every other variable below, they are consumed by the
-# sourcing decision itself, by argv parsing that must run before it
-# (BUILD_DIR/GATE/SELECTOR), or by a later computation with no way to
-# re-derive the pre-source value from anything computed after sourcing
-# (ROOT_DIR, used at the SHA line below).
-#
-# setvars.sh also sources compiler/latest/env/vars.sh, which reads
+# setvars.sh sources compiler/latest/env/vars.sh, which reads
 # ${OCL_ICD_FILENAMES} (no ":-" default) after deliberately unsetting it a
 # few lines earlier -- under `set -u` that is an unbound-variable error in a
 # SOURCED file, which kills THIS script, not a subshell; `|| true` cannot
 # save it because bash's `set -u` error is not a normal command failure.
-# set +u only around the source, restored immediately after.
+# set +u only around the source, restored immediately after (and by the
+# EXIT/INT/TERM trap above, if interrupted mid-source).
+#
+# Unlike sibling scripts that source oneAPI unconditionally on every
+# invocation (scripts/sycl-build.sh, scripts/benchmark-sycl.sh -- neither
+# checks ONEAPI_ROOT first), this script short-circuits when ONEAPI_ROOT is
+# already set. Those two are each normally run once per human invocation;
+# this script is a ctest-registered gate that may run inside a shell where
+# oneAPI was already sourced by a wrapping session, or (once
+# llama.cpp-ezfm's GPU-serialization wrapper exists) be invoked repeatedly
+# within one already-sourced session. Re-sourcing every call would spend
+# several seconds of setvars.sh's own component-discovery output for no
+# benefit, and -- per the BIN_DIR collision above -- is not even fully
+# idempotent: re-sourcing risks re-clobbering a name this script has
+# already restored once. SYCL_GATES_SKIP_ONEAPI_SOURCE is the complementary
+# override for a caller that has sourced oneAPI in a way this script's
+# ONEAPI_ROOT check would not detect.
 #
 # SYCL_GATES_SETVARS overrides the setvars.sh path itself (default
 # /opt/intel/oneapi/setvars.sh) so the stub test can point this script at a
@@ -233,35 +270,81 @@ fi
 # combines 2>&1) reads its own "no device" message as proof a device
 # exists. A real device line only ever appears on STDOUT, from
 # common_print_available_devices(): "  SYCL<N>: <description> (...)" .
-# Anchor on that exact shape, and treat a non-zero probe exit (the abort
-# form) or stdout with no such line (the graceful "(none)" form,
-# llama.cpp-1lrh) identically as no-device.
+# Anchor on that exact shape. The probe's stderr is saved (not discarded)
+# to $GATES_OUT_DIR/list-devices.err so a genuine failure has a paper trail,
+# and its first line is quoted into whichever explanation below applies.
+#
+# The probe's own exit status is NOT uniformly "no device": rc 126/127 mean
+# the binary itself failed to EXECUTE (a broken oneAPI install or
+# dynamic-linker failure resolving llama-completion's shared libs), which
+# is a real infrastructure failure this script must fail closed on, not a
+# "no SYCL device" SKIP -- conflating the two would silently report a
+# broken host as "nothing to test here". Any OTHER non-zero rc (the current
+# dev_mgr GGML_ABORT is 134/SIGABRT; a stub or a future implementation
+# could reasonably use any other non-zero code) is treated as no-device,
+# the same as stdout with no matching device line (the future graceful
+# "(none)" shape, llama.cpp-1lrh).
+LIST_DEVICES_ERR="$GATES_OUT_DIR/list-devices.err"
 LIST_DEVICES_OUT=""
 LIST_DEVICES_RC=0
-LIST_DEVICES_OUT="$("$BIN_DIR/llama-completion" --list-devices 2>/dev/null)" || LIST_DEVICES_RC=$?
+LIST_DEVICES_OUT="$("$BIN_DIR/llama-completion" --list-devices 2>"$LIST_DEVICES_ERR")" || LIST_DEVICES_RC=$?
+LIST_DEVICES_ERR_FIRST_LINE="$(head -n1 "$LIST_DEVICES_ERR" 2>/dev/null || true)"
+
 NO_DEVICE_REASON=""
-if [ "$LIST_DEVICES_RC" -ne 0 ]; then
-    NO_DEVICE_REASON="llama-completion --list-devices exited rc=$LIST_DEVICES_RC for selector $SELECTOR (no SYCL device, or the pre-llama.cpp-1lrh dev_mgr abort path)"
-elif ! printf '%s\n' "$LIST_DEVICES_OUT" | grep -qE '^[[:space:]]*SYCL[0-9]+:'; then
-    NO_DEVICE_REASON="no SYCL GPU devices enumerated for selector $SELECTOR (list-devices stdout: $(printf '%s' "$LIST_DEVICES_OUT" | tr '\n' ' '))"
-fi
+case "$LIST_DEVICES_RC" in
+    0)
+        if ! printf '%s\n' "$LIST_DEVICES_OUT" | grep -qE '^[[:space:]]*SYCL[0-9]+:'; then
+            NO_DEVICE_REASON="no SYCL GPU devices enumerated for selector $SELECTOR (list-devices stdout: $(printf '%s' "$LIST_DEVICES_OUT" | tr '\n' ' '))"
+        fi
+        ;;
+    126|127)
+        fail_closed "llama-completion --list-devices exited rc=$LIST_DEVICES_RC -- 126/127 means the binary itself failed to execute (a broken oneAPI install or dynamic-linker failure), not 'no SYCL device'; stderr: ${LIST_DEVICES_ERR_FIRST_LINE:-<empty, see $LIST_DEVICES_ERR>}"
+        ;;
+    *)
+        NO_DEVICE_REASON="llama-completion --list-devices exited rc=$LIST_DEVICES_RC for selector $SELECTOR (no SYCL device, or the pre-llama.cpp-1lrh dev_mgr abort path); stderr: ${LIST_DEVICES_ERR_FIRST_LINE:-<empty, see $LIST_DEVICES_ERR>}"
+        ;;
+esac
 
 # --- gate runners ----------------------------------------------------------
 
 RESULTS=()
 
+# gate_skip NAME REASON
+# Shared SKIP shape: print the SKIP explanation to stderr, the GATE line to
+# stdout, and record the result. Used by both the no-device and the
+# missing-model skip paths in run_mistral/run_gptoss below.
+gate_skip() {
+    local name="$1" reason="$2"
+    echo "SKIP: $name gate -- $reason" >&2
+    echo "GATE $name SKIP rc=77 selector=$SELECTOR sha=$SHA"
+    RESULTS+=("SKIP")
+}
+
+# gate_verdict NAME OUT ERR RC PASS_REGEX
+# Shared PASS/FAIL shape every gate uses: rc==0, PASS_REGEX matches a line
+# in OUT (the .out log), and no abort line appears in ERR (the .err log).
+# Prints the GATE line and records the result. This -- not per-gate
+# duplication -- is where the "STDOUT only, and no abort line" rule lives,
+# so it applies identically to both gates by construction.
+gate_verdict() {
+    local name="$1" out="$2" err="$3" rc="$4" pass_regex="$5"
+    local verdict="FAIL"
+    if [ "$rc" -eq 0 ] \
+        && grep -qE "$pass_regex" "$out" \
+        && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
+        verdict="PASS"
+    fi
+    echo "GATE $name $verdict rc=$rc selector=$SELECTOR sha=$SHA"
+    RESULTS+=("$verdict")
+}
+
 run_mistral() {
     if [ -n "$NO_DEVICE_REASON" ]; then
-        echo "SKIP: mistral gate -- $NO_DEVICE_REASON" >&2
-        echo "GATE mistral SKIP rc=77 selector=$SELECTOR sha=$SHA"
-        RESULTS+=("SKIP")
+        gate_skip mistral "$NO_DEVICE_REASON"
         return
     fi
-    local model="$MISTRAL_MODEL"
-    if [ ! -f "$model" ]; then
-        echo "SKIP: mistral gate -- model not found at $model" >&2
-        echo "GATE mistral SKIP rc=77 selector=$SELECTOR sha=$SHA"
-        RESULTS+=("SKIP")
+    if [ ! -f "$MISTRAL_MODEL" ]; then
+        gate_skip mistral "model not found at $MISTRAL_MODEL"
         return
     fi
 
@@ -269,36 +352,24 @@ run_mistral() {
     sample_mem "mistral pre"
     local rc=0
     timeout 600 "$BIN_DIR/llama-completion" \
-        -m "$model" -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
+        -m "$MISTRAL_MODEL" -p '1, 2, 3, 4, 5,' -n 15 --seed 42 --temp 0 \
         >"$out" 2>"$err" || rc=$?
     sleep "$SETTLE_SECONDS"
     sample_mem "mistral post"
 
-    local verdict="FAIL"
     # Anchored to the start of a line, matching the GPT-OSS check's own
-    # anchoring below: STDOUT contains the exact line/prefix, not the digits
+    # anchoring: STDOUT contains the exact line/prefix, not the digits
     # anywhere in the file (e.g. only inside an echoed prompt).
-    if [ "$rc" -eq 0 ] \
-        && grep -qE '^1, 2, 3, 4, 5, 6, 7, 8, 9, 10' "$out" \
-        && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
-        verdict="PASS"
-    fi
-    echo "GATE mistral $verdict rc=$rc selector=$SELECTOR sha=$SHA"
-    RESULTS+=("$verdict")
+    gate_verdict mistral "$out" "$err" "$rc" '^1, 2, 3, 4, 5, 6, 7, 8, 9, 10'
 }
 
 run_gptoss() {
     if [ -n "$NO_DEVICE_REASON" ]; then
-        echo "SKIP: gptoss gate -- $NO_DEVICE_REASON" >&2
-        echo "GATE gptoss SKIP rc=77 selector=$SELECTOR sha=$SHA"
-        RESULTS+=("SKIP")
+        gate_skip gptoss "$NO_DEVICE_REASON"
         return
     fi
-    local model="$GPTOSS_MODEL"
-    if [ ! -f "$model" ]; then
-        echo "SKIP: gptoss gate -- model not found at $model" >&2
-        echo "GATE gptoss SKIP rc=77 selector=$SELECTOR sha=$SHA"
-        RESULTS+=("SKIP")
+    if [ ! -f "$GPTOSS_MODEL" ]; then
+        gate_skip gptoss "model not found at $GPTOSS_MODEL"
         return
     fi
 
@@ -308,7 +379,7 @@ run_gptoss() {
     # NO -cnv (post-b10630 form verified in CLAUDE.md); -c 4096 is pinned
     # (llama.cpp-uize -- the model's n_ctx_train default does not fit the B50).
     timeout 900 "$BIN_DIR/llama-cli" \
-        -m "$model" -ngl 99 -c 4096 -st --simple-io --no-display-prompt \
+        -m "$GPTOSS_MODEL" -ngl 99 -c 4096 -st --simple-io --no-display-prompt \
         --chat-template-kwargs '{"reasoning_effort":"medium"}' \
         --reasoning-format none --reasoning-budget 0 \
         -p 'Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5' \
@@ -317,18 +388,11 @@ run_gptoss() {
     sleep "$SETTLE_SECONDS"
     sample_mem "gptoss post"
 
-    local verdict="FAIL"
     # The pass check is the digit sequence ON ITS OWN LINE. Grepping the
     # echoed prompt (which also contains these digits, e.g. after a
     # "> ...Answer with only: 1, 2, 3, 4, 5" echo) is the documented
     # false-fail this anchored regex exists to avoid.
-    if [ "$rc" -eq 0 ] \
-        && grep -qE '^1, 2, 3, 4, 5[[:space:]]*$' "$out" \
-        && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
-        verdict="PASS"
-    fi
-    echo "GATE gptoss $verdict rc=$rc selector=$SELECTOR sha=$SHA"
-    RESULTS+=("$verdict")
+    gate_verdict gptoss "$out" "$err" "$rc" '^1, 2, 3, 4, 5[[:space:]]*$'
 }
 
 case "$GATE" in

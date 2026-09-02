@@ -938,7 +938,7 @@ if (NOT WIN32)
         bash
         NAME sycl-canonical-gates
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../scripts/sycl-canonical-gates.sh
+        ARGS ${PROJECT_SOURCE_DIR}/scripts/sycl-canonical-gates.sh
              --build-dir ${CMAKE_BINARY_DIR} --gate all --selector level_zero:1
     )
     set_tests_properties(sycl-canonical-gates PROPERTIES
