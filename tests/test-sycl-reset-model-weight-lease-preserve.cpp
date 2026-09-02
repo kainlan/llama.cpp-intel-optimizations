@@ -91,13 +91,13 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-reset-model-weight-lease-preserve
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>

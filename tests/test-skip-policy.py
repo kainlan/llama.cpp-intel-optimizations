@@ -35,14 +35,8 @@ This gate fails loudly rather than skipping when it cannot find what it checks.
 A gate against vacuous passes that passes vacuously is worth less than no gate,
 because it also reads as coverage.
 
-llama.cpp-g290 round 2 widened the tree-wide scan below from a narrow
-return/exit-keyword regex to a broad `\b77\b` literal scan, because the narrow
-regex missed 77 bound to a named constant first (`static const int X = 77;`
-... `return X;`) rather than written directly as `return 77;`. The narrow scan
-stays as a second, stricter check -- see LITERAL_SKIP_EXIT_RE below -- and the
-broad one adds a small, explicit, re-verified allowlist for the tree's genuine
-non-exit numeric literals (tensor dimensions, fixture ids, sentinel values)
-instead of trying to infer intent from context.
+Revision history: llama.cpp-g290, commits 848bbd3bc, 4915e340b, 4d1420116,
+f2c6ae1ec.
 """
 from __future__ import annotations
 
@@ -72,16 +66,19 @@ SKIP_HEADER = ROOT / "tests" / "test-skip.h"
 # else. Anchored on the return/exit keyword, not on the digits alone, so it
 # does not fire on a float literal (test-llama-archs.cpp's
 # `3.5565588200778455f`), an array size, or a line/ticket number mentioned in
-# a comment. Kept as the second, stricter check alongside BROAD_LITERAL_77_RE
-# below (llama.cpp-g290 round 2): a change that breaks the broad scan's
-# allowlist should not also silently lose this narrower, allowlist-free one.
+# a comment. Kept as a second, stricter check alongside BROAD_LITERAL_77_RE
+# below: a change that breaks the broad scan's allowlist should not also
+# silently lose this narrower, allowlist-free one.
 LITERAL_SKIP_EXIT_RE = re.compile(r"\breturn\s+77\s*;" r"|\b(?:std::)?_?[Ee]xit\s*\(\s*77\s*\)")
 
-# The broad scan: literal 77 as a standalone integer token, wherever it
-# appears in code (not inside a comment or a string/char literal -- see
+# The broad scan: literal 77 (with an optional C++ integer-literal suffix --
+# `77u`, `77U`, `77L`, `77UL`, `77ull`, up to 3 chars of u/U/l/L -- so a skip
+# constant spelled `77u` is not invisible to this scan the way it was until
+# this widening) as a standalone integer token, wherever it appears in code
+# (not inside a comment or a string/char/raw-string literal -- see
 # _strip_comments). This is what catches 77 bound to a named constant that is
 # only later `return`ed, which LITERAL_SKIP_EXIT_RE above cannot see by
-# construction (llama.cpp-g290 spec review, finding 2).
+# construction.
 #
 # One structural exclusion is baked in rather than allowlisted per-occurrence:
 # 77 immediately followed by `.<digit>` is the start of a float/double literal
@@ -97,14 +94,17 @@ LITERAL_SKIP_EXIT_RE = re.compile(r"\breturn\s+77\s*;" r"|\b(?:std::)?_?[Ee]xit\
 # is allowlisted by entry (file + line-content regex), the same as every
 # other non-exit literal below -- see the array-size-shape assertion inside
 # test_broad_literal_77_regex_has_controls.
-BROAD_LITERAL_77_RE = re.compile(r"\b77\b(?!\.\d)")
+BROAD_LITERAL_77_RE = re.compile(r"\b77[uUlL]{0,3}\b(?!\.\d)")
 
 # Small, explicit, re-verified allowlist of genuine non-exit uses of the
-# literal 77 found by BROAD_LITERAL_77_RE across the tree (llama.cpp-g290
-# round 2). Keyed on (relative file path, a regex matching the offending
-# LINE's content) rather than on line numbers, so it does not rot as the
-# surrounding file is edited -- a line-number-keyed allowlist silently stops
-# covering its target the moment an unrelated edit shifts it.
+# literal 77 found by BROAD_LITERAL_77_RE across the tree. Keyed on (relative
+# file path, a regex matching the offending LINE's content) rather than on
+# line numbers, so it does not rot as the surrounding file is edited -- a
+# line-number-keyed allowlist silently stops covering its target the moment
+# an unrelated edit shifts it. test_allowed_non_exit_77_entries_are_all_live
+# asserts every entry below still matches something, so a stale one (the
+# named line moved or was deleted) fails loudly instead of quietly rotting
+# into dead weight.
 #
 # Every entry was read in context and confirmed to be tensor-shape data, a
 # fixture id/argument, or a sentinel value that happens to equal 77 -- never
@@ -152,47 +152,23 @@ _RAW_STRING_START_RE = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n]{0,16})\(')
 
 
 def _strip_comments(text: str, _disable_raw_strings: bool = False) -> str:
-    """Blank out // and /* */ comments, character-for-character in place.
+    """Blank `//` and `/* */` comments to same-length whitespace, in place.
 
-    Every character that is not part of a comment keeps its original
-    position, including every newline -- so a line number computed by
-    counting "\\n" in the RESULT is the same line number in the ORIGINAL
-    text (llama.cpp-g290 spec review, finding 3: the previous DOTALL-based
-    stripper deleted block comments instead of blanking them, so offender
-    line numbers reported after a multi-line comment were wrong).
+    Contract: every character keeps its original position -- including
+    every newline, so a line number computed on the result matches the
+    original text even across a multi-line block comment -- no character
+    is ever moved, and string, char, and raw-string literals are scanned
+    only to find their end and are otherwise left byte-for-byte untouched,
+    so a `//` or `/*` inside one of them is never mistaken for a real
+    comment marker.
 
-    A small hand-written scanner, not a full tokenizer, but literal-aware:
-    it skips over "...", '...' and RAW string literals (finding 4, then
-    llama.cpp-g290 round 3) whole, BEFORE it ever considers whether `/`
-    starts a comment, so a `//` or `/*` inside one of them cannot swallow
-    real code the way a plain `re.sub(r"//.*", ...)` would -- see
-    test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal
-    and test_strip_comments_is_raw_string_aware.
+    `_disable_raw_strings=True` disables the raw-string branch only (no
+    other behaviour changes), so a test can construct a known-broken
+    scanner without duplicating this function -- see
+    test_the_cross_check_actually_fires. Never pass it outside a test.
 
-    Raw string literals (`R"delim(...)delim"`) need their own handling
-    because, unlike a plain "..." literal, their body can contain an
-    unescaped `"` -- e.g. `R"({"text": ...)"` in
-    tests/peg-parser/test-json-parser.cpp -- which desyncs the plain
-    quote-tracker: it closes the "string" early at that embedded `"`, then
-    resumes in what it thinks is code state at the wrong offset. Depending
-    on parity that either blanks real code following a later `//`/`*/` that
-    now looks like it starts inside a "string" (a false negative on this
-    very scan -- `R"(x " // y)"; return 77;` used to lose its
-    `return 77;`), or leaves a genuine comment unstripped because the
-    scanner (wrongly) still thinks it is inside a literal (the observed
-    case, in tests/peg-parser/test-json-parser.cpp:85-86). A raw string's
-    body is found by its own `)delim"` terminator, is never re-entered by
-    the plain quote/comment checks below, and -- unlike a plain "..."
-    literal -- is allowed to span real newlines, matching what raw strings
-    are for.
-
-    `_disable_raw_strings=True` turns the raw-string branch off (falling
-    back to the pre-round-3 behaviour, which desyncs on an embedded `"`).
-    It exists ONLY so a test can construct a deliberately-broken scanner
-    without duplicating this function -- see
-    test_the_cross_check_actually_fires, the RED control for
-    test_strip_comments_agrees_with_an_independent_implementation. It must
-    never be passed True anywhere outside a test.
+    History: llama.cpp-g290, commits 848bbd3bc (introduced),
+    4d1420116 (raw string literals), f2c6ae1ec (C++14 digit separators).
     """
     out = list(text)
     i = 0
@@ -225,19 +201,11 @@ def _strip_comments(text: str, _disable_raw_strings: bool = False) -> str:
         if c == "'":
             # A C++ character literal holds exactly one character or one
             # backslash-escape unit -- unlike a string literal's arbitrary
-            # length. C++14 digit separators (`2'000'000'000`) are bare `'`
-            # marks between digits, NOT character literals, and a scanner
-            # that treats any `'...'` span as a literal (matching whatever
-            # `'` comes next, however far away) desyncs on them: an odd
-            # digit-separator `'` gets swallowed as an "unterminated
-            # literal" through end of line, hiding a real trailing `//`
-            # comment -- observed at tests/test-rset-release.cpp:37,
-            # `2'000'000'000); // 2GB` (found by this fix's own whole-tree
-            # cross-check against _independent_strip_comments, whose `chr`
-            # pattern is equally strict). So: only the closing `'`
-            # IMMEDIATELY after one plain character or one `\\<char>`
-            # escape counts as a char literal; anything else means this `'`
-            # is not a literal opener at all -- leave it as ordinary code.
+            # length. A C++14 digit separator (`2'000'000'000`) is a bare
+            # `'` between digits, not a character literal; only the closing
+            # `'` IMMEDIATELY after one plain character or one `\<char>`
+            # escape counts as a literal, so a digit separator is correctly
+            # left as ordinary code instead of desyncing the scanner.
             if i + 3 < n and text[i + 1] == "\\" and text[i + 3] == "'":
                 i += 4
                 continue
@@ -265,22 +233,17 @@ def _strip_comments(text: str, _disable_raw_strings: bool = False) -> str:
     return "".join(out)
 
 
-# A second, INDEPENDENTLY-implemented stripper with the same contract as
-# _strip_comments (llama.cpp-g290 round 4 spec review, finding 1): a single
-# alternation regex, not a hand-written char-by-char state machine, matching
-# -- in priority order at each position -- a raw string literal (via a named
-# backreference to its own delimiter, so an arbitrary delimiter's contents
-# never need escaping), a plain "..." literal (escape-aware, no embedded
-# unescaped quote or bare newline), a plain '...' literal (exactly one plain
-# character or one backslash-escape unit between the quotes -- NOT the
-# arbitrary-length `*` a string literal allows, because a C++ character
-# literal really is exactly one character, and treating it as arbitrary-
-# length is what let _strip_comments desync on a C++14 digit separator like
-# `2'000'000'000` (tests/test-rset-release.cpp:37) and swallow a real
-# trailing `//` comment -- found by this very cross-check), a //
-# line comment, or a /* */ block comment (DOTALL, non-greedy so it stops at
-# the first "*/"). Two implementations that agree are much better evidence
-# than either alone, because they are unlikely to share the same bug.
+# A second, structurally different stripper with the same contract as
+# _strip_comments: one alternation regex (raw string via a `(?P=delim)`
+# backreference; plain string, escape-aware; plain char, exactly one
+# character or escape unit, matching a real C++ character literal; `//`;
+# `/* */`, DOTALL and non-greedy), rather than a hand-written char-by-char
+# scanner. It transcribes the SAME raw-string delimiter specification as
+# _RAW_STRING_START_RE (both independently encode the same d-char-set rule),
+# so agreement between the two rules out a MECHANISM bug in either
+# implementation -- not a bug both would share because they encode the same
+# (possibly wrong) specification. See
+# test_strip_comments_agrees_with_an_independent_implementation.
 _INDEPENDENT_TOKEN_RE = re.compile(
     r'(?P<raw>(?:u8|u|U|L)?R"(?P<delim>[^ ()\\\t\v\f\n]{0,16})\(.*?\)(?P=delim)")'
     r'|(?P<str>"(?:\\.|[^"\\\n])*")'
@@ -292,10 +255,9 @@ _INDEPENDENT_TOKEN_RE = re.compile(
 
 
 def _independent_strip_comments(text: str) -> str:
-    """Same contract as _strip_comments (blank comments to same-length
-    whitespace, newlines preserved, literals left untouched), built as a
-    single regex tokenization instead of a hand-rolled scanner. Used only
-    to cross-check _strip_comments -- see
+    """Same contract as _strip_comments, built as a single regex
+    tokenization instead of a hand-rolled scanner. Used only to cross-check
+    _strip_comments -- see
     test_strip_comments_agrees_with_an_independent_implementation.
     """
     out = list(text)
@@ -319,6 +281,46 @@ def _iter_test_sources():
 
 def _is_allowlisted(rel_path: str, line: str) -> bool:
     return any(entry_path == rel_path and pattern.search(line) for entry_path, pattern in ALLOWED_NON_EXIT_77)
+
+
+def _assert_scan_is_not_vacuous(scanned: int, what: str) -> None:
+    """Fail loudly if a whole-tree scan looked at zero files. A scan that
+    finds no offenders because it looked at nothing is indistinguishable,
+    by its result alone, from a scan that looked at everything and found
+    nothing real -- this makes them distinguishable.
+    """
+    assert scanned > 0, (
+        f"{what}: scanned 0 files under {TEST_SOURCE_DIRS} -- this "
+        "assertion would pass vacuously (nothing to check), which is "
+        "worse than no assertion at all."
+    )
+
+
+def _scan_tree_for_offenders(regex: "re.Pattern[str]", allowlist_check=None):
+    """Shared engine for the two tree-wide "stray literal 77" scans below.
+    Walks _iter_test_sources() exactly once, strips comments once per file,
+    and collects every `regex` match not vetoed by
+    `allowlist_check(rel_path, line_text)` (when given). tests/test-skip.h
+    is always excluded -- the one place the literal is allowed to live.
+    Returns (offenders, scanned_count) so a caller's vacuity guard never
+    needs a second walk of _iter_test_sources().
+    """
+    offenders = []
+    scanned = 0
+    for path in _iter_test_sources():
+        if path.resolve() == SKIP_HEADER.resolve():
+            continue
+        scanned += 1
+        rel = str(path.relative_to(ROOT))
+        code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        lines = code.splitlines()
+        for m in regex.finditer(code):
+            line_no = code.count("\n", 0, m.start()) + 1
+            line_text = lines[line_no - 1] if 0 <= line_no - 1 < len(lines) else m.group(0)
+            if allowlist_check is not None and allowlist_check(rel, line_text):
+                continue
+            offenders.append(f"{rel}:{line_no}: {line_text.strip()!r}")
+    return offenders, scanned
 
 
 def build_and_test_body() -> str:
@@ -451,21 +453,8 @@ def test_no_stray_literal_skip_exit_outside_header() -> None:
     # C/C++ test source under tests/ and ggml/src/ggml-sycl/tests/ must spell
     # a skip exit as LLAMA_TEST_EXIT_SKIP, never as the bare literal, or the
     # convention drifts back to having multiple homes that can disagree.
-    offenders = []
-    for path in _iter_test_sources():
-        if path.resolve() == SKIP_HEADER.resolve():
-            continue  # the one place the literal 77 is allowed to live
-        code = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
-        for m in LITERAL_SKIP_EXIT_RE.finditer(code):
-            line_no = code.count("\n", 0, m.start()) + 1
-            offenders.append(f"{path.relative_to(ROOT)}:{line_no}: {m.group(0)!r}")
-
-    non_header_sources = [p for p in _iter_test_sources() if p.resolve() != SKIP_HEADER.resolve()]
-    assert non_header_sources, (
-        f"found no C/C++ test sources under {TEST_SOURCE_DIRS} other than "
-        "test-skip.h itself -- this assertion would pass vacuously (nothing "
-        "to scan), which is worse than no assertion at all."
-    )
+    offenders, scanned = _scan_tree_for_offenders(LITERAL_SKIP_EXIT_RE)
+    _assert_scan_is_not_vacuous(scanned, "test_no_stray_literal_skip_exit_outside_header")
 
     assert not offenders, (
         "found the literal skip code 77 used as an exit/return value outside "
@@ -476,11 +465,11 @@ def test_no_stray_literal_skip_exit_outside_header() -> None:
 
 
 def test_strip_comments_preserves_line_numbers() -> None:
-    # llama.cpp-g290 spec review, finding 3: the old stripper used
-    # re.sub(..., flags=re.DOTALL) to DELETE block comments, which removes
-    # their embedded newlines too and shifts every line number after them. A
-    # 3-line block comment made a real offender on line 4 get reported as
-    # line 2. _strip_comments must blank comment bodies in place instead.
+    # The old stripper used re.sub(..., flags=re.DOTALL) to DELETE block
+    # comments, which removes their embedded newlines too and shifts every
+    # line number after them. A 3-line block comment made a real offender
+    # on line 4 get reported as line 2. _strip_comments must blank comment
+    # bodies in place instead.
     fixture = "int a;\n/* line2\n   line3\n   line4 */\nreturn 77;\n"
     stripped = _strip_comments(fixture)
     assert "return 77;" in stripped
@@ -493,11 +482,11 @@ def test_strip_comments_preserves_line_numbers() -> None:
 
 
 def test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal() -> None:
-    # llama.cpp-g290 spec review, finding 4: a naive `//` -> end-of-line
-    # stripper treats the `//` inside "// x" as a real comment marker and
-    # blanks everything after it on the line, including a `return 77;` that
-    # follows the string on the SAME line. _strip_comments must recognise the
-    # string literal as a unit and never look for comment markers inside it.
+    # A naive `//` -> end-of-line stripper treats the `//` inside "// x" as
+    # a real comment marker and blanks everything after it on the line,
+    # including a `return 77;` that follows the string on the SAME line.
+    # _strip_comments must recognise the string literal as a unit and never
+    # look for comment markers inside it.
     fixture = 'const char * s = "// x"; int main(){ return 77; }'
     stripped = _strip_comments(fixture)
     assert LITERAL_SKIP_EXIT_RE.search(stripped), (
@@ -508,10 +497,9 @@ def test_strip_comments_does_not_hide_code_after_a_slash_in_a_string_literal() -
 
 
 def test_strip_comments_is_raw_string_aware() -> None:
-    # llama.cpp-g290 round 3 spec review, finding 1: a raw string literal
-    # (`R"delim(...)delim"`) can embed an unescaped `"` -- the plain
-    # quote-tracker (finding 4's fix) is not enough, because IT is what
-    # desyncs on that embedded `"`. Observed for real at
+    # A raw string literal (`R"delim(...)delim"`) can embed an unescaped `"`
+    # -- the plain quote-tracker is not enough, because IT is what desyncs
+    # on that embedded `"`. Observed for real at
     # tests/peg-parser/test-json-parser.cpp:85-86 (two genuine // comments
     # left unstripped, harmlessly there); the dangerous direction is a false
     # negative, reproduced by the fixture below (blanks a real `return 77;`).
@@ -546,30 +534,21 @@ def test_strip_comments_is_raw_string_aware() -> None:
 
 
 def test_strip_comments_agrees_with_an_independent_implementation() -> None:
-    # llama.cpp-g290 round 4 spec review, finding 1: the round-3 self-check
-    # this replaces (test_strip_comments_marks_every_surviving_slash_as_
-    # inside_a_literal) was CIRCULAR -- it validated _strip_comments'
-    # survivors against spans recorded by _strip_comments ITSELF, so a
-    # desynced scanner that mints a phantom "literal" span covering exactly
-    # its own survivors passes trivially (the reviewer confirmed this
-    # empirically: the round-2 scanner's peg-parser survivors both sat
-    # inside spans the SAME round-2 scanner had recorded). It was also
-    # blind to the opposite failure mode -- over-blanking real code -- since
-    # on `R"(x " // y)"; return 77;` the round-2 scanner leaves ZERO `//`
-    # survivors, so a check that only ever looks at survivors has nothing
-    # to examine.
-    #
-    # This is not that: _independent_strip_comments is a SEPARATE
-    # implementation (one alternation regex, not a hand-written char-by-
-    # char scanner), so a bug specific to _strip_comments' state machine
-    # (or to _independent_strip_comments' regex) is very unlikely to be
-    # shared, and the comparison is over the FULL stripped output -- code
-    # that one implementation wrongly blanks and the other does not is
-    # caught exactly as readily as a comment one wrongly leaves and the
-    # other blanks. See test_the_cross_check_actually_fires for a RED
-    # control proving this check can actually fail.
+    # Cross-checks _strip_comments against _independent_strip_comments (a
+    # structurally different implementation, per _INDEPENDENT_TOKEN_RE's
+    # comment) across every real file in scope, INCLUDING tests/test-skip.h
+    # itself -- byte-for-byte agreement on the stripped output catches both
+    # over-blanking (real code wrongly treated as a comment) and
+    # under-blanking (a real comment left unstripped) alike. This replaces
+    # a circular self-check (commit 4d1420116) that validated a scanner's
+    # survivors against spans that SAME scanner had recorded, so a desynced
+    # scanner's phantom span could cover its own survivors and pass
+    # trivially. See test_the_cross_check_actually_fires for the RED control
+    # proving this comparison can actually fail.
     mismatches = []
+    scanned = 0
     for path in _iter_test_sources():
+        scanned += 1
         original = path.read_text(encoding="utf-8", errors="replace")
         by_hand_written = _strip_comments(original)
         by_independent = _independent_strip_comments(original)
@@ -583,29 +562,24 @@ def test_strip_comments_agrees_with_an_independent_implementation() -> None:
                     )
                     break
 
-    non_header_sources = [p for p in _iter_test_sources() if p.resolve() != SKIP_HEADER.resolve()]
-    assert non_header_sources, (
-        f"found no C/C++ test sources under {TEST_SOURCE_DIRS} to cross-check -- "
-        "this assertion would pass vacuously (nothing to compare), which is "
-        "worse than no assertion at all."
-    )
+    _assert_scan_is_not_vacuous(scanned, "test_strip_comments_agrees_with_an_independent_implementation")
 
     assert not mismatches, (
         "_strip_comments and _independent_strip_comments -- two separately "
         "implemented comment/literal scanners -- disagree on what is code "
         "vs. comment/literal for at least one real file. One of them has a "
-        "bug (llama.cpp-g290 round 4). Mismatches:\n  " + "\n  ".join(mismatches)
+        "bug. Mismatches:\n  " + "\n  ".join(mismatches)
     )
 
 
 def test_the_cross_check_actually_fires() -> None:
     # The RED control for test_strip_comments_agrees_with_an_independent_
-    # implementation, required by the round-4 spec review: a cross-check
-    # that never disagrees is exactly as suspect as the circular self-check
-    # it replaced, unless it is shown to disagree on a KNOWN-broken
-    # scanner. `_strip_comments(text, _disable_raw_strings=True)` is that
-    # known-broken scanner -- the pre-round-3 behaviour, which desyncs on
-    # an embedded `"` inside a raw string -- reached without duplicating
+    # implementation: a cross-check that never disagrees is exactly as
+    # suspect as the circular self-check it replaced, unless it is shown to
+    # disagree on a KNOWN-broken scanner.
+    # `_strip_comments(text, _disable_raw_strings=True)` is that known-broken
+    # scanner -- the pre-raw-string-aware behaviour, which desyncs on an
+    # embedded `"` inside a raw string -- reached without duplicating
     # _strip_comments' body.
     def broken(text: str) -> str:
         return _strip_comments(text, _disable_raw_strings=True)
@@ -615,8 +589,8 @@ def test_the_cross_check_actually_fires() -> None:
         "the cross-check did not fire on the dangerous fixture: the "
         "raw-string-disabled scanner agreed with the independent parser, "
         "which means test_strip_comments_agrees_with_an_independent_"
-        "implementation would not have caught the round-2 regression this "
-        "control exists to prove it can catch."
+        "implementation would not have caught the regression this control "
+        "exists to prove it can catch."
     )
 
     peg_parser_path = ROOT / "tests" / "peg-parser" / "test-json-parser.cpp"
@@ -632,21 +606,33 @@ def test_the_cross_check_actually_fires() -> None:
     # parser on these same two fixtures -- otherwise this control would be
     # unable to distinguish "the check works" from "the independent parser
     # itself is unreliable on these inputs".
-    assert _strip_comments(dangerous) == _independent_strip_comments(dangerous)
-    assert _strip_comments(peg_parser_text) == _independent_strip_comments(peg_parser_text)
+    assert _strip_comments(dangerous) == _independent_strip_comments(dangerous), (
+        "the un-broken (raw-string-aware) scanner disagrees with the "
+        "independent parser on the dangerous fixture -- this control cannot "
+        "tell 'the check works' apart from 'the independent parser is wrong "
+        "here' unless this holds."
+    )
+    assert _strip_comments(peg_parser_text) == _independent_strip_comments(peg_parser_text), (
+        "the un-broken (raw-string-aware) scanner disagrees with the "
+        "independent parser on the real peg-parser file -- same concern as "
+        "the dangerous-fixture assertion above, for the real-file half."
+    )
 
 
 def test_broad_literal_77_regex_has_controls() -> None:
-    # llama.cpp-g290 spec review, finding 1/2: the narrow LITERAL_SKIP_EXIT_RE
-    # cannot see 77 bound to a named constant that is only later `return`ed
-    # (`static const int X = 77; ... return X;`), which is exactly the shape
-    # every one of the ten round-1 offenders used. BROAD_LITERAL_77_RE exists
-    # to catch that shape; prove it fires on the three spellings the offenders
-    # actually used.
+    # The narrow LITERAL_SKIP_EXIT_RE cannot see 77 bound to a named
+    # constant that is only later `return`ed (`static const int X = 77;`
+    # ... `return X;`), which is exactly the shape every one of the ten
+    # round-1 offenders used. BROAD_LITERAL_77_RE exists to catch that
+    # shape; prove it fires on the three spellings the offenders actually
+    # used, and on 77 with an integer-literal suffix.
     for positive in (
         "static const int X = 77;",
         "#define X 77",
         "constexpr int X = 77;",
+        "return 77u;",
+        "return 77U;",
+        "return 77L;",
     ):
         assert BROAD_LITERAL_77_RE.search(positive), (
             f"BROAD_LITERAL_77_RE did not match {positive!r} -- the widened "
@@ -678,56 +664,77 @@ def test_broad_literal_77_regex_has_controls() -> None:
     )
 
 
+def test_allowed_non_exit_77_entries_are_all_live() -> None:
+    # A stale ALLOWED_NON_EXIT_77 entry fails SILENTLY today: if the line it
+    # named moves or is deleted, the entry simply never matches anything,
+    # so it neither hides a real offender (there is nothing left to hide)
+    # nor is itself flagged as unnecessary -- it just accretes as dead
+    # weight nobody notices. Assert every entry matches at least one line of
+    # its target file's stripped text.
+    dead = []
+    stripped_lines_by_file: dict[str, list[str]] = {}
+    for rel_path, pattern in ALLOWED_NON_EXIT_77:
+        if rel_path not in stripped_lines_by_file:
+            full_path = ROOT / rel_path
+            assert full_path.is_file(), f"ALLOWED_NON_EXIT_77 names {rel_path}, which does not exist"
+            text = full_path.read_text(encoding="utf-8", errors="replace")
+            stripped_lines_by_file[rel_path] = _strip_comments(text).splitlines()
+        if not any(pattern.search(line) for line in stripped_lines_by_file[rel_path]):
+            dead.append(f"{rel_path}: {pattern.pattern!r} matches no line")
+
+    assert not dead, (
+        "ALLOWED_NON_EXIT_77 has an entry that matches nothing in its target "
+        "file -- delete it, or the line it was meant to exempt moved or was "
+        "deleted without the allowlist being updated. Dead entries:\n  " + "\n  ".join(dead)
+    )
+
+
 def test_allowlist_matcher_has_controls() -> None:
     # The allowlist itself needs a control, the same way the regexes do: an
     # allowlist entry that matches everything would make
-    # test_no_stray_bound_skip_constant_outside_header pass vacuously no
-    # matter what the tree contains.
+    # test_no_unallowlisted_bare_77_outside_header pass vacuously no matter
+    # what the tree contains.
     assert ALLOWED_NON_EXIT_77, "ALLOWED_NON_EXIT_77 is empty -- nothing to control against"
 
-    # Positive: a real entry's file + a line matching its regex is allowlisted.
-    sample_path, sample_re = ALLOWED_NON_EXIT_77[0]
-    assert sample_path == "tests/test-backend-ops.cpp"
-    assert _is_allowlisted(sample_path, "test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));")
+    # Positive: a real entry's file + a line matching its regex is
+    # allowlisted. Selected by searching for the file rather than indexing
+    # ALLOWED_NON_EXIT_77[0], so this control survives the allowlist being
+    # reordered or extended.
+    sample_path = "tests/test-backend-ops.cpp"
+    sample_entries = [entry for entry in ALLOWED_NON_EXIT_77 if entry[0] == sample_path]
+    assert sample_entries, f"expected at least one ALLOWED_NON_EXIT_77 entry for {sample_path}"
+    sample_line = "test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));"
+    assert _is_allowlisted(sample_path, sample_line), (
+        f"{sample_path}'s tensor-dims ALLOWED_NON_EXIT_77 entry did not match "
+        f"a known tensor-dims line ({sample_line!r}) -- the allowlist matcher "
+        "regressed."
+    )
 
     # Negative: the same file, but a line that merely contains a bare 77 in an
     # unrelated shape, is NOT allowlisted -- proves the entry regex is scoped
     # to its specific shape rather than "any line in this file".
-    assert not _is_allowlisted(sample_path, "    return 77;  // not a tensor-dims line")
+    assert not _is_allowlisted(sample_path, "    return 77;  // not a tensor-dims line"), (
+        f"{sample_path} allowlisted an unrelated 'return 77;' line -- the "
+        "matcher is not scoped to the entry's specific shape."
+    )
 
     # Negative: a line that WOULD match an entry's regex, but under a
     # different file, is not allowlisted -- proves matching is keyed on the
     # file too, not just the line content.
-    assert not _is_allowlisted("tests/some-other-file.cpp", "test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));")
-
-
-def test_no_stray_bound_skip_constant_outside_header() -> None:
-    # llama.cpp-g290 round 2: the widened scan. Same shape as
-    # test_no_stray_literal_skip_exit_outside_header above, but over
-    # BROAD_LITERAL_77_RE with ALLOWED_NON_EXIT_77 subtracted, so it also
-    # catches 77 bound to a named constant (`static const int X = 77;`
-    # ... `return X;`) rather than only a bare `return 77;`.
-    offenders = []
-    for path in _iter_test_sources():
-        if path.resolve() == SKIP_HEADER.resolve():
-            continue  # the one place the literal 77 is allowed to live
-        rel = str(path.relative_to(ROOT))
-        original = path.read_text(encoding="utf-8", errors="replace")
-        code = _strip_comments(original)
-        lines = code.splitlines()
-        for m in BROAD_LITERAL_77_RE.finditer(code):
-            line_no = code.count("\n", 0, m.start()) + 1
-            line_text = lines[line_no - 1] if 0 <= line_no - 1 < len(lines) else ""
-            if _is_allowlisted(rel, line_text):
-                continue
-            offenders.append(f"{rel}:{line_no}: {line_text.strip()!r}")
-
-    non_header_sources = [p for p in _iter_test_sources() if p.resolve() != SKIP_HEADER.resolve()]
-    assert non_header_sources, (
-        f"found no C/C++ test sources under {TEST_SOURCE_DIRS} other than "
-        "test-skip.h itself -- this assertion would pass vacuously (nothing "
-        "to scan), which is worse than no assertion at all."
+    assert not _is_allowlisted("tests/some-other-file.cpp", sample_line), (
+        "a line matching a real entry's regex was allowlisted under a "
+        "DIFFERENT file -- the matcher is not keyed on file path."
     )
+
+
+def test_no_unallowlisted_bare_77_outside_header() -> None:
+    # The widened scan: same shape as test_no_stray_literal_skip_exit_
+    # outside_header above, but over BROAD_LITERAL_77_RE with
+    # ALLOWED_NON_EXIT_77 subtracted, so it also catches 77 bound to a named
+    # constant (`static const int X = 77;` ... `return X;`) rather than
+    # only a bare `return 77;`.
+    offenders, scanned = _scan_tree_for_offenders(BROAD_LITERAL_77_RE, allowlist_check=_is_allowlisted)
+    _assert_scan_is_not_vacuous(scanned, "test_no_unallowlisted_bare_77_outside_header")
 
     assert not offenders, (
         "found the literal 77 bound to what looks like a skip-exit constant "

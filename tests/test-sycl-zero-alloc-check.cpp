@@ -41,8 +41,8 @@
 // stay silent, plus a positive control showing a single shared instance
 // would not have.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl/unified-cache.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 

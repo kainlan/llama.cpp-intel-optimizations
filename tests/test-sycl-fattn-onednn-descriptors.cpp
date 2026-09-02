@@ -1,6 +1,6 @@
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend-impl.h"
 #include "ggml-sycl/fattn-onednn.hpp"
+#include "test-skip.h"
 
 #include <sys/wait.h>
 #include <unistd.h>

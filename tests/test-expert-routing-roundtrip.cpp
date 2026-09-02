@@ -11,7 +11,7 @@
 // Run:
 //   ONEAPI_DEVICE_SELECTOR='level_zero:0;level_zero:1' ./test-expert-routing-roundtrip
 //
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <sycl/sycl.hpp>
 #include <cstdio>
 #include <cstring>

@@ -1,7 +1,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/esimd.hpp>
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <exception>

@@ -34,7 +34,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>

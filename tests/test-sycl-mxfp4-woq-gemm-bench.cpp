@@ -65,9 +65,9 @@
 // BUILT (compiled) by anyone, but RUN only by the lead session, serially,
 // with the standard Shmem/MemAvailable sampling around it.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-common.h"
 #include "ggml-sycl/common.hpp"
+#include "test-skip.h"
 
 #include <algorithm>
 #include <cmath>

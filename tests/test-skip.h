@@ -9,11 +9,14 @@
 // a model-less or CPU-only runner legitimately skips -- it just may not claim to
 // have passed.
 //
-// This header is fork-local on purpose. tests/get-model.cpp is upstream code, so
-// a rebase can revert the two lines there that call into this policy; it cannot
-// take the policy itself, and this comment, with it. See llama.cpp-nwip: exiting
-// EXIT_SUCCESS made test-autorelease, test-model-load-cancel and
-// test-backend-sampler pass vacuously in 0.18 s on every local ctest run.
+// This header is fork-local on purpose. Its no-model call sites --
+// common_get_model_or_exit() in common/common.cpp (upstream code; tests/get-
+// model.cpp dissolved into it at the upstream b10630 merge) and
+// test-thread-safety.cpp -- are upstream-shaped, so a rebase can revert the
+// call that reaches into this policy; it cannot take the policy itself, and
+// this comment, with it. See llama.cpp-nwip: exiting EXIT_SUCCESS made
+// test-autorelease, test-model-load-cancel and test-backend-sampler pass
+// vacuously in 0.18 s on every local ctest run.
 
 #include <cstdio>
 #include <cstdlib>

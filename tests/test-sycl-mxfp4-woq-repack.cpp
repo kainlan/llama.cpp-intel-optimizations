@@ -16,9 +16,9 @@
 //      k-blocks), checked against a CPU reference that DOES mirror the
 //      kernel's index derivation -- this catches launch/offset/OOB bugs that
 //      a tiny hand fixture is too small to exercise.
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-common.h"
 #include "ggml-sycl/convert.hpp"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>

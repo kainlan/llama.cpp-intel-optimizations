@@ -16,10 +16,10 @@
 // is the positive control -- it proves the kernel ran and wrote, so an unchanged
 // guard row means the bound held rather than that nothing happened.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>

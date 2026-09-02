@@ -84,9 +84,9 @@
 // it goes red it is a real finding in every state.
 // ---------------------------------------------------------------------------
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl/fattn.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cmath>
 #include <cstdio>

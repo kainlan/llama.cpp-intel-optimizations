@@ -13,7 +13,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-quants.h"
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {

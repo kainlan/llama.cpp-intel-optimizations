@@ -15,9 +15,9 @@
 //
 // Exits 77 (ctest SKIP_RETURN_CODE) when no SYCL device is present.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>

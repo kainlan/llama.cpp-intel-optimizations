@@ -34,9 +34,9 @@
 //      (trivial packing, sharing no code with either the kernel or the
 //      forward writer). This triangulates through the logical definition
 //      of the weight matrix rather than through any shared index formula.
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-common.h"
 #include "ggml-sycl/convert.hpp"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>

@@ -9,7 +9,8 @@
 // and quietly select a reference implementation, so each arm reports
 // per-iteration time and the ratio is the load-bearing output (a
 // green-but-slow strided arm FAILS option A).
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>

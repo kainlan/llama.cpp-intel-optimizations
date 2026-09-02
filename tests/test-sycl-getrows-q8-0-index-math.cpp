@@ -21,8 +21,8 @@
 // axis, since the CPU/OP_TIMING attribution this ticket started from was
 // drain-mode wall time, not recoverable time.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl/getrows.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 

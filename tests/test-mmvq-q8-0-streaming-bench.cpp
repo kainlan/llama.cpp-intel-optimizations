@@ -18,7 +18,7 @@
 //   GGML_SYCL_MMVQ_BENCH_MMQ_WARMUP  (default: 0)
 //   GGML_SYCL_MMVQ_BENCH_MMQ_BUDGET_MB (default: 1)
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>

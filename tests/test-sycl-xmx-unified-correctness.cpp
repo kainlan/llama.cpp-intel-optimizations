@@ -17,7 +17,7 @@
 // this test asserts did not hold, 77 = a capability or configuration it needs
 // is genuinely absent (ctest SKIP_RETURN_CODE).  Never collapse 77 into 0.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

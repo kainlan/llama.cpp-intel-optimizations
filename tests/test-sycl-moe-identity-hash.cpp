@@ -26,7 +26,7 @@
 // logical + representation identity keys), llama.cpp-twc (the original expert
 // identity collision).
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

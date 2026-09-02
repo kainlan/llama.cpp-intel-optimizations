@@ -6,10 +6,10 @@
 
 // Integration contract for the current-model planner-placement verdict.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-sycl.h"
 #include "ggml-sycl/tiered-plan-clear.hpp"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>

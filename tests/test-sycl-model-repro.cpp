@@ -3,7 +3,7 @@
 // Usage:
 //   LLAMA_SYCL_TEST_MODEL=/path/to/model.gguf ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-model-repro
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

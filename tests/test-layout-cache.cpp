@@ -43,7 +43,7 @@
 // CLAUDE.md describes ("Host-resident weights -> CPU dispatch, not GPU PCIe
 // zero-copy").  The cases below split the two axes apart instead.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <cstdio>
 #include <cstdlib>
 #include <string>

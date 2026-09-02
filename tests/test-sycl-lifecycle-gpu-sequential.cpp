@@ -1,8 +1,8 @@
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "test-skip.h"
 
 #include <cerrno>
 #include <charconv>

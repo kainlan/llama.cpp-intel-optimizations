@@ -13,7 +13,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+#include "test-skip.h"
 #include <atomic>
 #include <algorithm>
 #include <cassert>

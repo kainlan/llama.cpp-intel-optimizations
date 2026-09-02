@@ -20,8 +20,9 @@
 //
 // Run with `--check <file>` to point the same parser at a captured sweep log.
 
-#include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "test-archs-table.h"
+
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstring>
