@@ -44,6 +44,21 @@ void ggml_sycl_fattn_xmx_v2_cache_destroy(void * ptr) {
     fattn_xmx_v2_cache_destroy_inline(ptr);
 }
 
+// llama.cpp-dyi3: bisect wrapper -- see ggml_sycl_graph_record_plain_mask()
+// in common.hpp. Deliberately NOT used at every g_ggml_sycl_graph_recording
+// check in this file: several exist specifically to skip a wait()/malloc
+// that is illegal while a SYCL command-graph recording is genuinely active
+// (the seq_ids path ~line 3606, the paged-V2 auto buffer realloc paths
+// ~4062-4128, all explicitly commented "wait()/malloc forbidden during
+// recording") -- those stay on the raw g_ggml_sycl_graph_recording so
+// bypassing "fattn" cannot make this file attempt an illegal operation
+// during a real recording. Only sites verified to have a genuinely
+// non-blocking alternative (async memcpy, or pure host bookkeeping) are
+// wired to this wrapper.
+static inline bool fattn_graph_recording_active() {
+    return g_ggml_sycl_graph_recording && !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_FATTN);
+}
+
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_D == 64, "Packed-K materializer currently supports D=64 decode K");
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS == XMX_V2_DECODE_BATCH_KV,
               "Packed-K materializer block size must match XMX-v2 decode");
@@ -2571,6 +2586,21 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     const bool dispatch_debug_enabled =
         std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit;
     auto dispatch_debug_kernel = [&](const char * kernel) {
+        // llama.cpp-dyi3: OBSERVE (not predict) which kernel family a
+        // decode-shape (ne01<=1) FA op actually reached. This is the
+        // dispatcher's own choke point (every exit path in this function
+        // calls it), so recording here -- unconditionally, not gated by
+        // dispatch_debug_enabled -- is the single authority the SYCL-graph
+        // gate (ggml-sycl.cpp) reads instead of maintaining a second,
+        // independently-derived eligibility classifier that could drift
+        // from this dispatcher's real decisions.
+        if (ne01 <= 1) {
+            if (std::strcmp(kernel, "esimd_f16") == 0) {
+                ctx.fa_decode_kernel_obs.esimd_partitioned_count++;
+            } else {
+                ctx.fa_decode_kernel_obs.other_kernel_count++;
+            }
+        }
         if (dispatch_debug_enabled) {
             // ne11 (KV length) and the mask extents are the shape terms that
             // actually bound the kernels' KV loops; without them a "selected"
@@ -3468,12 +3498,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     }
     params.V                    = static_cast<const char *>(V_t.resolve_ptr());
     auto graph_input_device_ptr = [&](const ggml_tensor * tensor) -> const char * {
-        if (!g_ggml_sycl_graph_recording || !tensor || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->name[0]) {
+        if (!fattn_graph_recording_active() || !tensor || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) ||
+            !tensor->name[0]) {
             return nullptr;
         }
         void * staged_ptr = nullptr;
-        if (ctx.graph_input_stage_lookup(tensor->name, ggml_nbytes(tensor), device, nullptr, &staged_ptr) &&
-            staged_ptr) {
+        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+        // comment on graph_input_staging in common.hpp.
+        if (ctx.graph_input_stage_lookup(tensor, ggml_nbytes(tensor), device, nullptr, &staged_ptr) && staged_ptr) {
             return static_cast<const char *>(staged_ptr);
         }
         return nullptr;
@@ -3752,7 +3784,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // Set paged layout flag (read from op_params[4], set via ggml_flash_attn_ext_set_paged_layout)
     params.use_paged_layout = use_paged_layout;
 
-    if (g_ggml_sycl_graph_recording && ctx.fa_graph_ptrs_recording) {
+    if (fattn_graph_recording_active() && ctx.fa_graph_ptrs_recording) {
         ggml_backend_sycl_context::fa_graph_ptr_snapshot snap;
         snap.q           = params.Q;
         snap.k           = params.K;
@@ -3763,10 +3795,16 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         snap.block_table = params.block_table;
         snap.seq_lens    = params.seq_lens;
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            snap.q_ne[i]   = Q ? Q->ne[i] : 0;
-            snap.k_ne[i]   = K ? K->ne[i] : 0;
-            snap.v_ne[i]   = V ? V->ne[i] : 0;
-            snap.dst_ne[i] = dst ? dst->ne[i] : 0;
+            snap.q_ne[i]     = Q ? Q->ne[i] : 0;
+            snap.k_ne[i]     = K ? K->ne[i] : 0;
+            snap.v_ne[i]     = V ? V->ne[i] : 0;
+            snap.dst_ne[i]   = dst ? dst->ne[i] : 0;
+            // llama.cpp-dyi3: mask/sinks shape, so a base-vs-SWA mask swap
+            // (same pointer slot family, different n_kv) at the same
+            // resolved address cannot silently replay against the wrong
+            // extents -- see graph_fa_ptrs_match's dims_match calls.
+            snap.mask_ne[i]  = mask ? mask->ne[i] : 0;
+            snap.sinks_ne[i] = sinks ? sinks->ne[i] : 0;
         }
         ctx.fa_graph_ptrs.push_back(snap);
     }
@@ -3823,6 +3861,26 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // supports_op admitted -- a genuine predicate disagreement in one of
     // the two admissibility helpers.
     if (D == 512) {
+        // llama.cpp-dyi3 ROUND 2 FIX: this whole D=512 branch (gemma4's
+        // global-attention layers; D=512 has no vec/XMX/ESIMD kernel in
+        // this fork, so it can NEVER reach fattn_esimd_f16) is a SEPARATE
+        // code path from ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> --
+        // ncols<D> is never instantiated for D=512 -- so it previously
+        // never went through dispatch_debug_kernel's observation, leaving
+        // ctx.fa_decode_kernel_obs blind to it. The graph-replay AUTO gate
+        // in ggml-sycl.cpp then saw "35 esimd_partitioned observations, 0
+        // other" from the SWA (D=256) layers alone and wrongly concluded
+        // the whole decode graph was replay-safe, engaging the graph while
+        // these 7 unverified D=512 (oneDNN or tile_d512) dispatches also
+        // ran inside it every token -- the oracle then failed (root cause
+        // still under investigation; see task comment log). Record here
+        // unconditionally so "every observed decode-shape FA dispatch
+        // reached esimd_partitioned" can no longer be true while any
+        // D=512 layer is live, regardless of which of the two routes
+        // below actually executes.
+        if (params.ne01 <= 1) {
+            ctx.fa_decode_kernel_obs.other_kernel_count++;
+        }
         // Latched once per process rather than a fresh getenv() on every
         // D=512 dispatch (spec review rev-dtpk-qual, F7: this branch is a
         // genuine hot path -- every D=512 layer of every token -- unlike

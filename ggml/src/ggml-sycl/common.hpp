@@ -210,6 +210,13 @@ const ggml_sycl_device_info & ggml_sycl_info();
 #if GGML_SYCL_DNNL
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"
+// Graph API + its SYCL interop -- needed here (not only in fattn-onednn.hpp)
+// because make_engine() below builds the engine with a dnnl::graph::allocator
+// so the SDPA compiled partition's per-execute scratch comes from the unified
+// cache instead of the SYCL runtime (llama.cpp-gwno). Both headers guard
+// their own re-inclusion, so fattn-onednn.hpp including them again is fine.
+#    include "oneapi/dnnl/dnnl_graph.hpp"
+#    include "oneapi/dnnl/dnnl_graph_sycl.hpp"
 #endif
 
 // Helper macro for deprecated get_pointer() -> get_multi_ptr() migration
@@ -460,6 +467,88 @@ inline bool ggml_sycl_graph_recording_active() {
 // made in the same window does not -- recording is already off, so no node will capture it.
 inline bool ggml_sycl_graph_recording_this_thread() {
     return g_ggml_sycl_graph_recording;
+}
+
+// llama.cpp-dyi3: env-gated per-family bypass for the decode FA graph-
+// replay divergence bisect. Round 4 (RERECORD=1) showed a fresh record+
+// finalize every token still produces the same deterministic garbage as
+// replay, ruling out staleness entirely -- the defect is in RECORDING-MODE
+// EXECUTION itself, something that behaves differently when
+// ggml_sycl_graph_recording_active()/_this_thread() is true. Rather than
+// five separate builds (one per suspect op family), each target file
+// defines its own <family>_recording_active()/_this_thread() wrapper that
+// ANDs the real predicate with "not bypassed for this family", and every
+// existing call site in that file is renamed to call the wrapper instead
+// of the raw predicate. With GGML_SYCL_GRAPH_RECORD_PLAIN unset (the
+// default) every wrapper is identical to the real predicate -- zero
+// behavior change. Set to a family, and that family's op dispatch takes
+// its normal NON-recording code path even while actually recording, for
+// one bisect run; where that path submits something non-graph-capturable,
+// it will fire the existing [SYCL-GRAPH-CENSUS] warning (mem-ops.cpp),
+// which is expected during a bisect, not itself a correctness signal.
+enum ggml_sycl_graph_record_plain_family : uint32_t {
+    GGML_SYCL_RECORD_PLAIN_MMVQ     = 1u << 0,
+    GGML_SYCL_RECORD_PLAIN_BINBCAST = 1u << 1,
+    GGML_SYCL_RECORD_PLAIN_FATTN    = 1u << 2,
+    GGML_SYCL_RECORD_PLAIN_GETROWS  = 1u << 3,
+    GGML_SYCL_RECORD_PLAIN_MEMOPS   = 1u << 4,
+};
+
+inline uint32_t ggml_sycl_graph_record_plain_mask() {
+    static const uint32_t mask = [] {
+        const char * env = std::getenv("GGML_SYCL_GRAPH_RECORD_PLAIN");
+        if (!env || env[0] == '\0') {
+            return 0u;
+        }
+        uint32_t    m   = 0;
+        std::string s   = env;
+        size_t      pos = 0;
+        while (pos <= s.size()) {
+            size_t      comma = s.find(',', pos);
+            std::string tok   = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (tok == "mmvq" || tok == "binbcast") {
+                // llama.cpp-dyi3: deliberately NOT wired to any call site yet.
+                // A hand review of these two families' recording-mode checks
+                // found several that exist specifically to avoid an
+                // operation illegal during a REAL SYCL graph recording (a
+                // blocking .wait()/throw on the "not recording" path, e.g.
+                // binbcast.cpp's raw-host-staging fallback) -- naively
+                // bypassing them does not select a plain dispatch variant,
+                // it reaches a path designed to be unreachable while
+                // recording is genuinely active, and could throw/hang
+                // rather than just warn. Fail LOUD instead of silently
+                // accepting a family whose bit no site checks.
+                fprintf(stderr,
+                        "[SYCL-GRAPH-RECORD-PLAIN] family '%s' requested but NOT YET SAFELY IMPLEMENTED -- no call "
+                        "site in that file checks this bypass, so it is a no-op. See the comment here for why (a "
+                        "naive bypass risks a real crash, not just a WARN).\n",
+                        tok.c_str());
+            } else if (tok == "fattn") {
+                m |= GGML_SYCL_RECORD_PLAIN_FATTN;
+            } else if (tok == "getrows") {
+                m |= GGML_SYCL_RECORD_PLAIN_GETROWS;
+            } else if (tok == "memops") {
+                m |= GGML_SYCL_RECORD_PLAIN_MEMOPS;
+            } else if (!tok.empty()) {
+                fprintf(stderr, "[SYCL-GRAPH-RECORD-PLAIN] unknown family '%s' in GGML_SYCL_GRAPH_RECORD_PLAIN\n",
+                        tok.c_str());
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        if (m != 0) {
+            fprintf(stderr, "[SYCL-GRAPH-RECORD-PLAIN] bypass mask=0x%x (from GGML_SYCL_GRAPH_RECORD_PLAIN=%s)\n",
+                    (unsigned) m, s.c_str());
+        }
+        return m;
+    }();
+    return mask;
+}
+
+inline bool ggml_sycl_graph_record_plain_bypassed(uint32_t family_bit) {
+    return (ggml_sycl_graph_record_plain_mask() & family_bit) != 0;
 }
 
 // Allocation shape for a scoped device-VRAM transient -- the scoped_unified_device_temp and
@@ -858,6 +947,13 @@ inline dpct::device_ext & ggml_sycl_get_device(int device) {
 }
 
 int ggml_sycl_get_device_id_from_queue(sycl::queue & queue);
+
+// Same lookup as ggml_sycl_get_device_id_from_queue(), but from a bare
+// sycl::device -- for call sites that only have the device (e.g. the oneDNN
+// Graph SYCL allocator callbacks in unified-cache.cpp/hpp, which receive
+// `const void * dev` pointing at oneDNN's own copy of the sycl::device, not
+// one of ours, so only value equality -- not a queue lookup -- is available).
+int ggml_sycl_get_device_id_from_device(const sycl::device & dev);
 
 inline dpct::err0 ggml_sycl_set_device(const int device) try {
     int current_device_id;
@@ -5458,13 +5554,35 @@ struct ggml_backend_sycl_context {
     queue_ptr stream() { return stream(device, 0); }
 
 #if GGML_SYCL_DNNL
+    // llama.cpp-gwno (S4 root cause, jmc5 c-uxch): without a dnnl::graph
+    // allocator, a compiled SDPA partition's ~12 MiB scratch is allocated by
+    // oneDNN's default SYCL allocator on EVERY dnnl::graph::sycl_interop::execute()
+    // (35x/ubatch on the B70 pp512, ~2.7 ms host block each -- a real
+    // zeMemAllocDevice/xe_vm_bind round trip the unified cache never sees).
+    // dnnl::graph::engine is literally `= dnnl::engine` (dnnl_graph.hpp), so
+    // the SAME engine object returned here backs both the primitive API
+    // (dnnl::sycl_interop::make_stream, gemm.hpp) and the Graph API
+    // (fattn-onednn.cpp's compile()/execute()) -- one make_engine() change
+    // reaches both call sites make_engine()/engine_dnnl() ultimately serve.
     dnnl::engine make_engine(sycl::queue * q) {
         // Get the device associated with the queue
-        sycl::device       dev = q->get_device();
+        sycl::device  dev = q->get_device();
         // Get the context associated with the queue
-        sycl::context      ctx = q->get_context();
-        const dnnl::engine eng = dnnl::sycl_interop::make_engine(dev, ctx);
-        return eng;
+        sycl::context ctx = q->get_context();
+
+        if (ggml_sycl::onednn_graph_allocator_enabled()) {
+            try {
+                dnnl::graph::allocator alloc = dnnl::graph::sycl_interop::make_allocator(
+                    ggml_sycl::onednn_graph_sycl_malloc, ggml_sycl::onednn_graph_sycl_free);
+                return dnnl::graph::sycl_interop::make_engine_with_allocator(dev, ctx, alloc);
+            } catch (const dnnl::error & e) {
+                GGML_LOG_WARN(
+                    "[SYCL] oneDNN Graph allocator engine construction failed (%s); falling back to oneDNN's "
+                    "default allocator -- GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0 silences this by opting out\n",
+                    e.what());
+            }
+        }
+        return dnnl::sycl_interop::make_engine(dev, ctx);
     }
 
     std::unordered_map<sycl::queue *, dnnl::stream> stream_map;
@@ -5915,23 +6033,41 @@ struct ggml_backend_sycl_context {
     // The ggml allocator may reassign tensor->data between iterations, but L0 graph
     // replay bakes USM pointers at finalize time. The staging allocation is owned by
     // a mem_handle so lifetime/refcount/free still flow through unified_alloc().
-    // Key: tensor name (stable across iterations). Value: {handle, capacity}.
+    //
+    // Key: llama.cpp-dyi3 -- previously keyed on tensor NAME alone. gemma4's
+    // build_attn_inp_kv_iswa() builds a base (global) mask and a SWA (local)
+    // mask via the same helper, which unconditionally names every mask
+    // tensor "attn_inp_kq_mask" (llama-graph.cpp). Both are genuinely
+    // per-token-varying INPUT leaves that are NOT sycl::usm::alloc::device
+    // in some configurations (contrary to this task's earlier round-1
+    // assumption -- confirmed live via GGML_SYCL_GRAPH_DIAG:
+    // "[GRAPH-PRESTAGE] INPUT staged ... attn_inp_kq_mask (data=0x...203840)
+    // -> dev 0x...a600000" followed by a SECOND, different-source-address
+    // mask staged to the SAME dev slot), so both DID take this staging path
+    // and collided under the old name-only key: last writer wins, so one
+    // layer class silently replayed the OTHER layer class's mask every
+    // token. The tensor's own struct pointer (NOT tensor->data, which the
+    // comment above already documents as unstable across iterations) is
+    // stable for as long as the owning ggml_cgraph is reused (llama_context's
+    // own "graphs reused" contract) and is naturally distinct per logical
+    // input regardless of a shared name, so it is the correct identity to
+    // key on. Value: {handle, capacity}.
     struct graph_input_staging_entry {
         ggml_sycl::mem_handle handle{};
         size_t                capacity = 0;
     };
 
-    std::unordered_map<std::string, graph_input_staging_entry> graph_input_staging;
+    std::unordered_map<const ggml_tensor *, graph_input_staging_entry> graph_input_staging;
 
-    bool graph_input_stage_lookup(const char *            name,
+    bool graph_input_stage_lookup(const ggml_tensor *     owner,
                                   size_t                  nbytes,
                                   int                     dev_id,
                                   ggml_sycl::mem_handle * out_handle,
                                   void **                 out_device_ptr) {
-        if (!name || name[0] == '\0' || nbytes == 0) {
+        if (!owner || nbytes == 0) {
             return false;
         }
-        auto it = graph_input_staging.find(name);
+        auto it = graph_input_staging.find(owner);
         if (it == graph_input_staging.end() || it->second.capacity < nbytes || !it->second.handle.valid()) {
             return false;
         }
@@ -5950,14 +6086,20 @@ struct ggml_backend_sycl_context {
 
     // Look up or create a stable device staging buffer for an INPUT tensor.
     // Returns a device pointer that persists across graph iterations.
-    void * graph_input_stage(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {
+    // `owner` is the tensor's own struct pointer -- the staging identity;
+    // `host_data` is `owner->data`, the current (possibly reassigned since
+    // last call) source bytes to copy from.
+    void * graph_input_stage(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
+        if (!owner) {
+            return nullptr;
+        }
         int dev_id = -1;
         try {
             dev_id = ggml_sycl_get_device_id_from_queue(q);
         } catch (...) {
         }
 
-        auto it = graph_input_staging.find(name);
+        auto it = graph_input_staging.find(owner);
         if (it != graph_input_staging.end() && it->second.capacity >= nbytes) {
             auto resolved = it->second.handle.resolve(dev_id);
             if (resolved.ptr && resolved.on_device) {
@@ -5999,11 +6141,11 @@ struct ggml_backend_sycl_context {
         ggml_sycl::mem_handle src_handle = ggml_sycl::mem_handle::from_direct(
             const_cast<void *>(host_data), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
         ggml_sycl::mem_copy(handle, src_handle, nbytes, q);
-        graph_input_staging[name] = { std::move(handle), nbytes };
-        return graph_input_staging[name].handle.resolve(dev_id).ptr;
+        graph_input_staging[owner] = { std::move(handle), nbytes };
+        return graph_input_staging[owner].handle.resolve(dev_id).ptr;
     }
 
-    bool graph_input_refresh(const char * name, const void * host_data, size_t nbytes, sycl::queue & q) {
+    bool graph_input_refresh(const ggml_tensor * owner, const void * host_data, size_t nbytes, sycl::queue & q) {
         int dev_id = -1;
         try {
             dev_id = ggml_sycl_get_device_id_from_queue(q);
@@ -6012,7 +6154,7 @@ struct ggml_backend_sycl_context {
 
         ggml_sycl::mem_handle dst_handle{};
         void *                dst_ptr = nullptr;
-        if (!graph_input_stage_lookup(name, nbytes, dev_id, &dst_handle, &dst_ptr) || !dst_ptr || !host_data) {
+        if (!graph_input_stage_lookup(owner, nbytes, dev_id, &dst_handle, &dst_ptr) || !dst_ptr || !host_data) {
             return false;
         }
 
@@ -6022,6 +6164,13 @@ struct ggml_backend_sycl_context {
         return true;
     }
 
+    // llama.cpp-dyi3: was previously defined but never called anywhere --
+    // graph_input_staging accumulated entries for the process lifetime with
+    // no reset across exec_graph re-records/invalidations. Now wired into
+    // sycl_exec_graph_clear_active() alongside the other per-generation
+    // input caches it already resets (cached_input_tensors, moe phase
+    // layout cache) -- a rare phase-boundary event, not a hot path, per
+    // that function's own comment.
     void graph_input_staging_clear(sycl::queue & q) {
         GGML_UNUSED(q);
         graph_input_staging.clear();
@@ -6654,6 +6803,26 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
+    // llama.cpp-dyi3: OBSERVED (not predicted) FA-kernel-family selection
+    // for decode-shape (ne01<=1) FLASH_ATTN_EXT dispatches, updated by the
+    // real dispatcher in fattn.cpp (ggml_sycl_flash_attn_ext_dispatch_ncols's
+    // dispatch_debug_kernel lambda) every time it selects a kernel. The
+    // SYCL-graph gate reads this instead of re-deriving eligibility from
+    // tensor shape in a second, independently-maintained classifier --
+    // "one check, one authority" (see the file's own dkw0/one-check-cannot-
+    // serve-two-authorities lesson). Monotonic and never reset: once any
+    // non-ESIMD-partitioned kernel is observed for a decode-shape FA op,
+    // auto-engagement stays disabled for the rest of this context's life
+    // (fail closed), matching FA graph replay having been verified only for
+    // the ESIMD partitioned decode kernel family.
+    struct fa_decode_kernel_observation {
+        uint64_t esimd_partitioned_count = 0;
+        uint64_t other_kernel_count      = 0;
+
+        bool all_esimd_partitioned() const { return esimd_partitioned_count > 0 && other_kernel_count == 0; }
+    };
+    fa_decode_kernel_observation fa_decode_kernel_obs;
+
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;
     std::vector<ggml_sycl::mem_handle>                      graph_weight_leases;
@@ -6670,10 +6839,17 @@ struct ggml_backend_sycl_context {
         const void * sinks                 = nullptr;
         const void * block_table           = nullptr;
         const void * seq_lens              = nullptr;
-        int64_t      q_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      k_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      v_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      dst_ne[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
+        int64_t      q_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      k_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      v_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      dst_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
+        // llama.cpp-dyi3: mask/sinks were pointer-checked only -- a shape
+        // change on either (e.g. gemma4's base vs SWA mask, which differ in
+        // ne[0]==n_kv) at the same pointer would silently replay stale
+        // extents. Tracked alongside q/k/v/dst so graph_fa_ptrs_match can
+        // catch it and force a re-record instead.
+        int64_t      mask_ne[GGML_MAX_DIMS]  = { 0, 0, 0, 0 };
+        int64_t      sinks_ne[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
     };
 
     std::vector<fa_graph_ptr_snapshot> fa_graph_ptrs;

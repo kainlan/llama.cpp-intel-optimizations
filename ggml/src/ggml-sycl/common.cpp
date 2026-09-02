@@ -240,10 +240,9 @@ void ggml_sycl_set_device_map(const int * device_ids, int device_count) {
     g_sycl_device_map_count = count;
 }
 
-int ggml_sycl_get_device_id_from_queue(sycl::queue & queue) {
+int ggml_sycl_get_device_id_from_device(const sycl::device & dev) {
     try {
-        sycl::device dev        = queue.get_device();
-        const int    dpct_count = static_cast<int>(dpct::dev_mgr::instance().device_count());
+        const int dpct_count = static_cast<int>(dpct::dev_mgr::instance().device_count());
         if (g_sycl_device_map_count > 0) {
             for (int i = 0; i < g_sycl_device_map_count && i < GGML_SYCL_MAX_DEVICES; ++i) {
                 const int dpct_id = g_sycl_device_map[i];
@@ -259,6 +258,14 @@ int ggml_sycl_get_device_id_from_queue(sycl::queue & queue) {
                 return i;
             }
         }
+    } catch (...) {
+    }
+    return dpct::dev_mgr::instance().current_device_id();
+}
+
+int ggml_sycl_get_device_id_from_queue(sycl::queue & queue) {
+    try {
+        return ggml_sycl_get_device_id_from_device(queue.get_device());
     } catch (...) {
     }
     return dpct::dev_mgr::instance().current_device_id();

@@ -10,10 +10,28 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <new>
+#include <string>
 #include <thread>
+#include <unordered_set>
 
 namespace ggml_sycl {
+
+// llama.cpp-dyi3: bisect wrapper -- see the comment on
+// ggml_sycl_graph_record_plain_mask() in common.hpp. Every call in this
+// file to the raw recording predicates is renamed to one of these two, so
+// GGML_SYCL_GRAPH_RECORD_PLAIN=memops forces this file's normally-
+// recording-aware allocation/copy decisions to take their plain path
+// without touching any other family.
+static inline bool mem_ops_graph_recording_active() {
+    return ggml_sycl_graph_recording_active() && !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_MEMOPS);
+}
+
+static inline bool mem_ops_graph_recording_this_thread() {
+    return ggml_sycl_graph_recording_this_thread() &&
+           !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_MEMOPS);
+}
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<uint64_t> g_mem_fill_profile_error_after_submit_count{ 0 };
@@ -463,8 +481,8 @@ static bool alloc_pinned_stage_handle(size_t        size,
                                       int           retries = 0) {
     // Read both predicates ONCE: recording state is dynamic, so sampling it a
     // second time for the trace could report a value the request never used.
-    const bool graph_self = ggml_sycl_graph_recording_this_thread();
-    const bool graph_any  = ggml_sycl_graph_recording_active();
+    const bool graph_self = mem_ops_graph_recording_this_thread();
+    const bool graph_any  = mem_ops_graph_recording_active();
 
     alloc_request req{};
     req.queue                               = &queue;
@@ -543,6 +561,35 @@ static sycl::event mem_copy_direct_submit(const mem_handle &               dst,
                                           const char * file               = __builtin_FILE(),
                                           int          line               = __builtin_LINE(),
                                           const char * function           = __builtin_FUNCTION()) {
+    // llama.cpp-dyi3 round 3b: census of copies that reach this NON-graph-
+    // capturable path (profile label "sycl.memcpy.mem_ops", as opposed to
+    // ggml_sycl_graph_safe_memcpy's "sycl.memcpy.graph_safe") while a SYCL
+    // command-graph recording is in progress. Per the lead's static read of
+    // the suspect list (rope.cpp:20, getrows.cpp:123/365/380/410/595/645/
+    // 2288/2312, set_rows.cpp:493, fattn.cpp:1047), a copy issued here
+    // during recording executes ONCE at record time and is never re-issued
+    // on replay -- if its destination is read by any replayed kernel, that
+    // kernel sees the record-time value forever. Warn once per call site
+    // (file:line default-captures the CALLER via __builtin_FILE/LINE, not
+    // this function's own location, for every caller that does not
+    // override those defaults) so this census does not have to be
+    // re-derived by hand; this does not fix anything by itself, it only
+    // names the suspects for round 3c to check individually.
+    if (ggml_sycl_graph_recording_active()) {
+        static std::unordered_set<std::string> warned_sites;
+        static std::mutex                      warned_sites_mutex;
+        char                                   site[256];
+        snprintf(site, sizeof(site), "%s:%d", file, line);
+        std::lock_guard<std::mutex> lock(warned_sites_mutex);
+        if (warned_sites.insert(site).second) {
+            GGML_LOG_WARN(
+                "[SYCL-GRAPH-CENSUS] mem_copy_direct_submit (non-capturable) called during recording at %s "
+                "(%s), size=%zu -- this copy's destination will be stale on every replay unless it is refreshed "
+                "some other way\n",
+                site, function, size);
+        }
+    }
+
     const int    queue_device = queue_device_or_host(queue);
     resolved_ptr d            = dst.resolve(queue_device);
     resolved_ptr s            = src.resolve(queue_device);

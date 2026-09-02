@@ -2888,6 +2888,34 @@ class unified_cache {
 
     size_t onednn_activations_scratch_size() const { return onednn_activations_scratch_size_; }
 
+#if GGML_SYCL_DNNL
+    // oneDNN Graph SYCL allocator backing (llama.cpp-gwno / S4 root cause,
+    // jmc5 c-uxch): the compiled SDPA partition's ~12 MiB scratch is allocated
+    // by oneDNN itself on every dnnl::graph::sycl_interop::execute() unless
+    // the engine is built with a dnnl::graph::allocator (see make_engine() in
+    // common.hpp). These two serve that allocator's malloc/free callbacks
+    // (onednn_graph_sycl_malloc/free, declared above) from the SAME ONEDNN
+    // VRAM zone reserve_onednn_scratch() already uses for the primitive-API
+    // path, so a request is a host-side TLSF suballocation, not a
+    // zeMemAllocDevice/xe_vm_bind round trip. Falls back to a real
+    // mem_handle-owned allocation only if the zone has no room.
+    void * onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q);
+    // `event` is the completion event oneDNN hands back for the compiled
+    // partition's submission (may be null in principle; oneDNN's SYCL interop
+    // always supplies one for a real execute). See the .cpp definition for why
+    // the ONEDNN-zone case reclaims immediately (in-order-queue safety) while
+    // the DIRECT-fallback case still defers via retain_handles_until_event --
+    // the two paths are NOT symmetric, and that's deliberate.
+    void   onednn_graph_scratch_free(void * ptr, const sycl::event * event);
+
+    // Peak bytes concurrently outstanding across every onednn_graph_scratch_alloc()
+    // call that had not yet been freed (zone-backed and DIRECT-fallback
+    // combined), high-water rather than current -- lets the lead's teardown
+    // log answer "did N MiB actually fit in the planned zone" for a run that
+    // already finished. Zero if the allocator was never used this process.
+    size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
+#endif
+
     struct pp_moe_onednn_scratch_slot {
         uint32_t   slot            = std::numeric_limits<uint32_t>::max();
         uint64_t   generation      = 0;
@@ -3530,16 +3558,58 @@ class unified_cache {
     // Pre-allocated to avoid per-op allocations that cause OOM with large contexts.
     // weights_scratch_: holds dequantized weights (max N*K*2 bytes)
     // activations_scratch_: holds converted activations (max M*K*2 bytes)
-    void *     onednn_weights_scratch_          = nullptr;
-    void *     onednn_activations_scratch_      = nullptr;
-    size_t     onednn_weights_scratch_size_     = 0;
-    size_t     onednn_activations_scratch_size_ = 0;
-    mem_handle onednn_weights_scratch_owner_;
-    mem_handle onednn_activations_scratch_owner_;
+    void *                  onednn_weights_scratch_          = nullptr;
+    void *                  onednn_activations_scratch_      = nullptr;
+    size_t                  onednn_weights_scratch_size_     = 0;
+    size_t                  onednn_activations_scratch_size_ = 0;
+    mem_handle              onednn_weights_scratch_owner_;
+    mem_handle              onednn_activations_scratch_owner_;
     std::mutex              onednn_scratch_mutex_;
     std::condition_variable onednn_scratch_cv_;
     uint64_t                onednn_scratch_generation_ = 0;
     uint32_t                onednn_scratch_refcount_   = 0;
+
+#if GGML_SYCL_DNNL
+    // State for onednn_graph_scratch_alloc/free() (llama.cpp-gwno). Separate
+    // mutex from onednn_scratch_mutex_ above: that one guards the
+    // weights+activations PAIR reservation (locked for the whole duration of a
+    // GEMM call via lock_onednn_scratch()); this one only ever guards a quick
+    // map lookup/insert around a zone_alloc/zone_free call, and the two must
+    // not become the same lock or a Graph SDPA call inside a locked GEMM
+    // region (or vice versa) would self-deadlock.
+    std::mutex                             onednn_graph_scratch_mutex_;
+    // Pointers currently on loan to oneDNN's Graph allocator that came from a
+    // DIRECT (non-arena) unified_alloc() fallback -- i.e. the ONEDNN zone had
+    // no room when they were allocated. Absence from this map means the
+    // pointer (if non-null and ours) came from the zone instead. Empty at
+    // steady state; only ever populated if the zone is under-sized for this
+    // model's concurrent within-ubatch Graph-scratch demand. Sized so free()
+    // has what it needs for retain_handles_until_event() bookkeeping and the
+    // high-water counter below (mem_handle itself doesn't expose a cheap size
+    // accessor here).
+    std::unordered_map<void *, mem_handle> onednn_graph_scratch_direct_owners_;
+    std::unordered_map<void *, size_t>     onednn_graph_scratch_direct_sizes_;
+    // Zone-backed pointers on loan: ptr -> requested size. The size is not
+    // needed by zone_free() itself (TLSF recovers it from the block header)
+    // -- it is tracked purely so free() can maintain the outstanding-bytes
+    // counter below without oneDNN having to pass it back (its free callback
+    // doesn't carry one).
+    std::unordered_map<void *, size_t>     onednn_graph_scratch_zone_sizes_;
+
+    // Concurrently-outstanding bytes (zone-backed + DIRECT-fallback
+    // combined) and its running peak, both updated under
+    // onednn_graph_scratch_mutex_ in lock-step with the two maps above.
+    // Exposed via onednn_graph_scratch_high_water_bytes() and logged once at
+    // cache teardown (shutdown_resources()) so a normal run answers "did the
+    // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB floor actually cover the concurrent
+    // demand" without a special env var or a live debugger.
+    size_t onednn_graph_scratch_outstanding_bytes_ = 0;
+    size_t onednn_graph_scratch_high_water_bytes_  = 0;
+
+    // Callers must hold onednn_graph_scratch_mutex_.
+    void note_onednn_graph_scratch_alloc_locked(size_t size);
+    void note_onednn_graph_scratch_free_locked(size_t size);
+#endif
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_retired_slots_;
@@ -3888,6 +3958,25 @@ unified_cache * get_unified_cache_for_device(int device_id);
 // Use from destructors and shutdown paths where creating a new cache would
 // re-enter allocator/static teardown.
 unified_cache * get_existing_unified_cache_for_device(int device_id);
+
+#if GGML_SYCL_DNNL
+// oneDNN Graph SYCL allocator callbacks (llama.cpp-gwno). Free functions, not
+// unified_cache members: dnnl_graph_sycl_interop_allocator_create() takes only
+// two bare function pointers -- no user-data slot to carry a `this` -- so
+// these resolve the owning unified_cache themselves (via the device oneDNN
+// hands back) and forward to unified_cache::onednn_graph_scratch_alloc/free().
+// Signatures match dnnl_graph_sycl_allocate_f / dnnl_graph_sycl_deallocate_f
+// (oneapi/dnnl/dnnl_graph_sycl.h) exactly; declared with the raw signature
+// here so this header does not need to include the dnnl Graph headers itself
+// -- only common.hpp, where they are actually passed to
+// dnnl::graph::sycl_interop::make_allocator(), needs those.
+void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev, const void * ctx);
+void   onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void * event);
+
+// GGML_SYCL_ONEDNN_CACHE_ALLOCATOR opt-out (default enabled). Checked once and
+// cached; see unified-cache.cpp for the env parse.
+bool onednn_graph_allocator_enabled();
+#endif
 
 // Overload with device memory hints — avoids ggml_sycl_info() reentry
 // deadlock when called from within ggml_sycl_init() static initialization.

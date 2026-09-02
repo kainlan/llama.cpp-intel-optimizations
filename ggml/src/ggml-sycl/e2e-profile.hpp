@@ -29,6 +29,23 @@ enum class e2e_tg_stage : uint8_t {
 struct e2e_tg_stage_accum {
     uint64_t    calls     = 0;
     double      host_us   = 0.0;
+    // HOST-ONLY INSTRUMENT: no call site supplies a device timestamp. The
+    // accumulator and its printed field work (test-sycl-e2e-profile.cpp feeds
+    // and reads back a non-zero value), and the one non-zero producer in the
+    // tree is a host-clock span -- e2e_tg_profile_record_transfer(
+    // "peer_host_bounce_measure", ...) passes the chrono time of a
+    // host-mediated peer-link bounce copy as `device_us` -- so this field is
+    // not universally 0.0, but it is never a SYCL device timestamp. Reading
+    // sycl::event::get_profiling_info<command_start/command_end> at the
+    // per-op e2e_tg_scope bracket would be an implicit host wait on an
+    // incomplete event, which the no-host-waits rule forbids on the dispatch
+    // path (the assert_no_waits source guards in
+    // tests/test-sycl-e2e-profile-compute-forward-source.py and
+    // -fattn-source.py fail that region on any wait). GGML_SYCL_KERNEL_PROFILE
+    // (sycl-kernel-profiler.hpp) gets real device time by deferring the
+    // profiling read to its own flush point; this instrument has no such
+    // mechanism. Use the kernel profiler for device time; treat `device_us`
+    // here as host-only unless a caller documents otherwise.
     double      device_us = 0.0;
     uint64_t    bytes     = 0;
     std::string last_path = "unknown";
@@ -54,6 +71,11 @@ bool         e2e_tg_profile_enabled_from_env(const char * env);
 bool         e2e_tg_profile_enabled();
 const char * e2e_tg_stage_name(e2e_tg_stage stage);
 e2e_tg_stage e2e_tg_stage_from_op(ggml_op op, const char * tensor_name);
+// `device_us`: see e2e_tg_stage_accum::device_us above -- no caller supplies
+// a device timestamp today (the one non-zero producer forwards a host chrono
+// span through e2e_tg_profile_record_transfer). A future caller with a
+// non-blocking way to measure device time (a deferred/pending-event flush
+// like the kernel profiler's) can supply one without further plumbing.
 void         e2e_tg_profile_record(e2e_tg_stage stage,
                                    const char * path,
                                    double       host_us,
@@ -83,6 +105,10 @@ void         e2e_tg_profile_flush_for_tests(FILE * out);
 // Read-only diagnostic snapshot: safe ABI allowlist entry.
 e2e_tg_profile_snapshot e2e_tg_profile_snapshot_for_tests();
 
+// llama.cpp-qmen: this scope is HOST-CLOCK ONLY -- its destructor always
+// records device_us=0.0 (see e2e_tg_stage_accum::device_us above for why
+// that is a deliberate, documented limitation rather than an oversight).
+// host_us is real and is the primary signal this instrument provides.
 class e2e_tg_scope {
   public:
     e2e_tg_scope(e2e_tg_stage stage, const char * path, bool enabled = e2e_tg_profile_enabled()) :

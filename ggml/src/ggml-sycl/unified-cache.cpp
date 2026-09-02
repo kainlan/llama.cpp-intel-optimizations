@@ -1510,11 +1510,78 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
+#if GGML_SYCL_DNNL
+// llama.cpp-gwno: extra headroom for onednn_graph_scratch_alloc() (the Graph
+// API SDPA allocator, unified_cache::onednn_graph_scratch_alloc/free above),
+// ADDITIVE on top of the primitive-API weights+activations pair below -- both
+// can be resident in the ONEDNN zone at once, and the weights+activations
+// pair is not released between calls once grown large enough, so this cannot
+// be a max() of the two.
+//
+// Sized for at most a HANDFUL of buffers outstanding, not the whole ubatch's
+// worth. That used to be the wrong mental model here: an earlier version of
+// this comment sized the floor for N compiled-partition scratch buffers
+// concurrently outstanding across a ubatch's 35 SDPA calls (512 MiB, for
+// "~12 MiB/layer x <=40 layers"). That was true only while
+// onednn_graph_scratch_free() deferred reclaiming a buffer until its
+// completion event fired -- it no longer does. Since the fix that dropped
+// the blocking event_complete() check from the zone-backed free path (see
+// unified_cache::onednn_graph_scratch_free()'s "in-order-queue" comment),
+// zone_free()/zone_alloc() are synchronous and immediate, so at most ~1
+// buffer is outstanding at a time in practice. Measured high-water
+// (onednn_graph_scratch_high_water_bytes(), logged once at cache teardown):
+// 12.0 MB on a B70 gemma4 pp512 run, 3.0 MB on a B50 two-model
+// (gemma4-Q8_0 + mistral-Q4_0) GGML_SYCL_STRICT_LEASES=1 run. Default 64 MiB
+// is ~5 buffers of headroom over the largest of those, not 40 layers' worth.
+//
+// The old 512 MiB default was not just wasteful, it was an active landing
+// blocker: a second model's load-time zone-growth request (weights+
+// activations pair 143.5 MB + this 512 MB floor = 655.5 MB) could exceed
+// what ensure_planned_arena_zones() can grow into while the FIRST model's
+// leases are still live and pinning the arena -- aborting with "[VRAM-ARENA]
+// planned zones exceed active arena but live allocations prevent rebuild"
+// on a two-model GGML_SYCL_STRICT_LEASES=1 run that passes on master (which
+// never needs this zone to grow at all). 64 MiB clears that same run with
+// rc=0 and margin (measured high-water on it: 3.0 MB).
+//
+// There is still no cheap, GPU-verifiable way to derive an exact
+// per-model/quant floor from this call site (that would need the same
+// structural (type, ne) classification zone-sizing.hpp already does for the
+// primitive-API pair, extended to a new consumer this change does not
+// attempt), so this stays a flat, env-tunable floor. If the lead's uprobe
+// (zeMemAllocDevice count during the benchmark phase) is nonzero, or a
+// two-model/strict-leases run aborts sizing the arena, check the "did not
+// fit the ONEDNN zone" warning first (unified_cache::onednn_graph_scratch_alloc)
+// before raising GGML_SYCL_ONEDNN_GRAPH_ZONE_MB back up -- a nonzero uprobe
+// count or a sizing abort means the zone genuinely doesn't fit this
+// workload's outstanding-buffer count, not that the allocator is unwired.
+static size_t onednn_graph_scratch_zone_floor_bytes() {
+    static const size_t floor_bytes = [] {
+        size_t       mb  = 64;
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
+        if (env && env[0] != '\0') {
+            long parsed = std::atol(env);
+            if (parsed >= 0) {
+                mb = static_cast<size_t>(parsed);
+            }
+        }
+        return mb * 1024ull * 1024ull;
+    }();
+    return floor_bytes;
+}
+#endif
+
 size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return 0;
     }
-    return g_planned_onednn_scratchpad_bytes[device_id].load(std::memory_order_acquire);
+    size_t bytes = g_planned_onednn_scratchpad_bytes[device_id].load(std::memory_order_acquire);
+#if GGML_SYCL_DNNL
+    if (ggml_sycl::onednn_graph_allocator_enabled()) {
+        bytes += onednn_graph_scratch_zone_floor_bytes();
+    }
+#endif
+    return bytes;
 }
 
 void unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
@@ -3702,6 +3769,19 @@ bool unified_cache::shutdown_resources() {
                     ggml_sycl::zone_sizing_observation_count("onednn"),
                     ggml_sycl::zone_sizing_underestimate_count("onednn"));
     (void) ggml_sycl::zone_sizing_log_underestimate_summary();
+
+#if GGML_SYCL_DNNL
+    // llama.cpp-gwno: same "silent unless interesting" convention as the zone
+    // sizing summary just above -- absent on a run that never used the Graph
+    // allocator, present (INFO, not DEBUG, so a normal run shows it without
+    // GGML_SYCL_DEBUG=1) on any run that did, answering "did the concurrent
+    // within-ubatch demand actually fit GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" from
+    // a finished run's log alone.
+    if (onednn_graph_scratch_high_water_bytes_ > 0) {
+        GGML_LOG_INFO("[UNIFIED-CACHE] oneDNN Graph scratch high-water: %.1f MB\n",
+                      onednn_graph_scratch_high_water_bytes_ / (1024.0 * 1024.0));
+    }
+#endif
 
     // Stop the prefetch worker thread first (before any resource cleanup).
     // This is safe even if the SYCL runtime is shutting down since the worker
@@ -9369,6 +9449,235 @@ bool unified_cache::event_complete(const sycl::event & evt) {
         return false;
     }
 }
+
+#if GGML_SYCL_DNNL
+// llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations
+// in unified-cache.hpp for the design rationale.
+//
+void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q) {
+    if (size == 0 || q == nullptr) {
+        return nullptr;
+    }
+    const size_t align = (alignment != 0) ? alignment : 256;
+
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+
+    if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, align)) {
+        onednn_graph_scratch_zone_sizes_[ptr] = size;
+        note_onednn_graph_scratch_alloc_locked(size);
+        return ptr;
+    }
+
+    // The ONEDNN zone had no room for this request -- either it is not
+    // planned yet (arena not active), or a request's peak concurrent
+    // within-ubatch demand exceeded the planned size (see
+    // unified_cache_get_planned_onednn_scratchpad_bytes()'s Graph-scratch
+    // floor). Fall back to a real mem_handle-owned allocation so correctness
+    // is preserved; this reintroduces exactly the zeMemAllocDevice round trip
+    // this change exists to avoid, so it is logged once (not per-call) so
+    // under-sizing is visible without flooding the log on every SDPA call.
+    static std::atomic<bool> warned{ false };
+    if (!warned.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB did not fit the ONEDNN zone -- falling back to a "
+            "direct allocation (only logged once). This defeats the point of the Graph allocator cache; raise "
+            "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB if this repeats.\n",
+            size / (1024.0 * 1024.0));
+    }
+
+    alloc_request req{};
+    req.queue                               = q;
+    req.device                              = ggml_sycl_get_device_id_from_queue(*q);
+    req.size                                = size;
+    req.alignment                           = align;
+    req.intent.role                         = alloc_role::COMPUTE;
+    req.intent.category                     = runtime_category::COMPUTE;
+    req.intent.cohort_id                    = "onednn_graph_scratch_direct";
+    req.intent.constraints.must_device      = true;
+    req.intent.constraints.prefer_vram_zone = vram_zone_id::COUNT;  // zone is already known to be too small
+    req.suppress_failure_log                = true;
+
+    alloc_handle handle{};
+    if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
+        return nullptr;
+    }
+    mem_handle owner    = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
+    auto       resolved = owner.resolve(req.device);
+    if (!resolved.ptr || !resolved.on_device) {
+        return nullptr;  // owner destructs here, releasing the allocation
+    }
+    void * direct_ptr                               = resolved.ptr;
+    onednn_graph_scratch_direct_owners_[direct_ptr] = std::move(owner);
+    onednn_graph_scratch_direct_sizes_[direct_ptr]  = size;
+    note_onednn_graph_scratch_alloc_locked(size);
+    return direct_ptr;
+}
+
+void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * event) {
+    if (!ptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+
+    auto direct_it = onednn_graph_scratch_direct_owners_.find(ptr);
+    if (direct_it != onednn_graph_scratch_direct_owners_.end()) {
+        // DIRECT (non-arena) allocation: a real, individually mem_handle-owned
+        // allocation from unified_alloc(), not a zone suballocation -- the
+        // ONLY lifetime guard available for it is the handle itself (mirrors
+        // reserve_onednn_scratch's defer_published_direct_release,
+        // llama.cpp-ndn9). Always deferred through retain_handles_until_event():
+        // unlike the zone path below, immediate reclaim here is NOT backed by
+        // an in-order-queue argument (a DIRECT block, once released, goes back
+        // to the unified cache's general pool, not straight back into this
+        // allocator's own reuse loop, so nothing pins its next consumer to the
+        // same queue as its last one) -- so an event-gated release is the only
+        // correct option. retain_handles_until_event() hands the wait to the
+        // cache's existing background drain worker rather than polling here.
+        mem_handle owner = std::move(direct_it->second);
+        onednn_graph_scratch_direct_owners_.erase(direct_it);
+        auto size_it = onednn_graph_scratch_direct_sizes_.find(ptr);
+        if (size_it != onednn_graph_scratch_direct_sizes_.end()) {
+            note_onednn_graph_scratch_free_locked(size_it->second);
+            onednn_graph_scratch_direct_sizes_.erase(size_it);
+        }
+        if (event) {
+            retain_handles_until_event({ std::move(owner) }, *event);
+        }
+        // else: no event given -- owner destructs here, releasing immediately
+        // through the cache. oneDNN's SYCL interop always supplies an event
+        // for a real free(); this branch only matters if that ever changes.
+        return;
+    }
+
+    auto zone_it = onednn_graph_scratch_zone_sizes_.find(ptr);
+    if (zone_it == onednn_graph_scratch_zone_sizes_.end()) {
+        GGML_LOG_WARN("[UNIFIED-CACHE] oneDNN Graph allocator free() for untracked pointer %p -- ignoring\n", ptr);
+        return;
+    }
+
+    // Zone-backed suballocation: return it to the ONEDNN zone's TLSF free
+    // list IMMEDIATELY -- deliberately, with NO event wait or completion
+    // check of any kind (an earlier version of this function called
+    // event_complete() here on every free(), which BLOCKS rather than polls
+    // on this queue -- see below -- turning every free() into a synchronous
+    // wait for that op's device completion; that defeated much of the point
+    // of this whole change and is why this function no longer touches an
+    // event at all on this path).
+    //
+    // This is safe by construction, not by omission: the ONLY consumer of a
+    // Graph-scratch buffer is a dnnl::graph::sycl_interop::execute() call
+    // built on stream_dnnl(qptr), where qptr == ctx.stream() == this
+    // allocator's own cache->get_queue() -- the SAME in-order compute queue
+    // for every SDPA call, every layer, every ubatch. A later zone_alloc()
+    // that hands this same block to a NEW execute() submits that execute's
+    // kernels on that identical queue, so the device enforces "finish reading
+    // the old contents before writing the new ones" via plain in-order
+    // submission order -- exactly the guarantee an event wait would have
+    // bought us, already free.
+    //
+    // THE ASSUMPTION THIS RESTS ON, AND MUST KEEP HOLDING: every consumer of
+    // a zone-backed Graph-scratch buffer submits on ctx.stream() and nothing
+    // else -- no DMA queue, no BCS queue, no second device, no second
+    // concurrent graph reading it out-of-band. If oneDNN, a future
+    // engine-construction change, or a multi-queue/multi-graph execution path
+    // ever lets a DIFFERENT queue touch one of these buffers, this reasoning
+    // breaks and immediate reuse becomes a real race -- at that point this
+    // needs a genuinely non-blocking completion check, e.g. the dma_queue_
+    // pattern (see get_dma_queue()'s comment above): a dedicated
+    // NON-profiling queue whose events CAN be polled via
+    // event.get_info<command_execution_status>() without blocking, unlike
+    // every other backend stream (profiling-enabled, where that same query
+    // blocks instead of polling -- the exact hazard this function used to
+    // walk into).
+    note_onednn_graph_scratch_free_locked(zone_it->second);
+    onednn_graph_scratch_zone_sizes_.erase(zone_it);
+    zone_free(vram_zone_id::ONEDNN, ptr);
+}
+
+void unified_cache::note_onednn_graph_scratch_alloc_locked(size_t size) {
+    onednn_graph_scratch_outstanding_bytes_ += size;
+    if (onednn_graph_scratch_outstanding_bytes_ > onednn_graph_scratch_high_water_bytes_) {
+        onednn_graph_scratch_high_water_bytes_ = onednn_graph_scratch_outstanding_bytes_;
+    }
+}
+
+void unified_cache::note_onednn_graph_scratch_free_locked(size_t size) {
+    onednn_graph_scratch_outstanding_bytes_ -= std::min(size, onednn_graph_scratch_outstanding_bytes_);
+}
+
+bool onednn_graph_allocator_enabled() {
+    // Read once and cache: this is consulted from make_engine() at engine
+    // construction (once per queue, not per op), but it is also on the
+    // callback registration path, so keep it cheap and stable for the life of
+    // the process rather than re-parsing getenv() on every engine build.
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_CACHE_ALLOCATOR");
+        return !env || env[0] == '\0' || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Both callbacks receive `dev`/`ctx` pointing at oneDNN's OWN copies of the
+// sycl::device/sycl::context passed to make_engine_with_allocator() (see the
+// header comment on the declarations) — never assume any other device or
+// context, in particular never substitute a platform default context, or a
+// pointer allocated against one context can be freed against another.
+void * onednn_graph_sycl_malloc(size_t size, size_t alignment, const void * dev, const void * ctx) {
+    if (size == 0 || dev == nullptr || ctx == nullptr) {
+        return nullptr;
+    }
+    try {
+        const sycl::device &  sycl_dev  = *static_cast<const sycl::device *>(dev);
+        const sycl::context & sycl_ctx  = *static_cast<const sycl::context *>(ctx);
+        const int             device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
+        unified_cache *       cache     = get_existing_unified_cache_for_device(device_id);
+        if (!cache) {
+            // No cache yet for this device (should not happen in practice --
+            // the engine that reaches this callback is built from a queue the
+            // cache already owns -- but fail safe rather than dereference a
+            // null cache): fall back to a raw USM allocation against oneDNN's
+            // own device+context so correctness is preserved.
+            return sycl::aligned_alloc_device(alignment ? alignment : 256, size, sycl_dev, sycl_ctx);
+        }
+        return cache->onednn_graph_scratch_alloc(size, alignment, &cache->get_queue());
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void onednn_graph_sycl_free(void * buf, const void * dev, const void * ctx, void * event) {
+    if (buf == nullptr || dev == nullptr || ctx == nullptr) {
+        return;
+    }
+    try {
+        const sycl::event *   ev        = static_cast<const sycl::event *>(event);
+        const sycl::device &  sycl_dev  = *static_cast<const sycl::device *>(dev);
+        const sycl::context & sycl_ctx  = *static_cast<const sycl::context *>(ctx);
+        const int             device_id = ggml_sycl_get_device_id_from_device(sycl_dev);
+        unified_cache *       cache     = get_existing_unified_cache_for_device(device_id);
+        if (!cache) {
+            // Mirrors the malloc() fallback above: this pointer can only have
+            // come from that same sycl::aligned_alloc_device() branch (the
+            // cache path allocates all its own pointers, tracked internally).
+            // Wait for the event before freeing -- there is no owning cache
+            // to defer the release for us, and freeing memory the compiled
+            // partition may still be reading would corrupt results.
+            if (ev) {
+                try {
+                    sycl::event ev_copy = *ev;  // sycl::event::wait() is non-const
+                    ev_copy.wait();
+                } catch (...) {
+                }
+            }
+            sycl::free(buf, sycl_ctx);
+            return;
+        }
+        cache->onednn_graph_scratch_free(buf, ev);
+    } catch (...) {
+    }
+}
+#endif  // GGML_SYCL_DNNL
 
 sycl::event unified_cache::submit_barrier(const std::vector<sycl::event> & deps) {
     if (deps.empty()) {

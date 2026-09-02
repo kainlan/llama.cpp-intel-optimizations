@@ -40,6 +40,7 @@
 #include <numeric>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -444,12 +445,42 @@ static bool ggml_sycl_graph_diag_enabled() {
     return enabled;
 }
 
-static bool ggml_sycl_flash_attn_graph_allow_enabled() {
-    static const bool enabled = [] {
+// llama.cpp-dyi3: GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW is a three-way override.
+// Owner ruling (round 5, decode replay proven wrong -- see task comment
+// log): default UNSET is FORCE_OFF -- today's master behavior -- until
+// replay is proven correct; the observation-gated AUTO mode is opt-in via
+// the literal string "auto" (engage only for FA nodes this dispatcher has
+// observed reaching the graph-replay-safe ESIMD partitioned decode kernel,
+// see fa_decode_kernel_observation in common.hpp); "1" (or any nonzero
+// integer) force-engages the graph regardless of the observation (the
+// original diagnostic-only behavior, kept for other FA shapes/paths that
+// were never verified replay-safe -- oneDNN SDPA, tile_d512, non-ESIMD);
+// "0" (or any other value) is an explicit force-off, same as unset. This
+// was AUTO-by-default until this ruling -- Mistral's decode shape may be
+// esimd-only and would have passed the observation gate on a model this
+// task never verified against, so AUTO must not be reachable without an
+// explicit opt-in while replay correctness is still open.
+enum class ggml_sycl_fa_graph_allow_mode { AUTO, FORCE_ON, FORCE_OFF };
+
+static ggml_sycl_fa_graph_allow_mode ggml_sycl_flash_attn_graph_allow_mode() {
+    static const ggml_sycl_fa_graph_allow_mode mode = [] {
         const char * env = std::getenv("GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW");
-        return env && std::atoi(env) != 0;
+        if (!env || env[0] == '\0') {
+            return ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
+        }
+        if (std::strcmp(env, "auto") == 0) {
+            return ggml_sycl_fa_graph_allow_mode::AUTO;
+        }
+        return std::atoi(env) != 0 ? ggml_sycl_fa_graph_allow_mode::FORCE_ON : ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
     }();
-    return enabled;
+    return mode;
+}
+
+// Preserved as FORCE_ON-only for the moe_graphlet_replay_probe call site
+// below, whose own FA-replay-safety this task does not verify -- that path
+// keeps requiring the explicit force, unaffected by the new AUTO default.
+static bool ggml_sycl_flash_attn_graph_allow_enabled() {
+    return ggml_sycl_flash_attn_graph_allow_mode() == ggml_sycl_fa_graph_allow_mode::FORCE_ON;
 }
 
 static bool ggml_sycl_non_fa_attn_graph_allow_enabled() {
@@ -458,6 +489,53 @@ static bool ggml_sycl_non_fa_attn_graph_allow_enabled() {
         return env && std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+// llama.cpp-dyi3: verify every FLASH_ATTN_EXT node's mask/sinks dependency
+// is provably refreshable across graph replay, instead of assuming it based
+// on this task's read of today's llama-graph.cpp/llama-kv-cache.cpp. A
+// tensor is refresh-safe if it is either (a) sycl::usm::alloc::device --
+// refreshed every token by the backend-agnostic ggml_backend_tensor_set
+// before graph_compute is even invoked, at a stable per-tensor address
+// (see task comment c-wbw9, points 2-4), or (b) GGML_TENSOR_FLAG_INPUT +
+// named, so graph_refresh_input_tensors' discovery/refresh path covers it.
+// Anything else is the exact "per-token-varying leaf nobody flagged"
+// hazard the file's own dkw0 defect #4 comment warns about
+// (ggml-sycl.cpp:92977-92990 as of this task) -- fail closed rather than
+// silently replay it. Only called pre-record (see call site), so this
+// O(n_nodes) scan does not run on the steady-state replay hot path.
+static bool ggml_sycl_fa_mask_sinks_refresh_safe(const ggml_cgraph * cgraph) {
+    if (!cgraph) {
+        return false;
+    }
+    auto tensor_refresh_safe = [](const ggml_tensor * t) -> bool {
+        if (!t) {
+            return true;  // absent (e.g. no attention sinks) is trivially safe
+        }
+        if (!t->data) {
+            return false;
+        }
+        sycl::usm::alloc alloc_kind = sycl::usm::alloc::unknown;
+        try {
+            alloc_kind = ggml_sycl_get_alloc_type(t->data);
+        } catch (...) {
+            // Query failure: do not assume safety.
+        }
+        if (alloc_kind == sycl::usm::alloc::device) {
+            return true;
+        }
+        return (t->flags & GGML_TENSOR_FLAG_INPUT) && t->name && t->name[0] != '\0';
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!node || node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        if (!tensor_refresh_safe(node->src[3]) || !tensor_refresh_safe(node->src[4])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ggml_sycl_graph_has_op(const ggml_cgraph * cgraph, enum ggml_op op) {
@@ -703,6 +781,214 @@ static void ggml_sycl_graph_diag_report(const char * phase, bool use_graph, cons
                                          0.0, 0, 1);
     }
     ggml_sycl_sequence_graphlet_summary_report(phase, false);
+}
+
+// llama.cpp-dyi3: opt-in decisive-experiment probe for the decode FA
+// graph-replay divergence. Kept as a permanent diagnostic (owner decision,
+// task comment log) -- zero overhead when GGML_SYCL_GRAPH_REPLAY_PROBE is
+// unset. For the first GGML_SYCL_GRAPH_REPLAY_PROBE_LIMIT (default 4)
+// decode-phase graph_compute calls of the process, walks the cgraph's
+// leafs/nodes/srcs, substring-matches tensor names against
+// GGML_SYCL_GRAPH_REPLAY_PROBE_NAMES (comma-separated; falls back to a
+// built-in default list covering the embedding, per-layer-embedding
+// selection, Q projection, attention mask, KV cache, attention output, and
+// logits stages), and for each match does a synchronous device->host
+// readback and prints op, shape, sum/abs_sum/sq_sum (same convention as
+// common/debug.cpp's common_debug_cb_eval, so a transcript reads the same
+// way), and the first 4 decoded values. F32/F16/I32 only; other types are
+// noted and skipped rather than silently omitted.
+//
+// Method (task comment log on llama.cpp-dyi3): run once with
+// GGML_SYCL_DISABLE_GRAPH=1 and once with GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1
+// (both with GGML_SYCL_GRAPH_REPLAY_PROBE=1), diff the two dumps by matching
+// call index -- the first tensor whose sq_sum differs at the SAME decode
+// step names the un-refreshed input. Call site: graph_diag_report_once (see
+// ggml_backend_sycl_graph_compute_impl), which already fires exactly once
+// per call after whichever path (record, replay, or disabled) actually
+// computed -- this reads RESULTS, not inputs, deliberately: an un-refreshed
+// input corrupts everything downstream of the first op that reads it, so
+// reading post-compute tensors still localizes the fault to "the first name
+// in this list whose value diverges," even though the actual defect is
+// upstream of that tensor's own computation. The pointer is resolved via
+// ggml_sycl_resolve_tensor_ptr(), the same generic resolution path replay
+// itself uses -- not tensor->data blindly.
+static bool ggml_sycl_graph_replay_probe_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_SYCL_GRAPH_REPLAY_PROBE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static const std::vector<std::string> & ggml_sycl_graph_replay_probe_names() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> result;
+        if (const char * env = std::getenv("GGML_SYCL_GRAPH_REPLAY_PROBE_NAMES")) {
+            std::stringstream ss(env);
+            std::string       tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) {
+                    result.push_back(tok);
+                }
+            }
+        }
+        if (result.empty()) {
+            result = {
+                "embd",        "inp_per_layer_selected",
+                "inp_scaled",  "Qcur",
+                "Qcur_pos",    "attn_inp_kq_mask",
+                "kq_mask",     "cache_k_l0",
+                "cache_v_l0",  "kqv_out",
+                "ffn_out",     "per_layer_embd",
+                "result_norm", "result_output",
+                "inp_out_ids", "inp_pos",
+            };
+        }
+        return result;
+    }();
+    return names;
+}
+
+static void ggml_sycl_graph_replay_probe_dump(ggml_backend_sycl_context * ctx,
+                                              ggml_cgraph *               cgraph,
+                                              bool                        is_decode,
+                                              bool                        used_graph_replay) {
+    if (!ggml_sycl_graph_replay_probe_enabled() || !is_decode || !ctx || !cgraph) {
+        return;
+    }
+    static const int limit = [] {
+        const char * env = std::getenv("GGML_SYCL_GRAPH_REPLAY_PROBE_LIMIT");
+        return env ? std::atoi(env) : 4;
+    }();
+    static std::atomic<int> call_count{ 0 };
+    const int               call_idx = call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (call_idx > limit) {
+        return;
+    }
+    const std::vector<std::string> & patterns = ggml_sycl_graph_replay_probe_names();
+    sycl::queue *                    q        = ctx->stream();
+    if (!q) {
+        return;
+    }
+    auto dump_one = [&](const ggml_tensor * t) {
+        if (!t || !t->data) {
+            return;
+        }
+        void * dev_ptr = ggml_sycl_resolve_tensor_ptr(t, ctx->device);
+        if (!dev_ptr) {
+            fprintf(stderr, "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s: pointer unresolved\n",
+                    call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op));
+            return;
+        }
+        // sum/abs_sum/sq_sum mirror common/debug.cpp's common_debug_cb_eval
+        // convention deliberately (see that file's llama.cpp-dkw0 comment):
+        // sum alone is cancellation-prone; abs_sum (L1) and sq_sum (L2
+        // squared) are monotonic in per-element magnitude and cannot be
+        // faked by sign cancellation, so a real divergence always shows up
+        // in them even when a mixed-sign tensor's plain sum looks clean.
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_I32) {
+            fprintf(stderr,
+                    "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s type=%d: unsupported type, "
+                    "skipped\n",
+                    call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op), (int) t->type);
+            return;
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        if (nbytes == 0) {
+            return;
+        }
+        std::vector<uint8_t> host_buf(nbytes);
+        try {
+            q->memcpy(host_buf.data(), dev_ptr, nbytes).wait_and_throw();
+        } catch (const sycl::exception & exc) {
+            fprintf(stderr, "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s: readback failed: %s\n",
+                    call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op), exc.what());
+            return;
+        }
+        const int64_t nelements = ggml_nelements(t);
+        // llama.cpp-dyi3: masks are F16 with -inf entries by construction
+        // (invalid/masked-out KV positions), which poisons a naive sum/sq_sum
+        // to -inf/NaN and hides any real divergence underneath. finite_count
+        // (the number of non-inf/non-NaN entries -- for a causal mask, the
+        // count of currently-valid KV columns) is tracked separately, and
+        // sum/abs_sum/sq_sum only accumulate over finite values so they stay
+        // informative for masks too, not just the F32/I32 tensors that were
+        // finite everywhere already.
+        double        sum = 0.0, abs_sum = 0.0, sq_sum = 0.0;
+        int64_t       finite_count = 0;
+        char          first4[160]  = "?";
+        int           off          = 0;
+        auto          elem_f32     = [&](int64_t i) -> double {
+            if (t->type == GGML_TYPE_F32) {
+                return reinterpret_cast<const float *>(host_buf.data())[i];
+            }
+            if (t->type == GGML_TYPE_F16) {
+                return (double) ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(host_buf.data())[i]);
+            }
+            return (double) reinterpret_cast<const int32_t *>(host_buf.data())[i];
+        };
+        for (int64_t i = 0; i < nelements; ++i) {
+            const double v = elem_f32(i);
+            if (std::isfinite(v)) {
+                sum += v;
+                abs_sum += std::fabs(v);
+                sq_sum += v * v;
+                finite_count++;
+            }
+            if (i < 4) {
+                off += snprintf(first4 + off, sizeof(first4) - off, "%s%.6g", i ? "," : "", v);
+            }
+        }
+        // llama.cpp-dyi3 round 4: the lead's new hypothesis is that the
+        // recorded command list bakes in a SCRATCH/intermediate tensor's
+        // device address (or view offset) at record time, and the ggml
+        // graph allocator reassigns it on a later token even though "graphs
+        // reused" holds for the leaf/graph OBJECTS. That is a pointer/
+        // stride story, not a value story -- print it directly instead of
+        // inferring it from a value mismatch: t->data (the logical pointer
+        // ggml itself tracks), the resolved device pointer (what the
+        // recorded kernel actually captured), the view root's byte offset
+        // (ggml_sycl_view_root_and_offset -- 0 and view_root==t for a
+        // non-view tensor), and nb[] (row/plane/batch strides). Any of
+        // these changing between calls in the SAME exec_graph generation
+        // while the recorded kernel still holds the OLD value is the bug.
+        size_t              view_offs = 0;
+        const ggml_tensor * view_root = ggml_sycl_view_root_and_offset(t, view_offs);
+        fprintf(stderr,
+                "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
+                "nb=[%zu,%zu,%zu,%zu] data=%p dev_ptr=%p view_root=%p view_offs=%zu "
+                "nelements=%lld finite_count=%lld sum=%f abs_sum=%f sq_sum=%f first4=%s\n",
+                call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op), (int) t->type, (long long) t->ne[0],
+                (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2],
+                t->nb[3], t->data, dev_ptr, (const void *) view_root, view_offs, (long long) nelements,
+                (long long) finite_count, sum, abs_sum, sq_sum, first4);
+    };
+    // De-dup: gemma4's mask/idx tensors are shared by every layer's FA node
+    // (same object, same name), so a plain node scan would print it ~20x.
+    std::unordered_set<const ggml_tensor *> dumped;
+    auto                                    maybe_dump = [&](const ggml_tensor * t) {
+        if (!t || !t->name[0] || !dumped.insert(t).second) {
+            return;
+        }
+        for (const std::string & pat : patterns) {
+            if (std::strstr(t->name, pat.c_str())) {
+                dump_one(t);
+                return;
+            }
+        }
+    };
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        maybe_dump(cgraph->leafs[i]);
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        maybe_dump(node);
+        if (node) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                maybe_dump(node->src[s]);
+            }
+        }
+    }
 }
 
 static void ggml_sycl_moe_aggregation_diag(ggml_backend_sycl_context * sycl_ctx,
@@ -32986,6 +33272,41 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
             dst_size = src_size;
         }
     }
+    // llama.cpp-dyi3 round 6 (root cause, task comment log): this fast path
+    // used to live AFTER the recording gate below, only reachable on the
+    // non-recording side. gemma4's kmeq BF16->F32 materialization
+    // (~line 60095, "<name>.bf16_materialized_f32") builds a stack-local
+    // alias tensor with extra=nullptr and data pointing at the already-
+    // materialized F32 device buffer, keyed under a synthesized cache name
+    // that is DESIGNED to miss cache->get_view() (kmeq's own comment).
+    // Under recording the old gate below tried only get_view(), missed by
+    // design, and returned nullptr -- silently failing MUL_MAT dispatch for
+    // gemma4's per-layer-embedding projection on every recorded/replayed
+    // decode token. This rule is the correct, general answer regardless of
+    // recording state: a device-resident, non-host-preferred source is
+    // already directly usable, no allocation or cache entry needed. Placed
+    // ahead of the "Host placement" block below, so used_host_layout is
+    // trivially false here -- it can only become true when !src_is_device
+    // (line ~33306's own guard), which is mutually exclusive with this
+    // rule's src_is_device requirement, so the ordering does not change
+    // which case reaches the host-placement branch versus this one.
+    if (src_is_device && !request_prefer_host) {
+        if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
+                extra->layout.device_id == device && extra->layout.size >= dst_size) {
+                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
+                                                   extra->layout.size, xmx_info, onednn_pack_m);
+                return extra->layout.data_ptr;
+            }
+        }
+        if (resolved == GGML_LAYOUT_AOS) {
+            if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
+                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, const_cast<void *>(src_ptr),
+                                                   src_size, xmx_info, onednn_pack_m);
+            }
+            return const_cast<void *>(src_ptr);
+        }
+    }
     if (ggml_sycl_graph_recording_active()) {
         ggml_sycl::cache_ptr_view view = cache->get_view(cache_key, resolved);
         if (view.ptr) {
@@ -33073,26 +33394,6 @@ void * ggml_sycl_get_weight_layout_ptr(const ggml_tensor * tensor, int device, l
                         host_pinned ? 1 : 0);
                 }
             }
-        }
-    }
-    // Fast path: if the tensor is already device-resident in the requested layout,
-    // reuse that storage directly instead of creating a duplicate unified-cache entry.
-    // Duplicating pre-transformed weights can exhaust VRAM before warmup/decode.
-    if (!used_host_layout && src_is_device && !request_prefer_host) {
-        if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-            if (extra->layout.data_ptr != nullptr && extra->layout.mode == resolved &&
-                extra->layout.device_id == device && extra->layout.size >= dst_size) {
-                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, extra->layout.data_ptr,
-                                                   extra->layout.size, xmx_info, onednn_pack_m);
-                return extra->layout.data_ptr;
-            }
-        }
-        if (resolved == GGML_LAYOUT_AOS) {
-            if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-                ggml_sycl_update_layout_from_cache(extra, tensor, device, resolved, const_cast<void *>(src_ptr),
-                                                   src_size, xmx_info, onednn_pack_m);
-            }
-            return const_cast<void *>(src_ptr);
         }
     }
     // Direct layout-specific lookup — all weights should be staged by S1-PRELOAD.
@@ -42099,7 +42400,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                               (src0_pp_scratch ? src0_pp_scratch : src0_as_f16.get());
             DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), dst_dd_i,
-                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc);
+                                      DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
         }
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
@@ -42238,7 +42539,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
 
         DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i, DnnlGemmWrapper::to_dt<float>(),
                                   src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(), dst_dd_i,
-                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc);
+                                  DnnlGemmWrapper::to_dt<float>(), stream, ldc, ggml_type_name(src0->type));
 #elif GGML_SYCL_HAS_ONEAPI_MATH
         {
             const float alpha = 1.0f;
@@ -57153,7 +57454,9 @@ static bool graph_fa_ptrs_match(ggml_backend_sycl_context & ctx, ggml_cgraph * c
         }
         if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) && tensor->name && tensor->name[0] != '\0') {
             void * staged_ptr = nullptr;
-            if (ctx.graph_input_stage_lookup(tensor->name, ggml_nbytes(tensor), ctx.device, nullptr, &staged_ptr) &&
+            // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+            // comment on graph_input_staging in common.hpp.
+            if (ctx.graph_input_stage_lookup(tensor, ggml_nbytes(tensor), ctx.device, nullptr, &staged_ptr) &&
                 staged_ptr) {
                 return staged_ptr;
             }
@@ -57200,7 +57503,15 @@ static bool graph_fa_ptrs_match(ggml_backend_sycl_context & ctx, ggml_cgraph * c
         if (q_ptr != snap.q || k_ptr != snap.k || v_ptr != snap.v || dst_ptr != snap.dst || mask_ptr != snap.mask ||
             sinks_ptr != snap.sinks || block_ptr != snap.block_table || seq_ptr != snap.seq_lens ||
             !dims_match(snap.q_ne, Q) || !dims_match(snap.k_ne, K) || !dims_match(snap.v_ne, V) ||
-            !dims_match(snap.dst_ne, node)) {
+            !dims_match(snap.dst_ne, node) ||
+            // llama.cpp-dyi3: mask/sinks were pointer-only. gemma4's
+            // build_attn_inp_kv_iswa builds a base mask and a SWA mask that
+            // share the literal name "attn_inp_kq_mask" (llama-graph.cpp);
+            // they resolve to distinct, stable per-tensor addresses today
+            // (see task comment c-wbw9), but a shape drift at an unchanged
+            // pointer must still force a re-record rather than replay
+            // against the wrong n_kv/mask extents.
+            !dims_match(snap.mask_ne, mask) || !dims_match(snap.sinks_ne, sinks)) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] FA pointer/shape drift detected; re-recording graph\n");
             GGML_SYCL_DEBUG("[SYCL-GRAPH] FA ptrs current q=%p k=%p v=%p dst=%p mask=%p sinks=%p block=%p seq=%p\n",
                             q_ptr, k_ptr, v_ptr, dst_ptr, mask_ptr, sinks_ptr, block_ptr, seq_ptr);
@@ -61959,6 +62270,26 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                 return;
             }
             trace_decision("dispatch-legacy-failed", decision);
+            // llama.cpp-dyi3 round 6: a fallback decline is normal during
+            // ordinary per-op dispatch (a cache miss just falls through to
+            // BLAS below), but during SYCL graph recording it is the one
+            // mode where a "fall through and hope the next route works"
+            // decline cannot be trusted -- this exact chain (legacy decline
+            // -> generic BLAS fallback -> its own silent failure) is how
+            // gemma4's per-layer-embedding projection went missing under
+            // recording. Once per tensor name, not per call.
+            if (ggml_sycl_graph_recording_active()) {
+                static std::unordered_set<std::string> warned_tensors;
+                static std::mutex                      warned_tensors_mutex;
+                const char *                           name = src0->name ? src0->name : "?";
+                std::lock_guard<std::mutex>            lock(warned_tensors_mutex);
+                if (warned_tensors.insert(name).second) {
+                    GGML_LOG_WARN(
+                        "[MUL_MAT] legacy dispatch declined for %s during SYCL graph recording -- falling through "
+                        "to a route not verified for this recording state; see llama.cpp-dyi3\n",
+                        name);
+                }
+            }
         }
 
         if (forced_layout && *forced_layout == GGML_LAYOUT_AOS && ggml_sycl_supports_mmq(src0->type) &&
@@ -62044,7 +62375,25 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             // This triggers weight eviction if needed, freeing physical VRAM
             // so the pool allocator inside ggml_sycl_op_mul_mat_sycl can succeed.
             const size_t f16_bytes = src0->ne[0] * src0->ne[1] * sizeof(sycl::half);
-            ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, GGML_LAYOUT_AOS);
+            // llama.cpp-dyi3 round 6 (root cause, task comment log): this
+            // call's return value used to be discarded -- a false return
+            // (e.g. the weight's layout pointer could not be resolved) left
+            // dst silently unwritten instead of producing an error. That is
+            // exactly how gemma4's per-layer-embedding projection went
+            // silently missing under SYCL graph recording before this
+            // round's fix to ggml_sycl_get_weight_layout_ptr: a discarded
+            // false here would have masked the same class of bug again.
+            // This is the last fallback in the dispatch chain, so a false
+            // return here means the op genuinely did not run -- a crash is
+            // strictly better than deterministic wrong output that survives
+            // every other instrument, which is what happened.
+            if (!ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl,
+                                                        GGML_LAYOUT_AOS)) {
+                GGML_ABORT(
+                    "[MUL_MAT] generic BLAS fallback did not compute %s (type=%d, recording=%d) -- dst was left "
+                    "unwritten instead of silently succeeding; see llama.cpp-dyi3",
+                    src0->name ? src0->name : "?", (int) src0->type, ggml_sycl_graph_recording_active() ? 1 : 0);
+            }
             return;
         }
         GGML_LOG_ERROR("[MUL_MAT] No eligible kernel variant for %s (type=%d)\n", src0->name ? src0->name : "?",
@@ -92771,7 +93120,9 @@ static void graph_prestage_leaf_tensors(ggml_backend_sycl_context * ctx, const g
         // bakes the pointer at finalize time. The stable staging buffer survives across replays.
         if ((tensor->flags & GGML_TENSOR_FLAG_INPUT) && tensor->name && tensor->name[0] != '\0') {
             sycl::queue & q       = *ctx->stream();
-            void *        dev_ptr = ctx->graph_input_stage(tensor->name, tensor->data, nbytes, q);
+            // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+            // comment on graph_input_staging in common.hpp.
+            void * dev_ptr = ctx->graph_input_stage(tensor, tensor->data, nbytes, q);
             if (dev_ptr) {
                 staged_count++;
                 mark_staged(tensor);
@@ -92883,8 +93234,11 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         if (!tensor || !tensor->data) {
             return false;
         }
+        // llama.cpp-dyi3: keyed on tensor identity, not name -- see the
+        // comment on graph_input_staging in common.hpp. The name check
+        // stays as a cheap pre-filter (an unnamed leaf was never staged).
         if (tensor->name && tensor->name[0] != '\0' &&
-            ctx->graph_input_refresh(tensor->name, tensor->data, ggml_nbytes(tensor), q)) {
+            ctx->graph_input_refresh(tensor, tensor->data, ggml_nbytes(tensor), q)) {
             return true;
         }
         ggml_sycl_tensor_storage_handle dst_storage{};
@@ -92991,7 +93345,16 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
     static const char *              dkw0_input_list_env = std::getenv("GGML_SYCL_DKW0_PTR_CHECK");
     const bool                       dkw0_input_list_on   = dkw0_input_list_env && std::atoi(dkw0_input_list_env) != 0;
     std::unordered_set<const ggml_tensor *> dkw0_skipped_seen;
-    auto discover_input = [&](ggml_tensor * tensor) {
+
+    // llama.cpp-dyi3: the fast (already-cached) path below prints a
+    // "refreshed N input tensors" summary every call; this first-call
+    // discovery path refreshes each tensor too (via refresh_input_tensor
+    // inline below) but previously had no matching summary, so a run whose
+    // first replay-eligible call happened to take THIS path (e.g. right
+    // after a re-record) looked like it never refreshed at all in the log.
+    int  discover_copy_count = 0;
+    int  discover_skip_count = 0;
+    auto discover_input      = [&](ggml_tensor * tensor) {
         if (!tensor || !tensor->data) {
             return;
         }
@@ -93018,6 +93381,9 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
         ctx->cached_input_tensors.push_back(tensor);
         if (resolved_ptr && refresh_input_tensor(tensor)) {
             resolved_ptr = ggml_sycl_resolve_tensor_ptr(tensor, ctx->device);
+            discover_copy_count++;
+        } else {
+            discover_skip_count++;
         }
         GGML_SYCL_DEBUG("[SYCL-GRAPH] discovered input %s -> %p (tensor->data=%p, %s)\n",
                         tensor->name ? tensor->name : "?", resolved_ptr, tensor->data,
@@ -93042,6 +93408,8 @@ static void graph_refresh_input_tensors(ggml_backend_sycl_context * ctx, const g
 
     ctx->input_tensors_cached = true;
     GGML_SYCL_DEBUG("[SYCL-GRAPH] cached %zu input tensors for future replays\n", ctx->cached_input_tensors.size());
+    GGML_SYCL_DEBUG("[SYCL-GRAPH] refreshed %d input tensors (skipped %d same-ptr) [discovery pass]\n",
+                    discover_copy_count, discover_skip_count);
 }
 
 static uint64_t ggml_sycl_graph_signature(const ggml_cgraph * cgraph) {
@@ -93330,6 +93698,11 @@ static void sycl_exec_graph_clear_active(ggml_backend_sycl_context * ctx, const 
     ctx->invalidate_moe_phase_layout_cache();
     ctx->input_tensors_cached = false;
     ctx->cached_input_tensors.clear();
+    // llama.cpp-dyi3: graph_input_staging_clear() previously existed but was
+    // never called anywhere, so staging entries accumulated for the whole
+    // context's lifetime with no reset across exec_graph generations. Clear
+    // it alongside the other per-generation input caches above.
+    ctx->graph_input_staging_clear(*ctx->stream());
 
     ggml_sycl_cpu_staging_cache_clear();
     graph_unpin_moe_experts(ctx);
@@ -99917,6 +100290,12 @@ normal_dispatch:
         if (phase_timing && !ggml_sycl_graph_diag_enabled()) {
             ggml_sycl_sequence_graphlet_summary_report(cached_is_decode ? "TG" : "PP", true);
         }
+        // llama.cpp-dyi3: opt-in decisive-experiment instrument
+        // (GGML_SYCL_GRAPH_REPLAY_PROBE=1 only; see the function's own
+        // comment). Fires here because this lambda already runs exactly
+        // once per call, after whichever path (record/replay/disabled)
+        // finished computing.
+        ggml_sycl_graph_replay_probe_dump(sycl_ctx, cgraph, cached_is_decode, use_sycl_graph);
     };
 
     if (ggml_sycl_cpu_offload_enabled() && ggml_sycl_info().has_cpu_device) {
@@ -100079,18 +100458,54 @@ normal_dispatch:
     }
 
     const bool decode_has_flash_attn_ext = cached_is_decode && ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT);
-    if (use_sycl_graph && decode_has_flash_attn_ext && !ggml_sycl_flash_attn_graph_allow_enabled()) {
-        const bool               has_moe_ops = ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
-        static std::atomic<bool> logged{ false };
-        if (!logged.exchange(true, std::memory_order_acq_rel)) {
-            GGML_LOG_INFO(
-                "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of SYCL command "
-                "graphs by default (set GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 only for controlled diagnostics)\n");
-        }
-        if (has_moe_ops) {
-            sycl_ctx->moe_graph_rerecord = true;
-        } else {
-            use_sycl_graph = false;
+    if (use_sycl_graph && decode_has_flash_attn_ext) {
+        // llama.cpp-dyi3: default-engage the graph for FA, but ONLY when
+        // every decode-shape FA dispatch this context has observed reached
+        // the ESIMD partitioned decode kernel -- the sole kernel family this
+        // task verified replay-safe (dynamic mask/idx refresh, drift
+        // detector dims-checks mask+sinks; see task comment c-wbw9). Any
+        // other observed kernel (oneDNN SDPA, tile_d512, VEC safe-decode,
+        // XMX, ...) keeps the exclusion, same as before this task, unless
+        // explicitly forced with GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1.
+        const ggml_sycl_fa_graph_allow_mode allow_mode         = ggml_sycl_flash_attn_graph_allow_mode();
+        const bool                          observed_all_esimd = sycl_ctx->fa_decode_kernel_obs.all_esimd_partitioned();
+        // Coverage guard only needs to run before a (re-)record decision --
+        // once exec_graph exists, replay-time correctness for this call is
+        // already governed by graph_fa_ptrs_match's pointer+shape drift
+        // check (mask/sinks now dims-checked too, see task comment c-wbw9)
+        // plus the standard input-refresh mechanism, so re-scanning every
+        // node on the steady-state replay hot path would be pure overhead.
+        const bool coverage_ok = sycl_ctx->exec_graph != nullptr || ggml_sycl_fa_mask_sinks_refresh_safe(cgraph);
+        const bool engage      = allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
+                            (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO && observed_all_esimd && coverage_ok);
+        if (!engage) {
+            const bool               has_moe_ops = ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
+            static std::atomic<bool> logged{ false };
+            if (!logged.exchange(true, std::memory_order_acq_rel)) {
+                GGML_LOG_INFO(
+                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of SYCL command "
+                    "graphs (mode=%s observed_all_esimd=%d coverage_ok=%d esimd=%llu other=%llu). Verified "
+                    "replay-safe only for the ESIMD partitioned decode kernel; set "
+                    "GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 to force other shapes for controlled diagnostics, or =0 to "
+                    "force this off.\n",
+                    allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_OFF ? "force-off" : "auto",
+                    (int) observed_all_esimd, (int) coverage_ok,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.other_kernel_count);
+            }
+            if (has_moe_ops) {
+                sycl_ctx->moe_graph_rerecord = true;
+            } else {
+                use_sycl_graph = false;
+            }
+        } else if (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO) {
+            static std::atomic<bool> logged_auto{ false };
+            if (!logged_auto.exchange(true, std::memory_order_acq_rel)) {
+                GGML_LOG_INFO(
+                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; engaging SYCL command graph replay by "
+                    "default (observed esimd_partitioned=%llu, no other kernel seen)\n",
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count);
+            }
         }
     }
     // Graph debug output (controlled by GGML_SYCL_DEBUG)
