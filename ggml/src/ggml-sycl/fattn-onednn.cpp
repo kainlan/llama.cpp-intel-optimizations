@@ -557,24 +557,37 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
     // llama.cpp-hhbb (S3): no host wait here -- both repack events are
     // threaded into dnnl::graph::sycl_interop::execute(..., deps) by the
     // caller instead of being drained on the host before every SDPA execute.
+    // If the V submit throws after K's repack kernel is already queued, K's
+    // buffer must outlive that kernel: hand it to the reaper against its own
+    // event instead of releasing it here (the caller's scope guard cannot
+    // reach handles this helper has already reset).
+    auto release_after_failure = [&]() {
+        if (out->K.valid() && out->k_submitted) {
+            std::vector<ggml_sycl::mem_handle> retained;
+            retained.push_back(std::move(out->K));
+            ggml_sycl::retain_handles_until_event(std::move(retained), out->k_evt);
+        }
+        out->K           = {};
+        out->V           = {};
+        out->k_submitted = false;
+    };
     try {
         out->k_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.K, static_cast<char *>(k_resolved.ptr), desc,
                                                          /*value_tensor=*/false);
+        out->k_submitted = true;
         out->v_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.V, static_cast<char *>(v_resolved.ptr), desc,
                                                          /*value_tensor=*/true);
     } catch (const std::exception & e) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed: %s\n", e.what());
         }
-        out->K = {};
-        out->V = {};
+        release_after_failure();
         return false;
     } catch (...) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed with unknown exception\n");
         }
-        out->K = {};
-        out->V = {};
+        release_after_failure();
         return false;
     }
     return true;
@@ -1369,11 +1382,14 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
         profile_label.category             = "fattn";
         profile_label.queue_kind           = "compute";
-        const std::string profile_metadata = "D=" + std::to_string(D) + ";ne01=" + std::to_string(active_params.ne01) +
-                                             ";ne11=" + std::to_string(active_params.ne11) +
-                                             ";H_q=" + std::to_string(H_q) + ";H_kv=" + std::to_string(H_kv);
-        profile_label.metadata = profile_metadata.c_str();
-        profile_label.device   = ctx.device;
+        std::string profile_metadata;
+        if (ggml_sycl_kernel_profile_enabled()) {
+            profile_metadata = "D=" + std::to_string(D) + ";ne01=" + std::to_string(active_params.ne01) +
+                               ";ne11=" + std::to_string(active_params.ne11) + ";H_q=" + std::to_string(H_q) +
+                               ";H_kv=" + std::to_string(H_kv);
+            profile_label.metadata = profile_metadata.c_str();
+        }
+        profile_label.device = ctx.device;
 
         sycl::event exec_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue &) {
             return dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);

@@ -39,6 +39,10 @@ struct ggml_sycl_onednn_fa_materialized_kv {
     sycl::event                     q_evt;
     sycl::event                     k_evt;
     sycl::event                     v_evt;
+    // True once K's repack kernel has been submitted: on a later submit
+    // failure inside materialize_kv, K's buffer must be retained against
+    // k_evt rather than released (ggml_sycl_flash_attn_ext_onednn_materialize_kv).
+    bool                            k_submitted = false;
 };
 
 // Cache key for oneDNN graph compiled_partition.
