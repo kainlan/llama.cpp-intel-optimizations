@@ -18,6 +18,21 @@
 
 namespace ggml_sycl {
 
+// llama.cpp-dyi3: bisect wrapper -- see the comment on
+// ggml_sycl_graph_record_plain_mask() in common.hpp. Every call in this
+// file to the raw recording predicates is renamed to one of these two, so
+// GGML_SYCL_GRAPH_RECORD_PLAIN=memops forces this file's normally-
+// recording-aware allocation/copy decisions to take their plain path
+// without touching any other family.
+static inline bool mem_ops_graph_recording_active() {
+    return ggml_sycl_graph_recording_active() && !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_MEMOPS);
+}
+
+static inline bool mem_ops_graph_recording_this_thread() {
+    return ggml_sycl_graph_recording_this_thread() &&
+           !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_MEMOPS);
+}
+
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static std::atomic<uint64_t> g_mem_fill_profile_error_after_submit_count{ 0 };
 static std::atomic<bool>     g_mem_fill_profile_error_after_submit{ false };
@@ -466,8 +481,8 @@ static bool alloc_pinned_stage_handle(size_t        size,
                                       int           retries = 0) {
     // Read both predicates ONCE: recording state is dynamic, so sampling it a
     // second time for the trace could report a value the request never used.
-    const bool graph_self = ggml_sycl_graph_recording_this_thread();
-    const bool graph_any  = ggml_sycl_graph_recording_active();
+    const bool graph_self = mem_ops_graph_recording_this_thread();
+    const bool graph_any  = mem_ops_graph_recording_active();
 
     alloc_request req{};
     req.queue                               = &queue;

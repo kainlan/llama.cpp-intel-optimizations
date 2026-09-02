@@ -44,6 +44,21 @@ void ggml_sycl_fattn_xmx_v2_cache_destroy(void * ptr) {
     fattn_xmx_v2_cache_destroy_inline(ptr);
 }
 
+// llama.cpp-dyi3: bisect wrapper -- see ggml_sycl_graph_record_plain_mask()
+// in common.hpp. Deliberately NOT used at every g_ggml_sycl_graph_recording
+// check in this file: several exist specifically to skip a wait()/malloc
+// that is illegal while a SYCL command-graph recording is genuinely active
+// (the seq_ids path ~line 3606, the paged-V2 auto buffer realloc paths
+// ~4062-4128, all explicitly commented "wait()/malloc forbidden during
+// recording") -- those stay on the raw g_ggml_sycl_graph_recording so
+// bypassing "fattn" cannot make this file attempt an illegal operation
+// during a real recording. Only sites verified to have a genuinely
+// non-blocking alternative (async memcpy, or pure host bookkeeping) are
+// wired to this wrapper.
+static inline bool fattn_graph_recording_active() {
+    return g_ggml_sycl_graph_recording && !ggml_sycl_graph_record_plain_bypassed(GGML_SYCL_RECORD_PLAIN_FATTN);
+}
+
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_D == 64, "Packed-K materializer currently supports D=64 decode K");
 static_assert(GGML_SYCL_FATTN_XMX_PACKED_K_TOKENS == XMX_V2_DECODE_BATCH_KV,
               "Packed-K materializer block size must match XMX-v2 decode");
@@ -3483,7 +3498,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     }
     params.V                    = static_cast<const char *>(V_t.resolve_ptr());
     auto graph_input_device_ptr = [&](const ggml_tensor * tensor) -> const char * {
-        if (!g_ggml_sycl_graph_recording || !tensor || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->name[0]) {
+        if (!fattn_graph_recording_active() || !tensor || !(tensor->flags & GGML_TENSOR_FLAG_INPUT) ||
+            !tensor->name[0]) {
             return nullptr;
         }
         void * staged_ptr = nullptr;
@@ -3768,7 +3784,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // Set paged layout flag (read from op_params[4], set via ggml_flash_attn_ext_set_paged_layout)
     params.use_paged_layout = use_paged_layout;
 
-    if (g_ggml_sycl_graph_recording && ctx.fa_graph_ptrs_recording) {
+    if (fattn_graph_recording_active() && ctx.fa_graph_ptrs_recording) {
         ggml_backend_sycl_context::fa_graph_ptr_snapshot snap;
         snap.q           = params.Q;
         snap.k           = params.K;

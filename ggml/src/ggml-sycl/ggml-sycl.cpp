@@ -445,21 +445,30 @@ static bool ggml_sycl_graph_diag_enabled() {
     return enabled;
 }
 
-// llama.cpp-dyi3: GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW is now a three-way
-// override, not a plain bool -- unset means AUTO (engage only for FA nodes
-// this dispatcher has observed reaching the graph-replay-safe ESIMD
-// partitioned decode kernel, see fa_decode_kernel_observation in
-// common.hpp), "1" forces the graph on regardless of the observation (the
-// old diagnostic-only behavior, kept for other FA shapes/paths that were
-// never verified replay-safe -- oneDNN SDPA, tile_d512, non-ESIMD), and "0"
-// forces it off. atoi("0")==0 and atoi(unset)==0 used to be indistinguishable,
-// which is why the old accessor could not offer a real opt-out.
+// llama.cpp-dyi3: GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW is a three-way override.
+// Owner ruling (round 5, decode replay proven wrong -- see task comment
+// log): default UNSET is FORCE_OFF -- today's master behavior -- until
+// replay is proven correct; the observation-gated AUTO mode is opt-in via
+// the literal string "auto" (engage only for FA nodes this dispatcher has
+// observed reaching the graph-replay-safe ESIMD partitioned decode kernel,
+// see fa_decode_kernel_observation in common.hpp); "1" (or any nonzero
+// integer) force-engages the graph regardless of the observation (the
+// original diagnostic-only behavior, kept for other FA shapes/paths that
+// were never verified replay-safe -- oneDNN SDPA, tile_d512, non-ESIMD);
+// "0" (or any other value) is an explicit force-off, same as unset. This
+// was AUTO-by-default until this ruling -- Mistral's decode shape may be
+// esimd-only and would have passed the observation gate on a model this
+// task never verified against, so AUTO must not be reachable without an
+// explicit opt-in while replay correctness is still open.
 enum class ggml_sycl_fa_graph_allow_mode { AUTO, FORCE_ON, FORCE_OFF };
 
 static ggml_sycl_fa_graph_allow_mode ggml_sycl_flash_attn_graph_allow_mode() {
     static const ggml_sycl_fa_graph_allow_mode mode = [] {
         const char * env = std::getenv("GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW");
         if (!env || env[0] == '\0') {
+            return ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
+        }
+        if (std::strcmp(env, "auto") == 0) {
             return ggml_sycl_fa_graph_allow_mode::AUTO;
         }
         return std::atoi(env) != 0 ? ggml_sycl_fa_graph_allow_mode::FORCE_ON : ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
@@ -825,19 +834,14 @@ static const std::vector<std::string> & ggml_sycl_graph_replay_probe_names() {
         }
         if (result.empty()) {
             result = {
-                "embd",
-                "inp_per_layer_selected",
-                "inp_scaled",
-                "Qcur",
-                "attn_inp_kq_mask",
-                "kq_mask",
-                "cache_k_l0",
-                "cache_v_l0",
-                "kqv_out",
-                "ffn_out",
-                "result_output",
-                "inp_out_ids",
-                "inp_pos",
+                "embd",        "inp_per_layer_selected",
+                "inp_scaled",  "Qcur",
+                "Qcur_pos",    "attn_inp_kq_mask",
+                "kq_mask",     "cache_k_l0",
+                "cache_v_l0",  "kqv_out",
+                "ffn_out",     "per_layer_embd",
+                "result_norm", "result_output",
+                "inp_out_ids", "inp_pos",
             };
         }
         return result;
@@ -935,11 +939,28 @@ static void ggml_sycl_graph_replay_probe_dump(ggml_backend_sycl_context * ctx,
                 off += snprintf(first4 + off, sizeof(first4) - off, "%s%.6g", i ? "," : "", v);
             }
         }
+        // llama.cpp-dyi3 round 4: the lead's new hypothesis is that the
+        // recorded command list bakes in a SCRATCH/intermediate tensor's
+        // device address (or view offset) at record time, and the ggml
+        // graph allocator reassigns it on a later token even though "graphs
+        // reused" holds for the leaf/graph OBJECTS. That is a pointer/
+        // stride story, not a value story -- print it directly instead of
+        // inferring it from a value mismatch: t->data (the logical pointer
+        // ggml itself tracks), the resolved device pointer (what the
+        // recorded kernel actually captured), the view root's byte offset
+        // (ggml_sycl_view_root_and_offset -- 0 and view_root==t for a
+        // non-view tensor), and nb[] (row/plane/batch strides). Any of
+        // these changing between calls in the SAME exec_graph generation
+        // while the recorded kernel still holds the OLD value is the bug.
+        size_t              view_offs = 0;
+        const ggml_tensor * view_root = ggml_sycl_view_root_and_offset(t, view_offs);
         fprintf(stderr,
                 "[GRAPH-REPLAY-PROBE] call=%d graph_replay=%d name=%s op=%s type=%d ne=[%lld,%lld,%lld,%lld] "
+                "nb=[%zu,%zu,%zu,%zu] data=%p dev_ptr=%p view_root=%p view_offs=%zu "
                 "nelements=%lld finite_count=%lld sum=%f abs_sum=%f sq_sum=%f first4=%s\n",
                 call_idx, used_graph_replay ? 1 : 0, t->name, ggml_op_name(t->op), (int) t->type, (long long) t->ne[0],
-                (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], (long long) nelements,
+                (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2],
+                t->nb[3], t->data, dev_ptr, (const void *) view_root, view_offs, (long long) nelements,
                 (long long) finite_count, sum, abs_sum, sq_sum, first4);
     };
     // De-dup: gemma4's mask/idx tensors are shared by every layer's FA node
