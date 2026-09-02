@@ -210,6 +210,13 @@ const ggml_sycl_device_info & ggml_sycl_info();
 #if GGML_SYCL_DNNL
 #    include "dnnl.hpp"
 #    include "dnnl_sycl.hpp"
+// Graph API + its SYCL interop -- needed here (not only in fattn-onednn.hpp)
+// because make_engine() below builds the engine with a dnnl::graph::allocator
+// so the SDPA compiled partition's per-execute scratch comes from the unified
+// cache instead of the SYCL runtime (llama.cpp-gwno). Both headers guard
+// their own re-inclusion, so fattn-onednn.hpp including them again is fine.
+#    include "oneapi/dnnl/dnnl_graph.hpp"
+#    include "oneapi/dnnl/dnnl_graph_sycl.hpp"
 #endif
 
 // Helper macro for deprecated get_pointer() -> get_multi_ptr() migration
@@ -858,6 +865,13 @@ inline dpct::device_ext & ggml_sycl_get_device(int device) {
 }
 
 int ggml_sycl_get_device_id_from_queue(sycl::queue & queue);
+
+// Same lookup as ggml_sycl_get_device_id_from_queue(), but from a bare
+// sycl::device -- for call sites that only have the device (e.g. the oneDNN
+// Graph SYCL allocator callbacks in unified-cache.cpp/hpp, which receive
+// `const void * dev` pointing at oneDNN's own copy of the sycl::device, not
+// one of ours, so only value equality -- not a queue lookup -- is available).
+int ggml_sycl_get_device_id_from_device(const sycl::device & dev);
 
 inline dpct::err0 ggml_sycl_set_device(const int device) try {
     int current_device_id;
@@ -5458,13 +5472,35 @@ struct ggml_backend_sycl_context {
     queue_ptr stream() { return stream(device, 0); }
 
 #if GGML_SYCL_DNNL
+    // llama.cpp-gwno (S4 root cause, jmc5 c-uxch): without a dnnl::graph
+    // allocator, a compiled SDPA partition's ~12 MiB scratch is allocated by
+    // oneDNN's default SYCL allocator on EVERY dnnl::graph::sycl_interop::execute()
+    // (35x/ubatch on the B70 pp512, ~2.7 ms host block each -- a real
+    // zeMemAllocDevice/xe_vm_bind round trip the unified cache never sees).
+    // dnnl::graph::engine is literally `= dnnl::engine` (dnnl_graph.hpp), so
+    // the SAME engine object returned here backs both the primitive API
+    // (dnnl::sycl_interop::make_stream, gemm.hpp) and the Graph API
+    // (fattn-onednn.cpp's compile()/execute()) -- one make_engine() change
+    // reaches both call sites make_engine()/engine_dnnl() ultimately serve.
     dnnl::engine make_engine(sycl::queue * q) {
         // Get the device associated with the queue
-        sycl::device       dev = q->get_device();
+        sycl::device  dev = q->get_device();
         // Get the context associated with the queue
-        sycl::context      ctx = q->get_context();
-        const dnnl::engine eng = dnnl::sycl_interop::make_engine(dev, ctx);
-        return eng;
+        sycl::context ctx = q->get_context();
+
+        if (ggml_sycl::onednn_graph_allocator_enabled()) {
+            try {
+                dnnl::graph::allocator alloc = dnnl::graph::sycl_interop::make_allocator(
+                    ggml_sycl::onednn_graph_sycl_malloc, ggml_sycl::onednn_graph_sycl_free);
+                return dnnl::graph::sycl_interop::make_engine_with_allocator(dev, ctx, alloc);
+            } catch (const dnnl::error & e) {
+                GGML_LOG_WARN(
+                    "[SYCL] oneDNN Graph allocator engine construction failed (%s); falling back to oneDNN's "
+                    "default allocator -- GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0 silences this by opting out\n",
+                    e.what());
+            }
+        }
+        return dnnl::sycl_interop::make_engine(dev, ctx);
     }
 
     std::unordered_map<sycl::queue *, dnnl::stream> stream_map;
@@ -6654,6 +6690,26 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
 
+    // llama.cpp-dyi3: OBSERVED (not predicted) FA-kernel-family selection
+    // for decode-shape (ne01<=1) FLASH_ATTN_EXT dispatches, updated by the
+    // real dispatcher in fattn.cpp (ggml_sycl_flash_attn_ext_dispatch_ncols's
+    // dispatch_debug_kernel lambda) every time it selects a kernel. The
+    // SYCL-graph gate reads this instead of re-deriving eligibility from
+    // tensor shape in a second, independently-maintained classifier --
+    // "one check, one authority" (see the file's own dkw0/one-check-cannot-
+    // serve-two-authorities lesson). Monotonic and never reset: once any
+    // non-ESIMD-partitioned kernel is observed for a decode-shape FA op,
+    // auto-engagement stays disabled for the rest of this context's life
+    // (fail closed), matching FA graph replay having been verified only for
+    // the ESIMD partitioned decode kernel family.
+    struct fa_decode_kernel_observation {
+        uint64_t esimd_partitioned_count = 0;
+        uint64_t other_kernel_count      = 0;
+
+        bool all_esimd_partitioned() const { return esimd_partitioned_count > 0 && other_kernel_count == 0; }
+    };
+    fa_decode_kernel_observation fa_decode_kernel_obs;
+
     // Flag to disable graphs when weight streaming is active
     bool                                                    weight_streaming_graphs_disabled = false;
     std::vector<ggml_sycl::mem_handle>                      graph_weight_leases;
@@ -6670,10 +6726,17 @@ struct ggml_backend_sycl_context {
         const void * sinks                 = nullptr;
         const void * block_table           = nullptr;
         const void * seq_lens              = nullptr;
-        int64_t      q_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      k_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      v_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
-        int64_t      dst_ne[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
+        int64_t      q_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      k_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      v_ne[GGML_MAX_DIMS]     = { 0, 0, 0, 0 };
+        int64_t      dst_ne[GGML_MAX_DIMS]   = { 0, 0, 0, 0 };
+        // llama.cpp-dyi3: mask/sinks were pointer-checked only -- a shape
+        // change on either (e.g. gemma4's base vs SWA mask, which differ in
+        // ne[0]==n_kv) at the same pointer would silently replay stale
+        // extents. Tracked alongside q/k/v/dst so graph_fa_ptrs_match can
+        // catch it and force a re-record instead.
+        int64_t      mask_ne[GGML_MAX_DIMS]  = { 0, 0, 0, 0 };
+        int64_t      sinks_ne[GGML_MAX_DIMS] = { 0, 0, 0, 0 };
     };
 
     std::vector<fa_graph_ptr_snapshot> fa_graph_ptrs;
