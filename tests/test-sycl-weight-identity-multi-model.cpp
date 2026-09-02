@@ -67,7 +67,8 @@
 //      ggml_sycl::dispatch_tuning::ensure_model_loaded() (env-var gated
 //      local-file read, no device access -- dispatch-tuning.cpp:356), and
 //      sycl_module_mutation_guard (a plain mutex/counter in ggml-sycl.cpp;
-//      `grep -n 'class sycl_module_mutation_guard'` locates it).
+//      `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'class
+//      sycl_module_mutation_guard'` locates it).
 //      get_weight_cache_key()'s one branch that WOULD touch a device
 //      (ggml_backend_sycl_reg()/ggml_backend_reg_dev_get(), guarded by
 //      `!extra && tensor->buffer && ...`) is never reached here because
