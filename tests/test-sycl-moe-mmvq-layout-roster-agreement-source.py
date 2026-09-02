@@ -93,12 +93,55 @@ The one thing a flat `if (` scan genuinely cannot find is a decision with NO
 `if` token governing it at all -- a raw `switch` `case` label
 (`case GGML_TYPE_Q4_0: resolved = GGML_LAYOUT_AOS; break;`, no "if"
 anywhere) is the concrete instance the matrix caught (M5c, GREEN/blind on
-every revision including this one), and it is DELIBERATELY not fixed here:
-widening the scanner to walk `switch` bodies is a real, separate change that
-deserves its own justification rather than riding this documentation and
-offset fix. Filed as [ticket pending -- team lead to supply id]; reference it
-here once filed. Until then, treat M5c/this gap as a KNOWN, NAMED exception,
-not an oversight.
+every revision including this one). llama.cpp-mcdk owned the residual
+coverage decision for this gap; its disposition, recorded here, is (b): the
+gap is ACCEPTED, not closed, for a reason verified against the tree rather
+than assumed.
+
+The alternative -- option (a), teaching find_carveouts/OR_CHAIN_RE to also
+recognize a switch-case label group whose types are exactly {Q4_0, Q8_0} --
+was evaluated and rejected on the merits, not skipped for convenience: it is
+not safe to apply file-wide, because that exact shape already exists in-tree
+TODAY for reasons that have nothing to do with this ticket's AoS-only
+carve-out. Two real, unrelated switch statements each group `case
+GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0:` under one shared consequent:
+dispatch_thresholds.hpp's `should_convert_layout` (`return true; //
+Coalesced layout wins`) and xmx-esimd-common.hpp's `supports_qtype` (`return
+m_supports_int8;`, the int8 XMX path). A type-set-only switch matcher,
+applied the way find_carveouts is applied today -- across every `.cpp`/`.hpp`
+in ggml-sycl/, exactly like the whole-file scan in
+test_no_hand_maintained_carveout_survives_outside_the_named_exception --
+would flag both as offenders on the very next test run, not hypothetically;
+this was confirmed by reading both switch bodies against the current tree,
+not inferred from how the `==` OR-chain form behaves. And unlike an `==`
+OR-chain, which this file's own accounting in
+test_regex_does_not_over_match_longer_or_chains shows is rare enough and
+specific enough in intent that every existing occurrence has been enumerated
+and reasoned about, `switch (type) { case ... }` is the DOMINANT,
+idiomatic type-dispatch form throughout ggml-sycl/ (dmmv.cpp, mmq.cpp,
+mmvq.cpp, getrows.cpp, dispatch.hpp, dispatch_thresholds.hpp,
+xmx-esimd-common.hpp and more all switch on a ggml_type). A bare two-type
+group sharing this exact pair is therefore not the rare shape the OR-chain
+form is -- it is two-for-two on the very first check of the real tree.
+
+Making a switch-aware matcher safe would require either (i) growing the same
+SITE-scoped exemption pattern already used for common.hpp::get_optimal onto
+these two additional, unrelated sites (and any future one that groups the
+same pair for its own reasons), which is exactly the frozen-list
+accumulation this file's design argues against elsewhere, or (ii)
+restricting switch detection to run only inside the three specific function
+bodies this gate already extracts for the decision-scoped check (mirroring
+find_decision_condition's scope, not find_carveouts' file-wide one), which
+would close the actual live risk -- one of those three sites reverting to
+switch form -- without the file-wide false-positive blast radius. (ii) is
+the sounder shape if this is ever picked back up, but it is a separate,
+narrower change from "widen find_carveouts", it is not what inverting the
+negative companion in test_positive_control_regex_is_sensitive would
+produce, and it was not undertaken here: it needs its own switch-body
+consequent extraction (case-label run -> shared block, mirroring
+if_statements' brace matching), its own fixture, and its own review -- more
+than this ticket's narrow charter (fill the placeholder, record the
+disposition) buys.
 
 Consequence for the bound below: it holds for IDENTIFIER OPACITY, but does
 NOT hold for the switch-case gap, and stating it as if it did would be the
@@ -114,7 +157,10 @@ GGML_TYPE_Q4_0: case GGML_TYPE_Q8_0:` uses `:`, not `==`, so OR_CHAIN_RE
 syntax -- see that regex's own comment) never matches it at ANY arity,
 including the exact pre-fix shape. A switch-form carve-out therefore escapes
 BOTH checks regardless of how many types it lists. This is not a hazard this
-file quietly hopes goes unnoticed: it is the reason the ticket above exists.
+file quietly hopes goes unnoticed: it is the reason llama.cpp-mcdk was filed,
+and its recorded disposition above is to accept this specific gap rather
+than close it -- treat M5c/the switch-case gap as a KNOWN, NAMED,
+DELIBERATELY-ACCEPTED exception, not an oversight and not still pending.
 
 Not in scope, and deliberately so: llama.cpp-mn70's sibling consumer-side
 guard (R1, landed as 011064e2b) is a RUNTIME comparison against the observed
