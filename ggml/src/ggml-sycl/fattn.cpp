@@ -2571,6 +2571,21 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
     const bool dispatch_debug_enabled =
         std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG") && dispatch_debug_counter <= debug_limit;
     auto dispatch_debug_kernel = [&](const char * kernel) {
+        // llama.cpp-dyi3: OBSERVE (not predict) which kernel family a
+        // decode-shape (ne01<=1) FA op actually reached. This is the
+        // dispatcher's own choke point (every exit path in this function
+        // calls it), so recording here -- unconditionally, not gated by
+        // dispatch_debug_enabled -- is the single authority the SYCL-graph
+        // gate (ggml-sycl.cpp) reads instead of maintaining a second,
+        // independently-derived eligibility classifier that could drift
+        // from this dispatcher's real decisions.
+        if (ne01 <= 1) {
+            if (std::strcmp(kernel, "esimd_f16") == 0) {
+                ctx.fa_decode_kernel_obs.esimd_partitioned_count++;
+            } else {
+                ctx.fa_decode_kernel_obs.other_kernel_count++;
+            }
+        }
         if (dispatch_debug_enabled) {
             // ne11 (KV length) and the mask extents are the shape terms that
             // actually bound the kernels' KV loops; without them a "selected"
@@ -3763,10 +3778,16 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         snap.block_table = params.block_table;
         snap.seq_lens    = params.seq_lens;
         for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-            snap.q_ne[i]   = Q ? Q->ne[i] : 0;
-            snap.k_ne[i]   = K ? K->ne[i] : 0;
-            snap.v_ne[i]   = V ? V->ne[i] : 0;
-            snap.dst_ne[i] = dst ? dst->ne[i] : 0;
+            snap.q_ne[i]     = Q ? Q->ne[i] : 0;
+            snap.k_ne[i]     = K ? K->ne[i] : 0;
+            snap.v_ne[i]     = V ? V->ne[i] : 0;
+            snap.dst_ne[i]   = dst ? dst->ne[i] : 0;
+            // llama.cpp-dyi3: mask/sinks shape, so a base-vs-SWA mask swap
+            // (same pointer slot family, different n_kv) at the same
+            // resolved address cannot silently replay against the wrong
+            // extents -- see graph_fa_ptrs_match's dims_match calls.
+            snap.mask_ne[i]  = mask ? mask->ne[i] : 0;
+            snap.sinks_ne[i] = sinks ? sinks->ne[i] : 0;
         }
         ctx.fa_graph_ptrs.push_back(snap);
     }

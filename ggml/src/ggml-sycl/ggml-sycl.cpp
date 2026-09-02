@@ -444,12 +444,33 @@ static bool ggml_sycl_graph_diag_enabled() {
     return enabled;
 }
 
-static bool ggml_sycl_flash_attn_graph_allow_enabled() {
-    static const bool enabled = [] {
+// llama.cpp-dyi3: GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW is now a three-way
+// override, not a plain bool -- unset means AUTO (engage only for FA nodes
+// this dispatcher has observed reaching the graph-replay-safe ESIMD
+// partitioned decode kernel, see fa_decode_kernel_observation in
+// common.hpp), "1" forces the graph on regardless of the observation (the
+// old diagnostic-only behavior, kept for other FA shapes/paths that were
+// never verified replay-safe -- oneDNN SDPA, tile_d512, non-ESIMD), and "0"
+// forces it off. atoi("0")==0 and atoi(unset)==0 used to be indistinguishable,
+// which is why the old accessor could not offer a real opt-out.
+enum class ggml_sycl_fa_graph_allow_mode { AUTO, FORCE_ON, FORCE_OFF };
+
+static ggml_sycl_fa_graph_allow_mode ggml_sycl_flash_attn_graph_allow_mode() {
+    static const ggml_sycl_fa_graph_allow_mode mode = [] {
         const char * env = std::getenv("GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW");
-        return env && std::atoi(env) != 0;
+        if (!env || env[0] == '\0') {
+            return ggml_sycl_fa_graph_allow_mode::AUTO;
+        }
+        return std::atoi(env) != 0 ? ggml_sycl_fa_graph_allow_mode::FORCE_ON : ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
     }();
-    return enabled;
+    return mode;
+}
+
+// Preserved as FORCE_ON-only for the moe_graphlet_replay_probe call site
+// below, whose own FA-replay-safety this task does not verify -- that path
+// keeps requiring the explicit force, unaffected by the new AUTO default.
+static bool ggml_sycl_flash_attn_graph_allow_enabled() {
+    return ggml_sycl_flash_attn_graph_allow_mode() == ggml_sycl_fa_graph_allow_mode::FORCE_ON;
 }
 
 static bool ggml_sycl_non_fa_attn_graph_allow_enabled() {
@@ -458,6 +479,53 @@ static bool ggml_sycl_non_fa_attn_graph_allow_enabled() {
         return env && std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+// llama.cpp-dyi3: verify every FLASH_ATTN_EXT node's mask/sinks dependency
+// is provably refreshable across graph replay, instead of assuming it based
+// on this task's read of today's llama-graph.cpp/llama-kv-cache.cpp. A
+// tensor is refresh-safe if it is either (a) sycl::usm::alloc::device --
+// refreshed every token by the backend-agnostic ggml_backend_tensor_set
+// before graph_compute is even invoked, at a stable per-tensor address
+// (see task comment c-wbw9, points 2-4), or (b) GGML_TENSOR_FLAG_INPUT +
+// named, so graph_refresh_input_tensors' discovery/refresh path covers it.
+// Anything else is the exact "per-token-varying leaf nobody flagged"
+// hazard the file's own dkw0 defect #4 comment warns about
+// (ggml-sycl.cpp:92977-92990 as of this task) -- fail closed rather than
+// silently replay it. Only called pre-record (see call site), so this
+// O(n_nodes) scan does not run on the steady-state replay hot path.
+static bool ggml_sycl_fa_mask_sinks_refresh_safe(const ggml_cgraph * cgraph) {
+    if (!cgraph) {
+        return false;
+    }
+    auto tensor_refresh_safe = [](const ggml_tensor * t) -> bool {
+        if (!t) {
+            return true;  // absent (e.g. no attention sinks) is trivially safe
+        }
+        if (!t->data) {
+            return false;
+        }
+        sycl::usm::alloc alloc_kind = sycl::usm::alloc::unknown;
+        try {
+            alloc_kind = ggml_sycl_get_alloc_type(t->data);
+        } catch (...) {
+            // Query failure: do not assume safety.
+        }
+        if (alloc_kind == sycl::usm::alloc::device) {
+            return true;
+        }
+        return (t->flags & GGML_TENSOR_FLAG_INPUT) && t->name && t->name[0] != '\0';
+    };
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (!node || node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+        if (!tensor_refresh_safe(node->src[3]) || !tensor_refresh_safe(node->src[4])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ggml_sycl_graph_has_op(const ggml_cgraph * cgraph, enum ggml_op op) {
@@ -57200,7 +57268,15 @@ static bool graph_fa_ptrs_match(ggml_backend_sycl_context & ctx, ggml_cgraph * c
         if (q_ptr != snap.q || k_ptr != snap.k || v_ptr != snap.v || dst_ptr != snap.dst || mask_ptr != snap.mask ||
             sinks_ptr != snap.sinks || block_ptr != snap.block_table || seq_ptr != snap.seq_lens ||
             !dims_match(snap.q_ne, Q) || !dims_match(snap.k_ne, K) || !dims_match(snap.v_ne, V) ||
-            !dims_match(snap.dst_ne, node)) {
+            !dims_match(snap.dst_ne, node) ||
+            // llama.cpp-dyi3: mask/sinks were pointer-only. gemma4's
+            // build_attn_inp_kv_iswa builds a base mask and a SWA mask that
+            // share the literal name "attn_inp_kq_mask" (llama-graph.cpp);
+            // they resolve to distinct, stable per-tensor addresses today
+            // (see task comment c-wbw9), but a shape drift at an unchanged
+            // pointer must still force a re-record rather than replay
+            // against the wrong n_kv/mask extents.
+            !dims_match(snap.mask_ne, mask) || !dims_match(snap.sinks_ne, sinks)) {
             GGML_SYCL_DEBUG("[SYCL-GRAPH] FA pointer/shape drift detected; re-recording graph\n");
             GGML_SYCL_DEBUG("[SYCL-GRAPH] FA ptrs current q=%p k=%p v=%p dst=%p mask=%p sinks=%p block=%p seq=%p\n",
                             q_ptr, k_ptr, v_ptr, dst_ptr, mask_ptr, sinks_ptr, block_ptr, seq_ptr);
@@ -100079,18 +100155,54 @@ normal_dispatch:
     }
 
     const bool decode_has_flash_attn_ext = cached_is_decode && ggml_sycl_graph_has_op(cgraph, GGML_OP_FLASH_ATTN_EXT);
-    if (use_sycl_graph && decode_has_flash_attn_ext && !ggml_sycl_flash_attn_graph_allow_enabled()) {
-        const bool               has_moe_ops = ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
-        static std::atomic<bool> logged{ false };
-        if (!logged.exchange(true, std::memory_order_acq_rel)) {
-            GGML_LOG_INFO(
-                "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of SYCL command "
-                "graphs by default (set GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 only for controlled diagnostics)\n");
-        }
-        if (has_moe_ops) {
-            sycl_ctx->moe_graph_rerecord = true;
-        } else {
-            use_sycl_graph = false;
+    if (use_sycl_graph && decode_has_flash_attn_ext) {
+        // llama.cpp-dyi3: default-engage the graph for FA, but ONLY when
+        // every decode-shape FA dispatch this context has observed reached
+        // the ESIMD partitioned decode kernel -- the sole kernel family this
+        // task verified replay-safe (dynamic mask/idx refresh, drift
+        // detector dims-checks mask+sinks; see task comment c-wbw9). Any
+        // other observed kernel (oneDNN SDPA, tile_d512, VEC safe-decode,
+        // XMX, ...) keeps the exclusion, same as before this task, unless
+        // explicitly forced with GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1.
+        const ggml_sycl_fa_graph_allow_mode allow_mode         = ggml_sycl_flash_attn_graph_allow_mode();
+        const bool                          observed_all_esimd = sycl_ctx->fa_decode_kernel_obs.all_esimd_partitioned();
+        // Coverage guard only needs to run before a (re-)record decision --
+        // once exec_graph exists, replay-time correctness for this call is
+        // already governed by graph_fa_ptrs_match's pointer+shape drift
+        // check (mask/sinks now dims-checked too, see task comment c-wbw9)
+        // plus the standard input-refresh mechanism, so re-scanning every
+        // node on the steady-state replay hot path would be pure overhead.
+        const bool coverage_ok = sycl_ctx->exec_graph != nullptr || ggml_sycl_fa_mask_sinks_refresh_safe(cgraph);
+        const bool engage      = allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_ON ||
+                            (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO && observed_all_esimd && coverage_ok);
+        if (!engage) {
+            const bool               has_moe_ops = ggml_sycl_graph_has_op(cgraph, GGML_OP_MUL_MAT_ID);
+            static std::atomic<bool> logged{ false };
+            if (!logged.exchange(true, std::memory_order_acq_rel)) {
+                GGML_LOG_INFO(
+                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; keeping attention nodes out of SYCL command "
+                    "graphs (mode=%s observed_all_esimd=%d coverage_ok=%d esimd=%llu other=%llu). Verified "
+                    "replay-safe only for the ESIMD partitioned decode kernel; set "
+                    "GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=1 to force other shapes for controlled diagnostics, or =0 to "
+                    "force this off.\n",
+                    allow_mode == ggml_sycl_fa_graph_allow_mode::FORCE_OFF ? "force-off" : "auto",
+                    (int) observed_all_esimd, (int) coverage_ok,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count,
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.other_kernel_count);
+            }
+            if (has_moe_ops) {
+                sycl_ctx->moe_graph_rerecord = true;
+            } else {
+                use_sycl_graph = false;
+            }
+        } else if (allow_mode == ggml_sycl_fa_graph_allow_mode::AUTO) {
+            static std::atomic<bool> logged_auto{ false };
+            if (!logged_auto.exchange(true, std::memory_order_acq_rel)) {
+                GGML_LOG_INFO(
+                    "[SYCL-GRAPH] Decode graph contains FLASH_ATTN_EXT; engaging SYCL command graph replay by "
+                    "default (observed esimd_partitioned=%llu, no other kernel seen)\n",
+                    (unsigned long long) sycl_ctx->fa_decode_kernel_obs.esimd_partitioned_count);
+            }
         }
     }
     // Graph debug output (controlled by GGML_SYCL_DEBUG)
