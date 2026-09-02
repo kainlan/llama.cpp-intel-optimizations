@@ -74,8 +74,9 @@
 // Test harness (mirrors test-unified-cache-fast-path.cpp)
 // =============================================================================
 
-static int g_tests_run    = 0;
-static int g_tests_passed = 0;
+static int g_tests_run     = 0;
+static int g_tests_passed  = 0;
+static int g_tests_skipped = 0;
 
 #define TEST_BEGIN(name)                         \
     do {                                         \
@@ -100,6 +101,21 @@ static int g_tests_passed = 0;
         if (!(cond)) {         \
             TEST_FAIL(msg);    \
         }                      \
+    } while (0)
+
+// A skip is not a pass and not a failure: it means the environment could not
+// exercise the case (e.g. the device lacks a capability the case needs), so
+// nothing about the case's correctness was proven either way.  Unlike
+// TEST_BEGIN's g_tests_run, this decrements g_tests_run back out -- a skip
+// was not a completed run of the case's logic -- so "N run, M passed,
+// K skipped" always satisfies N == M + (failures) with skips counted
+// separately, matching test-mem-handle-wrong-device.cpp's TEST_SKIP.
+#define TEST_SKIP(reason)                        \
+    do {                                         \
+        g_tests_skipped++;                       \
+        g_tests_run--;                            \
+        fprintf(stderr, "SKIPPED: %s\n", reason); \
+        return true;                              \
     } while (0)
 
 // =============================================================================
@@ -1090,6 +1106,43 @@ struct arena_chunk_lease_guard {
     ~arena_chunk_lease_guard() { release_now(); }
 };
 
+// If drain_retained_handles() does not report success on its first bounded
+// wait, the retained copy it was waiting on may still be queued (its wait is
+// itself bounded -- mem-handle.cpp's drain loop -- so a timeout there is not
+// proof the copy was dropped).  A caller may NOT simply return in that case:
+// the queued copy holds a raw pointer into that caller's stack-local cache
+// (mem-handle.cpp ~1116-1131), and returning while it is still queued lets a
+// later drain dereference that pointer after the cache is destroyed --
+// llama.cpp-goegc.1 finding #3, the same use-after-free class as finding #4,
+// one level further out: finding #4 was about an early TEST_ASSERT skipping
+// the drain entirely; this is about the drain call itself not being trusted
+// on a single non-success result.
+//
+// The event this file's cases wait via ev.wait_and_throw() before calling
+// this proves the kernel itself has completed, so a genuine indefinite hang
+// here is not expected -- this is a belt-and-braces guard against a spurious
+// wakeup or a future change to drain_retained_handles()'s contract, not a
+// path measured to occur.  Retrying is cheap (each retry is itself a bounded
+// wait); giving up and returning is not an option once the first wait has
+// been tried, so the only two outcomes are "eventually drained" and a loud,
+// deterministic abort -- never a silent return with a dangling reference.
+static void require_fully_drained_or_abort(const char * case_name, bool already_drained) {
+    bool drained = already_drained;
+    for (int attempt = 0; !drained && attempt < 5; ++attempt) {
+        drained = ggml_sycl::drain_retained_handles(true, 10000);
+    }
+    if (!drained) {
+        fprintf(stderr,
+                "[ABORT] %s: drain_retained_handles did not clear after repeated retries although the kernel "
+                "event it was waiting on already completed; a retained handle would otherwise be returned to "
+                "the caller still queued against a cache object about to be destroyed (use-after-free) -- "
+                "aborting instead of returning\n",
+                case_name);
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
 // Both in-flight-kernel cases below mint a device-side sycl::atomic_ref over
 // memory_scope::system so a GPU kernel can observe a host-USM store without a
 // queue round-trip.  This file is the ONLY place in the SYCL backend that
@@ -1103,24 +1156,6 @@ static bool device_supports_system_scope_atomics(const sycl::device & dev) {
     }
     const auto caps = dev.get_info<sycl::info::device::atomic_memory_scope_capabilities>();
     return std::find(caps.begin(), caps.end(), sycl::memory_scope::system) != caps.end();
-}
-
-// This file has no TEST_SKIP macro (unlike test-mem-handle-wrong-device.cpp);
-// print a visible marker and decline to count a pass rather than silently
-// passing when the capability is absent.  Caller must already have run
-// TEST_BEGIN(name), so g_tests_run reflects the attempt; g_tests_passed is
-// deliberately left unincremented so the final "N run, M passed" summary
-// diverges instead of reading as an unqualified green.
-static bool skip_if_no_system_scope_atomics(const sycl::device & dev, const char * name) {
-    if (device_supports_system_scope_atomics(dev)) {
-        return false;
-    }
-    fprintf(stderr,
-            "[SKIP] %s: device lacks system-scope USM atomic support (aspect::usm_atomic_host_allocations "
-            "and/or memory_scope::system not in atomic_memory_scope_capabilities) -- this run proves nothing "
-            "about it\n",
-            name);
-    return true;
 }
 
 // Iteration bound for the device-side gate spin in both cases below.
@@ -1215,8 +1250,10 @@ static constexpr uint32_t kInFlightKernelSpinBound = 2000000u;
 // =============================================================================
 static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
     TEST_BEGIN("in_flight_kernel_lease_blocks_eviction");
-    if (skip_if_no_system_scope_atomics(q.get_device(), "in_flight_kernel_lease_blocks_eviction")) {
-        return true;
+    if (!device_supports_system_scope_atomics(q.get_device())) {
+        TEST_SKIP(
+            "device lacks system-scope USM atomic support (aspect::usm_atomic_host_allocations and/or "
+            "memory_scope::system not in atomic_memory_scope_capabilities)");
     }
 
     constexpr size_t         entry_bytes = 4 * 1024;
@@ -1318,31 +1355,37 @@ static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
     const auto host_side_latency = std::chrono::duration_cast<std::chrono::milliseconds>(gate_open_time - submit_time);
 
     // Step 5: the event completes, the drain worker drops the retained copy.
-    // This -- along with ev.wait_and_throw() -- MUST happen before any
-    // TEST_ASSERT below can return, not after: retain_handles_until_event has
-    // already queued a copy of `handle` that holds a raw lease.entry pointer
-    // into this function's stack-local `cache`.  An early return here would
-    // leave that copy queued against a cache object about to be destroyed on
-    // return, and the drain worker would later dereference the dangling
-    // entry while unrelated later tests are running (llama.cpp-goegc.1
-    // finding #4: mem-handle.cpp ~1120-1129 is where that dereference
-    // happens).
-    const bool drained = ggml_sycl::drain_retained_handles(true, 10000);
+    // This -- along with ev.wait_and_throw() and require_fully_drained_or_abort()
+    // -- MUST happen before any TEST_ASSERT below can return, not after:
+    // retain_handles_until_event has already queued a copy of `handle` that
+    // holds a raw lease.entry pointer into this function's stack-local
+    // `cache`.  An early return here would leave that copy queued against a
+    // cache object about to be destroyed on return, and the drain worker
+    // would later dereference the dangling entry while unrelated later
+    // tests are running (llama.cpp-goegc.1 finding #4: mem-handle.cpp
+    // ~1120-1129 is where that dereference happens).  A single
+    // drain_retained_handles() call reporting failure is not itself proof
+    // the copy is safe to leave queued (finding #3) -- see
+    // require_fully_drained_or_abort()'s comment for why that path aborts
+    // rather than returns.
+    const bool drained_first_attempt = ggml_sycl::drain_retained_handles(true, 10000);
     ev.wait_and_throw();
+    require_fully_drained_or_abort("in_flight_kernel_lease_blocks_eviction", drained_first_attempt);
 
     uint32_t out_host[2] = { 0, 0 };
     q.memcpy(out_host, out, sizeof(out_host)).wait();
     const uint32_t leases_after_drain = lease.entry->in_use_count.load();
 
     // From here on it is safe to assert and return early: no retained handle
-    // is outstanding regardless of which assertion below fails.
+    // is outstanding regardless of which assertion below fails --
+    // require_fully_drained_or_abort() above guarantees that, or the process
+    // has already aborted rather than reaching here.
     TEST_ASSERT(host_side_latency < std::chrono::seconds(5),
                 "host must open the gate within a few seconds of kernel submission on every path");
     TEST_ASSERT(leases_retained == 1, "retained copy must hold exactly one lease");
     TEST_ASSERT(freed_live == 0, "evict() must free nothing while the entry is leased by in-flight work");
     TEST_ASSERT(still_there && ptr_live == ptr, "A must still resolve to the same pointer during in-flight work");
     TEST_ASSERT(gen_live == gen_before, "cache_generation must not bump while eviction is deferred");
-    TEST_ASSERT(drained, "drain_retained_handles must clear once the kernel event completes");
     TEST_ASSERT(out_host[1] < spin_bound, "kernel must have observed the gate open (not the spin bound)");
     TEST_ASSERT(out_host[0] == 0x5Au * entry_bytes, "kernel must have read A's original bytes, not freed memory");
     TEST_ASSERT(leases_after_drain == 0, "drain must have released the retained lease");
@@ -1391,18 +1434,39 @@ static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
 // substitute for it.
 //
 // Shape (mirrors the WEIGHT-lease case's steps 2-6):
-//   1. cache.arena_base() is a pointer into arena_chunks_[0] (every
-//      unified_cache reserves its arena at construction when
-//      GGML_SYCL_VRAM_ARENA defaults on -- see ensure_planned_arena_zones()).
-//      arena_acquire_chunk_lease(base) leases that chunk.
-//   2. Submit a kernel that spins on a host-USM gate, then reads a few bytes
-//      at the base pointer into an output buffer -- proof the chunk is in
-//      use by in-flight device work, mirroring the WEIGHT-lease kernel.
-//   3. Raise GGML_SYCL_RUNTIME_ARENA_MB strictly above THIS cache's own
-//      current zone_capacity(RUNTIME) -- so this is independent of whatever
-//      any earlier case in this binary already left in the environment --
-//      and call ensure_planned_arena_zones() again while the chunk lease
-//      (and the kernel) are still live: must return false (refused).
+//   1. cache.arena_base() is a pointer into arena_chunks_[0] once the arena
+//      is actually reserved.  That reservation is NOT automatic at any
+//      budget: arena_reserve()'s single-chunk admission check (unified-
+//      cache.cpp ~19222-19236) refuses unless
+//        alloc_size >= tail_bytes + k_min_shared_bytes
+//      where tail_bytes = oneDNN + RUNTIME + SCRATCH zone bytes (defaults
+//      256 + 512 + 512 MB unless GGML_SYCL_ONEDNN/RUNTIME/COMPUTE_ARENA_MB
+//      override them) and k_min_shared_bytes = 16 MB -- i.e. roughly
+//      1296 MB, not this file's usual 16 MB per-entry-cache budget (the
+//      N-chunk fallback at ~19348/~19367-19372 refuses on the same shape
+//      of arithmetic against per_chunk_cap).  A prior version of this case
+//      used the 16 MB budget and silently [SKIP]ped on every run as a
+//      result -- caught in spec review.  budget below is sized with ~750 MB
+//      of headroom over that ~1296 MB floor (live zone sizes are read back
+//      via zone_capacity() rather than assumed, so this also tolerates an
+//      externally-set GGML_SYCL_*_ARENA_MB or a planner-raised oneDNN
+//      zone).  arena_active() is asserted, not skipped, below: with this
+//      budget a false reading is a test bug, not an environment condition.
+//   2. arena_acquire_chunk_lease(base) leases that chunk; submit a kernel
+//      that spins on a host-USM gate, then reads a few bytes at the base
+//      pointer into an output buffer -- proof the chunk is in use by
+//      in-flight device work, mirroring the WEIGHT-lease kernel.
+//   3. Raise GGML_SYCL_RUNTIME_ARENA_MB by 1 MB over THIS cache's own
+//      current zone_capacity(RUNTIME) -- independent of whatever any
+//      earlier case in this binary already left in the environment, and
+//      deliberately a 1 MB step rather than a large one: the positive
+//      control in step 5 re-runs arena_reserve() at this raised target
+//      after arena_destroy(), so it is bound by the SAME admission
+//      arithmetic as step 1 (tail_bytes + k_min_shared_bytes <= budget) --
+//      a large step could blow that budget and turn the positive control
+//      red for a reason unrelated to the lease.  Then call
+//      ensure_planned_arena_zones() again while the chunk lease (and the
+//      kernel) are still live: must return false (refused).
 //   4. Open the gate; wait the event; release the chunk lease.
 //   5. Call ensure_planned_arena_zones() again with the same raised target:
 //      must now return true -- the positive control showing step 3's refusal
@@ -1410,20 +1474,21 @@ static bool test_in_flight_kernel_lease_blocks_eviction(sycl::queue & q) {
 // =============================================================================
 static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & q) {
     TEST_BEGIN("in_flight_kernel_arena_chunk_lease_blocks_replan");
-    if (skip_if_no_system_scope_atomics(q.get_device(), "in_flight_kernel_arena_chunk_lease_blocks_replan")) {
-        return true;
+    if (!device_supports_system_scope_atomics(q.get_device())) {
+        TEST_SKIP(
+            "device lacks system-scope USM atomic support (aspect::usm_atomic_host_allocations and/or "
+            "memory_scope::system not in atomic_memory_scope_capabilities)");
     }
 
-    constexpr size_t         budget     = 16 * 1024 * 1024;
+    // See the block comment above for the arena_reserve() admission
+    // arithmetic this budget must clear (~1296 MB floor with default zone
+    // sizes); 2048 MB leaves ~750 MB of margin.
+    constexpr size_t         budget     = 2048ull * 1024 * 1024;
     const uint32_t           spin_bound = kInFlightKernelSpinBound;
     ggml_sycl::unified_cache cache(q, budget);
-    if (!cache.arena_active()) {
-        fprintf(stderr,
-                "[SKIP] in_flight_kernel_arena_chunk_lease_blocks_replan: device VRAM arena is not active for "
-                "this cache (insufficient free VRAM for the ~1GB default zone reservation?) -- this run proves "
-                "nothing about the chunk-lease reclaim path\n");
-        return true;
-    }
+    TEST_ASSERT(cache.arena_active(),
+                "arena must be active at this budget (see the admission arithmetic in the block comment above); "
+                "a false reading here is a test bug, not an environment condition");
 
     void * arena_ptr = cache.arena_base();
     TEST_ASSERT(arena_ptr != nullptr, "an active arena must have a base pointer");
@@ -1467,9 +1532,14 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
     // Force the next ensure_planned_arena_zones() call to see insufficient
     // zones regardless of what any earlier case in this binary left in the
     // environment: target strictly above THIS cache's own current RUNTIME
-    // zone capacity, not a hardcoded absolute value.
+    // zone capacity, not a hardcoded absolute value.  +1 MB, not a larger
+    // step: see the block comment above this function -- the positive
+    // control at step 5 must clear the SAME tail_bytes + k_min_shared_bytes
+    // <= budget admission check this cache's own construction did, and a
+    // large step risks failing that arithmetic against `budget` for a
+    // reason unrelated to the lease.
     const size_t      current_runtime_mb = cache.zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) / (1024 * 1024);
-    const size_t      target_runtime_mb  = current_runtime_mb + 256;
+    const size_t      target_runtime_mb  = current_runtime_mb + 1;
     const char *      old_runtime_env    = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB");
     const bool        had_runtime_env    = old_runtime_env != nullptr;
     const std::string saved_runtime_env  = old_runtime_env ? old_runtime_env : "";
@@ -1504,7 +1574,14 @@ static bool test_in_flight_kernel_arena_chunk_lease_blocks_replan(sycl::queue & 
     // process on a live allocator owner, per the comment above).  Unlike a
     // mem_handle-retained release, the chunk lease is not routed through the
     // async retained-handle queue (see the class comment above this test),
-    // so releasing it is a direct, synchronous call once the event completes.
+    // so releasing it is a direct, synchronous call once the event completes
+    // -- arena_release_chunk_lease() is a plain atomic decrement with no
+    // bounded internal wait of its own, unlike drain_retained_handles().
+    // release_now() therefore has no "reported failure but may still be
+    // queued" outcome to retry or abort on (llama.cpp-goegc.1 finding #3 is
+    // specific to drain_retained_handles()'s bounded-wait contract, which
+    // this path does not go through), so this case has no equivalent window
+    // to guard beyond the RAII guard already in place above.
     ev.wait_and_throw();
     chunk_lease_guard.release_now();
     const bool chunk_lease_cleared = !cache.arena_chunk_has_leases(chunk_idx);
@@ -1603,11 +1680,20 @@ int main(int argc, char ** argv) {
     all_passed &= test_retained_publication_failure_is_transactional(q);
 
     fprintf(stderr, "-------------------------------------------\n");
-    fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+    fprintf(stderr, "Tests: %d run, %d passed, %d skipped\n", g_tests_run, g_tests_passed, g_tests_skipped);
 
     if (!all_passed) {
         fprintf(stderr, "SOME TESTS FAILED\n");
         return 1;
+    }
+    if (g_tests_skipped > 0) {
+        // A skip means an environment condition (e.g. no system-scope USM
+        // atomic support) kept a case from running its logic at all -- that
+        // case proved nothing, in either direction.  Reporting this as
+        // "ALL TESTS PASSED" would read as an unqualified green when some
+        // fraction of the suite is actually unverified this run.
+        fprintf(stderr, "PASSED WITH SKIPS\n");
+        return 0;
     }
     fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;
