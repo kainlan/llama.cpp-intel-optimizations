@@ -339,6 +339,35 @@ sycl_tools_dl_block_match = re.search(
 # Empty when the guard itself is gone, so losing the guard reports as a named
 # RED check rather than an extraction crash.
 sycl_tools_dl_block = sycl_tools_dl_block_match.group(1) if sycl_tools_dl_block_match else ""
+
+
+def nodelete_moe_state_reset_ok(source, wrapper_source):
+    """NODELETE-on-reset contract for the two module/model-bound MoE registries.
+
+    ggml_sycl_reset_moe_module_state() no longer clears g_moe_expert_meta /
+    g_expert_groups directly -- install_fresh() deliberately leaves them
+    ("Both metadata registries are value-only and intentionally survive
+    teardown") because they carry no live device pointers, and every consumer
+    is gated behind g_moe_hybrid_init_success[d], which install_fresh() does
+    clear. The registries are republished, not wiped, by the build-new-then-
+    swap idiom in moe_hybrid_init_once() the next time a model initializes
+    MoE state on that device. Anchor on that swap (the actual mechanism that
+    retires the previous owner's entries) and on the comment documenting the
+    design, instead of the removed literal .clear() calls.
+    """
+    return (
+        "ggml_sycl_reset_moe_module_state()" in source
+        and "g_moe_hybrid_init_success[d].store(false" in source
+        and "g_moe_expert_meta.swap(new_expert_meta);" in source
+        and "g_expert_groups.swap(new_expert_groups);" in source
+        and "intentionally survive" in source
+        and "g_expert_popularity.clear()" in source
+        and "g_adaptive_prestage.reset_after_stop()" in source
+        and "g_expert_predictors[d].reset()" in source
+        and "NODELETE reload retained model-bound MoE state" in wrapper_source
+    )
+
+
 checks = {
     "full slot token": re.search(r"struct SlotToken\s*\{\s*uint32_t\s+slot", hpp) is not None
     and "uint64_t generation" in hpp,
@@ -965,15 +994,8 @@ checks = {
     and "post-hook logical reload retry failed" in
         (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
     and "barrier models a cross-thread dependency" in registry_backend,
-    "NODELETE MoE state reset": "ggml_sycl_reset_moe_module_state()" in backend
-    and "g_moe_hybrid_init_success[d].store(false" in backend
-    and "g_moe_expert_meta.clear()" in backend
-    and "g_expert_groups.clear()" in backend
-    and "g_expert_popularity.clear()" in backend
-    and "g_adaptive_prestage.reset_after_stop()" in backend
-    and "g_expert_predictors[d].reset()" in backend
-    and "NODELETE reload retained model-bound MoE state" in
-        (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text(),
+    "NODELETE MoE state reset": nodelete_moe_state_reset_ok(
+        backend, (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()),
     "process pinned raw handle lifetime": "Generic raw-handle policy: pin" in registry_backend
     and "dl_pin_library(handle.get(), path)" in registry_backend
     and "g_backend_raw_handle_leases" not in registry_backend
@@ -1366,8 +1388,30 @@ if "--self-test" in sys.argv:
                   else _retirement_storage_release_failures(mutated))
         if not caught:
             mutant_failures.append(name + ": bypass was not detected")
+
+    # Negative control for "NODELETE MoE state reset": the swap idiom is the
+    # part of the reset contract that actually retires the previous owner's
+    # entries (the .clear() calls it replaced no longer exist in source), so
+    # a mutant that deletes the swap lines must turn the predicate RED.
+    nodelete_swap_anchor = (
+        "        g_moe_expert_meta.swap(new_expert_meta);\n"
+        "        g_expert_groups.swap(new_expert_groups);\n"
+    )
+    if nodelete_swap_anchor not in backend:
+        mutant_failures.append("NODELETE MoE state reset: anchor missing")
+    else:
+        nodelete_mutated = backend.replace(
+            nodelete_swap_anchor,
+            "        // NODELETE-MUTANT: swap republish removed\n",
+            1,
+        )
+        wrapper_text = (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_text()
+        if nodelete_moe_state_reset_ok(nodelete_mutated, wrapper_text):
+            mutant_failures.append("NODELETE MoE state reset: bypass was not detected")
+
     if mutant_failures:
         print("lifecycle source self-test failed: " + ", ".join(mutant_failures), file=sys.stderr)
         raise SystemExit(1)
-    print("lifecycle source contract: self-test PASS (3 bypass insertion mutants)")
+    print("lifecycle source contract: self-test PASS (3 bypass insertion mutants, "
+          "1 NODELETE MoE reset negative control)")
 print("lifecycle source contract: PASS")
