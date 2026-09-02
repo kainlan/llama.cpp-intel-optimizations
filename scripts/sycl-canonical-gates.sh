@@ -82,7 +82,37 @@ case "$GATE" in
         ;;
 esac
 
+# --- source oneAPI if it is not already active ---------------------------
+# Deliberately BEFORE resolving any of this script's own derived variables
+# below (BIN_DIR, CACHE_FILE, ...), not just before using them. Sourcing
+# setvars.sh pulls in every installed oneAPI component's env/vars.sh into
+# THIS shell (no subshell isolation), and at least one of them assigns a
+# plain, unprefixed scratch variable that collides with a name this script
+# used to compute first and rely on afterwards: advisor/vtune's vars.sh sets
+# a bare `BIN_DIR=bin64` for their own internal use. Sourced AFTER our own
+# BIN_DIR was assigned, that silently overwrote it (verified: `need_bin`
+# then resolved to the literal path "bin64/llama-completion" and failed
+# closed with a "missing binary" it never should have hit). There is no way
+# to enumerate every such name in advance -- a future oneAPI component could
+# collide with a different one of our names -- so the general fix is
+# ordering: source first, and let every one of our own assignments below
+# execute AFTER, so ours always wins whatever the environment set.
+#
+# setvars.sh also sources compiler/latest/env/vars.sh, which reads
+# ${OCL_ICD_FILENAMES} (no ":-" default) after deliberately unsetting it a
+# few lines earlier -- under `set -u` that is an unbound-variable error in a
+# SOURCED file, which kills THIS script, not a subshell; `|| true` cannot
+# save it because bash's `set -u` error is not a normal command failure.
+# set +u only around the source, restored immediately after.
+if [ -z "${SYCL_GATES_SKIP_ONEAPI_SOURCE:-}" ] && [ -z "${ONEAPI_ROOT:-}" ] && [ -f /opt/intel/oneapi/setvars.sh ]; then
+    set +u
+    # shellcheck disable=SC1091
+    source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
+    set -u
+fi
+
 # --- resolve paths (all overridable for the CPU-only stub test) ---------
+# Assigned AFTER the oneAPI source above -- see the comment there.
 BIN_DIR="${SYCL_GATES_BIN_DIR:-$BUILD_DIR/bin}"
 CACHE_FILE="${SYCL_GATES_CMAKE_CACHE:-$BUILD_DIR/CMakeCache.txt}"
 LDD_CMD="${SYCL_GATES_LDD_CMD:-ldd}"
@@ -94,12 +124,6 @@ SETTLE_SECONDS="${SYCL_GATES_SETTLE_SECONDS:-5}"
 mkdir -p "$GATES_OUT_DIR"
 
 SHA="$(cd "$ROOT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-
-# --- source oneAPI if it is not already active ---------------------------
-if [ -z "${SYCL_GATES_SKIP_ONEAPI_SOURCE:-}" ] && [ -z "${ONEAPI_ROOT:-}" ] && [ -f /opt/intel/oneapi/setvars.sh ]; then
-    # shellcheck disable=SC1091
-    source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true
-fi
 
 # Device selection belongs to oneAPI (CLAUDE.md rulings 9/10): this script
 # only ever SETS ONEAPI_DEVICE_SELECTOR for its own children, from its
@@ -153,10 +177,26 @@ fi
 # `--list-devices` exits from inside common_arg's handler before any model
 # file is opened -- see the design note at the top of this file. Zero
 # enumerated SYCL devices makes every requested gate SKIP, not FAIL.
-LIST_DEVICES_OUT="$("$BIN_DIR/llama-completion" --list-devices 2>&1 || true)"
+#
+# STDOUT ONLY, never stderr: on a genuinely device-less host, dev_mgr's
+# discovery failure prints "SYCL device manager initialization ...: no
+# devices found on any platform." to STDERR (and, in the abort form of that
+# code path, follows it with a GGML_ABORT/SIGABRT) -- that stderr text
+# itself contains the substring "SYCL", so a probe that reads stderr (or
+# combines 2>&1) reads its own "no device" message as proof a device
+# exists. A real device line only ever appears on STDOUT, from
+# common_print_available_devices(): "  SYCL<N>: <description> (...)" .
+# Anchor on that exact shape, and treat a non-zero probe exit (the abort
+# form) or stdout with no such line (the graceful "(none)" form,
+# llama.cpp-1lrh) identically as no-device.
+LIST_DEVICES_OUT=""
+LIST_DEVICES_RC=0
+LIST_DEVICES_OUT="$("$BIN_DIR/llama-completion" --list-devices 2>/dev/null)" || LIST_DEVICES_RC=$?
 NO_DEVICE_REASON=""
-if ! printf '%s' "$LIST_DEVICES_OUT" | grep -q 'SYCL'; then
-    NO_DEVICE_REASON="no SYCL GPU devices enumerated for selector $SELECTOR (list-devices output: $(printf '%s' "$LIST_DEVICES_OUT" | tr '\n' ' '))"
+if [ "$LIST_DEVICES_RC" -ne 0 ]; then
+    NO_DEVICE_REASON="llama-completion --list-devices exited rc=$LIST_DEVICES_RC for selector $SELECTOR (no SYCL device, or the pre-llama.cpp-1lrh dev_mgr abort path)"
+elif ! printf '%s\n' "$LIST_DEVICES_OUT" | grep -qE '^[[:space:]]*SYCL[0-9]+:'; then
+    NO_DEVICE_REASON="no SYCL GPU devices enumerated for selector $SELECTOR (list-devices stdout: $(printf '%s' "$LIST_DEVICES_OUT" | tr '\n' ' '))"
 fi
 
 # --- gate runners ----------------------------------------------------------
@@ -188,8 +228,11 @@ run_mistral() {
     sample_mem "mistral post"
 
     local verdict="FAIL"
+    # Anchored to the start of a line, matching the GPT-OSS check's own
+    # anchoring below: STDOUT contains the exact line/prefix, not the digits
+    # anywhere in the file (e.g. only inside an echoed prompt).
     if [ "$rc" -eq 0 ] \
-        && grep -qF '1, 2, 3, 4, 5, 6, 7, 8, 9, 10' "$out" \
+        && grep -qE '^1, 2, 3, 4, 5, 6, 7, 8, 9, 10' "$out" \
         && ! grep -qE 'DEVICE_LOST|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:' "$err"; then
         verdict="PASS"
     fi
