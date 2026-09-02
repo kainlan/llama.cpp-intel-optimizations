@@ -471,14 +471,36 @@ static ggml_sycl_fa_graph_allow_mode ggml_sycl_flash_attn_graph_allow_mode() {
         if (std::strcmp(env, "auto") == 0) {
             return ggml_sycl_fa_graph_allow_mode::AUTO;
         }
+        // llama.cpp-dyi3 round 8: warn on a value that is neither "auto" nor
+        // a valid integer, matching the sibling GGML_SYCL_FA_FORCE_PATH
+        // parser's precedent (fattn.cpp: "unknown GGML_SYCL_FA_FORCE_PATH=%s,
+        // falling through") of naming the bad value instead of silently
+        // falling through -- std::atoi("garbage") == 0 would otherwise make
+        // a typo (e.g. "atuo") silently behave exactly like unset, with no
+        // signal the value was never recognized. Read once, so this warns
+        // once, not per call.
+        char * end = nullptr;
+        std::strtol(env, &end, 10);
+        if (end == env || *end != '\0') {
+            fprintf(stderr,
+                    "[SYCL] unknown GGML_SYCL_FLASH_ATTN_GRAPH_ALLOW=%s (expected \"auto\" or an integer), falling "
+                    "back to force-off\n",
+                    env);
+        }
         return std::atoi(env) != 0 ? ggml_sycl_fa_graph_allow_mode::FORCE_ON : ggml_sycl_fa_graph_allow_mode::FORCE_OFF;
     }();
     return mode;
 }
 
-// Preserved as FORCE_ON-only for the moe_graphlet_replay_probe call site
-// below, whose own FA-replay-safety this task does not verify -- that path
-// keeps requiring the explicit force, unaffected by the new AUTO default.
+// FORCE_ON-only (not AUTO): this predicate has five callers, not just the
+// moe_graphlet_replay_probe site -- the segmented-graph FA-direct decisions
+// (~91393, ~91585, ~91600), the segmented-path gate (~91794), and the
+// graphlet probe (~100575). AUTO's observation gate (fa_decode_kernel_obs,
+// above) only ever watched the WHOLE-GRAPH decode dispatch it instruments;
+// it says nothing about these segmented/graphlet mechanisms, which record
+// and replay a different, independently-verified slice of the graph. So
+// AUTO authorizing the whole-graph path does not authorize these, and every
+// one of the five keeps requiring the explicit force.
 static bool ggml_sycl_flash_attn_graph_allow_enabled() {
     return ggml_sycl_flash_attn_graph_allow_mode() == ggml_sycl_fa_graph_allow_mode::FORCE_ON;
 }
@@ -908,7 +930,15 @@ static void ggml_sycl_graph_replay_probe_dump(ggml_backend_sycl_context * ctx,
             // device pointer, let ggml_sycl::mem_copy submit the copy, then wait
             // on the queue directly -- a diagnostic readback may legitimately
             // block; a raw queue memcpy is not guaranteed to exist outside the
-            // unified cache.
+            // unified cache. GGML_LAYOUT_AOS is correct for the default
+            // activation/KV/mask name list this probe matches (plain ggml
+            // row-major tensors, never unified-cache-materialized), but if
+            // GGML_SYCL_GRAPH_REPLAY_PROBE_NAMES is ever pointed at a weight
+            // routed to a packed layout (e.g. COALESCED), this readback would
+            // silently misinterpret the bytes -- see the llama.cpp-dkw0
+            // sibling a few thousand lines below (~line 60163), which
+            // resolves the actual layout via ggml_sycl_resolve() specifically
+            // because it targets weights.
             ggml_sycl::mem_handle host_handle = ggml_sycl::mem_handle::from_direct(
                 host_buf.data(), GGML_LAYOUT_AOS, /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, nbytes);
             ggml_sycl::mem_handle dev_handle =
@@ -60127,7 +60157,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
         return;
     }
     GGML_SYCL_PROFILE_SCOPE_GEMM("mul_mat");
-    // llama.cpp-dkw0 (worktree-only diagnostic): D2H the device copy of the
+    // llama.cpp-dkw0: D2H the device copy of the
     // one weight under investigation and checksum it the same way the
     // upload-time hook in ggml_backend_sycl_buffer_set_tensor does, so the
     // two can be diffed directly -- settles whether the device materialization
@@ -62386,10 +62416,6 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
             GGML_LOG_WARN("[MUL_MAT] Generic BLAS fallback for %s (type=%d batch=%lld)\n",
                           src0->name ? src0->name : "?", src0->type, (long long) src1->ne[1]);
 
-            // Reserve budget headroom for F16 dequantization buffer.
-            // This triggers weight eviction if needed, freeing physical VRAM
-            // so the pool allocator inside ggml_sycl_op_mul_mat_sycl can succeed.
-            const size_t f16_bytes = src0->ne[0] * src0->ne[1] * sizeof(sycl::half);
             // llama.cpp-dyi3 round 6 (root cause, task comment log): this
             // call's return value used to be discarded -- a false return
             // (e.g. the weight's layout pointer could not be resolved) left
