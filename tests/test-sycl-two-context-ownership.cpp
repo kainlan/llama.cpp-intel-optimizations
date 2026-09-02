@@ -102,12 +102,12 @@ static llama_context * make_ctx(llama_model * model, uint32_t n_ctx, uint32_t n_
 
 // Decode a whole script (prompt, then single-token continuations) in ONE fresh
 // context and record the logits after every step.  Frees the context.
-static bool run_reference(llama_model *                   model,
-                          uint32_t                        n_ctx,
+static bool run_reference(llama_model *                    model,
+                          uint32_t                         n_ctx,
                           const std::vector<llama_token> & prompt,
                           const std::vector<llama_token> & cont,
-                          const char *                    tag,
-                          std::vector<step_logits> &      out) {
+                          const char *                     tag,
+                          std::vector<step_logits> &       out) {
     llama_context * ctx = make_ctx(model, n_ctx, 32);
     if (!ctx) {
         fprintf(stderr, "[TWO-CTX] %s: reference context creation failed (n_ctx=%u)\n", tag, n_ctx);
@@ -171,7 +171,7 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
     // Two DIFFERENT prompts, different lengths, plus shared continuations.
@@ -225,8 +225,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx_a = make_ctx(model, n_ctx_a, 32);
     llama_context * ctx_b = make_ctx(model, n_ctx_b, 32);
     if (!ctx_a || !ctx_b) {
-        fprintf(stderr, "[TWO-CTX] FAIL: could not create both contexts (a=%p b=%p)\n", (void *) ctx_a,
-                (void *) ctx_b);
+        fprintf(stderr, "[TWO-CTX] FAIL: could not create both contexts (a=%p b=%p)\n", (void *) ctx_a, (void *) ctx_b);
         if (ctx_a) {
             llama_free(ctx_a);
         }
