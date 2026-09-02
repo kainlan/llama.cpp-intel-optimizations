@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NORM = ROOT / "ggml" / "src" / "ggml-sycl" / "norm.cpp"
@@ -104,6 +105,31 @@ def test_plain_norm_and_group_norm_submits_are_also_wrapped() -> None:
     )
     assert group_body.count('"norm.group_norm"') >= 1
     assert group_body.count("ggml_sycl_profile_submit(*stream, group_norm_label") == 2
+
+
+def test_metadata_construction_is_gated_for_every_wrapped_norm_function() -> None:
+    # Spec-review fix round, finding 6: each of the 6 wrapped functions'
+    # metadata std::string must be built ONLY under
+    # ggml_sycl_kernel_profile_enabled() -- building it unconditionally is
+    # a heap allocation on every launch even with the profiler off
+    # (~300/decode token across this family), which contradicts
+    # docs/backend/sycl-env-vars.md's "zero overhead when unset" claim.
+    norm = NORM.read_text(encoding="utf-8")
+    for label_var, metadata_var in [
+        ("norm_label", "norm_metadata"),
+        ("group_norm_label", "group_norm_metadata"),
+        ("rms_norm_label", "rms_norm_metadata"),
+        ("rms_norm_mul_label", "rms_norm_mul_metadata"),
+        ("rms_norm_mul_add_label", "rms_norm_mul_add_metadata"),
+        ("add_rms_norm_label", "add_rms_norm_metadata"),
+    ]:
+        decl = f"std::string {metadata_var};"
+        assert decl in norm, decl
+        gate = norm.index("if (ggml_sycl_kernel_profile_enabled()) {", norm.index(decl))
+        gate_close = norm.index("\n    }", gate)
+        gated = norm[gate:gate_close]
+        assert re.search(rf"{metadata_var}\s*=", gated), metadata_var
+        assert re.search(rf"{label_var}\.metadata\s*=\s*{metadata_var}\.c_str\(\);", gated), label_var
 
 
 def test_l2_norm_is_intentionally_out_of_scope_and_left_raw() -> None:

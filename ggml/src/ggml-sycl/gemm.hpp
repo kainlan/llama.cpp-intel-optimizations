@@ -313,28 +313,28 @@ class DnnlGemmWrapper {
     // (SYCL events this GEMM must wait on) even though no caller populates it
     // today -- the event-form execute() needs the parameter to exist either
     // way, and every other executor in this file already writes it this way.
-    static sycl::event gemm(ggml_backend_sycl_context & ctx,
-                     int                         m,
-                     int                         n,
-                     int                         k,
-                     const void *                a,
-                     dt                          at,
-                     dnnl_dim_t                  stra0,
-                     dnnl_dim_t                  stra1,
-                     dnnl_dim_t                  stra2,
-                     const void *                b,
-                     dt                          bt,
-                     dnnl_dim_t                  strb0,
-                     dnnl_dim_t                  strb1,
-                     dnnl_dim_t                  strb2,
-                     void *                      c,
-                     dt                          ct,
-                     const queue_ptr &           q,
-                     dnnl_dim_t                  batches_a,
-                     dnnl_dim_t                  batches_b,
-                     int                         ldc = -1,
-                     const std::vector<sycl::event> & deps = {},
-                     const char *                op_context = nullptr) {
+    static sycl::event gemm(ggml_backend_sycl_context &      ctx,
+                            int                              m,
+                            int                              n,
+                            int                              k,
+                            const void *                     a,
+                            dt                               at,
+                            dnnl_dim_t                       stra0,
+                            dnnl_dim_t                       stra1,
+                            dnnl_dim_t                       stra2,
+                            const void *                     b,
+                            dt                               bt,
+                            dnnl_dim_t                       strb0,
+                            dnnl_dim_t                       strb1,
+                            dnnl_dim_t                       strb2,
+                            void *                           c,
+                            dt                               ct,
+                            const queue_ptr &                q,
+                            dnnl_dim_t                       batches_a,
+                            dnnl_dim_t                       batches_b,
+                            int                              ldc        = -1,
+                            const std::vector<sycl::event> & deps       = {},
+                            const char *                     op_context = nullptr) {
         std::lock_guard<std::mutex> lock(exec_mutex(q));
 
         auto stream = ctx.stream_dnnl(q);
@@ -413,10 +413,22 @@ class DnnlGemmWrapper {
             gemm_label.category   = "mulmat";
             gemm_label.queue_kind = "compute";
             gemm_label.device     = ctx.device;
-            const std::string label_metadata = op_context ?
-                (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=fallback_create") :
-                (std::string("m=") + std::to_string(m) + ";variant=fallback_create");
-            gemm_label.metadata = label_metadata.c_str();
+            // llama.cpp-qmen (spec-review fix round, finding 6): built only
+            // under the profiler gate -- otherwise this is a heap
+            // allocation on every call even with the profiler off, which
+            // is what the docs/backend/sycl-env-vars.md row's "zero
+            // overhead when unset" claim requires. gemm_label.metadata
+            // defaults to "" (ggml_sycl_profile_label's member
+            // initializer), so leaving it untouched when disabled is
+            // already correct.
+            std::string label_metadata;
+            if (ggml_sycl_kernel_profile_enabled()) {
+                label_metadata =
+                    op_context ?
+                        (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=fallback_create") :
+                        (std::string("m=") + std::to_string(m) + ";variant=fallback_create");
+                gemm_label.metadata = label_metadata.c_str();
+            }
             return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
                 return dnnl::sycl_interop::execute(matmul_prim, stream, matmul_args, deps);
             });
@@ -445,28 +457,34 @@ class DnnlGemmWrapper {
         gemm_label.category   = "mulmat";
         gemm_label.queue_kind = "compute";
         gemm_label.device     = ctx.device;
-        const std::string label_metadata = op_context ?
-            (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=cached") :
-            (std::string("m=") + std::to_string(m) + ";variant=cached");
-        gemm_label.metadata = label_metadata.c_str();
+        // llama.cpp-qmen (spec-review fix round, finding 6): see the
+        // fallback-create arm above for the rationale -- same gate, same
+        // "" default when disabled.
+        std::string label_metadata;
+        if (ggml_sycl_kernel_profile_enabled()) {
+            label_metadata      = op_context ?
+                                      (std::string("src0=") + op_context + ";m=" + std::to_string(m) + ";variant=cached") :
+                                      (std::string("m=") + std::to_string(m) + ";variant=cached");
+            gemm_label.metadata = label_metadata.c_str();
+        }
         return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
             return dnnl::sycl_interop::execute(cached->primitive, stream, matmul_args, deps);
         });
     }
 
     static sycl::event row_gemm(ggml_backend_sycl_context & ctx,
-                         int                         m,
-                         int                         n,
-                         int                         k,
-                         const void *                a,
-                         dt                          at,
-                         const void *                b,
-                         dt                          bt,
-                         void *                      c,
-                         dt                          ct,
-                         const queue_ptr &           q,
-                         int                         ldc = -1,
-                         const char *                op_context = nullptr) {
+                                int                         m,
+                                int                         n,
+                                int                         k,
+                                const void *                a,
+                                dt                          at,
+                                const void *                b,
+                                dt                          bt,
+                                void *                      c,
+                                dt                          ct,
+                                const queue_ptr &           q,
+                                int                         ldc        = -1,
+                                const char *                op_context = nullptr) {
         return gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, ldc, /* deps = */ {},
                     op_context);
     }

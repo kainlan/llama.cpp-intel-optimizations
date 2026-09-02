@@ -74,15 +74,24 @@ void                            ggml_sycl_kernel_profile_record_event(const ggml
                                                                       ggml_sycl::sycl_timeline_callsite callsite = {},
                                                                       uint64_t                          host_submit_begin_us = 0,
                                                                       uint64_t                          host_submit_end_us = 0);
-// For call sites that have no sycl::event to attach to (e.g. oneDNN Graph's
-// dnnl::graph::sycl_interop::execute(), which returns void): records a
-// sample using the HOST wall-clock span around the call as a stand-in
+// For call sites that have no sycl::event to attach to at all (a pure
+// host-side marker, or an API with no async submission to observe): records
+// a sample using the HOST wall-clock span around the call as a stand-in
 // duration. This is NOT device execution time -- it also includes host-side
 // enqueue overhead and, if the call blocks, device time too -- so rows
 // produced by this path carry timestamp_status="host_span_only" in raw-event
-// output to keep them distinguishable from real device-event timing. Use
-// ggml_sycl_kernel_profile_record_event (device timestamps) whenever the
-// call site returns a sycl::event; reach for this only when it does not.
+// output to keep them distinguishable from real device-event timing.
+//
+// When a call site DOES return a sycl::event, prefer
+// ggml_sycl_kernel_profile_record_event -- and when you also want the host
+// span alongside a real (if partial) device event, pass it its
+// host_submit_begin_us/host_submit_end_us parameters rather than calling
+// this function separately: that records ONE sample carrying both, instead
+// of two samples under the same label that double the aggregate row's count
+// and blend device+host time into one total_ns (see fattn-onednn.cpp's
+// oneDNN SDPA execute() call, where the returned event covers only the
+// compiled partition's last kernel -- not void, as an earlier revision of
+// this comment incorrectly claimed, but not the whole call's cost either).
 void                            ggml_sycl_kernel_profile_record_host_span(const ggml_sycl_profile_label &   label,
                                                                           uint64_t                          host_begin_us,
                                                                           uint64_t                          host_end_us,

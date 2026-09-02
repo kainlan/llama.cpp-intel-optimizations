@@ -11,7 +11,6 @@
 #    include "common.hpp"
 #    include "fattn-common.hpp"
 
-#    include <chrono>
 #    include <cmath>
 #    include <cstdio>
 #    include <mutex>
@@ -560,9 +559,9 @@ bool ggml_sycl_flash_attn_ext_onednn_materialize_kv(const ggml_sycl_onednn_fa_ma
     // caller instead of being drained on the host before every SDPA execute.
     try {
         out->k_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.K, static_cast<char *>(k_resolved.ptr), desc,
-                                                          /*value_tensor=*/false);
+                                                         /*value_tensor=*/false);
         out->v_evt = ggml_sycl_onednn_fa_materialize_one(stream, params.V, static_cast<char *>(v_resolved.ptr), desc,
-                                                          /*value_tensor=*/true);
+                                                         /*value_tensor=*/true);
     } catch (const std::exception & e) {
         if (std::getenv("GGML_SYCL_FA_DISPATCH_DEBUG")) {
             fprintf(stderr, "[SYCL] fattn: oneDNN materialized K/V repack failed: %s\n", e.what());
@@ -1007,6 +1006,71 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
 
     fattn_params                        active_params = params;
     ggml_sycl_onednn_fa_materialized_kv materialized{};
+
+    // llama.cpp-hhbb (S3 fix round, spec review c-fm68 finding 2): every
+    // `return false` between materialization and the SDPA `execute()` below
+    // -- resolve failures, the negative-cache hit (reachable on EVERY call
+    // for a negative-cached shape, and Q/K/V may already be materialized by
+    // then), a JIT compile failure, the scale guard, and the catch block at
+    // the end -- is a failure path that must NOT let a still-in-flight
+    // repack kernel's buffer be freed out from under it. `materialized` is a
+    // plain local; with the host waits removed, its mem_handles would
+    // otherwise be released the instant any of those returns unwinds this
+    // scope, while the Q/K/V repack kernels (submitted, never waited on) may
+    // still be running on the device. This scope guard is the uniform fix:
+    // at ANY exit where a handle in `materialized` is still valid -- i.e.
+    // the success path near the bottom of this function did not already
+    // move it into retain_handles_until_event(..., exec_event) -- it
+    // retains whatever is left against the LAST-submitted repack event.
+    // Retaining against only the last one is sufficient, not one call per
+    // handle: K, then V (inside materialize_kv), then Q (materialize_q_f32,
+    // which runs after the K/V block below) are always submitted, in that
+    // fixed order, onto this same in-order `*stream` queue, so a
+    // later-submitted event's completion already implies every
+    // earlier-submitted one on this queue has completed too.
+    struct materialized_kv_release_guard {
+        ggml_sycl_onednn_fa_materialized_kv & m;
+
+        ~materialized_kv_release_guard() {
+            try {
+                sycl::event last_evt;
+                bool        have_evt = false;
+                if (m.K.valid()) {
+                    last_evt = m.k_evt;
+                    have_evt = true;
+                }
+                if (m.V.valid()) {
+                    last_evt = m.v_evt;
+                    have_evt = true;
+                }
+                if (m.Q.valid()) {
+                    last_evt = m.q_evt;
+                    have_evt = true;
+                }
+                if (!have_evt) {
+                    return;
+                }
+                std::vector<ggml_sycl::mem_handle> retained;
+                retained.reserve(3);
+                if (m.Q.valid()) {
+                    retained.push_back(std::move(m.Q));
+                }
+                if (m.K.valid()) {
+                    retained.push_back(std::move(m.K));
+                }
+                if (m.V.valid()) {
+                    retained.push_back(std::move(m.V));
+                }
+                ggml_sycl::retain_handles_until_event(std::move(retained), last_evt);
+            } catch (...) {
+                // Destructors must not throw -- this one may run while
+                // another exception is already unwinding through the catch
+                // block at the end of this function. There is nothing safe
+                // left to do here but swallow rather than std::terminate.
+            }
+        }
+    } materialized_release_guard{ materialized };
+
     if (layout_plan.kind == ggml_sycl_onednn_fa_layout_kind::MATERIALIZE_REQUIRED) {
         ggml_sycl_onednn_fa_materialization_desc desc{};
         if (!ggml_sycl_flash_attn_ext_onednn_materialization_desc(params, H_q, H_kv, ctx.device, &desc) ||
@@ -1258,7 +1322,7 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         // a few lines down.
         //
         // PROFILING CAVEAT (found in GPU verification, llama.cpp-hhbb
-        // c-xqi6): the returned event's device profiling window covers only
+        // c-xqi6): that returned event's device profiling window covers only
         // the compiled partition's LAST kernel (~0.4 ms), not the whole
         // fused 5-op SDPA pattern (bmm1 -> divide -> [mask] -> softmax ->
         // bmm2) -- oneDNN Graph does not expose per-op or whole-partition
@@ -1271,21 +1335,24 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
         // tests/e1-rca/probe-barrier-bug.cpp) and its events carry no
         // profiling info anyway (artifacts/perf-recovery/
         // alt6-pp-gap-attribution.md), so it could not supply a real start
-        // timestamp even if it were safe. So both are recorded, matching
-        // ggml_sycl_kernel_profile_record_host_span's documented purpose
-        // ("For call sites that have no sycl::event to attach to... use
-        // ggml_sycl_kernel_profile_record_event whenever the call site
-        // returns a sycl::event; reach for this only when it does not" --
-        // here we have a real but PARTIAL event, so both apply): the host
-        // span brackets the whole synchronous host-side cost of the call
-        // (which per S4/llama.cpp-jmc5 is where the real ~2.7 ms/call
-        // actually lives -- oneDNN's per-execute scratch allocate/free
-        // through the SYCL runtime, not GPU kernel time) and the device
-        // event supplies the real, if partial, device timestamp for the
-        // tail kernel. The profiler already keeps the two kinds of rows
-        // distinguishable via timestamp_status ("host_span_only" vs a real
-        // device timestamp), so recording both under the same label is the
-        // documented, not a workaround.
+        // timestamp even if it were safe.
+        //
+        // ggml_sycl_profile_submit() below is the fix instead: its 5-arg
+        // ggml_sycl_kernel_profile_record_event(label, event, callsite,
+        // host_submit_begin_us, host_submit_end_us) form (sycl-kernel-
+        // profiler.hpp:72-76) records ONE sample carrying both the real
+        // device event (the tail kernel above) and the host span around the
+        // whole submit call (which per S4/llama.cpp-jmc5 is where the real
+        // ~2.7 ms/call actually lives -- oneDNN's per-execute scratch
+        // allocate/free through the SYCL runtime, not GPU kernel time). An
+        // earlier revision of this fix called
+        // ggml_sycl_kernel_profile_record_event() and
+        // ggml_sycl_kernel_profile_record_host_span() separately under the
+        // same label; that recorded TWO samples per call, which the
+        // profiler's aggregate rows (keyed on {name,category,metadata}, not
+        // on the per-raw-row timestamp_status) silently summed into a
+        // doubled count and a device+host-blended total_ns -- a real defect,
+        // caught in review, not a hypothetical one.
         std::vector<sycl::event> deps;
         deps.reserve(3);
         if (materialized.Q.valid()) {
@@ -1298,33 +1365,19 @@ bool ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, const fatt
             deps.push_back(materialized.v_evt);
         }
 
-        const bool     profile_enabled = ggml_sycl_kernel_profile_enabled();
-        const uint64_t host_begin_us =
-            profile_enabled ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                        std::chrono::steady_clock::now().time_since_epoch())
-                                                        .count()) :
-                              0;
+        ggml_sycl_profile_label profile_label{};
+        profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
+        profile_label.category             = "fattn";
+        profile_label.queue_kind           = "compute";
+        const std::string profile_metadata = "D=" + std::to_string(D) + ";ne01=" + std::to_string(active_params.ne01) +
+                                             ";ne11=" + std::to_string(active_params.ne11) +
+                                             ";H_q=" + std::to_string(H_q) + ";H_kv=" + std::to_string(H_kv);
+        profile_label.metadata = profile_metadata.c_str();
+        profile_label.device   = ctx.device;
 
-        sycl::event exec_event =
-            dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);
-
-        if (profile_enabled) {
-            const uint64_t host_end_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                                   .count());
-            ggml_sycl_profile_label profile_label{};
-            profile_label.name                 = "fattn.decode.onednn_sdpa_graph";
-            profile_label.category             = "fattn";
-            profile_label.queue_kind           = "compute";
-            const std::string profile_metadata = "D=" + std::to_string(D) +
-                                                 ";ne01=" + std::to_string(active_params.ne01) +
-                                                 ";ne11=" + std::to_string(active_params.ne11) +
-                                                 ";H_q=" + std::to_string(H_q) + ";H_kv=" + std::to_string(H_kv);
-            profile_label.metadata = profile_metadata.c_str();
-            profile_label.device   = ctx.device;
-            ggml_sycl_kernel_profile_record_event(profile_label, exec_event);
-            ggml_sycl_kernel_profile_record_host_span(profile_label, host_begin_us, host_end_us);
-        }
+        sycl::event exec_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue &) {
+            return dnnl::graph::sycl_interop::execute(entry->cp, dnnl_stream, in_tensors, out_tensors, deps);
+        });
 
         if (materialized.Q.valid() || materialized.K.valid() || materialized.V.valid()) {
             std::vector<ggml_sycl::mem_handle> retained;

@@ -30,12 +30,20 @@ struct e2e_tg_stage_accum {
     uint64_t    calls     = 0;
     double      host_us   = 0.0;
     // llama.cpp-qmen (S6/I1 profiler completeness, spike S6 of
-    // docs/plans/2026-09-01-sycl-utilization-plan.md): the ACCUMULATOR and
-    // its printed field are real and tested (test-sycl-e2e-profile.cpp feeds
-    // and reads back a non-zero value end to end) -- what is missing is a
-    // producer. Every production call site in the tree passes a literal 0.0
-    // today, so in practice this field always reads 0.0. That is NOT
-    // fixable by reading `sycl::event::get_profiling_info<command_start/
+    // docs/plans/2026-09-01-sycl-utilization-plan.md; corrected in the
+    // spec-review fix round, finding 5 -- the first version of this
+    // comment claimed "every production call site passes a literal 0.0",
+    // which was false): the ACCUMULATOR and its printed field are real and
+    // tested (test-sycl-e2e-profile.cpp feeds and reads back a non-zero
+    // value end to end) -- what is missing is a DEVICE-timestamp producer.
+    // No call site supplies one; the one non-zero producer in the tree is
+    // a HOST-CLOCK measurement (a chrono span around a host-mediated peer-
+    // link bounce copy, not a SYCL device event) passed through as
+    // `device_us` at ggml-sycl.cpp:22472
+    // (e2e_tg_profile_record_transfer("peer_host_bounce_measure", bytes,
+    // /*host_us=*/0.0, link.host_bounce_us)) -- so this field is not
+    // universally 0.0, but it is universally NOT a device timestamp. That
+    // is NOT fixable by reading `sycl::event::get_profiling_info<command_start/
     // command_end>` at the call sites that matter most (the per-op
     // `e2e_tg_scope` bracket in ggml_sycl_compute_forward, which accounts
     // for the bulk of dispatched ops): querying profiling info on an event

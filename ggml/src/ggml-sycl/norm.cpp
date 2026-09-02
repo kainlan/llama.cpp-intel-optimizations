@@ -882,8 +882,13 @@ static void norm_f32_sycl(const float * x,
     norm_label.category   = "norm";
     norm_label.queue_kind = "compute";
     norm_label.device     = device;
-    const std::string norm_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    norm_label.metadata              = norm_metadata.c_str();
+    // (spec-review fix round, finding 6): metadata built only under the
+    // gate -- see rms_norm_f32_sycl below for the full rationale.
+    std::string norm_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+        norm_label.metadata = norm_metadata.c_str();
+    }
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         ggml_sycl_profile_submit(*stream, norm_label, [&](sycl::queue &) {
@@ -932,9 +937,13 @@ static void group_norm_f32_sycl(const float * x,
     group_norm_label.category   = "norm";
     group_norm_label.queue_kind = "compute";
     group_norm_label.device     = device;
-    const std::string group_norm_metadata =
-        "num_groups=" + std::to_string(num_groups) + ";group_size=" + std::to_string(group_size);
-    group_norm_label.metadata = group_norm_metadata.c_str();
+    // (spec-review fix round, finding 6): metadata built only under the
+    // gate -- see rms_norm_f32_sycl below for the full rationale.
+    std::string group_norm_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        group_norm_metadata = "num_groups=" + std::to_string(num_groups) + ";group_size=" + std::to_string(group_size);
+        group_norm_label.metadata = group_norm_metadata.c_str();
+    }
     if (group_size < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
         ggml_sycl_profile_submit(*stream, group_norm_label, [&](sycl::queue &) {
@@ -998,8 +1007,21 @@ static void rms_norm_f32_sycl(const float * x,
     rms_norm_label.category   = "norm";
     rms_norm_label.queue_kind = "compute";
     rms_norm_label.device     = device;
-    const std::string rms_norm_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    rms_norm_label.metadata              = rms_norm_metadata.c_str();
+    // (spec-review fix round, finding 6): the metadata string is built
+    // ONLY under the profiler gate. ggml_sycl_profile_label::metadata
+    // defaults to "" (its member initializer), so leaving it untouched
+    // when disabled is already correct -- the alternative (building it
+    // unconditionally, as this task's first version and the older
+    // mxfp4.pp.gemm.execute 2-D loop in gemm.hpp both do) is a real heap
+    // allocation on every RMS_NORM call even with the profiler off,
+    // which contradicts docs/backend/sycl-env-vars.md's "zero overhead
+    // when unset" claim for this instrument -- ~300 such calls/decode
+    // token across the whole RMS_NORM family, not a rounding error.
+    std::string rms_norm_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        rms_norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+        rms_norm_label.metadata = rms_norm_metadata.c_str();
+    }
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -1070,8 +1092,13 @@ static void rms_norm_mul_f32_sycl(const float * x,
     rms_norm_mul_label.category   = "norm";
     rms_norm_mul_label.queue_kind = "compute";
     rms_norm_mul_label.device     = device;
-    const std::string rms_norm_mul_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    rms_norm_mul_label.metadata              = rms_norm_mul_metadata.c_str();
+    // (spec-review fix round, finding 6): metadata built only under the
+    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    std::string rms_norm_mul_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        rms_norm_mul_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+        rms_norm_mul_label.metadata = rms_norm_mul_metadata.c_str();
+    }
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     sycl::event          evt;
@@ -1174,9 +1201,13 @@ static void rms_norm_mul_add_f32_sycl(const float * x,
     rms_norm_mul_add_label.category   = "norm";
     rms_norm_mul_add_label.queue_kind = "compute";
     rms_norm_mul_add_label.device     = device;
-    const std::string rms_norm_mul_add_metadata =
-        "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    rms_norm_mul_add_label.metadata = rms_norm_mul_add_metadata.c_str();
+    // (spec-review fix round, finding 6): metadata built only under the
+    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    std::string rms_norm_mul_add_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        rms_norm_mul_add_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+        rms_norm_mul_add_label.metadata = rms_norm_mul_add_metadata.c_str();
+    }
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
@@ -1185,13 +1216,13 @@ static void rms_norm_mul_add_f32_sycl(const float * x,
             return stream->submit([&](sycl::handler & cgh) {
                 cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                     rms_norm_mul_add_f32(
-                                         x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample,
-                                         mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols, mul_nrows,
-                                         mul_nchannels, mul_nsamples, add_stride_row, add_stride_channel,
-                                         add_stride_sample, add_ncols, add_nrows, add_nchannels, add_nsamples,
-                                         dst_stride_row, dst_stride_channel, dst_stride_sample, eps, item_ct1, nullptr,
-                                         WARP_SIZE);
+                                     rms_norm_mul_add_f32(x, mul, add, dst, ncols, stride_row, stride_channel,
+                                                          stride_sample, mul_stride_row, mul_stride_channel,
+                                                          mul_stride_sample, mul_ncols, mul_nrows, mul_nchannels,
+                                                          mul_nsamples, add_stride_row, add_stride_channel,
+                                                          add_stride_sample, add_ncols, add_nrows, add_nchannels,
+                                                          add_nsamples, dst_stride_row, dst_stride_channel,
+                                                          dst_stride_sample, eps, item_ct1, nullptr, WARP_SIZE);
                                  });
             });
         });
@@ -1278,8 +1309,13 @@ static void add_rms_norm_f32_sycl(const float * x,
     add_rms_norm_label.category   = "norm";
     add_rms_norm_label.queue_kind = "compute";
     add_rms_norm_label.device     = device;
-    const std::string add_rms_norm_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    add_rms_norm_label.metadata              = add_rms_norm_metadata.c_str();
+    // (spec-review fix round, finding 6): metadata built only under the
+    // gate -- see rms_norm_f32_sycl above for the full rationale.
+    std::string add_rms_norm_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        add_rms_norm_metadata       = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+        add_rms_norm_label.metadata = add_rms_norm_metadata.c_str();
+    }
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
@@ -1327,13 +1363,12 @@ static void add_rms_norm_f32_sycl(const float * x,
                 sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
                 cgh.parallel_for(sycl::nd_range<3>(global_dims * block_dims, block_dims),
                                  [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                     add_rms_norm_f32(x, add, add_dst, dst, ncols, stride_x_row, stride_x_channel,
-                                                      stride_x_sample, stride_add_row, stride_add_channel,
-                                                      stride_add_sample, add_ncols, add_nrows, add_nchannels,
-                                                      add_nsamples, add_dst_stride_row, add_dst_stride_channel,
-                                                      add_dst_stride_sample, dst_stride_row, dst_stride_channel,
-                                                      dst_stride_sample, eps, item_ct1, get_pointer(s_sum_acc_ct1),
-                                                      work_group_size);
+                                     add_rms_norm_f32(
+                                         x, add, add_dst, dst, ncols, stride_x_row, stride_x_channel, stride_x_sample,
+                                         stride_add_row, stride_add_channel, stride_add_sample, add_ncols, add_nrows,
+                                         add_nchannels, add_nsamples, add_dst_stride_row, add_dst_stride_channel,
+                                         add_dst_stride_sample, dst_stride_row, dst_stride_channel, dst_stride_sample,
+                                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
                                  });
             });
         });
