@@ -2276,6 +2276,42 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         # an oracle; take the named mechanism back to its ticket above.
         # It loads models, so run it ONCE. Never in a loop.
     )
+
+    # llama.cpp-6cgq: Q8_0 SOA MMVQ small-N occupancy geometry numerics.
+    #
+    # Compares reorder_mul_mat_vec_q8_0_q8_1_sycl's output (SOA, either
+    # geometry branch depending on GGML_SYCL_MMVQ_Q8_SOA_SMALLN) against a
+    # CPU dequant+dot reference AND against coalesced_mul_mat_vec_q8_0_q8_1_
+    # sycl's output for the SAME weight bytes, across the shapes the ticket
+    # profiled plus batch 2/8 for the shape the small-N geometry changes
+    # most. Needs the ggml-sycl-private-fixtures layout-override hook (same
+    # mechanism test-layout-cache and test-q8-0-layout-cache-path-mmvq use)
+    # to force each weight tensor's materialized layout deterministically --
+    # a plain device-buffer upload does not exercise SOA/COALESCED
+    # materialization at all, only the model-load path does.
+    #
+    # The env accessor mmvq_q8_0_soa_smalln_enabled() (mmvq.cpp) caches its
+    # value once per process, so ONE ctest registration cannot see both
+    # GGML_SYCL_MMVQ_Q8_SOA_SMALLN states -- this registration runs the
+    # default (ON) state; run the binary by hand with =0 for the other arm
+    # (see the file's own header comment for the exact command).
+    add_executable(test-sycl-mmvq-q8-0-soa-smalln-numerics test-sycl-mmvq-q8-0-soa-smalln-numerics.cpp)
+    target_link_libraries(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE ggml-sycl-private-fixtures)
+    target_include_directories(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_PRIVATE_TESTING=1)
+    target_compile_options(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE "-fsycl")
+    add_test(NAME test-sycl-mmvq-q8-0-soa-smalln-numerics COMMAND $<TARGET_FILE:test-sycl-mmvq-q8-0-soa-smalln-numerics>)
+    set_tests_properties(test-sycl-mmvq-q8-0-soa-smalln-numerics PROPERTIES
+        LABELS "sycl;mmvq;quant;soa;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 # test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
@@ -2645,6 +2681,17 @@ endif()
 llama_build_and_test(test-sycl-q8-scale-plane-index.cpp)
 target_include_directories(test-sycl-q8-scale-plane-index PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 set_tests_properties(test-sycl-q8-scale-plane-index PROPERTIES LABELS "main;sycl;quant;soa;host")
+
+# llama.cpp-6cgq: the Q8_0 SOA MMVQ small-N occupancy geometry
+# (ggml/src/ggml-sycl/mmvq-launch-geometry.hpp:ggml_sycl_mmvq_q8_0_soa_geometry)
+# that reorder_mul_mat_vec_q8_0_q8_1_sycl (mmvq.cpp) uses to raise work-group
+# count for small nrows, checked against the unmodified dispatch code's
+# today-values as a regression anchor plus an occupancy-floor contract and a
+# positive control. Pure C++ -- no SYCL, no device, no ggml link -- so it
+# runs in every sweep at any parallelism.
+llama_build_and_test(test-sycl-mmvq-q8-0-soa-geometry.cpp)
+target_include_directories(test-sycl-mmvq-q8-0-soa-geometry PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+set_tests_properties(test-sycl-mmvq-q8-0-soa-geometry PROPERTIES LABELS "main;sycl;quant;soa;host")
 
 # llama.cpp-nz1k: source gate -- the WoQ-Q8 arm (ONEDNN_SOA) is reachable only
 # with GGML_SYCL_ONEDNN_WOQ_Q8=1 and a Q8_0 weight the planner materialized SOA

@@ -2261,6 +2261,15 @@ static bool ggml_sycl_is_host_resident_weight(const ggml_tensor * src0, sycl::qu
 // Note: Using int instead of ggml_type because SYCL kernel names require fixed underlying types
 template <int qtype> class mmvq_kernel_name;
 template <int qtype> class mmvq_reorder_kernel_name;
+// llama.cpp-6cgq: distinct name tag for the Q8_0 SOA small-N branch in
+// reorder_mul_mat_vec_q8_0_q8_1_sycl. It launches the SAME kernel body
+// (mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>) as the
+// unchanged large-N site below it in that function, from a second, separate
+// `parallel_for` call site -- reusing mmvq_reorder_kernel_name<GGML_TYPE_Q8_0>
+// there gives two distinct lambdas the same explicit SYCL kernel name, which
+// the SYCL compiler rejects at link time ("definition with same mangled name
+// as another definition").
+template <int qtype> class mmvq_reorder_smalln_kernel_name;
 template <int qtype> class mmvq_reorder_slm_kernel_name;
 template <int qtype> class mmvq_coalesced_kernel_name;
 template <int qtype> class mmvq_id_kernel_name;
@@ -3518,6 +3527,17 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     });
 }
 
+// llama.cpp-6cgq: small-N occupancy fix for the Q8_0 SOA MMVQ launch below.
+// Default ON; GGML_SYCL_MMVQ_Q8_SOA_SMALLN=0 restores today's fixed
+// num_subgroups=16 geometry byte-for-byte at every N, for A/B comparison.
+static bool mmvq_q8_0_soa_smalln_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MMVQ_Q8_SOA_SMALLN");
+        return !(env && std::atoi(env) == 0);
+    }();
+    return enabled;
+}
+
 // Q8_0 reorder MMVQ dispatch function
 // Note: total_nrows is the full tensor row count (ne01), nrows is the slice size (row_diff)
 //       row_low is the starting row offset for this slice (for split tensor support)
@@ -3534,6 +3554,55 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
                                                const int64_t   fused_add_nb0      = sizeof(float),
                                                const int64_t   fused_add_row_base = 0) {
     GGML_ASSERT(ncols % QK8_0 == 0);
+
+    // llama.cpp-6cgq: small-N occupancy fix. Kept as an EARLIER, SEPARATE
+    // dispatch branch rather than editing `num_subgroups` below: that line's
+    // literal text is the anchor
+    // tests/test-sycl-mmvq-launch-geometry-contract.py scans at all 11
+    // sub-group-per-row launch sites in this file (llama.cpp-99ke), and it
+    // requires them textually identical. Branching before it, with its own
+    // early return, leaves that pre-existing contract covering the unchanged
+    // path below byte-for-byte; the geometry computed here is covered
+    // instead by this ticket's own host-only test
+    // (tests/test-sycl-mmvq-q8-0-soa-geometry.cpp). See
+    // ggml_sycl_mmvq_q8_0_soa_geometry's comment in mmvq-launch-geometry.hpp
+    // for the occupancy analysis and derivation.
+    if (mmvq_q8_0_soa_smalln_enabled()) {
+        const int  device_id = ggml_sycl_get_device_id_from_queue(*stream);
+        const int  n_cores   = (int) ggml_sycl_info().devices[device_id].xmx_caps.compute_units;
+        const auto geometry  = ggml_sycl::ggml_sycl_mmvq_q8_0_soa_geometry(nrows, ncols, n_cores);
+        if (geometry.subgroups_per_workgroup != 16) {
+            const int num_subgroups = geometry.subgroups_per_workgroup;
+            const int block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
+            const int padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, num_subgroups);
+
+            const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
+            const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+            ggml_sycl_profile_label profile_label{};
+            profile_label.name                 = "mulmat.mmvq.q8_0_soa";
+            profile_label.category             = "mulmat";
+            profile_label.queue_kind           = "compute";
+            const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows) +
+                                                 ";subgroups=" + std::to_string(num_subgroups);
+            profile_label.metadata = profile_metadata.c_str();
+            profile_label.device   = device_id;
+
+            (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+                return profiled_queue.submit([&](sycl::handler & cgh) {
+                    cgh.parallel_for<mmvq_reorder_smalln_kernel_name<GGML_TYPE_Q8_0>>(
+                        sycl::nd_range<3>(global_size, workgroup_size),
+                        [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                            mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                                vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0,
+                                fused_add_nb0, fused_add_row_base);
+                        });
+                });
+            });
+            return;
+        }
+    }
+
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
     const int        padded_num_y  = ggml_sycl::mmvq_pad_rows_to_workgroups(block_num_y, (int) num_subgroups);
