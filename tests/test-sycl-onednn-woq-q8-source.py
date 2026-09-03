@@ -9,6 +9,7 @@ opt-in interim only; the default is decided on llama.cpp-2zsc with the A/B
 numbers. This file exists so a quiet default flip, or a new eligibility site
 for ONEDNN_SOA that forgets the env gate, fails a test instead of shipping.
 
+Runs under pytest (llama_test_pytest registration) and as a plain script.
 Point it at alternate copies (to exercise the RED path with a deliberately
 broken tree) via GGML_SYCL_WOQ_Q8_BACKEND_SOURCE / GGML_SYCL_WOQ_Q8_COMMON_SOURCE;
 defaults are the in-tree files. No SYCL device or build is touched.
@@ -16,7 +17,6 @@ defaults are the in-tree files. No SYCL device or build is touched.
 
 import os
 import re
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,12 +26,10 @@ COMMON = Path(os.environ.get("GGML_SYCL_WOQ_Q8_COMMON_SOURCE", str(ROOT / "ggml/
 backend = BACKEND.read_text()
 common = COMMON.read_text()
 
-failures = []
-
-
-def check(cond, msg):
-    if not cond:
-        failures.append(msg)
+ARM_SIG = "static bool ggml_sycl_onednn_woq_q8_enabled() {"
+OP_SIG = "inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,"
+PICK_SIG = "auto pick_kernel_for_layout = [&](layout_mode layout) -> std::optional<ggml_sycl_mul_mat_kernel> {"
+GET_OPTIMAL_SIG = "static layout_mode get_optimal(ggml_type qtype, tensor_usage usage, int device_id = -1) {"
 
 
 def matching_brace(text, open_idx):
@@ -89,118 +87,114 @@ def matching_brace(text, open_idx):
 
 def function_body(text, signature):
     idx = text.find(signature)
-    check(idx >= 0, f"missing definition: {signature}")
-    if idx < 0:
-        return ""
+    assert idx >= 0, f"missing definition: {signature}"
     open_idx = text.find("{", idx)
     return text[open_idx : matching_brace(text, open_idx) + 1]
 
 
-# 1. The arm env accessor exists once, reads GGML_SYCL_ONEDNN_WOQ_Q8, defaults OFF.
-ARM_SIG = "static bool ggml_sycl_onednn_woq_q8_enabled() {"
-check(backend.count(ARM_SIG) == 1, "ggml_sycl_onednn_woq_q8_enabled must be defined exactly once")
-arm_body = function_body(backend, ARM_SIG)
-check('std::getenv("GGML_SYCL_ONEDNN_WOQ_Q8")' in arm_body, "arm accessor must read GGML_SYCL_ONEDNN_WOQ_Q8")
-check(
-    "(env != nullptr && std::atoi(env) != 0) ? 1 : 0" in arm_body,
-    "GGML_SYCL_ONEDNN_WOQ_Q8 must default OFF (unset => 0); ruling 9 / nz1k c-c4jp",
-)
+def test_arm_env_accessor_exists_once_and_defaults_off():
+    assert backend.count(ARM_SIG) == 1, "ggml_sycl_onednn_woq_q8_enabled must be defined exactly once"
+    body = function_body(backend, ARM_SIG)
+    assert 'std::getenv("GGML_SYCL_ONEDNN_WOQ_Q8")' in body, "arm accessor must read GGML_SYCL_ONEDNN_WOQ_Q8"
+    assert (
+        "(env != nullptr && std::atoi(env) != 0) ? 1 : 0" in body
+    ), "GGML_SYCL_ONEDNN_WOQ_Q8 must default OFF (unset => 0); ruling 9 / nz1k c-c4jp"
 
-# 2. The layout env: read once in common.hpp, default coalesced (only the exact
-#    string "soa" selects SOA), and the SOA return is used in the dense blocks.
-check(
-    'std::getenv("GGML_SYCL_Q8_DENSE_LAYOUT")' in common,
-    "common.hpp must read GGML_SYCL_Q8_DENSE_LAYOUT",
-)
-check(
-    'q8_dense_soa_cached = (env && std::strcmp(env, "soa") == 0) ? 1 : 0;' in common,
-    "GGML_SYCL_Q8_DENSE_LAYOUT must default to coalesced (only \"soa\" selects SOA)",
-)
-soa_returns = common.count("if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) {\n                return GGML_LAYOUT_SOA;")
-check(soa_returns == 2, f"expected the SOA layout return in the ATTENTION/FFN and OUTPUT blocks (2), found {soa_returns}")
-get_optimal = function_body(common, "static layout_mode get_optimal(ggml_type qtype, tensor_usage usage, int device_id = -1) {")
-emb_idx = get_optimal.find("if (usage == tensor_usage::EMBEDDING) {")
-check(emb_idx > 0, "get_optimal EMBEDDING block not found")
-if emb_idx > 0:
+
+def test_layout_env_defaults_coalesced_and_only_touches_dense_projections():
+    assert 'std::getenv("GGML_SYCL_Q8_DENSE_LAYOUT")' in common, "common.hpp must read GGML_SYCL_Q8_DENSE_LAYOUT"
+    assert (
+        'q8_dense_soa_cached = (env && std::strcmp(env, "soa") == 0) ? 1 : 0;' in common
+    ), 'GGML_SYCL_Q8_DENSE_LAYOUT must default to coalesced (only "soa" selects SOA)'
+    soa_returns = common.count(
+        "if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) {\n                return GGML_LAYOUT_SOA;"
+    )
+    assert soa_returns == 2, f"expected the SOA return in the ATTENTION/FFN and OUTPUT blocks (2), found {soa_returns}"
+    get_optimal = function_body(common, GET_OPTIMAL_SIG)
+    emb_idx = get_optimal.find("if (usage == tensor_usage::EMBEDDING) {")
+    assert emb_idx > 0, "get_optimal EMBEDDING block not found"
     emb_block = get_optimal[emb_idx : matching_brace(get_optimal, get_optimal.find("{", emb_idx)) + 1]
-    check("q8_dense_soa_cached" not in emb_block, "GGML_SYCL_Q8_DENSE_LAYOUT must not touch EMBEDDING layouts (nz1k scope)")
+    assert "q8_dense_soa_cached" not in emb_block, "GGML_SYCL_Q8_DENSE_LAYOUT must not touch EMBEDDING (nz1k scope)"
 
-# 3. Every ONEDNN_SOA eligibility site is gated on the arm env. The sites are
-#    the two `case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:` switch arms (override
-#    check + preferred-kernel selection) and the pick_kernel_for_layout SOA arm.
-case_sites = [m.start() for m in re.finditer(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", backend)]
-# Four sites: kernel-name table, override check, preferred-kernel selection,
-# dispatch. The two SELECTION sites must consult the env gate; the name table
-# and the dispatch arm (which executes an already-selected kernel) do not.
-check(
-    len(case_sites) == 4,
-    f"expected 4 `case ONEDNN_SOA:` sites (name table, override check, preferred selection, dispatch), found {len(case_sites)}",
-)
-kinds = {"gated": 0, "dispatch": 0, "name": 0}
-for start in case_sites:
-    # the case body runs to the next `case`/`default` at the same switch level
-    end = re.search(r"\n\s*(case |default:)", backend[start + 10 :])
-    body = backend[start : start + 10 + (end.start() if end else 800)]
-    if "ggml_sycl_onednn_woq_q8_enabled()" in body:
-        kinds["gated"] += 1
-    elif "ggml_sycl_op_mul_mat<no_quantize_q8_1>" in body:
-        kinds["dispatch"] += 1
-    elif 'return "ONEDNN_SOA";' in body:
-        kinds["name"] += 1
-    else:
-        failures.append("an ONEDNN_SOA case body is neither env-gated, the dispatch arm, nor the name table")
-check(kinds["gated"] == 2, f"both ONEDNN_SOA selection sites must consult the env gate (found {kinds['gated']})")
-check(kinds["dispatch"] == 1 and kinds["name"] == 1, f"unexpected ONEDNN_SOA case census: {kinds}")
 
-pick_idx = backend.find("auto pick_kernel_for_layout = [&](layout_mode layout) -> std::optional<ggml_sycl_mul_mat_kernel> {")
-check(pick_idx > 0, "pick_kernel_for_layout lambda not found")
-if pick_idx > 0:
-    pick = backend[pick_idx : matching_brace(backend, backend.find("{", pick_idx)) + 1]
+def test_every_onednn_soa_selection_site_consults_the_env_gate():
+    # Four `case ONEDNN_SOA:` sites: kernel-name table, override check,
+    # preferred-kernel selection, dispatch. The two SELECTION sites must consult
+    # the env gate; the name table and the dispatch arm (which executes an
+    # already-selected kernel) do not.
+    case_sites = [m.start() for m in re.finditer(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", backend)]
+    assert len(case_sites) == 4, (
+        f"expected 4 `case ONEDNN_SOA:` sites (name table, override check, preferred selection, dispatch), "
+        f"found {len(case_sites)}"
+    )
+    kinds = {"gated": 0, "dispatch": 0, "name": 0, "unknown": 0}
+    for start in case_sites:
+        end = re.search(r"\n\s*(case |default:)", backend[start + 10 :])
+        body = backend[start : start + 10 + (end.start() if end else 800)]
+        if "ggml_sycl_onednn_woq_q8_enabled()" in body:
+            kinds["gated"] += 1
+        elif "ggml_sycl_op_mul_mat<no_quantize_q8_1>" in body:
+            kinds["dispatch"] += 1
+        elif 'return "ONEDNN_SOA";' in body:
+            kinds["name"] += 1
+        else:
+            kinds["unknown"] += 1
+    assert kinds == {"gated": 2, "dispatch": 1, "name": 1, "unknown": 0}, f"ONEDNN_SOA case census: {kinds}"
+
+
+def test_pick_kernel_for_layout_soa_case_is_gated():
+    pick = function_body(backend, PICK_SIG)
     soa_case = pick[pick.find("case GGML_LAYOUT_SOA:") : pick.find("case GGML_LAYOUT_AOS:")]
     assign = soa_case.find("layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_SOA;")
-    check(assign > 0, "pick_kernel_for_layout SOA case must be able to select ONEDNN_SOA")
-    if assign > 0:
-        guard = soa_case[:assign]
-        check(
-            "src0->type == GGML_TYPE_Q8_0" in guard and "ggml_sycl_onednn_woq_q8_enabled()" in guard,
-            "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the env gate",
-        )
-    check(soa_case.count("ONEDNN_SOA") == 1, "ONEDNN_SOA must be selected from exactly one branch of the SOA case")
+    assert assign > 0, "pick_kernel_for_layout SOA case must be able to select ONEDNN_SOA"
+    guard = soa_case[:assign]
+    assert (
+        "src0->type == GGML_TYPE_Q8_0" in guard and "ggml_sycl_onednn_woq_q8_enabled()" in guard
+    ), "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the env gate"
+    assert soa_case.count("ONEDNN_SOA") == 1, "ONEDNN_SOA must be selected from exactly one branch of the SOA case"
 
-# 4. The GEMM call site: exactly one, inside ggml_sycl_op_mul_mat_sycl, guarded
-#    by Q8_0 && the env gate, and consuming the SOA plane (not the AOS pointer).
-check(backend.count("DnnlGemmWrapper::woq_gemm_q8_0(") == 1, "woq_gemm_q8_0 must be called from exactly one site")
-op_body = function_body(backend, "inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,")
-call = op_body.find("DnnlGemmWrapper::woq_gemm_q8_0(")
-check(call > 0, "the woq_gemm_q8_0 call must live in ggml_sycl_op_mul_mat_sycl")
-if call > 0:
+
+def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
+    assert backend.count("DnnlGemmWrapper::woq_gemm_q8_0(") == 1, "woq_gemm_q8_0 must be called from exactly one site"
+    op_body = function_body(backend, OP_SIG)
+    call = op_body.find("DnnlGemmWrapper::woq_gemm_q8_0(")
+    assert call > 0, "the woq_gemm_q8_0 call must live in ggml_sycl_op_mul_mat_sycl"
     before = op_body[:call]
     guard_idx = before.rfind("if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled()")
-    check(guard_idx > 0, "the arm must be guarded by `!used_woq && Q8_0 && ggml_sycl_onednn_woq_q8_enabled()`")
-    if guard_idx > 0:
-        arm = before[guard_idx:]
-        check(
-            "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)" in arm,
-            "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)",
-        )
-        check('decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed")
-        check('decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)")
+    assert guard_idx > 0, "the arm must be guarded by `!used_woq && Q8_0 && ggml_sycl_onednn_woq_q8_enabled()`"
+    arm = before[guard_idx:]
+    assert (
+        "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)" in arm
+    ), "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)"
+    assert 'decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed"
+    assert 'decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)"
     after = op_body[call:]
-    check(
-        "dequantize_row_q8_0_soa_to_fp16_rowmajor(q8_0_soa_ptr" in after,
-        "the decline path must dequantize from the SOA plane, never the AOS dispatcher",
-    )
+    assert (
+        "dequantize_row_q8_0_soa_to_fp16_rowmajor(q8_0_soa_ptr" in after
+    ), "the decline path must dequantize from the SOA plane, never the AOS dispatcher"
 
-# 5. No other SOA-scale binding: the [N][K/32] order must never reach oneDNN
-#    directly (probe V5 accepted-but-garbage). The only scale-staging producer
-#    is the transpose kernel.
-check(
-    backend.count("q8_0_soa_scale_plane_to_kbn_sycl(") == 1,
-    "exactly one scale-staging call (the transpose into PP scratch) is expected",
-)
 
-if failures:
-    for f in failures:
-        print("FAIL:", f)
-    sys.exit(1)
-print("PASS: llama.cpp-nz1k oneDNN WoQ-Q8 arm is opt-in on both axes and reachable only through the SOA plane")
+def test_scale_staging_has_exactly_one_producer():
+    # The [N][K/32] SOA order must never reach oneDNN directly (probe V5 is
+    # accepted-but-garbage); the transpose into PP scratch is the only producer.
+    assert (
+        backend.count("q8_0_soa_scale_plane_to_kbn_sycl(") == 1
+    ), "exactly one scale-staging call (the transpose into PP scratch) is expected"
+
+
+if __name__ == "__main__":
+    import sys
+
+    failures = 0
+    for fn_name, fn in sorted(list(globals().items())):
+        if fn_name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {fn_name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {fn_name}: {exc}")
+    if failures:
+        print(f"{failures} test(s) failed")
+        sys.exit(1)
+    print("all tests passed")
