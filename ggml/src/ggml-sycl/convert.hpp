@@ -186,6 +186,18 @@ void dequantize_row_q8_0_soa_to_fp16_rowmajor(
     int nrows,
     dpct::queue_ptr stream);
 
+// llama.cpp-nz1k (prefill L2b phase 1): stage the Q8_0 SOA d plane
+// ([nrows][K/32] f16, located at ggml_sycl_q8_0_soa_scale_plane_offset_bytes
+// from `soa_base`) into the [K/32][nrows] f16 order oneDNN's K/32 grouped
+// weight scales require (index mapping: q8-scale-plane.hpp). `dst` must hold
+// nrows*blocks_per_row halves; the caller passes a sub-range of the existing
+// oneDNN PP weights scratch. Submits one profiled kernel, no host wait.
+void q8_0_soa_scale_plane_to_kbn_sycl(const void *    soa_base,
+                                      sycl::half *    dst,
+                                      int             blocks_per_row,
+                                      int             nrows,
+                                      dpct::queue_ptr stream);
+
 // Dequantize MXFP4 SOA→row-major FP16 (for oneDNN PP path)
 void dequantize_row_mxfp4_soa_to_fp16_rowmajor(
     const void * src,

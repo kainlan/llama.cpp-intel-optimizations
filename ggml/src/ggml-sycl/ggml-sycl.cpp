@@ -42320,6 +42320,9 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
 // Forward declaration: cached-env gate for the Q8_0 COALESCED oneDNN dequant
 // arm (defined later, near the other cached-env kernel-selection helpers).
 static bool ggml_sycl_q8_0_onednn_coalesced_enabled();
+// llama.cpp-nz1k: cached-env gate for the Q8_0 SOA oneDNN WoQ-int8 arm
+// (defined next to ggml_sycl_q8_0_onednn_coalesced_enabled below).
+static bool ggml_sycl_onednn_woq_q8_enabled();
 
 inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                       const ggml_tensor *         src0,
@@ -42497,6 +42500,76 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 }
             }
         }
+        // -----------------------------------------------------------------
+        // llama.cpp-nz1k (prefill L2b phase 1): Q8_0 SOA oneDNN WoQ-int8 arm.
+        // Reached through the ONEDNN_SOA kernel choice (pick_kernel_for_layout /
+        // k_mul_mat_priority), itself eligible only under
+        // GGML_SYCL_ONEDNN_WOQ_Q8=1 for a Q8_0 weight materialized SOA (dense
+        // projections need GGML_SYCL_Q8_DENSE_LAYOUT=soa). Probe llama.cpp-ovkn's
+        // V4 form: f16 activations x the stored int8 qs plane read as-is, K/32
+        // grouped f16 scales, f16 fpmath apply_to_int. The ONLY per-call
+        // staging is the scale-plane transpose ([N][K/32] -> [K/32][N], 2 bytes
+        // per 32 weights = 1/17 of what the f16 dequant writes) into the
+        // existing oneDNN PP weights scratch (ruling 1: no new allocator;
+        // ruling 4: transient format staging of device-resident data, not a
+        // second stored layout). Declines -- never errors -- into the SOA f16
+        // dequant + row_gemm below when the scratch is absent, the rows are
+        // partial, the SOA plane is not device-resident, or oneDNN refuses.
+        // -----------------------------------------------------------------
+        void * q8_0_soa_ptr = nullptr;
+        if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled() && row_diff > 0 &&
+            ggml_is_contiguous(src0)) {
+            void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA);
+            if (candidate) {
+                const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
+                if (ptr_type == sycl::usm::alloc::device || ptr_type == sycl::usm::alloc::shared) {
+                    q8_0_soa_ptr = candidate;
+                }
+            }
+            const int64_t total_rows = ggml_nrows(src0);
+            const bool    full_rows  = (row_low == 0 && row_diff == total_rows);
+            const char *  decline    = nullptr;
+            if (!q8_0_soa_ptr) {
+                decline = "soa_plane_not_resident";
+            } else if (!full_rows) {
+                decline = "partial_rows";
+            } else if (!src0_pp_scratch) {
+                decline = "no_pp_scratch";
+            } else if ((ne00 % QK8_0) != 0) {
+                decline = "k_not_block_multiple";
+            }
+            if (!decline) {
+                const int    blocks_per_row = static_cast<int>(ne00 / QK8_0);
+                // The staged scales are row_diff*blocks_per_row halves -- always a
+                // sub-range of the row_diff*ne00-half weights scratch that
+                // acquire_onednn_pp_scratch sized for the dequant this replaces.
+                sycl::half * scales_kbn     = src0_pp_scratch;
+                q8_0_soa_scale_plane_to_kbn_sycl(q8_0_soa_ptr, scales_kbn, blocks_per_row, static_cast<int>(row_diff),
+                                                 stream);
+                try {
+                    used_woq = DnnlGemmWrapper::woq_gemm_q8_0(
+                        ctx, static_cast<int>(src1_ncols), static_cast<int>(row_diff), static_cast<int>(ne10), src1_ptr,
+                        q8_0_soa_ptr, scales_kbn, dst_dd_i, stream, ldc);
+                    if (!used_woq) {
+                        decline = "primitive_declined";
+                    }
+                } catch (const std::exception & e) {
+                    GGML_LOG_WARN("[SYCL] oneDNN WoQ-Q8 arm failed, falling back to SOA dequant: %s\n", e.what());
+                    used_woq = false;
+                    decline  = "exec_threw";
+                }
+            }
+            if (ggml_sycl_mul_mat_route_trace_enabled()) {
+                static std::atomic<int> woq_q8_trace_count{ 0 };
+                const int               trace_idx = woq_q8_trace_count.fetch_add(1, std::memory_order_relaxed);
+                if (trace_idx < ggml_sycl_mul_mat_route_trace_limit()) {
+                    fprintf(stderr, "[MUL-MAT-ROUTE] onednn_woq_q8 idx=%d src0=%s M=%lld K=%lld N=%lld arm=%s%s%s\n",
+                            trace_idx, src0->name ? src0->name : "?", (long long) src1_ncols, (long long) ne10,
+                            (long long) row_diff, used_woq ? "woq_q8" : "dequant_f16", decline ? " decline=" : "",
+                            decline ? decline : "");
+                }
+            }
+        }
         if (!used_woq) {
             ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
             if (src0->type != GGML_TYPE_F16) {
@@ -42528,7 +42601,15 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                     }
                 }
 
-                if (q8_0_coalesced_ptr) {
+                if (q8_0_soa_ptr) {
+                    // llama.cpp-nz1k: the WoQ arm above declined. src0_dd_i is the
+                    // SOA plane (ONEDNN_SOA's layout), so the AOS to_fp16 dispatch
+                    // below would read scale bytes as quants -- use the SOA-aware
+                    // row-major dequant (same GEMM as every other arm afterwards).
+                    const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
+                    dequantize_row_q8_0_soa_to_fp16_rowmajor(q8_0_soa_ptr, dst_f16, blocks_per_row,
+                                                             static_cast<int>(row_diff), stream);
+                } else if (q8_0_coalesced_ptr) {
                     const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
                     dequantize_row_q8_0_coalesced_to_fp16_rowmajor(q8_0_coalesced_ptr, dst_f16, blocks_per_row,
                                                                    static_cast<int>(row_diff), stream);
@@ -57782,10 +57863,13 @@ static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * 
 // ggml_sycl_mul_mat_kernel enum is now defined in kernel-selection.hpp
 
 static constexpr ggml_sycl_mul_mat_kernel k_mul_mat_priority[] = {
-    ggml_sycl_mul_mat_kernel::DMMV_SOA,       ggml_sycl_mul_mat_kernel::DMMV_COALESCED,
+    ggml_sycl_mul_mat_kernel::DMMV_SOA,
+    ggml_sycl_mul_mat_kernel::DMMV_COALESCED,
 
-    ggml_sycl_mul_mat_kernel::MMVQ_COALESCED, ggml_sycl_mul_mat_kernel::MMVQ_SOA,
-    ggml_sycl_mul_mat_kernel::MMVQ_AOS,       ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED,
+    ggml_sycl_mul_mat_kernel::MMVQ_COALESCED,
+    ggml_sycl_mul_mat_kernel::MMVQ_SOA,
+    ggml_sycl_mul_mat_kernel::MMVQ_AOS,
+    ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED,
     ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS,
     // ONEDNN_COALESCED must precede MMQ_COALESCED here: this priority list, not
     // pick_kernel_for_layout, is what ggml_sycl_mul_mat's default (non-forced-layout,
@@ -57797,7 +57881,12 @@ static constexpr ggml_sycl_mul_mat_kernel k_mul_mat_priority[] = {
     // Q8_0 and preceded ONEDNN_AOS (last entry), which is why the arm never fired (llama.cpp-e3xj).
     ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED,
     ggml_sycl_mul_mat_kernel::MMQ_COALESCED,
-    ggml_sycl_mul_mat_kernel::MMQ_SOA,        ggml_sycl_mul_mat_kernel::MMQ_AOS,
+    // ONEDNN_SOA must precede MMQ_SOA for the same reason (llama.cpp-nz1k). It
+    // is eligible only for Q8_0 under GGML_SYCL_ONEDNN_WOQ_Q8=1, so the default
+    // ordering of everything else is unchanged.
+    ggml_sycl_mul_mat_kernel::ONEDNN_SOA,
+    ggml_sycl_mul_mat_kernel::MMQ_SOA,
+    ggml_sycl_mul_mat_kernel::MMQ_AOS,
     ggml_sycl_mul_mat_kernel::ONEDNN_AOS,
 };
 
@@ -57810,20 +57899,21 @@ struct ggml_sycl_mul_mat_kernel_caps {
 
 static constexpr ggml_sycl_mul_mat_kernel_caps k_mul_mat_kernel_caps[] = {
 
-    { ggml_sycl_mul_mat_kernel::DMMV_SOA,       GGML_LAYOUT_SOA,            1                   },
-    { ggml_sycl_mul_mat_kernel::DMMV_COALESCED, GGML_LAYOUT_COALESCED,      1                   },
-    { ggml_sycl_mul_mat_kernel::MMVQ_COALESCED, GGML_LAYOUT_COALESCED,      MMVQ_MAX_BATCH_SIZE },
-    { ggml_sycl_mul_mat_kernel::MMVQ_SOA,       GGML_LAYOUT_SOA,            MMVQ_MAX_BATCH_SIZE },
-    { ggml_sycl_mul_mat_kernel::MMVQ_AOS,       GGML_LAYOUT_AOS,            MMVQ_MAX_BATCH_SIZE },
-    { ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED, GGML_LAYOUT_XMX_GEMM_TILED, 0                   },
-    { ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS,   GGML_LAYOUT_AOS,            0                   },
-    { ggml_sycl_mul_mat_kernel::MMQ_COALESCED,  GGML_LAYOUT_COALESCED,      0                   },
-    { ggml_sycl_mul_mat_kernel::MMQ_SOA,        GGML_LAYOUT_SOA,            0                   },
+    { ggml_sycl_mul_mat_kernel::DMMV_SOA,         GGML_LAYOUT_SOA,            1                   },
+    { ggml_sycl_mul_mat_kernel::DMMV_COALESCED,   GGML_LAYOUT_COALESCED,      1                   },
+    { ggml_sycl_mul_mat_kernel::MMVQ_COALESCED,   GGML_LAYOUT_COALESCED,      MMVQ_MAX_BATCH_SIZE },
+    { ggml_sycl_mul_mat_kernel::MMVQ_SOA,         GGML_LAYOUT_SOA,            MMVQ_MAX_BATCH_SIZE },
+    { ggml_sycl_mul_mat_kernel::MMVQ_AOS,         GGML_LAYOUT_AOS,            MMVQ_MAX_BATCH_SIZE },
+    { ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED,   GGML_LAYOUT_XMX_GEMM_TILED, 0                   },
+    { ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS,     GGML_LAYOUT_AOS,            0                   },
+    { ggml_sycl_mul_mat_kernel::MMQ_COALESCED,    GGML_LAYOUT_COALESCED,      0                   },
+    { ggml_sycl_mul_mat_kernel::MMQ_SOA,          GGML_LAYOUT_SOA,            0                   },
 
-    { ggml_sycl_mul_mat_kernel::MMQ_AOS,        GGML_LAYOUT_AOS,            0                   },
-    { ggml_sycl_mul_mat_kernel::ONEDNN_AOS,     GGML_LAYOUT_AOS,            0                   },
-    { ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED, GGML_LAYOUT_COALESCED,    0                   },
-    { ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL, GGML_LAYOUT_AOS,            0                   },
+    { ggml_sycl_mul_mat_kernel::MMQ_AOS,          GGML_LAYOUT_AOS,            0                   },
+    { ggml_sycl_mul_mat_kernel::ONEDNN_AOS,       GGML_LAYOUT_AOS,            0                   },
+    { ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED, GGML_LAYOUT_COALESCED,      0                   },
+    { ggml_sycl_mul_mat_kernel::ONEDNN_SOA,       GGML_LAYOUT_SOA,            0                   },
+    { ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL,   GGML_LAYOUT_AOS,            0                   },
 };
 
 static const ggml_sycl_mul_mat_kernel_caps * ggml_sycl_mul_mat_kernel_get_caps(ggml_sycl_mul_mat_kernel kernel) {
@@ -57857,6 +57947,23 @@ static bool ggml_sycl_q8_0_onednn_coalesced_enabled() {
     if (enabled < 0) {
         const char * env = std::getenv("GGML_SYCL_Q8_ONEDNN_COALESCED");
         enabled          = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// llama.cpp-nz1k (prefill L2b phase 1): opt-in oneDNN WoQ-int8 PP arm for Q8_0
+// dense weights materialized SOA (GGML_SYCL_Q8_DENSE_LAYOUT=soa, common.hpp
+// layout_policy): f16 activations x the stored int8 qs plane with K/32 grouped
+// f16 scales, no per-call weight dequant (DnnlGemmWrapper::woq_gemm_q8_0,
+// dispatched through the ONEDNN_SOA kernel choice). Default OFF this campaign
+// (ruling 9 / nz1k c-c4jp): the arm is a phase-1 interim that stages only the
+// scale plane per call; phase 2 (llama.cpp-2zsc) stores the d plane in oneDNN
+// order and the default is decided there with the A/B numbers.
+static bool ggml_sycl_onednn_woq_q8_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_WOQ_Q8");
+        enabled          = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
     }
     return enabled != 0;
 }
@@ -57922,6 +58029,8 @@ const char * ggml_sycl_mul_mat_kernel_name(ggml_sycl_mul_mat_kernel kernel) {
             return "ONEDNN_AOS";
         case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
             return "ONEDNN_COALESCED";
+        case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
+            return "ONEDNN_SOA";
         case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
             return "UNIFIED_MATMUL";
     }
@@ -57939,19 +58048,20 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_parse_force_kernel() {
         const char *             name;
         ggml_sycl_mul_mat_kernel kernel;
     } kernel_map[] = {
-        { "DMMV_SOA",       ggml_sycl_mul_mat_kernel::DMMV_SOA       },
-        { "DMMV_COALESCED", ggml_sycl_mul_mat_kernel::DMMV_COALESCED },
-        { "MMVQ_SOA",       ggml_sycl_mul_mat_kernel::MMVQ_SOA       },
-        { "MMVQ_COALESCED", ggml_sycl_mul_mat_kernel::MMVQ_COALESCED },
-        { "MMVQ_AOS",       ggml_sycl_mul_mat_kernel::MMVQ_AOS       },
-        { "XMX_GEMM_TILED", ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED },
-        { "XMX_GEMM_AOS",   ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS   },
-        { "MMQ_SOA",        ggml_sycl_mul_mat_kernel::MMQ_SOA        },
-        { "MMQ_COALESCED",  ggml_sycl_mul_mat_kernel::MMQ_COALESCED  },
-        { "MMQ_AOS",        ggml_sycl_mul_mat_kernel::MMQ_AOS        },
-        { "ONEDNN_AOS",     ggml_sycl_mul_mat_kernel::ONEDNN_AOS     },
+        { "DMMV_SOA",         ggml_sycl_mul_mat_kernel::DMMV_SOA         },
+        { "DMMV_COALESCED",   ggml_sycl_mul_mat_kernel::DMMV_COALESCED   },
+        { "MMVQ_SOA",         ggml_sycl_mul_mat_kernel::MMVQ_SOA         },
+        { "MMVQ_COALESCED",   ggml_sycl_mul_mat_kernel::MMVQ_COALESCED   },
+        { "MMVQ_AOS",         ggml_sycl_mul_mat_kernel::MMVQ_AOS         },
+        { "XMX_GEMM_TILED",   ggml_sycl_mul_mat_kernel::XMX_GEMM_TILED   },
+        { "XMX_GEMM_AOS",     ggml_sycl_mul_mat_kernel::XMX_GEMM_AOS     },
+        { "MMQ_SOA",          ggml_sycl_mul_mat_kernel::MMQ_SOA          },
+        { "MMQ_COALESCED",    ggml_sycl_mul_mat_kernel::MMQ_COALESCED    },
+        { "MMQ_AOS",          ggml_sycl_mul_mat_kernel::MMQ_AOS          },
+        { "ONEDNN_AOS",       ggml_sycl_mul_mat_kernel::ONEDNN_AOS       },
         { "ONEDNN_COALESCED", ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED },
-        { "UNIFIED_MATMUL", ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL },
+        { "ONEDNN_SOA",       ggml_sycl_mul_mat_kernel::ONEDNN_SOA       },
+        { "UNIFIED_MATMUL",   ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL   },
     };
 
     for (const auto & entry : kernel_map) {
@@ -58186,6 +58296,17 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
                     override_ok = false;
 #endif
                     break;
+                case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
+#if GGML_SYCL_DNNL
+                    // llama.cpp-nz1k: Q8_0 only, SOA-capable type, and the opt-in env.
+                    if (src0->type != GGML_TYPE_Q8_0 || !ggml_sycl_layout_supports_soa(src0->type) ||
+                        !ggml_sycl_onednn_woq_q8_enabled()) {
+                        override_ok = false;
+                    }
+#else
+                    override_ok = false;
+#endif
+                    break;
                 case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
                     {
                         const bool src1_contiguous =
@@ -58321,6 +58442,16 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
                 }
 #endif
                 break;
+
+            case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
+#if GGML_SYCL_DNNL
+                // llama.cpp-nz1k: eligible only under GGML_SYCL_ONEDNN_WOQ_Q8=1.
+                if (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_layout_supports_soa(src0->type) &&
+                    ggml_sycl_onednn_woq_q8_enabled()) {
+                    return kernel;
+                }
+#endif
+                break;
         }
     }
 
@@ -58408,6 +58539,12 @@ static bool ggml_sycl_dispatch_mul_mat_kernel(ggml_backend_sycl_context & ctx,
         case ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED:
             GGML_SYCL_KTRACE("mul_mat_dispatch_onednn_coalesced", " type=%d ne1=%lld", src0->type,
                              (long long) src1->ne[1]);
+            return ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, layout);
+
+        case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
+            // llama.cpp-nz1k: same legacy oneDNN entry as ONEDNN_COALESCED; the
+            // Q8_0 SOA WoQ arm lives inside ggml_sycl_op_mul_mat_sycl.
+            GGML_SYCL_KTRACE("mul_mat_dispatch_onednn_soa", " type=%d ne1=%lld", src0->type, (long long) src1->ne[1]);
             return ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl, layout);
 
         case ggml_sycl_mul_mat_kernel::UNIFIED_MATMUL:
@@ -58613,6 +58750,10 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
             // Diagnostic only (matches ONEDNN_AOS above) -- dispatch does its own
             // independent GGML_LAYOUT_COALESCED weight lookup regardless of this field.
             decision.onednn_path = OneDnnPath::DequantFp16;
+        } else if (kernel == ggml_sycl_mul_mat_kernel::ONEDNN_SOA) {
+            // Diagnostic only (llama.cpp-nz1k): the arm is WoQ-first and falls
+            // back to the SOA f16 dequant inside ggml_sycl_op_mul_mat_sycl.
+            decision.onednn_path = OneDnnPath::WoQ;
         }
     };
 
@@ -58644,6 +58785,14 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
                     layout_kernel = ggml_sycl_mul_mat_kernel::DMMV_SOA;
                 } else if (batch <= MMVQ_MAX_BATCH_SIZE) {
                     layout_kernel = ggml_sycl_mul_mat_kernel::MMVQ_SOA;
+#if GGML_SYCL_DNNL
+                } else if (src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
+                           ggml_sycl_onednn_woq_q8_enabled()) {
+                    // llama.cpp-nz1k: opt-in oneDNN WoQ-int8 arm for SOA Q8_0 PP
+                    // batches (GGML_SYCL_ONEDNN_WOQ_Q8=1). Default lands on
+                    // MMQ_SOA exactly as before.
+                    layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_SOA;
+#endif
                 } else {
                     layout_kernel = ggml_sycl_mul_mat_kernel::MMQ_SOA;
                 }

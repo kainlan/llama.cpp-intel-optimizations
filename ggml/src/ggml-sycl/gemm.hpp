@@ -524,6 +524,147 @@ class DnnlGemmWrapper {
                                   scales, zero_points, c, ct, q, c_stride0, c_stride1);
     }
 
+    // llama.cpp-nz1k (prefill L2b phase 1): WoQ-int8 GEMM for Q8_0 SOA weights
+    // -- probe llama.cpp-ovkn's V4 form (c-kn4p: equal to f16 x f16 speed on
+    // the B70, +25% on the B50, with no per-call weight dequant and half the
+    // weight bytes). f16 activations x the stored int8 qs plane read AS
+    // STORED, K/32 grouped f16 scales, f16 fpmath apply_to_int.
+    //   A: [m, k] f16 row-major (activations)     -> logical (m,k)    strides {k,1}
+    //   B: [n, k] s8 row-major = the SOA qs plane -> logical (k,n)    strides {1,k}
+    //   S: [k/32, n] f16 (q8_0_soa_scale_plane_to_kbn_sycl output)
+    //                                             -> logical (k/32,n) strides {n,1}
+    //   C: [m, n] f32 with row stride ldc          -> logical (m,n)    strides {ldc,1}
+    // The SOA d-plane order [n][k/32] bound through strides {1,k/32} is
+    // accepted-but-GARBAGE (probe V5) and must never be passed here; the
+    // caller stages the transpose. Returns false (nothing submitted) when a
+    // precondition or primitive creation fails; throws only what
+    // dnnl::sycl_interop::execute throws. Same cache idiom as
+    // woq_gemm_q4_0_impl: key = shapes/dtypes/strides only (ruling 2, no
+    // addresses); no host wait (ruling 6).
+    static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
+                              int                         m,
+                              int                         n,
+                              int                         k,
+                              const void *                a_f16,
+                              const void *                b_s8,
+                              const void *                scales_f16_kbn,
+                              void *                      c_f32,
+                              const queue_ptr &           q,
+                              int64_t                     ldc) {
+        constexpr int64_t group_size = 32;  // QK8_0: one f16 scale per 32 int8
+        if (!a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] null pointer(s) provided\n");
+            }
+            return false;
+        }
+        if (m <= 0 || n <= 0 || k <= 0 || (k % group_size) != 0 || ldc < n) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] invalid dims m=%d n=%d k=%d ldc=%lld\n", m, n, k,
+                             static_cast<long long>(ldc));
+            }
+            return false;
+        }
+        const int64_t groups = k / group_size;
+
+        std::lock_guard<std::mutex> lock(exec_mutex(q));
+        auto                        stream = ctx.stream_dnnl(q);
+        auto                        eng    = ctx.engine_dnnl(q);
+
+        // Exactly the probe's V4 descriptors (llama.cpp-ovkn c-kn4p).
+        const dnnl::memory::desc a_md({ m, k }, dt::f16, { k, 1 });
+        const dnnl::memory::desc b_md({ k, n }, dt::s8, { 1, k });
+        const dnnl::memory::desc c_md({ m, n }, dt::f32, { ldc, 1 });
+        const dnnl::memory::desc s_md({ groups, n }, dt::f16, { n, 1 });
+
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        const int mask = (1 << 0) | (1 << 1);
+        attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);
+        // Part of the recipe, not an optimization: apply_to_int is what makes
+        // oneDNN up-convert the s8 plane and apply the grouped scales in f16.
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
+
+        DnnlPrimitiveKey key{};
+        key.m               = m;
+        key.n               = n;
+        key.k               = k;
+        key.batches_a       = 1;
+        key.batches_b       = 1;
+        key.at              = dt::f16;
+        key.bt              = dt::s8;
+        key.ct              = dt::f32;
+        key.stra0           = 1;
+        key.stra1           = k;
+        key.stra2           = static_cast<int64_t>(m) * k;
+        key.strb0           = 1;
+        key.strb1           = k;
+        key.strb2           = static_cast<int64_t>(k) * n;
+        key.strc0           = ldc;
+        key.strc1           = 1;
+        key.ldc             = static_cast<int>(ldc);
+        key.variant         = 5;  // woq_gemm_q8_0: f16 x s8-as-stored, K/32 f16 scales
+        key.woq_group_size  = group_size;
+        key.woq_scales_mask = mask;
+        key.woq_zp_mask     = 0;
+
+        auto &                      cache  = get_dnnl_primitive_cache();
+        const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_md, b_md, c_md, attr);
+        if (!cached) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] primitive creation failed m=%d n=%d k=%d\n", m, n, k);
+            }
+            return false;
+        }
+        // Ruling 5 tripwire: the weights are consumed AS STORED. Were oneDNN to
+        // answer with a different weights desc than the plain one bound above, a
+        // reorder (= a second layout) would be needed -- decline instead.
+        if (cached->b_md != b_md) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] weights desc is not the plain stored layout; declining\n");
+            }
+            return false;
+        }
+
+        auto a_mem = dnnl::memory(cached->a_md, eng, const_cast<void *>(a_f16));
+        auto b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b_s8));
+        auto c_mem = dnnl::memory(cached->c_md, eng, c_f32);
+        auto s_mem = dnnl::memory(s_md, eng, const_cast<void *>(scales_f16_kbn));
+
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({ DNNL_ARG_SRC, a_mem });
+        args.insert({ DNNL_ARG_WEIGHTS, b_mem });
+        args.insert({ DNNL_ARG_DST, c_mem });
+        args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, s_mem });
+        if (cached->scratchpad_size > 0) {
+            auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+            if (scratchpad_mem.get(true) == nullptr) {
+                throw std::runtime_error("oneDNN scratchpad allocation failed");
+            }
+            args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+        }
+
+        ggml_sycl_profile_label gemm_label{};
+        gemm_label.name       = "mulmat.onednn_woq_q8.execute";
+        gemm_label.category   = "mulmat";
+        gemm_label.queue_kind = "compute";
+        gemm_label.device     = ctx.device;
+        // Metadata only under the profiler gate (same idiom as the other arms).
+        std::string label_metadata;
+        if (ggml_sycl_kernel_profile_enabled()) {
+            label_metadata =
+                "m=" + std::to_string(m) + ";n=" + std::to_string(n) + ";k=" + std::to_string(k) + ";variant=cached";
+            gemm_label.metadata = label_metadata.c_str();
+        }
+        // Exactly one record per submit; no host wait (ruling 6) -- the
+        // in-order queue orders this behind the scale staging and the
+        // activation conversion the caller already submitted.
+        (void) ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+            return dnnl::sycl_interop::execute(cached->primitive, stream, args, {});
+        });
+        return true;
+    }
+
   private:
     // The proven WOQ-MXFP4 (f4_e2m1 nibbles + e8m0 grouped scales) 2-D
     // scale-mask/group_dims recipe -- C1's exact spike result (llama.cpp-4m9p),

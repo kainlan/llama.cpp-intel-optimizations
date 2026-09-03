@@ -2636,3 +2636,24 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;source;host"
         TIMEOUT 30)
 endif()
+
+# llama.cpp-nz1k (prefill L2b phase 1): the Q8_0 SOA scale-plane index mapping
+# (ggml/src/ggml-sycl/q8-scale-plane.hpp) that the oneDNN WoQ-int8 arm's scale
+# staging kernel calls, checked against a scalar reference with a positive
+# control. Pure C++ -- no SYCL, no device, no ggml link -- so it runs in every
+# sweep at any parallelism. Labelled like the other host-only quant tests.
+llama_build_and_test(test-sycl-q8-scale-plane-index.cpp)
+target_include_directories(test-sycl-q8-scale-plane-index PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+set_tests_properties(test-sycl-q8-scale-plane-index PROPERTIES LABELS "main;sycl;quant;soa;host")
+
+# llama.cpp-nz1k: source gate -- the WoQ-Q8 arm (ONEDNN_SOA) is reachable only
+# under BOTH GGML_SYCL_Q8_DENSE_LAYOUT=soa and GGML_SYCL_ONEDNN_WOQ_Q8=1, and
+# both default OFF (ruling 9 / nz1k c-c4jp). Host-only, reads the sources as
+# text. Same registration shape as test-sycl-resolve-tensor-owner-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-onednn-woq-q8-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-woq-q8-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()

@@ -7,8 +7,10 @@
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
 #include "presets.hpp"
+#include "q8-scale-plane.hpp"
 #include "sycl-kernel-profiler.hpp"
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1263,6 +1265,55 @@ void dequantize_row_q8_0_soa_to_fp16_rowmajor(const void *    src,
                 dequantize_block_q8_0_soa_rowmajor(src, dst, blocks_per_row, total_blocks, item);
             }
         });
+}
+
+// llama.cpp-nz1k (prefill L2b phase 1): Q8_0 SOA d plane [nrows][K/32] f16 ->
+// [K/32][nrows] f16, the order oneDNN 3.11's grouped weight scales require
+// (probe llama.cpp-ovkn: V4 is correct with this order; V5 -- the SOA order
+// bound through strides {1,K/32} -- is accepted-but-garbage). The mapping is
+// defined once in q8-scale-plane.hpp so the host-only
+// test-sycl-q8-scale-plane-index checks the exact function this kernel calls.
+// Iterates destination elements so writes are contiguous; the strided reads
+// are 2 bytes per 32 weights, 1/17 of what the f16 dequant this arm replaces
+// writes. Phase 2 (llama.cpp-2zsc) stores the d plane in this order and
+// retires the kernel.
+void q8_0_soa_scale_plane_to_kbn_sycl(const void *    soa_base,
+                                      sycl::half *    dst,
+                                      int             blocks_per_row,
+                                      int             nrows,
+                                      dpct::queue_ptr stream) {
+    const int64_t n_elems = static_cast<int64_t>(nrows) * static_cast<int64_t>(blocks_per_row);
+    if (n_elems <= 0 || !soa_base || !dst) {
+        return;
+    }
+    const sycl::half * d_plane = reinterpret_cast<const sycl::half *>(
+        static_cast<const uint8_t *>(soa_base) + ggml_sycl_q8_0_soa_scale_plane_offset_bytes(nrows, blocks_per_row));
+    constexpr int WG_SIZE = 256;
+    const int64_t n_wgs   = (n_elems + WG_SIZE - 1) / WG_SIZE;
+    const int64_t nrows64 = nrows;
+    const int64_t bpr64   = blocks_per_row;
+
+    ggml_sycl_profile_label label{};
+    label.name       = "mulmat.onednn_woq_q8.stage_scales";
+    label.category   = "mulmat";
+    label.queue_kind = "compute";
+    label.device     = ggml_sycl_get_device_id_from_queue(*stream);
+    // Metadata only under the profiler gate (same idiom as gemm.hpp's arms).
+    std::string label_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        label_metadata = "nrows=" + std::to_string(nrows) + ";blocks_per_row=" + std::to_string(blocks_per_row);
+        label.metadata = label_metadata.c_str();
+    }
+    (void) ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, n_wgs * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+            [=](sycl::nd_item<3> item) {
+                const int64_t i = item.get_group(2) * item.get_local_range(2) + item.get_local_id(2);
+                if (i < n_elems) {
+                    dst[i] = d_plane[ggml_sycl_q8_0_soa_scale_src_index_for_kbn(i, nrows64, bpr64)];
+                }
+            });
+    });
 }
 
 void dequantize_row_q8_0_coalesced_to_fp16_rowmajor(const void *    src,

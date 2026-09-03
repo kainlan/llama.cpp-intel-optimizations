@@ -20,6 +20,7 @@ enum class ggml_sycl_mul_mat_kernel {
     MMQ_AOS,
     ONEDNN_AOS,
     ONEDNN_COALESCED,
+    ONEDNN_SOA,  // llama.cpp-nz1k: Q8_0 SOA oneDNN WoQ-int8 PP arm (opt-in)
     UNIFIED_MATMUL,
 };
 

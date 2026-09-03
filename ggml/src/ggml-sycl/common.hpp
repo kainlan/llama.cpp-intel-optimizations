@@ -1649,12 +1649,29 @@ struct layout_policy {
             const char * env    = std::getenv("GGML_SYCL_Q8_DENSE_AOS");
             q8_dense_aos_cached = (env && std::atoi(env) != 0) ? 1 : 0;  // Default OFF (TG regression)
         }
+        // llama.cpp-nz1k (prefill L2b phase 1): GGML_SYCL_Q8_DENSE_LAYOUT=soa
+        // materializes Q8_0 dense projections (ATTENTION/FFN/OUTPUT) SOA instead
+        // of COALESCED so the opt-in oneDNN WoQ-int8 PP arm
+        // (GGML_SYCL_ONEDNN_WOQ_Q8=1, ggml-sycl.cpp ONEDNN_SOA) can consume the
+        // stored int8 qs plane directly. One layout serves every consumer
+        // (ruling 5): TG runs the existing DMMV/MMVQ q8_0_soa kernels. Default
+        // "coalesced" = the current behaviour, and the default is NOT flipped in
+        // this campaign (nz1k ruling c-c4jp) -- that decision is recorded on the
+        // task with the A/B numbers. Any value other than "soa" means coalesced.
+        static int q8_dense_soa_cached = -1;
+        if (q8_dense_soa_cached < 0) {
+            const char * env    = std::getenv("GGML_SYCL_Q8_DENSE_LAYOUT");
+            q8_dense_soa_cached = (env && std::strcmp(env, "soa") == 0) ? 1 : 0;  // Default coalesced
+        }
         if (usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT) {
             if (skip_onednn_q4_0_cached && qtype == GGML_TYPE_Q4_0) {
                 return GGML_LAYOUT_SOA;
             }
             if (qtype == GGML_TYPE_Q8_0 && q8_dense_aos_cached) {
                 return GGML_LAYOUT_AOS;
+            }
+            if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) {
+                return GGML_LAYOUT_SOA;
             }
             if (is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
@@ -1666,6 +1683,9 @@ struct layout_policy {
         if (usage == tensor_usage::OUTPUT_WEIGHT) {
             if (qtype == GGML_TYPE_Q8_0 && q8_dense_aos_cached) {
                 return GGML_LAYOUT_AOS;
+            }
+            if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) {
+                return GGML_LAYOUT_SOA;
             }
             if (qtype == GGML_TYPE_Q8_0 && is_coalesced_supported(qtype)) {
                 return GGML_LAYOUT_COALESCED;
