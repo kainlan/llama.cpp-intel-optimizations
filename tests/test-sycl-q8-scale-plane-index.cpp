@@ -67,7 +67,8 @@ static std::vector<uint16_t> kernel_kbn(const std::vector<uint16_t> & soa_d,
 }
 
 static void run_shape(int64_t nrows, int64_t bpr) {
-    const int64_t         n = nrows * bpr;
+    const int             failures_before = failures;
+    const int64_t         n               = nrows * bpr;
     // Distinct value per element so any permutation error is visible.
     std::vector<uint16_t> soa_d(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
@@ -130,7 +131,8 @@ static void run_shape(int64_t nrows, int64_t bpr) {
         CHECK(identical != n, "positive control void: SOA order equals the reference plane for nrows=%lld bpr=%lld",
               (long long) nrows, (long long) bpr);
     }
-    std::printf("shape nrows=%lld blocks_per_row=%lld: ok\n", (long long) nrows, (long long) bpr);
+    std::printf("shape nrows=%lld blocks_per_row=%lld: %s\n", (long long) nrows, (long long) bpr,
+                failures == failures_before ? "ok" : "FAILED");
 }
 
 int main() {

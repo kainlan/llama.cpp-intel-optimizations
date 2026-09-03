@@ -540,36 +540,37 @@ class DnnlGemmWrapper {
     // precondition or primitive creation fails; throws only what
     // dnnl::sycl_interop::execute throws. Same cache idiom as
     // woq_gemm_q4_0_impl: key = shapes/dtypes/strides only (ruling 2, no
-    // addresses); no host wait (ruling 6).
-    static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
-                              int                         m,
-                              int                         n,
-                              int                         k,
-                              const void *                a_f16,
-                              const void *                b_s8,
-                              const void *                scales_f16_kbn,
-                              void *                      c_f32,
-                              const queue_ptr &           q,
-                              int64_t                     ldc) {
+    // addresses); no host wait (ruling 6). Split into woq_q8_0_prepare
+    // (descriptors + cached primitive, private), woq_gemm_q8_0_ready
+    // (availability probe) and woq_gemm_q8_0 (bind + submit), both public.
+  private:
+    // Descriptors, attr, cache key and the cached primitive for one
+    // woq_gemm_q8_0 shape. Shared by woq_gemm_q8_0_ready (probe: is the
+    // primitive available, so the caller stages scales only when it is) and
+    // woq_gemm_q8_0 (execute). No queue lock here: the primitive cache has
+    // its own mutex, and the execute path takes exec_mutex after this returns.
+    struct woq_q8_0_plan {
+        const DnnlCachedPrimitive * cached = nullptr;
+        dnnl::memory::desc          s_md;
+    };
+
+    static woq_q8_0_plan woq_q8_0_prepare(ggml_backend_sycl_context & ctx,
+                                          int                         m,
+                                          int                         n,
+                                          int                         k,
+                                          const queue_ptr &           q,
+                                          int64_t                     ldc) {
         constexpr int64_t group_size = 32;  // QK8_0: one f16 scale per 32 int8
-        if (!a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
-            if (g_ggml_sycl_debug) {
-                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] null pointer(s) provided\n");
-            }
-            return false;
-        }
+        woq_q8_0_plan     plan;
         if (m <= 0 || n <= 0 || k <= 0 || (k % group_size) != 0 || ldc < n) {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ-Q8] invalid dims m=%d n=%d k=%d ldc=%lld\n", m, n, k,
                              static_cast<long long>(ldc));
             }
-            return false;
+            return plan;
         }
         const int64_t groups = k / group_size;
-
-        std::lock_guard<std::mutex> lock(exec_mutex(q));
-        auto                        stream = ctx.stream_dnnl(q);
-        auto                        eng    = ctx.engine_dnnl(q);
+        auto          eng    = ctx.engine_dnnl(q);
 
         // Exactly the probe's V4 descriptors (llama.cpp-ovkn c-kn4p).
         const dnnl::memory::desc a_md({ m, k }, dt::f16, { k, 1 });
@@ -614,7 +615,7 @@ class DnnlGemmWrapper {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ-Q8] primitive creation failed m=%d n=%d k=%d\n", m, n, k);
             }
-            return false;
+            return plan;
         }
         // Ruling 5 tripwire: the weights are consumed AS STORED. Were oneDNN to
         // answer with a different weights desc than the plain one bound above, a
@@ -623,8 +624,51 @@ class DnnlGemmWrapper {
             if (g_ggml_sycl_debug) {
                 std::fprintf(stderr, "[ONEDNN][WOQ-Q8] weights desc is not the plain stored layout; declining\n");
             }
+            return plan;
+        }
+        plan.cached = cached;
+        plan.s_md   = s_md;
+        return plan;
+    }
+
+  public:
+    // True when the cached primitive for this shape exists (creating it on
+    // first use). Callers stage the scale plane only after this says yes.
+    static bool woq_gemm_q8_0_ready(ggml_backend_sycl_context & ctx,
+                                    int                         m,
+                                    int                         n,
+                                    int                         k,
+                                    const queue_ptr &           q,
+                                    int64_t                     ldc) {
+        return woq_q8_0_prepare(ctx, m, n, k, q, ldc).cached != nullptr;
+    }
+
+    static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
+                              int                         m,
+                              int                         n,
+                              int                         k,
+                              const void *                a_f16,
+                              const void *                b_s8,
+                              const void *                scales_f16_kbn,
+                              void *                      c_f32,
+                              const queue_ptr &           q,
+                              int64_t                     ldc) {
+        if (!a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
+            if (g_ggml_sycl_debug) {
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] null pointer(s) provided\n");
+            }
             return false;
         }
+        const woq_q8_0_plan plan = woq_q8_0_prepare(ctx, m, n, k, q, ldc);
+        if (!plan.cached) {
+            return false;
+        }
+        const DnnlCachedPrimitive * cached = plan.cached;
+        const dnnl::memory::desc &  s_md   = plan.s_md;
+
+        std::lock_guard<std::mutex> lock(exec_mutex(q));
+        auto                        stream = ctx.stream_dnnl(q);
+        auto                        eng    = ctx.engine_dnnl(q);
 
         auto a_mem = dnnl::memory(cached->a_md, eng, const_cast<void *>(a_f16));
         auto b_mem = dnnl::memory(cached->b_md, eng, const_cast<void *>(b_s8));

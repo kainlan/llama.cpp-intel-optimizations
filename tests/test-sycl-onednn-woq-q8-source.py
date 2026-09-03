@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Source gate for llama.cpp-nz1k (prefill L2b phase 1): the Q8_0 SOA oneDNN
-WoQ-int8 PP arm must be reachable ONLY under BOTH opt-in env conditions --
-GGML_SYCL_Q8_DENSE_LAYOUT=soa (the weight is materialized SOA) and
-GGML_SYCL_ONEDNN_WOQ_Q8=1 (the arm itself) -- and both must default OFF.
+WoQ-int8 PP arm must be reachable ONLY with GGML_SYCL_ONEDNN_WOQ_Q8=1 AND a
+Q8_0 weight the planner materialized SOA -- which for dense projections
+requires GGML_SYCL_Q8_DENSE_LAYOUT=soa (an already-SOA weight, e.g. a
+tile-misaligned Q8_0 head, takes the arm under WOQ_Q8=1 alone). The arm must
+never request a layout the planner did not choose, and both env vars must
+default OFF.
 
 Ruling 9 / nz1k c-c4jp: phase 1 stages the scale plane per call, which is an
 opt-in interim only; the default is decided on llama.cpp-2zsc with the A/B
@@ -168,10 +171,31 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     ), "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)"
     assert 'decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed"
     assert 'decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)"
-    after = op_body[call:]
+    # Structural invariant: the SOA plane is looked up only behind the
+    # non-materializing predicate AND the full-rows / K-blocked tests, so a
+    # non-null q8_0_soa_ptr implies the fallback dequant's addressing is valid
+    # and the arm can never mint a second stored layout.
     assert (
-        "dequantize_row_q8_0_soa_to_fp16_rowmajor(q8_0_soa_ptr" in after
-    ), "the decline path must dequantize from the SOA plane, never the AOS dispatcher"
+        "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {"
+        in arm
+    ), "the SOA lookup must sit behind full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel"
+    lookup = arm.find("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)")
+    guard = arm.find("if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(")
+    assert 0 < guard < lookup, "the predicate guard must precede the SOA lookup"
+    # The primitive must be known good before the staging kernel is submitted.
+    ready = arm.find("DnnlGemmWrapper::woq_gemm_q8_0_ready(")
+    stage = arm.find("q8_0_soa_scale_plane_to_kbn_sycl(")
+    assert 0 < ready < stage, "woq_gemm_q8_0_ready must be checked before the scale staging is submitted"
+    after = op_body[call:]
+    # The decline path must dequantize from the SOA plane, and that branch must
+    # be guarded by the pointer itself (an `if (false)`-style dead branch would
+    # send the SOA plane to the AOS dispatcher).
+    assert re.search(
+        r"if \(q8_0_soa_ptr\) \{[^{}]*dequantize_row_q8_0_soa_to_fp16_rowmajor\(q8_0_soa_ptr", after
+    ), "the SOA dequant fallback must be the body of `if (q8_0_soa_ptr) {`"
+    assert (
+        "if (!q8_0_soa_ptr && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {" in after
+    ), "the COALESCED lookup must be skipped for a SOA-planned weight"
 
 
 def test_scale_staging_has_exactly_one_producer():

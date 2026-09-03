@@ -1658,6 +1658,8 @@ struct layout_policy {
         // "coalesced" = the current behaviour, and the default is NOT flipped in
         // this campaign (nz1k ruling c-c4jp) -- that decision is recorded on the
         // task with the A/B numbers. Any value other than "soa" means coalesced.
+        // Precedence: GGML_SYCL_Q8_DENSE_AOS=1 is checked first in every block
+        // below and wins over this variable.
         static int q8_dense_soa_cached = -1;
         if (q8_dense_soa_cached < 0) {
             const char * env    = std::getenv("GGML_SYCL_Q8_DENSE_LAYOUT");

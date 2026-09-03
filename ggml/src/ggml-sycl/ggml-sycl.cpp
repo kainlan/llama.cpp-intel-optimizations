@@ -42504,17 +42504,26 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         // llama.cpp-nz1k (prefill L2b phase 1): Q8_0 SOA oneDNN WoQ-int8 arm.
         // Reached through the ONEDNN_SOA kernel choice (pick_kernel_for_layout /
         // k_mul_mat_priority), itself eligible only under
-        // GGML_SYCL_ONEDNN_WOQ_Q8=1 for a Q8_0 weight materialized SOA (dense
-        // projections need GGML_SYCL_Q8_DENSE_LAYOUT=soa). Probe llama.cpp-ovkn's
-        // V4 form: f16 activations x the stored int8 qs plane read as-is, K/32
+        // GGML_SYCL_ONEDNN_WOQ_Q8=1 for a Q8_0 weight. The arm then requires the
+        // weight to be MATERIALIZED SOA by the planner: for dense projections
+        // that means GGML_SYCL_Q8_DENSE_LAYOUT=soa, while a weight that is
+        // already SOA (e.g. a tile-misaligned Q8_0 head) takes the arm under
+        // WOQ_Q8=1 alone. It never requests a layout the planner did not choose
+        // (ggml_sycl_can_use_layout_for_kernel before the lookup), so it cannot
+        // mint a second stored layout (ruling 5). Probe llama.cpp-ovkn's V4
+        // form: f16 activations x the stored int8 qs plane read as-is, K/32
         // grouped f16 scales, f16 fpmath apply_to_int. The ONLY per-call
-        // staging is the scale-plane transpose ([N][K/32] -> [K/32][N], 2 bytes
-        // per 32 weights = 1/17 of what the f16 dequant writes) into the
-        // existing oneDNN PP weights scratch (ruling 1: no new allocator;
-        // ruling 4: transient format staging of device-resident data, not a
-        // second stored layout). Declines -- never errors -- into the SOA f16
-        // dequant + row_gemm below when the scratch is absent, the rows are
-        // partial, the SOA plane is not device-resident, or oneDNN refuses.
+        // staging is the scale-plane transpose ([N][K/32] -> [K/32][N]: 2 bytes
+        // per 32 weights, 1/32 of the 64 bytes the f16 dequant writes) into the
+        // existing oneDNN PP weights scratch (ruling 1: no new allocator; the
+        // arm uses <= 1/32 of the dequant-sized reservation the caller already
+        // made; ruling 4: transient format staging of device-resident data, not
+        // a second stored layout). Declines -- never errors -- into the SOA f16
+        // dequant + row_gemm below when the rows are partial, K is not a block
+        // multiple, the SOA plane is not resident, the scratch is absent, or
+        // oneDNN refuses the primitive / throws. INVARIANT: q8_0_soa_ptr is
+        // non-null only when full_rows && k_blocked hold, because the SOA-aware
+        // fallback dequant is full-tensor/row-0-based.
         // -----------------------------------------------------------------
         void * q8_0_soa_ptr = nullptr;
         if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled() && row_diff > 0 &&
@@ -42528,7 +42537,10 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             // finding 1, nz1k c-uihb.)
             const int64_t total_rows = ggml_nrows(src0);
             const bool    full_rows  = (row_low == 0 && row_diff == total_rows);
-            if (full_rows) {
+            const bool    k_blocked  = (ne00 % QK8_0) == 0;
+            // Non-materializing predicate first (what every selection site
+            // applies), then the lookup, which is a pure cache hit or nullptr.
+            if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {
                 void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA);
                 if (candidate) {
                     const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
@@ -42540,12 +42552,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             const char * decline = nullptr;
             if (!full_rows) {
                 decline = "partial_rows";
+            } else if (!k_blocked) {
+                decline = "k_not_block_multiple";
             } else if (!q8_0_soa_ptr) {
                 decline = "soa_plane_not_resident";
             } else if (!src0_pp_scratch) {
                 decline = "no_pp_scratch";
-            } else if ((ne00 % QK8_0) != 0) {
-                decline = "k_not_block_multiple";
             }
             if (!decline) {
                 const int    blocks_per_row = static_cast<int>(ne00 / QK8_0);
@@ -42553,14 +42565,22 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 // sub-range of the row_diff*ne00-half weights scratch that
                 // acquire_onednn_pp_scratch sized for the dequant this replaces.
                 sycl::half * scales_kbn     = src0_pp_scratch;
-                q8_0_soa_scale_plane_to_kbn_sycl(q8_0_soa_ptr, scales_kbn, blocks_per_row, static_cast<int>(row_diff),
-                                                 stream);
                 try {
-                    used_woq = DnnlGemmWrapper::woq_gemm_q8_0(
-                        ctx, static_cast<int>(src1_ncols), static_cast<int>(row_diff), static_cast<int>(ne10), src1_ptr,
-                        q8_0_soa_ptr, scales_kbn, dst_dd_i, stream, ldc);
-                    if (!used_woq) {
+                    // Create/cache the primitive BEFORE submitting the staging
+                    // kernel so a declining shape never pays a wasted transpose.
+                    if (!DnnlGemmWrapper::woq_gemm_q8_0_ready(ctx, static_cast<int>(src1_ncols),
+                                                              static_cast<int>(row_diff), static_cast<int>(ne10),
+                                                              stream, ldc)) {
                         decline = "primitive_declined";
+                    } else {
+                        q8_0_soa_scale_plane_to_kbn_sycl(q8_0_soa_ptr, scales_kbn, blocks_per_row,
+                                                         static_cast<int>(row_diff), stream);
+                        used_woq = DnnlGemmWrapper::woq_gemm_q8_0(
+                            ctx, static_cast<int>(src1_ncols), static_cast<int>(row_diff), static_cast<int>(ne10),
+                            src1_ptr, q8_0_soa_ptr, scales_kbn, dst_dd_i, stream, ldc);
+                        if (!used_woq) {
+                            decline = "primitive_declined";
+                        }
                     }
                 } catch (const std::exception & e) {
                     GGML_LOG_WARN("[SYCL] oneDNN WoQ-Q8 arm failed, falling back to SOA dequant: %s\n", e.what());
@@ -42600,7 +42620,9 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 // miss, host tier, etc.) this falls straight through to the unmodified
                 // AOS dequant below, never erroring.
                 void * q8_0_coalesced_ptr = nullptr;
-                if (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                // llama.cpp-nz1k: skip the COALESCED lookup when the weight is
+                // SOA-planned -- never request a layout the planner did not choose.
+                if (!q8_0_soa_ptr && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {
                     void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
                     if (candidate) {
                         const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);

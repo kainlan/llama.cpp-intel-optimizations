@@ -8,6 +8,7 @@
 #include "mem-ops.hpp"
 #include "presets.hpp"
 #include "q8-scale-plane.hpp"
+#include "quants.hpp"
 #include "sycl-kernel-profiler.hpp"
 
 #include <string>
@@ -1274,9 +1275,16 @@ void dequantize_row_q8_0_soa_to_fp16_rowmajor(const void *    src,
 // defined once in q8-scale-plane.hpp so the host-only
 // test-sycl-q8-scale-plane-index checks the exact function this kernel calls.
 // Iterates destination elements so writes are contiguous; the strided reads
-// are 2 bytes per 32 weights, 1/17 of what the f16 dequant this arm replaces
-// writes. Phase 2 (llama.cpp-2zsc) stores the d plane in this order and
-// retires the kernel.
+// are 2 bytes per 32 weights, 1/32 of the 64 bytes per 32 weights the f16
+// dequant this arm replaces writes. Phase 2 (llama.cpp-2zsc) stores the d
+// plane in this order and retires the kernel.
+//
+// q8-scale-plane.hpp is deliberately ggml-free (host-only test); these
+// static_asserts tie its constants to the authoritative Q8_0 definitions.
+static_assert(GGML_SYCL_Q8_SCALE_PLANE_QK == QK8_0, "q8-scale-plane.hpp block width must equal QK8_0");
+static_assert(ggml_sycl_q8_0_soa_scale_plane_offset_bytes(4, 128) ==
+                  static_cast<size_t>(block_q_t<GGML_TYPE_Q8_0>::get_d_offset(4, 4096, 0).first),
+              "q8-scale-plane.hpp d-plane offset must equal block_q_t<Q8_0>::get_d_offset");
 void q8_0_soa_scale_plane_to_kbn_sycl(const void *    soa_base,
                                       sycl::half *    dst,
                                       int             blocks_per_row,
@@ -1286,6 +1294,7 @@ void q8_0_soa_scale_plane_to_kbn_sycl(const void *    soa_base,
     if (n_elems <= 0 || !soa_base || !dst) {
         return;
     }
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
     const sycl::half * d_plane = reinterpret_cast<const sycl::half *>(
         static_cast<const uint8_t *>(soa_base) + ggml_sycl_q8_0_soa_scale_plane_offset_bytes(nrows, blocks_per_row));
     constexpr int WG_SIZE = 256;

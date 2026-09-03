@@ -2647,9 +2647,11 @@ target_include_directories(test-sycl-q8-scale-plane-index PRIVATE ${CMAKE_SOURCE
 set_tests_properties(test-sycl-q8-scale-plane-index PROPERTIES LABELS "main;sycl;quant;soa;host")
 
 # llama.cpp-nz1k: source gate -- the WoQ-Q8 arm (ONEDNN_SOA) is reachable only
-# under BOTH GGML_SYCL_Q8_DENSE_LAYOUT=soa and GGML_SYCL_ONEDNN_WOQ_Q8=1, and
-# both default OFF (ruling 9 / nz1k c-c4jp). Host-only, reads the sources as
-# text. Same registration shape as test-sycl-resolve-tensor-owner-source.
+# with GGML_SYCL_ONEDNN_WOQ_Q8=1 and a Q8_0 weight the planner materialized SOA
+# (dense projections: GGML_SYCL_Q8_DENSE_LAYOUT=soa), never requests a layout
+# the planner did not choose, and both env vars default OFF (ruling 9 / nz1k
+# c-c4jp). Host-only, reads the sources as text. Same registration shape as
+# test-sycl-resolve-tensor-owner-source.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-onednn-woq-q8-source
