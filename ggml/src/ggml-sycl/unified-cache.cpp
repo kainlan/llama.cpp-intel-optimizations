@@ -21920,24 +21920,25 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
 // so nothing drifts against the runtime's SOA choice for the head.
 //
 // llama.cpp-pktr: this IS load-bearing for ATTENTION_WEIGHT/FFN_WEIGHT, in
-// MULTI-DEVICE planning specifically. Unlike token_embd/output.weight,
-// per-layer dense weights carry `entry.layer_id >= 0`, and the entry
-// overload's dense re-placement caller (add_no_p2p_candidate_dense_alternates,
-// `entry.layer_id < 0 || entry.expert_id >= 0` skip) reaches this function
-// for them -- but only when it itself runs, which is gated on
-// `use_cohesive_no_p2p_moe && n_layers > 0 && device_budgets.size() > 1`
-// (spec review finding 5, rev-pktr-spec-1: the earlier wording here implied
-// this ran unconditionally). On a single-device plan this caller is never
-// invoked, so the two chokepoints agreeing there is an accident of that path
-// not calling this function at all, not evidence the fix is unneeded --
-// keep the mirror for when it does run. Before this task
-// ggml_sycl_adjust_layout_for_tensor's tile-alignment net did not cover
-// ATTENTION_WEIGHT/FFN_WEIGHT either, so both chokepoints agreed
-// (COALESCED). Now that the runtime chokepoint demotes non-tile-aligned Q8_0
-// dense rows to SOA, this planner chokepoint must mirror the same predicate
+// MULTI-DEVICE planning specifically -- the entry overload's dense
+// re-placement caller (add_no_p2p_candidate_dense_alternates) reaches this
+// function for per-layer dense weights (`entry.layer_id >= 0`), but only
+// when it itself runs, gated on `use_cohesive_no_p2p_moe && n_layers > 0 &&
+// device_budgets.size() > 1`. A single-device plan never invokes that
+// caller, so agreement there is an accident of the path not running at
+// all, not evidence the mirror below is unneeded. This chokepoint must
+// mirror ggml_sycl_adjust_layout_for_tensor's tile-alignment predicate
 // (ggml_sycl_q8_0_coalesced_tile_aligned, common.hpp) or its byte-charging
-// and re-placement decisions would target a layout runtime never
-// materializes -- exactly the drift the os8k comment above warned about.
+// and re-placement decisions target a layout runtime never materializes --
+// the drift the os8k comment above warns about. Shared by both overloads
+// below.
+static ggml_layout_mode planner_demote_coalesced_if_misaligned(ggml_layout_mode layout, ggml_type type, int64_t ne00) {
+    if (layout == GGML_LAYOUT_COALESCED && type == GGML_TYPE_Q8_0 && !ggml_sycl_q8_0_coalesced_tile_aligned(ne00)) {
+        return GGML_LAYOUT_SOA;
+    }
+    return layout;
+}
+
 static ggml_layout_mode planner_default_device_layout(const placement_tensor_info & tensor,
                                                       tensor_usage                  usage,
                                                       int                           device_id) {
@@ -21964,11 +21965,8 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
             !ggml_sycl_is_canonical_tied_embedding_name(tensor.name.c_str())) {
             return GGML_LAYOUT_AOS;
         }
-        ggml_layout_mode layout = layout_policy::get_optimal(tensor.type, usage, device_id);
-        if (layout == GGML_LAYOUT_COALESCED && tensor.type == GGML_TYPE_Q8_0 &&
-            !ggml_sycl_q8_0_coalesced_tile_aligned(tensor.ne[0])) {
-            layout = GGML_LAYOUT_SOA;
-        }
+        const ggml_layout_mode layout = planner_demote_coalesced_if_misaligned(
+            layout_policy::get_optimal(tensor.type, usage, device_id), tensor.type, tensor.ne[0]);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
         }
@@ -21998,11 +21996,8 @@ static ggml_layout_mode planner_default_device_layout(const placement_entry & en
             !ggml_sycl_is_canonical_tied_embedding_name(entry.name.c_str())) {
             return GGML_LAYOUT_AOS;
         }
-        ggml_layout_mode layout = layout_policy::get_optimal(entry.type, usage, device_id);
-        if (layout == GGML_LAYOUT_COALESCED && entry.type == GGML_TYPE_Q8_0 &&
-            !ggml_sycl_q8_0_coalesced_tile_aligned(entry.ne[0])) {
-            layout = GGML_LAYOUT_SOA;
-        }
+        const ggml_layout_mode layout = planner_demote_coalesced_if_misaligned(
+            layout_policy::get_optimal(entry.type, usage, device_id), entry.type, entry.ne[0]);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
         }

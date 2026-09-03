@@ -77,7 +77,11 @@ int main() {
     // both as an exact multiple of QK8_0 and (for a few) with a remainder.
     for (int64_t bpr = 0; bpr <= 256; ++bpr) {
         const int64_t ne00 = bpr * 32;
-        check_shape(ne00, reference_tile_aligned(ne00), "sweep (exact block boundary)");
+        // Not check_shape() here: its second CHECK would duplicate the
+        // first verbatim, since expect_aligned IS reference_tile_aligned(ne00)
+        // for this exact-boundary case (spec review nit 13, rev-pktr-spec-3).
+        CHECK(ggml_sycl_q8_0_coalesced_tile_aligned(ne00) == reference_tile_aligned(ne00),
+              "sweep (exact block boundary): ne00=%lld disagrees with the independent reference", (long long) ne00);
         if (bpr > 0) {
             check_shape(ne00 - 1, false, "sweep (one below block boundary, never a QK8_0 multiple)");
         }

@@ -2688,18 +2688,7 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
-# llama.cpp-pktr spec review finding 2 (rev-pktr-spec-1) CORRECTION: this
-# task originally registered test-sycl-layout-choice here on the premise that
-# it was never wired into any CMakeLists.txt. That premise was WRONG -- a
-# rebuild failed with "add_executable cannot create target
-# test-sycl-layout-choice because another target with the same name already
-# exists ... in source directory .../ggml/src/ggml-sycl". The executable IS
-# already registered, in ggml/src/ggml-sycl/CMakeLists.txt (search that file
-# for "test-sycl-layout-choice"), under ctest name `sycl-layout-choice` (note
-# the name differs from the executable target name, which is why an earlier
-# `grep sycl-layout-choice tests/CMakeLists.txt` search here found nothing).
-# That registration's own comment documents exactly the same "no GPU needed
-# by default" property this task verified independently by reading main().
-# No registration belongs here; this task's run_dense_attention_ffn_layout_test
-# cases (tests/test-sycl-layout-choice.cpp) are already exercised by the
-# pre-existing `ctest -R '^sycl-layout-choice$'`.
+# llama.cpp-pktr: test-sycl-layout-choice.cpp is already registered, in
+# ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
+# ctest name differs from the executable target name). Do not register it
+# here too.

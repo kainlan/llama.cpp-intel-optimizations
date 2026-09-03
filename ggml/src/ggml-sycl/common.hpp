@@ -38,7 +38,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -51,6 +50,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <exception>
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;

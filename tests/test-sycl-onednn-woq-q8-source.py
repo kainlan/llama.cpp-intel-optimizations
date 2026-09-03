@@ -50,6 +50,7 @@ common = COMMON.read_text()
 
 ARM_SIG = "static bool ggml_sycl_onednn_woq_q8_enabled() {"
 SOA_ELIGIBILITY_SIG = "static bool ggml_sycl_q8_0_onednn_soa_enabled() {"
+HELPER_SIG = "static layout_mode ggml_sycl_q8_0_dense_planned_layout(const ggml_tensor * src0, int device) {"
 OP_SIG = "inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,"
 PICK_SIG = "auto pick_kernel_for_layout = [&](layout_mode layout) -> std::optional<ggml_sycl_mul_mat_kernel> {"
 GET_OPTIMAL_SIG = "static layout_mode get_optimal(ggml_type qtype, tensor_usage usage, int device_id = -1) {"
@@ -113,6 +114,68 @@ def function_body(text, signature):
     assert idx >= 0, f"missing definition: {signature}"
     open_idx = text.find("{", idx)
     return text[open_idx : matching_brace(text, open_idx) + 1]
+
+
+def ws_pattern(needle):
+    """Compile a regex matching `needle` with every run of whitespace
+    treated as flexible (`\\s+`), so a pure clang-format line-wrap in the
+    source (demonstrably real: git-clang-format wrapped
+    `q8_0_dense_planned_layout == GGML_LAYOUT_SOA &&` across two lines in
+    this exact function during development) does not break an exact-string
+    match. Positions returned by .search()/.finditer() are real offsets
+    into the ORIGINAL, un-normalized text (spec review finding 3,
+    rev-pktr-spec-3)."""
+    tokens = needle.split()
+    assert tokens, "empty needle"
+    return re.compile(r"\s+".join(re.escape(t) for t in tokens))
+
+
+def ws_find(text, needle, start=0):
+    """First match position of `needle` in `text`, whitespace-flexible, or -1."""
+    m = ws_pattern(needle).search(text, start)
+    return m.start() if m else -1
+
+
+def ws_rfind(text, needle):
+    """Last match position of `needle` in `text`, whitespace-flexible, or -1."""
+    matches = list(ws_pattern(needle).finditer(text))
+    return matches[-1].start() if matches else -1
+
+
+def ws_in(needle, text):
+    """Whitespace-flexible containment check: True iff `needle` (as a
+    sequence of tokens) appears in `text` with any whitespace between
+    tokens, including a line wrap."""
+    return ws_pattern(needle).search(text) is not None
+
+
+def enclosing_if_condition_text(text, pos):
+    """Full condition text of the innermost `if (...)` whose CONDITION
+    (not body) contains `pos` -- complements enclosing_if_conditions, which
+    only sees ifs whose body contains the target position. Used to extract
+    a guard's complete condition regardless of a line wrap inside it, so a
+    substring check across the whole condition is safe rather than a
+    fragile single-physical-line slice."""
+    if_idx = text.rfind("if (", 0, pos)
+    if if_idx < 0:
+        if_idx = text.rfind("if(", 0, pos)
+    if if_idx < 0:
+        return None
+    paren_start = text.find("(", if_idx)
+    depth = 1
+    j = paren_start + 1
+    n = len(text)
+    while depth > 0 and j < n:
+        c = text[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        j += 1
+    cond_end = j - 1
+    if not (paren_start < pos < cond_end):
+        return None
+    return text[paren_start + 1 : cond_end]
 
 
 def enclosing_if_conditions(text, start, target):
@@ -277,9 +340,9 @@ def test_pick_kernel_for_layout_soa_case_is_gated():
     assign = soa_case.find("layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_SOA;")
     assert assign > 0, "pick_kernel_for_layout SOA case must be able to select ONEDNN_SOA"
     guard = soa_case[:assign]
-    assert (
-        "src0->type == GGML_TYPE_Q8_0" in guard and "ggml_sycl_q8_0_onednn_soa_enabled()" in guard
-    ), "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the eligibility gate"
+    assert ws_in("src0->type == GGML_TYPE_Q8_0", guard) and "ggml_sycl_q8_0_onednn_soa_enabled()" in guard, (
+        "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the eligibility gate"
+    )
     assert (
         "ggml_sycl_onednn_woq_q8_enabled()" not in guard
     ), "pick_kernel_for_layout's ONEDNN_SOA choice must not also require the WoQ-execute gate"
@@ -292,70 +355,51 @@ def test_pick_kernel_for_layout_soa_case_is_gated():
 
 
 def test_planned_layout_decided_once_and_gates_both_lookups():
-    # llama.cpp-pktr spec-review fix (finding 1, rev-pktr-spec-1 then
-    # CORRECTED in rev-pktr-spec-2 after a real B50 regression):
-    # ggml_sycl_get_weight_layout_ptr does not verify that what it returns
-    # matches the layout it was asked for, so a lookup's own success/failure
-    # must never stand in for "the planner chose this layout" -- in EITHER
-    # direction. The tensor's actual materialized layout must be decided
-    # ONCE and used to gate both lookups.
-    #
-    # rev-pktr-spec-1's source for that decision, get_effective_layout_mode
-    # (src0->extra's cached layout field), is NOT guaranteed to agree with
-    # what ggml_sycl_op_mul_mat already resolved to hand this function
-    # src0_dd_i -- e.g. a Mistral Q8_0 weight materialized COALESCED via the
-    # unified cache's device-side path (not the CPU-side set_tensor reorder
-    # path that is the only writer of extra->layout.mode) reads AOS from
-    # extra's field while genuinely being COALESCED-resident. That mismatch
-    # made planned==AOS, which skipped BOTH lookups below and fell through
-    # to the plain AOS dequant on bytes that were actually COALESCED:
-    # `1, 2, 3, 4, 5,###############` on the B50 at default env. The planned
-    # layout must instead come from ggml_sycl_resolve(src0, ctx.device) --
-    # NOT literally the identical resolution ggml_sycl_op_mul_mat uses for a
-    # weight (that function's own src0_dd resolution takes an inline
-    # direct-handle consult; ggml_sycl_resolve is only its non-weight
-    # else-branch, though it agrees with the direct-handle path on the
-    # common resolve-exact/host-AOS cases -- see the declaration's own
-    # comment for the residual "layout_ptr" divergence, tracked separately
-    # on llama.cpp-ftnh).
-    op_body = function_body(backend, OP_SIG)
-    resolved_var_idx = op_body.find("q8_0_dense_resolved =")
-    assert resolved_var_idx > 0, "q8_0_dense_resolved must be declared"
-    resolved_stmt_end = op_body.find(";", resolved_var_idx)
+    # llama.cpp-pktr: ggml_sycl_get_weight_layout_ptr does not verify that
+    # what it returns matches the layout it was asked for, so a lookup's
+    # own success/failure must never stand in for "the planner chose this
+    # layout" -- in EITHER direction (this caused a real B50 regression,
+    # `1, 2, 3, 4, 5,###############` on Mistral Q8_0 at default env, when
+    # the planned-layout signal was read from get_effective_layout_mode
+    # instead -- see the shared helper's own comment for why). The tensor's
+    # actual materialized layout is decided ONCE, by the standalone helper
+    # ggml_sycl_q8_0_dense_planned_layout, and used to gate both lookups.
     assert (
-        "ggml_sycl_resolve(src0, ctx.device)" in op_body[resolved_var_idx:resolved_stmt_end]
-    ), "q8_0_dense_resolved must be assigned from ggml_sycl_resolve(src0, ctx.device)"
-    decl_idx = op_body.find("q8_0_dense_planned_layout =")
-    assert decl_idx > 0, "q8_0_dense_planned_layout must be declared"
-    assert resolved_var_idx < decl_idx, "the ggml_sycl_resolve call must precede the planned-layout declaration"
-    # Scope the source-of-truth check to the DECLARATION STATEMENTS
-    # themselves (from the resolve call's own statement through the planned-
-    # layout declaration's terminating semicolon), not the whole function
-    # body -- this function's own explanatory comments above them
-    # legitimately mention get_effective_layout_mode by name (as the
-    # rejected rev-pktr-spec-1 approach), which would otherwise false-fail a
-    # whole-body substring check.
-    decl_stmt_start = op_body.rfind("\n", 0, resolved_var_idx) + 1
-    decl_stmt_end = op_body.find(";", decl_idx)
-    decl_stmts = op_body[decl_stmt_start:decl_stmt_end]
+        backend.count(HELPER_SIG) == 1
+    ), "ggml_sycl_q8_0_dense_planned_layout must be defined exactly once"
+    helper_body = function_body(backend, HELPER_SIG)
     assert (
-        "get_effective_layout_mode(" not in decl_stmts
+        "get_effective_layout_mode(" not in helper_body
     ), "the planned layout must NOT be read from get_effective_layout_mode (rev-pktr-spec-2 regression source)"
     assert (
-        op_body.count("ggml_sycl_resolve(src0, ctx.device)") == 1
-    ), "ggml_sycl_resolve(src0, ctx.device) must be called exactly once (the planned-layout declaration itself)"
-    soa_guard_idx = op_body.find("q8_0_dense_planned_layout == GGML_LAYOUT_SOA")
-    coalesced_guard_idx = op_body.find("q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
+        helper_body.count("ggml_sycl_resolve(") == 1
+    ), "the helper must call ggml_sycl_resolve() exactly once"
+    assert ws_in("resolved.on_device", helper_body), "the helper must require on_device before trusting .layout"
+    op_body = function_body(backend, OP_SIG)
+    call_pattern = re.compile(r"q8_0_dense_planned_layout\s*=\s*ggml_sycl_q8_0_dense_planned_layout\(")
+    calls = list(call_pattern.finditer(op_body))
+    assert len(calls) == 1, (
+        f"ggml_sycl_op_mul_mat_sycl must assign q8_0_dense_planned_layout from the shared helper exactly once, "
+        f"found {len(calls)}"
+    )
+    decl_idx = calls[0].start()
+    soa_guard_idx = ws_find(op_body, "q8_0_dense_planned_layout == GGML_LAYOUT_SOA")
+    coalesced_guard_idx = ws_find(op_body, "q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
     assert 0 < decl_idx < soa_guard_idx, "the planned layout must be declared before the SOA lookup consults it"
     assert 0 < decl_idx < coalesced_guard_idx, "the planned layout must be declared before the COALESCED lookup consults it"
     # Neither lookup's guard may use the OTHER lookup's own pointer result as
-    # a proxy for what the planner chose.
-    soa_guard_line = op_body[op_body.rfind("\n", 0, soa_guard_idx) : op_body.find("\n", soa_guard_idx)]
-    coalesced_guard_line = op_body[
-        op_body.rfind("\n", 0, coalesced_guard_idx) : op_body.find("\n", coalesced_guard_idx)
-    ]
-    assert "q8_0_coalesced_ptr" not in soa_guard_line, "the SOA lookup's guard must not reference q8_0_coalesced_ptr"
-    assert "q8_0_soa_ptr" not in coalesced_guard_line, (
+    # a proxy for what the planner chose. Extract the FULL enclosing `if`
+    # condition (not a single physical line -- a line wrap inside the
+    # condition would otherwise truncate this check) via
+    # enclosing_if_condition_text.
+    soa_guard_text = enclosing_if_condition_text(op_body, soa_guard_idx)
+    coalesced_guard_text = enclosing_if_condition_text(op_body, coalesced_guard_idx)
+    assert soa_guard_text is not None, "no enclosing `if (...)` condition contains the SOA equality"
+    assert coalesced_guard_text is not None, "no enclosing `if (...)` condition contains the COALESCED equality"
+    assert (
+        "q8_0_coalesced_ptr" not in soa_guard_text
+    ), "the SOA lookup's guard must not reference q8_0_coalesced_ptr"
+    assert "q8_0_soa_ptr" not in coalesced_guard_text, (
         "the COALESCED lookup's guard must not reference q8_0_soa_ptr -- a planned-SOA weight whose SOA lookup "
         "declined must not fall through to a COALESCED lookup"
     )
@@ -394,7 +438,7 @@ def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
         conds = enclosing_if_conditions(op_body, 0, m.start())
         assert conds, f"lookup {m.group(0)!r} at offset {m.start()} has no enclosing `if` guard at all"
         required = f"q8_0_dense_planned_layout == GGML_LAYOUT_{requested_layout}"
-        assert any(required in c for c in conds), (
+        assert any(ws_in(required, c) for c in conds), (
             f"lookup {m.group(0)!r} at offset {m.start()} requests {requested_layout} but no enclosing `if` "
             f"contains the exact equality {required!r} (found {len(conds)} enclosing guard(s): {conds!r})"
         )
@@ -411,20 +455,21 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     # planned SOA, row_diff > 0, contiguous), so the fallback dequant further
     # down this function can address q8_0_soa_ptr correctly regardless of
     # whether the WoQ int8-plane primitive itself is opted into.
-    guard_idx = before.rfind(
-        "if (!used_woq && src0->type == GGML_TYPE_Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA &&"
+    guard_idx = ws_rfind(
+        before, "if (!used_woq && src0->type == GGML_TYPE_Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA &&"
     )
     assert guard_idx > 0, (
         "the arm must be guarded by `!used_woq && Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA && ...` "
         "(no WoQ-execute env in the outer guard)"
     )
-    outer_guard_end = before.find(") {", guard_idx)
+    outer_guard_text = enclosing_if_condition_text(before, guard_idx + 5)
+    assert outer_guard_text is not None, "the outer guard's own condition could not be extracted"
     assert (
-        "ggml_sycl_onednn_woq_q8_enabled()" not in before[guard_idx:outer_guard_end]
+        "ggml_sycl_onednn_woq_q8_enabled()" not in outer_guard_text
     ), "the WoQ-execute env must not gate the outer guard (only the decline reasoning may reference it)"
     arm = before[guard_idx:]
-    assert (
-        "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)" in arm
+    assert ws_in(
+        "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)", arm
     ), "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)"
     assert 'decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed"
     assert 'decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)"
@@ -442,12 +487,12 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     # non-materializing predicate AND the full-rows / K-blocked tests, so a
     # non-null q8_0_soa_ptr implies the fallback dequant's addressing is valid
     # and the arm can never mint a second stored layout.
-    assert (
-        "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {"
-        in arm
+    assert ws_in(
+        "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {",
+        arm,
     ), "the SOA lookup must sit behind full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel"
-    lookup = arm.find("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)")
-    guard = arm.find("if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(")
+    lookup = ws_find(arm, "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)")
+    guard = ws_find(arm, "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(")
     assert 0 < guard < lookup, "the predicate guard must precede the SOA lookup"
     # The guarded lookup must be the ONLY writer of q8_0_soa_ptr and the ONLY
     # SOA getter call: a second, ungated assignment would reinstate both the
@@ -456,7 +501,8 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     assert len(writers) == 2, f"expected exactly the declaration + one guarded writer of q8_0_soa_ptr, found {len(writers)}"
     assert op_body.count("q8_0_soa_ptr = candidate;") == 1, "the guarded lookup must be the single writer"
     assert (
-        op_body.count("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)") == 1
+        len(list(ws_pattern("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)").finditer(op_body)))
+        == 1
     ), "exactly one SOA getter call is allowed, inside the guarded block"
     # The primitive must be prepared (known good) ONCE, before the staging kernel
     # is submitted, and that same plan is what executes.
@@ -472,10 +518,10 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     assert re.search(
         r"if \(q8_0_soa_ptr\) \{[^{}]*dequantize_row_q8_0_soa_to_fp16_rowmajor\(q8_0_soa_ptr", after
     ), "the SOA dequant fallback must be the body of `if (q8_0_soa_ptr) {`"
-    coalesced_guard_start = after.find("if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
+    coalesced_guard_start = ws_find(after, "if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
     assert coalesced_guard_start > 0, "the COALESCED lookup must be gated by the planned layout"
-    coalesced_guard_end = after.find(") {", coalesced_guard_start)
-    coalesced_guard_text = after[coalesced_guard_start:coalesced_guard_end]
+    coalesced_guard_text = enclosing_if_condition_text(after, coalesced_guard_start + 5)
+    assert coalesced_guard_text is not None, "the COALESCED lookup's own condition could not be extracted"
     assert (
         "ggml_sycl_q8_0_onednn_coalesced_enabled()" in coalesced_guard_text
     ), "the COALESCED lookup must also still consult its own opt-out env"

@@ -47,6 +47,9 @@ PREDICATE = "ggml_sycl_q8_0_coalesced_tile_aligned"
 ADJUST_SIG = "layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layout_mode target, int device) {"
 PLANNER_TENSOR_INFO_SIG = "static ggml_layout_mode planner_default_device_layout(const placement_tensor_info & tensor,"
 PLANNER_ENTRY_SIG = "static ggml_layout_mode planner_default_device_layout(const placement_entry & entry, int device_id) {"
+# Short prefix only (not the full signature): the parameter list wraps
+# across lines and clang-format may reflow it differently in the future.
+PLANNER_DEMOTE_SIG = "static ggml_layout_mode planner_demote_coalesced_if_misaligned("
 
 # Matches a hand-rolled re-derivation in the `% <const> <cmp> 0` family of
 # spellings: the named constant or the literal 32 it currently equals,
@@ -124,6 +127,21 @@ def function_body(text, signature):
     return text[open_idx : matching_brace(text, open_idx) + 1]
 
 
+def ws_find(text, needle, start=0):
+    """First match position of `needle` in `text` with every run of
+    whitespace in `needle` treated as flexible (`\\s+`), so a pure
+    clang-format line-wrap between tokens does not break an exact-string
+    match (spec review finding 3, rev-pktr-spec-3 -- this file's own
+    hardcoded two-line, hardcoded-indentation needle was exactly the
+    brittleness that finding described). Returns -1 if not found; the
+    returned position is a real offset into the ORIGINAL text."""
+    tokens = needle.split()
+    assert tokens, "empty needle"
+    pattern = re.compile(r"\s+".join(re.escape(t) for t in tokens))
+    m = pattern.search(text, start)
+    return m.start() if m else -1
+
+
 def test_predicate_defined_exactly_once():
     # Defined in the standalone header; ggml-sycl.cpp and unified-cache.cpp
     # must each CALL it, never redefine it (both include common.hpp, which
@@ -153,9 +171,10 @@ def test_adjust_layout_for_tensor_calls_the_predicate_for_the_dense_usage_set():
     assert f"{PREDICATE}(tensor->ne[0])" in body, "ggml_sycl_adjust_layout_for_tensor must call the shared predicate"
     # The dense-usage branch (llama.cpp-os8k, extended by llama.cpp-pktr) must
     # cover all four usages the predicate now applies to.
-    usage_idx = body.find(
-        "(usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT ||\n"
-        "         usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT)"
+    usage_idx = ws_find(
+        body,
+        "(usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT || "
+        "usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT)",
     )
     assert usage_idx > 0, "the dense-usage branch must cover EMBEDDING, OUTPUT_WEIGHT, ATTENTION_WEIGHT, FFN_WEIGHT"
     predicate_idx = body.find(f"{PREDICATE}(tensor->ne[0])")
@@ -178,18 +197,31 @@ def test_adjust_layout_for_tensor_calls_the_predicate_for_the_dense_usage_set():
 
 
 def test_planner_default_device_layout_calls_the_predicate_in_both_overloads():
+    # llama.cpp-pktr spec review nit 9 (rev-pktr-spec-3): both overloads used
+    # to call the predicate directly and identically; that duplicate
+    # 4-line block is now factored into planner_demote_coalesced_if_misaligned,
+    # which each overload calls instead. Check the delegation from each
+    # overload, and that the shared helper itself calls the predicate
+    # exactly once with no re-derivation anywhere.
     tensor_info_body = function_body(cache, PLANNER_TENSOR_INFO_SIG)
     entry_body = function_body(cache, PLANNER_ENTRY_SIG)
+    helper_body = function_body(cache, PLANNER_DEMOTE_SIG)
     assert (
-        f"{PREDICATE}(tensor.ne[0])" in tensor_info_body
-    ), "the placement_tensor_info overload of planner_default_device_layout must call the shared predicate"
+        "planner_demote_coalesced_if_misaligned(" in tensor_info_body and "tensor.ne[0]" in tensor_info_body
+    ), "the placement_tensor_info overload must delegate to planner_demote_coalesced_if_misaligned(..., tensor.ne[0])"
     assert (
-        f"{PREDICATE}(entry.ne[0])" in entry_body
-    ), "the placement_entry overload of planner_default_device_layout must call the shared predicate"
-    for label, body in (("tensor_info", tensor_info_body), ("entry", entry_body)):
+        "planner_demote_coalesced_if_misaligned(" in entry_body and "entry.ne[0]" in entry_body
+    ), "the placement_entry overload must delegate to planner_demote_coalesced_if_misaligned(..., entry.ne[0])"
+    assert (
+        helper_body.count(f"{PREDICATE}(") == 1
+    ), "planner_demote_coalesced_if_misaligned must call the shared predicate exactly once"
+    for label, body in (
+        ("tensor_info", tensor_info_body),
+        ("entry", entry_body),
+        ("planner_demote_coalesced_if_misaligned", helper_body),
+    ):
         assert not RE_DERIVATION_RE.search(body), (
-            f"planner_default_device_layout({label}) must not re-derive the tile-alignment arithmetic inline "
-            "next to calling the shared predicate"
+            f"{label} must not re-derive the tile-alignment arithmetic inline next to calling the shared predicate"
         )
 
 

@@ -1786,6 +1786,32 @@ static bool run_dense_attention_ffn_layout_test() {
         }
     }
 
+    // Negative control (spec review nit 8, rev-pktr-spec-3): the pktr rule
+    // is Q8_0-only. A Q4_0 dense weight with the SAME tile-misaligned shape
+    // (K=2560, 80 blocks/row) must NOT be demoted to SOA -- the type guard
+    // in ggml_sycl_adjust_layout_for_tensor's dense-usage branch must keep
+    // it out of that net entirely, so it stays wherever layout_policy::
+    // get_optimal() already put it (COALESCED, since is_coalesced_supported
+    // is true for Q4_0).
+    {
+        ggml_tensor q4_0_attn_q{};
+        q4_0_attn_q.type  = GGML_TYPE_Q4_0;
+        q4_0_attn_q.ne[0] = 2560;
+        q4_0_attn_q.ne[1] = 2048;
+        q4_0_attn_q.ne[2] = 1;
+        q4_0_attn_q.ne[3] = 1;
+        ggml_set_name(&q4_0_attn_q, "blk.0.attn_q.weight");
+        const layout_mode q4_0_attn_q_layout =
+            ggml_sycl_adjust_layout_for_tensor(&q4_0_attn_q, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (q4_0_attn_q_layout != GGML_LAYOUT_COALESCED) {
+            printf(
+                "FAIL: Q4_0 ATTENTION_WEIGHT with ne00=2560 (tile-misaligned for Q8_0, but the pktr rule is "
+                "Q8_0-only) must stay COALESCED, got %d\n",
+                (int) q4_0_attn_q_layout);
+            return false;
+        }
+    }
+
     // Regression guard: EMBEDDING/OUTPUT_WEIGHT behaviour from
     // run_tied_embedding_output_layout_test() above must be unaffected by
     // widening the usage set this branch checks.
