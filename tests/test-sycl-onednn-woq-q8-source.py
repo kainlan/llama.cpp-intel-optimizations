@@ -127,7 +127,12 @@ def ws_pattern(needle):
     this exact function during development) does not break an exact-string
     match. Positions returned by .search()/.finditer() are real offsets
     into the ORIGINAL, un-normalized text (spec review finding 3,
-    rev-pktr-spec-3)."""
+    rev-pktr-spec-3). test-sycl-q8-dense-layout-rule-source.py deliberately
+    carries a more general sibling ws_pattern that also tolerates a wrap
+    directly against `( ) , * &` with no whitespace in the needle (needed
+    for a single-parameter signature, where clang-format at the 120-column
+    limit puts the sole over-limit parameter on its own line right after
+    `(`); the two are intentionally separate copies, not to be unified."""
     tokens = needle.split()
     assert tokens, "empty needle"
     return re.compile(r"\s+".join(re.escape(t) for t in tokens))
