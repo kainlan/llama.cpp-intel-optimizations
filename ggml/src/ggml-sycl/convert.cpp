@@ -1283,7 +1283,7 @@ void dequantize_row_q8_0_soa_to_fp16_rowmajor(const void *    src,
 // static_asserts tie its constants to the authoritative Q8_0 definitions.
 static_assert(GGML_SYCL_Q8_SCALE_PLANE_QK == QK8_0, "q8-scale-plane.hpp block width must equal QK8_0");
 static_assert(ggml_sycl_q8_0_soa_scale_plane_offset_bytes(4, 128) ==
-                  static_cast<size_t>(block_q_t<GGML_TYPE_Q8_0>::get_d_offset(4, 4096, 0).first),
+                  static_cast<size_t>(ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>::get_d_offset(4, 4096, 0).first),
               "q8-scale-plane.hpp d-plane offset must equal block_q_t<Q8_0>::get_d_offset");
 void q8_0_soa_scale_plane_to_kbn_sycl(const void *    soa_base,
                                       sycl::half *    dst,
