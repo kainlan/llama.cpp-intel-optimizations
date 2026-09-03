@@ -21933,8 +21933,8 @@ static ggml_layout_mode planner_demote_coalesced_if_misaligned(ggml_layout_mode 
 //
 // llama.cpp-pktr: this IS load-bearing for ATTENTION_WEIGHT/FFN_WEIGHT, in
 // MULTI-DEVICE planning specifically -- the entry overload's dense
-// re-placement caller (add_no_p2p_candidate_dense_alternates) reaches this
-// function for per-layer dense weights (`entry.layer_id >= 0`), but only
+// re-placement caller (add_no_p2p_candidate_dense_alternates) reaches that
+// overload for per-layer dense weights (`entry.layer_id >= 0`), but only
 // when it itself runs, gated on `use_cohesive_no_p2p_moe && n_layers > 0 &&
 // device_budgets.size() > 1`. A single-device plan never invokes that
 // caller, so agreement there is an accident of the path not running at

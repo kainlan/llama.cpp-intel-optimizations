@@ -152,6 +152,14 @@ def ws_in(needle, text):
     return ws_pattern(needle).search(text) is not None
 
 
+def ws_count(text, needle):
+    """Number of whitespace-flexible matches of `needle` in `text` -- for
+    "defined exactly once" checks on a signature (e.g. HELPER_SIG,
+    ARM_SIG, SOA_ELIGIBILITY_SIG) that a reflowed parameter list must not
+    false-fail (spec review should-fix 1, rev-pktr-spec-5)."""
+    return len(list(ws_pattern(needle).finditer(text)))
+
+
 def enclosing_if_condition_text(text, pos):
     """Full condition text of the innermost `if (...)` whose CONDITION
     (not body) contains `pos` -- complements enclosing_if_conditions, which
@@ -271,7 +279,7 @@ def enclosing_if_conditions(text, start, target):
 
 
 def test_arm_env_accessor_exists_once_and_defaults_off():
-    assert backend.count(ARM_SIG) == 1, "ggml_sycl_onednn_woq_q8_enabled must be defined exactly once"
+    assert ws_count(backend, ARM_SIG) == 1, "ggml_sycl_onednn_woq_q8_enabled must be defined exactly once"
     body = function_body(backend, ARM_SIG)
     assert 'std::getenv("GGML_SYCL_ONEDNN_WOQ_Q8")' in body, "arm accessor must read GGML_SYCL_ONEDNN_WOQ_Q8"
     assert (
@@ -283,7 +291,7 @@ def test_soa_eligibility_accessor_exists_once_and_defaults_on():
     # llama.cpp-pktr: separate accessor for whether ONEDNN_SOA may be chosen
     # at all, distinct from the WoQ-execute accessor above. Mirrors
     # ggml_sycl_q8_0_onednn_coalesced_enabled's default-ON pattern.
-    assert backend.count(SOA_ELIGIBILITY_SIG) == 1, "ggml_sycl_q8_0_onednn_soa_enabled must be defined exactly once"
+    assert ws_count(backend, SOA_ELIGIBILITY_SIG) == 1, "ggml_sycl_q8_0_onednn_soa_enabled must be defined exactly once"
     body = function_body(backend, SOA_ELIGIBILITY_SIG)
     assert 'std::getenv("GGML_SYCL_Q8_ONEDNN_SOA")' in body, "SOA eligibility accessor must read GGML_SYCL_Q8_ONEDNN_SOA"
     assert (
@@ -371,7 +379,7 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
     # actual materialized layout is decided ONCE, by the standalone helper
     # ggml_sycl_q8_0_dense_planned_layout, and used to gate both lookups.
     assert (
-        backend.count(HELPER_SIG) == 1
+        ws_count(backend, HELPER_SIG) == 1
     ), "ggml_sycl_q8_0_dense_planned_layout must be defined exactly once"
     helper_body = function_body(backend, HELPER_SIG)
     assert (
