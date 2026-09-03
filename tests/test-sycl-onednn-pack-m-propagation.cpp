@@ -34,6 +34,7 @@
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,9 +49,10 @@
 // ctest SKIP_RETURN_CODE, matching the test-sycl-*-policy.sh family.  Only a
 // genuinely absent device skips; every other precondition FAILs, because a
 // precondition that skips is how this file spent months reporting green.
+// Skip exits return LLAMA_TEST_EXIT_SKIP (tests/test-skip.h); see that header
+// for the rationale.
 static const int GATE_PASS = 0;
 static const int GATE_FAIL = 1;
-static const int GATE_SKIP = 77;
 
 // The tensor-level override under test.  Deliberately different from the
 // GGML_SYCL_ONEDNN_PACK_M env default below, so that a lookup which ignored
@@ -97,14 +99,14 @@ static int run_pack_m_propagation_test() {
     fx.backend = ggml_backend_sycl_init(0);
     if (!fx.backend) {
         std::printf("SKIP: SYCL backend unavailable\n");
-        return GATE_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
     ggml_backend_buffer_type_t dev_buft  = ggml_backend_get_default_buffer_type(fx.backend);
     if (!host_buft || !dev_buft) {
         std::printf("SKIP: buffer types unavailable\n");
-        return GATE_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_init_params params = {

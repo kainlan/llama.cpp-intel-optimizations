@@ -98,6 +98,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "llama.h"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -106,9 +107,6 @@
 #if defined(__linux__)
 #    include <sys/resource.h>
 #endif
-
-// ctest's SKIP_RETURN_CODE.  Never 0: a skip that exits 0 reads as verification.
-static const int EXIT_SKIP = 77;
 
 static int g_failures = 0;
 
@@ -192,7 +190,7 @@ int main(int argc, char ** argv) {
     if (!model_path) {
         printf("SKIP: no model given (-m <gguf> or LLAMACPP_TEST_MODELFILE).\n");
         printf("      This run proves NOTHING about the lifecycle hooks.\n");
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     if (FILE * f = fopen(model_path, "rb")) {
         fclose(f);
@@ -200,7 +198,7 @@ int main(int argc, char ** argv) {
         printf("SKIP: model not readable: %s\n", model_path);
         printf("      The test-download-model fixture supplies it; it did not run or failed.\n");
         printf("      This run proves NOTHING about the lifecycle hooks.\n");
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     llama_backend_init();
@@ -215,7 +213,7 @@ int main(int argc, char ** argv) {
         printf("      cache, so the counters would advance while nothing was cached.\n");
         printf("      This run proves NOTHING about the lifecycle hooks.\n");
         llama_backend_free();
-        return EXIT_SKIP;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_sycl_model_lifecycle_probe before   = {};

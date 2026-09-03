@@ -18,6 +18,7 @@
 //      a tiny hand fixture is too small to exercise.
 #include "ggml-common.h"
 #include "ggml-sycl/convert.hpp"
+#include "test-skip.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -534,6 +535,6 @@ int main() {
         return 0;
     } catch (const sycl::exception & ex) {
         std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 }

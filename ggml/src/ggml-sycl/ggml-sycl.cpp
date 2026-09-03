@@ -2806,6 +2806,20 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_exact_wrapper_owner(uint64_t m
     return state->token;
 }
 
+// llama.cpp-qq19: the SINGLE authority for resolving a tensor's owner. Owner
+// resolution IS identity resolution (ruling 2), so every call site that needs
+// "who owns this tensor" must come through here -- resolve extra->model_id via
+// the registry when the wrapper names one, else fall back to the
+// published/identity plan -- rather than re-inlining
+// ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0) itself. A FUTURE
+// FOURTH (or Nth) SITE MUST CALL THIS, NOT COPY THE BLOCK; see the divergence
+// guard in tests/test-sycl-resolve-tensor-owner-source.py, which fails if the
+// pattern is re-inlined anywhere outside this function's body.
+static ggml_sycl::lifecycle::ModelToken ggml_sycl_resolve_tensor_owner(const ggml_tensor * tensor) noexcept {
+    const auto * extra = tensor ? static_cast<const ggml_tensor_extra_gpu *>(tensor->extra) : nullptr;
+    return ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
+}
+
 static bool ggml_sycl_host_row_authorized(const ggml_sycl::lifecycle::ModelToken & owner) noexcept {
     const auto candidate = ggml_sycl_bound_load_candidate();
     if (candidate) {
@@ -9150,8 +9164,7 @@ static std::string ggml_sycl_canonical_checksum_key(const ggml_tensor * tensor) 
     if (!name || name[0] == '\0') {
         return {};
     }
-    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-    const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
+    const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
     return ggml_sycl_owner_name_key(owner, name);
 }
 
@@ -13984,9 +13997,8 @@ tensor_usage ggml_sycl_get_tensor_usage(const ggml_tensor * tensor) {
 
     const char * name = ggml_get_name(tensor);
     if (name && name[0]) {
-        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-        const auto owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
-        const std::string key = ggml_sycl_owner_name_key(owner, name);
+        const auto        owner = ggml_sycl_resolve_tensor_owner(tensor);
+        const std::string key   = ggml_sycl_owner_name_key(owner, name);
         if (!key.empty()) {
             std::lock_guard<std::mutex> lock(g_sycl_weight_usage_mutex);
             auto                        it = g_sycl_weight_usages.find(key);
@@ -14078,9 +14090,8 @@ static void ggml_sycl_bf16_materialize_cache_erase_for_owner(ggml_sycl::lifecycl
 }
 
 static std::string ggml_sycl_bf16_materialize_key(const ggml_tensor * tensor, int device) {
-    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
-    const auto   owner = ggml_sycl_exact_wrapper_owner(extra ? extra->model_id : 0);
-    std::string  key   = ggml_sycl_owner_name_key(owner, tensor->name);
+    const auto  owner = ggml_sycl_resolve_tensor_owner(tensor);
+    std::string key   = ggml_sycl_owner_name_key(owner, tensor->name);
     key += "|dev";
     key += std::to_string(device);
     return key;
@@ -14312,8 +14323,7 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
         // one that is not published would otherwise find no identity at all and
         // silently drop to the fallback UUID path.  Same lookup order as
         // ggml_sycl_get_tensor_usage().
-        const uint64_t extra_model_id = extra ? extra->model_id : 0;
-        const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
+        const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
 
         if (owner.model.value != 0) {
             auto name_it = g_sycl_weight_identities_by_name.find(ggml_sycl_owner_name_key(owner, name.c_str()));
@@ -14404,7 +14414,8 @@ ggml_sycl_cache_id ggml_backend_sycl_get_weight_cache_key(const ggml_tensor * te
     // instances SHOULD collapse to the same cache_id via
     // (file_id,file_offs,nbytes,type,ne) -- but that only holds when
     // has_gguf_identity is true for BOTH calls. If model_id/owner resolution
-    // (extra->model_id -> ggml_sycl_exact_wrapper_owner) differs between the
+    // (ggml_sycl_resolve_tensor_owner, extra->model_id -> ggml_sycl_exact_wrapper_owner)
+    // differs between the
     // GET_ROWS call site (embedding role, known-correct per the divergence
     // hunt) and the MUL_MAT call site (output-projection role, proven
     // corrupted -- device bytes are byte-exact per_layer_token_embd.weight),
@@ -14450,6 +14461,47 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
 
     if (tensor->data == nullptr) {
         return id;
+    }
+
+    // llama.cpp-79o5: a TRANSIENT non-weight tensor gets no cache identity.
+    //
+    // The identity built below is the tensor's raw device address -- name_hash and
+    // file_offs are both (uintptr_t) tensor->data, and model_id is 0 -- so it carries no
+    // owner, no context and no graph.  Activations and KV views are per-token, per-graph
+    // memory drawn from an address space shared by every llama_context on the device, so
+    // that identity cannot distinguish "this tensor" from "whatever last occupied this
+    // address".  get_data_ptr_slow() then resolves such a tensor from a copy staged by a
+    // different graph or a different context; its own comment already conceded it "could
+    // observe content validated for a different graph/caller".  CLAUDE.md forbids the
+    // construction outright: pointer addresses must not be cache keys, and dispatch caches
+    // must derive from the stable identity carried by mem_handle.
+    //
+    // Measured on test-sycl-two-context-ownership (two contexts, one model, one device):
+    // with this identity in place all four size pairings fail deterministically; with it
+    // withheld all four pass, in both creation orders and with the second context never
+    // decoding.  The change moves no allocation -- every address is unchanged -- which is
+    // what distinguishes it from the layout perturbations (separate models, creation order)
+    // that also hide the defect while proving nothing.
+    //
+    // A better key does NOT fix this: keying additionally by the owning buffer was tried
+    // and failed, because the fault is freshness, not collision.  A content-addressed cache
+    // is sound for weights (stable bytes, reused every token) and unsound for activations
+    // (new bytes every token) regardless of how the key is built.
+    //
+    // Cost: nil.  Non-weight prestage resolutions numbered 2 in a whole run, and Mistral
+    // Q4_0 and GPT-OSS 20B measured flat on pp512 and tg128 across interleaved pairs.
+    // Weight caching is untouched -- weights delegated to
+    // ggml_backend_sycl_get_weight_cache_key above, before this point.
+    //
+    // GGML_SYCL_NONWEIGHT_CACHE_KEY=1 restores the old behaviour for bisection only.
+    {
+        static const bool legacy_address_identity = [] {
+            const char * e = std::getenv("GGML_SYCL_NONWEIGHT_CACHE_KEY");
+            return e && std::atoi(e) != 0;
+        }();
+        if (!legacy_address_identity) {
+            return id;  // id.valid == false -> no participation in the shared cache
+        }
     }
 
     const uintptr_t data_id = reinterpret_cast<uintptr_t>(tensor->data);
@@ -22144,8 +22196,9 @@ static ggml_sycl_cache_id ggml_sycl_get_moe_expert_cache_key(const ggml_tensor *
     // Canonical MoE identity is minted only from the exact lifecycle owner and
     // the registered GGUF parent slice.  Wrapper addresses, allocation ids,
     // cache UUIDs and graph-local extras are observations, never identity.
-    const uint64_t extra_model_id = extra ? extra->model_id : 0;
-    const auto     owner          = ggml_sycl_exact_wrapper_owner(extra_model_id);
+    // `extra` here is always the caller's own static_cast<...>(tensor->extra),
+    // so resolving through the tensor gives the identical answer.
+    const auto owner = ggml_sycl_resolve_tensor_owner(tensor);
     if (owner.model.value == 0 || owner.load.value == 0 ||
         owner.owner.slot == ggml_sycl::lifecycle::no_model_slot || owner.owner.generation == 0) {
         return id; // fail closed on a partial owner
@@ -40361,12 +40414,47 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr = nullptr;
 
         // Try the pre-reserved compute arena first.
+        //
+        // llama.cpp-wld8: this used to call cache->arena_alloc(rounded_size)
+        // directly and return its raw pointer -- no mem_handle, nothing
+        // inserted into arena_handles. free() below can only defer release
+        // for a live SYCL graph recording when it finds a valid owner in
+        // arena_handles; a raw pointer from this path always misses that
+        // lookup and falls through to the legacy branch's unconditional
+        // drain-then-free. A drain only waits for SUBMITTED work, and
+        // recorded (not yet replayed) work is not submitted until replay,
+        // so the block was returned to the SCRATCH TLSF while a recorded
+        // graph still baked in its address -- the root cause of the
+        // two-context corruption in llama.cpp-79o5, and this was the
+        // common path since arena_active() defaults on. Mint ownership here
+        // instead, via the exact-handle owner API for the SCRATCH zone,
+        // using the SAME (size+255)&~255 rounding and 256 alignment
+        // arena_alloc() applies internally (unified-cache.cpp:17964,17967)
+        // so this path's allocation shape is unchanged -- only free() can
+        // now find and defer it.
         {
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-            ptr          = (cache && cache->arena_active()) ? cache->arena_alloc(rounded_size) : nullptr;
-            if (ptr) {
-                *actual_size = rounded_size;
-                return ptr;
+            if (cache && cache->arena_active()) {
+                const size_t                 aligned    = (rounded_size + 255) & ~size_t(255);
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(
+                    device, ggml_sycl::vram_zone_id::SCRATCH, aligned, 256);
+                if (allocation) {
+                    ggml_sycl::mem_handle owner =
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                    const auto resolved = owner.resolve(device);
+                    if (resolved.ptr && resolved.on_device && !ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
+                        {
+                            std::lock_guard<std::mutex> lock(arena_handles_mutex);
+                            arena_handles[resolved.ptr] = std::move(owner);
+                        }
+                        *actual_size = rounded_size;
+                        return resolved.ptr;
+                    }
+                    // Minted but did not resolve to a usable device pointer --
+                    // owner's destructor releases it; fall through to the
+                    // existing fallback below rather than returning a raw
+                    // pointer or aborting (requirement: preserve the fallback).
+                }
             }
         }
         // Arena full or not reserved — fall back to unified cache.
@@ -40451,6 +40539,29 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 // this pool without an allocation-time mem_handle.  Drain before
                 // reclaiming so correctness is preserved while those call sites
                 // are migrated.
+                //
+                // llama.cpp-wld8: this is the unsafe case for a caller under
+                // active SYCL graph recording -- a drain here only waits for
+                // SUBMITTED work, and recorded (not yet replayed) work is not
+                // submitted until replay, so the block can still be handed
+                // back to SCRATCH while a recorded graph bakes in its
+                // address. alloc()'s own arena_alloc() call site (the common
+                // source of these) was migrated to mint ownership above; warn
+                // once per device if any OTHER, still-unmigrated call site
+                // reaches here while recording, so it is visible instead of
+                // silently corrupting output.
+                if (ggml_sycl_graph_recording_active()) {
+                    static std::unordered_set<int> warned_devices;
+                    static std::mutex              warned_devices_mutex;
+                    std::lock_guard<std::mutex>    lock(warned_devices_mutex);
+                    if (warned_devices.insert(device).second) {
+                        GGML_LOG_WARN(
+                            "[POOL-LEG] device=%d: legacy arena free reached during SYCL graph recording -- this "
+                            "allocation is not owner-tracked and its release cannot be deferred to replay; see "
+                            "llama.cpp-wld8\n",
+                            device);
+                    }
+                }
                 try {
                     qptr->wait_and_throw();
                 } catch (...) {

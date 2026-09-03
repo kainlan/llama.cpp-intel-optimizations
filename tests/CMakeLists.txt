@@ -525,6 +525,36 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# oneDNN int8-with-grouped-scales matmul probe + microbench (track prefill of
+# epic llama.cpp-xihy, llama.cpp-ovkn): a capability/perf probe, NOT a
+# correctness gate and NOT a ctest -- it opens a GPU device and must never run
+# inside a ctest sweep, so add_executable only (no llama_build_and_test, no
+# add_test). Standalone like test-onednn-woq-mxfp4 above (dnnl + sycl headers
+# only, no ggml/backend deps), so it needs the same directory-local
+# find_package(DNNL) re-issue and IntelSYCL::SYCL_CXX/-fsycl fallback --
+# copied from that block -- plus GGML_SYCL_DNNL=1 so the file's `#if
+# GGML_SYCL_DNNL` guard compiles the real probe body instead of the SKIP
+# stub. Build with `./scripts/sycl-build.sh test-sycl-onednn-int8-grouped-
+# probe` and run manually (see the file header for the full command, device
+# selector required).
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-onednn-int8-grouped-probe test-sycl-onednn-int8-grouped-probe.cpp)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-int8-grouped-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-int8-grouped-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-int8-grouped-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-int8-grouped-probe PRIVATE "-fsycl")
+    endif()
+    find_package(DNNL QUIET)
+    if (TARGET DNNL::dnnl)
+        target_link_libraries(test-sycl-onednn-int8-grouped-probe PRIVATE DNNL::dnnl)
+        target_compile_definitions(test-sycl-onednn-int8-grouped-probe PRIVATE GGML_SYCL_DNNL=1)
+    else()
+        message(WARNING "test-sycl-onednn-int8-grouped-probe: DNNL::dnnl not found in this directory scope; the target will fail to link")
+    endif()
+endif()
+
 # Custom PP GEMM activation-format microbench (llama.cpp-iikr, stage 1):
 # same rationale as the repack bench above -- a device-event throughput
 # measurement, not a correctness gate, so add_executable directly. Build
@@ -702,6 +732,30 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 # for that fix: a regression reappears as "error=DEVICE_BUSY" in the log and a
 # failure of every context after the first. Do not re-add the pin to make a
 # failure go away -- it would hide exactly the defect this test now covers.
+
+# Two live contexts on one model, different n_ctx, interleaved decodes, each
+# step compared against a single-context reference (llama.cpp-32dg8.15.1). This
+# is the executable half of docs/design/sycl-memory-ownership-table.md. It
+# LOADS A MODEL, so it carries the "cache" label on purpose: CLAUDE.md's
+# full-sweep form excludes `-LE 'residency|mem-handle|cache'` and runs that
+# family serially -- an unlabelled model-loading test slips past that filter.
+# The selector pin is what keeps the iGPU out of the run (llama.cpp-403s).
+# Guarded by GGML_SYCL so a build without the SYCL backend compiled in never
+# tries to build/register this test at all (precedent:
+# test-sycl-model-lifecycle-hooks below). That is all this CMake guard claims:
+# a SYCL build that enumerates no GPU device, or whose backend init silently
+# falls back to CPU, is instead caught at RUNTIME by the
+# llama_supports_gpu_offload() check inside the test itself, which exits 77
+# (skip) rather than passing vacuously.
+if (GGML_SYCL)
+    llama_build_and_test(test-sycl-two-context-ownership.cpp ARGS "${MODEL_DEST}" -ngl 99 --ctx-a 256 --ctx-b 512)
+    set_tests_properties(test-sycl-two-context-ownership PROPERTIES
+        FIXTURES_REQUIRED test-download-model
+        LABELS "main;sycl;cache;ownership;two-context"
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
@@ -905,6 +959,95 @@ if (NOT WIN32)
     set_tests_properties(test-sycl-device-guard-symmetry-policy PROPERTIES
         LABELS "sycl;policy"
         SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+# sycl-canonical-gates (llama.cpp-rou3): the two prose gates in CLAUDE.md
+# ("Verification Commands & Correctness Gates" -- the Mistral completion gate
+# and the GPT-OSS chat gate) as ONE executable, ctest-registered runner. Not
+# guarded by `if (GGML_SYCL)`: the whole point of the script's own
+# CMakeCache/ldd precondition check is to catch a build where GGML_SYCL was
+# silently reset OFF (CLAUDE.md: this happened 2026-07-25 and the Mistral
+# gate still passed, on the CPU fallback, at ~8.38 tok/s instead of ~108). If
+# registration itself were gated on the CMake-configure-time GGML_SYCL
+# variable, that exact scenario would make this test vanish from `ctest -N`
+# instead of failing loudly -- so it is registered unconditionally (mirroring
+# the test-sycl-*-policy.sh family above) and fails closed (rc=1) at runtime
+# instead.
+#
+# LABELS "gpu;model-loading": this test loads two real models on a real GPU
+# (llama-completion, llama-cli), which the never-loop / GPU-serialization
+# rules in CLAUDE.md forbid running unpinned, in a subagent, or concurrently
+# with any other GPU-allocating test. Neither "gpu" nor "model-loading" is in
+# CLAUDE.md's documented safe-sweep denylist (`-LE
+# 'residency|mem-handle|cache'`) as written today -- that denylist must grow
+# a `|gpu` term before any documented "safe" sweep can be trusted not to
+# schedule this test (flagged on the tracking epic, llama.cpp-97yn).
+# RESOURCE_LOCK gpu-ttm-memory: llama.cpp-ezfm's fail-closed GPU/TTM
+# serialization policy had not landed a shared resource-lock name as of this
+# commit; adopt ezfm's wrapper here once it exists instead of this literal.
+#
+# OPT-IN (llama.cpp-9hz0, 2026-09-02). The paragraph above correctly identified
+# that neither of this test's labels is in CLAUDE.md's documented safe-sweep
+# denylist, and deferred the fix. Deferring it shipped the hazard: a plain
+# `ctest --test-dir build` or the documented "safe" form
+# (-LE 'residency|mem-handle|cache' -E '^test-backend-ops$') selected this test
+# and started TWO real model loads, and scripts/check-ctest-safety-net.sh --
+# which exists to police exactly this -- checks only for backend-ops and then
+# prints "safety net intact". CLAUDE.md measures a single model-loading test at
+# 195-206 GB of 255 GB and states that two do not fit; this host has been
+# OOM-killed by that class twice.
+#
+# So registration is now behind an explicit opt-in that defaults OFF. This
+# preserves the fail-loudly-on-a-CPU-fallback-build intent above: the script's
+# own CMakeCache/ldd precondition check still runs and still fails closed --
+# it simply only runs for someone who asked for it, e.g.
+#     cmake -B build -DLLAMA_SYCL_CANONICAL_GATES=ON && ctest -R sycl-canonical-gates
+# The proper fix is to make the denylist label-driven (add gpu|model-loading to
+# CLAUDE.md's documented sweep AND to check-ctest-safety-net.sh, and make that
+# script fail when any GPU-labelled test survives the documented sweep). That
+# edits an owner-owned file, so it is tracked on llama.cpp-9hz0 rather than done
+# here. Note the stub test sycl-canonical-gates-script below is UNAFFECTED and
+# still runs in every sweep -- it is CPU-only and is what keeps the gate script
+# itself from being decorative.
+option(LLAMA_SYCL_CANONICAL_GATES
+       "Register the canonical Mistral/GPT-OSS gates as a ctest test (loads two real models on a real GPU; off by default so no sweep can schedule it)"
+       OFF)
+if (NOT WIN32 AND LLAMA_SYCL_CANONICAL_GATES)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${PROJECT_SOURCE_DIR}/scripts/sycl-canonical-gates.sh
+             --build-dir ${CMAKE_BINARY_DIR} --gate all --selector level_zero:1
+    )
+    set_tests_properties(sycl-canonical-gates PROPERTIES
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK gpu-ttm-memory
+        ENVIRONMENT ONEAPI_DEVICE_SELECTOR=level_zero:1
+        TIMEOUT 1800
+        LABELS "gpu;model-loading"
+    )
+endif()
+
+# sycl-canonical-gates-script: the stub-driven unit test of the gate script's
+# OWN logic (tests/test-sycl-canonical-gates-script.sh) -- fail-closed
+# preconditions, the no-device probe, and both pass/fail digit checks, all
+# against fake llama-completion/llama-cli executables. CPU-only, no GPU
+# label: this is what stops the gate script itself from being decorative,
+# and it must run in every sweep that the real gpu-labelled test above is
+# excluded from.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME sycl-canonical-gates-script
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-canonical-gates-script.sh
+    )
+    set_tests_properties(sycl-canonical-gates-script PROPERTIES
+        LABELS "sycl;policy"
         TIMEOUT 120
     )
 endif()
@@ -1824,20 +1967,28 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mmvq-event-duration-guard.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
 
-    # DECLINED, with reasons (llama.cpp-0igs).  Four sibling .py gates in this
-    # directory are deliberately left unregistered.  Registering them would put
-    # four permanently-red lines in ctest for reasons that are NOT code
-    # defects, and a suite with known-red lines in it stops being read.
+    # DECLINED, with reasons (llama.cpp-0igs).  Sibling .py gates in this
+    # directory that are deliberately left unregistered.  Registering them would
+    # put permanently-red lines in ctest for reasons that are NOT code defects,
+    # and a suite with known-red lines in it stops being read.
     #
     #   test-sycl-end-to-end-profiling-docs.py
     #   test-sycl-mxfp4-tg-speedup-docs.py
-    #       Both assert on files that HAVE NEVER EXISTED in this repository:
-    #       `research.md` at the root, and
+    #       DELETED (llama.cpp-zxlp).  Both asserted on files that HAVE NEVER
+    #       EXISTED in this repository: `research.md` at the root, and
     #       `activation/sycl-mxfp4-tg-speedup-final-review-20260707.md`.
-    #       `git log --all --` on either path returns nothing, so these are not
-    #       deleted artifacts, they were never committed.  Unpassable as
-    #       written; they need rewriting or removing, not registering.
+    #       `git log --all --` on either path returned nothing, so they were not
+    #       deleted artifacts, they were never committed (and no renamed
+    #       in-tree equivalent was found).  Unpassable as written, so removed
+    #       rather than registered; the deletion commit carries the reasoning.
     #
     #   test-sycl-moe-multirhs-gateup-source.py
     #       Asserts the literal "multi_rhs_gateup = false".  The field IS
@@ -1854,7 +2005,7 @@ if (NOT WIN32)
     #       strings moved out of the section the test slices.
     #
     # All four were RUN, not guessed: 62 of the 66 unregistered pytest-style
-    # files in tests/ pass, and these are the 4 that do not.
+    # files in tests/ passed, and these were the 4 that did not.
 endif()
 
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
@@ -2449,4 +2600,39 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# Regression gate for llama.cpp-1lrh: a SYCL backend *registration* query
+# (ggml_backend_reg_by_name("SYCL")) must report zero devices rather than
+# abort the process when platform enumeration finds none. Forces the
+# zero-device condition on every host via ONEAPI_DEVICE_SELECTOR=level_zero:99
+# (an out-of-range device index -- verified empirically to resolve to "zero
+# devices enumerated", not a selector parse error) so the property is
+# exercised unconditionally rather than only on device-less runners. See
+# test-sycl-registration-no-device.cpp for the full rationale.
+if (GGML_SYCL)
+    llama_build(test-sycl-registration-no-device.cpp)
+    target_link_libraries(test-sycl-registration-no-device PRIVATE ggml-sycl)
+    llama_test(test-sycl-registration-no-device LABEL "main")
+    set_tests_properties(test-sycl-registration-no-device PROPERTIES
+        LABELS "sycl;env"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:99"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 120
+    )
+endif()
+
+# llama.cpp-qq19: divergence guard for the single owner-resolution authority
+# ggml_sycl_resolve_tensor_owner() -- asserts the "resolve owner from tensor
+# extra->model_id via registry, else fall back to the identity plan" block
+# exists exactly once and every former inline site (and any future one) calls
+# it rather than copying it. Host-only -- reads ggml-sycl.cpp as text, builds
+# nothing, touches no device. Mirrors test-sycl-device-uuid-source's
+# llama_test_pytest registration shape.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-resolve-tensor-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-resolve-tensor-owner-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
 endif()

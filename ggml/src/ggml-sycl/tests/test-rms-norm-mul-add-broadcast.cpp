@@ -60,6 +60,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -345,13 +346,13 @@ int main() {
         std::fprintf(stderr,
                      "SKIP: no SYCL GPU devices available -- NO DEVICE WORK WAS PERFORMED.\n"
                      "      source /opt/intel/oneapi/setvars.sh --force and re-run.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
         std::fprintf(stderr, "SKIP: ggml_backend_sycl_init(0) failed -- NO DEVICE WORK WAS PERFORMED.\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     std::fprintf(stderr, "=== bit1 (RMS_NORM+MUL+ADD) broadcast-vs-full-residual discriminator ===\n");

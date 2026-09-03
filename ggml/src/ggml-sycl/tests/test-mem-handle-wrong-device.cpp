@@ -22,6 +22,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -270,8 +272,19 @@ static bool test_chunk_lease_tripwire_and_wrong_device_resolve(int n_gpu_devices
         // (resolve(1) needs a valid device_id to check against).
         fprintf(stderr, "  [NOTE] wrong-device resolve(1) skipped — fewer than 2 GPUs\n");
     } else {
-        // Wrong-device resolve must return null (explicit-fail policy).
-        // handle's device_=0 != caller device_id=1, so the check fires and returns null.
+        // ⚠️ KNOWN-BROKEN on a real >=2-GPU run (llama.cpp-os9t, found while
+        // widening this test's registration for llama.cpp-9trn): this handle
+        // is HOST-PINNED (from unified_cache_host_zone_alloc(SCRATCH, ...)
+        // above), and mem_handle::resolve(int) deliberately skips the
+        // wrong-device check for non-device-resident pointers ("Host-pinned/
+        // host-mmap pointers are device-agnostic from the dispatcher's
+        // perspective" — mem-handle.cpp comment above resolve(int)). So
+        // resolve(1) legitimately returns the pointer here; the assertion
+        // below is unsound as written and fails whenever n_gpu_devices >= 2.
+        // It has never fired on this host because the registration pins a
+        // single device (level_zero:1), so n_gpu_devices is always < 2 here.
+        // Do not "fix" this by weakening mem_handle::resolve(int)'s check —
+        // that check is correct by design. See llama.cpp-os9t for the fix.
         ggml_sycl::resolved_ptr r1 = chunk_slice.resolve(1);
         TEST_ASSERT(r1.ptr == nullptr, "wrong-device CHUNK_LEASE slice resolve must return null");
     }
@@ -836,12 +849,55 @@ int main(int argc, char ** argv) {
     if (n_gpu_devices > 0) {
         try {
             sycl::queue q(sycl::gpu_selector_v, sycl::property::queue::in_order{});
-            all_passed &= test_arena_slice_generation_and_bounds(q);
-            all_passed &= test_retention_transitions_and_exhaustion(q);
+
+            // Each call gets its own try/catch (not one try around both) so a
+            // sycl::exception from the first call cannot swallow the second, and
+            // so the SKIPPED line names the specific case that actually threw --
+            // not "both cases, blamed on whichever name happened to be printed".
+            //
+            // Not routed through the TEST_SKIP() macro (there is no guarantee
+            // TEST_BEGIN() ran before the throw), so accounting is done here via
+            // a run-count delta rather than assuming a fixed increment: if
+            // TEST_BEGIN() already fired for this case (g_tests_run moved),
+            // undo that phantom "run" the same way TEST_SKIP() would, so the
+            // case doesn't end up counted as run-but-neither-passed-nor-failed-
+            // nor-skipped; if the exception preempted TEST_BEGIN() entirely (it
+            // never got called), there's nothing to undo -- just count the skip.
+            const int run_before_arena = g_tests_run;
+            try {
+                all_passed &= test_arena_slice_generation_and_bounds(q);
+            } catch (const sycl::exception & e) {
+                if (g_tests_run > run_before_arena) {
+                    g_tests_run--;
+                }
+                g_tests_skipped++;
+                fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: %s\n", e.what());
+            }
+
+            const int run_before_retention = g_tests_run;
+            try {
+                all_passed &= test_retention_transitions_and_exhaustion(q);
+            } catch (const sycl::exception & e) {
+                if (g_tests_run > run_before_retention) {
+                    g_tests_run--;
+                }
+                g_tests_skipped++;
+                fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
+            }
         } catch (const sycl::exception & e) {
+            // Queue construction itself threw -- both calls above are entirely
+            // inside this try, so neither one's TEST_BEGIN() ever ran. Nothing
+            // to undo (unlike the inner catches); just count both as skipped and
+            // name both, so a queue failure on a >=2-GPU host doesn't leave
+            // g_tests_skipped at 0 -- or leave only one of the two named -- while
+            // two cases silently never ran.
+            g_tests_skipped += 2;
+            fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: %s\n", e.what());
             fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: %s\n", e.what());
         }
     } else {
+        g_tests_skipped += 2;
+        fprintf(stderr, "[TEST] arena_slice_generation_and_bounds ... SKIPPED: no GPU device\n");
         fprintf(stderr, "[TEST] retention_transitions_and_exhaustion ... SKIPPED: no GPU device\n");
     }
 
@@ -851,6 +907,14 @@ int main(int argc, char ** argv) {
     if (!all_passed) {
         fprintf(stderr, "SOME TESTS FAILED\n");
         return 1;
+    }
+    if (g_tests_skipped > 0) {
+        // At least one case did not run -- this binary did not verify everything
+        // it could have (typically: fewer than 2 GPU devices visible under the
+        // current ONEAPI_DEVICE_SELECTOR). 77 is ctest's SKIP_RETURN_CODE, so a
+        // run like this reports as Skipped, never as Passed. See llama.cpp-9trn.
+        fprintf(stderr, "SKIP: %d case(s) did not run -- NOT verified.\n", g_tests_skipped);
+        return LLAMA_TEST_EXIT_SKIP;
     }
     fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;

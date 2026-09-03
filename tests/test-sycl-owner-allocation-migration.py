@@ -21,6 +21,53 @@ def region(source: str, start: str, end: str) -> str:
     return source[begin:finish]
 
 
+def _blank_comments(source: str) -> str:
+    """Replace // and /* */ comment bodies with spaces, preserving offsets and string
+    literals. Without this, prose naming a function reads as a call to it -- both the
+    census below (a doc-only commit can inflate a raw literal count with no code
+    change at all -- see 073078ff1/d431c7e44) and the "scan matched nothing" control
+    further down would treat a comment mention as the real thing it describes."""
+    out, index, size = [], 0, len(source)
+    while index < size:
+        char = source[index]
+        if char in "\"'":
+            quote = char
+            out.append(char)
+            index += 1
+            while index < size:
+                if source[index] == "\\":
+                    out.append(source[index:index + 2])
+                    index += 2
+                    continue
+                out.append(source[index])
+                index += 1
+                if source[index - 1] == quote:
+                    break
+            continue
+        if source.startswith("//", index):
+            while index < size and source[index] != "\n":
+                out.append(" ")
+                index += 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            end = size if end < 0 else end + 2
+            out.extend("\n" if c == "\n" else " " for c in source[index:end])
+            index = end
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+# Positive control for _blank_comments itself: a comment mention of the token must
+# be stripped (so a documentation-only commit cannot move the census below) while a
+# real call immediately after survives untouched (so the blanking cannot eat code).
+_blank_comments_probe = _blank_comments("// see unified_alloc( in the old code\nunified_alloc(req, &owner);\n")
+assert _blank_comments_probe.count("unified_alloc(") == 1, "comment blinding did not strip a commented mention"
+assert "unified_alloc(req, &owner);" in _blank_comments_probe, "comment blinding ate real code"
+
+
 def owner_first(block: str, mutation: str) -> None:
     allocation = block.index("unified_allocate_owner(req)")
     owner = block.index("from_owned_alloc", allocation)
@@ -68,9 +115,25 @@ print("PASS fattn-allocation-failure-leaves-output-untouched")
 # Ten coherent runtime staging/workspace owner sites were migrated. The exact
 # compatibility inventory prevents either a silent regression or an unreviewed
 # widening of this bounded batch.
-assert RUNTIME.count("unified_alloc(") == 56
-assert RUNTIME.count("from_legacy_owned_alloc(") == 44
-assert RUNTIME.count("unified_allocate_owner(") == 25
+#
+# Counted comment-blind (RUNTIME_CODE, not RUNTIME): a raw literal count conflates
+# documentation with call sites, and this file's own history proves it drifts on a
+# comment-only commit. 073078ff1 (llama.cpp-13u6) legitimately retired one raw
+# unified_alloc()+from_legacy_owned_alloc() site from ggml_sycl_copy_payload_to_
+# handle_async in favour of the shared alloc_pinned_stage_handle_terminal() owner-
+# first helper -- a real reduction, 55->54 code sites. The immediately following
+# d431c7e44 (comment-only, no code change) then mentioned "unified_alloc()" twice in
+# prose explaining that same migration, which pushed the raw literal count from 55
+# to 57 with zero call sites added -- silently invalidating the raw-count census
+# (llama.cpp-1s31). unified_allocate_owner( shows the same shape from a different
+# pair (fe68ef272 added a comment mention, 756be1d6f later removed it): raw count
+# round-tripped 25->27->26, but the comment-blind count never moved off 25. Bisected
+# with `git log -S'<token>(' -- ggml/src/ggml-sycl/ggml-sycl.cpp`; verified per-commit
+# with `git show <sha>:ggml/src/ggml-sycl/ggml-sycl.cpp | grep -o '<token>(' | wc -l`.
+RUNTIME_CODE = _blank_comments(RUNTIME)
+assert RUNTIME_CODE.count("unified_alloc(") == 54
+assert RUNTIME_CODE.count("from_legacy_owned_alloc(") == 42
+assert RUNTIME_CODE.count("unified_allocate_owner(") == 25
 assert CACHE.count("unified_alloc(") == 28
 assert CACHE.count("from_legacy_owned_alloc(") == 12
 assert CACHE.count("unified_allocate_owner(") == 10
@@ -387,44 +450,6 @@ def check_dot_directory_skip_is_live() -> list:
 # pass true (so a second bootstrap mint cannot be added without review).
 ADOPT_MINT_HELPER = "unified_cache_adopt_raw_host_allocation"
 ADOPT_CACHE_BACKING_ARG = 6  # 0-based: ptr, size, queue, role, category, cohort_id, cache_backing
-
-
-def _blank_comments(source: str) -> str:
-    """Replace // and /* */ comment bodies with spaces, preserving offsets and string
-    literals. Without this, prose naming a function reads as a call to it -- the
-    comments documenting this very mechanism would otherwise keep the "scan matched
-    nothing" control below permanently satisfied by a phantom zero-argument call."""
-    out, index, size = [], 0, len(source)
-    while index < size:
-        char = source[index]
-        if char in "\"'":
-            quote = char
-            out.append(char)
-            index += 1
-            while index < size:
-                if source[index] == "\\":
-                    out.append(source[index:index + 2])
-                    index += 2
-                    continue
-                out.append(source[index])
-                index += 1
-                if source[index - 1] == quote:
-                    break
-            continue
-        if source.startswith("//", index):
-            while index < size and source[index] != "\n":
-                out.append(" ")
-                index += 1
-            continue
-        if source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            end = size if end < 0 else end + 2
-            out.extend("\n" if c == "\n" else " " for c in source[index:end])
-            index = end
-            continue
-        out.append(char)
-        index += 1
-    return "".join(out)
 
 
 def _call_argument_lists(source: str, function: str) -> list:

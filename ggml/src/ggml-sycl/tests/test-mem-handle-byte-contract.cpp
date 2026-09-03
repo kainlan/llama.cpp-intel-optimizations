@@ -83,6 +83,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../common.hpp"
 #include "../mem-handle.hpp"
 #include "../mem-ops.hpp"
@@ -335,7 +336,7 @@ int main() {
     // proof just as absent as it would be device-less.
     if (g_tests_skipped > 0) {
         fprintf(stderr, "ALL RUNNABLE TESTS PASSED, BUT %d SKIPPED -- NOT A FULL PASS\n", g_tests_skipped);
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     fprintf(stderr, "ALL TESTS PASSED\n");
     return 0;

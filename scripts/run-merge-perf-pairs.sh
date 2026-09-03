@@ -72,7 +72,7 @@ mkdir -p "$OUT"
 # catches the "<arm>-pre-<n>.log" baselines, since "pre-<n>" matches "*".
 for f in "$OUT/$ARM"-*.log; do
     [ -e "$f" ] || continue
-    echo "run-merge-perf-pairs: refusing to run: '$f' already exists for arm '$ARM' in $OUT -- use a fresh --outdir" >&2
+    echo "run-merge-perf-pairs: refusing to run: '$f' already exists for arm '$ARM' in $OUT -- remove this arm's prior output (rm '$OUT/$ARM'-*.log '$OUT/$ARM.complete') and rerun; a fresh --outdir is not the fix, it would strand the stale logs uncleaned" >&2
     exit 2
 done
 

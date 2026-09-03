@@ -1532,7 +1532,13 @@ set(SYCL_LINK_ONLY_TEST_OPTIONS
 # the production definitions -- it needs -fsycl and the SYCL include dir, which
 # this target deliberately lacked, but no extra link dependency.
 
-# unified_matmul winners map to the orchestrator entrypoint. Host-only.
+# Winner-string -> kernel mapping for the dispatch-tuning JSON loader:
+# unified_matmul, mmvq_coalesced/mmvq_soa, onednn_*, mmq_soa (llama.cpp-bqtu,
+# llama.cpp-la7d), plus a multi-entry case that loads one JSON with several
+# distinct (type,m,n,k) keys into one cache and asserts lookup discriminates
+# between them (llama.cpp-la7d). Host-only. The repo-root
+# tests/test-dispatch-tuning.cpp twin was an unregistered duplicate and is
+# gone (llama.cpp-la7d).
 add_executable(test-sycl-dispatch-tuning
     tests/test-dispatch-tuning.cpp
     dispatch-tuning.cpp
@@ -2120,7 +2126,30 @@ endif()
 add_test(NAME mem-handle-wrong-device COMMAND test-mem-handle-wrong-device)
 set_tests_properties(mem-handle-wrong-device PROPERTIES
     LABELS "sycl;handle;device-identity;tdd"
+    # llama.cpp-9trn: two of this binary's eleven cases (test_wrong_device_
+    # direct_resolve_fails and test_wrong_device_weight_handle_fails, each a
+    # TEST_SKIP("fewer than 2 GPU devices available")), plus the wrong-device
+    # resolve(1) half of test_chunk_lease_tripwire_and_wrong_device_resolve,
+    # require a second visible GPU. Pinned to this single device, they
+    # silently TEST_SKIP'd every run -- proving nothing. This host DOES have
+    # two discrete cards (B70=level_zero:0, B50=level_zero:1; the iGPU must
+    # never be admitted), so widening to level_zero:0,1 was tried. It does
+    # NOT work today: with two real devices visible, the CHUNK_LEASE
+    # wrong-device assertion ("wrong-device CHUNK_LEASE slice resolve must
+    # return null") fails -- not a production bug, but a pre-existing test
+    # defect (that assertion targets a HOST-PINNED CHUNK_LEASE handle, and
+    # mem_handle::resolve(int) deliberately treats host-pinned/host-mmap
+    # pointers as device-agnostic -- see the comment above resolve(int) in
+    # mem-handle.cpp -- so resolve(1) legitimately succeeds and the assertion
+    # of null is unsound). It was never caught because it only executes when
+    # n_gpu_devices >= 2, which this registration never provided. Filed as
+    # llama.cpp-os9t; do not re-widen until that lands. Until then the two
+    # 2-GPU-only cases stay exit-77-skipped here -- honest, not silently
+    # green (that was the bug).
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    # Without this, ctest renders a 77 exit (any case skipped -- see the exit
+    # path in test-mem-handle-wrong-device.cpp) as FAILED rather than Skipped.
+    SKIP_RETURN_CODE 77
     TIMEOUT 120
 )
 
@@ -3718,6 +3747,42 @@ set_tests_properties(test-sycl-moe-identity-hash PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Regression test (llama.cpp-s83n) pinning the multi-model weight-identity
+# lookup order fixed by llama.cpp-n3pw (commit 6f38363f1): the owner is
+# resolved from the tensor's own extra->model_id BEFORE the published-plan
+# fallback. Host-side: drives the lifecycle load-transaction + weight-identity
+# registries directly and never opens a device or allocates GPU memory.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-weight-identity-multi-model
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-weight-identity-multi-model.cpp
+)
+target_include_directories(test-sycl-weight-identity-multi-model PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-weight-identity-multi-model PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-weight-identity-multi-model PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-weight-identity-multi-model PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-weight-identity-multi-model PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-weight-identity-multi-model PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-weight-identity-multi-model COMMAND test-sycl-weight-identity-multi-model)
+set_tests_properties(test-sycl-weight-identity-multi-model PROPERTIES
+    LABELS "sycl;weight-identity;hostonly;s83n"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0,1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # Exits 77 when the binary was built without GGML_USE_SYCL; without this
+    # the skip would be reported as a failure instead of a skip.
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+endif() # static SYCL backend fixture
+
 # Device-free: constructs canonical WEIGHT snapshots over stack storage and
 # exercises only route validation/retention.  No queue or backend is opened.
 if (NOT GGML_BACKEND_DL)
@@ -5262,3 +5327,44 @@ if (BUILD_TESTING AND GGML_BACKEND_DL)
         LABELS "sycl;lifecycle;private-carrier;artifact;host"
         TIMEOUT 120)
 endif()
+
+# ExpertPredictor guard-field race (llama.cpp-41bs): predict()/record_actual()
+# read the plain, non-atomic guard fields initialized_/n_layers_ BEFORE taking
+# mutex_, while reset() clears the backing vectors under mutex_ -- a
+# concurrent reset() between the guard read and the lock could index into
+# vectors reset() had already cleared. Fixed by locking before evaluating the
+# guard (same ordering reset() already used).
+#
+# Host-only, same shape as test-attn-host-pool above: none of the methods
+# exercised (init/reset/predict/record_actual/get_frequency_ranking) touch a
+# sycl::queue or open a device -- it needs the SYCL compiler/runtime only
+# because expert-prefetch.hpp includes sycl/sycl.hpp for other class members.
+# No ONEAPI_DEVICE_SELECTOR pin and no SKIP_RETURN_CODE: unlike a
+# device-touching test there is no "no device" case to skip.
+add_executable(test-sycl-expert-predictor-guard
+    tests/test-sycl-expert-predictor-guard.cpp
+)
+target_include_directories(test-sycl-expert-predictor-guard PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-expert-predictor-guard PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-expert-predictor-guard PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-expert-predictor-guard PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-expert-predictor-guard PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-expert-predictor-guard COMMAND test-sycl-expert-predictor-guard)
+set_tests_properties(sycl-expert-predictor-guard PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;expert-predict;41bs;hostonly"
+    TIMEOUT 30
+)

@@ -313,25 +313,6 @@ test_unit_tests() {
     local tests_passed=0
     local tests_failed=0
 
-    # Run tensor inventory API test
-    if [ -x "${LLAMA_BIN_DIR}/test-tensor-inventory-api" ]; then
-        echo "Running test-tensor-inventory-api..."
-        local exit_code=0
-        ONEAPI_DEVICE_SELECTOR="${DEVICE_SELECTOR}" "${LLAMA_BIN_DIR}/test-tensor-inventory-api" || exit_code=$?
-        if [ ${exit_code} -eq 0 ]; then
-            echo -e "${GREEN}PASSED: test-tensor-inventory-api${NC}"
-            tests_passed=$((tests_passed + 1))
-        elif [ ${exit_code} -eq 77 ]; then
-            echo -e "${YELLOW}SKIPPED: test-tensor-inventory-api (exit 77)${NC}"
-        else
-            echo -e "${RED}FAILED: test-tensor-inventory-api (exit ${exit_code})${NC}"
-            tests_failed=$((tests_failed + 1))
-        fi
-        echo ""
-    else
-        echo -e "${YELLOW}SKIPPED: test-tensor-inventory-api not found${NC}"
-    fi
-
     # Run tiered dispatch test
     if [ -x "${LLAMA_BIN_DIR}/test-tiered-dispatch" ]; then
         echo "Running test-tiered-dispatch..."

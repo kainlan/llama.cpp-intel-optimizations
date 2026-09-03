@@ -44,6 +44,12 @@ python3 scripts/audit-sycl-static-storage.py
 python3 scripts/audit-sycl-static-storage.py --check
 ```
 
+⚠️ Do not pipe `--check` into `tail`/`head`/etc: `$?` after a pipe reports
+the last pipeline command's exit status, not the script's, so
+`--check | tail` silently reads rc=0 even on a real rc=1 (stale) or rc=2
+(fail-closed rejection). Capture it directly (`--check; echo rc=$?`) or read
+`${PIPESTATUS[0]}` (bash) if a pipe is unavoidable.
+
 `--self-test` validates the parser logic against synthetic fixtures only. It
 never reads the repository census inputs or the checked-in inventory, so it is
 independent of source-tree and line-number drift (including running at a newer

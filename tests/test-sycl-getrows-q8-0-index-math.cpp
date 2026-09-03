@@ -22,6 +22,7 @@
 // drain-mode wall time, not recoverable time.
 
 #include "ggml-sycl/getrows.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 
@@ -30,7 +31,7 @@ int main() {
     // 77 (ctest SKIP_RETURN_CODE), not 0: no gate was evaluated in this
     // build, so this must not read as a pass.
     std::fprintf(stderr, "SKIP: GGML SYCL not enabled; no gate was evaluated.\n");
-    return 77;
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 

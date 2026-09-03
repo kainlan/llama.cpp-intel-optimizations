@@ -572,6 +572,12 @@ bool ExpertPredictor::test_scores_allocated() const {
 }
 
 void ExpertPredictor::init(int n_layers, int n_experts, int n_experts_used) {
+    // Lock before the guard check: init() writes the same backing vectors
+    // that reset() clears under mutex_ (last_experts_, freq_table_, ...), so
+    // the initialized_ check and the writes it gates must be one atomic
+    // critical section -- the same contract predict()/record_actual() and
+    // get_frequency_ranking() observe on the read side.
+    std::lock_guard<std::mutex> lock(mutex_);
     if (initialized_) {
         return;
     }
@@ -625,11 +631,17 @@ static std::vector<int> argsort_top_k(const std::vector<float> & scores, int k) 
 // ============================================================================
 
 std::vector<int> ExpertPredictor::predict(int layer_idx, const float * /*hidden_state*/) {
+    // Lock BEFORE evaluating the guard: reset() clears last_experts_,
+    // freq_table_, last_prediction_ (and n_layers_ itself) under mutex_. A
+    // guard check performed before the lock could pass against a stale
+    // n_layers_, then race a concurrent reset() clearing the vectors before
+    // the indexing below runs -- an out-of-bounds/UB access into an emptied
+    // vector. Locking first makes the check and the indexing one atomic
+    // critical section against reset().
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || layer_idx < 0 || layer_idx >= n_layers_) {
         return {};
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
 
     std::vector<int> predicted;
     predicted.reserve(n_experts_used_);
@@ -691,11 +703,14 @@ std::vector<int> ExpertPredictor::predict(int layer_idx, const float * /*hidden_
 }
 
 void ExpertPredictor::record_actual(int layer_idx, const std::vector<int> & actual_experts) {
+    // Lock before the guard check -- see predict() for the race this closes:
+    // reset() clears last_experts_/freq_table_/last_prediction_ under
+    // mutex_, so the bounds check and the indexing it gates must be one
+    // atomic critical section.
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || layer_idx < 0 || layer_idx >= n_layers_) {
         return;
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
 
     // Update last-token expert selections for this layer (ALWAYS, even during warmup)
     last_experts_[layer_idx] = actual_experts;
@@ -813,10 +828,12 @@ bool ExpertPredictor::is_prefetch_disabled() const {
 }
 
 std::vector<std::pair<int, uint32_t>> ExpertPredictor::get_frequency_ranking(int layer_idx) const {
+    // Lock before the guard check -- same race as predict(): reset() clears
+    // freq_table_ (and n_layers_) under mutex_.
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!initialized_ || layer_idx < 0 || layer_idx >= n_layers_) {
         return {};
     }
-    std::lock_guard<std::mutex>           lock(mutex_);
     std::vector<std::pair<int, uint32_t>> ranked;
     for (int e = 0; e < n_experts_; e++) {
         if (freq_table_[layer_idx][e] > 0) {
@@ -872,15 +889,32 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
                                                   const void *  gate_weights,
                                                   const void *  hidden_state,
                                                   sycl::queue & compute_q) {
-    if (!initialized_ || next_layer_idx < 0 || next_layer_idx >= n_layers_) {
-        return predict(next_layer_idx);
-    }
-
-    // If gate_weights not provided explicitly, look up from registered pointers
-    if (!gate_weights) {
-        if (next_layer_idx < static_cast<int>(gate_weight_ptrs_.size())) {
-            gate_weights = gate_weight_ptrs_[next_layer_idx];
+    // Snapshot every guard field and every vector-derived value this function
+    // needs under one lock, atomically against reset() (which clears
+    // gate_weight_ptrs_/n_embd_/n_experts_/n_layers_ under mutex_) -- same
+    // race class as predict()/record_actual(). Note predict() itself now
+    // takes mutex_, so the fallback calls below MUST happen after this
+    // scope releases the lock or they would self-deadlock.
+    bool need_fallback        = false;
+    int  n_embd_local         = 0;
+    int  n_experts_local      = 0;
+    int  n_experts_used_local = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!initialized_ || next_layer_idx < 0 || next_layer_idx >= n_layers_) {
+            need_fallback = true;
+        } else {
+            // If gate_weights not provided explicitly, look up from registered pointers
+            if (!gate_weights && next_layer_idx < static_cast<int>(gate_weight_ptrs_.size())) {
+                gate_weights = gate_weight_ptrs_[next_layer_idx];
+            }
+            n_embd_local         = n_embd_;
+            n_experts_local      = n_experts_;
+            n_experts_used_local = n_experts_used_;
         }
+    }
+    if (need_fallback) {
+        return predict(next_layer_idx);
     }
 
     // Fallback to heuristic if inputs are unavailable
@@ -888,18 +922,32 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
         return predict(next_layer_idx);
     }
 
-    if (n_embd_ <= 0 || n_experts_ <= 0) {
+    if (n_embd_local <= 0 || n_experts_local <= 0) {
         return predict(next_layer_idx);
     }
 
-    const int    K          = n_embd_;
-    const int    M          = n_experts_;
+    const int    K          = n_embd_local;
+    const int    M          = n_experts_local;
     const auto * gate_f32   = static_cast<const float *>(gate_weights);
     const auto * hidden_f32 = static_cast<const float *>(hidden_state);
 
     // Allocate host buffer for scores (tiny: n_experts floats, e.g. 512 bytes for 128 experts)
     std::vector<float> scores_host(M);
 
+    // NOTE (llama.cpp-41bs audit): scores_dev_/scores_handle_/scores_dev_n_/
+    // scores_queue_ below are read and written WITHOUT mutex_ for the rest of
+    // this function, including across the blocking GEMV submit + D2H copy.
+    // reset() clears these same fields under mutex_, so this is the same
+    // hazard class as the guard-field races fixed above in predict(),
+    // record_actual(), get_frequency_ranking() and the top of this function
+    // -- but closing it fully would require holding mutex_ across a SYCL
+    // kernel submission and a blocking wait_and_throw() (mem_copy() below is
+    // synchronous), which would newly contend with every predict()/
+    // record_actual() call for the duration of a GPU dispatch. That is a
+    // real behavior change outside this task's stated scope (the plain
+    // initialized_/n_layers_ guard-read pattern) and predict_pregate() has no
+    // concurrent caller today (single decode thread, like predict()/
+    // record_actual()). Left as a documented follow-up rather than fixed here.
     // Reuse pre-allocated device buffer for output scores, or allocate on first use.
     // This avoids sycl::malloc_device/free per call (3 calls with 3-layer lookahead).
     if (!scores_dev_ || scores_dev_n_ < M) {
@@ -991,9 +1039,9 @@ std::vector<int> ExpertPredictor::predict_pregate(int           next_layer_idx,
     }
 
     // Top-K selection on host
-    auto result = argsort_top_k(scores_host, n_experts_used_);
+    auto result = argsort_top_k(scores_host, n_experts_used_local);
 
-    GGML_SYCL_DEBUG("[EXPERT-PREDICT] Pre-gate layer=%d: top-%d experts = [", next_layer_idx, n_experts_used_);
+    GGML_SYCL_DEBUG("[EXPERT-PREDICT] Pre-gate layer=%d: top-%d experts = [", next_layer_idx, n_experts_used_local);
     for (int i = 0; i < static_cast<int>(result.size()); i++) {
         GGML_SYCL_DEBUG("%s%d", i > 0 ? "," : "", result[i]);
     }

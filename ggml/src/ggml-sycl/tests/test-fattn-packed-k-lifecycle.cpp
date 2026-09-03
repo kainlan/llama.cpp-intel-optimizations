@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 
+#include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "../fattn-xmx-f16-v2.hpp"
 #include "../fattn.hpp"
 #include "../unified-cache.hpp"
@@ -33,7 +34,6 @@ constexpr int D = 64;
 constexpr int N_KV = 64;
 constexpr int H_KV = 1;
 constexpr int BATCH = 1;
-constexpr int SKIP_UNSUPPORTED = 77;
 
 void set_failpoint(const char * value) {
 #if defined(_WIN32)
@@ -886,7 +886,7 @@ int main(int argc, char ** argv) {
 
     if (!preflight_device()) {
         std::fprintf(stderr, "SKIP: host packed-K boundaries passed; Level Zero GPU FP16/XMX/SLM unavailable\n");
-        return SKIP_UNSUPPORTED;
+        return LLAMA_TEST_EXIT_SKIP;
     }
 
     set_failpoint(nullptr);

@@ -987,9 +987,43 @@ static int test_sequence_graphlet_tg_diagnostics_after_replay_drain() {
     const std::string mmvq_scratch = required_region(mmvq, "static uint8_t * mmvq_alloc_device_scratch",
                                                      "struct ggml_sycl_mmvq_temp_release_marker_kernel",
                                                      "sequence graphlet MMVQ scratch allocation");
-    CHECK(contains(mmvq_scratch, "ggml_sycl_graph_recording_active() ? ggml_sycl::vram_zone_id::COUNT") &&
-              contains(mmvq_scratch, "ggml_sycl::vram_zone_id::SCRATCH"),
+    // The check below used to literal-match the exact ternary shape
+    // `recording_active() ? COUNT : SCRATCH`, which 30a45128b legitimately
+    // widened to `(persistent || recording_active()) ? COUNT : SCRATCH` for an
+    // unrelated caching caller (llama.cpp-b2yb) -- the literal match went
+    // stale and red against correct code (llama.cpp-stjn). The invariant this
+    // exists to protect is ORDER, not exact shape: whatever boolean expression
+    // guards the ternary, a `graph_recording_active()` call must appear in it
+    // and be evaluated before the ternary can resolve to COUNT, and SCRATCH
+    // must still be the other arm. That is robust to future widening of the
+    // guard the way the original exact-substring match was not.
+    auto mmvq_scratch_zone_ok = [](const std::string & region) {
+        const size_t recording_pos = region.find("ggml_sycl_graph_recording_active()");
+        const size_t count_pos     = region.find("vram_zone_id::COUNT");
+        const size_t scratch_pos   = region.find("vram_zone_id::SCRATCH");
+        return recording_pos != std::string::npos && count_pos != std::string::npos &&
+               scratch_pos != std::string::npos && recording_pos < count_pos;
+    };
+    CHECK(mmvq_scratch_zone_ok(mmvq_scratch),
           "MMVQ scratch captured by sequence graphlets must not use the reset SCRATCH zone");
+    // Negative control: an in-memory mutant of the same region with the
+    // recording-active guard deleted entirely (the shape a careless revert of
+    // 30a45128b would produce, leaving only the `persistent` opt-in) must fail
+    // the same check logic. A check that cannot go red is decorative -- per
+    // this suite's own epistemics (llama.cpp-97yn) -- so this is executed, not
+    // merely asserted. No mutant is written to disk; it is a local std::string
+    // edit of the already-extracted region, the same snapshot mechanism
+    // required_region() already uses for every other check in this file.
+    const char * mmvq_scratch_zone_original_line =
+        "req.intent.constraints.prefer_vram_zone = (persistent || ggml_sycl_graph_recording_active()) ?";
+    const size_t mmvq_scratch_zone_anchor = mmvq_scratch.find(mmvq_scratch_zone_original_line);
+    CHECK(mmvq_scratch_zone_anchor != std::string::npos,
+          "negative-control anchor line must exist verbatim in mmvq.cpp before it can be mutated");
+    std::string mmvq_scratch_mutant = mmvq_scratch;
+    mmvq_scratch_mutant.replace(mmvq_scratch_zone_anchor, std::strlen(mmvq_scratch_zone_original_line),
+                                "req.intent.constraints.prefer_vram_zone = (persistent) ?");
+    CHECK(!mmvq_scratch_zone_ok(mmvq_scratch_mutant),
+          "negative control: deleting the recording-active guard from MMVQ scratch zone selection must be caught");
     const std::string device_grouping_gate = required_region(mmvq, "static bool mxfp4_moe_device_grouping_enabled()",
                                                             "static bool mxfp4_moe_device_grouping_sync_chunks_enabled()",
                                                             "sequence graphlet XMX device grouping gate");

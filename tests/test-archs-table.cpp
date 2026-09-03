@@ -22,6 +22,8 @@
 
 #include "test-archs-table.h"
 
+#include "test-skip.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -292,7 +294,7 @@ int main(int argc, char ** argv) {
     std::string out_fixed;
     if (!capture_merged(body_fixed, out_fixed)) {
         fprintf(stderr, "SKIP: tmpfile() unavailable, cannot capture a merged stream\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     const parse_result fixed = parse_table(out_fixed, true);
 
@@ -318,7 +320,7 @@ int main(int argc, char ** argv) {
     std::string out_pre_fix;
     if (!capture_merged(body_pre_fix, out_pre_fix)) {
         fprintf(stderr, "SKIP: tmpfile() unavailable, cannot capture a merged stream\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     const parse_result pre_fix = parse_table(out_pre_fix, false);
     check(pre_fix.n_mangled == g_n_rows, "control: pre-fix emission mangles every row");
@@ -342,7 +344,7 @@ int main(int argc, char ** argv) {
     std::string out_oversize;
     if (!capture_merged(body_oversize, out_oversize)) {
         fprintf(stderr, "SKIP: tmpfile() unavailable, cannot capture a merged stream\n");
-        return 77;
+        return LLAMA_TEST_EXIT_SKIP;
     }
     check(out_oversize.find("exceeds the 256-byte atomic-write bound") != std::string::npos,
           "control: emit() warns when a line exceeds the bound");

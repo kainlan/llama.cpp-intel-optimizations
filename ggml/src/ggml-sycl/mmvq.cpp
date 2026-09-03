@@ -1415,6 +1415,16 @@ static int mxfp4_moe_xmx_tiled_output_validate_rows() {
     return rows > 0 ? rows : 256;
 }
 
+// get_profiling_info() BLOCKS the calling host thread until `ev` completes --
+// every backend queue is created with sycl::property::queue::enable_profiling
+// (see default_queue_properties() in common.hpp), so this call always
+// succeeds and always waits; there is no "info unavailable" escape hatch on
+// this backend. Only call this helper when a profiling diagnostic that
+// actually consumes the result is enabled (detail_profile / tg_profile /
+// pp_profile / profile_launch, or the mmvq_moe_{tg,pp}_profile_enabled()
+// checks that feed them) -- i.e. only behind a profile guard, never
+// unconditionally on the dispatch hot path (ruling 6: no host waits in
+// dispatch).
 static double mmvq_sycl_event_duration_us(const sycl::event & ev) {
     try {
         const uint64_t start = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -17407,8 +17417,8 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
     auto us = [](std::chrono::high_resolution_clock::time_point a, std::chrono::high_resolution_clock::time_point b) {
         return std::chrono::duration<double, std::micro>(b - a).count();
     };
-    const double kernel_wall_us    = us(t_kernel_begin, t_kernel_end);
-    const double kernel_event_us   = have_kernel_event ? mmvq_sycl_event_duration_us(kernel_event) : -1.0;
+    const double kernel_wall_us  = us(t_kernel_begin, t_kernel_end);
+    const double kernel_event_us = (tg_profile && have_kernel_event) ? mmvq_sycl_event_duration_us(kernel_event) : -1.0;
     const double kernel_profile_us = kernel_event_us >= 0.0 ? kernel_event_us : kernel_wall_us;
     g_mmvq_moe_dispatch_timing.activation_quant_us += us(t_quant_begin, t_quant_end);
     g_mmvq_moe_dispatch_timing.batch_id_us += us(t_batch_begin, t_batch_end);
@@ -18952,8 +18962,9 @@ bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   
             }
         }
     }
-    const double kernel_wall_us    = us(t_kernel_begin, t_kernel_end);
-    const double kernel_event_us   = have_kernel_event ? mmvq_sycl_event_duration_us(kernel_event) : -1.0;
+    const double kernel_wall_us = us(t_kernel_begin, t_kernel_end);
+    const double kernel_event_us =
+        (detail_profile && have_kernel_event) ? mmvq_sycl_event_duration_us(kernel_event) : -1.0;
     const double kernel_profile_us = kernel_event_us >= 0.0 ? kernel_event_us : kernel_wall_us;
     double       group_copy_us     = 0.0;
     if (pp_profile) {
@@ -19797,9 +19808,9 @@ bool mmvq_moe_batched_dispatch_down_from_cached_q8_mxfp4(ggml_backend_sycl_conte
             stream->wait();
         }
     }
-    const auto   t_kernel_end      = std::chrono::high_resolution_clock::now();
-    const double kernel_wall_us    = std::chrono::duration<double, std::micro>(t_kernel_end - t_kernel_begin).count();
-    const double kernel_event_us   = have_down_event ? mmvq_sycl_event_duration_us(down_event) : -1.0;
+    const auto   t_kernel_end    = std::chrono::high_resolution_clock::now();
+    const double kernel_wall_us  = std::chrono::duration<double, std::micro>(t_kernel_end - t_kernel_begin).count();
+    const double kernel_event_us = (detail_profile && have_down_event) ? mmvq_sycl_event_duration_us(down_event) : -1.0;
     const double kernel_profile_us = kernel_event_us >= 0.0 ? kernel_event_us : kernel_wall_us;
     double       group_copy_us     = 0.0;
     if (pp_profile) {
