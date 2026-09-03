@@ -4,8 +4,9 @@ WoQ-int8 PP arm must be reachable ONLY with GGML_SYCL_ONEDNN_WOQ_Q8=1 AND a
 Q8_0 weight the planner materialized SOA -- which for dense projections
 requires GGML_SYCL_Q8_DENSE_LAYOUT=soa (an already-SOA weight, e.g. a
 tile-misaligned Q8_0 head, takes the arm under WOQ_Q8=1 alone). The arm must
-never request a layout the planner did not choose, and both env vars must
-default OFF.
+apply the codebase's standard eligibility predicate
+(ggml_sycl_can_use_layout_for_kernel) before its single lookup, that lookup
+must be the only writer of q8_0_soa_ptr, and both env vars must default OFF.
 
 Ruling 9 / nz1k c-c4jp: phase 1 stages the scale plane per call, which is an
 opt-in interim only; the default is decided on llama.cpp-2zsc with the A/B
@@ -182,10 +183,22 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     lookup = arm.find("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)")
     guard = arm.find("if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(")
     assert 0 < guard < lookup, "the predicate guard must precede the SOA lookup"
-    # The primitive must be known good before the staging kernel is submitted.
-    ready = arm.find("DnnlGemmWrapper::woq_gemm_q8_0_ready(")
+    # The guarded lookup must be the ONLY writer of q8_0_soa_ptr and the ONLY
+    # SOA getter call: a second, ungated assignment would reinstate both the
+    # partial-row mis-addressing and a dispatch-time layout request.
+    writers = re.findall(r"\bq8_0_soa_ptr\s*=[^=]", op_body)
+    assert len(writers) == 2, f"expected exactly the declaration + one guarded writer of q8_0_soa_ptr, found {len(writers)}"
+    assert op_body.count("q8_0_soa_ptr = candidate;") == 1, "the guarded lookup must be the single writer"
+    assert (
+        op_body.count("ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)") == 1
+    ), "exactly one SOA getter call is allowed, inside the guarded block"
+    # The primitive must be prepared (known good) ONCE, before the staging kernel
+    # is submitted, and that same plan is what executes.
+    ready = arm.find("DnnlGemmWrapper::woq_q8_0_prepare(")
     stage = arm.find("q8_0_soa_scale_plane_to_kbn_sycl(")
-    assert 0 < ready < stage, "woq_gemm_q8_0_ready must be checked before the scale staging is submitted"
+    assert 0 < ready < stage, "woq_q8_0_prepare must run before the scale staging is submitted"
+    assert arm.count("DnnlGemmWrapper::woq_q8_0_prepare(") == 1, "the arm must prepare exactly once per dispatch"
+    assert op_body[call:].startswith("DnnlGemmWrapper::woq_gemm_q8_0(ctx, plan,"), "the execute must consume the prepared plan"
     after = op_body[call:]
     # The decline path must dequantize from the SOA plane, and that branch must
     # be guarded by the pointer itself (an `if (false)`-style dead branch would

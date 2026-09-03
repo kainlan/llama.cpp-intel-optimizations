@@ -42508,9 +42508,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         // weight to be MATERIALIZED SOA by the planner: for dense projections
         // that means GGML_SYCL_Q8_DENSE_LAYOUT=soa, while a weight that is
         // already SOA (e.g. a tile-misaligned Q8_0 head) takes the arm under
-        // WOQ_Q8=1 alone. It never requests a layout the planner did not choose
-        // (ggml_sycl_can_use_layout_for_kernel before the lookup), so it cannot
-        // mint a second stored layout (ruling 5). Probe llama.cpp-ovkn's V4
+        // WOQ_Q8=1 alone. It applies the codebase's standard eligibility
+        // predicate, ggml_sycl_can_use_layout_for_kernel, before the lookup --
+        // the same gate every kernel-selection site uses. That is not a proof
+        // the getter cannot materialize (for an evictable host-buffered weight
+        // the predicate accepts any layout); it is the same exposure every
+        // other selection site carries. Probe llama.cpp-ovkn's V4
         // form: f16 activations x the stored int8 qs plane read as-is, K/32
         // grouped f16 scales, f16 fpmath apply_to_int. The ONLY per-call
         // staging is the scale-plane transpose ([N][K/32] -> [K/32][N]: 2 bytes
@@ -42538,8 +42541,8 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             const int64_t total_rows = ggml_nrows(src0);
             const bool    full_rows  = (row_low == 0 && row_diff == total_rows);
             const bool    k_blocked  = (ne00 % QK8_0) == 0;
-            // Non-materializing predicate first (what every selection site
-            // applies), then the lookup, which is a pure cache hit or nullptr.
+            // Standard eligibility predicate first (what every selection site
+            // applies), then the lookup. This is the ONLY writer of q8_0_soa_ptr.
             if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {
                 void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA);
                 if (candidate) {
@@ -42566,18 +42569,19 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 // acquire_onednn_pp_scratch sized for the dequant this replaces.
                 sycl::half * scales_kbn     = src0_pp_scratch;
                 try {
-                    // Create/cache the primitive BEFORE submitting the staging
-                    // kernel so a declining shape never pays a wasted transpose.
-                    if (!DnnlGemmWrapper::woq_gemm_q8_0_ready(ctx, static_cast<int>(src1_ncols),
-                                                              static_cast<int>(row_diff), static_cast<int>(ne10),
-                                                              stream, ldc)) {
+                    // Prepare (create/cache the primitive) ONCE, BEFORE submitting
+                    // the staging kernel, so a declining shape never pays a wasted
+                    // transpose and the execute reuses the same plan.
+                    const DnnlGemmWrapper::woq_q8_0_plan plan =
+                        DnnlGemmWrapper::woq_q8_0_prepare(ctx, static_cast<int>(src1_ncols), static_cast<int>(row_diff),
+                                                          static_cast<int>(ne10), stream, ldc);
+                    if (!plan.ready) {
                         decline = "primitive_declined";
                     } else {
                         q8_0_soa_scale_plane_to_kbn_sycl(q8_0_soa_ptr, scales_kbn, blocks_per_row,
                                                          static_cast<int>(row_diff), stream);
-                        used_woq = DnnlGemmWrapper::woq_gemm_q8_0(
-                            ctx, static_cast<int>(src1_ncols), static_cast<int>(row_diff), static_cast<int>(ne10),
-                            src1_ptr, q8_0_soa_ptr, scales_kbn, dst_dd_i, stream, ldc);
+                        used_woq = DnnlGemmWrapper::woq_gemm_q8_0(ctx, plan, src1_ptr, q8_0_soa_ptr, scales_kbn,
+                                                                  dst_dd_i, stream);
                         if (!used_woq) {
                             decline = "primitive_declined";
                         }

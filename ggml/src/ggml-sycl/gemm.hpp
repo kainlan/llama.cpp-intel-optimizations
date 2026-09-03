@@ -541,17 +541,22 @@ class DnnlGemmWrapper {
     // dnnl::sycl_interop::execute throws. Same cache idiom as
     // woq_gemm_q4_0_impl: key = shapes/dtypes/strides only (ruling 2, no
     // addresses); no host wait (ruling 6). Split into woq_q8_0_prepare
-    // (descriptors + cached primitive, private), woq_gemm_q8_0_ready
-    // (availability probe) and woq_gemm_q8_0 (bind + submit), both public.
-  private:
-    // Descriptors, attr, cache key and the cached primitive for one
-    // woq_gemm_q8_0 shape. Shared by woq_gemm_q8_0_ready (probe: is the
-    // primitive available, so the caller stages scales only when it is) and
-    // woq_gemm_q8_0 (execute). No queue lock here: the primitive cache has
-    // its own mutex, and the execute path takes exec_mutex after this returns.
+    // (descriptors + cached primitive -> a woq_q8_0_plan the caller holds)
+    // and woq_gemm_q8_0 (bind + submit that plan), both public: one dispatch
+    // prepares exactly once and stages its scales only when the plan is ready.
+  public:
+    // One prepared woq_gemm_q8_0 shape. Holds a VALUE COPY of the cached
+    // primitive record (dnnl handles are ref-counted), never a pointer into
+    // the global cache map: get_or_create erases entries on an engine change
+    // and prepare runs outside exec_mutex. No queue lock in prepare (the
+    // primitive cache has its own mutex); woq_gemm_q8_0 takes exec_mutex.
     struct woq_q8_0_plan {
-        const DnnlCachedPrimitive * cached = nullptr;
-        dnnl::memory::desc          s_md;
+        bool                ready = false;
+        int                 m     = 0;
+        int                 n     = 0;
+        int                 k     = 0;
+        DnnlCachedPrimitive prim;
+        dnnl::memory::desc  s_md;
     };
 
     static woq_q8_0_plan woq_q8_0_prepare(ggml_backend_sycl_context & ctx,
@@ -626,45 +631,36 @@ class DnnlGemmWrapper {
             }
             return plan;
         }
-        plan.cached = cached;
-        plan.s_md   = s_md;
+        plan.prim  = *cached;  // value copy; the map pointer is not retained
+        plan.s_md  = s_md;
+        plan.m     = m;
+        plan.n     = n;
+        plan.k     = k;
+        plan.ready = true;
         return plan;
     }
 
-  public:
-    // True when the cached primitive for this shape exists (creating it on
-    // first use). Callers stage the scale plane only after this says yes.
-    static bool woq_gemm_q8_0_ready(ggml_backend_sycl_context & ctx,
-                                    int                         m,
-                                    int                         n,
-                                    int                         k,
-                                    const queue_ptr &           q,
-                                    int64_t                     ldc) {
-        return woq_q8_0_prepare(ctx, m, n, k, q, ldc).cached != nullptr;
-    }
-
+    // Bind + submit a prepared plan. Returns false (nothing submitted) on an
+    // unready plan or a null pointer; throws only what
+    // dnnl::sycl_interop::execute throws.
     static bool woq_gemm_q8_0(ggml_backend_sycl_context & ctx,
-                              int                         m,
-                              int                         n,
-                              int                         k,
+                              const woq_q8_0_plan &       plan,
                               const void *                a_f16,
                               const void *                b_s8,
                               const void *                scales_f16_kbn,
                               void *                      c_f32,
-                              const queue_ptr &           q,
-                              int64_t                     ldc) {
-        if (!a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
+                              const queue_ptr &           q) {
+        if (!plan.ready || !a_f16 || !b_s8 || !scales_f16_kbn || !c_f32) {
             if (g_ggml_sycl_debug) {
-                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] null pointer(s) provided\n");
+                std::fprintf(stderr, "[ONEDNN][WOQ-Q8] unready plan or null pointer(s)\n");
             }
             return false;
         }
-        const woq_q8_0_plan plan = woq_q8_0_prepare(ctx, m, n, k, q, ldc);
-        if (!plan.cached) {
-            return false;
-        }
-        const DnnlCachedPrimitive * cached = plan.cached;
+        const DnnlCachedPrimitive * cached = &plan.prim;
         const dnnl::memory::desc &  s_md   = plan.s_md;
+        const int                   m      = plan.m;
+        const int                   n      = plan.n;
+        const int                   k      = plan.k;
 
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         auto                        stream = ctx.stream_dnnl(q);
