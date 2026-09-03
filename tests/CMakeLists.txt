@@ -2277,24 +2277,28 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         # It loads models, so run it ONCE. Never in a loop.
     )
 
-    # llama.cpp-6cgq: Q8_0 SOA MMVQ small-N occupancy geometry numerics.
+    # llama.cpp-6cgq: Q8_0 SOA MMVQ fast-path numerics (D-plane SLM staging
+    # plus the occupancy geometry from mmvq-launch-geometry.hpp, applied
+    # together whenever GGML_SYCL_MMVQ_Q8_SOA_FASTPATH is on -- renamed from
+    # GGML_SYCL_MMVQ_Q8_SOA_SMALLN in spec review round 2 once the fix
+    # stopped being small-N-only).
     #
-    # Compares reorder_mul_mat_vec_q8_0_q8_1_sycl's output (SOA, either
-    # geometry branch depending on GGML_SYCL_MMVQ_Q8_SOA_SMALLN) against a
-    # CPU dequant+dot reference AND against coalesced_mul_mat_vec_q8_0_q8_1_
+    # Compares reorder_mul_mat_vec_q8_0_q8_1_sycl's output against a CPU
+    # dequant+dot reference AND against coalesced_mul_mat_vec_q8_0_q8_1_
     # sycl's output for the SAME weight bytes, across the shapes the ticket
-    # profiled plus batch 2/8 for the shape the small-N geometry changes
+    # profiled plus batch 2/8 for the shape the fast path's geometry changes
     # most. Needs the ggml-sycl-private-fixtures layout-override hook (same
     # mechanism test-layout-cache and test-q8-0-layout-cache-path-mmvq use)
     # to force each weight tensor's materialized layout deterministically --
     # a plain device-buffer upload does not exercise SOA/COALESCED
     # materialization at all, only the model-load path does.
     #
-    # The env accessor mmvq_q8_0_soa_smalln_enabled() (mmvq.cpp) caches its
-    # value once per process, so ONE ctest registration cannot see both
-    # GGML_SYCL_MMVQ_Q8_SOA_SMALLN states -- this registration runs the
-    # default (ON) state; run the binary by hand with =0 for the other arm
-    # (see the file's own header comment for the exact command).
+    # The env accessor mmvq_q8_0_soa_fastpath_enabled() (mmvq.cpp) caches its
+    # value once per process, so ONE process cannot exercise both
+    # GGML_SYCL_MMVQ_Q8_SOA_FASTPATH states -- but ctest runs each registered
+    # test in its OWN process, so registering the SAME binary a second time
+    # under a second test NAME with =0 in its ENVIRONMENT covers both arms
+    # without a second executable (spec review round 1, finding 3).
     add_executable(test-sycl-mmvq-q8-0-soa-smalln-numerics test-sycl-mmvq-q8-0-soa-smalln-numerics.cpp)
     target_link_libraries(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE ggml-sycl-private-fixtures)
     target_include_directories(test-sycl-mmvq-q8-0-soa-smalln-numerics PRIVATE
@@ -2308,6 +2312,20 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-mmvq-q8-0-soa-smalln-numerics PROPERTIES
         LABELS "sycl;mmvq;quant;soa;gpu-serial"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+    # Second registration, same binary, GGML_SYCL_MMVQ_Q8_SOA_FASTPATH=0 arm
+    # -- covers the fast-path-disabled path (byte-for-byte the original
+    # kernel and its fixed-16 geometry) with the identical numerics coverage
+    # the default-ON arm above gets, so a regression that only shows up with
+    # the fix disabled is not invisible to ctest.
+    add_test(NAME test-sycl-mmvq-q8-0-soa-smalln-numerics-off
+             COMMAND $<TARGET_FILE:test-sycl-mmvq-q8-0-soa-smalln-numerics>)
+    set_tests_properties(test-sycl-mmvq-q8-0-soa-smalln-numerics-off PROPERTIES
+        LABELS "sycl;mmvq;quant;soa;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MMVQ_Q8_SOA_FASTPATH=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         TIMEOUT 300

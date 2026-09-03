@@ -93,17 +93,43 @@ inline bool mmvq_launch_covers_rows(const int padded_rows, const int rows) {
 // count above, `nrows / subgroups_per_workgroup`, which shrinks as nrows
 // shrinks. This is also why the gap is worse on the B70 (256 cores) than the
 // B50 (128 cores) at the same N: the SAME work-group count fills half as much
-// of the larger device.
+// of the larger device. 256 and 128 are this fork's two current discrete
+// cards, not special-cased constants -- `n_cores` below is whatever
+// `ggml_sycl_info().devices[d].xmx_caps.compute_units` reports for the
+// device actually in use, and the floor formula scales monotonically with
+// it: a smaller reported core count only makes the fix less aggressive
+// (raises fewer work-groups), never wrong. The reverse also holds, and the
+// "large-N shapes stay unchanged" guarantee is correspondingly
+// device-conditional, not absolute: floor = round(2 * n_cores) at the
+// K<=4096 reference, so a hypothetical device reporting >=449 cores would
+// push the N=14336 "gate/up" shape's floor above its today's-geometry
+// work-group count of 896, moving it off subgroups_per_workgroup=16 too --
+// exactly the intended behaviour, since that device's larger core count
+// genuinely would leave 896 work-groups under-occupying it.
 //
-// The fix below does not touch per-row memory access at all (that would mean
-// rewriting the SOA byte layout to match COALESCED's word-major tiling, a far
-// larger change). It only raises the work-group count for small nrows by
-// spreading the SAME rows across MORE, smaller work-groups (fewer sub-groups
-// per work-group) -- a launch-configuration-only change, safe under SYCL
-// graph record/replay because it is a pure function of arguments already
-// available at record time (nrows, ncols, device core count), and it costs
-// nothing at large N because a work-group count already at or above the
-// floor leaves `subgroups_per_workgroup` at today's 16, unchanged.
+// The fix below does not touch per-row memory access at all -- it only
+// raises the work-group count for small nrows by spreading the SAME rows
+// across MORE, smaller work-groups (fewer sub-groups per work-group), a
+// launch-configuration-only change, safe under SYCL graph record/replay
+// because it is a pure function of arguments already available at record
+// time (nrows, ncols, device core count), and it costs nothing at large N
+// because a work-group count already at or above the floor leaves
+// `subgroups_per_workgroup` at today's 16, unchanged.
+//
+// GPU verification of this geometry-only change (llama.cpp-6cgq round 1,
+// posted with the profiler capture) confirmed the reasoning above but found
+// the effect small in practice (~1 percentage point at N=1024) -- occupancy
+// was never the dominant limiter, and raising it can even add L1 contention
+// among the very same scattered small reads described above, roughly
+// cancelling the latency-hiding benefit. The dominant fix is a companion
+// change in mmvq.cpp (mul_mat_vec_q8_0_soa_scale_slm): the SOA D-plane
+// (per-block fp16 scale) is read as 8 separate, redundant, 2-byte-per-lane
+// scattered small loads per sub-group iteration, spanning only 16 contiguous
+// bytes of genuinely distinct data -- unlike the QS-plane reads, which are
+// already perfectly 256-byte-contiguous per iteration. Staging each row's
+// D-plane segment into SLM once, via one coalesced cooperative load, removes
+// that waste; this geometry function is now a complementary lever applied
+// alongside it (same env gate, mmvq.cpp), not a fix on its own.
 //
 // `ncols` (K) matters too: for the SAME nrows, a longer per-row K loop gives
 // each sub-group more of its own sequential memory transactions to overlap,
