@@ -305,6 +305,13 @@ static std::vector<float> run_layout(ggml_backend_t                       backen
     return gpu_output;
 }
 
+// Per-element numpy-`allclose`-style tolerance: an element passes when
+// |got-ref| <= abs_tol + rel_tol*|ref|, and the WHOLE comparison passes only
+// when every element does. An earlier version used global maxima with
+// `max_rel < rel_tol || max_diff < abs_tol` -- an unconditional OR that let
+// a small max_diff silently excuse an arbitrarily large max_rel (or vice
+// versa) across the WHOLE array, rather than requiring each element to
+// satisfy a real combined bound.
 static void compare(const char *               what,
                     const std::vector<float> & got,
                     const std::vector<float> & ref,
@@ -315,17 +322,21 @@ static void compare(const char *               what,
         ++g_failures;
         return;
     }
-    float max_diff = 0.0f;
-    float max_rel  = 0.0f;
+    float  max_diff   = 0.0f;
+    float  max_rel    = 0.0f;
+    size_t violations = 0;
     for (size_t i = 0; i < got.size(); ++i) {
         const float diff = std::fabs(got[i] - ref[i]);
         max_diff         = std::max(max_diff, diff);
         const float rel  = std::fabs(ref[i]) > 1e-6f ? diff / std::fabs(ref[i]) : diff;
         max_rel          = std::max(max_rel, rel);
+        if (diff > abs_tol + rel_tol * std::fabs(ref[i])) {
+            ++violations;
+        }
     }
-    const bool ok = max_rel < rel_tol || max_diff < abs_tol;
-    std::printf("%s [%s]: max_diff=%.6e max_rel=%.6e (tol rel=%.1e abs=%.1e)\n", ok ? "OK" : "FAIL", what, max_diff,
-                max_rel, rel_tol, abs_tol);
+    const bool ok = violations == 0;
+    std::printf("%s [%s]: max_diff=%.6e max_rel=%.6e violations=%zu/%zu (tol rel=%.1e abs=%.1e)\n", ok ? "OK" : "FAIL",
+                what, max_diff, max_rel, violations, got.size(), rel_tol, abs_tol);
     if (!ok) {
         ++g_failures;
     }
