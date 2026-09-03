@@ -351,14 +351,55 @@ int main(int argc, char ** argv) {
     }
 
     step_logits got;
+    // llama.cpp-79o5 bisection: does the defect need ctx_b to DECODE, or merely
+    // to EXIST?  With TWOCTX_B_NO_DECODE=1 ctx_b is created (so its KV/runtime
+    // allocations and its share of the plan are present) but never decodes, so
+    // it contributes no graph recording, no dispatch and no writes.  If A still
+    // corrupts, the carrier is allocation/planning; if A stays clean, it is
+    // execution.
+    const char * b_nodec_env = std::getenv("TWOCTX_B_NO_DECODE");
+    const bool   b_no_decode = b_nodec_env && std::atoi(b_nodec_env) != 0;
+    if (b_no_decode) {
+        fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: ctx_b created but will NEVER decode\n");
+    }
+
+    // llama.cpp-79o5: with TWOCTX_CREATE_B_LATE=1, ctx_b is not created until
+    // AFTER ctx_a has already decoded once (and therefore already recorded a
+    // graph).  Discriminates "A was initialised in B's shadow" from "B's
+    // creation breaks an already-working A".
+    const char * b_late_env = std::getenv("TWOCTX_CREATE_B_LATE");
+    const bool   b_late     = b_late_env && std::atoi(b_late_env) != 0;
+    if (b_late && ctx_b) {
+        fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: destroying ctx_b; it will be re-created after A step0\n");
+        llama_free(ctx_b);
+        ctx_b = nullptr;
+    }
+
     ok = ok && decode_tokens(ctx_a, prompt_a, "A step0", got) && compare_step(got, ref_a[0], "A step0", tol);
-    ok = ok && decode_tokens(ctx_b, prompt_b, "B step0", got) && compare_step(got, ref_b[0], "B step0", tol);
+
+    if (b_late) {
+        ctx_b = make_ctx(model_b, n_ctx_b, 32);
+        if (!ctx_b) {
+            fprintf(stderr, "[TWO-CTX] FAIL: could not re-create ctx_b late\n");
+            llama_free(ctx_a);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        fprintf(stderr, "[TWO-CTX] DIAGNOSTIC: ctx_b created AFTER A step0\n");
+    }
+
+    if (!b_no_decode) {
+        ok = ok && decode_tokens(ctx_b, prompt_b, "B step0", got) && compare_step(got, ref_b[0], "B step0", tol);
+    }
     for (size_t i = 0; i < cont.size(); ++i) {
         char tag[64];
         std::snprintf(tag, sizeof(tag), "A step%zu", i + 1);
         ok = ok && decode_tokens(ctx_a, { cont[i] }, tag, got) && compare_step(got, ref_a[1 + i], tag, tol);
-        std::snprintf(tag, sizeof(tag), "B step%zu", i + 1);
-        ok = ok && decode_tokens(ctx_b, { cont[i] }, tag, got) && compare_step(got, ref_b[1 + i], tag, tol);
+        if (!b_no_decode) {
+            std::snprintf(tag, sizeof(tag), "B step%zu", i + 1);
+            ok = ok && decode_tokens(ctx_b, { cont[i] }, tag, got) && compare_step(got, ref_b[1 + i], tag, tol);
+        }
     }
 
     // 3. Clearing B's memory must not disturb A: A continues to match. The

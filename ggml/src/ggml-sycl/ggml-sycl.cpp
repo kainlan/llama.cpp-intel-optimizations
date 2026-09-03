@@ -14423,6 +14423,47 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
         return id;
     }
 
+    // llama.cpp-79o5: a TRANSIENT non-weight tensor gets no cache identity.
+    //
+    // The identity built below is the tensor's raw device address -- name_hash and
+    // file_offs are both (uintptr_t) tensor->data, and model_id is 0 -- so it carries no
+    // owner, no context and no graph.  Activations and KV views are per-token, per-graph
+    // memory drawn from an address space shared by every llama_context on the device, so
+    // that identity cannot distinguish "this tensor" from "whatever last occupied this
+    // address".  get_data_ptr_slow() then resolves such a tensor from a copy staged by a
+    // different graph or a different context; its own comment already conceded it "could
+    // observe content validated for a different graph/caller".  CLAUDE.md forbids the
+    // construction outright: pointer addresses must not be cache keys, and dispatch caches
+    // must derive from the stable identity carried by mem_handle.
+    //
+    // Measured on test-sycl-two-context-ownership (two contexts, one model, one device):
+    // with this identity in place all four size pairings fail deterministically; with it
+    // withheld all four pass, in both creation orders and with the second context never
+    // decoding.  The change moves no allocation -- every address is unchanged -- which is
+    // what distinguishes it from the layout perturbations (separate models, creation order)
+    // that also hide the defect while proving nothing.
+    //
+    // A better key does NOT fix this: keying additionally by the owning buffer was tried
+    // and failed, because the fault is freshness, not collision.  A content-addressed cache
+    // is sound for weights (stable bytes, reused every token) and unsound for activations
+    // (new bytes every token) regardless of how the key is built.
+    //
+    // Cost: nil.  Non-weight prestage resolutions numbered 2 in a whole run, and Mistral
+    // Q4_0 and GPT-OSS 20B measured flat on pp512 and tg128 across interleaved pairs.
+    // Weight caching is untouched -- weights delegated to
+    // ggml_backend_sycl_get_weight_cache_key above, before this point.
+    //
+    // GGML_SYCL_NONWEIGHT_CACHE_KEY=1 restores the old behaviour for bisection only.
+    {
+        static const bool legacy_address_identity = [] {
+            const char * e = std::getenv("GGML_SYCL_NONWEIGHT_CACHE_KEY");
+            return e && std::atoi(e) != 0;
+        }();
+        if (!legacy_address_identity) {
+            return id;  // id.valid == false -> no participation in the shared cache
+        }
+    }
+
     const uintptr_t data_id = reinterpret_cast<uintptr_t>(tensor->data);
 
     id.valid     = true;
@@ -40333,12 +40374,47 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr = nullptr;
 
         // Try the pre-reserved compute arena first.
+        //
+        // llama.cpp-wld8: this used to call cache->arena_alloc(rounded_size)
+        // directly and return its raw pointer -- no mem_handle, nothing
+        // inserted into arena_handles. free() below can only defer release
+        // for a live SYCL graph recording when it finds a valid owner in
+        // arena_handles; a raw pointer from this path always misses that
+        // lookup and falls through to the legacy branch's unconditional
+        // drain-then-free. A drain only waits for SUBMITTED work, and
+        // recorded (not yet replayed) work is not submitted until replay,
+        // so the block was returned to the SCRATCH TLSF while a recorded
+        // graph still baked in its address -- the root cause of the
+        // two-context corruption in llama.cpp-79o5, and this was the
+        // common path since arena_active() defaults on. Mint ownership here
+        // instead, via the exact-handle owner API for the SCRATCH zone,
+        // using the SAME (size+255)&~255 rounding and 256 alignment
+        // arena_alloc() applies internally (unified-cache.cpp:17964,17967)
+        // so this path's allocation shape is unchanged -- only free() can
+        // now find and defer it.
         {
             auto * cache = ggml_sycl::get_unified_cache_for_device(device);
-            ptr          = (cache && cache->arena_active()) ? cache->arena_alloc(rounded_size) : nullptr;
-            if (ptr) {
-                *actual_size = rounded_size;
-                return ptr;
+            if (cache && cache->arena_active()) {
+                const size_t                 aligned    = (rounded_size + 255) & ~size_t(255);
+                ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(
+                    device, ggml_sycl::vram_zone_id::SCRATCH, aligned, 256);
+                if (allocation) {
+                    ggml_sycl::mem_handle owner =
+                        ggml_sycl::mem_handle::from_owned_alloc(std::move(allocation.owner), GGML_LAYOUT_AOS);
+                    const auto resolved = owner.resolve(device);
+                    if (resolved.ptr && resolved.on_device && !ggml_sycl_ptr_is_invalid_sentinel(resolved.ptr)) {
+                        {
+                            std::lock_guard<std::mutex> lock(arena_handles_mutex);
+                            arena_handles[resolved.ptr] = std::move(owner);
+                        }
+                        *actual_size = rounded_size;
+                        return resolved.ptr;
+                    }
+                    // Minted but did not resolve to a usable device pointer --
+                    // owner's destructor releases it; fall through to the
+                    // existing fallback below rather than returning a raw
+                    // pointer or aborting (requirement: preserve the fallback).
+                }
             }
         }
         // Arena full or not reserved — fall back to unified cache.
@@ -40423,6 +40499,29 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 // this pool without an allocation-time mem_handle.  Drain before
                 // reclaiming so correctness is preserved while those call sites
                 // are migrated.
+                //
+                // llama.cpp-wld8: this is the unsafe case for a caller under
+                // active SYCL graph recording -- a drain here only waits for
+                // SUBMITTED work, and recorded (not yet replayed) work is not
+                // submitted until replay, so the block can still be handed
+                // back to SCRATCH while a recorded graph bakes in its
+                // address. alloc()'s own arena_alloc() call site (the common
+                // source of these) was migrated to mint ownership above; warn
+                // once per device if any OTHER, still-unmigrated call site
+                // reaches here while recording, so it is visible instead of
+                // silently corrupting output.
+                if (ggml_sycl_graph_recording_active()) {
+                    static std::unordered_set<int> warned_devices;
+                    static std::mutex              warned_devices_mutex;
+                    std::lock_guard<std::mutex>    lock(warned_devices_mutex);
+                    if (warned_devices.insert(device).second) {
+                        GGML_LOG_WARN(
+                            "[POOL-LEG] device=%d: legacy arena free reached during SYCL graph recording -- this "
+                            "allocation is not owner-tracked and its release cannot be deferred to replay; see "
+                            "llama.cpp-wld8\n",
+                            device);
+                    }
+                }
                 try {
                     qptr->wait_and_throw();
                 } catch (...) {
