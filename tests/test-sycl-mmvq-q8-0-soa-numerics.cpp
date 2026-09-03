@@ -88,12 +88,47 @@
 // the fast path's profile_label metadata carries (mmvq.cpp), so a
 // GGML_SYCL_KERNEL_PROFILE=1 capture can be cross-checked against this
 // test's own prediction by hand.
+//
+// PRODUCTION DISPATCH OBSERVATION (spec review round 2, finding 1 -- C4
+// still open from round 1): check_geometry_decision() above only reasons
+// about what the geometry helper WOULD return; it re-reads the env var and
+// calls the same pure function the production code calls, entirely from
+// this test's own code, so it observes nothing about whether the actual
+// PRODUCTION dispatch in mmvq.cpp ever ran. Because the fast-path kernel is
+// bit-identical to the original by construction (same QS reads, same dp4a
+// math -- only the source of `d` differs), every numerics comparison in
+// this file is INVARIANT to which kernel actually executed: a
+// mmvq_q8_0_soa_fastpath_enabled() that always returned false (e.g. from a
+// broken env read, or the two-registration ctest wiring somehow losing the
+// FASTPATH=0 arm's environment) would still pass every OK line below on
+// BOTH ctest arms, because the untouched original kernel produces the same
+// numbers. run_soa_with_dispatch_observation() closes this gap by observing
+// a REAL artifact of the production dispatch: it force-enables the kernel
+// profiler for the test process (ggml_sycl_kernel_profile_set_config_for_test,
+// GGML_SYCL_PRIVATE_TESTING-gated, sycl-kernel-profiler.hpp -- this binary
+// already links ggml-sycl-private-fixtures with that macro defined), runs
+// the SOA layout, flushes, and inspects the recorded CSV rows directly.
+// Both mmvq.cpp branches label their profile_label "mulmat.mmvq.q8_0_soa"
+// (deliberate profiler continuity across this ticket), so the label name
+// alone cannot distinguish them; the metadata string can: only the fast
+// path's includes ";subgroups=" (mmvq.cpp's fast-path branch builds
+// "ncols=...;nrows=...;subgroups=..."), while the unchanged original
+// kernel's is "ncols=...;nrows=..." with no such field, since `metadata` is
+// part of the profiler's aggregation key (sycl-kernel-profiler.cpp's
+// profile_key), so the two branches' records never collide or get merged.
+// A run where the fast path silently never dispatches FAILS with an
+// explicit "production dispatch observation mismatch ... expected a
+// mulmat.mmvq.q8_0_soa profiler record WITH/WITHOUT a 'subgroups=' metadata
+// field, but ..." message, distinguishable from both a numerics failure
+// (names the diverging comparison) and a geometry-decision mismatch (names
+// the expected vs actual subgroups_per_workgroup).
 
 #include "common.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mmvq-launch-geometry.hpp"
+#include "ggml-sycl/sycl-kernel-profiler.hpp"
 #include "ggml.h"
 #include "test-skip.h"
 
@@ -396,6 +431,44 @@ static void check_geometry_decision(const char * label, int ncols, int nrows) {
     }
 }
 
+// See "PRODUCTION DISPATCH OBSERVATION" in the file header comment. Runs the
+// SOA layout under forced profiler capture and reports whether the
+// production dispatch code path (not this test's own prediction) actually
+// took the fast-path branch. Both mmvq.cpp branches label their
+// ggml_sycl_profile_label "mulmat.mmvq.q8_0_soa" (profiler continuity), so
+// the distinguishing observable is the metadata string: only the fast
+// path's includes ";subgroups=" (mmvq.cpp's fast-path branch); the
+// unchanged original kernel's is "ncols=...;nrows=..." with no such field.
+struct soa_run_result {
+    std::vector<float> output;
+    bool               fastpath_dispatch_observed = false;
+};
+
+static soa_run_result run_soa_with_dispatch_observation(ggml_backend_t                       backend,
+                                                        int                                  ncols,
+                                                        int                                  nrows,
+                                                        int                                  batch,
+                                                        const std::vector<block_q8_0_test> & weight_data,
+                                                        const std::vector<float> &           input_data) {
+    ggml_sycl_kernel_profile_reset_for_test();
+    ggml_sycl_kernel_profile_config cfg;
+    cfg.enabled = true;
+    ggml_sycl_kernel_profile_set_config_for_test(cfg);
+
+    soa_run_result result;
+    result.output = run_layout(backend, GGML_LAYOUT_SOA, "soa", ncols, nrows, batch, weight_data, input_data);
+
+    ggml_sycl_kernel_profile_flush(/*wait_for_events=*/true, "llama.cpp-6cgq dispatch observation");
+    const std::string csv = ggml_sycl_kernel_profile_format_csv_for_test();
+    result.fastpath_dispatch_observed =
+        csv.find("mulmat.mmvq.q8_0_soa") != std::string::npos && csv.find("subgroups=") != std::string::npos;
+
+    // Reset so profiler state does not leak into later shapes' unprofiled
+    // GPU work (and so a later shape's capture starts from an empty table).
+    ggml_sycl_kernel_profile_reset_for_test();
+    return result;
+}
+
 static void run_shape(ggml_backend_t backend, const char * label, int ncols, int nrows, int batch) {
     std::printf("== shape %s: ncols=%d nrows=%d batch=%d ==\n", label, ncols, nrows, batch);
     check_geometry_decision(label, ncols, nrows);
@@ -415,10 +488,29 @@ static void run_shape(ggml_backend_t backend, const char * label, int ncols, int
     std::vector<float> ref((size_t) nrows * batch);
     compute_reference(weight_data.data(), input_data.data(), ref.data(), ncols, nrows, batch);
 
-    const std::vector<float> soa =
-        run_layout(backend, GGML_LAYOUT_SOA, "soa", ncols, nrows, batch, weight_data, input_data);
-    const std::vector<float> coalesced =
+    const soa_run_result soa_result =
+        run_soa_with_dispatch_observation(backend, ncols, nrows, batch, weight_data, input_data);
+    const std::vector<float> & soa = soa_result.output;
+    const std::vector<float>   coalesced =
         run_layout(backend, GGML_LAYOUT_COALESCED, "coalesced", ncols, nrows, batch, weight_data, input_data);
+
+    // PRODUCTION DISPATCH OBSERVATION: correct numerics prove nothing about
+    // which kernel produced them (the fast path is bit-identical to the
+    // original by design), so a broken mmvq_q8_0_soa_fastpath_enabled()
+    // (e.g. always reading off) would otherwise pass every comparison below
+    // on the ON ctest arm while never actually exercising this ticket's
+    // kernel. This checks a REAL profiler record from the production
+    // dispatch, not a self-computed prediction.
+    const bool expect_fastpath_dispatched = fastpath_env_enabled();
+    if (soa_result.fastpath_dispatch_observed != expect_fastpath_dispatched) {
+        std::printf(
+            "FAIL [%s]: production dispatch observation mismatch -- GGML_SYCL_MMVQ_Q8_SOA_FASTPATH=%s, expected a "
+            "mulmat.mmvq.q8_0_soa profiler record %s a 'subgroups=' metadata field, but %s\n",
+            label, expect_fastpath_dispatched ? "on" : "off", expect_fastpath_dispatched ? "WITH" : "WITHOUT",
+            soa_result.fastpath_dispatch_observed ? "one WITH subgroups= was recorded (fast path ran)" :
+                                                    "no such record was found (fast path did NOT run)");
+        ++g_failures;
+    }
 
     // Q8_0 x Q8_1 accumulation: generous but not vacuous tolerance, matching
     // test-q8-0-layout-cache-path-mmvq.cpp's precedent for this same op.
