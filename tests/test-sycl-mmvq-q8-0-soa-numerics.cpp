@@ -366,9 +366,12 @@ static void run_shape(ggml_backend_t backend, const char * label, int ncols, int
         run_layout(backend, GGML_LAYOUT_COALESCED, "coalesced", ncols, nrows, batch, weight_data, input_data);
 
     // Q8_0 x Q8_1 accumulation: generous but not vacuous tolerance, matching
-    // test-q8-0-layout-cache-path-mmvq.cpp's precedent for this same op.
+    // test-q8-0-layout-cache-path-mmvq.cpp's precedent for this same op
+    // (rel_tol=1e-3, abs_tol=1e-2). A run against real hardware measured
+    // max_diff ~3e-5 here -- inside abs_tol by ~300x -- so this is not tight
+    // against actual GPU behaviour, just against the stated precedent.
     const float rel_tol = 1e-3f;
-    const float abs_tol = 5e-2f;
+    const float abs_tol = 1e-2f;
     compare("soa-vs-cpu-reference", soa, ref, rel_tol, abs_tol);
     compare("coalesced-vs-cpu-reference", coalesced, ref, rel_tol, abs_tol);
     // Tighter: both kernels read the SAME bytes, so their outputs should
@@ -394,7 +397,11 @@ int main() {
     run_shape(backend, "gemma4-ish N=2048 K=2560 b1", 2560, 2048, 1);
     run_shape(backend, "N=10240 K=2560 b1", 2560, 10240, 1);
     run_shape(backend, "tiny N=37 K=4096 b1", 4096, 37, 1);
-    // Batch 2 and 8 for the shape with the tightest bandwidth deficit.
+    // Batch 2 and 8 for the shape with the tightest bandwidth deficit. This
+    // test asserts NUMERICS, not which kernel ran for a given batch size --
+    // batch > 1 may route through a different MMVQ/MMQ path than batch 1 in
+    // the production dispatcher, and these arms exercise whichever one that
+    // dispatcher selects.
     run_shape(backend, "k,v N=1024 K=4096 b2", 4096, 1024, 2);
     run_shape(backend, "k,v N=1024 K=4096 b8", 4096, 1024, 8);
 
