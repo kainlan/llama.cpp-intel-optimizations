@@ -42377,6 +42377,55 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
 #endif
     const char *    src1_device_base  = static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
     const uint8_t * src0_host_storage = static_cast<const uint8_t *>(ggml_sycl_host_data(src0));
+    // llama.cpp-pktr spec-review fix (finding 1, rev-pktr-spec-1), CORRECTED
+    // in round 2 (rev-pktr-spec-2, a real B50 regression -- Mistral Q8_0
+    // emitted "###############" at default env), and HOISTED here in round 3
+    // (rev-pktr-spec-2 finding 2) so BOTH the f16 GEMM/dequant arm below
+    // (inside the use_fp16 branch) and the fp32 dequant arm (that branch's
+    // else, the llama.cpp-dkw0 coalesced fp32 lookup) can consult the same
+    // decided layout -- it was originally declared inside the use_fp16
+    // branch only, so the dkw0 fp32 sibling had no planned-layout signal at
+    // all and requested GGML_LAYOUT_COALESCED for any Q8_0 weight
+    // unconditionally (see that lookup's own comment below).
+    //
+    // ggml_sycl_get_weight_layout_ptr(tensor, device, target) internally
+    // re-derives `resolved = ggml_sycl_adjust_layout_for_tensor(tensor,
+    // target, device)` and returns whatever pointer it finds for `resolved`
+    // WITHOUT verifying `resolved == target` -- so a GGML_LAYOUT_COALESCED
+    // request against a weight the pktr rule (or GGML_SYCL_Q8_DENSE_LAYOUT=soa)
+    // resolves to SOA can silently hand back the SOA plane, which a
+    // COALESCED dequant kernel then reads as coalesced bytes: silent
+    // garbage. Using a lookup's own success/failure as a proxy for "the
+    // planner chose this layout" has the same failure mode in the other
+    // direction. Decide the tensor's ACTUAL materialized layout ONCE -- but
+    // round 1 read that from get_effective_layout_mode(src0->extra), which
+    // is NOT guaranteed to agree with what ggml_sycl_op_mul_mat already
+    // resolved to hand this function src0_dd_i in the first place
+    // (ggml_sycl_resolve(src0, i), called by ggml_sycl_op_mul_mat before
+    // dispatching here). extra->layout.mode has exactly two writers: the
+    // CPU-side set_tensor reorder path (skipped when the model buffer is
+    // host-pinned) and ggml_sycl_update_layout_from_cache, which is itself
+    // reached ONLY from inside ggml_sycl_get_weight_layout_ptr -- so for a
+    // weight the unified cache's S1-PRELOAD staged straight to a COALESCED
+    // device plane (unified_cache_direct_stage_weight, never touching
+    // extra), extra->layout.mode sits at its GGML_LAYOUT_AOS default until
+    // something calls that getter for it; round 1's fix gated the ONLY
+    // caller that would have populated it behind a check of that same
+    // stale field -- a chicken-and-egg deadlock that read AOS forever for
+    // such a weight, skipped BOTH the SOA and COALESCED lookups, and fell
+    // through to the plain AOS dequant on bytes that were actually
+    // COALESCED: garbage. Read the SAME resolution ggml_sycl_op_mul_mat
+    // used (ggml_sycl_resolve, not the extra's lazily-updated cache field),
+    // and require on_device (this dequant-scratch path only ever looks up
+    // device/shared USM pointers; a host-resident weight should not be
+    // routed here at all under "placement decides the executor"). If the
+    // resolve is unavailable or genuinely AOS, fall back to GGML_LAYOUT_AOS
+    // -- every Q8_0-specific lookup below stays skipped and execution
+    // reaches the pre-nz1k / pre-dkw0 generic AOS dequant unchanged, which
+    // is correct exactly when the weight really is AOS.
+    const ggml_sycl::resolved_ptr q8_0_dense_resolved = ggml_sycl_resolve(src0, ctx.device);
+    const layout_mode             q8_0_dense_planned_layout =
+        (q8_0_dense_resolved && q8_0_dense_resolved.on_device) ? q8_0_dense_resolved.layout : GGML_LAYOUT_AOS;
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         sycl::half * src0_pp_scratch = nullptr;
@@ -42563,29 +42612,13 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         // INVARIANT: q8_0_soa_ptr is non-null only when full_rows && k_blocked
         // hold, because the SOA-aware fallback dequant is full-tensor/row-0-based.
         //
-        // llama.cpp-pktr spec-review fix (finding 1, rev-pktr-spec-1):
-        // ggml_sycl_get_weight_layout_ptr(tensor, device, target) internally
-        // re-derives `resolved = ggml_sycl_adjust_layout_for_tensor(tensor,
-        // target, device)` and returns whatever pointer it finds for
-        // `resolved` WITHOUT verifying `resolved == target` -- so a
-        // GGML_LAYOUT_COALESCED request against a weight the pktr rule (or
-        // GGML_SYCL_Q8_DENSE_LAYOUT=soa) resolves to SOA can silently hand
-        // back the SOA plane, which the COALESCED dequant kernel then reads
-        // as coalesced bytes: silent garbage. Using a lookup's own
-        // success/failure as a proxy for "the planner chose this layout"
-        // (the previous `!q8_0_soa_ptr` guard below) has the same failure
-        // mode in the other direction. Decide the tensor's ACTUAL
-        // materialized layout ONCE, from the registered layout info
-        // (get_effective_layout_mode -- the same accessor every other
-        // dispatch site in this file uses to ask "what layout is this
-        // tensor really in", not a re-derivation that can diverge from env
-        // overrides like GGML_SYCL_Q8_DENSE_AOS/GGML_SYCL_Q8_DENSE_LAYOUT),
-        // and gate the SOA lookup on planned==SOA, the COALESCED lookup on
+        // llama.cpp-pktr spec-review fix (finding 1, rev-pktr-spec-1/2): see
+        // q8_0_dense_planned_layout's declaration above the use_fp16 branch
+        // (this whole f16 GEMM/dequant arm is that branch's body) for how the
+        // tensor's actual materialized layout is decided and why. Gate the
+        // SOA lookup on planned==SOA, the COALESCED lookup on
         // planned==COALESCED -- never one as the fallback of the other, and
         // never both live for a single dispatch (one layout per weight).
-        const ggml_tensor_extra_gpu * q8_0_dense_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-        const layout_mode             q8_0_dense_planned_layout =
-            q8_0_dense_extra ? get_effective_layout_mode(q8_0_dense_extra) : GGML_LAYOUT_AOS;
         // -----------------------------------------------------------------
         void * q8_0_soa_ptr = nullptr;
         if (!used_woq && src0->type == GGML_TYPE_Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA && row_diff > 0 &&
@@ -42686,12 +42719,14 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 // AOS dequant below, never erroring.
                 void * q8_0_coalesced_ptr = nullptr;
                 // llama.cpp-nz1k, corrected llama.cpp-pktr spec review
-                // finding 1: gate on the tensor's PLANNED layout
-                // (q8_0_dense_planned_layout, decided once above from the
-                // registered layout info), not on whether the SOA lookup
-                // above happened to fail. A planned-SOA weight whose SOA
-                // lookup declined (host-evictable, not currently resident)
-                // must never fall through to a COALESCED lookup: there is no
+                // finding 1 (round 2, rev-pktr-spec-2): gate on the tensor's
+                // PLANNED layout (q8_0_dense_planned_layout, decided once
+                // above from ggml_sycl_resolve -- the same resolution
+                // ggml_sycl_op_mul_mat used to hand this function src0_dd_i
+                // in the first place), not on whether the SOA lookup above
+                // happened to fail. A planned-SOA weight whose SOA lookup
+                // declined (host-evictable, not currently resident) must
+                // never fall through to a COALESCED lookup: there is no
                 // COALESCED materialization for it to find (one layout per
                 // weight), and ggml_sycl_get_weight_layout_ptr does not
                 // verify that what it returns matches the layout requested,
@@ -42848,8 +42883,33 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             // host tier, GGML_SYCL_Q8_ONEDNN_COALESCED=0 never materialized
             // it, etc.) this falls straight through to the unmodified
             // to_fp32_sycl() path below, never erroring.
+            //
+            // llama.cpp-pktr spec-review fix (finding 2, rev-pktr-spec-2):
+            // this lookup used to fire for ANY Q8_0 weight, with no
+            // planned-layout gate -- so a tile-misaligned Q8_0 weight the
+            // pktr rule resolves to SOA (e.g. gemma4-E4B's K=2560 head)
+            // could have its SOA plane handed back here (the getter does
+            // not verify resolved == target) and fed to a dequant kernel
+            // that reads it as coalesced: silent garbage, reachable when the
+            // f16 GEMM branch above declines (GGML_SYCL_F16=OFF, a
+            // row-split dispatch with row_diff != src0->ne[1], or
+            // GGML_PREC_F32). Gate on q8_0_dense_planned_layout ==
+            // GGML_LAYOUT_COALESCED (decided once, above the use_fp16
+            // branch, from the same ggml_sycl_resolve() call
+            // ggml_sycl_op_mul_mat used for src0_dd_i -- see that
+            // declaration's comment). There is no SOA-aware fp32 dequant
+            // kernel (no dequantize_row_q8_0_soa_to_fp32* exists in
+            // convert.hpp/.cpp, only the f16 form
+            // dequantize_row_q8_0_soa_to_fp16_rowmajor does) to add as a
+            // sibling fallback, so a planned-SOA weight here simply declines
+            // this lookup and falls to the generic to_fp32_sycl() path
+            // below -- the same pre-existing behaviour as any other decline
+            // reason. That generic path's own correctness for a genuinely
+            // SOA-materialized weight is a separate, pre-existing question
+            // (the lead is filing it, along with the src0_full_tensor gap
+            // noted above) that this fix does not attempt to resolve.
             void * dkw0_q8_0_coalesced_ptr = nullptr;
-            if (src0->type == GGML_TYPE_Q8_0) {
+            if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED && src0->type == GGML_TYPE_Q8_0) {
                 void * dkw0_candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
                 if (dkw0_candidate) {
                     const sycl::usm::alloc dkw0_ptr_type = ggml_sycl_get_alloc_type(dkw0_candidate);

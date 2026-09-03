@@ -50,12 +50,16 @@ PLANNER_ENTRY_SIG = "static ggml_layout_mode planner_default_device_layout(const
 
 # Matches a hand-rolled re-derivation of the tile-alignment test, in the
 # family of spellings a re-derivation could plausibly take: the named
-# constant or the literal 32 it currently equals, compared with != or == to
-# 0, in any spacing. Deliberately broader than the one exact string
+# constant or the literal 32 it currently equals, compared against 0 with
+# ANY comparison operator (!=, ==, >, <, >=, <=) in any spacing.
+# Deliberately broader than the one exact string
 # ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the shared predicate itself
 # happens to use, so a differently-spelled re-derivation is still caught
-# (spec review finding 6, rev-pktr-spec-1).
-RE_DERIVATION_RE = re.compile(r"%\s*(MMVQ_COALESCED_TILE_BLOCKS|32)\s*(!=|==)\s*0")
+# (spec review finding 6, rev-pktr-spec-1; widened again to cover
+# comparison operators other than != / == in finding 3, rev-pktr-spec-2 --
+# "% 32 > 0" is an equally plausible re-derivation and the narrower
+# alternation missed it).
+RE_DERIVATION_RE = re.compile(r"%\s*(MMVQ_COALESCED_TILE_BLOCKS|32)\s*[<>=!]=?\s*0")
 
 
 def matching_brace(text, open_idx):
