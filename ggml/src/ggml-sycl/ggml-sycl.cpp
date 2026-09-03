@@ -42519,20 +42519,29 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         void * q8_0_soa_ptr = nullptr;
         if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled() && row_diff > 0 &&
             ggml_is_contiguous(src0)) {
-            void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA);
-            if (candidate) {
-                const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
-                if (ptr_type == sycl::usm::alloc::device || ptr_type == sycl::usm::alloc::shared) {
-                    q8_0_soa_ptr = candidate;
-                }
-            }
+            // Full-rows test FIRST, and the SOA plane is looked up only when it
+            // holds (same shape as the Q4_0 WoQ arm above): the SOA-aware
+            // fallback dequant below is full-tensor/row-0-based, so a
+            // partial-row dispatch (a 3-D/4-D src0 sliced per i02/i03) must
+            // leave q8_0_soa_ptr null and fall through to the pre-existing path
+            // byte-for-byte rather than mis-address the d plane. (Spec review
+            // finding 1, nz1k c-uihb.)
             const int64_t total_rows = ggml_nrows(src0);
             const bool    full_rows  = (row_low == 0 && row_diff == total_rows);
-            const char *  decline    = nullptr;
-            if (!q8_0_soa_ptr) {
-                decline = "soa_plane_not_resident";
-            } else if (!full_rows) {
+            if (full_rows) {
+                void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA);
+                if (candidate) {
+                    const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
+                    if (ptr_type == sycl::usm::alloc::device || ptr_type == sycl::usm::alloc::shared) {
+                        q8_0_soa_ptr = candidate;
+                    }
+                }
+            }
+            const char * decline = nullptr;
+            if (!full_rows) {
                 decline = "partial_rows";
+            } else if (!q8_0_soa_ptr) {
+                decline = "soa_plane_not_resident";
             } else if (!src0_pp_scratch) {
                 decline = "no_pp_scratch";
             } else if ((ne00 % QK8_0) != 0) {
