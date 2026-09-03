@@ -110,7 +110,10 @@ def matching_brace(text, open_idx):
 
 
 def function_body(text, signature):
-    idx = text.find(signature)
+    # Whitespace-flexible (spec review nit 4, rev-pktr-spec-4): a reflowed
+    # signature (e.g. a long parameter list clang-format wraps differently)
+    # must not read as "missing definition".
+    idx = ws_find(text, signature)
     assert idx >= 0, f"missing definition: {signature}"
     open_idx = text.find("{", idx)
     return text[open_idx : matching_brace(text, open_idx) + 1]
@@ -293,8 +296,11 @@ def test_layout_env_defaults_coalesced_and_only_touches_dense_projections():
     assert (
         'q8_dense_soa_cached = (env && std::strcmp(env, "soa") == 0) ? 1 : 0;' in common
     ), 'GGML_SYCL_Q8_DENSE_LAYOUT must default to coalesced (only "soa" selects SOA)'
-    soa_returns = common.count(
-        "if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) {\n                return GGML_LAYOUT_SOA;"
+    # Whitespace-flexible: the original exact-string form (with a literal
+    # newline and hardcoded indentation) false-failed on a pure reindent of
+    # this block in common.hpp (spec review nit 3, rev-pktr-spec-4).
+    soa_returns = len(
+        list(ws_pattern("if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) { return GGML_LAYOUT_SOA;").finditer(common))
     )
     assert soa_returns == 2, f"expected the SOA return in the ATTENTION/FFN and OUTPUT blocks (2), found {soa_returns}"
     get_optimal = function_body(common, GET_OPTIMAL_SIG)

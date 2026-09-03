@@ -121,7 +121,10 @@ def matching_brace(text, open_idx):
 
 
 def function_body(text, signature):
-    idx = text.find(signature)
+    # Whitespace-flexible (spec review nit 4, rev-pktr-spec-4): a reflowed
+    # signature (e.g. a long parameter list clang-format wraps differently)
+    # must not read as "missing definition".
+    idx = ws_find(text, signature)
     assert idx >= 0, f"missing definition: {signature}"
     open_idx = text.find("{", idx)
     return text[open_idx : matching_brace(text, open_idx) + 1]
