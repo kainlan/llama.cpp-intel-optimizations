@@ -14463,7 +14463,9 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
         return id;
     }
 
-    // llama.cpp-79o5: a TRANSIENT non-weight tensor gets no cache identity.
+    // llama.cpp-79o5: a TRANSIENT non-weight tensor gets no cache identity --
+    // UNLESS it is a graph INPUT (GGML_TENSOR_FLAG_INPUT), which keeps the
+    // address-keyed identity below.
     //
     // The identity built below is the tensor's raw device address -- name_hash and
     // file_offs are both (uintptr_t) tensor->data, and model_id is 0 -- so it carries no
@@ -14488,18 +14490,45 @@ ggml_sycl_cache_id ggml_backend_sycl_get_tensor_cache_key(const ggml_tensor * te
     // is sound for weights (stable bytes, reused every token) and unsound for activations
     // (new bytes every token) regardless of how the key is built.
     //
-    // Cost: nil.  Non-weight prestage resolutions numbered 2 in a whole run, and Mistral
-    // Q4_0 and GPT-OSS 20B measured flat on pp512 and tg128 across interleaved pairs.
+    // WHY THE BOUNDARY IS "HAS THE INPUT FLAG", NOT "IS NON-WEIGHT": the content-hash
+    // check performed on a staged copy is only meaningful when the tensor's HOST bytes
+    // are the source of truth -- a host-written GGML_TENSOR_FLAG_INPUT tensor (per-token
+    // position/mask leaves, attn_inp_kq_mask) changes its host bytes every token, so a
+    // changed hash correctly triggers re-upload, and a matching hash correctly proves the
+    // staged device copy is current.  For a device-resident intermediate (e.g. kqv_out-N)
+    // the host bytes are NOT the source of truth -- the tensor was never written from the
+    // host at all -- so a "matching" hash on stale host-side bytes proves nothing about
+    // the device contents, which is exactly how the original two-context corruption served
+    // stale kqv_out data.  Withholding identity from every non-weight tensor fixed that
+    // correctly for intermediates but also, as a side effect, disabled prestage dedup for
+    // INPUT tensors, which are safe to key by address because their freshness is enforced
+    // by the content hash, not by the identity alone.
+    //
+    // Cost of over-withholding (measured, single-context Mistral decode, 32 tokens): with
+    // the identity withheld from ALL non-weight tensors, "[GRAPH-PRESTAGE] INPUT staged"
+    // rose from 6 to 163 over the run -- every per-token graph INPUT leaf was re-staged
+    // host->device on every token instead of being deduped -- while graph record/replay
+    // (2/28) and get_data_ptr_slow (251) were identical either way. That regressed tg128
+    // -9.4% on B70 / -4.5% on B50 with pp512 flat. Restoring identity for INPUT-flagged
+    // tensors only (this change) recovers the dedup without reintroducing the intermediate-
+    // tensor corruption, since kqv_out-N and friends carry no GGML_TENSOR_FLAG_INPUT and so
+    // still fall through to id.valid == false. Do not widen this boundary again (e.g. back
+    // to "all non-weight tensors") without re-measuring both the correctness gate
+    // (test-sycl-two-context-ownership) and this per-token restaging count -- it is the
+    // axis that was actually costing throughput, not non-weight caching in general.
+    //
     // Weight caching is untouched -- weights delegated to
     // ggml_backend_sycl_get_weight_cache_key above, before this point.
     //
-    // GGML_SYCL_NONWEIGHT_CACHE_KEY=1 restores the old behaviour for bisection only.
+    // GGML_SYCL_NONWEIGHT_CACHE_KEY=1 restores the old behaviour (address identity for
+    // ALL non-weight tensors, including intermediates) for bisection only.
     {
         static const bool legacy_address_identity = [] {
             const char * e = std::getenv("GGML_SYCL_NONWEIGHT_CACHE_KEY");
             return e && std::atoi(e) != 0;
         }();
-        if (!legacy_address_identity) {
+        const bool is_graph_input = (tensor->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+        if (!legacy_address_identity && !is_graph_input) {
             return id;  // id.valid == false -> no participation in the shared cache
         }
     }
