@@ -2276,6 +2276,40 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         # an oracle; take the named mechanism back to its ticket above.
         # It loads models, so run it ONCE. Never in a loop.
     )
+
+    # llama.cpp-6cgq: Q8_0 SOA-vs-COALESCED MMVQ numerics. The ticket tried
+    # two kernel-side fixes for a measured small-N bandwidth deficit (an
+    # occupancy-geometry change, then a D-plane SLM-staging change); both
+    # were refuted by GPU measurement and neither shipped (see the test
+    # file's own header comment for the numbers) -- what remains is this
+    # numerics coverage, kept because it is useful independent of which
+    # layout wins any future default-flip decision: it compares the SOA and
+    # COALESCED Q8_0 MMVQ kernels against each other AND against a CPU
+    # reference that correctly quantizes activations to Q8_1 before the dot
+    # product (a real bug in an earlier reference was caught and fixed
+    # during this ticket). Needs the ggml-sycl-private-fixtures
+    # layout-override hook (same mechanism test-layout-cache above and
+    # test-q8-0-layout-cache-path-mmvq use) to force each weight tensor's
+    # materialized layout deterministically -- a plain device-buffer upload
+    # does not exercise SOA/COALESCED materialization at all, only the
+    # model-load path does.
+    add_executable(test-sycl-mmvq-q8-0-soa-numerics test-sycl-mmvq-q8-0-soa-numerics.cpp)
+    target_link_libraries(test-sycl-mmvq-q8-0-soa-numerics PRIVATE ggml-sycl-private-fixtures)
+    target_include_directories(test-sycl-mmvq-q8-0-soa-numerics PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_compile_definitions(test-sycl-mmvq-q8-0-soa-numerics PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_PRIVATE_TESTING=1)
+    target_compile_options(test-sycl-mmvq-q8-0-soa-numerics PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-mmvq-q8-0-soa-numerics PRIVATE "-fsycl")
+    add_test(NAME test-sycl-mmvq-q8-0-soa-numerics COMMAND $<TARGET_FILE:test-sycl-mmvq-q8-0-soa-numerics>)
+    set_tests_properties(test-sycl-mmvq-q8-0-soa-numerics PROPERTIES
+        LABELS "sycl;mmvq;quant;soa;gpu-serial"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
 endif()
 
 # test-sycl-fattn-onednn-gates: oneDNN SDPA must reject unsafe FA layouts.
