@@ -130,31 +130,71 @@ def function_body(text, signature):
     return text[open_idx : matching_brace(text, open_idx) + 1]
 
 
+def ws_pattern(needle):
+    """Compile a regex matching `needle` where a line wrap is tolerated at
+    ANY boundary, not just an EXISTING whitespace run: a boundary next to
+    structural punctuation ( `(` `)` `,` `*` `&` ) allows zero or more
+    whitespace, while a boundary between two adjacent identifiers/keywords
+    requires at least one (real C++ needs the separator; a punctuation
+    boundary does not). This matters for a single-parameter signature like
+    `bool NAME(int64_t ne00)`: a real formatter can place that sole
+    parameter on its own line, wrapping immediately after `(` -- a spot
+    with NO whitespace at all in the canonical string, which a simpler
+    tokenizer that only allows flex at existing whitespace runs (as this
+    file's own predecessor did, and as the sibling woq gate's ws_pattern
+    still does) cannot represent (spec review should-fix, rev-pktr-spec-6:
+    the exact-count check false-failed on that reflow, and the same
+    exact-substring style in the negative "must not redefine" check let a
+    reflowed redefinition slip past undetected)."""
+    marked = re.sub(r"([(),*&])", r" \1 ", needle)
+    raw_tokens = marked.split()
+    assert raw_tokens, "empty needle"
+
+    def is_word(tok):
+        return re.fullmatch(r"\w+", tok) is not None
+
+    parts = [re.escape(raw_tokens[0])]
+    for i in range(1, len(raw_tokens)):
+        sep = r"\s+" if is_word(raw_tokens[i - 1]) and is_word(raw_tokens[i]) else r"\s*"
+        parts.append(sep)
+        parts.append(re.escape(raw_tokens[i]))
+    return re.compile("".join(parts))
+
+
 def ws_find(text, needle, start=0):
-    """First match position of `needle` in `text` with every run of
-    whitespace in `needle` treated as flexible (`\\s+`), so a pure
-    clang-format line-wrap between tokens does not break an exact-string
-    match (spec review finding 3, rev-pktr-spec-3 -- this file's own
-    hardcoded two-line, hardcoded-indentation needle was exactly the
-    brittleness that finding described). Returns -1 if not found; the
-    returned position is a real offset into the ORIGINAL text."""
-    tokens = needle.split()
-    assert tokens, "empty needle"
-    pattern = re.compile(r"\s+".join(re.escape(t) for t in tokens))
-    m = pattern.search(text, start)
+    """First match position of `needle` in `text`, boundary-flexible (see
+    ws_pattern). Returns -1 if not found; the returned position is a real
+    offset into the ORIGINAL text."""
+    m = ws_pattern(needle).search(text, start)
     return m.start() if m else -1
+
+
+def ws_in(text, needle):
+    """Boundary-flexible containment check (see ws_pattern)."""
+    return ws_pattern(needle).search(text) is not None
+
+
+def ws_count(text, needle):
+    """Number of boundary-flexible matches of `needle` in `text` (see
+    ws_pattern) -- for a "defined exactly once" style check."""
+    return len(list(ws_pattern(needle).finditer(text)))
 
 
 def test_predicate_defined_exactly_once():
     # Defined in the standalone header; ggml-sycl.cpp and unified-cache.cpp
     # must each CALL it, never redefine it (both include common.hpp, which
-    # includes the header).
+    # includes the header). Boundary-flexible (spec review should-fix,
+    # rev-pktr-spec-6): the previous exact-string forms false-failed the
+    # positive check on a reflowed single-parameter signature (a real
+    # formatter can place `int64_t ne00` alone on the next line, wrapping
+    # right after `(`) and, worse, let a reflowed REDEFINITION slip past
+    # the negative check undetected (fail-open).
     assert (
-        rule_header.count(f"bool {PREDICATE}(int64_t ne00)") == 1
+        ws_count(rule_header, f"bool {PREDICATE}(int64_t ne00)") == 1
     ), f"{PREDICATE} must be defined exactly once, in q8-dense-layout-rule.hpp"
     for path, text in (("ggml-sycl.cpp", backend), ("unified-cache.cpp", cache)):
-        assert (
-            f"bool {PREDICATE}(int64_t" not in text
+        assert not ws_in(
+            text, f"bool {PREDICATE}(int64_t"
         ), f"{path} must not redefine {PREDICATE} -- it must call the shared helper"
 
 

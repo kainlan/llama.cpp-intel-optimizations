@@ -145,10 +145,12 @@ def ws_rfind(text, needle):
     return matches[-1].start() if matches else -1
 
 
-def ws_in(needle, text):
+def ws_in(text, needle):
     """Whitespace-flexible containment check: True iff `needle` (as a
     sequence of tokens) appears in `text` with any whitespace between
-    tokens, including a line wrap."""
+    tokens, including a line wrap. Argument order (text, needle) matches
+    ws_find/ws_rfind/ws_count in this same helper block (spec review nit,
+    rev-pktr-spec-6: this function alone used to take (needle, text))."""
     return ws_pattern(needle).search(text) is not None
 
 
@@ -354,7 +356,7 @@ def test_pick_kernel_for_layout_soa_case_is_gated():
     assign = soa_case.find("layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_SOA;")
     assert assign > 0, "pick_kernel_for_layout SOA case must be able to select ONEDNN_SOA"
     guard = soa_case[:assign]
-    assert ws_in("src0->type == GGML_TYPE_Q8_0", guard) and "ggml_sycl_q8_0_onednn_soa_enabled()" in guard, (
+    assert ws_in(guard, "src0->type == GGML_TYPE_Q8_0") and "ggml_sycl_q8_0_onednn_soa_enabled()" in guard, (
         "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the eligibility gate"
     )
     assert (
@@ -388,7 +390,7 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
     assert (
         helper_body.count("ggml_sycl_resolve(") == 1
     ), "the helper must call ggml_sycl_resolve() exactly once"
-    assert ws_in("resolved.on_device", helper_body), "the helper must require on_device before trusting .layout"
+    assert ws_in(helper_body, "resolved.on_device"), "the helper must require on_device before trusting .layout"
     op_body = function_body(backend, OP_SIG)
     call_pattern = re.compile(r"q8_0_dense_planned_layout\s*=\s*ggml_sycl_q8_0_dense_planned_layout\(")
     calls = list(call_pattern.finditer(op_body))
@@ -452,7 +454,7 @@ def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
         conds = enclosing_if_conditions(op_body, 0, m.start())
         assert conds, f"lookup {m.group(0)!r} at offset {m.start()} has no enclosing `if` guard at all"
         required = f"q8_0_dense_planned_layout == GGML_LAYOUT_{requested_layout}"
-        assert any(ws_in(required, c) for c in conds), (
+        assert any(ws_in(c, required) for c in conds), (
             f"lookup {m.group(0)!r} at offset {m.start()} requests {requested_layout} but no enclosing `if` "
             f"contains the exact equality {required!r} (found {len(conds)} enclosing guard(s): {conds!r})"
         )
@@ -483,7 +485,7 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     ), "the WoQ-execute env must not gate the outer guard (only the decline reasoning may reference it)"
     arm = before[guard_idx:]
     assert ws_in(
-        "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)", arm
+        arm, "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)"
     ), "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)"
     assert 'decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed"
     assert 'decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)"
@@ -502,8 +504,8 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     # non-null q8_0_soa_ptr implies the fallback dequant's addressing is valid
     # and the arm can never mint a second stored layout.
     assert ws_in(
-        "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {",
         arm,
+        "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(src0, GGML_LAYOUT_SOA, ctx.device)) {",
     ), "the SOA lookup must sit behind full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel"
     lookup = ws_find(arm, "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)")
     guard = ws_find(arm, "if (full_rows && k_blocked && ggml_sycl_can_use_layout_for_kernel(")
