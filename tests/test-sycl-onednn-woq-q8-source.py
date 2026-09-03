@@ -202,6 +202,36 @@ def test_pick_kernel_for_layout_soa_case_is_gated():
     ), "ONEDNN_SOA must be selected from exactly one branch of the SOA case"
 
 
+def test_planned_layout_decided_once_and_gates_both_lookups():
+    # llama.cpp-pktr spec-review fix (finding 1, rev-pktr-spec-1):
+    # ggml_sycl_get_weight_layout_ptr does not verify that what it returns
+    # matches the layout it was asked for, so a lookup's own success/failure
+    # must never stand in for "the planner chose this layout" -- in EITHER
+    # direction. The tensor's actual materialized layout must be decided
+    # ONCE from the registered layout info and used to gate both lookups.
+    op_body = function_body(backend, OP_SIG)
+    assert (
+        op_body.count("get_effective_layout_mode(q8_0_dense_extra)") == 1
+    ), "the planned layout must be read from the registered layout info exactly once"
+    decl_idx = op_body.find("q8_0_dense_planned_layout =")
+    assert decl_idx > 0, "q8_0_dense_planned_layout must be declared"
+    soa_guard_idx = op_body.find("q8_0_dense_planned_layout == GGML_LAYOUT_SOA")
+    coalesced_guard_idx = op_body.find("q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
+    assert 0 < decl_idx < soa_guard_idx, "the planned layout must be declared before the SOA lookup consults it"
+    assert 0 < decl_idx < coalesced_guard_idx, "the planned layout must be declared before the COALESCED lookup consults it"
+    # Neither lookup's guard may use the OTHER lookup's own pointer result as
+    # a proxy for what the planner chose.
+    soa_guard_line = op_body[op_body.rfind("\n", 0, soa_guard_idx) : op_body.find("\n", soa_guard_idx)]
+    coalesced_guard_line = op_body[
+        op_body.rfind("\n", 0, coalesced_guard_idx) : op_body.find("\n", coalesced_guard_idx)
+    ]
+    assert "q8_0_coalesced_ptr" not in soa_guard_line, "the SOA lookup's guard must not reference q8_0_coalesced_ptr"
+    assert "q8_0_soa_ptr" not in coalesced_guard_line, (
+        "the COALESCED lookup's guard must not reference q8_0_soa_ptr -- a planned-SOA weight whose SOA lookup "
+        "declined must not fall through to a COALESCED lookup"
+    )
+
+
 def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     assert backend.count("DnnlGemmWrapper::woq_gemm_q8_0(") == 1, "woq_gemm_q8_0 must be called from exactly one site"
     op_body = function_body(backend, OP_SIG)
@@ -210,15 +240,20 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     before = op_body[:call]
     # llama.cpp-pktr: the outer guard no longer requires the WoQ-execute env --
     # the SOA-plane lookup must run whenever the arm is reached (Q8_0,
-    # row_diff > 0, contiguous), so the fallback dequant further down this
-    # function can address q8_0_soa_ptr correctly regardless of whether the
-    # WoQ int8-plane primitive itself is opted into.
-    guard_idx = before.rfind("if (!used_woq && src0->type == GGML_TYPE_Q8_0 && row_diff > 0 &&")
-    assert guard_idx > 0, "the arm must be guarded by `!used_woq && Q8_0 && row_diff > 0 && ...` (no env in the outer guard)"
-    outer_guard_line_end = before.find(")", guard_idx)
+    # planned SOA, row_diff > 0, contiguous), so the fallback dequant further
+    # down this function can address q8_0_soa_ptr correctly regardless of
+    # whether the WoQ int8-plane primitive itself is opted into.
+    guard_idx = before.rfind(
+        "if (!used_woq && src0->type == GGML_TYPE_Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA &&"
+    )
+    assert guard_idx > 0, (
+        "the arm must be guarded by `!used_woq && Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA && ...` "
+        "(no WoQ-execute env in the outer guard)"
+    )
+    outer_guard_end = before.find(") {", guard_idx)
     assert (
-        "ggml_sycl_onednn_woq_q8_enabled()" not in before[guard_idx:outer_guard_line_end]
-    ), "the WoQ-execute env must not gate the outer guard (only the SOA-plane lookup + decline reasoning may reference it)"
+        "ggml_sycl_onednn_woq_q8_enabled()" not in before[guard_idx:outer_guard_end]
+    ), "the WoQ-execute env must not gate the outer guard (only the decline reasoning may reference it)"
     arm = before[guard_idx:]
     assert (
         "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)" in arm
@@ -269,9 +304,17 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     assert re.search(
         r"if \(q8_0_soa_ptr\) \{[^{}]*dequantize_row_q8_0_soa_to_fp16_rowmajor\(q8_0_soa_ptr", after
     ), "the SOA dequant fallback must be the body of `if (q8_0_soa_ptr) {`"
+    coalesced_guard_start = after.find("if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED")
+    assert coalesced_guard_start > 0, "the COALESCED lookup must be gated by the planned layout"
+    coalesced_guard_end = after.find(") {", coalesced_guard_start)
+    coalesced_guard_text = after[coalesced_guard_start:coalesced_guard_end]
     assert (
-        "if (!q8_0_soa_ptr && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {" in after
-    ), "the COALESCED lookup must be skipped for a SOA-planned weight"
+        "ggml_sycl_q8_0_onednn_coalesced_enabled()" in coalesced_guard_text
+    ), "the COALESCED lookup must also still consult its own opt-out env"
+    assert "q8_0_soa_ptr" not in coalesced_guard_text, (
+        "the COALESCED lookup must not be gated by whether the SOA lookup declined -- not by whether the SOA "
+        "lookup succeeded either"
+    )
 
 
 def test_scale_staging_has_exactly_one_producer():

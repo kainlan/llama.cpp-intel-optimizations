@@ -21919,11 +21919,18 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
 // GGML_LAYOUT_AOS` dense path instead, which charges AOS bytes == SOA bytes,
 // so nothing drifts against the runtime's SOA choice for the head.
 //
-// llama.cpp-pktr: this IS load-bearing for ATTENTION_WEIGHT/FFN_WEIGHT.
-// Unlike token_embd/output.weight, per-layer dense weights carry
-// `entry.layer_id >= 0`, and the entry overload's dense re-placement caller
-// (add_no_p2p_candidate_dense_alternates, `entry.layer_id < 0 ||
-// entry.expert_id >= 0` skip) reaches this function for them. Before this task
+// llama.cpp-pktr: this IS load-bearing for ATTENTION_WEIGHT/FFN_WEIGHT, in
+// MULTI-DEVICE planning specifically. Unlike token_embd/output.weight,
+// per-layer dense weights carry `entry.layer_id >= 0`, and the entry
+// overload's dense re-placement caller (add_no_p2p_candidate_dense_alternates,
+// `entry.layer_id < 0 || entry.expert_id >= 0` skip) reaches this function
+// for them -- but only when it itself runs, which is gated on
+// `use_cohesive_no_p2p_moe && n_layers > 0 && device_budgets.size() > 1`
+// (spec review finding 5, rev-pktr-spec-1: the earlier wording here implied
+// this ran unconditionally). On a single-device plan this caller is never
+// invoked, so the two chokepoints agreeing there is an accident of that path
+// not calling this function at all, not evidence the fix is unneeded --
+// keep the mirror for when it does run. Before this task
 // ggml_sycl_adjust_layout_for_tensor's tile-alignment net did not cover
 // ATTENTION_WEIGHT/FFN_WEIGHT either, so both chokepoints agreed
 // (COALESCED). Now that the runtime chokepoint demotes non-tile-aligned Q8_0
