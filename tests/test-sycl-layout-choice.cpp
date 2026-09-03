@@ -1705,6 +1705,116 @@ static bool run_tied_embedding_output_layout_test() {
     return true;
 }
 
+// llama.cpp-pktr: the os8k tile-alignment net (EMBEDDING/OUTPUT_WEIGHT only)
+// extended to dense ATTENTION_WEIGHT/FFN_WEIGHT Q8_0 projections. A
+// tile-misaligned row (gemma4-E4B's K=2560 gate/up/q/k/v/o -- 80 blocks/row,
+// not a multiple of the 32-block coalesced tile) must resolve SOA; a
+// tile-aligned row (Mistral's K=4096/14336) must stay COALESCED.
+// device=-1 is safe here: the Q8_0 dense-usage branch this test exercises
+// never reads ggml_sycl_info().devices[device] (only the MXFP4/XMX branches
+// above it do, and this test never resolves to those), the same property
+// run_tied_embedding_output_layout_test() above already relies on.
+static bool run_dense_attention_ffn_layout_test() {
+    auto make_dense_weight = [](const char * name, int64_t ne00, int64_t ne01) {
+        ggml_tensor t{};
+        t.type  = GGML_TYPE_Q8_0;
+        t.ne[0] = ne00;
+        t.ne[1] = ne01;
+        t.ne[2] = 1;
+        t.ne[3] = 1;
+        ggml_set_name(&t, name);
+        return t;
+    };
+
+    // gemma4-E4B q/k/v/o and gate/up (K=2560, 80 blocks/row): NOT a multiple
+    // of MMVQ_COALESCED_TILE_BLOCKS (32) -- must resolve SOA.
+    {
+        ggml_tensor attn_q = make_dense_weight("blk.0.attn_q.weight", 2560, 2048);
+        if (infer_tensor_usage(attn_q.name) != tensor_usage::ATTENTION_WEIGHT) {
+            printf("FAIL: blk.0.attn_q.weight must infer as ATTENTION_WEIGHT\n");
+            return false;
+        }
+        const layout_mode attn_q_layout =
+            ggml_sycl_adjust_layout_for_tensor(&attn_q, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (attn_q_layout != GGML_LAYOUT_SOA) {
+            printf(
+                "FAIL: Q8_0 ATTENTION_WEIGHT with ne00=2560 (80 blocks/row, tile-misaligned) must resolve SOA, "
+                "got %d\n",
+                (int) attn_q_layout);
+            return false;
+        }
+
+        ggml_tensor ffn_gate = make_dense_weight("blk.0.ffn_gate.weight", 2560, 10240);
+        if (infer_tensor_usage(ffn_gate.name) != tensor_usage::FFN_WEIGHT) {
+            printf("FAIL: blk.0.ffn_gate.weight must infer as FFN_WEIGHT\n");
+            return false;
+        }
+        const layout_mode ffn_gate_layout =
+            ggml_sycl_adjust_layout_for_tensor(&ffn_gate, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (ffn_gate_layout != GGML_LAYOUT_SOA) {
+            printf(
+                "FAIL: Q8_0 FFN_WEIGHT with ne00=2560 (80 blocks/row, tile-misaligned) must resolve SOA, "
+                "got %d\n",
+                (int) ffn_gate_layout);
+            return false;
+        }
+    }
+
+    // Mistral 7B attn/ffn (K=4096, 128 blocks/row) and ffn (K=14336, 448
+    // blocks/row): both exact multiples of 32 -- must stay COALESCED.
+    {
+        ggml_tensor       attn_q = make_dense_weight("blk.0.attn_q.weight", 4096, 4096);
+        const layout_mode attn_q_layout =
+            ggml_sycl_adjust_layout_for_tensor(&attn_q, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (attn_q_layout != GGML_LAYOUT_COALESCED) {
+            printf(
+                "FAIL: Q8_0 ATTENTION_WEIGHT with ne00=4096 (128 blocks/row, tile-aligned) must stay COALESCED, "
+                "got %d\n",
+                (int) attn_q_layout);
+            return false;
+        }
+
+        ggml_tensor       ffn_down = make_dense_weight("blk.0.ffn_down.weight", 14336, 4096);
+        const layout_mode ffn_down_layout =
+            ggml_sycl_adjust_layout_for_tensor(&ffn_down, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (ffn_down_layout != GGML_LAYOUT_COALESCED) {
+            printf(
+                "FAIL: Q8_0 FFN_WEIGHT with ne00=14336 (448 blocks/row, tile-aligned) must stay COALESCED, "
+                "got %d\n",
+                (int) ffn_down_layout);
+            return false;
+        }
+    }
+
+    // Regression guard: EMBEDDING/OUTPUT_WEIGHT behaviour from
+    // run_tied_embedding_output_layout_test() above must be unaffected by
+    // widening the usage set this branch checks.
+    {
+        ggml_tensor       vocab_embd = make_dense_weight("token_embd.weight", 2560, 262144);
+        const layout_mode vocab_layout =
+            ggml_sycl_adjust_layout_for_tensor(&vocab_embd, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (vocab_layout != GGML_LAYOUT_SOA) {
+            printf("FAIL: canonical tied token_embd.weight (K=2560) must still resolve SOA, got %d\n",
+                   (int) vocab_layout);
+            return false;
+        }
+
+        ggml_tensor       output_w = make_dense_weight("output.weight", 4096, 32000);
+        const layout_mode output_layout =
+            ggml_sycl_adjust_layout_for_tensor(&output_w, GGML_LAYOUT_COALESCED, /*device=*/-1);
+        if (output_layout != GGML_LAYOUT_COALESCED) {
+            printf("FAIL: OUTPUT_WEIGHT with ne00=4096 (tile-aligned) must stay COALESCED, got %d\n",
+                   (int) output_layout);
+            return false;
+        }
+    }
+
+    printf(
+        "PASS: dense Q8_0 ATTENTION_WEIGHT/FFN_WEIGHT tile-alignment rule (SOA when misaligned, COALESCED when "
+        "aligned), EMBEDDING/OUTPUT_WEIGHT unchanged\n");
+    return true;
+}
+
 // llama.cpp-o3h1: unit coverage for compute_vram_budget_authority(), THE
 // single source of truth six previously-independent sites (placement
 // planning, arena_reserve()'s physical budget, arena_reserve()'s own since-
@@ -1996,6 +2106,9 @@ int main() {
         return 1;
     }
     if (!run_tied_embedding_output_layout_test()) {
+        return 1;
+    }
+    if (!run_dense_attention_ffn_layout_test()) {
         return 1;
     }
     if (!run_resource_exhaustion_error_code_test()) {

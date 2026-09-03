@@ -1,17 +1,35 @@
 #!/usr/bin/env python3
-"""Source gate for llama.cpp-nz1k (prefill L2b phase 1): the Q8_0 SOA oneDNN
-WoQ-int8 PP arm must be reachable ONLY with GGML_SYCL_ONEDNN_WOQ_Q8=1 AND a
-Q8_0 weight the planner materialized SOA -- which for dense projections
-requires GGML_SYCL_Q8_DENSE_LAYOUT=soa (an already-SOA weight, e.g. a
-tile-misaligned Q8_0 head, takes the arm under WOQ_Q8=1 alone). The arm must
-apply the codebase's standard eligibility predicate
-(ggml_sycl_can_use_layout_for_kernel) before its single lookup, that lookup
-must be the only writer of q8_0_soa_ptr, and both env vars must default OFF.
+"""Source gate for llama.cpp-nz1k (prefill L2b phase 1), extended by
+llama.cpp-pktr for the ONEDNN_SOA kernel-choice eligibility split.
 
-Ruling 9 / nz1k c-c4jp: phase 1 stages the scale plane per call, which is an
-opt-in interim only; the default is decided on llama.cpp-2zsc with the A/B
-numbers. This file exists so a quiet default flip, or a new eligibility site
-for ONEDNN_SOA that forgets the env gate, fails a test instead of shipping.
+Two SEPARATE gates now apply to the Q8_0 SOA oneDNN path, and this file
+checks both:
+
+  1. KERNEL-CHOICE ELIGIBILITY (llama.cpp-pktr): whether ONEDNN_SOA may be
+     selected at all is gated by ggml_sycl_q8_0_onednn_soa_enabled()
+     (GGML_SYCL_Q8_ONEDNN_SOA), which defaults ON -- the pktr per-weight
+     layout rule now materializes tile-misaligned dense Q8_0 rows SOA at
+     default env (e.g. gemma4-E4B's K=2560 head), and those PP batches need a
+     route to oneDNN GEMM parity, not MMQ_SOA at ~3 TFLOPS.
+  2. WOQ-INT8 EXECUTE (llama.cpp-nz1k, unchanged): whether the int8-plane
+     WoQ primitive itself runs, inside ggml_sycl_op_mul_mat_sycl, is still
+     gated by ggml_sycl_onednn_woq_q8_enabled() (GGML_SYCL_ONEDNN_WOQ_Q8),
+     default OFF (ruling 9 / nz1k c-c4jp: phase 1 stages the scale plane per
+     call, an opt-in interim only; the default is decided on llama.cpp-2zsc
+     with the A/B numbers). With it off, an ONEDNN_SOA-selected batch still
+     reaches oneDNN PP through the SOA-aware f16 dequant + row_gemm fallback
+     in the same function -- so the SOA-plane LOOKUP (writing q8_0_soa_ptr)
+     must run whenever the arm is reached, unconditional of the WoQ env; only
+     the prepare/stage/execute of the WoQ primitive is gated by it.
+
+The lookup must apply the codebase's standard eligibility predicate
+(ggml_sycl_can_use_layout_for_kernel) before its single lookup, that lookup
+must be the only writer of q8_0_soa_ptr, and both env vars must default as
+stated above.
+
+This file exists so a quiet default flip, or a new eligibility site for
+ONEDNN_SOA that forgets the correct env gate, fails a test instead of
+shipping.
 
 Runs under pytest (llama_test_pytest registration) and as a plain script.
 Point it at alternate copies (to exercise the RED path with a deliberately
@@ -31,6 +49,7 @@ backend = BACKEND.read_text()
 common = COMMON.read_text()
 
 ARM_SIG = "static bool ggml_sycl_onednn_woq_q8_enabled() {"
+SOA_ELIGIBILITY_SIG = "static bool ggml_sycl_q8_0_onednn_soa_enabled() {"
 OP_SIG = "inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,"
 PICK_SIG = "auto pick_kernel_for_layout = [&](layout_mode layout) -> std::optional<ggml_sycl_mul_mat_kernel> {"
 GET_OPTIMAL_SIG = "static layout_mode get_optimal(ggml_type qtype, tensor_usage usage, int device_id = -1) {"
@@ -105,6 +124,18 @@ def test_arm_env_accessor_exists_once_and_defaults_off():
     ), "GGML_SYCL_ONEDNN_WOQ_Q8 must default OFF (unset => 0); ruling 9 / nz1k c-c4jp"
 
 
+def test_soa_eligibility_accessor_exists_once_and_defaults_on():
+    # llama.cpp-pktr: separate accessor for whether ONEDNN_SOA may be chosen
+    # at all, distinct from the WoQ-execute accessor above. Mirrors
+    # ggml_sycl_q8_0_onednn_coalesced_enabled's default-ON pattern.
+    assert backend.count(SOA_ELIGIBILITY_SIG) == 1, "ggml_sycl_q8_0_onednn_soa_enabled must be defined exactly once"
+    body = function_body(backend, SOA_ELIGIBILITY_SIG)
+    assert 'std::getenv("GGML_SYCL_Q8_ONEDNN_SOA")' in body, "SOA eligibility accessor must read GGML_SYCL_Q8_ONEDNN_SOA"
+    assert (
+        "(env == nullptr || std::atoi(env) != 0) ? 1 : 0" in body
+    ), "GGML_SYCL_Q8_ONEDNN_SOA must default ON (unset => 1; env==nullptr short-circuits atoi)"
+
+
 def test_layout_env_defaults_coalesced_and_only_touches_dense_projections():
     assert 'std::getenv("GGML_SYCL_Q8_DENSE_LAYOUT")' in common, "common.hpp must read GGML_SYCL_Q8_DENSE_LAYOUT"
     assert (
@@ -123,9 +154,11 @@ def test_layout_env_defaults_coalesced_and_only_touches_dense_projections():
 
 def test_every_onednn_soa_selection_site_consults_the_env_gate():
     # Four `case ONEDNN_SOA:` sites: kernel-name table, override check,
-    # preferred-kernel selection, dispatch. The two SELECTION sites must consult
-    # the env gate; the name table and the dispatch arm (which executes an
-    # already-selected kernel) do not.
+    # preferred-kernel selection, dispatch. llama.cpp-pktr: the two SELECTION
+    # sites must consult the KERNEL-CHOICE ELIGIBILITY gate
+    # (ggml_sycl_q8_0_onednn_soa_enabled, default ON) -- NOT the WoQ-execute
+    # gate, which they must no longer reference at all; the name table and the
+    # dispatch arm (which executes an already-selected kernel) consult neither.
     case_sites = [m.start() for m in re.finditer(r"case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:", backend)]
     assert len(case_sites) == 4, (
         f"expected 4 `case ONEDNN_SOA:` sites (name table, override check, preferred selection, dispatch), "
@@ -135,7 +168,10 @@ def test_every_onednn_soa_selection_site_consults_the_env_gate():
     for start in case_sites:
         end = re.search(r"\n\s*(case |default:)", backend[start + 10 :])
         body = backend[start : start + 10 + (end.start() if end else 800)]
-        if "ggml_sycl_onednn_woq_q8_enabled()" in body:
+        if "ggml_sycl_q8_0_onednn_soa_enabled()" in body:
+            assert (
+                "ggml_sycl_onednn_woq_q8_enabled()" not in body
+            ), "a kernel-choice ELIGIBILITY site must not also reference the WoQ-EXECUTE gate"
             kinds["gated"] += 1
         elif "ggml_sycl_op_mul_mat<no_quantize_q8_1>" in body:
             kinds["dispatch"] += 1
@@ -153,9 +189,17 @@ def test_pick_kernel_for_layout_soa_case_is_gated():
     assert assign > 0, "pick_kernel_for_layout SOA case must be able to select ONEDNN_SOA"
     guard = soa_case[:assign]
     assert (
-        "src0->type == GGML_TYPE_Q8_0" in guard and "ggml_sycl_onednn_woq_q8_enabled()" in guard
-    ), "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the env gate"
-    assert soa_case.count("ONEDNN_SOA") == 1, "ONEDNN_SOA must be selected from exactly one branch of the SOA case"
+        "src0->type == GGML_TYPE_Q8_0" in guard and "ggml_sycl_q8_0_onednn_soa_enabled()" in guard
+    ), "pick_kernel_for_layout's ONEDNN_SOA choice must be guarded by Q8_0 && the eligibility gate"
+    assert (
+        "ggml_sycl_onednn_woq_q8_enabled()" not in guard
+    ), "pick_kernel_for_layout's ONEDNN_SOA choice must not also require the WoQ-execute gate"
+    # Qualified enum reference, not bare "ONEDNN_SOA": llama.cpp-pktr's env
+    # var GGML_SYCL_Q8_ONEDNN_SOA also contains that substring, so a comment
+    # naming the env var would otherwise double-count and false-fail this.
+    assert (
+        soa_case.count("ggml_sycl_mul_mat_kernel::ONEDNN_SOA") == 1
+    ), "ONEDNN_SOA must be selected from exactly one branch of the SOA case"
 
 
 def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
@@ -164,14 +208,33 @@ def test_single_gemm_call_site_consumes_the_soa_plane_and_declines_safely():
     call = op_body.find("DnnlGemmWrapper::woq_gemm_q8_0(")
     assert call > 0, "the woq_gemm_q8_0 call must live in ggml_sycl_op_mul_mat_sycl"
     before = op_body[:call]
-    guard_idx = before.rfind("if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled()")
-    assert guard_idx > 0, "the arm must be guarded by `!used_woq && Q8_0 && ggml_sycl_onednn_woq_q8_enabled()`"
+    # llama.cpp-pktr: the outer guard no longer requires the WoQ-execute env --
+    # the SOA-plane lookup must run whenever the arm is reached (Q8_0,
+    # row_diff > 0, contiguous), so the fallback dequant further down this
+    # function can address q8_0_soa_ptr correctly regardless of whether the
+    # WoQ int8-plane primitive itself is opted into.
+    guard_idx = before.rfind("if (!used_woq && src0->type == GGML_TYPE_Q8_0 && row_diff > 0 &&")
+    assert guard_idx > 0, "the arm must be guarded by `!used_woq && Q8_0 && row_diff > 0 && ...` (no env in the outer guard)"
+    outer_guard_line_end = before.find(")", guard_idx)
+    assert (
+        "ggml_sycl_onednn_woq_q8_enabled()" not in before[guard_idx:outer_guard_line_end]
+    ), "the WoQ-execute env must not gate the outer guard (only the SOA-plane lookup + decline reasoning may reference it)"
     arm = before[guard_idx:]
     assert (
         "ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_SOA)" in arm
     ), "the arm must consume the SOA-materialized plane (GGML_LAYOUT_SOA lookup)"
     assert 'decline = "soa_plane_not_resident"' in arm, "a missing SOA plane must decline, not proceed"
     assert 'decline = "no_pp_scratch"' in arm, "scales must be staged only into the existing PP scratch (ruling 1)"
+    # llama.cpp-pktr: with the WoQ-execute env off but a resident SOA plane,
+    # the arm must decline with a reason that says so -- NOT
+    # "soa_plane_not_resident" (the plane WAS found) and not silent success.
+    assert 'decline = "woq_disabled"' in arm, "WoQ execute disabled with a resident SOA plane must decline distinctly"
+    assert (
+        arm.find('decline = "soa_plane_not_resident"') < arm.find('decline = "woq_disabled"') < arm.find('decline = "no_pp_scratch"')
+    ), "decline reasons must be checked in order: plane residency, then WoQ opt-in, then scratch availability"
+    assert (
+        "ggml_sycl_onednn_woq_q8_enabled()" in arm
+    ), "the WoQ-execute gate must still be consulted somewhere in the arm (the woq_disabled decline)"
     # Structural invariant: the SOA plane is looked up only behind the
     # non-materializing predicate AND the full-rows / K-blocked tests, so a
     # non-null q8_0_soa_ptr implies the fallback dequant's addressing is valid

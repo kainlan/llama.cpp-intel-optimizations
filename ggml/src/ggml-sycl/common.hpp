@@ -25,6 +25,7 @@
 #include "moe-route-table.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
+#include "q8-dense-layout-rule.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
 #include "tensor-types.hpp"
@@ -37,6 +38,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -49,7 +51,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <exception>
 
 struct ggml_backend_sycl_context;
 bool ggml_sycl_retire_moe_graph_epoch(ggml_backend_sycl_context * ctx) noexcept;
@@ -783,6 +784,19 @@ static inline size_t ggml_sycl_q8_0_coalesced_row_quants_bytes(int blocks_per_ro
     return static_cast<size_t>(ggml_sycl_coalesced_fixed_tile_count(blocks_per_row)) *
            static_cast<size_t>(MMVQ_COALESCED_TILE_BYTES_Q8_0);
 }
+
+// llama.cpp-pktr: ggml_sycl_q8_0_coalesced_tile_aligned() -- the Q8_0
+// dense-weight coalesced/SOA tile-alignment predicate -- lives in
+// q8-dense-layout-rule.hpp (included above) so a host-only unit test can
+// exercise it without a SYCL toolchain (same pattern as q8-scale-plane.hpp
+// for the nz1k scale-plane index math). That header keeps its own local
+// copies of QK8_0 and MMVQ_COALESCED_TILE_BLOCKS to stay free of ggml/SYCL
+// includes; assert here, where both the canonical values and the header are
+// visible, that they have not drifted apart.
+static_assert(GGML_SYCL_Q8_DENSE_LAYOUT_RULE_QK == QK8_0,
+              "q8-dense-layout-rule.hpp's local QK copy no longer matches QK8_0");
+static_assert(GGML_SYCL_Q8_DENSE_LAYOUT_RULE_TILE_BLOCKS == MMVQ_COALESCED_TILE_BLOCKS,
+              "q8-dense-layout-rule.hpp's local tile-blocks copy no longer matches MMVQ_COALESCED_TILE_BLOCKS");
 
 // Variable tile decomposition helpers (power-of-2, largest first, max 32)
 // Used for Q6_K coalesced layout to support arbitrary block counts

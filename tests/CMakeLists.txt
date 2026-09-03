@@ -2646,6 +2646,18 @@ llama_build_and_test(test-sycl-q8-scale-plane-index.cpp)
 target_include_directories(test-sycl-q8-scale-plane-index PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 set_tests_properties(test-sycl-q8-scale-plane-index PROPERTIES LABELS "main;sycl;quant;soa;host")
 
+# llama.cpp-pktr: the Q8_0 dense-weight coalesced/SOA tile-alignment predicate
+# (ggml/src/ggml-sycl/q8-dense-layout-rule.hpp) that
+# ggml_sycl_adjust_layout_for_tensor and planner_default_device_layout both
+# call to pick SOA for a tile-misaligned dense Q8_0 row (e.g. gemma4-E4B's
+# K=2560 head) and COALESCED otherwise (Mistral K=4096/14336, gemma4
+# K=10240/2048). Checked against an independent reference over an exhaustive
+# sweep. Pure C++ -- no SYCL, no device, no ggml link -- so it runs in every
+# sweep at any parallelism. Labelled like the other host-only quant tests.
+llama_build_and_test(test-sycl-q8-dense-layout-rule.cpp)
+target_include_directories(test-sycl-q8-dense-layout-rule PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+set_tests_properties(test-sycl-q8-dense-layout-rule PROPERTIES LABELS "main;sycl;quant;soa;host")
+
 # llama.cpp-nz1k: source gate -- the WoQ-Q8 arm (ONEDNN_SOA) is reachable only
 # with GGML_SYCL_ONEDNN_WOQ_Q8=1 and a Q8_0 weight the planner materialized SOA
 # (dense projections: GGML_SYCL_Q8_DENSE_LAYOUT=soa), applies the codebase's
@@ -2656,6 +2668,22 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-onednn-woq-q8-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-woq-q8-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-pktr: source gate -- the Q8_0 dense-weight coalesced/SOA
+# tile-alignment predicate must be defined exactly once
+# (q8-dense-layout-rule.hpp) and every chokepoint that resolves a dense Q8_0
+# weight's layout (ggml_sycl_adjust_layout_for_tensor's runtime resolution,
+# both overloads of planner_default_device_layout's planning-time resolution)
+# must call it rather than re-deriving the alignment arithmetic inline.
+# Host-only, reads the sources as text. Same registration shape as
+# test-sycl-onednn-woq-q8-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-q8-dense-layout-rule-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-q8-dense-layout-rule-source.py
         LABEL "sycl;source;host"
         TIMEOUT 30)
 endif()
