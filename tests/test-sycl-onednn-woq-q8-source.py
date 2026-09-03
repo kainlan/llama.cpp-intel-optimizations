@@ -311,10 +311,20 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
     # to the plain AOS dequant on bytes that were actually COALESCED:
     # `1, 2, 3, 4, 5,###############` on the B50 at default env. The planned
     # layout must instead come from ggml_sycl_resolve(src0, ctx.device) --
-    # the SAME resolution ggml_sycl_op_mul_mat itself used.
+    # NOT literally the identical resolution ggml_sycl_op_mul_mat uses for a
+    # weight (that function's own src0_dd resolution takes an inline
+    # direct-handle consult; ggml_sycl_resolve is only its non-weight
+    # else-branch, though it agrees with the direct-handle path on the
+    # common resolve-exact/host-AOS cases -- see the declaration's own
+    # comment for the residual "layout_ptr" divergence, tracked separately
+    # on llama.cpp-ftnh).
     op_body = function_body(backend, OP_SIG)
-    resolved_var_idx = op_body.find("q8_0_dense_resolved = ggml_sycl_resolve(src0, ctx.device)")
-    assert resolved_var_idx > 0, "q8_0_dense_resolved must be assigned from ggml_sycl_resolve(src0, ctx.device)"
+    resolved_var_idx = op_body.find("q8_0_dense_resolved =")
+    assert resolved_var_idx > 0, "q8_0_dense_resolved must be declared"
+    resolved_stmt_end = op_body.find(";", resolved_var_idx)
+    assert (
+        "ggml_sycl_resolve(src0, ctx.device)" in op_body[resolved_var_idx:resolved_stmt_end]
+    ), "q8_0_dense_resolved must be assigned from ggml_sycl_resolve(src0, ctx.device)"
     decl_idx = op_body.find("q8_0_dense_planned_layout =")
     assert decl_idx > 0, "q8_0_dense_planned_layout must be declared"
     assert resolved_var_idx < decl_idx, "the ggml_sycl_resolve call must precede the planned-layout declaration"
@@ -365,6 +375,13 @@ def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
     # `if` (possibly several levels up, not just its immediate parent --
     # the SOA lookup's own immediate guard is an unrelated full_rows/
     # k_blocked predicate) that references q8_0_dense_planned_layout.
+    # rev-pktr-spec-3 finding 3: checking only that some enclosing `if`
+    # CONTAINS the variable name is directionally blind -- a mutant gating
+    # the fp32 lookup on `q8_0_dense_planned_layout != GGML_LAYOUT_SOA`
+    # (wrong operator, wrong constant) passed the earlier form of this
+    # test. Require the SPECIFIC equality each lookup needs: the target
+    # layout it requests must equal the requested constant in an enclosing
+    # condition, via `==` (not `!=`, `<`, or anything else).
     op_body = function_body(backend, OP_SIG)
     lookup_pattern = re.compile(r"ggml_sycl_get_weight_layout_ptr\(src0, ctx\.device, GGML_LAYOUT_(SOA|COALESCED)\)")
     matches = list(lookup_pattern.finditer(op_body))
@@ -373,11 +390,13 @@ def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
         f"the dkw0 fp32-branch COALESCED), found {len(matches)}"
     )
     for m in matches:
+        requested_layout = m.group(1)  # "SOA" or "COALESCED"
         conds = enclosing_if_conditions(op_body, 0, m.start())
         assert conds, f"lookup {m.group(0)!r} at offset {m.start()} has no enclosing `if` guard at all"
-        assert any("q8_0_dense_planned_layout" in c for c in conds), (
-            f"lookup {m.group(0)!r} at offset {m.start()} is not gated by q8_0_dense_planned_layout in any "
-            f"enclosing `if` (found {len(conds)} enclosing guard(s), none mentioning it)"
+        required = f"q8_0_dense_planned_layout == GGML_LAYOUT_{requested_layout}"
+        assert any(required in c for c in conds), (
+            f"lookup {m.group(0)!r} at offset {m.start()} requests {requested_layout} but no enclosing `if` "
+            f"contains the exact equality {required!r} (found {len(conds)} enclosing guard(s): {conds!r})"
         )
 
 

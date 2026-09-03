@@ -42399,32 +42399,66 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
     // planner chose this layout" has the same failure mode in the other
     // direction. Decide the tensor's ACTUAL materialized layout ONCE -- but
     // round 1 read that from get_effective_layout_mode(src0->extra), which
-    // is NOT guaranteed to agree with what ggml_sycl_op_mul_mat already
-    // resolved to hand this function src0_dd_i in the first place
-    // (ggml_sycl_resolve(src0, i), called by ggml_sycl_op_mul_mat before
-    // dispatching here). extra->layout.mode has exactly two writers: the
-    // CPU-side set_tensor reorder path (skipped when the model buffer is
-    // host-pinned) and ggml_sycl_update_layout_from_cache, which is itself
-    // reached ONLY from inside ggml_sycl_get_weight_layout_ptr -- so for a
-    // weight the unified cache's S1-PRELOAD staged straight to a COALESCED
-    // device plane (unified_cache_direct_stage_weight, never touching
-    // extra), extra->layout.mode sits at its GGML_LAYOUT_AOS default until
+    // is NOT guaranteed to agree with what src0_dd_i was actually bound to.
+    // extra->layout.mode has exactly two writers: the CPU-side set_tensor
+    // reorder path (skipped when the model buffer is host-pinned) and
+    // ggml_sycl_update_layout_from_cache, which is itself reached ONLY from
+    // inside ggml_sycl_get_weight_layout_ptr -- so for a weight the unified
+    // cache's S1-PRELOAD staged straight to a COALESCED device plane
+    // (unified_cache_direct_stage_weight, never touching extra),
+    // extra->layout.mode sits at its GGML_LAYOUT_AOS default until
     // something calls that getter for it; round 1's fix gated the ONLY
     // caller that would have populated it behind a check of that same
     // stale field -- a chicken-and-egg deadlock that read AOS forever for
     // such a weight, skipped BOTH the SOA and COALESCED lookups, and fell
     // through to the plain AOS dequant on bytes that were actually
-    // COALESCED: garbage. Read the SAME resolution ggml_sycl_op_mul_mat
-    // used (ggml_sycl_resolve, not the extra's lazily-updated cache field),
-    // and require on_device (this dequant-scratch path only ever looks up
-    // device/shared USM pointers; a host-resident weight should not be
-    // routed here at all under "placement decides the executor"). If the
-    // resolve is unavailable or genuinely AOS, fall back to GGML_LAYOUT_AOS
-    // -- every Q8_0-specific lookup below stays skipped and execution
-    // reaches the pre-nz1k / pre-dkw0 generic AOS dequant unchanged, which
-    // is correct exactly when the weight really is AOS.
-    const ggml_sycl::resolved_ptr q8_0_dense_resolved = ggml_sycl_resolve(src0, ctx.device);
-    const layout_mode             q8_0_dense_planned_layout =
+    // COALESCED: garbage.
+    //
+    // Read ggml_sycl_resolve()'s .layout for (src0, ctx.device) instead
+    // (round 2, corrected round 4, rev-pktr-spec-3 finding 1): NOT literally "the
+    // same resolution ggml_sycl_op_mul_mat used", as an earlier version of
+    // this comment claimed. For a weight, ggml_sycl_op_mul_mat consults an
+    // INLINE direct-handle read (`handle.resolve(i)` under
+    // ggml_sycl_direct_handle_trust_ok, this file's src0_dd resolution
+    // block) -- ggml_sycl_resolve() is only its non-weight else-branch.
+    // ggml_sycl_resolve() itself does strictly more for a weight (the same
+    // handle fast path, plus a COALESCED-compatibility check, plus its own
+    // cache->get_weight_ptr() slow path), so the two AGREE on the
+    // resolve-exact fast path (both read the same data_handle[device]) and
+    // on host-AOS resolution. The one residual case where they can diverge
+    // is ggml_sycl_op_mul_mat's own "layout_ptr" fallback branch (src0_dd_i
+    // populated from ggml_sycl_get_weight_layout_ptr(src0, i, src0_layout)
+    // directly, bypassing ggml_sycl_resolve() entirely) and any
+    // multi-device/TP-buffer src0_dd_i source -- there, this function's own
+    // fresh ggml_sycl_resolve() call could in principle read a different
+    // cache state than what actually populated src0_dd_i. Structurally
+    // closing that gap (making both call sites share one resolution) is
+    // tracked on llama.cpp-ftnh, not fixed here. Require on_device (this
+    // dequant-scratch path only ever looks up device/shared USM pointers; a
+    // host-resident weight should not be routed here at all under
+    // "placement decides the executor"). If the resolve is unavailable or
+    // genuinely AOS, fall back to GGML_LAYOUT_AOS -- every Q8_0-specific
+    // lookup below stays skipped and execution reaches the pre-nz1k /
+    // pre-dkw0 generic AOS dequant unchanged, which is correct exactly when
+    // the weight really is AOS.
+    //
+    // Scoped to Q8_0 (round 4, rev-pktr-spec-3 finding 5 -- a candidate
+    // mechanism for a measured gemma4 pp512 dip): unscoped, this call ran
+    // for every src0 type on every dispatch through this function
+    // (F16/F32/Q4_0/...), and for a NON-weight src0 it reaches
+    // ggml_sycl_resolve()'s non-weight branch (common.hpp), which takes the
+    // unified cache's exclusive rw_mutex_ and may call
+    // ggml_sycl_refresh_cached_input_ptr, plus retains a lease for the rest
+    // of this function -- all wasted work for a type none of the three
+    // Q8_0-specific lookups below will ever consult. The row_diff > 0 /
+    // ggml_is_contiguous(src0) preconditions are the same ones the SOA
+    // lookup below already re-derives cheaply from existing locals, so
+    // checking them here too costs nothing extra and narrows the resolve
+    // call to exactly the dispatches that can use its result.
+    const bool      q8_0_dense_candidate = src0->type == GGML_TYPE_Q8_0 && row_diff > 0 && ggml_is_contiguous(src0);
+    const ggml_sycl::resolved_ptr q8_0_dense_resolved =
+        q8_0_dense_candidate ? ggml_sycl_resolve(src0, ctx.device) : ggml_sycl::resolved_ptr{};
+    const layout_mode q8_0_dense_planned_layout =
         (q8_0_dense_resolved && q8_0_dense_resolved.on_device) ? q8_0_dense_resolved.layout : GGML_LAYOUT_AOS;
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {

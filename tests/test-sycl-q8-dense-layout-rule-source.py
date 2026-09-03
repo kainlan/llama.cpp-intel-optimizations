@@ -48,17 +48,19 @@ ADJUST_SIG = "layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor *
 PLANNER_TENSOR_INFO_SIG = "static ggml_layout_mode planner_default_device_layout(const placement_tensor_info & tensor,"
 PLANNER_ENTRY_SIG = "static ggml_layout_mode planner_default_device_layout(const placement_entry & entry, int device_id) {"
 
-# Matches a hand-rolled re-derivation of the tile-alignment test, in the
-# family of spellings a re-derivation could plausibly take: the named
-# constant or the literal 32 it currently equals, compared against 0 with
-# ANY comparison operator (!=, ==, >, <, >=, <=) in any spacing.
-# Deliberately broader than the one exact string
+# Matches a hand-rolled re-derivation in the `% <const> <cmp> 0` family of
+# spellings: the named constant or the literal 32 it currently equals,
+# `%`'d and compared against 0 with any comparison operator (!=, ==, >, <,
+# >=, <=), in any spacing. Deliberately broader than the one exact string
 # ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the shared predicate itself
-# happens to use, so a differently-spelled re-derivation is still caught
-# (spec review finding 6, rev-pktr-spec-1; widened again to cover
+# happens to use, so a differently-spelled re-derivation WITHIN THIS FAMILY
+# is caught (spec review finding 6, rev-pktr-spec-1; widened again to cover
 # comparison operators other than != / == in finding 3, rev-pktr-spec-2 --
 # "% 32 > 0" is an equally plausible re-derivation and the narrower
-# alternation missed it).
+# alternation missed it). NOT a catch-all for every possible re-derivation
+# (wording corrected, finding 4, rev-pktr-spec-3): a bitwise spelling such
+# as `& (MMVQ_COALESCED_TILE_BLOCKS - 1)` uses neither `%` nor a comparison
+# token this regex looks for and would pass undetected.
 RE_DERIVATION_RE = re.compile(r"%\s*(MMVQ_COALESCED_TILE_BLOCKS|32)\s*[<>=!]=?\s*0")
 
 
@@ -159,12 +161,17 @@ def test_adjust_layout_for_tensor_calls_the_predicate_for_the_dense_usage_set():
     predicate_idx = body.find(f"{PREDICATE}(tensor->ne[0])")
     assert usage_idx < predicate_idx, "the predicate call must be inside the widened dense-usage branch"
     # No hand-rolled re-derivation of the arithmetic alongside the call, in
-    # ANY spelling -- spec review finding 6 (rev-pktr-spec-1): the original
-    # form of this check matched only the one exact spelling
-    # ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the predicate itself happens to
-    # use, so a re-derivation written with "== 0" instead of "!= 0", with the
-    # literal 32 instead of the named constant, or with different spacing
-    # would pass unnoticed. Match the family of comparisons instead.
+    # the `% <const> <cmp> 0` family of spellings -- spec review finding 6
+    # (rev-pktr-spec-1): the original form of this check matched only the
+    # one exact spelling ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the
+    # predicate itself happens to use, so a re-derivation written with
+    # "== 0" instead of "!= 0", with the literal 32 instead of the named
+    # constant, with a different spacing, or with a different comparison
+    # operator (finding 3, rev-pktr-spec-2) would pass unnoticed. This is
+    # NOT a catch-all for every possible re-derivation, wording corrected
+    # in finding 4, rev-pktr-spec-3 -- a re-derivation spelled as a bitwise
+    # test (e.g. `& (MMVQ_COALESCED_TILE_BLOCKS - 1)`) uses no `%`/comparison
+    # token this regex looks for and stays undetected.
     assert not RE_DERIVATION_RE.search(
         body[usage_idx:]
     ), "ggml_sycl_adjust_layout_for_tensor must not re-derive the tile-alignment arithmetic inline next to calling the shared predicate"
