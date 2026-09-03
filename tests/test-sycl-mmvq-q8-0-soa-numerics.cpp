@@ -9,10 +9,11 @@
 // numerics coverage outlived them and is the part worth keeping regardless
 // of which layout wins any future default-flip decision.
 //
-// This is intentionally NOT run by the implementer (no GPU access in this
-// role, per the fork's Hard-Won Rules); it is written for `main` to build
-// and run:
+// GPU and model-loading binaries in this fork are run only from the lead
+// session, one at a time (CLAUDE.md, Hard-Won Rules) -- this binary is no
+// exception:
 //
+//   source /opt/intel/oneapi/setvars.sh --force
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-mmvq-q8-0-soa-numerics
 //
 // Strategy per shape: build ONE weight tensor's worth of random Q8_0 blocks
@@ -89,7 +90,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -132,7 +132,11 @@ static void fill_q8_0_random(block_q8_0_test * blocks, int nblocks, std::mt19937
 
 // Transcribed from quantize_row_q8_1_ref (ggml/src/ggml-quants.c) -- see the
 // file header comment for why this must match that function exactly rather
-// than being approximated.
+// than being approximated. block_q8_1.s (computed at ggml-quants.c:326-334
+// as d*sum(qs)) is deliberately not reproduced here: the Q8_0 x Q8_1 dot
+// product only ever reads `d` (see reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>,
+// vecdotq.hpp), so `s` -- used by the asymmetric/zero-point quant types --
+// has nothing to compare against in this reference.
 static void quantize_q8_1_ref(const float * x, int n, std::vector<int8_t> & qs_out, std::vector<float> & d_out) {
     const int nb = n / QK8_1;
     qs_out.resize((size_t) n);
@@ -374,10 +378,13 @@ static void run_shape(ggml_backend_t backend, const char * label, int ncols, int
     const float abs_tol = 1e-2f;
     compare("soa-vs-cpu-reference", soa, ref, rel_tol, abs_tol);
     compare("coalesced-vs-cpu-reference", coalesced, ref, rel_tol, abs_tol);
-    // Tighter: both kernels read the SAME bytes, so their outputs should
-    // agree closely regardless of either's absolute accuracy against the
-    // reference.
-    compare("soa-vs-coalesced", soa, coalesced, 1e-4f, 1e-2f);
+    // Tighter on the RELATIVE axis only (abs_tol is unchanged at 1e-2): both
+    // kernels read the SAME bytes, so their outputs should agree closely in
+    // proportional terms regardless of either's absolute accuracy against
+    // the reference.
+    const float kernel_rel_tol = 1e-4f;
+    const float kernel_abs_tol = 1e-2f;
+    compare("soa-vs-coalesced", soa, coalesced, kernel_rel_tol, kernel_abs_tol);
 }
 
 int main() {
