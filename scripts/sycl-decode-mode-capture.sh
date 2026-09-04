@@ -9,7 +9,10 @@
 #   <dir>/timeline.tsv   -- act_freq/cur_freq/throttle/reason_pl2 + RssAnon of
 #                           the bench pid, sampled every 0.5s while it runs.
 #   <dir>/host.txt       -- loadavg, ffmpeg tenant count, Shmem, MemAvailable,
-#                           taken once before and once after the run.
+#                           taken once before and once after the run, plus a
+#                           trailing "bench_pid=... comm=... cmdline=..." line
+#                           recording exactly what timeline.tsv's RssAnon
+#                           column tracked (or "unknown" if never resolved).
 #   <dir>/kprof*         -- GGML_SYCL_KERNEL_PROFILE CSV for the run.
 #   <dir>/mode.txt       -- "tg128=<value> mode=slow|fast|unknown" (thresholds
 #                           32/36 tok/s), the same line printed to stdout.
@@ -104,28 +107,62 @@ host_snapshot() {
 }
 
 # find_bench_pid: bench-guard.sh runs the wrapped command as its own child
-# under `timeout -k 15 <budget>`, so the bench sits TWO levels below the
-# guard's pid -- walk pgrep -P twice (guard -> timeout -> command) and take
-# the first (only) descendant found at each hop. `timeout` forks exactly one
-# child to run the wrapped command, so no name filter is needed to pick the
-# right one -- and matching purely by process-tree ancestry (never a global
-# name/pattern search) means this can never match the capture script's own
-# command line either. Deliberately NOT matched by comm/basename: `env
-# VAR=1 CMD` execve()s CMD in place (no extra fork) so a compiled binary like
-# llama-bench keeps its own comm at this hop, but a shebang script (as used
-# by the test fixture) reports comm="bash" here via binfmt_script's interpreter
-# swap -- a name filter tuned for one would miss the other. Falls back to a
-# direct child of the guard in case a future bench-guard.sh cuts out the
-# intermediate `timeout` layer.
+# under `timeout -k 15 <budget>`, so the bench sits below a `timeout` process
+# that is ITSELF a direct child of the guard. Only ever descends through a
+# direct child of the guard whose comm is literally "timeout" -- every OTHER
+# direct child of the guard is ignored outright, never accepted and never
+# descended into. This is deliberately strict, not merely a name filter on
+# the final candidate: bench-guard.sh is a shell script that runs many of its
+# own external helpers (mktemp, awk, cat, journalctl, pgrep, and -- caught by
+# hardware testing, llama.cpp-gvu7 review -- the `rm -f "$tmp_out"` its own
+# EXIT trap runs right as it finishes) as transient direct children of
+# itself. Those are indistinguishable from the wrapped command by comm alone
+# (none of them is named "timeout" or "env" either), so a filter that simply
+# rejected "timeout"/"env" and accepted anything else, as an earlier version
+# of this function did, would occasionally sample bench-guard's own trap
+# cleanup instead of the bench -- reproduced on hardware as
+# `comm=rm cmdline=rm -f /tmp/tmp.XXXXXX`. Requiring the `timeout` hop first
+# means only the wrapped command's own subtree is ever eligible.
+#
+# Below the `timeout` hop, `env VAR=1 CMD` execve()s CMD in place (no extra
+# fork) so a compiled binary like llama-bench keeps its own comm at that hop
+# and is accepted immediately; a shebang script (as used by the test
+# fixture) reports comm="bash" here via binfmt_script's interpreter swap,
+# which is also accepted immediately (it is not "env") rather than descending
+# further into whatever the script itself later forks (e.g. a `sleep` child)
+# -- the bench's own top-level process is what RssAnon should track, not its
+# leaf descendant.
+#
+# An earlier version also fell back to returning the guard's own direct
+# child (i.e. "timeout" itself, unresolved further) whenever the first probe
+# raced ahead of timeout forking its child, and then never re-tried, so
+# every RssAnon sample for the whole run read the ~1.2 MB wrapper instead of
+# an 11 GB model process. There is no such fallback here: a `timeout` hop
+# with nothing (yet) beneath it simply yields no candidate this attempt, and
+# the caller re-invokes this function every sampling tick until one appears.
 find_bench_pid() {
-    local guard_pid="$1" tpid cpid
+    local guard_pid="$1" tpid p c comm depth
+    local -a queue next
     for tpid in $(pgrep -P "$guard_pid" 2>/dev/null || true); do
-        for cpid in $(pgrep -P "$tpid" 2>/dev/null || true); do
-            echo "$cpid"; return 0
+        comm="$(cat "/proc/$tpid/comm" 2>/dev/null || echo "")"
+        [ "$comm" = "timeout" ] || continue
+
+        queue=("$tpid")
+        depth=0
+        while [ "$depth" -lt 5 ] && [ "${#queue[@]}" -gt 0 ]; do
+            next=()
+            for p in "${queue[@]}"; do
+                for c in $(pgrep -P "$p" 2>/dev/null || true); do
+                    comm="$(cat "/proc/$c/comm" 2>/dev/null || echo "")"
+                    case "$comm" in
+                        env) next+=("$c");;
+                        *) echo "$c"; return 0;;
+                    esac
+                done
+            done
+            queue=("${next[@]}")
+            depth=$((depth + 1))
         done
-    done
-    for cpid in $(pgrep -P "$guard_pid" 2>/dev/null || true); do
-        echo "$cpid"; return 0
     done
     return 1
 }
@@ -159,16 +196,33 @@ guard_pid=$!
 : > "$OUT/timeline.tsv"
 printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\trss_anon_kb\n' >> "$OUT/timeline.tsv"
 
-bench_pid=""
-pid_attempts=0
+bench_pid="" bench_comm="-" bench_cmdline="-"
 start_ts="$(date +%s.%N)"
 while kill -0 "$guard_pid" 2>/dev/null; do
-    # Give up looking for the pid after ~2s (4 attempts at the 0.5s sampling
-    # cadence below); a run that never resolves it still proceeds, recording
-    # "-" for RssAnon rather than failing the capture.
-    if [ -z "$bench_pid" ] && [ "$pid_attempts" -lt 4 ]; then
-        bench_pid="$(find_bench_pid "$guard_pid" || true)"
-        pid_attempts=$((pid_attempts + 1))
+    # Re-resolve whenever we don't have a live candidate -- not capped at a
+    # fixed attempt count, so a slow-to-fork command is still found later in
+    # the run, and a candidate that exits mid-run (unexpected, but cheap to
+    # handle) triggers a fresh resolution rather than sampling a dead pid.
+    # Bounded only by the guard's own lifetime (the enclosing `while`); a run
+    # that never resolves still proceeds, recording "-" for RssAnon. A failed
+    # RE-resolution attempt (no candidate found THIS tick) deliberately does
+    # NOT clear bench_pid/bench_comm/bench_cmdline: the bench typically dies
+    # of natural causes moments before the guard itself exits (its own
+    # postflight still has to run), and blanking the audit fields at that
+    # point would report "bench_pid=unknown" alongside stale comm/cmdline
+    # from the process that actually ran -- inconsistent and less useful than
+    # keeping the last real resolution on record. RssAnon sampling below
+    # already degrades to "-" on its own once /proc/<pid>/status is gone, so
+    # nothing here causes a dead pid's memory to be misreported.
+    if [ -z "$bench_pid" ] || ! kill -0 "$bench_pid" 2>/dev/null; then
+        new_pid="$(find_bench_pid "$guard_pid" || true)"
+        if [ -n "$new_pid" ]; then
+            bench_pid="$new_pid"
+            bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
+            bench_cmdline="$(tr '\0' ' ' < "/proc/$bench_pid/cmdline" 2>/dev/null || true)"
+            bench_cmdline="${bench_cmdline:0:120}"
+            [ -n "$bench_cmdline" ] || bench_cmdline="-"
+        fi
     fi
 
     now_ts="$(date +%s.%N)"
@@ -191,6 +245,11 @@ rc=0
 wait "$guard_pid" || rc=$?
 
 host_snapshot after
+
+# Auditability (llama.cpp-gvu7 review): record exactly what the timeline's
+# RssAnon column tracked, so a reader can tell a resolved bench pid from a
+# never-found one without re-deriving the process tree.
+echo "bench_pid=${bench_pid:-unknown} comm=$bench_comm cmdline=$bench_cmdline" >> "$OUT/host.txt"
 
 if [ "$rc" -eq 3 ]; then
     echo "sycl-decode-mode-capture: bench-guard refused (see $OUT/bench.log); no mode computed" >&2

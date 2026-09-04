@@ -50,11 +50,15 @@ expect_status() {
 # match), so this bash-script fixture is found the same way a real
 # llama-bench binary would be, comm quirks and all (a shebang script reports
 # comm="bash" here, not its own basename -- see find_bench_pid's comment in
-# the script).
+# the script). If FAKE_BENCH_PIDFILE is set in the environment (exported by
+# the caller), the script writes its OWN pid ($$) there before sleeping --
+# this is the ground truth the pid-discovery regression check below compares
+# host.txt's recorded bench_pid against.
 mk_fake_bench() {
     local tg="$1" path="$T/fakebench.sh"
     cat > "$path" <<EOF
 #!/usr/bin/env bash
+if [ -n "\${FAKE_BENCH_PIDFILE:-}" ]; then echo "\$\$" > "\${FAKE_BENCH_PIDFILE}"; fi
 echo '| model | size | params | backend | ngl | test | t/s |'
 echo '|---|---|---|---|---|---|---|'
 echo "| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | $tg ± 0.31 |"
@@ -120,6 +124,30 @@ grep -q "loadavg:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing loadav
 grep -q "ffmpeg_count:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing ffmpeg_count"; fail=1; }
 grep -q "Shmem:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing Shmem"; fail=1; }
 grep -q "MemAvailable:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing MemAvailable"; fail=1; }
+grep -qE '^bench_pid=[0-9]+ comm=' "$out_slow/host.txt" \
+    || { echo "FAIL: host.txt missing a resolved bench_pid=<pid> comm=... audit line (got: $(grep '^bench_pid=' "$out_slow/host.txt" 2>/dev/null))"; fail=1; }
+
+# --- regression: RssAnon must track the ACTUAL bench pid, never a wrapper
+# (llama.cpp-gvu7 review). An earlier version's pid discovery raced ahead of
+# `timeout` forking its child, fell back to the guard's OWN direct child --
+# i.e. `timeout` itself -- froze on that pid for the whole run (never
+# re-resolved), and no existing assertion caught it: "at least one non-'-'
+# RssAnon sample" is trivially true for `timeout`'s ~1.2 MB too. This exports
+# FAKE_BENCH_PIDFILE so the fake bench records its OWN real pid, and checks
+# host.txt's audit line against that ground truth -- a check the old
+# (uncommitted, verified separately on a scratch copy) two-hop-plus-fallback
+# code fails, since it reports timeout's pid instead. ---
+
+out_pid="$T/out-pidcheck"
+mk_tree 0 0; mk_meminfo 3000000
+bench="$(mk_fake_bench 40.0)"
+export FAKE_BENCH_PIDFILE="$T/fake-bench.pid"
+run_capture "$out_pid" -- "$bench" || { echo "FAIL: pid-check run failed"; fail=1; }
+unset FAKE_BENCH_PIDFILE
+[ -s "$T/fake-bench.pid" ] || { echo "FAIL: fake bench never wrote its own pid"; fail=1; }
+want_pid="$(cat "$T/fake-bench.pid")"
+grep -q "^bench_pid=$want_pid comm=" "$out_pid/host.txt" \
+    || { echo "FAIL: expected bench_pid=$want_pid in host.txt (got: $(grep '^bench_pid=' "$out_pid/host.txt" 2>/dev/null))"; fail=1; }
 
 # --- exit status mirrors the underlying run (0 on a clean run) ---
 
