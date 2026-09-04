@@ -2692,6 +2692,23 @@ llama_build_and_test(test-sycl-q8-dense-layout-rule.cpp)
 target_include_directories(test-sycl-q8-dense-layout-rule PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 set_tests_properties(test-sycl-q8-dense-layout-rule PROPERTIES LABELS "main;sycl;quant;soa;host")
 
+# llama.cpp-vtfs (option C task 1, owner ruling 2026-08-23): host CPU
+# reference oracle for MXFP4 GEMMs on the two device-materialized expert
+# weight layouts -- SOA (down role, ggml/src/ggml-sycl/quants.hpp:190-211)
+# and XMX_TILED (gate/up role, ggml/src/ggml-sycl/moe-xmx-fused.hpp:118-153,
+# inverse map at ggml/src/ggml-sycl/convert.cpp:2111-2146). Every later
+# stored-layout MXFP4 kernel (tasks G4-G8) is scored against this file's
+# reference_gemm() + max_rel_violations(..., 0.0258 -- the proven 2-D WOQ
+# GEMM arm's hardware verdict, llama.cpp-sr83 fix cycle 2, documented at
+# ggml/src/ggml-sycl/gemm.hpp, not tests/test-sycl-mxfp4-woq-gemm-bench.cpp).
+# Pure C++ -- touches no device and enumerates no SYCL device (in a
+# GGML_SYCL=ON build it links libggml-sycl transitively through
+# llama-common, same as any other llama_build_and_test target, but never
+# calls into it), so it runs in every sweep at any parallelism.
+llama_build_and_test(test-sycl-mxfp4-stored-layout-gemm-oracle.cpp)
+target_include_directories(test-sycl-mxfp4-stored-layout-gemm-oracle PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+set_tests_properties(test-sycl-mxfp4-stored-layout-gemm-oracle PROPERTIES LABELS "main;sycl;mxfp4;host")
+
 # llama.cpp-nz1k: source gate -- the WoQ-Q8 arm (ONEDNN_SOA) is reachable only
 # with GGML_SYCL_ONEDNN_WOQ_Q8=1 and a Q8_0 weight the planner materialized SOA
 # (dense projections: GGML_SYCL_Q8_DENSE_LAYOUT=soa), applies the codebase's
