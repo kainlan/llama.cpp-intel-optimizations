@@ -11,11 +11,15 @@ diagnostic probe -- env-gated, WARN level, identifiable by a stable log tag --
 so the leak became measurable; task L2 replaced the unconditional preservation
 with a generation-stamped release (see ggml_backend_sycl_buffer_context::
 alloc_generation) and extended both the probe and the [SOA-DEBUG] line to
-report released=/kept=/gen=. This gate checks the SOURCE TEXT only -- that the
-probe exists, is env-gated and WARN-level, and that the release bookkeeping's
-fields are present and correctly ordered -- not the runtime counts (the GPU
-test tests/test-sycl-compute-buffer-extra-reuse.cpp is the runtime check for
-that) -- and does not touch a SYCL device.
+report released=/kept=/gen= (kept= replaced a duplicate "preserving" count on
+the probe line, so its field order -- kept=, released=, gen= -- is not the
+same as the [SOA-DEBUG] line's -- released=, kept=, gen=; each is checked
+against its own order, not a shared one). This gate checks the SOURCE TEXT
+only -- that the probe exists, is env-gated and WARN-level, and that the
+release bookkeeping's fields are present and each line's fields are in that
+line's own order -- not the runtime counts (the GPU test
+tests/test-sycl-compute-buffer-extra-reuse.cpp is the runtime check for that)
+-- and does not touch a SYCL device.
 
 Runs under pytest (llama_test_pytest registration) and as a plain script. Point it
 at an alternate copy (to exercise the RED path against a deliberately unmodified
@@ -289,8 +293,20 @@ def test_warn_call_reports_release_bookkeeping():
     assert body[open_idx] == "(", "GGML_LOG_WARN must be followed directly by '(' -- malformed call"
     close_idx = matching_paren(body, open_idx)
     warn_call = body[warn_match.start() : close_idx + 1]
+    positions = {}
     for field in ("released=", "kept=", "gen="):
-        assert field in warn_call, f"the probe's GGML_LOG_WARN call must report {field}"
+        idx = warn_call.find(field)
+        assert idx >= 0, f"the probe's GGML_LOG_WARN call must report {field}"
+        positions[field] = idx
+    # Order pinned to the WARN line's actual field order (kept=, then
+    # released=, then gen=) -- NOT the same order as the SOA-DEBUG line below,
+    # because kept= replaced the old duplicate "preserving" count near the
+    # front of this format string (llama.cpp-dfo0 plan task L2, quality review
+    # c-z4cf #8: the docstring claimed an order was checked when none was;
+    # this is that check, and the two lines legitimately differ).
+    assert positions["kept="] < positions["released="] < positions["gen="], (
+        "expected the WARN line's fields in the order kept=, released=, gen="
+    )
 
 
 def test_soa_debug_line_reports_release_bookkeeping():
@@ -316,8 +332,18 @@ def test_soa_debug_line_reports_release_bookkeeping():
     close_idx = matching_paren(body, open_idx)
     soa_call = body[call_start : close_idx + 1]
     assert SOA_DEBUG_TAG in soa_call, f"the {SOA_DEBUG_TAG} tag must be inside its own GGML_SYCL_DEBUG(...) call"
+    positions = {}
     for field in ("released=", "kept=", "gen="):
-        assert field in soa_call, f"the {SOA_DEBUG_TAG} line must report {field}"
+        idx = soa_call.find(field)
+        assert idx >= 0, f"the {SOA_DEBUG_TAG} line must report {field}"
+        positions[field] = idx
+    # Order pinned to the SOA-DEBUG line's actual field order (released=, then
+    # kept=, then gen=) -- see the WARN test's order check above for why this
+    # is a DIFFERENT order than that line (llama.cpp-dfo0 plan task L2,
+    # quality review c-z4cf #8).
+    assert positions["released="] < positions["kept="] < positions["gen="], (
+        f"expected the {SOA_DEBUG_TAG} line's fields in the order released=, kept=, gen="
+    )
 
 
 if __name__ == "__main__":

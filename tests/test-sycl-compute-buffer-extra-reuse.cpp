@@ -25,10 +25,10 @@
 // ggml_backend_sched does not hand test code the compute buffer it allocates
 // internally) stays bounded across 20 rebuilds instead of growing linearly.
 //
-// RED/GREEN evidence (recorded here because this test cannot be run from this
-// worktree -- no GPU access; see the commit message for what was actually
-// observed): the release condition in ggml_backend_sycl_buffer_reset's COMPUTE
-// branch,
+// RED/GREEN evidence (recorded here rather than reproduced by this file, since
+// RED requires a scratch source edit that must never land -- see the commit
+// message for what was actually observed): the release condition in
+// ggml_backend_sycl_buffer_reset's COMPUTE branch,
 //
 //     if (extra->alloc_generation + 1 < ctx->alloc_generation) { ... release ... }
 //
@@ -36,7 +36,8 @@
 // (false)` (keeping every other line, INCLUDING the debug-accessor bookkeeping,
 // intact) reproduces the pre-fix behaviour without needing a separately built
 // binary: nothing is ever released, so the count this test prints grows by
-// ~n_tensors_B (3) every iteration instead of staying <= 2*n_tensors_B.
+// ~N_TENSORS_PER_GRAPH (3) every iteration instead of staying
+// <= 2*N_TENSORS_PER_GRAPH.
 //
 // ggml_backend_sched_new() asserts its LAST backend entry is a CPU device
 // (ggml-backend.cpp:2518); this test still runs everything on SYCL (the CPU
@@ -259,8 +260,8 @@ int main(int, char ** argv) {
 
         if (last_extras > 2 * N_TENSORS_PER_GRAPH) {
             fprintf(stderr,
-                    "FAIL: compute buffer tensor_extras count %zu exceeds 2*n_tensors_B=%zu at iteration %d -- "
-                    "extras from a rebuilt graph are not being released\n",
+                    "FAIL: compute buffer tensor_extras count %zu exceeds 2*N_TENSORS_PER_GRAPH=%zu at iteration "
+                    "%d -- extras from a rebuilt graph are not being released\n",
                     last_extras, 2 * N_TENSORS_PER_GRAPH, iter);
             ok = false;
             break;

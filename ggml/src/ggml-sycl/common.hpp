@@ -3409,6 +3409,11 @@ struct ggml_tensor_extra_gpu {
     std::atomic<int>      refcount{ 1 };
     uint64_t              cache_uuid = 0;                                   // Monotonic cache identity for weights
     uint64_t              model_id   = 0;                                   // Model identifier for cache keys
+    void *                data_device[GGML_SYCL_MAX_DEVICES];               // 1 pointer for each device for split
+                                                                            // tensors (legacy — use data_handle)
+    ggml_sycl::mem_handle data_handle[GGML_SYCL_MAX_DEVICES];               // Smart handles (P12 migration)
+    size_t                data_device_size[GGML_SYCL_MAX_DEVICES] = { 0 };  // Allocation sizes for data_device
+
     // Stamped by ggml_backend_sycl_buffer_init_tensor() from the owning compute
     // buffer's ggml_backend_sycl_buffer_context::alloc_generation (llama.cpp-dfo0,
     // plan task L2). Lets buffer_reset() tell a graph REUSE (extra stamped with
@@ -3417,11 +3422,11 @@ struct ggml_tensor_extra_gpu {
     // over the same ggml_init mem_buffer) without ever dereferencing the stale
     // tensor pointer. Meaningless for WEIGHTS-usage extras, which never go
     // through buffer_reset's COMPUTE branch.
-    uint64_t              alloc_generation = 0;
-    void *                data_device[GGML_SYCL_MAX_DEVICES];               // 1 pointer for each device for split
-                                                                            // tensors (legacy — use data_handle)
-    ggml_sycl::mem_handle data_handle[GGML_SYCL_MAX_DEVICES];               // Smart handles (P12 migration)
-    size_t                data_device_size[GGML_SYCL_MAX_DEVICES] = { 0 };  // Allocation sizes for data_device
+    // Moved past the refcount/cache_uuid/.../data_device_size block (rather than
+    // sitting inside it) so this single field's declaration doesn't split that
+    // block's clang-format alignment group (llama.cpp-dfo0 plan task L2, quality
+    // review c-z4cf #10).
+    uint64_t alloc_generation = 0;
 
     // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
     // Use this instead of data_device[dev] directly for incremental migration.
