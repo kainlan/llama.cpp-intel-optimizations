@@ -37,11 +37,12 @@ loop, which is why it runs last):
   other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
   ~9.7 GB of Shmem. If tmpfs usage meets or exceeds raw Shmem the effective
   figure clamps to 0 rather than going negative, and the guard prints a note
-  to stderr when this happens — not hypothetical, it fires on this host
-  (tmpfs Used ~9.94 GB vs. Shmem ~9.39 GB, since swap-backed tmpfs pages and
-  `none`-fstype rows count toward `df`'s "Used" without counting toward
-  `Shmem`). The archived `--log` header stamps raw Shmem, tmpfs used, and the
-  net figure separately for both the pre- and post-run sample
+  to stderr once, at preflight, when this happens — not hypothetical, it
+  fires on this host (tmpfs Used ~9.94 GB vs. Shmem ~9.39 GB, since
+  swap-backed tmpfs pages and `none`-fstype rows count toward `df`'s "Used"
+  without counting toward `Shmem`). The archived `--log` header stamps raw
+  Shmem, tmpfs used, and the net figure separately for both the pre- and
+  post-run sample
   (`pre_shmem_raw`/`pre_tmpfs`/`pre_shmem_eff`, mirrored for `post_*`) rather
   than only the net number, so a SUSPECT-for-growth verdict can still be
   traced back to which component moved.

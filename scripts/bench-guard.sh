@@ -13,9 +13,10 @@
 # backing, and the ceiling exists for the latter, not the former. If tmpfs
 # usage meets or exceeds Shmem (swap-backed tmpfs pages, `none`-fstype rows
 # `df` counts that Shmem doesn't, etc.) effective Shmem clamps to 0 rather
-# than going negative, and a one-line note is printed to stderr so the clamp
-# is never silent. The archived --log header stamps raw Shmem, tmpfs used,
-# and the net figure separately at each sample point, never just the net.
+# than going negative, and a one-line note is printed to stderr (once, at
+# preflight) so the clamp is never silent. The archived --log header stamps
+# raw Shmem, tmpfs used, and the net figure separately at each sample point,
+# never just the net.
 #
 # On a clean host: runs the wrapped command under `timeout -k 15 <budget>`
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
@@ -94,9 +95,11 @@ shmem_kb() { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
 tmpfs_kb() { { if [ -n "$DF_CMD" ]; then $DF_CMD 2>/dev/null; else df -k -t tmpfs 2>/dev/null; fi; } | awk 'NR>1{s+=$3} END{print s+0}'; }
 
 # Sample raw Shmem + tmpfs usage ONCE and derive the effective figure, into
-# the three SAMPLE_* globals -- never re-derive individually, so a clamp note
-# below fires once per sample point, not once per printed number. Callers:
-# the preflight ceiling check, and pre/post around the wrapped command.
+# the three SAMPLE_* globals -- never re-derive individually. Callers: the
+# preflight ceiling check, and pre/post around the wrapped command. The clamp
+# note (below) is printed only at the FIRST call (preflight), not at every
+# sample point -- one run should print it at most once, not up to three
+# times for the same underlying host condition.
 SAMPLE_RAW=0 SAMPLE_TMPFS=0 SAMPLE_EFF=0
 sample_shmem() {
     SAMPLE_RAW="$(shmem_kb)"
@@ -111,12 +114,14 @@ sample_shmem() {
         SAMPLE_EFF=$((SAMPLE_RAW - SAMPLE_TMPFS))
     else
         SAMPLE_EFF=0
-        echo "bench-guard: note: tmpfs used (${SAMPLE_TMPFS} kB) exceeds Shmem (${SAMPLE_RAW} kB); effective Shmem clamped to 0" >&2
     fi
 }
 
 sample_shmem
 raw_shmem="$SAMPLE_RAW" tmpfs_used="$SAMPLE_TMPFS" eff_shmem="$SAMPLE_EFF"
+if [ "$tmpfs_used" -ge "$raw_shmem" ]; then
+    echo "bench-guard: note: tmpfs used (${tmpfs_used} kB) meets or exceeds Shmem (${raw_shmem} kB); effective Shmem clamped to 0" >&2
+fi
 [ "$eff_shmem" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $raw_shmem kB minus tmpfs $tmpfs_used kB = $eff_shmem kB above ceiling $SHMEM_CEIL_KB kB"
 
 # Poll throttle/act_freq up to --max-wait, checking the deadline BEFORE each

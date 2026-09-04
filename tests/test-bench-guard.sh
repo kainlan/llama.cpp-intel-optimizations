@@ -19,10 +19,13 @@ mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/me
 # run_guard <pgrep-cmd> [extra guard flags...] -- forwards anything after the
 # pgrep-cmd straight through to bench-guard.sh (e.g. --df-cmd), so callers
 # that need an extra override don't have to spell out the whole invocation.
+# Defaults --df-cmd to `true` (tmpfs=0kB) so the suite is hermetic against
+# THIS host's real tmpfs usage; a later --df-cmd in "$@" overrides it, since
+# bench-guard.sh's arg parser keeps the last occurrence of a repeated flag.
 run_guard() {
     local pgrep="$1"; shift
     "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
-              --pgrep-cmd "$pgrep" --max-wait 1 "$@" -- true
+              --pgrep-cmd "$pgrep" --max-wait 1 --df-cmd true "$@" -- true
 }
 
 # Assert an EXACT status, never merely non-zero (mirrors
@@ -51,7 +54,7 @@ mk_tree 0 0
 expect_status 3 "stale GPU tenant must refuse" -- run_guard "echo 1234 llama-bench"
 
 mk_meminfo 30000000
-expect_status 3 "high Shmem must refuse" -- run_guard "false" --df-cmd true
+expect_status 3 "high Shmem must refuse" -- run_guard "false"
 
 mk_meminfo 3000000
 expect_status 0 "clean host must run" -- run_guard "false"
@@ -79,7 +82,7 @@ mk_meminfo 3000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 8000000 5000000 3000000 63%% /tmp\n' > "$T/df-clamp.txt"
 out="$(run_guard "false" --df-cmd "cat $T/df-clamp.txt" 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: expected clamp branch (tmpfs >= Shmem) to still run, got $rc"; fail=1; }
-echo "$out" | grep -q "tmpfs used (5000000 kB) exceeds Shmem (3000000 kB); effective Shmem clamped to 0" || { echo "FAIL: clamp note missing (got: $out)"; fail=1; }
+echo "$out" | grep -q "tmpfs used (5000000 kB) meets or exceeds Shmem (3000000 kB); effective Shmem clamped to 0" || { echo "FAIL: clamp note missing (got: $out)"; fail=1; }
 
 # Selector-to-PCI derivation must be an EXACT match. level_zero:0,1 (and
 # anything else that isn't precisely "level_zero:0" or "level_zero:1") must
@@ -88,21 +91,36 @@ echo "$out" | grep -q "tmpfs used (5000000 kB) exceeds Shmem (3000000 kB); effec
 # exercises the real derivation branch, not the test-fixture bypass.
 expect_status 3 "level_zero:0,1 selector must not derive a card" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" \
-        --meminfo "$T/meminfo" --pgrep-cmd false --max-wait 1 -- true
+        --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 -- true
 
 # --- Task A2: run + verdict stamping ---
 
 # --log captures stdout+stderr behind a VALID header on a clean run.
 mk_tree 0 0; mk_meminfo 3000000
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 --log "$T/run.log" -- sh -c "echo bench-output" || fail=1
 head -1 "$T/run.log" | grep -q "bench-guard: VALID" || { echo "FAIL: VALID stamp missing"; fail=1; }
 grep -q "bench-output" "$T/run.log" || { echo "FAIL: output not captured"; fail=1; }
+# The header must carry raw/tmpfs/net separately, not a bare net figure under
+# the old field name -- a mutant reverting to `pre_shmem=...kB` must go RED.
+head -1 "$T/run.log" | grep -qE 'pre_shmem_raw=[0-9]+kB pre_tmpfs=[0-9]+kB pre_shmem_eff=[0-9]+kB' \
+    || { echo "FAIL: header missing pre_shmem_raw/pre_tmpfs/pre_shmem_eff fields"; fail=1; }
+head -1 "$T/run.log" | grep -qE 'post_shmem_raw=[0-9]+kB post_tmpfs=[0-9]+kB post_shmem_eff=[0-9]+kB' \
+    || { echo "FAIL: header missing post_shmem_raw/post_tmpfs/post_shmem_eff fields"; fail=1; }
+
+# Distinct fake Shmem/tmpfs values must reach the header arithmetically
+# correct: Shmem 12,000,000 kB minus tmpfs Used 4,000,000 kB = 8,000,000 kB.
+mk_tree 0 0; mk_meminfo 12000000
+printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 20000000 4000000 16000000 20%% /tmp\n' > "$T/df-header.txt"
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+         --df-cmd "cat $T/df-header.txt" --max-wait 1 --log "$T/run-header.log" -- true || fail=1
+head -1 "$T/run-header.log" | grep -q "pre_shmem_eff=8000000kB" \
+    || { echo "FAIL: expected pre_shmem_eff=8000000kB in header (got: $(head -1 "$T/run-header.log"))"; fail=1; }
 
 # A wrapped command that grows Shmem (rewrites the fake meminfo file mid-run)
 # must stamp SUSPECT, even though the command itself succeeds.
 mk_tree 0 0; mk_meminfo 3000000
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
          --log "$T/run2.log" -- sh -c "printf 'MemAvailable: 1 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
 head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must stamp SUSPECT"; fail=1; }
 
@@ -110,20 +128,20 @@ head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must sta
 # command's, in BOTH the --log and no-log paths -- never the verdict.
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 --log "$T/run3.log" -- sh -c "exit 7" || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: --log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: no-log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
 # --budget must parse and default the timeout without breaking a clean run.
 mk_tree 0 0; mk_meminfo 3000000
 expect_status 0 "clean host must run with --budget set" -- \
-    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
+    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
              --max-wait 1 --budget 5 -- true
 
 # A fixture tree missing act_freq must refuse with a clear message, not die
@@ -134,7 +152,7 @@ expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
 mk_tree 0 0; mk_meminfo 3000000
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
          --journalctl-cmd "echo kernel: xe 0000:03:00.0: GT reset triggered" \
          --log "$T/run4.log" -- true || fail=1
 head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line must stamp SUSPECT"; fail=1; }
@@ -143,7 +161,7 @@ head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line 
 # (rc 124, mirrored by the guard) and stamped SUSPECT with the reason.
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --max-wait 1 \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
          --budget 1 --log "$T/run5.log" -- sh -c "sleep 5" || rc=$?
 [ "$rc" -eq 124 ] || { echo "FAIL: timeout-killed command must exit 124 (got $rc)"; fail=1; }
 head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout kill must stamp SUSPECT with timeout-killed:rc=124"; fail=1; }
