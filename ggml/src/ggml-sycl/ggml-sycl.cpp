@@ -24169,13 +24169,14 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
         owner->control_host_allocs.push_back({ control_ptr, size, std::move(control_handle) });
     }
 
-    // Not stamped here: this function's one caller (ggml_backend_sycl_buffer_
-    // init_tensor, guarded there by ggml_sycl_tensor_is_cross_device_control())
-    // never returns early and runs before the view check, and control tensors
-    // have view_src == NULL, so execution falls through to that caller's
-    // universal "ensure data_device populated" block, which stamps
-    // alloc_generation on its reuse path (llama.cpp-dfo0 plan task L2, quality
-    // review c-2d63/c-z4cf #9, reworded per round-2 c-b7j9 #3).
+    // Not stamped here: the call site (ggml_backend_sycl_buffer_init_tensor,
+    // guarded by ggml_sycl_tensor_is_cross_device_control()) discards this
+    // function's return value and sits before the view check, so init_tensor
+    // always reaches the universal "ensure data_device populated" block below
+    // regardless of what this function did, which stamps alloc_generation on
+    // its reuse path outside the tensor-parallel compute-buffer case (tracked
+    // as llama.cpp-6mj1) (llama.cpp-dfo0 plan task L2, quality review
+    // c-2d63/c-z4cf #9, reworded per round-2 c-b7j9 #3, round-3 c-9q2j #1/#2).
     ggml_tensor_extra_gpu * extra = nullptr;
     if (tensor->extra != nullptr) {
         extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
