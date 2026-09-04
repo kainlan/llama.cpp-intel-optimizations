@@ -397,7 +397,7 @@ int main(int, char ** argv) {
     // initializer constructs a sycl::event at load, which makes libsycl memoize the
     // selector before main() runs (llama.cpp-2x3m, gdb-traced 2026-09-04). Re-exec so
     // the child starts with the variable set (llama.cpp-403s: unpinned, the iGPU's
-    // 231 GB "VRAM" is claimed).
+    // 231 GB "VRAM" is claimed); it then takes the getenv branch and cannot loop.
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
         execv("/proc/self/exe", argv);
