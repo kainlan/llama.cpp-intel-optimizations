@@ -6788,7 +6788,16 @@ struct ggml_backend_sycl_context {
     // fail-closed default as before either family existed in this set.
     struct fa_decode_kernel_observation {
         enum class kernel_family : uint8_t {
-            // Native ESIMD kernel, D<=256 decode -- llama.cpp-dyi3's original verified route.
+            // Native ESIMD kernel (fattn_esimd_f16<D,...>/launch_fattn_esimd_f16_optimized<D,...>,
+            // fattn-esimd-f16.hpp), D<=256 decode -- llama.cpp-dyi3's original verified route.
+            // llama.cpp-zwsj (plan Task P3) also observes D=512 decode dispatches
+            // (GGML_SYCL_FA_D512_DECODE_ESIMD, fattn.cpp's D==512 branch) into this SAME
+            // bucket rather than a new one, unlike D512_TILE below: it is not a distinct
+            // kernel that merely resembles this one, it is a literal new template
+            // instantiation of launch_fattn_esimd_f16_optimized -- same source, same
+            // graph-safe launch idiom (no wait()/malloc at submission, pointer resolution
+            // via the shared graph-input-staging mechanism) -- so the clearance genuinely
+            // transfers instead of needing independent re-verification the way D512_TILE did.
             ESIMD_PARTITIONED,
             // Native tile_d512 kernel, D=512 decode (gemma4 global-attention layers) -- llama.cpp-86a7:
             // same graph-safe launch idiom as ESIMD_PARTITIONED (no wait()/malloc at submission, pointer

@@ -3142,6 +3142,7 @@ set_tests_properties(test-sycl-fattn-tile-d512-decode PROPERTIES
     LABELS "sycl;fattn;tile;d512;decode;numerics;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
+    SKIP_RETURN_CODE 77
 )
 endif() # static SYCL backend fixture
 

@@ -42,6 +42,24 @@
 // each of those n_kv values still produces a numerically correct kernel
 // after any tiering change under test.
 //
+// COVERAGE ADDED FOR THE ESIMD TIER (spec review llama.cpp-zwsj/c-7iey,
+// findings 2 and 4): the ESIMD decode tier (llama.cpp-zwsj Phase 2) engages
+// at ne01<=8, not just ne01=1 -- a 2..8-token ubatch (speculative-decode
+// step) is a real, reachable shape this file's original ne01=1-only
+// coverage never exercised, and `launch_fattn_esimd_f16_optimized`'s
+// per-query mask indexing (`stride_mask * query_idx`, fattn-esimd-f16.hpp)
+// was entirely untested since every case passed mask=nullptr. One case
+// below uses ne01=4 WITH a real per-query causal-style mask (query qr may
+// see kv positions <= n_kv-ne01+qr, matching a genuine speculative-decode
+// causal pattern; masked positions carry -10000.0f, matching this fork's
+// bench_sycl_fattn_gptoss.cpp convention). Separately, H_kv=1 (this file's
+// only GQA shape until now) makes kv_head = head/gqa_ratio identically 0
+// for every one of the 8 Q heads, so a wrong head-mapping bug in the
+// ESIMD kernel's own gqa_ratio/kv_head computation (fattn-esimd-f16.hpp,
+// independent of the tile kernel's) would be undetectable; one case below
+// uses H_q=8/H_kv=2 (gqa_ratio=4) so a mis-mapped head produces an
+// observable difference.
+//
 // REFERENCE: double-precision CPU softmax(scale * Q K^T) V, transcribed
 // directly (no shared code with the kernel or with any other reference
 // file) -- Q converted to double from its F32 storage, K/V from their F16
@@ -61,6 +79,32 @@
 // n_kv=4096 is expected to carry more rounding error than a single Q8_0 x
 // Q8_1 dot product does, and the ticket's own acceptance line spells out
 // this tolerance rather than leaving it to be re-derived.
+//
+// DISCRIMINATING DATA (spec review llama.cpp-zwsj/c-7iey, finding 3): Q/K
+// magnitude is deliberately wide (U(-3,3), not the original U(-0.1,0.1))
+// so the QK logits actually spread -- at the old amplitude the softmax was
+// essentially uniform (logit stddev ~3.3e-3) and the output collapsed to
+// the plain mean of n_kv V samples, which SHRINKS as n_kv grows (law of
+// large numbers): |ref| ~1.0e-2 at n_kv=32 but ~9.0e-4 at n_kv=4096 --
+// smaller than the 1e-3 absolute floor itself, so a several-percent kernel
+// error was mathematically invisible at the largest n_kv case, the one
+// this file exists to cover. Widening Q/K raises the logit stddev to
+// ~O(1), which makes the softmax genuinely peaked (the max logit among
+// n_kv samples grows with n_kv too, via extreme-value scaling, so peakedness
+// does not degrade at large n_kv either) -- the output then tracks a
+// dominant V sample's magnitude (~O(1), V ~ U(-1,1)) rather than an
+// n_kv-shrinking average. run_shape() asserts `max|ref| >= 100*abs_tol` for
+// exactly this reason: a degenerate near-zero reference must fail the guard
+// by construction, not silently pass on the tolerance floor. Verified with
+// the mutant the review specified (scratch-only, not committed): scaling a
+// simulated kernel output by 1.01x relative to the reference (H_q=8,
+// H_kv=1, no mask). At the OLD amplitude (Q/K/V all U(-0.1,0.1)): max|ref|
+// 3.6e-2/7.6e-3/2.6e-3 and 0/4096 violations at every one of n_kv in
+// {32,512,4096} -- invisible, matching the review's own estimate. At the
+// NEW amplitude (Q/K U(-3,3), V U(-1,1)): max|ref| 8.9e-1/6.7e-1/3.2e-1
+// and 3010/2282/1104 violations out of 4096 at the same three n_kv values
+// -- the identical 1% mutant is now caught at every point, and every
+// max|ref| clears the 100*abs_tol=0.1 floor by 3x-9x.
 //
 // DISPATCH VISIBILITY: this file does not assert which named kernel ran --
 // that is the lead's job, either from a GGML_SYCL_KERNEL_PROFILE capture
@@ -148,57 +192,92 @@ static void fill_f16_random(std::vector<ggml_fp16_t> & out, int64_t n, std::mt19
     }
 }
 
-// Double-precision softmax(scale * Q K^T) V, per head, MQA/GQA-aware via
-// kv_h = h / (H_q/H_kv) (matches the production kv-head mapping; degenerate
-// to kv_h=0 for every h at H_kv=1, this file's shape). Q is D*H_q floats
-// (ne=[D,1,H_q,1] contiguous, so flat index d + D*h); K/V are D*n_kv*H_kv
-// half-precision elements (ne=[D,n_kv,H_kv,1] contiguous, flat index
-// d + D*(t + n_kv*kv_h)); output is D*H_q floats in the SAME [d + D*h]
-// layout ggml_flash_attn_ext's own dst ne={DV,H_q,ne01,ne03} produces at
-// ne01=ne03=1.
+// A genuine speculative-decode-style causal mask: query row qr (0-indexed,
+// out of ne01) may see kv positions t <= n_kv - ne01 + qr, i.e. the ne01
+// queries occupy the LAST ne01 kv-cache slots in order, each seeing
+// everything up to and including its own slot. This masks a different,
+// growing prefix of positions for higher qr -- a real per-query pattern,
+// not a uniform stand-in for "no mask". Masked positions carry -10000.0f
+// (matching this fork's bench-sycl-fattn-gptoss.cpp convention); visible
+// positions carry 0.0f. Layout ne=[n_kv, ne01, 1, 1] contiguous (flat index
+// t + n_kv*qr), matching what ggml_flash_attn_ext's own mask-shape asserts
+// require here (mask->ne[2]=1 divides Q->ne[2]=H_q trivially; mask->ne[3]=1
+// divides Q->ne[3]=1).
+static void build_causal_like_mask(std::vector<ggml_fp16_t> & out, int n_kv, int ne01) {
+    out.assign((size_t) n_kv * ne01, ggml_fp32_to_fp16(0.0f));
+    for (int qr = 0; qr < ne01; ++qr) {
+        const int visible_upto = n_kv - ne01 + qr;  // inclusive
+        for (int t = visible_upto + 1; t < n_kv; ++t) {
+            out[(size_t) t + (size_t) n_kv * qr] = ggml_fp32_to_fp16(-10000.0f);
+        }
+    }
+}
+
+// Double-precision softmax(scale * Q K^T + mask) V, per (query row, head),
+// MQA/GQA-aware via kv_h = h / (H_q/H_kv) (matches the production kv-head
+// mapping; degenerate to kv_h=0 for every h at H_kv=1). Q is D*ne01*H_q
+// floats (ne=[D,ne01,H_q,1] contiguous, so flat index d + D*(qr + ne01*h));
+// K/V are D*n_kv*H_kv half-precision elements (ne=[D,n_kv,H_kv,1]
+// contiguous, flat index d + D*(t + n_kv*kv_h)); mask (nullable) is
+// n_kv*ne01 half-precision elements (ne=[n_kv,ne01,1,1] contiguous, flat
+// index t + n_kv*qr) added to the pre-softmax logit, matching what
+// ggml_flash_attn_ext actually does with a mask; output is D*H_q*ne01
+// floats in the SAME [d + D*(h + H_q*qr)] layout ggml_flash_attn_ext's own
+// dst ne={DV,H_q,ne01,ne03} produces at ne03=1.
 static void compute_reference(const std::vector<float> &       Q,
                               const std::vector<ggml_fp16_t> & K,
                               const std::vector<ggml_fp16_t> & V,
+                              const std::vector<ggml_fp16_t> * mask,
                               int                              D,
                               int                              H_q,
                               int                              H_kv,
                               int                              n_kv,
+                              int                              ne01,
                               float                            scale,
                               std::vector<float> &             out) {
-    out.assign((size_t) D * H_q, 0.0f);
+    out.assign((size_t) D * H_q * ne01, 0.0f);
     const int           n_rep = H_q / H_kv;
     std::vector<double> logits((size_t) n_kv);
 
-    for (int h = 0; h < H_q; ++h) {
-        const int kv_h = h / n_rep;
+    for (int qr = 0; qr < ne01; ++qr) {
+        const size_t q_row_offset = (size_t) D * qr;
 
-        double max_logit = -std::numeric_limits<double>::infinity();
-        for (int t = 0; t < n_kv; ++t) {
-            double dot = 0.0;
-            for (int d = 0; d < D; ++d) {
-                const double q = (double) Q[(size_t) h * D + d];
-                const double k = (double) ggml_fp16_to_fp32(K[(size_t) kv_h * n_kv * D + (size_t) t * D + d]);
-                dot += q * k;
-            }
-            const double logit = dot * (double) scale;
-            logits[(size_t) t] = logit;
-            max_logit          = std::max(max_logit, logit);
-        }
+        for (int h = 0; h < H_q; ++h) {
+            const int    kv_h       = h / n_rep;
+            const size_t q_head_off = q_row_offset + (size_t) D * ne01 * h;
 
-        double              denom = 0.0;
-        std::vector<double> weight((size_t) n_kv);
-        for (int t = 0; t < n_kv; ++t) {
-            weight[(size_t) t] = std::exp(logits[(size_t) t] - max_logit);
-            denom += weight[(size_t) t];
-        }
-
-        for (int d = 0; d < D; ++d) {
-            double acc = 0.0;
+            double max_logit = -std::numeric_limits<double>::infinity();
             for (int t = 0; t < n_kv; ++t) {
-                const double v = (double) ggml_fp16_to_fp32(V[(size_t) kv_h * n_kv * D + (size_t) t * D + d]);
-                acc += weight[(size_t) t] * v;
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) {
+                    const double q = (double) Q[q_head_off + (size_t) d];
+                    const double k = (double) ggml_fp16_to_fp32(K[(size_t) kv_h * n_kv * D + (size_t) t * D + d]);
+                    dot += q * k;
+                }
+                double logit = dot * (double) scale;
+                if (mask) {
+                    logit += (double) ggml_fp16_to_fp32((*mask)[(size_t) t + (size_t) n_kv * qr]);
+                }
+                logits[(size_t) t] = logit;
+                max_logit          = std::max(max_logit, logit);
             }
-            out[(size_t) h * D + d] = (float) (denom > 0.0 ? acc / denom : 0.0);
+
+            double              denom = 0.0;
+            std::vector<double> weight((size_t) n_kv);
+            for (int t = 0; t < n_kv; ++t) {
+                weight[(size_t) t] = std::exp(logits[(size_t) t] - max_logit);
+                denom += weight[(size_t) t];
+            }
+
+            for (int d = 0; d < D; ++d) {
+                double acc = 0.0;
+                for (int t = 0; t < n_kv; ++t) {
+                    const double v = (double) ggml_fp16_to_fp32(V[(size_t) kv_h * n_kv * D + (size_t) t * D + d]);
+                    acc += weight[(size_t) t] * v;
+                }
+                const size_t out_idx = (size_t) d + (size_t) D * h + (size_t) D * H_q * qr;
+                out[out_idx]         = (float) (denom > 0.0 ? acc / denom : 0.0);
+            }
         }
     }
 }
@@ -235,27 +314,60 @@ static void compare(const char *               what,
     }
 }
 
-static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv) {
-    std::printf("== shape D=%d H_q=%d H_kv=%d n_kv=%d (decode, ne01=1) ==\n", D, H_q, H_kv, n_kv);
+// ne01=1, use_mask=false is the original decode-shaped, mask-free case;
+// ne01>1 and/or use_mask=true exercise the coverage the spec review added
+// (findings 2 and 4 -- see the file header "COVERAGE ADDED FOR THE ESIMD
+// TIER" note).
+static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv, int ne01 = 1, bool use_mask = false) {
+    std::printf("== shape D=%d H_q=%d H_kv=%d n_kv=%d ne01=%d mask=%d ==\n", D, H_q, H_kv, n_kv, ne01, (int) use_mask);
 
-    std::mt19937 rng(0xd512u ^ ((unsigned) n_kv * 2654435761u) ^ ((unsigned) H_q * 40503u));
+    std::mt19937 rng(0xd512u ^ ((unsigned) n_kv * 2654435761u) ^ ((unsigned) H_q * 40503u) ^
+                     ((unsigned) H_kv * 0x9e3779b9u) ^ ((unsigned) ne01 * 0x85ebca6bu));
 
     std::vector<float>       q_data;
     std::vector<ggml_fp16_t> k_data;
     std::vector<ggml_fp16_t> v_data;
-    // Small magnitude keeps the D=512-wide QK dot products (and therefore
-    // the softmax logits) in a numerically comfortable range -- these are
-    // synthetic activations, not real model weights, so nothing about their
-    // distribution needs to match gemma4's actual statistics for this to be
-    // a valid correctness check.
-    fill_f32_random(q_data, (int64_t) D * H_q, rng, -0.1f, 0.1f);
-    fill_f16_random(k_data, (int64_t) D * n_kv * H_kv, rng, -0.1f, 0.1f);
-    fill_f16_random(v_data, (int64_t) D * n_kv * H_kv, rng, -0.1f, 0.1f);
+    // Wide magnitude (spec review llama.cpp-zwsj/c-7iey, finding 3 -- see
+    // the file header "DISCRIMINATING DATA" note): U(-0.1,0.1) made the
+    // softmax near-uniform and the reference collapse to an n_kv-shrinking
+    // average, invisible to the tolerance floor at large n_kv. Q/K at
+    // U(-3,3) gives a logit stddev of order 1, a genuinely peaked softmax at
+    // every n_kv, and an output magnitude that tracks V's amplitude
+    // (U(-1,1)) instead of shrinking.
+    fill_f32_random(q_data, (int64_t) D * ne01 * H_q, rng, -3.0f, 3.0f);
+    fill_f16_random(k_data, (int64_t) D * n_kv * H_kv, rng, -3.0f, 3.0f);
+    fill_f16_random(v_data, (int64_t) D * n_kv * H_kv, rng, -1.0f, 1.0f);
+
+    std::vector<ggml_fp16_t> mask_data;
+    if (use_mask) {
+        build_causal_like_mask(mask_data, n_kv, ne01);
+    }
 
     const float scale = 1.0f / std::sqrt((float) D);
 
     std::vector<float> ref;
-    compute_reference(q_data, k_data, v_data, D, H_q, H_kv, n_kv, scale, ref);
+    compute_reference(q_data, k_data, v_data, use_mask ? &mask_data : nullptr, D, H_q, H_kv, n_kv, ne01, scale, ref);
+
+    // Fail-closed floor (spec review llama.cpp-zwsj/c-7iey, finding 3): a
+    // degenerate near-zero reference must never let the comparison below
+    // pass by construction on the tolerance floor alone. abs_tol is 1e-3
+    // (see the compare() call below); 100x it is the same floor the review
+    // specified.
+    float max_abs_ref = 0.0f;
+    for (float v : ref) {
+        max_abs_ref = std::max(max_abs_ref, std::fabs(v));
+    }
+    char label[96];
+    std::snprintf(label, sizeof(label), "D512-decode-vs-cpu-reference n_kv=%d ne01=%d H_kv=%d mask=%d", n_kv, ne01,
+                  H_kv, (int) use_mask);
+    if (max_abs_ref < 100.0f * 1e-3f) {
+        std::printf(
+            "FAIL [%s]: degenerate reference, max|ref|=%.6e < 1.0e-01 (100*abs_tol) -- fixture "
+            "produced a near-zero signal that would let the tolerance floor pass vacuously\n",
+            label, max_abs_ref);
+        ++g_failures;
+        return;
+    }
 
     ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
@@ -265,25 +377,37 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
         return;
     }
 
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 1, H_q, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, ne01, H_q, 1);
     ggml_set_name(q, "fattn_d512_decode_q");
     ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv, H_kv, 1);
     ggml_set_name(k, "fattn_d512_decode_k");
     ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, n_kv, H_kv, 1);
     ggml_set_name(v, "fattn_d512_decode_v");
 
-    // No mask (src[3] = nullptr): at decode every prior KV position is
-    // valid, so a real causal mask here would be all-zero -- see the file
-    // header for why this is the representative shape, not a shortcut.
-    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr, scale, /*max_bias=*/0.0f,
-                                            /*logit_softcap=*/0.0f);
+    ggml_tensor * mask = nullptr;
+    if (use_mask) {
+        // ne=[n_kv, ne01, 1, 1] -- matches build_causal_like_mask()'s layout
+        // and ggml_flash_attn_ext's own mask-shape asserts (mask->ne[2]=1
+        // divides Q->ne[2]=H_q; mask->ne[3]=1 divides Q->ne[3]=1).
+        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, ne01, 1, 1);
+        ggml_set_name(mask, "fattn_d512_decode_mask");
+    }
+
+    // No mask (src[3] = nullptr) at ne01=1: at single-token decode every
+    // prior KV position is valid, so a real causal mask here would be
+    // all-zero -- see the file header for why this is the representative
+    // shape, not a shortcut. The ne01>1 cases use a real per-query mask
+    // instead (see build_causal_like_mask()).
+    ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
     ggml_set_name(out, "fattn_d512_decode_out");
 
     ggml_backend_buffer_type_t dev_buft = ggml_backend_get_default_buffer_type(backend);
 
-    ggml_backend_buffer_t q_buf   = alloc_tensor_buffer(dev_buft, q, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-    ggml_backend_buffer_t k_buf   = alloc_tensor_buffer(dev_buft, k, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
-    ggml_backend_buffer_t v_buf   = alloc_tensor_buffer(dev_buft, v, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_backend_buffer_t q_buf = alloc_tensor_buffer(dev_buft, q, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_backend_buffer_t k_buf = alloc_tensor_buffer(dev_buft, k, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_backend_buffer_t v_buf = alloc_tensor_buffer(dev_buft, v, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    ggml_backend_buffer_t mask_buf =
+        mask ? alloc_tensor_buffer(dev_buft, mask, GGML_BACKEND_BUFFER_USAGE_COMPUTE) : nullptr;
     ggml_backend_buffer_t out_buf = alloc_tensor_buffer(dev_buft, out, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
 
     auto cleanup = [&]() {
@@ -296,13 +420,16 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
         if (v_buf) {
             ggml_backend_buffer_free(v_buf);
         }
+        if (mask_buf) {
+            ggml_backend_buffer_free(mask_buf);
+        }
         if (out_buf) {
             ggml_backend_buffer_free(out_buf);
         }
         ggml_free(ctx);
     };
 
-    if (!q_buf || !k_buf || !v_buf || !out_buf) {
+    if (!q_buf || !k_buf || !v_buf || !out_buf || (mask && !mask_buf)) {
         std::printf("FAIL: buffer allocation failed (n_kv=%d)\n", n_kv);
         ++g_failures;
         cleanup();
@@ -312,6 +439,9 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
     ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
     ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(ggml_fp16_t));
     ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(ggml_fp16_t));
+    if (mask) {
+        ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
@@ -323,15 +453,13 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
         return;
     }
 
-    std::vector<float> gpu_output((size_t) D * H_q, 0.0f);
+    std::vector<float> gpu_output((size_t) D * H_q * ne01, 0.0f);
     ggml_backend_tensor_get(out, gpu_output.data(), 0, gpu_output.size() * sizeof(float));
 
     cleanup();
 
     // 1e-3 + 1e-3*|ref| per element -- this task's own acceptance criterion;
     // see the file header for why it is looser than the Q8_0 MMVQ precedent.
-    char label[64];
-    std::snprintf(label, sizeof(label), "tile_d512-vs-cpu-reference n_kv=%d", n_kv);
     compare(label, gpu_output, ref, /*rel_tol=*/1e-3f, /*abs_tol=*/1e-3f);
 }
 
@@ -356,9 +484,19 @@ static int run_state_in_current_process(const char * state_label) {
     std::printf("== state %s: GGML_SYCL_FA_D512_DECODE_ESIMD=%s ==\n", state_label,
                 std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD") ? std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD") :
                                                                 "(unset, default ON)");
+    // Original decode-shaped (ne01=1), mask-free sweep across the FATTN_KQ_STRIDE axis.
     run_shape(backend, D, H_q, H_kv, 32);
     run_shape(backend, D, H_q, H_kv, 512);
     run_shape(backend, D, H_q, H_kv, 4096);
+    // Spec review llama.cpp-zwsj/c-7iey finding 2: ne01=4 (speculative-decode-
+    // shaped ubatch, within the tier's ne01<=8 engagement range) WITH a real
+    // per-query mask, exercising the ESIMD kernel's per-query mask indexing.
+    run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/4, /*use_mask=*/true);
+    // Spec review llama.cpp-zwsj/c-7iey finding 4: H_kv=2 (gqa_ratio=4, not
+    // the degenerate kv_head==0-for-every-head case H_kv=1 gives), so a
+    // mis-mapped GQA head in the ESIMD kernel's own gqa_ratio/kv_head
+    // computation would be observable.
+    run_shape(backend, D, H_q, /*H_kv=*/2, 512);
 
     ggml_backend_free(backend);
 

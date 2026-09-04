@@ -3809,10 +3809,15 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     const int D = Q->ne[0];
 
     // ==========================================================================
-    // D=512 route: oneDNN-if-admissible, else TILE-if-admissible, else abort
-    // (llama.cpp-jahv + llama.cpp-dtpk). D has no vec/XMX/ESIMD kernel at
-    // 512 in this fork. This branch must come before the paged-V2 and
-    // Standard Dispatch switches below: neither has a `case 512` (paged-V2's
+    // D=512 route: oneDNN-if-admissible, else ESIMD-decode-tier-if-admissible
+    // (ne01<=8, llama.cpp-zwsj), else TILE-if-admissible, else abort
+    // (llama.cpp-jahv + llama.cpp-dtpk). D has no PREFILL vec/XMX kernel at
+    // 512 in this fork -- llama.cpp-zwsj added a decode-shaped ESIMD
+    // instantiation (fattn_esimd_f16<512, float>, below), but it is reached
+    // only through this D==512 branch, never through
+    // ggml_sycl_flash_attn_ext_dispatch_ncols<D,...>'s ESIMD arm, which is
+    // still never instantiated for D=512. This branch must come before the
+    // paged-V2 and Standard Dispatch switches below: neither has a `case 512` (paged-V2's
     // scalar switch GGML_ABORTs on an unhandled D, the Standard Dispatch
     // switches do too), and dispatch_ncols<D,...> is never instantiated for
     // D=512 (no vec kernel body to instantiate it against).
@@ -3850,9 +3855,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // the two admissibility helpers.
     if (D == 512) {
         // llama.cpp-dyi3 ROUND 2 FIX / llama.cpp-86a7: this whole D=512
-        // branch (gemma4's global-attention layers; D=512 has no vec/XMX/
-        // ESIMD kernel in this fork, so it can NEVER reach fattn_esimd_f16)
-        // is a SEPARATE code path from
+        // branch (gemma4's global-attention layers) is a SEPARATE code path from
         // ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> -- ncols<D> is
         // never instantiated for D=512 -- so it previously never went
         // through dispatch_debug_kernel's observation, leaving
@@ -3939,15 +3942,22 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         // paged/multi-seq sources, no softcap), and ADMITTING is unchanged
         // either way -- supports_op() never asks which of the two decode
         // kernels will run, only whether the op is servable at all.
-        if (ggml_sycl_fattn_d512_tile_admissible(dst) && params.ne01 <= 8) {
-            static const bool d512_decode_esimd_enabled = ggml_sycl_fa_d512_decode_esimd_enabled();
+        // Toggle checked FIRST (a cached bool, no function call) so that
+        // GGML_SYCL_FA_D512_DECODE_ESIMD=0 short-circuits before the
+        // ggml_sycl_fattn_d512_tile_admissible(dst) call below -- that
+        // predicate is evaluated again, unconditionally, by the tile branch
+        // a few lines down, so ordering it after the toggle avoids running
+        // it twice per dispatch in the (default-off-of-tile, i.e. toggle=0)
+        // state, a genuine hot path (every D=512 layer of every token).
+        static const bool d512_decode_esimd_enabled = ggml_sycl_fa_d512_decode_esimd_enabled();
+        if (d512_decode_esimd_enabled && params.ne01 <= 8 && ggml_sycl_fattn_d512_tile_admissible(dst)) {
             // g_sycl_fa_esimd_enabled/fattn_esimd_f16_available(): the same
             // ESIMD-availability guard the D<=256 decode path checks before
             // calling this exact function (fattn.cpp:2525/2630/3038) --
             // fattn_esimd_f16<D,...>'s non-ESIMD stub GGML_ASSERTs rather
             // than declining, so skipping this guard would abort instead of
             // falling back to tile on a build/device without ESIMD.
-            if (d512_decode_esimd_enabled && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+            if (g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
                 // ggml_sycl_fattn_d512_tile_admissible() already guarantees
                 // Q->type == GGML_TYPE_F32 (fattn.cpp, same reasoning as the
                 // tile route's own defensive backstop: build_attn_mha()
@@ -3970,10 +3980,15 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 }
                 return;
             }
-            // Toggle off: fall through to the tile route below at any ne01,
-            // including this decode-shaped one -- GGML_SYCL_FA_D512_DECODE_ESIMD=0
-            // is a full opt-out, not just a "prefer tile when both fit" hint.
+            // Toggle is on but this build/device has no ESIMD (rare): fall
+            // through to the tile route below at any ne01, including this
+            // decode-shaped one.
         }
+        // GGML_SYCL_FA_D512_DECODE_ESIMD=0 (the toggle above is false), or
+        // ne01>8 (prefill), or the shape fails
+        // ggml_sycl_fattn_d512_tile_admissible(): the tile route below is
+        // reached at any ne01 -- =0 is a full opt-out, not just a "prefer
+        // tile when both fit" hint.
 
         if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
             // Correction of record (spec review rev-dtpk-qual, F1): the
