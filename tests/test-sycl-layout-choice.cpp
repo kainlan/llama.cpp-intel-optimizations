@@ -1786,17 +1786,18 @@ static bool run_dense_attention_ffn_layout_test() {
         }
     }
 
-    // Negative control (spec review nit 8, round 3): the pktr rule
-    // is Q8_0-only. A Q4_0 dense weight with the SAME tile-misaligned shape
-    // (K=2560, 80 blocks/row) must NOT be demoted to SOA -- the type guard
-    // in ggml_sycl_adjust_layout_for_tensor's dense-usage branch must keep
-    // it out of that net entirely, so it stays wherever layout_policy::
-    // get_optimal() already put it (COALESCED, since is_coalesced_supported
-    // is true for Q4_0).
+    // Aligned non-Q8_0 dense weight is untouched by the pktr net (round 11,
+    // replacing an unsound negative control -- see below). A Q4_0
+    // ATTENTION_WEIGHT at K=2048 (64 blocks/row, a multiple of
+    // MMVQ_COALESCED_TILE_BLOCKS) must stay COALESCED: the pktr block in
+    // ggml_sycl_adjust_layout_for_tensor's dense-usage branch is gated on
+    // `tensor->type == GGML_TYPE_Q8_0` and a Q4_0 tensor never enters it, so
+    // this exercises the ordinary layout_policy::get_optimal() path with the
+    // type guard simply out of the way.
     {
         ggml_tensor q4_0_attn_q{};
         q4_0_attn_q.type  = GGML_TYPE_Q4_0;
-        q4_0_attn_q.ne[0] = 2560;
+        q4_0_attn_q.ne[0] = 2048;
         q4_0_attn_q.ne[1] = 2048;
         q4_0_attn_q.ne[2] = 1;
         q4_0_attn_q.ne[3] = 1;
@@ -1805,12 +1806,32 @@ static bool run_dense_attention_ffn_layout_test() {
             ggml_sycl_adjust_layout_for_tensor(&q4_0_attn_q, GGML_LAYOUT_COALESCED, /*device=*/-1);
         if (q4_0_attn_q_layout != GGML_LAYOUT_COALESCED) {
             printf(
-                "FAIL: Q4_0 ATTENTION_WEIGHT with ne00=2560 (tile-misaligned for Q8_0, but the pktr rule is "
-                "Q8_0-only) must stay COALESCED, got %d\n",
+                "FAIL: Q4_0 ATTENTION_WEIGHT with ne00=2048 (64 blocks/row, tile-aligned) must stay COALESCED, "
+                "got %d\n",
                 (int) q4_0_attn_q_layout);
             return false;
         }
     }
+
+    // No Q4_0 negative control exists for the pktr type guard itself, and it
+    // cannot: ggml_sycl_layout_supports_coalesced()'s non-Q8_0 branch
+    // (common.hpp) already requires `blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS
+    // == 0` for every type it supports, Q4_0 included -- the identical
+    // arithmetic the pktr predicate applies to Q8_0. So any Q4_0 K the pktr
+    // net would have demoted is already demoted upstream by that
+    // pre-existing, unrelated check (at ggml-sycl.cpp's
+    // `resolved == GGML_LAYOUT_COALESCED && !ggml_sycl_layout_supports_coalesced(tensor)`
+    // gate, which runs before the pktr block and is not gated on Q8_0), and
+    // any K it would have kept is kept by both. Deleting the pktr type guard
+    // is therefore unobservable through the layout outcome for Q4_0 -- the
+    // guard is still correct to keep (it documents intent and scopes the
+    // Q8_0-specific trace/decline path), just not testable this way. The
+    // round-5 version of this test used K=2560 (80 blocks/row, NOT a
+    // multiple of 32) as a "negative control", asserting COALESCED; that
+    // shape is demoted to SOA by the pre-existing check above regardless of
+    // the pktr guard, so the assertion was never true and the test was
+    // simply wrong -- caught only now because the ctest binary was rebuilt
+    // and actually run (round 10 build), not because anything changed.
 
     // Regression guard: EMBEDDING/OUTPUT_WEIGHT behaviour from
     // run_tied_embedding_output_layout_test() above must be unaffected by
