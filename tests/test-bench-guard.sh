@@ -45,7 +45,7 @@ mk_tree 0 0
 expect_status 3 "stale GPU tenant must refuse" -- run_guard "echo 1234 llama-bench"
 
 mk_meminfo 30000000
-expect_status 3 "high Shmem must refuse" -- run_guard "false"
+expect_status 3 "high Shmem must refuse" -- "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 -- true
 
 mk_meminfo 3000000
 expect_status 0 "clean host must run" -- run_guard "false"
@@ -54,6 +54,17 @@ expect_status 0 "clean host must run" -- run_guard "false"
 mk_meminfo 30000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 33554432 29000000 4554432 87%% /tmp\n' > "$T/df.txt"
 expect_status 0 "high Shmem explained by tmpfs must run" -- "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "cat $T/df.txt" --max-wait 1 -- true
+
+# A FAILING df-cmd must be treated as tmpfs=0 -- fail closed toward the
+# pre-tmpfs-subtraction behaviour, never silently zero out the ceiling check.
+mk_meminfo 3000000
+expect_status 0 "failing df-cmd + low Shmem must still run (tmpfs=0)" -- \
+    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true
+
+mk_meminfo 30000000
+out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: expected failing df-cmd + high Shmem to exit 3, got $rc"; fail=1; }
+echo "$out" | grep -q "minus tmpfs 0 kB" || { echo "FAIL: refusal message must show 'minus tmpfs 0 kB' (got: $out)"; fail=1; }
 
 # Selector-to-PCI derivation must be an EXACT match. level_zero:0,1 (and
 # anything else that isn't precisely "level_zero:0" or "level_zero:1") must
