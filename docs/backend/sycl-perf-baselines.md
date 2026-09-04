@@ -30,8 +30,22 @@ loop, which is why it runs last):
 
 - **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
   process.
-- **Shmem ceiling** — `Shmem` in `/proc/meminfo` above 10 GB (the TTM-shmem OOM
-  signature this repo has hit repeatedly).
+- **Shmem ceiling** — `Shmem` in `/proc/meminfo`, net of the summed "Used" of
+  tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), above 10 GB
+  (the TTM-shmem OOM signature this repo has hit repeatedly). This became net
+  of tmpfs on 2026-09-04, after the guard refused every baseline run because
+  other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
+  ~9.7 GB of Shmem. If tmpfs usage meets or exceeds raw Shmem the effective
+  figure clamps to 0 rather than going negative, and the guard prints a note
+  to stderr once, at preflight, when this happens — not hypothetical, it
+  fires on this host (tmpfs Used ~9.94 GB vs. Shmem ~9.39 GB, since
+  swap-backed tmpfs pages and `none`-fstype rows count toward `df`'s "Used"
+  without counting toward `Shmem`). The archived `--log` header stamps raw
+  Shmem, tmpfs used, and the net figure separately for both the pre- and
+  post-run sample
+  (`pre_shmem_raw`/`pre_tmpfs`/`pre_shmem_eff`, mirrored for `post_*`) rather
+  than only the net number, so a SUSPECT-for-growth verdict can still be
+  traced back to which component moved.
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
