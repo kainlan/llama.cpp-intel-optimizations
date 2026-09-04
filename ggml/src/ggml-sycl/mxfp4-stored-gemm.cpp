@@ -109,16 +109,17 @@ SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<int8_t, N> mxfp4_stored
     return values;
 }
 
-// The generalised kernel: work-group (in the loose sense this backend's
-// other single-work-item-per-tile ESIMD kernels use, e.g.
-// mxfp4_dpas_down_single_col_sycl) = one M-tile (M_TILE activation rows,
-// M_TILE in {1,2,4,8}, the DPAS repeat-count values) x one N-tile (16 output
-// rows, GGML_SYCL_MXFP4_MOE_XMX_N -- the DPAS execution-size hardware
-// constant). K loops in 32-element blocks (QK_MXFP4) reading the raw SOA qs
-// bytes at `row_qs_offset = row * blocks_per_row * 16` and the E8M0 scale
-// byte at `total_qs_bytes + row * blocks_per_row + k_block` -- the same
-// addressing mxfp4_soa_load_a_vec (mmvq.cpp:7566) already uses on the decode
-// path and tests/mxfp4-stored-layout-oracle.hpp's decode_soa_mxfp4 mirrors.
+// The generalised kernel: one work-GROUP per N-tile (16 output rows,
+// GGML_SYCL_MXFP4_MOE_XMX_N -- the DPAS execution-size hardware constant),
+// with K_PARTITIONS work-ITEMS per group splitting the K reduction (llama.cpp-6f73
+// spec finding, round 2 -- see the K_PARTITIONS comment below for why this
+// replaced the original single-item-per-tile launch). Each work-item's own
+// per-k-tile body is otherwise unchanged: 32-element blocks (QK_MXFP4)
+// reading the raw SOA qs bytes at `row_qs_offset = row * blocks_per_row * 16`
+// and the E8M0 scale byte at `total_qs_bytes + row * blocks_per_row +
+// k_block` -- the same addressing mxfp4_soa_load_a_vec (mmvq.cpp:7566)
+// already uses on the decode path and
+// tests/mxfp4-stored-layout-oracle.hpp's decode_soa_mxfp4 mirrors.
 //
 // DPAS operand assignment is INTENTIONALLY SWAPPED relative to
 // mxfp4_pair_glu_soa_dpas_m4_sycl / mxfp4_dpas_down_single_col_sycl: those
@@ -148,6 +149,39 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     constexpr int packed_bytes = k_per / 2;                        // 16 nibble-packed bytes per block
     constexpr int an           = M_TILE * k_per;                   // activation "A" operand size
     constexpr int bn           = k_per * exec_n;                   // weight "B" operand size (VNNI-packed)
+    constexpr int acc_width    = M_TILE * exec_n;                  // per-partition partial-accumulator width
+
+    // Occupancy fix (llama.cpp-6f73, spec finding round 2): the original
+    // single-item-per-tile launch created only n_tiles work-groups (180 at
+    // N=2880), each serializing all k_tiles (90 at K=2880) in ONE dependent
+    // chain (load -> DPAS -> accumulate, repeated). Measured on hardware:
+    // time was flat across N (37 vs 2880 rows: 200-260 us) and flat across
+    // cards (128 vs 256 CU: within 2%) -- the signature of a fixed
+    // per-work-item latency floor, not a bandwidth- or occupancy-bound
+    // kernel, since ~180 threads on a 128-CU device (~1.4 threads/CU) leaves
+    // no concurrent work per CU to hide global-memory latency via SMT.
+    //
+    // K_PARTITIONS work-items per N-tile now split the K reduction, each
+    // summing a private PARTIAL accumulator over its own slice of k_tiles,
+    // then combine via an SLM hierarchical reduction (stride halved each
+    // round) -- the exact pattern fattn-esimd-f16.hpp's ESIMD partitioned
+    // decode kernel already uses for its KV-length split (slm_init,
+    // slm_block_store/slm_block_load, `barrier()`, then
+    // `for (stride = N/2; stride > 0; stride /= 2)`). 8 (not 16) is chosen
+    // to stay at or under the "up to 8 threads" per compute-unit budget the
+    // hardware diagnosis assumed, so one work-group's threads can be
+    // co-resident on one CU without oversubscribing it; N-tiling itself is
+    // deliberately UNCHANGED (n_tiles work-groups, same as before) -- this is
+    // a single, isolated lever, not combined with a second untested change
+    // in the same commit. If K_PARTITIONS=8 undershoots the >=50% peak-
+    // bandwidth target, tiling N for more resident work-groups per CU is the
+    // next, separate lever (not applied here).
+    constexpr int K_PARTITIONS = 8;  // power of 2, required by the tree reduction below
+
+    // SLM budget: K_PARTITIONS partial accumulators, acc_width floats each.
+    // Worst case (M_TILE=8): 8 * 128 * 4 B = 4 KiB, far under the 128 KiB/
+    // work-group budget this hardware provides (CLAUDE.md, SLM budget note).
+    constexpr size_t slm_acc_size = (size_t) K_PARTITIONS * acc_width * sizeof(float);
 
     const int64_t k_tiles          = n_k / k_per;
     const int64_t n_tiles          = (static_cast<int64_t>(n_out) + exec_n - 1) / exec_n;
@@ -155,21 +189,29 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     const int64_t total_qs_size    = (static_cast<int64_t>(n_k) / 2) * static_cast<int64_t>(n_out);
     const int64_t act_row_stride_q = static_cast<int64_t>(n_k);
     const int64_t act_row_stride_s = k_tiles;
+    const int64_t kt_per_partition = (k_tiles + K_PARTITIONS - 1) / K_PARTITIONS;
 
     return queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
         h.parallel_for<mxfp4_soa_gemm_int8_dpas_kernel<M_TILE>>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(n_tiles)), sycl::range<1>(1)),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(n_tiles * K_PARTITIONS)),
+                              sycl::range<1>(static_cast<size_t>(K_PARTITIONS))),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
-                const int64_t n_tile = static_cast<int64_t>(item.get_global_id(0));
-                const int64_t n_base = n_tile * exec_n;
+                slm_init<slm_acc_size>();
 
-                simd<float, M_TILE * exec_n> acc = 0.0f;
+                const int64_t n_tile    = static_cast<int64_t>(item.get_group(0));
+                const int     partition = static_cast<int>(item.get_local_id(0));
+                const int64_t n_base    = n_tile * exec_n;
 
-                for (int64_t kt = 0; kt < k_tiles; ++kt) {
+                const int64_t kt_start = static_cast<int64_t>(partition) * kt_per_partition;
+                const int64_t kt_end   = std::min(kt_start + kt_per_partition, k_tiles);
+
+                simd<float, acc_width> acc = 0.0f;
+
+                for (int64_t kt = kt_start; kt < kt_end; ++kt) {
                     // Activation "A" operand: M_TILE rows x 32 int8 q8_1 codes,
                     // plain row-major (no VNNI packing for A).
                     simd<int8_t, an> a_vec;
@@ -252,14 +294,44 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
                     }
                 }
 
+                // Combine the K_PARTITIONS work-items' partial accumulators
+                // via an SLM hierarchical (tree) reduction -- same structure
+                // as fattn-esimd-f16.hpp's partitioned decode kernel: each
+                // work-item stores its own partial sum, a barrier makes every
+                // store visible, then log2(K_PARTITIONS) rounds each halve
+                // the active partition count, summing pairs, with a barrier
+                // between rounds. Plain addition (not the online-softmax
+                // merge fattn needs) since these are independent partial
+                // dot-product sums, not incrementally-normalized values.
+                slm_block_store(static_cast<size_t>(partition) * acc_width * sizeof(float), acc);
+                barrier();
+
+                for (int stride = K_PARTITIONS / 2; stride > 0; stride /= 2) {
+                    if (partition < stride) {
+                        simd<float, acc_width> my_acc = slm_block_load<float, acc_width>(
+                            static_cast<size_t>(partition) * acc_width * sizeof(float));
+                        simd<float, acc_width> partner_acc = slm_block_load<float, acc_width>(
+                            static_cast<size_t>(partition + stride) * acc_width * sizeof(float));
+                        slm_block_store(static_cast<size_t>(partition) * acc_width * sizeof(float),
+                                        my_acc + partner_acc);
+                    }
+                    barrier();
+                }
+
+                // Partition 0 now holds the fully-reduced sum; it alone
+                // writes the output (matching fattn-esimd-f16.hpp's
+                // `if (partition_id == 0)` final-store convention).
+                if (partition == 0) {
+                    simd<float, acc_width> final_acc = slm_block_load<float, acc_width>(0);
 #    pragma unroll
-                for (int r = 0; r < M_TILE; ++r) {
+                    for (int r = 0; r < M_TILE; ++r) {
 #    pragma unroll
-                    for (int n = 0; n < exec_n; ++n) {
-                        const int64_t row = n_base + n;
-                        if (row < n_out) {
-                            simd<float, 1> value = acc.template select<1, 1>(r * exec_n + n);
-                            block_store<float, 1>(dst + (int64_t) r * n_out + row, value);
+                        for (int n = 0; n < exec_n; ++n) {
+                            const int64_t row = n_base + n;
+                            if (row < n_out) {
+                                simd<float, 1> value = final_acc.template select<1, 1>(r * exec_n + n);
+                                block_store<float, 1>(dst + (int64_t) r * n_out + row, value);
+                            }
                         }
                     }
                 }
