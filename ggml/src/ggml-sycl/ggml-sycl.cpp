@@ -34856,8 +34856,49 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         GGML_ASSERT(ggml_backend_buffer_has_stable_base(buffer) &&
                     "COMPUTE buffer_reset skip requires STABLE_BASE: tensor->data pointers must be stable");
-        GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
-                        ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size(), (void *) buffer);
+        // llama.cpp-dfo0 probe: a graph REBUILD (llm_graph_result::reset re-inits the ggml
+        // context) mints fresh tensor structs, so init_tensor allocates a new extra per tensor
+        // and the ones preserved here become unreachable. Count them so the leak is measurable.
+        // NOTE: llama-bench installs a null log callback unless run with -v, which swallows
+        // this WARN the same as it swallows GGML_LOG_INFO -- pass -v to see these lines there
+        // (llama-cli/llama-completion print WARN at default verbosity, no flag needed).
+        // ctx is loaded lazily below, inside the probe/debug guards, so the unset-env,
+        // debug-off hot path does no extra work beyond the magic-static guard load and the
+        // cached bool test.
+        static const bool leak_probe = [] {
+            const char * e = std::getenv("GGML_SYCL_EXTRA_LEAK_PROBE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (leak_probe) {
+            ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
+            if (ctx != nullptr) {
+                // preserved_total is a running SUM OF THE PER-CALL VECTOR SIZES, not a count of
+                // distinct leaked extras: the COMPUTE path never clears tensor_extras (the early
+                // return below skips the teardown loop), so `n` grows monotonically and this sum
+                // is a triangular series (~calls^2), not linear in bytes actually leaked. It is
+                // also PROCESS-WIDE across ALL COMPUTE buffers (one function-local static),
+                // whereas `buf=%p` and `preserving` below are this call's single buffer --
+                // ggml_vbuffer_reset resets multiple chunks and ggml_gallocr_alloc_graph loops
+                // over buffer types, so several buf=%p values can appear per graph allocation.
+                // The MB figure is this call's `n` x sizeof -- the bytes CURRENTLY HELD by this
+                // buffer's extras vector, which is the figure to compare against RSS growth; the
+                // per-rebuild leak is the DELTA between consecutive lines, not this MB itself.
+                // sum_of_sizes is trailing diagnostic context only -- never quote its MB
+                // equivalent as "leaked".
+                static std::atomic<size_t> preserved_total{ 0 };
+                const size_t               n     = ctx->tensor_extras.size();
+                const size_t               total = preserved_total.fetch_add(n, std::memory_order_relaxed) + n;
+                GGML_LOG_WARN(
+                    "[EXTRA-LEAK-PROBE] buf=%p preserving %zu extras this call (~%.1f MB), sum_of_sizes=%zu @ "
+                    "sizeof=%zu\n",
+                    (void *) buffer, n, (double) n * sizeof(ggml_tensor_extra_gpu) / (1024.0 * 1024.0), total,
+                    sizeof(ggml_tensor_extra_gpu));
+            }
+        }
+        GGML_SYCL_DEBUG(
+            "[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
+            buffer->context ? ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size() : (size_t) 0,
+            (void *) buffer);
         return;
     }
 

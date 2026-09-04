@@ -2739,6 +2739,18 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-dfo0 (plan task L1): source gate for the env-gated leak probe in
+# ggml_backend_sycl_buffer_reset's COMPUTE early return -- probe present,
+# WARN level, env-gated, zero-cost when unset. Host-only, reads the sources
+# as text. Same registration shape as test-sycl-onednn-woq-q8-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-extra-leak-probe-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-extra-leak-probe-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-pktr: test-sycl-layout-choice.cpp is already registered, in
 # ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
 # ctest name differs from the executable target name). Do not register it
