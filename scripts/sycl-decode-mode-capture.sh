@@ -16,10 +16,14 @@
 #                           tenant poll sleep, df, journalctl, ...) is never
 #                           attributed a row, even briefly. Consequence: a
 #                           wrapped command shorter than roughly
-#                           CONFIRM_TICKS*TICK_SECONDS (at least ~1.5s --
-#                           more under load, since confirmation counts
-#                           ticks, not elapsed time) is never confirmed at
-#                           all, so its ENTIRE run gets an all-"-"
+#                           (CONFIRM_TICKS-1)*TICK_SECONDS (at least ~1.0s
+#                           -- N observations spaced TICK_SECONDS apart span
+#                           (N-1)*TICK_SECONDS, not N*TICK_SECONDS; and more
+#                           under load in practice, since confirmation
+#                           counts ticks, not elapsed time -- see
+#                           confirm_bench_pid's own comment for the
+#                           measured bound) is never confirmed at all, so
+#                           its ENTIRE run gets an all-"-"
 #                           bench_pid/rss_anon_kb column (host.txt's audit
 #                           line still names it if resolved, since that
 #                           commit happens independently of row
@@ -88,16 +92,26 @@ BENCH_GUARD="$SCRIPT_DIR/bench-guard.sh"
 # --- tunables (named, not inline literals, the way bench-guard.sh names its
 # own: SHMEM_CEIL_KB, SHMEM_GROWTH_SUSPECT_KB, POLL_INTERVAL). Several
 # comments throughout this script and its test do arithmetic against these
-# (e.g. "CONFIRM_TICKS consecutive TICK_SECONDS ticks span >= 1.5s") -- a
-# silent literal edit would make those claims wrong with nothing to catch
-# it; a name change here is at least grep-able (llama.cpp-gvu7 quality
-# review). ---
+# (e.g. "CONFIRM_TICKS consecutive TICK_SECONDS ticks span >= (CONFIRM_TICKS
+# -1)*TICK_SECONDS") -- a silent literal edit would make those claims wrong
+# with nothing to catch it; a name change here is at least grep-able
+# (llama.cpp-gvu7 quality review). ---
 TG128_SLOW_MAX=32       # compute_mode: strictly below this is "slow"
 TG128_FAST_MIN=36       # compute_mode: strictly above this is "fast"
 TICK_SECONDS=0.5        # sampler cadence
 CONFIRM_TICKS=3         # consecutive ticks the SAME pid must resolve to
                          # before it is trusted (see confirm_bench_pid)
 CMDLINE_MAX_CHARS=120   # audit-line cmdline truncation
+# $EPOCHREALTIME (used below instead of forking `date` -- llama.cpp-gvu7
+# quality review round 1) formats its fractional part with the LOCALE's
+# decimal point (bash builds it via locale_decpoint()), unlike the
+# `date +%s.%N` it replaced, which always emitted '.'. Under a comma-decimal
+# LC_NUMERIC, the t_s column's `awk ... a - b` arithmetic would parse only
+# the integer part and silently quantize to whole seconds -- nothing in
+# this script or its test asserts on t_s, so that would land silently in a
+# real capture. Pinned here, once, rather than relying on every reader of
+# EPOCHREALTIME to know to guard it.
+export LC_NUMERIC=C
 
 OUT="" SYSFS_CARD="" MEMINFO="/proc/meminfo" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT=""
 
@@ -116,19 +130,15 @@ esac; done
 [ $# -gt 0 ] || { echo "sycl-decode-mode-capture: no bench command (pass it after --)" >&2; exit 2; }
 [ -x "$BENCH_GUARD" ] || { echo "sycl-decode-mode-capture: $BENCH_GUARD not found or not executable" >&2; exit 2; }
 
-mkdir -p "$OUT"
-# Reset every file this script itself writes, before bench-guard.sh is even
-# launched -- see the header comment above for why mode.txt and bench.log
-# need an explicit `rm -f` (their writers don't run on every path) while
-# host.txt and timeline.tsv only need a truncate (this script always
-# rewrites them). Grouped together so "what does a fresh invocation reset"
-# has one answer, in one place (llama.cpp-gvu7 quality review).
-: > "$OUT/host.txt"
-rm -f "$OUT/mode.txt" "$OUT/bench.log"
-: > "$OUT/timeline.tsv"
-printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\tbench_pid\trss_anon_kb\n' >> "$OUT/timeline.tsv"
-
 # --- card derivation (mirrors bench-guard.sh; skipped when --sysfs-card is given) ---
+# Deliberately BEFORE the reset block below: this can exit 3 without ever
+# having launched anything, and it must not touch $OUT at all if it does --
+# a setup-only failure (e.g. no selector and no --sysfs-card) must never
+# destroy a prior capture already sitting in a reused --out dir the way the
+# reset block does (llama.cpp-gvu7 quality review round 2: an earlier
+# version of this script ran the reset FIRST, so a setup failure alone
+# deleted a completed prior run's bench.log/mode.txt and blanked its
+# host.txt/timeline.tsv, even though nothing was ever actually launched).
 if [ -z "$SYSFS_CARD" ]; then
     SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
     case "$SELECTOR" in
@@ -142,6 +152,19 @@ if [ -z "$SYSFS_CARD" ]; then
     [ -n "$SYSFS_CARD" ] || { echo "sycl-decode-mode-capture: no DRM card for PCI $PCI" >&2; exit 3; }
 fi
 FREQ="$SYSFS_CARD/device/tile0/gt0/freq0"
+
+mkdir -p "$OUT"
+# Reset every file this script itself writes, before bench-guard.sh is even
+# launched -- see the header comment above for why mode.txt and bench.log
+# need an explicit `rm -f` (their writers don't run on every path) while
+# host.txt and timeline.tsv only need a truncate (this script always
+# rewrites them). Grouped together so "what does a fresh invocation reset"
+# has one answer, in one place (llama.cpp-gvu7 quality review) -- but ONLY
+# once card derivation has already succeeded (see the comment above it).
+: > "$OUT/host.txt"
+rm -f "$OUT/mode.txt" "$OUT/bench.log"
+: > "$OUT/timeline.tsv"
+printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\tbench_pid\trss_anon_kb\n' >> "$OUT/timeline.tsv"
 
 # Forward the test hooks bench-guard.sh understands, unchanged, plus the
 # --sysfs-card this script just derived (or was given) so both agree.
@@ -272,8 +295,8 @@ find_bench_pid() {
 # depth, comm, and timing -- not implemented, since nothing measured needs
 # it yet.
 confirm_bench_pid() {
-    local guard_pid="$1" new_pid
-    new_pid="$(find_bench_pid "$guard_pid" || true)"
+    local gpid="$1" new_pid
+    new_pid="$(find_bench_pid "$gpid" || true)"
     if [ -n "$new_pid" ] && [ "$new_pid" = "$pending_pid" ]; then
         pending_confirms=$((pending_confirms + 1))
     else
@@ -319,7 +342,7 @@ confirm_bench_pid() {
 # pid/comm on a row), and the two states remain distinguishable from the
 # output alone.
 commit_bench_pid() {
-    local pid="$1" guard_pid="$2" bench_ppid
+    local pid="$1" gpid="$2" bench_ppid
     bench_pid="$pid"
     bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
     # -r guards against a shell-level redirection error hitting stderr when
@@ -338,7 +361,7 @@ commit_bench_pid() {
     # parenthesised) has no embedded whitespace, true for every comm this
     # script ever sees.
     bench_ppid="$(awk '{print $4}' "/proc/$bench_pid/stat" 2>/dev/null || true)"
-    if [ -n "$bench_ppid" ] && [ "$bench_ppid" != "$guard_pid" ]; then
+    if [ -n "$bench_ppid" ] && [ "$bench_ppid" != "$gpid" ]; then
         bench_reportable=1
     else
         bench_reportable=0

@@ -8,7 +8,7 @@
 # capture script itself: the sampler timeline, host.txt before/after blocks,
 # tg128 parsing + mode computation, and refusal pass-through.
 #
-# Expected wall-clock runtime: roughly 35-45s (varies with host load -- see
+# Expected wall-clock runtime: roughly 30-45s (varies with host load -- see
 # CLAUDE.md's "host load is permanent" note). Dominated by
 # mk_fake_bench_grow's fixed ~2s busy-wait in three separate cases
 # (pid-check, busy-card, helper-race), mk_tree_busy_then_free's ~10s
@@ -28,16 +28,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAPTURE="$ROOT_DIR/scripts/sycl-decode-mode-capture.sh"
 GUARD="$ROOT_DIR/scripts/bench-guard.sh"
-
-# Mirrors scripts/sycl-decode-mode-capture.sh's own CONFIRM_TICKS/
-# TICK_SECONDS tunables -- this file does not source the script (no
-# tests/*.sh in this directory sources a shared helper; standalone files are
-# the convention here), so these are separate constants kept in sync by
-# hand, used below to derive fixture durations rather than hand-picking a
-# number with no traceable relationship to the script's own bar
-# (llama.cpp-gvu7 quality review).
-CONFIRM_TICKS=3
-TICK_SECONDS=0.5
 # CAPTURE ships in the SAME commit as this test (scripts/sycl-decode-mode-
 # capture.sh and this file were never landed separately, unlike the RED
 # phase before the script existed at all) -- its absence here is a defect
@@ -48,6 +38,26 @@ TICK_SECONDS=0.5
 # missing it is a different, genuinely skippable situation.
 [ -x "$CAPTURE" ] || { echo "FAIL: $CAPTURE is missing or not executable -- it ships in the same commit as this test, so its absence is a defect" >&2; exit 1; }
 [ -x "$GUARD" ] || { echo "SKIP: bench-guard.sh not present"; exit 77; }
+
+# CONFIRM_TICKS/TICK_SECONDS: read directly out of $CAPTURE with `sed`
+# instead of a hand-maintained mirror. An earlier version of this file
+# declared its own CONFIRM_TICKS=3/TICK_SECONDS=0.5 "mirrors" and claimed a
+# script-side edit that widened either without updating them would "fail
+# loudly" -- that claim was false in the direction that matters: the sanity
+# guard below is computed from the TEST's own copies, so it cannot see a
+# script-side change at all (demonstrated: bumping the script's
+# CONFIRM_TICKS from 3 to 9 with the mirror left at 3 produced no guard
+# failure, only a confusing downstream "bench_pid=unknown" further down --
+# llama.cpp-gvu7 quality review round 2). Reading the values FROM the
+# script closes that gap structurally: there is nothing left to drift out
+# of sync. A rename or reformat of either assignment line in the script
+# makes the sed pattern match nothing, and the explicit `-n` check below
+# fails this test closed (exit 1) rather than silently computing a
+# margin-of-zero from an empty string.
+CONFIRM_TICKS="$(sed -n 's/^CONFIRM_TICKS=\([0-9][0-9]*\).*/\1/p' "$CAPTURE")"
+TICK_SECONDS="$(sed -n 's/^TICK_SECONDS=\([0-9.][0-9.]*\).*/\1/p' "$CAPTURE")"
+[ -n "$CONFIRM_TICKS" ] || { echo "FAIL: could not read CONFIRM_TICKS out of $CAPTURE (renamed or reformatted?)" >&2; exit 1; }
+[ -n "$TICK_SECONDS" ] || { echo "FAIL: could not read TICK_SECONDS out of $CAPTURE (renamed or reformatted?)" >&2; exit 1; }
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
@@ -81,7 +91,9 @@ expect_status() {
 # the one case (out_slow) that asserts a resolved bench_pid. pid commitment
 # needs CONFIRM_TICKS consecutive TICK_SECONDS-spaced ticks to land on the
 # SAME resolved pid (llama.cpp-gvu7 review, round 2) -- a bare minimum of
-# CONFIRM_TICKS*TICK_SECONDS = 1.5s of real ticks -- and this suite's own
+# (CONFIRM_TICKS-1)*TICK_SECONDS = 1.0s of real ticks (N ticks spaced
+# TICK_SECONDS apart span (N-1)*TICK_SECONDS, not N*TICK_SECONDS -- see
+# confirm_bench_pid's own comment in the script) -- and this suite's own
 # per-tick overhead (several subprocess forks per sample in the capture
 # script) under this host's permanent ambient load can push the EFFECTIVE
 # tick spacing well past TICK_SECONDS -- caught directly by a flake loop
@@ -101,17 +113,20 @@ MK_FAKE_BENCH_SLOW_SECONDS=4
 # finding 8's "cheap partial" suggestion).
 MK_FAKE_BENCH_FAST_SECONDS=1
 
-# Sanity guard, derived from CONFIRM_TICKS/TICK_SECONDS rather than a second
-# hand-picked number: MK_FAKE_BENCH_SLOW_SECONDS must clear the tick-based
-# floor with real margin, or the "bench_pid resolved" assertions below are
-# set up to flake the way this fixture already did once at `sleep 2`. This
-# makes the mirrored tunables load-bearing, not decorative -- a future edit
-# that widens CONFIRM_TICKS or TICK_SECONDS in the script without updating
-# these mirrors, or that shrinks MK_FAKE_BENCH_SLOW_SECONDS, fails loudly
-# here instead of flaking silently later.
-MIN_CONFIRM_SECONDS="$(awk -v t="$CONFIRM_TICKS" -v s="$TICK_SECONDS" 'BEGIN { print t * s }')"
+# Sanity guard, derived from the CONFIRM_TICKS/TICK_SECONDS values just read
+# out of the script (above) rather than a second hand-picked number:
+# MK_FAKE_BENCH_SLOW_SECONDS must clear the tick-based floor with real
+# margin, or the "bench_pid resolved" assertions below are set up to flake
+# the way this fixture already did once at `sleep 2`. The floor itself is
+# (CONFIRM_TICKS-1)*TICK_SECONDS, not CONFIRM_TICKS*TICK_SECONDS -- N ticks
+# spaced TICK_SECONDS apart span (N-1)*TICK_SECONDS (llama.cpp-gvu7 quality
+# review round 2, item 3). Because CONFIRM_TICKS/TICK_SECONDS are now read
+# live from $CAPTURE instead of hand-mirrored, this guard also fails loudly
+# (rather than silently computing a stale floor) if the script's tunables
+# change without this fixture's margin being revisited.
+MIN_CONFIRM_SECONDS="$(awk -v t="$CONFIRM_TICKS" -v s="$TICK_SECONDS" 'BEGIN { print (t - 1) * s }')"
 awk -v have="$MK_FAKE_BENCH_SLOW_SECONDS" -v min="$MIN_CONFIRM_SECONDS" 'BEGIN { exit !(have >= min * 2) }' \
-    || { echo "FAIL: MK_FAKE_BENCH_SLOW_SECONDS ($MK_FAKE_BENCH_SLOW_SECONDS) has too little margin over 2x CONFIRM_TICKS*TICK_SECONDS ($MIN_CONFIRM_SECONDS)"; fail=1; }
+    || { echo "FAIL: MK_FAKE_BENCH_SLOW_SECONDS ($MK_FAKE_BENCH_SLOW_SECONDS) has too little margin over 2x (CONFIRM_TICKS-1)*TICK_SECONDS ($MIN_CONFIRM_SECONDS)"; fail=1; }
 
 # mk_fake_bench: a fake "llama-bench" that prints a canned markdown tg128 row
 # embedding $1 as the t/s figure, then sleeps $2 seconds (default
@@ -408,6 +423,45 @@ bench="$(mk_fake_bench_nonnumeric)"
 run_capture "$out_nonnum" -- "$bench" || { echo "FAIL: non-numeric-cell run failed"; fail=1; }
 grep -qx "tg128=unknown mode=unknown" "$out_nonnum/mode.txt" 2>/dev/null \
     || { echo "FAIL: expected tg128=unknown mode=unknown for a non-numeric t/s cell (got: $(cat "$out_nonnum/mode.txt" 2>/dev/null))"; fail=1; }
+
+# --- regression: a SETUP-ONLY failure (no --sysfs-card and no usable
+# ONEAPI_DEVICE_SELECTOR) must exit 3 WITHOUT touching a populated --out dir
+# at all (llama.cpp-gvu7 quality review round 2, finding 1 -- a regression
+# from round 1's own finding 7, which grouped the four resets together but
+# in doing so accidentally moved them to run BEFORE card derivation: an
+# earlier version of this script would delete bench.log/mode.txt and blank
+# host.txt/timeline.tsv from a completed prior run in a reused --out dir,
+# even though card derivation then failed and nothing was ever launched).
+# Unlike the high-Shmem refusal case below (a bench-guard.sh PREFLIGHT
+# refusal, reached only after --sysfs-card is already known-good), this
+# exercises the capture script's OWN card-derivation failure, which must
+# happen -- and must exit 3 -- before the reset block is ever reached. ---
+
+out_setup_fail="$T/out-setup-fail"
+mk_tree 0 0; mk_meminfo 3000000
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+run_capture "$out_setup_fail" -- "$bench" || { echo "FAIL: setup-fail-regression seed run failed"; fail=1; }
+for f in mode.txt bench.log timeline.tsv host.txt; do
+    [ -s "$out_setup_fail/$f" ] || { echo "FAIL: seed run for setup-fail regression left $f missing/empty"; fail=1; }
+done
+before_mode="$(cat "$out_setup_fail/mode.txt")"
+before_log="$(cat "$out_setup_fail/bench.log")"
+before_timeline="$(cat "$out_setup_fail/timeline.tsv")"
+before_host="$(cat "$out_setup_fail/host.txt")"
+
+setup_rc=0
+( unset ONEAPI_DEVICE_SELECTOR; "$CAPTURE" --out "$out_setup_fail" -- "$bench" ) >/dev/null 2>&1 || setup_rc=$?
+[ "$setup_rc" -eq 3 ] \
+    || { echo "FAIL: expected a setup-only failure (no --sysfs-card, no selector) to exit 3, got $setup_rc"; fail=1; }
+
+[ "$(cat "$out_setup_fail/mode.txt")" = "$before_mode" ] \
+    || { echo "FAIL: setup-only failure altered mode.txt in a populated --out dir"; fail=1; }
+[ "$(cat "$out_setup_fail/bench.log")" = "$before_log" ] \
+    || { echo "FAIL: setup-only failure altered bench.log in a populated --out dir"; fail=1; }
+[ "$(cat "$out_setup_fail/timeline.tsv")" = "$before_timeline" ] \
+    || { echo "FAIL: setup-only failure altered timeline.tsv in a populated --out dir"; fail=1; }
+[ "$(cat "$out_setup_fail/host.txt")" = "$before_host" ] \
+    || { echo "FAIL: setup-only failure altered host.txt in a populated --out dir"; fail=1; }
 
 # --- exit status mirrors the underlying run (0 on a clean run) ---
 
