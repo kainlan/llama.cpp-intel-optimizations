@@ -79,7 +79,7 @@ int main() {
         const int64_t ne00 = bpr * 32;
         // Not check_shape() here: its second CHECK would duplicate the
         // first verbatim, since expect_aligned IS reference_tile_aligned(ne00)
-        // for this exact-boundary case (spec review nit 13, rev-pktr-spec-3).
+        // for this exact-boundary case (spec review nit 13, round 3).
         CHECK(ggml_sycl_q8_0_coalesced_tile_aligned(ne00) == reference_tile_aligned(ne00),
               "sweep (exact block boundary): ne00=%lld disagrees with the independent reference", (long long) ne00);
         if (bpr > 0) {

@@ -1786,7 +1786,7 @@ static bool run_dense_attention_ffn_layout_test() {
         }
     }
 
-    // Negative control (spec review nit 8, rev-pktr-spec-3): the pktr rule
+    // Negative control (spec review nit 8, round 3): the pktr rule
     // is Q8_0-only. A Q4_0 dense weight with the SAME tile-misaligned shape
     // (K=2560, 80 blocks/row) must NOT be demoted to SOA -- the type guard
     // in ggml_sycl_adjust_layout_for_tensor's dense-usage branch must keep

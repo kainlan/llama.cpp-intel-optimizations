@@ -110,7 +110,7 @@ def matching_brace(text, open_idx):
 
 
 def function_body(text, signature):
-    # Whitespace-flexible (spec review nit 4, rev-pktr-spec-4): a reflowed
+    # Whitespace-flexible (spec review nit 4, round 4): a reflowed
     # signature (e.g. a long parameter list clang-format wraps differently)
     # must not read as "missing definition".
     idx = ws_find(text, signature)
@@ -127,7 +127,7 @@ def ws_pattern(needle):
     this exact function during development) does not break an exact-string
     match. Positions returned by .search()/.finditer() are real offsets
     into the ORIGINAL, un-normalized text (spec review finding 3,
-    rev-pktr-spec-3). test-sycl-q8-dense-layout-rule-source.py deliberately
+    round 3). test-sycl-q8-dense-layout-rule-source.py deliberately
     carries a more general sibling ws_pattern that also tolerates a wrap
     directly against `( ) , * &` with no whitespace in the needle (needed
     for a single-parameter signature, where clang-format at the 120-column
@@ -155,7 +155,7 @@ def ws_in(text, needle):
     sequence of tokens) appears in `text` with any whitespace between
     tokens, including a line wrap. Argument order (text, needle) matches
     ws_find/ws_rfind/ws_count in this same helper block (spec review nit,
-    rev-pktr-spec-6: this function alone used to take (needle, text))."""
+    round 6: this function alone used to take (needle, text))."""
     return ws_pattern(needle).search(text) is not None
 
 
@@ -163,7 +163,7 @@ def ws_count(text, needle):
     """Number of whitespace-flexible matches of `needle` in `text` -- for
     "defined exactly once" checks on a signature (e.g. HELPER_SIG,
     ARM_SIG, SOA_ELIGIBILITY_SIG) that a reflowed parameter list must not
-    false-fail (spec review should-fix 1, rev-pktr-spec-5)."""
+    false-fail (spec review should-fix 1, round 5)."""
     return len(list(ws_pattern(needle).finditer(text)))
 
 
@@ -201,7 +201,7 @@ def enclosing_if_conditions(text, start, target):
     `target`, scanning code (not comments/strings) from `start`. Used to check
     that a call site is actually gated by a condition possibly several nested
     `if`s above it, not just its immediate parent (spec review finding 2,
-    rev-pktr-spec-2: the SOA lookup's planned-layout check sits on the OUTER
+    round 2: the SOA lookup's planned-layout check sits on the OUTER
     `if`, while its own immediate guard is an unrelated inner predicate)."""
     stack = []
     i = start
@@ -313,7 +313,7 @@ def test_layout_env_defaults_coalesced_and_only_touches_dense_projections():
     ), 'GGML_SYCL_Q8_DENSE_LAYOUT must default to coalesced (only "soa" selects SOA)'
     # Whitespace-flexible: the original exact-string form (with a literal
     # newline and hardcoded indentation) false-failed on a pure reindent of
-    # this block in common.hpp (spec review nit 3, rev-pktr-spec-4).
+    # this block in common.hpp (spec review nit 3, round 4).
     soa_returns = len(
         list(ws_pattern("if (qtype == GGML_TYPE_Q8_0 && q8_dense_soa_cached) { return GGML_LAYOUT_SOA;").finditer(common))
     )
@@ -391,7 +391,7 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
     helper_body = function_body(backend, HELPER_SIG)
     assert (
         "get_effective_layout_mode(" not in helper_body
-    ), "the planned layout must NOT be read from get_effective_layout_mode (rev-pktr-spec-2 regression source)"
+    ), "the planned layout must NOT be read from get_effective_layout_mode (llama.cpp-pktr spec review round 2 regression source)"
     assert (
         helper_body.count("ggml_sycl_resolve(") == 1
     ), "the helper must call ggml_sycl_resolve() exactly once"
@@ -427,7 +427,7 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
 
 
 def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
-    # llama.cpp-pktr spec-review finding 2 (rev-pktr-spec-2): a THIRD Q8_0
+    # llama.cpp-pktr spec-review finding 2 (round 2): a THIRD Q8_0
     # layout lookup exists in this function -- the llama.cpp-dkw0 fp32
     # sibling's coalesced dequant lookup (reachable when the f16 GEMM branch
     # above declines: GGML_SYCL_F16=OFF, a row-split dispatch, or
@@ -440,7 +440,7 @@ def test_exactly_three_q8_0_layout_lookups_all_gated_on_planned_layout():
     # `if` (possibly several levels up, not just its immediate parent --
     # the SOA lookup's own immediate guard is an unrelated full_rows/
     # k_blocked predicate) that references q8_0_dense_planned_layout.
-    # rev-pktr-spec-3 finding 3: checking only that some enclosing `if`
+    # llama.cpp-pktr spec review round 3 finding 3: checking only that some enclosing `if`
     # CONTAINS the variable name is directionally blind -- a mutant gating
     # the fp32 lookup on `q8_0_dense_planned_layout != GGML_LAYOUT_SOA`
     # (wrong operator, wrong constant) passed the earlier form of this

@@ -57,11 +57,11 @@ PLANNER_DEMOTE_SIG = "static ggml_layout_mode planner_demote_coalesced_if_misali
 # >=, <=), in any spacing. Deliberately broader than the one exact string
 # ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the shared predicate itself
 # happens to use, so a differently-spelled re-derivation WITHIN THIS FAMILY
-# is caught (spec review finding 6, rev-pktr-spec-1; widened again to cover
-# comparison operators other than != / == in finding 3, rev-pktr-spec-2 --
+# is caught (spec review finding 6, round 1; widened again to cover
+# comparison operators other than != / == in finding 3, round 2 --
 # "% 32 > 0" is an equally plausible re-derivation and the narrower
 # alternation missed it). NOT a catch-all for every possible re-derivation
-# (wording corrected, finding 4, rev-pktr-spec-3): a bitwise spelling such
+# (wording corrected, finding 4, round 3): a bitwise spelling such
 # as `& (MMVQ_COALESCED_TILE_BLOCKS - 1)` uses neither `%` nor a comparison
 # token this regex looks for and would pass undetected.
 RE_DERIVATION_RE = re.compile(r"%\s*(MMVQ_COALESCED_TILE_BLOCKS|32)\s*[<>=!]=?\s*0")
@@ -121,7 +121,7 @@ def matching_brace(text, open_idx):
 
 
 def function_body(text, signature):
-    # Whitespace-flexible (spec review nit 4, rev-pktr-spec-4): a reflowed
+    # Whitespace-flexible (spec review nit 4, round 4): a reflowed
     # signature (e.g. a long parameter list clang-format wraps differently)
     # must not read as "missing definition".
     idx = ws_find(text, signature)
@@ -142,7 +142,7 @@ def ws_pattern(needle):
     with NO whitespace at all in the canonical string, which a simpler
     tokenizer that only allows flex at existing whitespace runs (as this
     file's own predecessor did, and as the sibling woq gate's ws_pattern
-    still does) cannot represent (spec review should-fix, rev-pktr-spec-6:
+    still does) cannot represent (spec review should-fix, round 6:
     the exact-count check false-failed on that reflow, and the same
     exact-substring style in the negative "must not redefine" check let a
     reflowed redefinition slip past undetected)."""
@@ -184,7 +184,7 @@ def test_predicate_defined_exactly_once():
     # Defined in the standalone header; ggml-sycl.cpp and unified-cache.cpp
     # must each CALL it, never redefine it (both include common.hpp, which
     # includes the header). Boundary-flexible (spec review should-fix,
-    # rev-pktr-spec-6): the previous exact-string forms false-failed the
+    # round 6): the previous exact-string forms false-failed the
     # positive check on a reflowed single-parameter signature (a real
     # formatter can place `int64_t ne00` alone on the next line, wrapping
     # right after `(`) and, worse, let a reflowed REDEFINITION slip past
@@ -224,14 +224,14 @@ def test_adjust_layout_for_tensor_calls_the_predicate_for_the_dense_usage_set():
     assert usage_idx < predicate_idx, "the predicate call must be inside the widened dense-usage branch"
     # No hand-rolled re-derivation of the arithmetic alongside the call, in
     # the `% <const> <cmp> 0` family of spellings -- spec review finding 6
-    # (rev-pktr-spec-1): the original form of this check matched only the
+    # (round 1): the original form of this check matched only the
     # one exact spelling ("% MMVQ_COALESCED_TILE_BLOCKS) != 0") the
     # predicate itself happens to use, so a re-derivation written with
     # "== 0" instead of "!= 0", with the literal 32 instead of the named
     # constant, with a different spacing, or with a different comparison
-    # operator (finding 3, rev-pktr-spec-2) would pass unnoticed. This is
+    # operator (finding 3, round 2) would pass unnoticed. This is
     # NOT a catch-all for every possible re-derivation, wording corrected
-    # in finding 4, rev-pktr-spec-3 -- a re-derivation spelled as a bitwise
+    # in finding 4, round 3 -- a re-derivation spelled as a bitwise
     # test (e.g. `& (MMVQ_COALESCED_TILE_BLOCKS - 1)`) uses no `%`/comparison
     # token this regex looks for and stays undetected.
     assert not RE_DERIVATION_RE.search(
@@ -240,7 +240,7 @@ def test_adjust_layout_for_tensor_calls_the_predicate_for_the_dense_usage_set():
 
 
 def test_planner_default_device_layout_calls_the_predicate_in_both_overloads():
-    # llama.cpp-pktr spec review nit 9 (rev-pktr-spec-3): both overloads used
+    # llama.cpp-pktr spec review nit 9 (round 3): both overloads used
     # to call the predicate directly and identically; that duplicate
     # 4-line block is now factored into planner_demote_coalesced_if_misaligned,
     # which each overload calls instead. Check the delegation from each

@@ -42346,7 +42346,7 @@ static bool ggml_sycl_q8_0_onednn_soa_enabled();
 
 // llama.cpp-pktr: ggml_sycl_get_weight_layout_ptr(tensor, device, target)
 // does not verify resolved == target, so a lookup's own success/failure
-// must never stand in for "the planner chose this layout" (rev-pktr-spec-1
+// must never stand in for "the planner chose this layout" (llama.cpp-pktr spec review round 1
 // finding 1 caused a real B50 regression this way -- see the commit
 // history on llama.cpp-pktr for the full incident, not repeated here).
 // Decide a Q8_0 weight's materialized layout ONCE, from
