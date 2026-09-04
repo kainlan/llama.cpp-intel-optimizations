@@ -16,8 +16,14 @@ mk_tree() { # $1=throttle $2=act_freq
     echo "$2" > "$d/act_freq"
 }
 mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/meminfo"; }
-run_guard() { "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
-              --pgrep-cmd "$1" --max-wait 1 -- true; }
+# run_guard <pgrep-cmd> [extra guard flags...] -- forwards anything after the
+# pgrep-cmd straight through to bench-guard.sh (e.g. --df-cmd), so callers
+# that need an extra override don't have to spell out the whole invocation.
+run_guard() {
+    local pgrep="$1"; shift
+    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
+              --pgrep-cmd "$pgrep" --max-wait 1 "$@" -- true
+}
 
 # Assert an EXACT status, never merely non-zero (mirrors
 # tests/test-sycl-device-guard-symmetry-policy.sh's expect_status). Usage:
@@ -45,7 +51,7 @@ mk_tree 0 0
 expect_status 3 "stale GPU tenant must refuse" -- run_guard "echo 1234 llama-bench"
 
 mk_meminfo 30000000
-expect_status 3 "high Shmem must refuse" -- "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+expect_status 3 "high Shmem must refuse" -- run_guard "false" --df-cmd true
 
 mk_meminfo 3000000
 expect_status 0 "clean host must run" -- run_guard "false"
@@ -53,18 +59,27 @@ expect_status 0 "clean host must run" -- run_guard "false"
 # tmpfs files are not GPU-BO shmem: Shmem 30 GB with 29 GB of tmpfs files must run
 mk_meminfo 30000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 33554432 29000000 4554432 87%% /tmp\n' > "$T/df.txt"
-expect_status 0 "high Shmem explained by tmpfs must run" -- "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "cat $T/df.txt" --max-wait 1 -- true
+expect_status 0 "high Shmem explained by tmpfs must run" -- run_guard "false" --df-cmd "cat $T/df.txt"
 
 # A FAILING df-cmd must be treated as tmpfs=0 -- fail closed toward the
 # pre-tmpfs-subtraction behaviour, never silently zero out the ceiling check.
 mk_meminfo 3000000
-expect_status 0 "failing df-cmd + low Shmem must still run (tmpfs=0)" -- \
-    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true
+expect_status 0 "failing df-cmd + low Shmem must still run (tmpfs=0)" -- run_guard "false" --df-cmd false
 
 mk_meminfo 30000000
 out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: expected failing df-cmd + high Shmem to exit 3, got $rc"; fail=1; }
 echo "$out" | grep -q "minus tmpfs 0 kB" || { echo "FAIL: refusal message must show 'minus tmpfs 0 kB' (got: $out)"; fail=1; }
+
+# The clamp branch: tmpfs usage that meets or exceeds Shmem must clamp
+# effective Shmem to 0 (not go negative) and emit an informational note on
+# stderr, without refusing -- Shmem 3,000,000 kB is comfortably under the
+# ceiling once clamped.
+mk_meminfo 3000000
+printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 8000000 5000000 3000000 63%% /tmp\n' > "$T/df-clamp.txt"
+out="$(run_guard "false" --df-cmd "cat $T/df-clamp.txt" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: expected clamp branch (tmpfs >= Shmem) to still run, got $rc"; fail=1; }
+echo "$out" | grep -q "tmpfs used (5000000 kB) exceeds Shmem (3000000 kB); effective Shmem clamped to 0" || { echo "FAIL: clamp note missing (got: $out)"; fail=1; }
 
 # Selector-to-PCI derivation must be an EXACT match. level_zero:0,1 (and
 # anything else that isn't precisely "level_zero:0" or "level_zero:1") must

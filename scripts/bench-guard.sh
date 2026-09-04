@@ -5,11 +5,17 @@
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
 # already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
-# --pgrep-cmd, --journalctl-cmd, --df-cmd) so the logic is testable without
-# hardware. The Shmem ceiling check compares Shmem net of tmpfs file usage
-# (summed "Used" from `df -k -t tmpfs`, override with --df-cmd): ordinary
-# tmpfs files (/tmp, /dev/shm) count toward Shmem in /proc/meminfo alongside
-# TTM GPU-BO backing, and the ceiling exists for the latter, not the former.
+# --pgrep-cmd, --journalctl-cmd, --df-cmd -- the last three are test hooks,
+# same as --meminfo/--sysfs-card, so the logic is testable without hardware).
+# The Shmem ceiling check compares Shmem net of tmpfs file usage (summed
+# "Used" from `df -k -t tmpfs`, override with --df-cmd): ordinary tmpfs files
+# (/tmp, /dev/shm) count toward Shmem in /proc/meminfo alongside TTM GPU-BO
+# backing, and the ceiling exists for the latter, not the former. If tmpfs
+# usage meets or exceeds Shmem (swap-backed tmpfs pages, `none`-fstype rows
+# `df` counts that Shmem doesn't, etc.) effective Shmem clamps to 0 rather
+# than going negative, and a one-line note is printed to stderr so the clamp
+# is never silent. The archived --log header stamps raw Shmem, tmpfs used,
+# and the net figure separately at each sample point, never just the net.
 #
 # On a clean host: runs the wrapped command under `timeout -k 15 <budget>`
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
@@ -79,10 +85,39 @@ tenants() {
 t="$(tenants | grep -E 'llama' || true)"
 [ -z "$t" ] || refuse "stale GPU tenant(s): $t"
 
-shmem_kb()  { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
-tmpfs_kb()  { { if [ -n "$DF_CMD" ]; then eval "$DF_CMD"; else df -k -t tmpfs 2>/dev/null; fi; } | awk 'NR>1{s+=$3} END{print s+0}'; }
-eff_shmem_kb() { local s t; s=$(shmem_kb); t=$(tmpfs_kb); [ "$s" -gt "$t" ] && echo $((s - t)) || echo 0; }
-[ "$(eff_shmem_kb)" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $(shmem_kb) kB minus tmpfs $(tmpfs_kb) kB = $(eff_shmem_kb) kB above ceiling $SHMEM_CEIL_KB kB"
+shmem_kb() { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
+# tmpfs_kb sits to the LEFT of a pipe (piped into awk): each pipeline stage
+# runs in its own subshell, so a refuse()/exit called from inside DF_CMD (or
+# a future rewrite of this helper) would only exit that subshell -- it would
+# be swallowed, never reach the top-level script. Do not add refuse() here;
+# keep this helper pure (probe in, number out).
+tmpfs_kb() { { if [ -n "$DF_CMD" ]; then $DF_CMD 2>/dev/null; else df -k -t tmpfs 2>/dev/null; fi; } | awk 'NR>1{s+=$3} END{print s+0}'; }
+
+# Sample raw Shmem + tmpfs usage ONCE and derive the effective figure, into
+# the three SAMPLE_* globals -- never re-derive individually, so a clamp note
+# below fires once per sample point, not once per printed number. Callers:
+# the preflight ceiling check, and pre/post around the wrapped command.
+SAMPLE_RAW=0 SAMPLE_TMPFS=0 SAMPLE_EFF=0
+sample_shmem() {
+    SAMPLE_RAW="$(shmem_kb)"
+    # `|| true`: tmpfs_kb's internal pipe can return non-zero under pipefail
+    # when DF_CMD itself fails (e.g. a fake `false` in tests) even though the
+    # trailing awk still emits a valid "0" -- this is a *plain* assignment
+    # (unlike the old `[ "$(eff_shmem_kb)" -le ... ]` form), so under set -e
+    # a bare non-zero status here would abort the whole script instead of
+    # just leaving SAMPLE_TMPFS at the awk-emitted fallback value.
+    SAMPLE_TMPFS="$(tmpfs_kb)" || true
+    if [ "$SAMPLE_RAW" -gt "$SAMPLE_TMPFS" ]; then
+        SAMPLE_EFF=$((SAMPLE_RAW - SAMPLE_TMPFS))
+    else
+        SAMPLE_EFF=0
+        echo "bench-guard: note: tmpfs used (${SAMPLE_TMPFS} kB) exceeds Shmem (${SAMPLE_RAW} kB); effective Shmem clamped to 0" >&2
+    fi
+}
+
+sample_shmem
+raw_shmem="$SAMPLE_RAW" tmpfs_used="$SAMPLE_TMPFS" eff_shmem="$SAMPLE_EFF"
+[ "$eff_shmem" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $raw_shmem kB minus tmpfs $tmpfs_used kB = $eff_shmem kB above ceiling $SHMEM_CEIL_KB kB"
 
 # Poll throttle/act_freq up to --max-wait, checking the deadline BEFORE each
 # sleep and capping each sleep to the time actually remaining -- so
@@ -99,7 +134,8 @@ while :; do
     waited=$((waited + interval))
 done
 
-pre_shmem="$(eff_shmem_kb)"
+sample_shmem
+pre_shmem_raw="$SAMPLE_RAW" pre_tmpfs="$SAMPLE_TMPFS" pre_shmem_eff="$SAMPLE_EFF"
 pre_thr="$st"
 
 # -e-safe capture: `cmd; rc=$?` would trip `set -e` the instant the wrapped
@@ -115,16 +151,17 @@ else
     timeout -k 15 "$BUDGET" "$@" || rc=$?
 fi
 
-post_shmem="$(eff_shmem_kb)"
+sample_shmem
+post_shmem_raw="$SAMPLE_RAW" post_tmpfs="$SAMPLE_TMPFS" post_shmem_eff="$SAMPLE_EFF"
 post_thr="$(cat "$FREQ/throttle/status")"
 
 verdict="VALID"
 reasons=""
 # Plain `if` blocks, not `&&` chains -- a trailing false `&&` under `set -e`
 # would exit the script instead of just skipping the reason.
-if [ $((post_shmem - pre_shmem)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
+if [ $((post_shmem_eff - pre_shmem_eff)) -gt "$SHMEM_GROWTH_SUSPECT_KB" ]; then
     verdict="SUSPECT"
-    reasons="$reasons shmem-grew:$((post_shmem - pre_shmem))kB"
+    reasons="$reasons shmem-grew:$((post_shmem_eff - pre_shmem_eff))kB"
 fi
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     verdict="SUSPECT"
@@ -143,7 +180,7 @@ fi
 verdict_line="$verdict${reasons:+:$reasons}"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict_line pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem=${pre_shmem}kB post_shmem=${post_shmem}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
 else
