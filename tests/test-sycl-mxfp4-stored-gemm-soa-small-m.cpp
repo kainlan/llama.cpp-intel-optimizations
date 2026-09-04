@@ -30,6 +30,7 @@
 //     N-tile), K=2880, M=8 -- exercises the partial-tile boundary check the
 //     main sweep's N=2880 (=180*16, an exact multiple) never reaches.
 
+#include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
@@ -127,7 +128,30 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     ggml_backend_tensor_set(t_act_qs, pack.qs.data(), 0, pack.qs.size());
     ggml_backend_tensor_set(t_act_sc, pack.scales.data(), 0, pack.scales.size() * sizeof(float));
 
-    sycl::queue & q = ggml_sycl_get_device(0).default_queue();
+    // NOT ggml_sycl_get_device(0).default_queue(): that raw dpct device queue
+    // only carries sycl::property::queue::enable_profiling when
+    // DPCT_PROFILING_ENABLED was defined at compile time, which it is not
+    // here -- a run under GGML_SYCL_KERNEL_PROFILE=1 then silently records
+    // zero-duration/failed-timestamp samples for every kernel this test
+    // submits. ctx->stream() is the SAME queue production dispatch (and the
+    // sibling GPU tests that go through ggml_backend_graph_compute) submits
+    // on: once the unified cache exists for this device -- which the buffer
+    // allocations above already created -- it resolves to the cache's owner
+    // queue, unconditionally constructed with default_queue_properties()
+    // (common.hpp), which DOES always set enable_profiling.
+    auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    sycl::queue & q        = *sycl_ctx->stream();
+
+    if (std::getenv("GGML_SYCL_KERNEL_PROFILE")) {
+        // Bytes moved per call, for deriving the mxfp4.stored_gemm.soa
+        // profile row's bandwidth: the whole expert's SOA buffer (17 bytes
+        // per 32-element block: 16 nibble-packed + 1 E8M0 scale byte) plus
+        // the M x n_k int8 activation codes plus the M x n_out f32 output.
+        const double bytes_moved =
+            (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k + (double) M * (double) n_out * 4.0;
+        std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,
+                    (long long) n_k, bytes_moved);
+    }
 
     sycl::event event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
         q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data), static_cast<const float *>(t_act_sc->data),

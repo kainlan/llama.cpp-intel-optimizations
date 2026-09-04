@@ -156,15 +156,34 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     const int64_t act_row_stride_q = static_cast<int64_t>(n_k);
     const int64_t act_row_stride_s = k_tiles;
 
+    // Local work-group size, and the padded global range it divides evenly:
+    // each of the n_tiles work-items is fully independent (no barrier, no
+    // SLM, no cross-lane communication -- every operand is either private or
+    // read-only), so grouping GGML_SYCL_MXFP4_MOE_XMX_SG of them (this
+    // hardware's native sub-group width, already used elsewhere in this
+    // backend) into one SYCL work-group is a pure launch-geometry change: it
+    // lets the driver co-schedule a full sub-group of independent DPAS
+    // issuers instead of dispatching n_tiles separate singleton work-groups,
+    // without altering any work-item's math (llama.cpp-6f73 c-ru7x item 3 --
+    // occupancy at N=2880 was 180 singleton work-groups on a 128-CU card,
+    // the first lever for the >=50% peak-bandwidth criterion). Extra padding
+    // lanes past n_tiles are guarded off below before touching any operand.
+    constexpr int64_t local_wg     = (int64_t) GGML_SYCL_MXFP4_MOE_XMX_SG;
+    const int64_t     padded_tiles = ((n_tiles + local_wg - 1) / local_wg) * local_wg;
+
     return queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
         h.parallel_for<mxfp4_soa_gemm_int8_dpas_kernel<M_TILE>>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(n_tiles)), sycl::range<1>(1)),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(padded_tiles)),
+                              sycl::range<1>(static_cast<size_t>(local_wg))),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
                 const int64_t n_tile = static_cast<int64_t>(item.get_global_id(0));
+                if (n_tile >= n_tiles) {
+                    return;
+                }
                 const int64_t n_base = n_tile * exec_n;
 
                 simd<float, M_TILE * exec_n> acc = 0.0f;
@@ -218,8 +237,13 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
                             for (int kk = 0; kk < k_per; ++kk) {
                                 b_vec[(kk / 4) * exec_n * 4 + n * 4 + (kk % 4)] = vals[kk];
                             }
-                            const uint8_t scale_byte = soa_base[total_qs_size + row * k_tiles + kt];
-                            w_scale[n]               = mxfp4_stored_gemm_e8m0_half_esimd(scale_byte);
+                            // block_load, not a scalar dereference, matching
+                            // mxfp4_soa_load_a_vec's own scale read
+                            // (mmvq.cpp:7591) for consistency with the
+                            // reference path this addressing mirrors.
+                            const uint8_t *  scale_ptr  = soa_base + total_qs_size + row * k_tiles + kt;
+                            simd<uint8_t, 1> scale_byte = block_load<uint8_t, 1>(scale_ptr);
+                            w_scale[n]                  = mxfp4_stored_gemm_e8m0_half_esimd(scale_byte[0]);
                         }
                     }
 
@@ -290,7 +314,14 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     // Bytes actually touched: the whole expert's SOA weight buffer (qs +
     // E8M0 scales) is read once per launch (no reuse across n-tiles for a
     // different m-tile since M_TILE covers all of M in one launch), plus the
-    // M x n_k activation codes/scales and the M x n_out f32 output.
+    // M x n_k activation codes/scales and the M x n_out f32 output. The
+    // activation is counted ONCE even though every one of the n_tiles
+    // work-items re-reads the whole M x n_k activation independently -- this
+    // is the correct figure for DRAM traffic (not for total bytes loaded by
+    // all lanes) under the reasonable assumption that the activation (at
+    // most 8 x 2880 = 23 KB for M=8, K=2880) stays cache-resident across the
+    // launch rather than being evicted and re-fetched from DRAM per
+    // work-item (llama.cpp-6f73 c-ru7x item 4).
     const size_t weight_bytes = (size_t) n_out * ((size_t) (n_k / 2) + (size_t) (n_k / 32));
     const size_t act_bytes    = (size_t) M * ((size_t) n_k + (size_t) (n_k / 32) * sizeof(float));
     const size_t dst_bytes    = (size_t) M * (size_t) n_out * sizeof(float);
