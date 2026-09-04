@@ -1,0 +1,11 @@
+=== before ===
+loadavg: 54.16 45.12 43.69 68/4873 3974099
+ffmpeg_count: 30
+Shmem: 9061280 kB
+MemAvailable: 205991064 kB
+=== after ===
+loadavg: 51.77 46.28 44.20 50/4877 3988010
+ffmpeg_count: 30
+Shmem: 9032648 kB
+MemAvailable: 206631820 kB
+bench_pid=3975054 comm=llama-bench cmdline=/Apps/llama.cpp/build/bin/llama-bench -m /models/gpt-oss-20b-mxfp4.gguf -p 0 -n 128 -r 3 -v 
