@@ -400,13 +400,15 @@ Score max_rel_violations(const std::vector<double> & out,
 // is the helper, not a repeated loop body).
 // -----------------------------------------------------------------------------
 
-// Element count where a[i] != b[i]. A size mismatch returns 0 without
-// indexing out of bounds rather than crashing -- the caller's own size check
-// (run separately, before this is called) is what turns a wrong-sized buffer
-// into a visible FAIL; this helper's only job is to not crash on it.
+// Element count where a[i] != b[i]. A size mismatch returns -1 (not 0 --
+// every call site's own PASS value, so 0 would silently read as "no
+// mismatches") without indexing out of bounds rather than crashing; the
+// caller's own size check (run separately, before this is called) is what
+// normally prevents this path, but the sentinel keeps a mismatched pair
+// fail-closed even if that guard were ever skipped.
 int64_t count_mismatches(const std::vector<float> & a, const std::vector<float> & b) {
     if (a.size() != b.size()) {
-        return 0;
+        return -1;
     }
     int64_t n = 0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -429,8 +431,11 @@ bool all_finite(const std::vector<double> & v) {
 // sqrt(sum((a-b)^2) / sum(b^2)): a whole-output relative error dominated by
 // the large-magnitude cells, not fooled by near-zero cells the way a
 // per-element relative metric is (see max_rel_violations' scoping note and
-// case_reference_gemm_gptoss_shape below for why that matters here).
+// case_reference_gemm_gptoss_shape below for why that matters here). Unlike
+// count_mismatches above, this has no in-band sentinel value to fail closed
+// with (any double is a plausible ratio), so a size mismatch asserts instead.
 double frobenius_rel(const std::vector<double> & a, const std::vector<double> & b) {
+    GGML_ASSERT(a.size() == b.size());
     double num = 0.0, den = 0.0;
     for (size_t i = 0; i < a.size(); ++i) {
         const double diff = a[i] - b[i];
@@ -665,6 +670,13 @@ void case_reference_gemm_gptoss_shape() {
     auto needs_exact_check = [](int64_t M) {
         return M == 1 || M == 32 || M == 512;
     };
+    // The ACT_F16 arm below (`if (M == 32 || M == 512)`) reads `exact`, which
+    // is only computed when needs_exact_check(M) is true -- it relies on 32
+    // and 512 both being in that set without re-checking it locally. Assert
+    // the dependency here so a future edit that drops either value from
+    // needs_exact_check fails loudly instead of silently deleting two real
+    // checks (or reading a stale `exact` from a previous loop iteration).
+    GGML_ASSERT(needs_exact_check(32) && needs_exact_check(512));
 
     for (int64_t M : Ms) {
         std::vector<float> X((size_t) (M * K));
