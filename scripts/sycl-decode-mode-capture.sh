@@ -4,48 +4,75 @@
 # llama-bench invocation -- never loops the bench, the ticket's rule is three
 # separate runs by the caller, each its own capture directory -- and records,
 # during that one run:
-#   <dir>/bench.log     -- bench-guard.sh's own VALID/SUSPECT-stamped capture
-#                           of the wrapped command's stdout+stderr.
-#   <dir>/timeline.tsv   -- act_freq/cur_freq/throttle/reason_pl2/bench_pid/
-#                           RssAnon of the bench pid, sampled every 0.5s
-#                           while it runs. bench_pid and RssAnon both read
-#                           "-" until a candidate has been CONFIRMED -- the
-#                           same pid resolved on three consecutive ticks -- so
-#                           a transient bench-guard helper (its throttle/
+#   <dir>/bench.log      -- bench-guard.sh's own VALID/SUSPECT-stamped
+#                           capture of the wrapped command's stdout+stderr.
+#   <dir>/timeline.tsv    -- act_freq/cur_freq/throttle/reason_pl2/bench_pid/
+#                           RssAnon of the bench pid, sampled every
+#                           TICK_SECONDS while it runs. bench_pid and
+#                           RssAnon both read "-" until a candidate has been
+#                           CONFIRMED -- the same pid resolved on
+#                           CONFIRM_TICKS consecutive ticks -- so a
+#                           transient bench-guard helper (its throttle/
 #                           tenant poll sleep, df, journalctl, ...) is never
 #                           attributed a row, even briefly. Consequence: a
-#                           wrapped command shorter than ~1.5s is never
-#                           confirmed at all, so its ENTIRE run gets an
-#                           all-"-" bench_pid/rss_anon_kb column (host.txt's
-#                           audit line still names it if resolved, since that
-#                           commit happens independently of row attribution)
-#                           -- acceptable for this script's stated purpose,
-#                           llama-bench decode runs of tens of seconds.
-#   <dir>/host.txt       -- loadavg, ffmpeg tenant count, Shmem, MemAvailable,
-#                           taken once before and once after the run, plus a
-#                           trailing "bench_pid=... comm=... cmdline=..." line
+#                           wrapped command shorter than roughly
+#                           CONFIRM_TICKS*TICK_SECONDS (at least ~1.5s --
+#                           more under load, since confirmation counts
+#                           ticks, not elapsed time) is never confirmed at
+#                           all, so its ENTIRE run gets an all-"-"
+#                           bench_pid/rss_anon_kb column (host.txt's audit
+#                           line still names it if resolved, since that
+#                           commit happens independently of row
+#                           attribution) -- acceptable for this script's
+#                           stated purpose, llama-bench decode runs of tens
+#                           of seconds.
+#   <dir>/host.txt        -- loadavg, ffmpeg tenant count, Shmem,
+#                           MemAvailable, taken once before and once after
+#                           the run, plus a trailing
+#                           "bench_pid=... comm=... cmdline=..." line
 #                           recording exactly what timeline.tsv's RssAnon
 #                           column tracked (or "unknown" if never resolved).
-#                           TRUNCATED at the start of every invocation (never
-#                           appended across runs): re-running a capture into
-#                           an existing --out dir starts host.txt fresh
-#                           rather than accumulating prior runs' blocks
-#                           underneath the new ones. timeline.tsv and mode.txt
-#                           are already overwritten wholesale by their own
-#                           writers; host.txt is the one file this script
-#                           otherwise only appends to, so it is the one that
-#                           needs an explicit truncate.
-#   <dir>/kprof*         -- GGML_SYCL_KERNEL_PROFILE CSV for the run.
-#   <dir>/mode.txt       -- "tg128=<value> mode=slow|fast|unknown" (thresholds
-#                           32/36 tok/s), the same line printed to stdout.
+#   <dir>/kprof*          -- GGML_SYCL_KERNEL_PROFILE CSV for the run.
+#   <dir>/mode.txt        -- "tg128=<value> mode=slow|fast|unknown"
+#                           (thresholds TG128_SLOW_MAX/TG128_FAST_MIN), the
+#                           same line printed to stdout.
+#
+# host.txt, bench.log, mode.txt, and timeline.tsv are ALL reset once at the
+# very start of every invocation, before bench-guard.sh is even launched.
+# host.txt and timeline.tsv need this because this script itself only
+# appends to them afterward. bench.log and mode.txt need it for a subtler
+# reason: their sole writers -- bench-guard.sh's own --log write, and this
+# script's own final mode.txt write -- are BOTH skipped entirely on a
+# preflight refusal (bench-guard.sh's refuse() path exits before ever
+# touching --log; this script's own `exit 3` branch runs before its mode.txt
+# write). Without an explicit reset, a refusal into a --out dir a PRIOR
+# successful run already populated would silently leave that prior run's
+# verdict in both files -- exactly the kind of stale artifact this script's
+# own refusal message would then point the reader at (llama.cpp-gvu7 quality
+# review; the round-1 nit that got host.txt's truncate added did not cover
+# these two, since they follow a different rule: reset-and-conditionally-
+# rewritten, not reset-and-always-rewritten).
 #
 # All host-corruption preflight (throttled/active card, stale GPU tenant,
-# elevated Shmem) is bench-guard.sh's, invoked here as a CHILD -- this script
-# never re-implements that logic, only forwards its test hooks unchanged
-# (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd, --journalctl-cmd,
-# --max-wait) so the VALID/SUSPECT verdict and the REFUSED (exit 3) path come
-# for free. On refusal, this script mirrors bench-guard's exit 3 and writes
-# NO mode.txt -- there was no run to compute a mode from.
+# elevated Shmem) is bench-guard.sh's DECISION logic, invoked here as a
+# CHILD -- this script never re-implements it, so the VALID/SUSPECT verdict
+# and the REFUSED (exit 3) path come for free. All six of bench-guard.sh's
+# own test hooks (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd,
+# --journalctl-cmd, --max-wait) are forwarded to it unchanged, but three are
+# ALSO read locally by this script for its own purposes, not merely handed
+# through: --sysfs-card additionally derives FREQ for the sampler (the same
+# card bench-guard.sh itself derives, so passing --sysfs-card keeps both in
+# agreement); --meminfo is additionally read by host_snapshot for its
+# Shmem/MemAvailable lines; --pgrep-cmd is additionally read by
+# ffmpeg_count, which pipes its output through `grep -c ffmpeg` -- a
+# DIFFERENT question than bench-guard.sh's own tenant-listing use of the
+# same hook (`pgrep -a -x 'llama-cli|llama-bench|llama-completion'`). A
+# --pgrep-cmd override built only to answer bench-guard.sh's tenant
+# question (e.g. one that lists tenants but never mentions "ffmpeg") will
+# silently make every host.txt ffmpeg_count read 0 rather than fail loudly
+# -- pass a general process-listing command if ffmpeg counting matters to
+# the caller, not one filtered to llama tenants (llama.cpp-gvu7 quality
+# review).
 #
 # Card derivation for the sampler is a live PCI-symlink lookup, the same one
 # bench-guard.sh performs internally for its own preflight (0000:03:00.0 =
@@ -57,6 +84,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_GUARD="$SCRIPT_DIR/bench-guard.sh"
+
+# --- tunables (named, not inline literals, the way bench-guard.sh names its
+# own: SHMEM_CEIL_KB, SHMEM_GROWTH_SUSPECT_KB, POLL_INTERVAL). Several
+# comments throughout this script and its test do arithmetic against these
+# (e.g. "CONFIRM_TICKS consecutive TICK_SECONDS ticks span >= 1.5s") -- a
+# silent literal edit would make those claims wrong with nothing to catch
+# it; a name change here is at least grep-able (llama.cpp-gvu7 quality
+# review). ---
+TG128_SLOW_MAX=32       # compute_mode: strictly below this is "slow"
+TG128_FAST_MIN=36       # compute_mode: strictly above this is "fast"
+TICK_SECONDS=0.5        # sampler cadence
+CONFIRM_TICKS=3         # consecutive ticks the SAME pid must resolve to
+                         # before it is trusted (see confirm_bench_pid)
+CMDLINE_MAX_CHARS=120   # audit-line cmdline truncation
 
 OUT="" SYSFS_CARD="" MEMINFO="/proc/meminfo" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT=""
 
@@ -76,10 +117,16 @@ esac; done
 [ -x "$BENCH_GUARD" ] || { echo "sycl-decode-mode-capture: $BENCH_GUARD not found or not executable" >&2; exit 2; }
 
 mkdir -p "$OUT"
-# host_snapshot (below) APPENDS; truncate once here so re-running a capture
-# into an existing --out dir doesn't accumulate stale before/after blocks
-# and audit lines from a prior run underneath the new ones.
+# Reset every file this script itself writes, before bench-guard.sh is even
+# launched -- see the header comment above for why mode.txt and bench.log
+# need an explicit `rm -f` (their writers don't run on every path) while
+# host.txt and timeline.tsv only need a truncate (this script always
+# rewrites them). Grouped together so "what does a fresh invocation reset"
+# has one answer, in one place (llama.cpp-gvu7 quality review).
 : > "$OUT/host.txt"
+rm -f "$OUT/mode.txt" "$OUT/bench.log"
+: > "$OUT/timeline.tsv"
+printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\tbench_pid\trss_anon_kb\n' >> "$OUT/timeline.tsv"
 
 # --- card derivation (mirrors bench-guard.sh; skipped when --sysfs-card is given) ---
 if [ -z "$SYSFS_CARD" ]; then
@@ -156,11 +203,8 @@ host_snapshot() {
 # subprocesses, because both are transient children somewhere under
 # guard_pid at one point or another. Leaf descent sidesteps the question:
 # it tracks WHERE the live tree currently bottoms out, and the caller
-# re-derives that on EVERY sampling tick (see the confirmation logic below)
-# rather than trusting one resolution for the rest of the run -- so a
-# candidate that stops being the deepest live descendant is never trusted
-# past that tick, and only a pid seen on three consecutive ticks is ever
-# committed to the audit fields at all.
+# (confirm_bench_pid, below) re-derives that on EVERY sampling tick rather
+# than trusting one resolution for the rest of the run.
 find_bench_pid() {
     local pid="$1" child
     while :; do
@@ -173,6 +217,132 @@ find_bench_pid() {
         return 0
     fi
     return 1
+}
+
+# confirm_bench_pid: calls find_bench_pid fresh on EVERY invocation (no
+# "skip if already have a candidate" shortcut) and requires the SAME pid on
+# CONFIRM_TICKS consecutive calls before treating it as trustworthy. Reads
+# and updates the global pending_pid/pending_confirms state, and sets the
+# global confirmed_pid to the confirmed pid once the bar is met (every
+# subsequent call while that same pid remains current) or to "" otherwise.
+# The caller is responsible for deciding whether a freshly-confirmed pid is
+# actually NEW (see commit_bench_pid) -- this function only answers "is the
+# current leaf trustworthy right now". MUST be called directly, never via
+# `$(confirm_bench_pid ...)`: command substitution forks a subshell, and a
+# subshell's writes to pending_pid/pending_confirms/confirmed_pid never
+# reach the caller -- the whole point of these being globals is that they
+# persist ACROSS ticks in the same shell (caught directly during this
+# refactor: capturing this function's output via `$(...)` silently kept
+# every tick's confirmation state stuck at zero, since each call started
+# and ended in its own throwaway subshell -- the sampler never confirmed
+# anything, ever, and every row read "-").
+#
+# CONFIRM_TICKS is 3, not 2: an earlier version of this mechanism (an
+# outright depth-based guard, rejecting only a candidate that is a direct
+# child of the guard) missed bench-guard's OWN helpers that run DEEPER than
+# that -- `SAMPLE_TMPFS="$(tmpfs_kb)"` puts `df` at depth 3 under the guard,
+# and the postflight `kernel_log | grep` puts `journalctl` at depth 2, both
+# measured directly -- so a depth check alone cannot tell them from the
+# bench once the real bench has exited and either helper becomes the sole
+# leaf for a moment. The FIRST fix tried here required only two consecutive
+# ticks (the reviewer's own proposal), but empirically re-testing that
+# against an adversarial ~0.8s helper (standing in for the ~10ms a real one
+# measures) showed a genuine ~20% false-confirmation rate (1/5 on a first
+# run, reproduced): two TICK_SECONDS-spaced samples CAN both land inside an
+# 0.8s-long process's lifetime purely by phase-alignment luck. THREE
+# consecutive ticks span a full 2*TICK_SECONDS = 1.0s, so a process cannot
+# be observed at three points TICK_SECONDS apart unless it lives at least
+# that long -- the REAL bound (round-3 review, measured on this fixed
+# script): an 0.8s helper is excluded 8/8, a 1.4s helper 5/5, but a 2.5s
+# helper IS confirmed 4/4 (it overwrites the audit line and two tail
+# timeline rows per run). No practical exposure follows from that: real
+# `journalctl -k ...` measured 0.01-0.02s and real `df -k -t tmpfs` measured
+# ~0.00s, two orders of magnitude under the bound. The bench, which runs for
+# many seconds, is unaffected either way.
+#
+# Confirmation is temporal, not structural, so re-resolution is never
+# frozen once a candidate has been confirmed -- the guard's own PREFLIGHT
+# `df` is depth 3 too, and freezing on "seen something deep once" would let
+# a stale confirmed candidate block noticing the real bench replace it. If
+# the >1.4s helper class ever needs closing rather than bounding: this
+# script sets GGML_SYCL_KERNEL_PROFILE_OUTPUT on the wrapped command only
+# (see the env call below), and bench-guard's own helpers inherit its
+# environment without that variable, so requiring the string in
+# /proc/PID/environ would identify the bench subtree independently of
+# depth, comm, and timing -- not implemented, since nothing measured needs
+# it yet.
+confirm_bench_pid() {
+    local guard_pid="$1" new_pid
+    new_pid="$(find_bench_pid "$guard_pid" || true)"
+    if [ -n "$new_pid" ] && [ "$new_pid" = "$pending_pid" ]; then
+        pending_confirms=$((pending_confirms + 1))
+    else
+        pending_pid="$new_pid"
+        if [ -n "$new_pid" ]; then pending_confirms=1; else pending_confirms=0; fi
+    fi
+    if [ "$pending_confirms" -ge "$CONFIRM_TICKS" ]; then
+        confirmed_pid="$pending_pid"
+    else
+        confirmed_pid=""
+    fi
+}
+
+# commit_bench_pid: records a freshly-confirmed pid into the global
+# bench_pid/bench_comm/bench_cmdline/bench_reportable audit state. Called
+# only when confirm_bench_pid reports a pid that differs from the
+# currently-committed one.
+#
+# bench_reportable is a SEPARATE gate from confirmation, computed once here
+# and cached (a pid's ppid never changes). CONFIRM_TICKS-tick confirmation
+# alone does not keep bench-guard's own throttle/tenant poll `sleep` out of
+# the timeline: unlike the ~10ms df/journalctl helpers confirm_bench_pid's
+# own comment discusses, that `sleep` runs for the FULL poll interval (5s =
+# 10 ticks) and so easily passes confirmation and gets committed to
+# bench_pid while the card is still busy. `sleep` is always a direct child
+# of the guard (depth 1); the wrapped command is always at least one hop
+# deeper (depth 2+, since `env VAR=1 CMD` execve()s CMD in place with no
+# extra hop of its own) -- so gating row attribution on depth specifically
+# excludes it without touching discovery or confirmation at all. This is
+# display-layer only: a depth-1 candidate can still be committed to the
+# audit fields (so a run that ends before the real bench ever forms still
+# reports something rather than "unknown"), it is just never given a
+# timeline row (see the sampler loop below).
+#
+# This assumes bench-guard.sh keeps wrapping the command in `timeout` (its
+# own header already pins `timeout -k 15` as load-bearing); if that ever
+# stops holding, the bench itself lands at depth 1 and bench_reportable
+# never becomes 1 -- confirmed by deleting `timeout` from a scratch
+# bench-guard.sh and re-running (round-3 review): the timeline carries ZERO
+# attributed rows for the whole capture while host.txt's audit line still
+# names the real bench correctly. That fails CLOSED (data loss, an all-"-"
+# timeline with a populated audit line), never misattribution (a wrong
+# pid/comm on a row), and the two states remain distinguishable from the
+# output alone.
+commit_bench_pid() {
+    local pid="$1" guard_pid="$2" bench_ppid
+    bench_pid="$pid"
+    bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
+    # -r guards against a shell-level redirection error hitting stderr when
+    # a fast-dying candidate (e.g. a bench that crashes almost immediately)
+    # exits in the gap between confirmation and this read -- `< missing-file`
+    # fails before `tr`'s own `2>/dev/null` can apply, since input
+    # redirection is set up before the command runs.
+    if [ -r "/proc/$bench_pid/cmdline" ]; then
+        bench_cmdline="$(tr '\0' ' ' < "/proc/$bench_pid/cmdline" 2>/dev/null || true)"
+    else
+        bench_cmdline=""
+    fi
+    bench_cmdline="${bench_cmdline:0:$CMDLINE_MAX_CHARS}"
+    [ -n "$bench_cmdline" ] || bench_cmdline="-"
+    # Field 4 of /proc/PID/stat is PPID; this assumes comm (field 2,
+    # parenthesised) has no embedded whitespace, true for every comm this
+    # script ever sees.
+    bench_ppid="$(awk '{print $4}' "/proc/$bench_pid/stat" 2>/dev/null || true)"
+    if [ -n "$bench_ppid" ] && [ "$bench_ppid" != "$guard_pid" ]; then
+        bench_reportable=1
+    else
+        bench_reportable=0
+    fi
 }
 
 parse_tg128() {
@@ -203,7 +373,8 @@ parse_tg128() {
 compute_mode() {
     local v="$1"
     [ -n "$v" ] || { echo unknown; return 0; }
-    awk -v v="$v" 'BEGIN { if (v + 0 < 32) print "slow"; else if (v + 0 > 36) print "fast"; else print "unknown"; }'
+    awk -v v="$v" -v slow="$TG128_SLOW_MAX" -v fast="$TG128_FAST_MIN" \
+        'BEGIN { if (v + 0 < slow) print "slow"; else if (v + 0 > fast) print "fast"; else print "unknown"; }'
 }
 
 # --- run ---
@@ -214,111 +385,16 @@ host_snapshot before
     env GGML_SYCL_KERNEL_PROFILE=1 GGML_SYCL_KERNEL_PROFILE_FORMAT=csv GGML_SYCL_KERNEL_PROFILE_OUTPUT="$OUT/kprof" "$@" &
 guard_pid=$!
 
-: > "$OUT/timeline.tsv"
-printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\tbench_pid\trss_anon_kb\n' >> "$OUT/timeline.tsv"
-
 bench_pid="" bench_comm="-" bench_cmdline="-" bench_reportable=0
-pending_pid="" pending_confirms=0
-start_ts="$(date +%s.%N)"
+pending_pid="" pending_confirms=0 confirmed_pid=""
+start_ts="$EPOCHREALTIME"
 while kill -0 "$guard_pid" 2>/dev/null; do
-    # Every tick, freshly re-derive the leaf (no "skip if already have a
-    # candidate" shortcut) and require the SAME pid on THREE consecutive
-    # ticks before committing it to bench_pid/bench_comm/bench_cmdline.
-    # This replaces an earlier depth-based guard (llama.cpp-gvu7 review,
-    # round 2): rejecting only a candidate that is a direct child of the
-    # guard missed bench-guard's OWN helpers that run DEEPER than that --
-    # `SAMPLE_TMPFS="$(tmpfs_kb)"` puts `df` at depth 3 under the guard, and
-    # the postflight `kernel_log | grep` puts `journalctl` at depth 2, both
-    # measured directly -- so a depth check alone cannot tell them from the
-    # bench once the real bench has exited and either helper becomes the
-    # sole leaf for a moment.
-    #
-    # THREE ticks, not two: the review's own proposed fix said two, but
-    # empirically re-testing that against an adversarial ~0.8s helper (an
-    # 0.8s fake journalctl, standing in for the ~10ms a real one measures)
-    # showed a genuine ~20% false-confirmation rate (1/5 on a first run,
-    # reproduced) -- two 0.5s-spaced samples CAN both land inside an
-    # 0.8s-long process's lifetime purely by phase-alignment luck. Three
-    # consecutive 0.5s ticks span a full 1.0s, so a process cannot be
-    # observed at three points 0.5s apart unless it lives at least that
-    # long -- the REAL bound (round-3 review, measured on this fixed
-    # script): an 0.8s helper is excluded 8/8, a 1.4s helper 5/5, but a
-    # 2.5s helper IS confirmed 4/4 (it overwrites the audit line and two
-    # tail timeline rows per run). No practical exposure follows from that:
-    # real `journalctl -k ...` measured 0.01-0.02s and real `df -k -t
-    # tmpfs` measured ~0.00s, two orders of magnitude under the bound. The
-    # bench, which runs for many seconds, is unaffected either way.
-    # Confirmation is temporal, not structural, so re-resolution is never
-    # frozen once a candidate has been confirmed -- the guard's own
-    # PREFLIGHT `df` is depth 3 too, and freezing on "seen something deep
-    # once" would let a stale confirmed candidate block noticing the real
-    # bench replace it. If the >1.4s helper class ever needs closing rather
-    # than bounding: this script sets GGML_SYCL_KERNEL_PROFILE_OUTPUT on
-    # the wrapped command only (see the env call below), and bench-guard's
-    # own helpers inherit its environment without that variable, so
-    # requiring the string in /proc/PID/environ would identify the bench
-    # subtree independently of depth, comm, and timing -- not implemented,
-    # since nothing measured needs it yet.
-    new_pid="$(find_bench_pid "$guard_pid" || true)"
-    if [ -n "$new_pid" ] && [ "$new_pid" = "$pending_pid" ]; then
-        pending_confirms=$((pending_confirms + 1))
-    else
-        pending_pid="$new_pid"
-        if [ -n "$new_pid" ]; then pending_confirms=1; else pending_confirms=0; fi
-    fi
-    if [ "$pending_confirms" -ge 3 ] && [ "$pending_pid" != "$bench_pid" ]; then
-        bench_pid="$pending_pid"
-        bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
-        # -r guards against a shell-level redirection error hitting stderr
-        # when a fast-dying candidate (e.g. a bench that crashes almost
-        # immediately) exits in the gap between confirmation and this read
-        # -- `< missing-file` fails before `tr`'s own `2>/dev/null` can
-        # apply, since input redirection is set up before the command runs.
-        if [ -r "/proc/$bench_pid/cmdline" ]; then
-            bench_cmdline="$(tr '\0' ' ' < "/proc/$bench_pid/cmdline" 2>/dev/null || true)"
-        else
-            bench_cmdline=""
-        fi
-        bench_cmdline="${bench_cmdline:0:120}"
-        [ -n "$bench_cmdline" ] || bench_cmdline="-"
-        # bench_reportable is a SEPARATE gate from confirmation, computed
-        # once here and cached (a pid's ppid never changes). Three-tick
-        # confirmation alone does not keep bench-guard's own throttle/
-        # tenant poll `sleep` out of the timeline: unlike the ~10 ms df/
-        # journalctl helpers above, that `sleep` runs for the FULL poll
-        # interval (5s = 10 ticks) and so easily passes confirmation and
-        # gets committed to bench_pid while the card is still busy. `sleep`
-        # is always a direct child of the guard (depth 1); the wrapped
-        # command is always at least one hop deeper (depth 2+, since
-        # `env VAR=1 CMD` execve()s CMD in place with no extra hop of its
-        # own) -- so gating row attribution on depth specifically excludes
-        # it without touching discovery or confirmation at all. This is
-        # display-layer only: a depth-1 candidate can still be committed to
-        # the audit fields (so a run that ends before the real bench ever
-        # forms still reports something rather than "unknown"), it is just
-        # never given a timeline row. This assumes bench-guard.sh keeps
-        # wrapping the command in `timeout` (its own header already pins
-        # `timeout -k 15` as load-bearing); if that ever stops holding, the
-        # bench itself lands at depth 1 and bench_reportable never becomes
-        # 1 -- confirmed by deleting `timeout` from a scratch bench-guard.sh
-        # and re-running (round-3 review): the timeline carries ZERO
-        # attributed rows for the whole capture while host.txt's audit line
-        # still names the real bench correctly. That fails CLOSED (data
-        # loss, an all-"-" timeline with a populated audit line), never
-        # misattribution (a wrong pid/comm on a row), and the two states
-        # remain distinguishable from the output alone. Field 4 of
-        # /proc/PID/stat is PPID; this assumes comm (field 2, parenthesised)
-        # has no embedded whitespace, true for every comm this script ever
-        # sees.
-        bench_ppid="$(awk '{print $4}' "/proc/$bench_pid/stat" 2>/dev/null || true)"
-        if [ -n "$bench_ppid" ] && [ "$bench_ppid" != "$guard_pid" ]; then
-            bench_reportable=1
-        else
-            bench_reportable=0
-        fi
+    confirm_bench_pid "$guard_pid"
+    if [ -n "$confirmed_pid" ] && [ "$confirmed_pid" != "$bench_pid" ]; then
+        commit_bench_pid "$confirmed_pid" "$guard_pid"
     fi
 
-    now_ts="$(date +%s.%N)"
+    now_ts="$EPOCHREALTIME"
     t_s="$(awk -v a="$now_ts" -v b="$start_ts" 'BEGIN { printf "%.1f", a - b }')"
     act_freq="$(read_field "$FREQ/act_freq")"
     cur_freq="$(read_field "$FREQ/cur_freq")"
@@ -326,12 +402,9 @@ while kill -0 "$guard_pid" 2>/dev/null; do
     reason_pl2="$(read_field "$FREQ/throttle/reason_pl2")"
     row_bench_pid="-"
     rss_anon_kb="-"
-    # Only a CONFIRMED, depth-2+ bench_pid is ever attributed a row -- the
-    # pre-bench phase, including bench-guard's own throttle/tenant poll
-    # `sleep`, deliberately reads "-" for both columns rather than
-    # misattributing a wrapper's RssAnon to "the bench" (llama.cpp-gvu7
-    # review, round 2: the header above promises RssAnon of the bench pid,
-    # and a wrapper's memory is not that).
+    # Only a CONFIRMED, depth-2+ (bench_reportable) bench_pid is ever
+    # attributed a row -- see commit_bench_pid's comment for why depth,
+    # not just confirmation, is required.
     if [ -n "$bench_pid" ] && [ "$bench_reportable" -eq 1 ] && [ -r "/proc/$bench_pid/status" ]; then
         row_bench_pid="$bench_pid"
         rss_anon_kb="$(awk '/^RssAnon:/{print $2}' "/proc/$bench_pid/status" 2>/dev/null || true)"
@@ -339,7 +412,7 @@ while kill -0 "$guard_pid" 2>/dev/null; do
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$t_s" "$act_freq" "$cur_freq" "$throttle_status" "$reason_pl2" "$row_bench_pid" "$rss_anon_kb" >> "$OUT/timeline.tsv"
 
-    sleep 0.5
+    sleep "$TICK_SECONDS"
 done
 
 rc=0
@@ -353,7 +426,12 @@ host_snapshot after
 echo "bench_pid=${bench_pid:-unknown} comm=$bench_comm cmdline=$bench_cmdline" >> "$OUT/host.txt"
 
 if [ "$rc" -eq 3 ]; then
-    echo "sycl-decode-mode-capture: bench-guard refused (see $OUT/bench.log); no mode computed" >&2
+    # bench-guard's own refuse() message already reached stderr directly
+    # (it is never redirected here) -- and, unlike a normal run, its
+    # refuse() path never touches --log at all, so $OUT/bench.log does not
+    # exist to point the reader at (removed at start, above; a stale prior
+    # run's file would otherwise still be sitting there).
+    echo "sycl-decode-mode-capture: bench-guard refused (see its message above); no mode computed" >&2
     exit "$rc"
 fi
 

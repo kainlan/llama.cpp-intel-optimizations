@@ -802,20 +802,26 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-mode-capture.sh
     )
-    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES SKIP_RETURN_CODE 77)
-    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above: LABEL there
-    # is a oneValueArg (:66) parsed from unquoted ${ARGN} (:68), so the
-    # embedded ";" splits into two arguments -- LABEL takes only "sycl" and
+    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above:
+    # llama_test_cmd's LABEL is a single-valued (oneValueArgs) argument, so
+    # the embedded ";" in "sycl;source" splits into two separate arguments
+    # when cmake_parse_arguments consumes it -- LABEL takes only "sycl", and
     # "source" silently falls into UNPARSED_ARGUMENTS, which the function
-    # never reads (see :110-113 for the same mechanism explained, in the
-    # comment on why llama_test_pytest's own LABEL had to be made
-    # multi-valued instead). A round-2 nit suggested that form, citing the
-    # multi-label call at :660 as precedent -- but that call is
-    # llama_test_pytest, not llama_test_cmd, and carries the multi-valued
-    # LABEL this function does not (round-3 review, llama.cpp-gvu7). Restored
-    # to the two-call form every other multi-label registration in this file
-    # uses (:385, :400, :421, :441, :817, :830, ...).
-    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES LABELS "sycl;source")
+    # never reads. llama_test_pytest's own LABEL is multi-valued precisely
+    # to avoid this (see its own doc comment above), which is why an earlier
+    # round of this comment cited a llama_test_pytest call as precedent for
+    # llama_test_cmd's LABEL argument -- llama_test_pytest is a different
+    # function with a different LABEL, and the precedent didn't transfer
+    # (round-3 review, llama.cpp-gvu7). No fixed TIMEOUT is set here despite
+    # the neighbouring test-sycl-handle-policy registration carrying one:
+    # this suite's own runtime varies with host load by design (see its own
+    # file header), and a fixed timeout tuned for a quiet host would flake
+    # under load the same way an under-provisioned test fixture already did
+    # once (quality review, finding 8).
+    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT WIN32)

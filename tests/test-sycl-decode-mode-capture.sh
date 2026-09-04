@@ -7,11 +7,37 @@
 # its own test suite (test-bench-guard.sh); this file exercises only the
 # capture script itself: the sampler timeline, host.txt before/after blocks,
 # tg128 parsing + mode computation, and refusal pass-through.
+#
+# Expected wall-clock runtime: roughly 35-45s (varies with host load -- see
+# CLAUDE.md's "host load is permanent" note). Dominated by
+# mk_fake_bench_grow's fixed ~2s busy-wait in three separate cases
+# (pid-check, busy-card, helper-race), mk_tree_busy_then_free's ~10s
+# worst-case poll-recovery window in the busy-card case, and
+# MK_FAKE_BENCH_SLOW_SECONDS in the one case that asserts a resolved
+# bench_pid (three-tick confirmation needs real ticks to accumulate, and
+# this suite's own per-tick subprocess overhead under load can push actual
+# tick spacing well past the script's nominal cadence -- see
+# MK_FAKE_BENCH_SLOW_SECONDS's own comment below). No fixed TIMEOUT is set
+# on this test's tests/CMakeLists.txt registration, unlike the 30-120s
+# TIMEOUTs some neighbouring registrations carry: these fixtures are
+# load-sensitive by design, so a timeout tuned for a quiet host would flake
+# under load exactly the way one fixture already did before its own margin
+# was widened (llama.cpp-gvu7 quality review).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAPTURE="$ROOT_DIR/scripts/sycl-decode-mode-capture.sh"
 GUARD="$ROOT_DIR/scripts/bench-guard.sh"
+
+# Mirrors scripts/sycl-decode-mode-capture.sh's own CONFIRM_TICKS/
+# TICK_SECONDS tunables -- this file does not source the script (no
+# tests/*.sh in this directory sources a shared helper; standalone files are
+# the convention here), so these are separate constants kept in sync by
+# hand, used below to derive fixture durations rather than hand-picking a
+# number with no traceable relationship to the script's own bar
+# (llama.cpp-gvu7 quality review).
+CONFIRM_TICKS=3
+TICK_SECONDS=0.5
 # CAPTURE ships in the SAME commit as this test (scripts/sycl-decode-mode-
 # capture.sh and this file were never landed separately, unlike the RED
 # phase before the script existed at all) -- its absence here is a defect
@@ -51,37 +77,62 @@ expect_status() {
     fi
 }
 
+# MK_FAKE_BENCH_SLOW_SECONDS: mk_fake_bench's default sleep duration, for
+# the one case (out_slow) that asserts a resolved bench_pid. pid commitment
+# needs CONFIRM_TICKS consecutive TICK_SECONDS-spaced ticks to land on the
+# SAME resolved pid (llama.cpp-gvu7 review, round 2) -- a bare minimum of
+# CONFIRM_TICKS*TICK_SECONDS = 1.5s of real ticks -- and this suite's own
+# per-tick overhead (several subprocess forks per sample in the capture
+# script) under this host's permanent ambient load can push the EFFECTIVE
+# tick spacing well past TICK_SECONDS -- caught directly by a flake loop
+# when this fixture used a flat `sleep 2`: too little margin, and the
+# "bench_pid resolved" check below intermittently saw "unknown" (2/10 runs,
+# all with 3+ real ticks simply not fitting in 2s). 4s is ample margin even
+# under load. mk_fake_bench_grow's own busy-wait is not similarly extended
+# because its scripts stay leaf from the moment they start (no forked child
+# to hand tracking off to), so they warm up faster in practice -- but if
+# that ever flakes too, the fix is the same: more real time, not fewer
+# required ticks.
+MK_FAKE_BENCH_SLOW_SECONDS=4
+# MK_FAKE_BENCH_FAST_SECONDS: for every OTHER mk_fake_bench case, which
+# asserts only mode/tg128/exit-status, never bench_pid -- these don't need
+# three ticks to elapse at all, so a short, fixed duration keeps the suite's
+# total runtime down without weakening any assertion (quality review,
+# finding 8's "cheap partial" suggestion).
+MK_FAKE_BENCH_FAST_SECONDS=1
+
+# Sanity guard, derived from CONFIRM_TICKS/TICK_SECONDS rather than a second
+# hand-picked number: MK_FAKE_BENCH_SLOW_SECONDS must clear the tick-based
+# floor with real margin, or the "bench_pid resolved" assertions below are
+# set up to flake the way this fixture already did once at `sleep 2`. This
+# makes the mirrored tunables load-bearing, not decorative -- a future edit
+# that widens CONFIRM_TICKS or TICK_SECONDS in the script without updating
+# these mirrors, or that shrinks MK_FAKE_BENCH_SLOW_SECONDS, fails loudly
+# here instead of flaking silently later.
+MIN_CONFIRM_SECONDS="$(awk -v t="$CONFIRM_TICKS" -v s="$TICK_SECONDS" 'BEGIN { print t * s }')"
+awk -v have="$MK_FAKE_BENCH_SLOW_SECONDS" -v min="$MIN_CONFIRM_SECONDS" 'BEGIN { exit !(have >= min * 2) }' \
+    || { echo "FAIL: MK_FAKE_BENCH_SLOW_SECONDS ($MK_FAKE_BENCH_SLOW_SECONDS) has too little margin over 2x CONFIRM_TICKS*TICK_SECONDS ($MIN_CONFIRM_SECONDS)"; fail=1; }
+
 # mk_fake_bench: a fake "llama-bench" that prints a canned markdown tg128 row
-# embedding $1 as the t/s figure, then sleeps 2s (an EXTERNAL `sleep`, so this
-# script forks a child partway through its life) so the sampler (0.5s
-# cadence) gets several samples. The capture script's pid discovery is pure
-# structural leaf descent (no name/comm matching at all -- see
-# find_bench_pid's comment in the script), so once this script forks `sleep`
-# the leaf being tracked moves from this script to that child; that's fine
-# for the tests below that only need SOME pid to be resolved (mode/tg128
-# parsing, timeline shape, host.txt shape). It is deliberately NOT used for
-# the pid/RSS regression check further down, which needs the tracked leaf to
-# stay this script's own process throughout -- see mk_fake_bench_grow.
-# `sleep 4`, not 2: pid commitment now needs three consecutive 0.5s ticks to
-# land on the SAME resolved pid (llama.cpp-gvu7 review, round 2), and this
-# suite's own per-tick overhead (several subprocess forks per sample) under
-# this host's permanent ambient load can push the EFFECTIVE tick spacing
-# well past 0.5s -- caught directly by a flake loop: `sleep 2` left too
-# little margin and the "bench_pid resolved" check below intermittently saw
-# "unknown" (2/10 runs, all with 3+ real ticks simply not fitting in 2s).
-# 4s is ample margin for three ticks even under load; mk_fake_bench_grow's
-# own busy-wait is not similarly extended because its scripts stay leaf
-# from the moment they start (no forked child to hand tracking off to), so
-# they warm up faster in practice -- but if that ever flakes too, the fix
-# is the same: more real time, not fewer required ticks.
+# embedding $1 as the t/s figure, then sleeps $2 seconds (default
+# MK_FAKE_BENCH_SLOW_SECONDS; an EXTERNAL `sleep`, so this script forks a
+# child partway through its life) so the sampler gets several samples. The
+# capture script's pid discovery is pure structural leaf descent (no
+# name/comm matching at all -- see find_bench_pid's comment in the script),
+# so once this script forks `sleep` the leaf being tracked moves from this
+# script to that child; that's fine for the tests below that only need SOME
+# pid to be resolved (mode/tg128 parsing, timeline shape, host.txt shape).
+# It is deliberately NOT used for the pid/RSS regression check further
+# down, which needs the tracked leaf to stay this script's own process
+# throughout -- see mk_fake_bench_grow.
 mk_fake_bench() {
-    local tg="$1" path="$T/fakebench.sh"
+    local tg="$1" seconds="${2:-$MK_FAKE_BENCH_SLOW_SECONDS}" path="$T/fakebench.sh"
     cat > "$path" <<EOF
 #!/usr/bin/env bash
 echo '| model | size | params | backend | ngl | test | t/s |'
 echo '|---|---|---|---|---|---|---|'
 echo "| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | $tg ± 0.31 |"
-sleep 4
+sleep $seconds
 EOF
     chmod +x "$path"
     echo "$path"
@@ -172,13 +223,13 @@ grep -q "tg128=28.0" "$out_slow/mode.txt" 2>/dev/null || { echo "FAIL: expected 
 
 mk_tree 0 0; mk_meminfo 3000000
 out_fast="$T/out-fast"
-bench="$(mk_fake_bench 39.5)"
+bench="$(mk_fake_bench 39.5 "$MK_FAKE_BENCH_FAST_SECONDS")"
 run_capture "$out_fast" -- "$bench" || { echo "FAIL: fast-mode run failed"; fail=1; }
 grep -q "mode=fast" "$out_fast/mode.txt" 2>/dev/null || { echo "FAIL: expected mode=fast (got: $(cat "$out_fast/mode.txt" 2>/dev/null))"; fail=1; }
 
 mk_tree 0 0; mk_meminfo 3000000
 out_mid="$T/out-unknown"
-bench="$(mk_fake_bench 34.0)"
+bench="$(mk_fake_bench 34.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
 run_capture "$out_mid" -- "$bench" || { echo "FAIL: mid-band run failed"; fail=1; }
 grep -q "mode=unknown" "$out_mid/mode.txt" 2>/dev/null || { echo "FAIL: expected mode=unknown (got: $(cat "$out_mid/mode.txt" 2>/dev/null))"; fail=1; }
 
@@ -361,16 +412,26 @@ grep -qx "tg128=unknown mode=unknown" "$out_nonnum/mode.txt" 2>/dev/null \
 # --- exit status mirrors the underlying run (0 on a clean run) ---
 
 mk_tree 0 0; mk_meminfo 3000000
-bench="$(mk_fake_bench 40.0)"
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
 expect_status 0 "clean run must exit 0" -- run_capture "$T/out-rc" -- "$bench"
 
 # --- refusal: high Shmem (zero tmpfs) must propagate bench-guard's exit 3
-# and must NOT write mode.txt -- there was no run to compute a mode from. ---
+# and must NOT leave a stale mode.txt/bench.log from an EARLIER successful
+# run in the same --out dir (llama.cpp-gvu7 quality review, finding 1).
+# Reuses out_slow, which the very first test case above already populated
+# with a real mode.txt (tg128=28.0 mode=slow) and bench.log (a VALID
+# header) -- a fresh, never-before-used --out dir could not catch this
+# regression, since bench-guard.sh's own refuse() path never touches --log
+# at all: without an explicit reset, mode.txt and bench.log would otherwise
+# survive completely unchanged from the earlier run, and this script's own
+# refusal message would point the reader at the now-stale bench.log. The
+# bench command itself is irrelevant here (refused at preflight, never
+# executed), so it uses the shortest fixture. ---
 
 mk_tree 0 0; mk_meminfo 30000000
-out_ref="$T/out-refused"
-bench="$(mk_fake_bench 40.0)"
-expect_status 3 "high-Shmem refusal must propagate as exit 3" -- run_capture "$out_ref" -- "$bench"
-[ ! -f "$out_ref/mode.txt" ] || { echo "FAIL: refusal must not write mode.txt"; fail=1; }
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+expect_status 3 "high-Shmem refusal into a reused --out dir must propagate as exit 3" -- run_capture "$out_slow" -- "$bench"
+[ ! -f "$out_slow/mode.txt" ] || { echo "FAIL: refusal into a reused --out dir must remove the PRIOR run's mode.txt, not just skip writing a new one"; fail=1; }
+[ ! -f "$out_slow/bench.log" ] || { echo "FAIL: refusal into a reused --out dir must remove the PRIOR run's bench.log"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: sycl-decode-mode-capture" || exit 1
