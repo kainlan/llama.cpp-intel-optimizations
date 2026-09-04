@@ -72,7 +72,25 @@
 // call site). Numerics-wrong-on-a-different-kernel and
 // numerics-wrong-on-this-kernel would look identical from inside this file
 // alone; the profiled/debug capture is what pins which kernel produced the
-// output this file scores.
+// output this file scores. With the llama.cpp-zwsj Phase 2 tier landed,
+// this now names one of TWO routes ("tile_d512" or "esimd_partitioned"),
+// selected by GGML_SYCL_FA_D512_DECODE_ESIMD -- see the TWO-STATE DRIVER
+// note below for why this file exercises both rather than trusting one.
+//
+// TWO-STATE DRIVER (Phase 2): GGML_SYCL_FA_D512_DECODE_ESIMD picks between
+// the tile route (the only one Phase 1 exercised) and the new decode-shaped
+// ESIMD route this file's dispatch site also latches into a function-local
+// static on first use (fattn.cpp, mirroring materialize_enabled()'s pattern
+// in test-sycl-fattn-onednn-gates.cpp -- see that file's header for why an
+// in-process setenv() after the first D=512 dispatch cannot move a plan a
+// previous call already latched). So testing both states needs two SEPARATE
+// PROCESSES, not two setenv() calls in one: main() forks and re-execs itself
+// once per state (mirroring the ONEAPI_DEVICE_SELECTOR self-reexec already
+// below, done AFTER that one so ONEAPI_DEVICE_SELECTOR is already inherited
+// and the child does not re-trigger it), each running the full n_kv sweep
+// against the double reference before either child has touched the SYCL
+// device at all -- so the toggle is set from process start, not raced
+// against a cached dispatch decision.
 //
 // GPU and model-loading binaries in this fork are run only from the lead
 // session, one at a time (CLAUDE.md, Hard-Won Rules) -- this binary is no
@@ -86,6 +104,7 @@
 #include "ggml.h"
 #include "test-skip.h"
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -316,6 +335,66 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
     compare(label, gpu_output, ref, /*rel_tol=*/1e-3f, /*abs_tol=*/1e-3f);
 }
 
+// Runs the full n_kv sweep against whichever D=512 decode route the CURRENT
+// process's environment selects (GGML_SYCL_FA_D512_DECODE_ESIMD, read once
+// on first dispatch and latched -- see the TWO-STATE DRIVER file-header
+// note). Returns 0/1/LLAMA_TEST_EXIT_SKIP exactly like the old single-state
+// main() did; g_failures is process-global and starts at 0 fresh in every
+// state's own process, so no reset is needed between states.
+static int run_state_in_current_process(const char * state_label) {
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    if (!backend) {
+        std::printf("SKIP [%s]: no SYCL GPU device available\n", state_label);
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+
+    // gemma4 GQA shape fallback -- see the file header "GQA SHAPE" note.
+    const int D    = 512;
+    const int H_q  = 8;
+    const int H_kv = 1;
+
+    std::printf("== state %s: GGML_SYCL_FA_D512_DECODE_ESIMD=%s ==\n", state_label,
+                std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD") ? std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD") :
+                                                                "(unset, default ON)");
+    run_shape(backend, D, H_q, H_kv, 32);
+    run_shape(backend, D, H_q, H_kv, 512);
+    run_shape(backend, D, H_q, H_kv, 4096);
+
+    ggml_backend_free(backend);
+
+    if (g_failures) {
+        std::printf("FAILED [%s]: %d check(s)\n", state_label, g_failures);
+        return 1;
+    }
+    std::printf("PASS [%s]: D=512 decode flash-attention numerics\n", state_label);
+    return 0;
+}
+
+// Re-execs self with GGML_SYCL_FA_D512_DECODE_ESIMD set to `value` (before
+// any SYCL/backend call in the child -- see the TWO-STATE DRIVER note),
+// waits for it, and returns its exit status (or -1 on a fork/exec failure,
+// which the caller treats as a hard failure).
+static int run_state_in_child(char ** argv, const char * value) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::fprintf(stderr, "FATAL: fork() failed for state=%s (%s)\n", value, std::strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        setenv("GGML_SYCL_FA_D512_DECODE_ESIMD", value, 1);
+        setenv("GGML_SYCL_FA_D512_DECODE_ESIMD_TEST_STATE", value, 1);
+        execv("/proc/self/exe", argv);
+        std::fprintf(stderr, "FATAL: re-exec failed for state=%s (%s)\n", value, std::strerror(errno));
+        _exit(1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        std::fprintf(stderr, "FATAL: waitpid() failed for state=%s (%s)\n", value, std::strerror(errno));
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 int main(int, char ** argv) {
     // ctest supplies ONEAPI_DEVICE_SELECTOR via the registration's ENVIRONMENT. Bare
     // invocation falls back to the B50, but setenv() here is too late: libccl's static
@@ -329,27 +408,33 @@ int main(int, char ** argv) {
         std::fprintf(stderr, "warning: re-exec failed (%s); continuing unpinned\n", std::strerror(errno));
     }
 
-    ggml_backend_t backend = ggml_backend_sycl_init(0);
-    if (!backend) {
-        std::printf("SKIP: no SYCL GPU device available\n");
+    // GGML_SYCL_FA_D512_DECODE_ESIMD_TEST_STATE is this file's own sentinel
+    // (never read by production code), set only by run_state_in_child()
+    // below. Its presence means this process IS one of the two per-state
+    // children; its absence means this is the top-level process, which owns
+    // spawning both and reporting the combined result.
+    const char * state = std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD_TEST_STATE");
+    if (state) {
+        return run_state_in_current_process(state);
+    }
+
+    // Top-level driver: state "1" (the new ESIMD tier) first, then "0" (the
+    // old tile route, Phase 1's only coverage) -- see the TWO-STATE DRIVER
+    // file-header note for why this cannot be done with two setenv() calls
+    // in one process. If the first child reports no device (SKIP), the
+    // second would report the same thing for the same reason, so skip
+    // immediately rather than forking a second child that cannot succeed.
+    const int rc_esimd = run_state_in_child(argv, "1");
+    if (rc_esimd == LLAMA_TEST_EXIT_SKIP) {
+        std::printf("SKIP: no SYCL GPU device available (state=1 child)\n");
         return LLAMA_TEST_EXIT_SKIP;
     }
+    const int rc_tile = run_state_in_child(argv, "0");
 
-    // gemma4 GQA shape fallback -- see the file header "GQA SHAPE" note.
-    const int D    = 512;
-    const int H_q  = 8;
-    const int H_kv = 1;
-
-    run_shape(backend, D, H_q, H_kv, 32);
-    run_shape(backend, D, H_q, H_kv, 512);
-    run_shape(backend, D, H_q, H_kv, 4096);
-
-    ggml_backend_free(backend);
-
-    if (g_failures) {
-        std::printf("FAILED: %d check(s)\n", g_failures);
+    if (rc_esimd != 0 || rc_tile != 0) {
+        std::printf("FAILED: state=1 (ESIMD) rc=%d, state=0 (tile) rc=%d\n", rc_esimd, rc_tile);
         return 1;
     }
-    std::printf("PASS: D=512 tile decode flash-attention numerics\n");
+    std::printf("PASS: D=512 decode flash-attention numerics (both GGML_SYCL_FA_D512_DECODE_ESIMD states)\n");
     return 0;
 }

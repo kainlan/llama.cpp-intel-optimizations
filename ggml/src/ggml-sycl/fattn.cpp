@@ -2327,6 +2327,13 @@ bool ggml_sycl_fa_tile_d512_enabled() {
     return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
 }
 
+// Shared parse for GGML_SYCL_FA_D512_DECODE_ESIMD (llama.cpp-zwsj), declared
+// in fattn.hpp -- mirrors ggml_sycl_fa_tile_d512_enabled()'s shape exactly.
+bool ggml_sycl_fa_d512_decode_esimd_enabled() {
+    const char * env = std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD");
+    return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+}
+
 // D=512 tile-path admissibility (llama.cpp-dtpk) -- the gemma-viable route.
 // Unlike oneDNN's compiled-partition-baked sqrt(D) divisor,
 // fattn-tile.hpp's flash_attn_tile<> takes scale as a runtime value, so it
@@ -3911,6 +3918,62 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             }
         }
 #endif  // GGML_SYCL_DNNL
+
+        // llama.cpp-zwsj (plan Task P3, part 2 of llama.cpp-ebxw): decode-
+        // shaped (ne01<=8) D=512 ESIMD tier. The spike (GGML_SYCL_KERNEL_
+        // PROFILE captures of gemma4's fattn.decode.tile_d512, both cards)
+        // found the tile route's decode cost FLAT in n_kv -- a fixed
+        // per-launch cost of one work-group doing the whole D=512 reduction
+        // serially, not per-key work -- so a split-KV tier inside the tile
+        // kernel cannot help a short decode call; there is nothing to
+        // split. This reuses fattn_esimd_f16<D, Q_type>()
+        // (fattn-esimd-f16.hpp), the SAME partitioned decode kernel already
+        // production-verified at D<=256 ("esimd_f16" in the allowlist
+        // below) -- its "optimized" launcher has no D<=256-specific
+        // branching (checked: the D==128 special-casing in that header
+        // belongs to the separate BATCHED prefill kernel, never called at
+        // ne01<=1/decode), so D=512 is a template instantiation, not a new
+        // algorithm. Reuses ggml_sycl_fattn_d512_tile_admissible()'s screen
+        // rather than a second copy: it already requires exactly what this
+        // route also needs (F16 K/V, F32 Q, DV=512, integer GQA ratio, no
+        // paged/multi-seq sources, no softcap), and ADMITTING is unchanged
+        // either way -- supports_op() never asks which of the two decode
+        // kernels will run, only whether the op is servable at all.
+        if (ggml_sycl_fattn_d512_tile_admissible(dst) && params.ne01 <= 8) {
+            static const bool d512_decode_esimd_enabled = ggml_sycl_fa_d512_decode_esimd_enabled();
+            // g_sycl_fa_esimd_enabled/fattn_esimd_f16_available(): the same
+            // ESIMD-availability guard the D<=256 decode path checks before
+            // calling this exact function (fattn.cpp:2525/2630/3038) --
+            // fattn_esimd_f16<D,...>'s non-ESIMD stub GGML_ASSERTs rather
+            // than declining, so skipping this guard would abort instead of
+            // falling back to tile on a build/device without ESIMD.
+            if (d512_decode_esimd_enabled && g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+                // ggml_sycl_fattn_d512_tile_admissible() already guarantees
+                // Q->type == GGML_TYPE_F32 (fattn.cpp, same reasoning as the
+                // tile route's own defensive backstop: build_attn_mha()
+                // skips the F16 Q cast specifically for D==512).
+                fattn_esimd_f16<512, float>(params, *stream);
+                if (d512_observe) {
+                    // Same allowlist bucket as the D<=256 decode path -- see
+                    // fa_decode_kernel_observation::classify() (common.hpp):
+                    // it matches on kernel NAME, not D, and this genuinely
+                    // is the identical verified graph-safe launch idiom
+                    // (no wait()/malloc at submission, pointer resolution
+                    // via the shared graph-input-staging mechanism), just a
+                    // new template instantiation of the same function.
+                    ctx.fa_decode_kernel_obs.observe("esimd_f16");
+                }
+                if (d512_dispatch_debug_enabled) {
+                    fprintf(stderr,
+                            "[SYCL] fattn selected [d512] esimd_partitioned D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D,
+                            params.ne01, params.ne11, params.ne02, params.ne12);
+                }
+                return;
+            }
+            // Toggle off: fall through to the tile route below at any ne01,
+            // including this decode-shaped one -- GGML_SYCL_FA_D512_DECODE_ESIMD=0
+            // is a full opt-out, not just a "prefer tile when both fit" hint.
+        }
 
         if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
             // Correction of record (spec review rev-dtpk-qual, F1): the
