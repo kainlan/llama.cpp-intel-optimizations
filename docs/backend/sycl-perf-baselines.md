@@ -147,11 +147,13 @@ Two things this snapshot established that the gate tables above cannot show:
    | B50 | GPT-OSS 20B MXFP4 | 291 | 840 | 580 | 586 |
 
    `-p 1024 -ub 1024` (one ubatch) runs at 4053 tok/s on the B70, so the GEMMs scale; every
-   ubatch after the first costs ~200 ms of host time, which `perf` attributes 79-81% to
-   `ggml_sycl::onednn_woq::pack_q4_0_aos_to_s4` (a CPU repack of the Q4_0 weights into oneDNN
-   WoQ form, redone per ubatch). Tracked as **llama.cpp-dfo0 (P1)**. Until it lands, any
-   prefill claim must carry a pp1024 or pp2048 point; the long-prompt table planned under
-   llama.cpp-bn5k item 3 (pp2048 / pp8192) is still owed.
+   ubatch after the first costs ~200 ms of host or idle time (device kernel time per ubatch is
+   identical between pp512 and pp1024; attention and graph-replay toggles do not change the
+   ratio). A whole-process `perf` first blamed `pack_q4_0_aos_to_s4`, but gdb shows every call
+   to it is under model load (the S1-preload WoQ alt-plane staging) — a whole-process profile
+   is not a prefill profile. The per-ubatch cost is unattributed; tracked as **llama.cpp-dfo0
+   (P1)**. Until it lands, any prefill claim must carry a pp1024 or pp2048 point; the
+   long-prompt table planned under llama.cpp-bn5k item 3 (pp2048 / pp8192) is still owed.
 
 ---
 
