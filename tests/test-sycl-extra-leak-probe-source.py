@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
-"""Source gate for llama.cpp-dfo0 (leak probe, plan task L1): the COMPUTE-usage
-early return in ggml_backend_sycl_buffer_reset (ggml/src/ggml-sycl/ggml-sycl.cpp)
-preserves ctx->tensor_extras across the reset on the premise that init_tensor is
-never called again for that buffer -- false whenever the graph is REBUILT
-(llm_graph_result::reset re-inits the ggml context, so every activation tensor is
-a fresh struct with extra == nullptr, and init_tensor mints a brand-new extra for
-it; the previously "preserved" entries become unreachable). This gate checks only
-that a diagnostic probe exists -- env-gated, WARN level, and identifiable by a
-stable log tag -- so the leak becomes measurable before anything is changed. It
-does not check the leak itself (Task L2's job) and does not touch a SYCL device.
+"""Source gate for llama.cpp-dfo0 (leak probe, plan task L1, extended by plan
+task L2): the COMPUTE-usage branch in ggml_backend_sycl_buffer_reset
+(ggml/src/ggml-sycl/ggml-sycl.cpp) used to preserve ctx->tensor_extras across
+every reset on the premise that init_tensor is never called again for that
+buffer -- false whenever the graph is REBUILT (llm_graph_result::reset re-inits
+the ggml context, so every activation tensor is a fresh struct with
+extra == nullptr, and init_tensor mints a brand-new extra for it; the
+previously "preserved" entries become unreachable). Task L1 added a
+diagnostic probe -- env-gated, WARN level, identifiable by a stable log tag --
+so the leak became measurable; task L2 replaced the unconditional preservation
+with a generation-stamped release (see ggml_backend_sycl_buffer_context::
+alloc_generation) and extended both the probe and the [SOA-DEBUG] line to
+report released=/kept=/gen= (kept= replaced a duplicate "preserving" count on
+the probe line, so its field order -- kept=, released=, gen= -- is not the
+same as the [SOA-DEBUG] line's -- released=, kept=, gen=; each is checked
+against its own order, not a shared one). This gate checks the SOURCE TEXT
+only -- that the probe exists, is env-gated and WARN-level, and that the
+release bookkeeping's fields are present and each line's fields are in that
+line's own order -- not the runtime counts (the GPU test
+tests/test-sycl-compute-buffer-extra-reuse.cpp is the runtime check for that)
+-- and does not touch a SYCL device.
 
 Runs under pytest (llama_test_pytest registration) and as a plain script. Point it
 at an alternate copy (to exercise the RED path against a deliberately unmodified
@@ -27,6 +38,11 @@ backend = BACKEND.read_text()
 RESET_SIG = "static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {"
 PROBE_ENV_VAR = "GGML_SYCL_EXTRA_LEAK_PROBE"
 PROBE_TAG = "[EXTRA-LEAK-PROBE]"
+SOA_DEBUG_TAG = "[SOA-DEBUG]"
+# Single source of truth for the "GGML_LOG_WARN(" literal (llama.cpp-i0oh spec
+# review carry-over, llama.cpp-kqy7): three call sites used to repeat the exact
+# string, which is the kind of duplication a reflow only needs to break once.
+WARN_CALL_RE = re.compile(r"GGML_LOG_WARN\s*\(")
 
 
 def matching_brace(text, open_idx):
@@ -51,7 +67,13 @@ def matching_brace(text, open_idx):
             if ch == '"':
                 state = "str"
             elif ch == "'":
-                state = "chr"
+                # A C++14 digit separator (1'000) is not a char-literal opener --
+                # only treat this as one when the preceding character could not
+                # be part of a numeric literal (llama.cpp-i0oh spec review
+                # carry-over, llama.cpp-kqy7).
+                prev = text[i - 1] if i > 0 else ""
+                if not (prev.isalnum() or prev == "_"):
+                    state = "chr"
             elif ch == "{":
                 depth += 1
             elif ch == "}":
@@ -146,7 +168,10 @@ def matching_paren(text, open_idx):
             if ch == '"':
                 state = "str"
             elif ch == "'":
-                state = "chr"
+                # Same digit-separator guard as matching_brace above.
+                prev = text[i - 1] if i > 0 else ""
+                if not (prev.isalnum() or prev == "_"):
+                    state = "chr"
             elif ch == "(":
                 depth += 1
             elif ch == ")":
@@ -201,13 +226,17 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     # tool (CLAUDE.md, common/log.cpp:444) -- an INFO-level probe would never
     # reach a normal run's output.
     body = function_body(backend, RESET_SIG)
-    assert "GGML_LOG_WARN(" in body, "the probe must log via GGML_LOG_WARN, not GGML_LOG_INFO/DEBUG"
-    warn_idx = body.find("GGML_LOG_WARN(")
+    warn_match = WARN_CALL_RE.search(body)
+    assert warn_match, "the probe must log via GGML_LOG_WARN, not GGML_LOG_INFO/DEBUG"
+    warn_idx = warn_match.start()
     # Slice the whole call expression via a paren-depth/string-aware scan, not
     # a naive find(";", ...): the format string can itself embed a ';', which
     # would truncate the slice before real arguments and make this check pass
     # or fail on the wrong text (llama.cpp-i0oh spec review round 2, nit 2).
-    open_idx = warn_idx + len("GGML_LOG_WARN")
+    # Derived from the match itself (not warn_idx + len("GGML_LOG_WARN")),
+    # consistent with WARN_CALL_RE's whitespace tolerance and the two release-
+    # bookkeeping tests below (llama.cpp-dfo0 plan task L2, spec review c-cnko #7).
+    open_idx = warn_match.end() - 1
     assert body[open_idx] == "(", "GGML_LOG_WARN must be followed directly by '(' -- malformed call"
     close_idx = matching_paren(body, open_idx)
     warn_call = body[warn_idx : close_idx + 1]
@@ -215,7 +244,8 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     # Named sum_of_sizes, not cumulative: it is a running sum of the per-call
     # vector *sizes* (a triangular series), not a byte-accurate leak count --
     # see the lead's spec-review finding on llama.cpp-i0oh (c-cqpq, F1). The
-    # per-call `preserving %zu` field is the real leak proxy.
+    # per-call `kept=%zu` field is the real leak proxy (renamed from
+    # `preserving %zu` by quality review c-z4cf #5, round-2 fix c-b7j9 #2).
     assert "sum_of_sizes=" in warn_call, "the probe must report a running sum_of_sizes, not just this call's count"
     # Regression guard for the rename itself (llama.cpp-i0oh spec review round
     # 2, nit 3): `cumulative=` must not creep back into the probe block.
@@ -239,7 +269,9 @@ def test_probe_is_zero_cost_when_the_env_var_is_unset():
     flag_match = re.search(r"static\s+const\s+bool\s+leak_probe", body)
     assert flag_match, "the probe must cache its getenv result in a function-local static bool"
     flag_idx = flag_match.start()
-    warn_idx = body.find("GGML_LOG_WARN(")
+    warn_match = WARN_CALL_RE.search(body)
+    assert warn_match, "the probe must log via GGML_LOG_WARN, not GGML_LOG_INFO/DEBUG"
+    warn_idx = warn_match.start()
     assert flag_idx < warn_idx, "the cached flag must be declared before the WARN call it gates"
     # Whitespace-flexible, consistent with the regex four lines above (spec
     # review round 3, Q6): an exact literal here is the same clang-format
@@ -247,7 +279,72 @@ def test_probe_is_zero_cost_when_the_env_var_is_unset():
     if_match = re.search(r"if\s*\(\s*leak_probe", body[flag_idx:])
     assert if_match, "the WARN call must be inside an `if (leak_probe ...)` guard"
     if_idx = flag_idx + if_match.start()
-    assert 0 <= if_idx < warn_idx, "the WARN call must be inside an `if (leak_probe ...)` guard"
+    assert if_idx < warn_idx, "the guard must precede the WARN call it gates"
+
+
+def test_warn_call_reports_release_bookkeeping():
+    # llama.cpp-kqy7 (plan task L2): the probe's format string legitimately
+    # changed from reporting only a preserved count to also reporting what the
+    # generation-stamped release actually did this call, so this gate must check
+    # the extension is real rather than leaving it unpinned.
+    body = function_body(backend, RESET_SIG)
+    warn_match = WARN_CALL_RE.search(body)
+    assert warn_match, "the probe must log via GGML_LOG_WARN, not GGML_LOG_INFO/DEBUG"
+    open_idx = warn_match.end() - 1
+    assert body[open_idx] == "(", "GGML_LOG_WARN must be followed directly by '(' -- malformed call"
+    close_idx = matching_paren(body, open_idx)
+    warn_call = body[warn_match.start() : close_idx + 1]
+    positions = {}
+    for field in ("released=", "kept=", "gen="):
+        idx = warn_call.find(field)
+        assert idx >= 0, f"the probe's GGML_LOG_WARN call must report {field}"
+        positions[field] = idx
+    # Order pinned to the WARN line's actual field order (kept=, then
+    # released=, then gen=) -- NOT the same order as the SOA-DEBUG line below,
+    # because kept= replaced the old duplicate "preserving" count near the
+    # front of this format string (llama.cpp-dfo0 plan task L2, quality review
+    # c-z4cf #8: the docstring claimed an order was checked when none was;
+    # this is that check, and the two lines legitimately differ).
+    assert positions["kept="] < positions["released="] < positions["gen="], (
+        "expected the WARN line's fields in the order kept=, released=, gen="
+    )
+
+
+def test_soa_debug_line_reports_release_bookkeeping():
+    # Same extension, the other of the two lines the task named
+    # ("the [SOA-DEBUG] and probe lines updated to report released=<n> kept=<m>").
+    body = function_body(backend, RESET_SIG)
+    assert SOA_DEBUG_TAG in body, f"buffer_reset must still emit a {SOA_DEBUG_TAG} line for the COMPUTE branch"
+    # Anchor on "compute buffer=" rather than the bare tag: buffer_reset emits
+    # TWO [SOA-DEBUG] lines (this function's COMPUTE branch, and the teardown
+    # loop further down for the WEIGHTS path), and body.find(SOA_DEBUG_TAG)
+    # would silently pick whichever comes first in the source regardless of
+    # which one is actually the COMPUTE line -- "compute buffer=" is unique to
+    # the COMPUTE branch's format string.
+    soa_idx = body.find("compute buffer=")
+    assert soa_idx >= 0, "expected a 'compute buffer=' field on the COMPUTE branch's SOA-DEBUG line"
+    # Slice out just the GGML_SYCL_DEBUG(...) call that carries this tag, using
+    # the same comment/string-aware paren scan as the WARN checks above rather
+    # than a raw find(";", ...) -- the format string itself can embed one.
+    call_start = body.rfind("GGML_SYCL_DEBUG(", 0, soa_idx)
+    assert call_start >= 0, f"{SOA_DEBUG_TAG} must appear inside a GGML_SYCL_DEBUG(...) call"
+    open_idx = call_start + len("GGML_SYCL_DEBUG")
+    assert body[open_idx] == "(", "GGML_SYCL_DEBUG must be followed directly by '(' -- malformed call"
+    close_idx = matching_paren(body, open_idx)
+    soa_call = body[call_start : close_idx + 1]
+    assert SOA_DEBUG_TAG in soa_call, f"the {SOA_DEBUG_TAG} tag must be inside its own GGML_SYCL_DEBUG(...) call"
+    positions = {}
+    for field in ("released=", "kept=", "gen="):
+        idx = soa_call.find(field)
+        assert idx >= 0, f"the {SOA_DEBUG_TAG} line must report {field}"
+        positions[field] = idx
+    # Order pinned to the SOA-DEBUG line's actual field order (released=, then
+    # kept=, then gen=) -- see the WARN test's order check above for why this
+    # is a DIFFERENT order than that line (llama.cpp-dfo0 plan task L2,
+    # quality review c-z4cf #8).
+    assert positions["released="] < positions["kept="] < positions["gen="], (
+        f"expected the {SOA_DEBUG_TAG} line's fields in the order released=, kept=, gen="
+    )
 
 
 if __name__ == "__main__":

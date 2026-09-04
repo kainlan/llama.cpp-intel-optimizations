@@ -23759,8 +23759,25 @@ struct ggml_backend_sycl_buffer_context {
     ggml_sycl::mem_handle       managed_handle{};
     // Back-pointer to main SYCL context for accessing persistent staging buffers
     ggml_backend_sycl_context * sycl_ctx = nullptr;
-    // Track both tensor and extra so we can null tensor->extra on reset
+    // Track both tensor and extra so we can null tensor->extra on reset -- true of
+    // the non-COMPUTE (WEIGHTS) teardown path below (buffer_reset's else branch,
+    // ggml_backend_sycl_buffer_free_buffer). The COMPUTE branch deliberately cannot:
+    // a released entry's tensor pointer may already be dangling by the time it is
+    // swept (the graph that owned it was rebuilt, re-initialising that memory), so
+    // that branch never dereferences `.first` (llama.cpp-dfo0 plan task L2, spec
+    // review c-cnko #8; line cite removed per c-z4cf #3, it drifts).
+    // ggml_sycl_invalidate_backend_buffer_weights() (reached from buffer_clear()
+    // below) DOES walk this vector and dereference `.first` -- L2's
+    // generation-stamped release shrinks that exposure window (a stale entry
+    // now survives at most one extra reset instead of indefinitely) but does
+    // not remove it.
     std::vector<std::pair<ggml_tensor *, ggml_tensor_extra_gpu *>> tensor_extras;
+    // Incremented on every COMPUTE-usage buffer_reset (llama.cpp-dfo0, plan task
+    // L2). init_tensor stamps each extra with the generation current when it
+    // (re)initialised that tensor; buffer_reset compares the stamp to release
+    // extras orphaned by a graph rebuild instead of preserving tensor_extras
+    // unboundedly. See ggml_backend_sycl_buffer_reset's COMPUTE branch below.
+    uint64_t                                                       alloc_generation = 0;
     // Buffer-scoped weight provenance.  The owner is minted when the buffer is
     // published; the keys are the cache identities its tensors were registered
     // under, captured at registration time because the destructor may not
@@ -24152,6 +24169,14 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
         owner->control_host_allocs.push_back({ control_ptr, size, std::move(control_handle) });
     }
 
+    // Not stamped here: the call site (ggml_backend_sycl_buffer_init_tensor,
+    // guarded by ggml_sycl_tensor_is_cross_device_control()) discards this
+    // function's return value and sits before the view check, so init_tensor
+    // always reaches the universal "ensure data_device populated" block below
+    // regardless of what this function did, which stamps alloc_generation on
+    // its reuse path outside the tensor-parallel compute-buffer case (tracked
+    // as llama.cpp-6mj1) (llama.cpp-dfo0 plan task L2, quality review
+    // c-2d63/c-z4cf #9, reworded per round-2 c-b7j9 #3, round-3 c-9q2j #1/#2).
     ggml_tensor_extra_gpu * extra = nullptr;
     if (tensor->extra != nullptr) {
         extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
@@ -24482,6 +24507,9 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                 ctx->tensor_extras.push_back({ tensor, extra });
                 ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
             }
+            // This path returns before the universal stamp block further down, so it
+            // must stamp itself (llama.cpp-dfo0 plan task L2, spec review c-cnko #3).
+            extra->alloc_generation = ctx->alloc_generation;
             for (int d = 0; d < ggml_sycl_info().device_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
                 extra->set_data_device(d, tensor->data, GGML_LAYOUT_AOS, /*on_device=*/false);
             }
@@ -24497,6 +24525,10 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                 ctx->tensor_extras.push_back({ tensor, extra });
                 ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
             }
+            // TP compute-buffer extras are excluded from the universal stamp block
+            // further down by that block's own TP guard, so this branch must stamp
+            // itself (llama.cpp-dfo0 plan task L2, spec review c-cnko #3).
+            extra->alloc_generation = ctx->alloc_generation;
             // Calculate offset of this VIEW tensor within the buffer
 
             ptrdiff_t offset            = (char *) tensor->data - (char *) ctx->dev_ptr;
@@ -24524,6 +24556,9 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
                 tensor->extra = extra;
                 ctx->tensor_extras.push_back({ tensor, extra });
             }
+            // This path returns before the universal stamp block further down, so it
+            // must stamp itself (llama.cpp-dfo0 plan task L2, spec review c-cnko #3).
+            extra->alloc_generation = ctx->alloc_generation;
             if (extra->data_device_ptr(ctx->device) == nullptr) {
                 extra->set_data_device(ctx->device, tensor->data);
             }
@@ -24541,6 +24576,10 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
             ctx->tensor_extras.push_back({ tensor, extra });
             ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
         }
+        // TP compute-buffer extras are excluded from the universal stamp block
+        // further down by that block's own TP guard, so this branch must stamp
+        // itself (llama.cpp-dfo0 plan task L2, spec review c-cnko #3).
+        extra->alloc_generation     = ctx->alloc_generation;
         // Calculate offset of this tensor within the buffer
         ptrdiff_t offset            = (char *) tensor->data - (char *) ctx->dev_ptr;
         // Set up data_device[] for each local TP device
@@ -24641,6 +24680,10 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
             }
         }
         ctx->tensor_extras.push_back({ tensor, extra });  //used to release it when destroy ctx.
+        // Not stamped here either: this branch never returns early, so control
+        // falls through to the universal "ensure data_device populated" block
+        // later in this same function, which stamps alloc_generation on its
+        // reuse path (llama.cpp-dfo0 plan task L2, quality review c-2d63/c-z4cf #9).
         ggml_sycl_init_layout_info(extra, tensor, ctx->device, true);
 
         // Pre-populate data_device to avoid get_pointer_type() driver round-trips
@@ -24697,6 +24740,13 @@ static enum ggml_status ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer
             tensor->extra = extra;
             ctx->tensor_extras.push_back({ tensor, extra });
         }
+        // llama.cpp-dfo0 plan task L2: stamp the extra with this buffer's current
+        // allocation generation, whether it was just created or is being reused
+        // (tensor->extra != nullptr). buffer_reset's COMPUTE branch reads this
+        // stamp to tell a graph reuse (current generation) from a graph rebuild
+        // (a stale generation, meaning the ggml_tensor this extra was reached
+        // through no longer exists -- see ggml_backend_sycl_buffer_reset).
+        extra->alloc_generation = ctx->alloc_generation;
         if (extra->data_device_ptr(ctx->device) == nullptr && !extra->data_handle[ctx->device].is_weight()) {
             extra->set_data_device(ctx->device, tensor->data);
         }
@@ -34836,6 +34886,23 @@ static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl::mem_fill(target_handle, value, size, *stream);
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Process-global by design (llama.cpp-dfo0, plan task L2): ggml_backend_sched
+// does not hand test code the compute buffer it allocates internally, so the
+// GPU test reads this TU-static instead of asking a buffer directly. Updated by
+// ggml_backend_sycl_buffer_reset's COMPUTE branch with the post-release
+// tensor_extras vector size of whichever COMPUTE buffer it last reset -- not
+// meaningful with more than one compute buffer resetting concurrently; single-
+// threaded test use only. See ggml_backend_sycl_debug_last_compute_buffer_extra_count().
+//
+// PER-CHUNK, NOT WHOLE-BUFFER (llama.cpp-dfo0 plan task L2, spec review c-cnko
+// #9): a compute buffer can have multiple chunks (ggml_vbuffer), each its own
+// ggml_backend_sycl_buffer_context reset independently, so this reports only
+// whichever chunk's reset last ran -- harmless for this test's single-chunk
+// graphs, but do not read it as an aggregate across a multi-chunk buffer.
+static std::atomic<size_t> g_sycl_debug_last_compute_buffer_extra_count{ 0 };
+#endif
+
 static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     if (buffer == nullptr) {
@@ -34844,61 +34911,140 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
 
     // Compute buffers (usage == COMPUTE) are reset by the ggml allocator at the
     // start of every graph allocation (ggml_gallocr_alloc_graph -> vbuffer_reset).
-    // However, init_tensor is NOT called again after the first allocation because
-    // tensor->buffer remains set.  Destroying the extras here would wipe the
-    // data_handle that init_tensor populated, forcing every tensor through the
+    // For a REUSED graph, init_tensor is NOT called again because tensor->buffer
+    // remains set -- destroying that graph's extras here would wipe the
+    // data_handle init_tensor populated, forcing every tensor through the
     // expensive get_data_ptr_slow path (alloc_registry lookup, driver round-trips).
+    // That premise is FALSE for a REBUILT graph (llm_graph_result::reset re-inits
+    // the ggml context over the same mem_buffer): every activation tensor is then
+    // a fresh struct with extra == nullptr, and init_tensor mints a brand-new
+    // extra for it, so the previous graph's extras become unreachable.
+    // Unconditionally preserving tensor_extras across every reset leaked ~465 MB
+    // of host RSS per pp1024 decode with no bound (llama.cpp-dfo0, plan task L1
+    // hardware evidence: 12 rebuilds over 6 pp1024 decodes, 838 extras/rebuild).
     //
     // Since the buffer has a stable base (STABLE_BASE cap), tensor->data pointers
-    // are stable across resets and the DIRECT handles remain valid.  Preserve them.
+    // are stable across resets and a REUSED graph's DIRECT handles remain valid
+    // -- those are still worth preserving. What changed (plan task L2) is HOW we
+    // tell reuse from rebuild: init_tensor stamps every extra it (re)touches with
+    // ctx->alloc_generation (see ggml_backend_sycl_buffer_init_tensor). An extra
+    // whose stamp is more than one generation behind the current one belonged to
+    // a graph that has since been rebuilt -- release it. The "+1" keeps the
+    // immediately-preceding generation's extras alive through the reset that
+    // precedes the rebuild that will re-stamp them (if reused) or make them
+    // releasable one reset later (if not), bounding the vector at <= 2 graphs'
+    // worth of extras instead of growing without limit.
     //
-    // Weight buffers (usage == WEIGHTS) are never reset by the allocator.
+    // A released extra's ggml_tensor struct has already been re-initialised by
+    // the rebuild (fresh ggml_init over the same mem_buffer): NEVER dereference
+    // v[i].first for a stale entry below -- release_extra_gpu() only ever touches
+    // the extra struct itself, never the tensor.
+    //
+    // What actually makes this safe is NOT a synchronise -- ggml_backend_sched_
+    // alloc_graph -> alloc_splits -> ggml_gallocr_alloc_graph -> ggml_vbuffer_reset
+    // reaches here with no ggml_backend_synchronize on the ordinary path (the only
+    // one lives in the realloc fallback, reached solely when backend_ids_changed or
+    // the first alloc attempt fails), llama_context::graph_compute is async, and a
+    // decode's graph_compute may legitimately return with kernels still in flight
+    // (llama.cpp-dfo0 plan task L2, spec review c-cnko #4). Safety instead comes
+    // from two independent facts:
+    //   (a) the release lags a full generation -- an extra released here belongs to
+    //       a graph rebuilt TWO generations back, whose host-side dispatch (single-
+    //       threaded, driving one graph at a time) completed before this generation's
+    //       graph was even built; and
+    //   (b) release_extra_gpu(extra) is called with an EMPTY streams vector, which
+    //       skips every device-storage release inside it (the streams.size() > 0
+    //       guards in common.cpp around the data_handle/host_pool_free, XMX-tiled,
+    //       and layout-release blocks) -- the device memory a compute-buffer extra's
+    //       handles alias is a lease on the buffer's own STABLE_BASE arena, which the
+    //       buffer continues to own and does not get returned here. So no device
+    //       allocation actually changes ownership at this point regardless of what
+    //       may still be executing against it; only host-side bookkeeping (the
+    //       ~277 KB ggml_tensor_extra_gpu struct and its member mem_handle/vector
+    //       destructors) is released.
+    //
+    // Weight buffers (usage == WEIGHTS) are never reset by the allocator and are
+    // untouched by this branch; they take the loop below via the ordinary
+    // (non-COMPUTE) path further down this function.
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         GGML_ASSERT(ggml_backend_buffer_has_stable_base(buffer) &&
-                    "COMPUTE buffer_reset skip requires STABLE_BASE: tensor->data pointers must be stable");
-        // llama.cpp-dfo0 probe: a graph REBUILD (llm_graph_result::reset re-inits the ggml
-        // context) mints fresh tensor structs, so init_tensor allocates a new extra per tensor
-        // and the ones preserved here become unreachable. Count them so the leak is measurable.
-        // NOTE: llama-bench installs a null log callback unless run with -v, which swallows
-        // this WARN the same as it swallows GGML_LOG_INFO -- pass -v to see these lines there
-        // (llama-cli/llama-completion print WARN at default verbosity, no flag needed).
-        // ctx is loaded lazily below, inside the probe/debug guards, so the unset-env,
-        // debug-off hot path does no extra work beyond the magic-static guard load and the
-        // cached bool test.
+                    "COMPUTE buffer_reset requires STABLE_BASE: tensor->data pointers must be stable");
+
+        ggml_backend_sycl_buffer_context * ctx      = (ggml_backend_sycl_buffer_context *) buffer->context;
+        size_t                             released = 0;
+        size_t                             kept     = 0;
+        if (ctx != nullptr) {
+            ctx->alloc_generation++;
+            auto & v = ctx->tensor_extras;
+            for (size_t i = 0; i < v.size();) {
+                ggml_tensor_extra_gpu * extra = v[i].second;
+                if (extra->alloc_generation + 1 < ctx->alloc_generation) {
+                    // Stamped by an allocation two generations back: the graph it
+                    // belonged to has since been rebuilt and its ggml_tensor struct
+                    // re-initialised. Never dereference v[i].first.
+                    release_extra_gpu(extra);
+                    v[i] = v.back();
+                    v.pop_back();
+                    ++released;
+                } else {
+                    ++i;
+                    ++kept;
+                }
+            }
+            GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: compute buffer=%p released=%zu kept=%zu gen=%llu\n",
+                            (void *) buffer, released, kept, (unsigned long long) ctx->alloc_generation);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+            g_sycl_debug_last_compute_buffer_extra_count.store(v.size(), std::memory_order_relaxed);
+#endif
+        }
+
+        // llama.cpp-dfo0 probe (plan task L1); now also reports released=/kept=/
+        // gen= alongside the original per-call fields (plan task L2). NOTE:
+        // llama-bench installs a null log callback unless run with -v, which
+        // swallows this WARN the same as it swallows GGML_LOG_INFO -- pass -v to
+        // see these lines there (llama-cli/llama-completion print WARN at default
+        // verbosity, no flag needed). The release loop above always runs
+        // regardless of this flag (it is the correctness fix, not a diagnostic);
+        // this guard only gates the extra logging and bookkeeping below it, so
+        // the unset-env hot path pays only the magic-static guard load and the
+        // cached bool test on top of the release loop already required.
         static const bool leak_probe = [] {
             const char * e = std::getenv("GGML_SYCL_EXTRA_LEAK_PROBE");
             return e != nullptr && e[0] == '1';
         }();
         if (leak_probe) {
-            ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
             if (ctx != nullptr) {
-                // preserved_total is a running SUM OF THE PER-CALL VECTOR SIZES, not a count of
-                // distinct leaked extras: the COMPUTE path never clears tensor_extras (the early
-                // return below skips the teardown loop), so `n` grows monotonically and this sum
-                // is a triangular series (~calls^2), not linear in bytes actually leaked. It is
-                // also PROCESS-WIDE across ALL COMPUTE buffers (one function-local static),
-                // whereas `buf=%p` and `preserving` below are this call's single buffer --
-                // ggml_vbuffer_reset resets multiple chunks and ggml_gallocr_alloc_graph loops
-                // over buffer types, so several buf=%p values can appear per graph allocation.
-                // The MB figure is this call's `n` x sizeof -- the bytes CURRENTLY HELD by this
-                // buffer's extras vector, which is the figure to compare against RSS growth; the
-                // per-rebuild leak is the DELTA between consecutive lines, not this MB itself.
-                // sum_of_sizes is trailing diagnostic context only -- never quote its MB
-                // equivalent as "leaked".
+                // preserved_total is a running SUM OF THE PER-CALL VECTOR SIZES
+                // (post-release, i.e. `kept`), not a count of distinct leaked
+                // extras. It is also PROCESS-WIDE across ALL COMPUTE buffers (one
+                // function-local static), whereas `buf=%p` and `kept=` below are
+                // this call's single buffer -- ggml_vbuffer_reset resets multiple
+                // chunks and ggml_gallocr_alloc_graph loops over buffer types, so
+                // several buf=%p values can appear per graph allocation.
+                // The MB figure is this call's `n` x sizeof -- the bytes CURRENTLY
+                // HELD by this buffer's extras vector after release, the figure to
+                // compare against RSS growth; with this fix it should stay bounded
+                // rather than grow every rebuild. sum_of_sizes is trailing
+                // diagnostic context only -- never compare it against RSS growth,
+                // and never quote its MB equivalent as "leaked".
+                //
+                // `n` and `kept` are the SAME NUMBER by construction (n is read
+                // right after the release loop, so it equals whatever the loop
+                // counted as kept) -- printed once, as kept=, rather than twice
+                // under two names (llama.cpp-dfo0 plan task L2, quality review
+                // c-z4cf #5); `n` is still used, unprinted, for the MB figure so
+                // that computation stays anchored to a literal `n` (see the gate's
+                // own regex).
                 static std::atomic<size_t> preserved_total{ 0 };
                 const size_t               n     = ctx->tensor_extras.size();
                 const size_t               total = preserved_total.fetch_add(n, std::memory_order_relaxed) + n;
                 GGML_LOG_WARN(
-                    "[EXTRA-LEAK-PROBE] buf=%p preserving %zu extras this call (~%.1f MB), sum_of_sizes=%zu @ "
-                    "sizeof=%zu\n",
-                    (void *) buffer, n, (double) n * sizeof(ggml_tensor_extra_gpu) / (1024.0 * 1024.0), total,
-                    sizeof(ggml_tensor_extra_gpu));
+                    "[EXTRA-LEAK-PROBE] buf=%p kept=%zu extras this call (~%.1f MB), sum_of_sizes=%zu @ "
+                    "sizeof=%zu released=%zu gen=%llu\n",
+                    (void *) buffer, kept, (double) n * sizeof(ggml_tensor_extra_gpu) / (1024.0 * 1024.0), total,
+                    sizeof(ggml_tensor_extra_gpu), released, (unsigned long long) ctx->alloc_generation);
             }
         }
-        GGML_SYCL_DEBUG(
-            "[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
-            buffer->context ? ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size() : (size_t) 0,
-            (void *) buffer);
         return;
     }
 
@@ -34920,6 +35066,17 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
         ctx->tensor_extras.clear();  // reset the tensor_extras vector
     }
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test-only accessor for g_sycl_debug_last_compute_buffer_extra_count (see its
+// definition above ggml_backend_sycl_buffer_reset). llama.cpp-dfo0, plan task
+// L2: lets tests/test-sycl-compute-buffer-extra-reuse.cpp observe that the
+// compute buffer's tensor_extras vector stays bounded across repeated graph
+// rebuilds instead of growing every reset.
+GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_compute_buffer_extra_count(void) {
+    return g_sycl_debug_last_compute_buffer_extra_count.load(std::memory_order_relaxed);
+}
+#endif
 
 static uint32_t ggml_backend_sycl_buffer_get_caps(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
