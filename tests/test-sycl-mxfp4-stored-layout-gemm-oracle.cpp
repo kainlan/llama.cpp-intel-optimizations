@@ -81,12 +81,15 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include "ggml.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -140,6 +143,7 @@ constexpr double DEFAULT_ABS_FLOOR = 0.01;
 
 // SOA: [qs0..qsN][scale0..scaleN] -- quants.hpp:190-211.
 std::vector<uint8_t> build_soa_from_aos(const std::vector<block_mxfp4> & aos, int64_t nrows, int64_t ncols) {
+    GGML_ASSERT(nrows > 0 && ncols > 0 && ncols % XMX_K == 0);
     const int64_t        n_k_blocks = ncols / XMX_K;
     const int64_t        qs_bytes   = (ncols / 2) * nrows;
     std::vector<uint8_t> out((size_t) (qs_bytes + nrows * n_k_blocks), 0);
@@ -161,6 +165,7 @@ std::vector<uint8_t> build_xmx_tiled_from_aos(const std::vector<block_mxfp4> & a
                                               int64_t                          nrows,
                                               int64_t                          ncols,
                                               int64_t                          tile_n_total) {
+    GGML_ASSERT(nrows > 0 && ncols > 0 && ncols % XMX_K == 0 && tile_n_total > 0);
     const int64_t        n_k_blocks      = ncols / XMX_K;
     const int64_t        n_tile_groups_n = (nrows + tile_n_total - 1) / tile_n_total;
     const int64_t        group_bytes     = tile_n_total * (1 + PACKED_BYTES);
@@ -189,6 +194,7 @@ std::vector<uint8_t> build_xmx_tiled_from_aos(const std::vector<block_mxfp4> & a
 // -----------------------------------------------------------------------------
 
 std::vector<float> decode_soa_mxfp4(const uint8_t * buf, int64_t nrows, int64_t ncols) {
+    GGML_ASSERT(nrows > 0 && ncols > 0 && ncols % XMX_K == 0);
     const int64_t      n_k_blocks = ncols / XMX_K;
     const int64_t      qs_bytes   = (ncols / 2) * nrows;
     std::vector<float> out((size_t) (nrows * ncols));
@@ -210,6 +216,7 @@ std::vector<float> decode_soa_mxfp4(const uint8_t * buf, int64_t nrows, int64_t 
 }
 
 std::vector<float> decode_xmx_tiled_mxfp4(const uint8_t * buf, int64_t nrows, int64_t ncols, int64_t tile_n_total) {
+    GGML_ASSERT(nrows > 0 && ncols > 0 && ncols % XMX_K == 0 && tile_n_total > 0);
     const int64_t      n_tile_groups_n = (nrows + tile_n_total - 1) / tile_n_total;
     const int64_t      group_bytes     = tile_n_total * (1 + PACKED_BYTES);
     std::vector<float> out((size_t) (nrows * ncols));
@@ -224,8 +231,10 @@ std::vector<float> decode_xmx_tiled_mxfp4(const uint8_t * buf, int64_t nrows, in
             const float   d               = GGML_E8M0_TO_FP32_HALF(e);
             const int64_t qs_local        = (k_local < XMX_K / 2) ? k_local : (k_local - XMX_K / 2);
             const uint8_t qs_byte         = buf[group_offset + tile_n_total + tn * PACKED_BYTES + qs_local];
-            const int8_t  nibble          = (k_local < XMX_K / 2) ? (qs_byte & 0x0F) : (qs_byte >> 4);
-            out[(size_t) (n * ncols + k)] = kvalues_mxfp4[nibble] * d;
+            // nibble_idx is a TABLE INDEX (0-15), not a looked-up value -- unlike
+            // x0/x1 in decode_soa_mxfp4 above, which hold the looked-up e2m1 value.
+            const int     nibble_idx      = (k_local < XMX_K / 2) ? (qs_byte & 0x0F) : (qs_byte >> 4);
+            out[(size_t) (n * ncols + k)] = kvalues_mxfp4[nibble_idx] * d;
         }
     }
     return out;
@@ -324,7 +333,19 @@ struct Score {
     // over the shorter of the two. Any real count is >= 0, so a caller that
     // naively checks `violations == 0` for "pass" still correctly rejects
     // this sentinel; callers that want to distinguish "no violations" from
-    // "could not be scored" should check `violations < 0` explicitly.
+    // "could not be scored" should check `violations < 0` explicitly. On the
+    // sentinel path max_rel and max_abs_diff are +infinity (not 0.0), so a
+    // caller that instead checks `max_rel <= tol` also fails closed on a
+    // size mismatch rather than reading it as a perfect match.
+    //
+    // `violations` is the VERDICT (rel_tol AND abs_floor both required, see
+    // max_rel_violations below); `max_rel` and `max_abs_diff` are NOT
+    // filtered by abs_floor -- they are the whole-output extrema computed
+    // over every cell, including ones the floor exempts from `violations`.
+    // So `violations == 0 && max_rel == 5.0` is a normal, expected reading
+    // (a near-zero-magnitude cell can carry a huge relative error that the
+    // floor correctly declined to count): read `violations` as the pass/fail
+    // signal, and `max_rel`/`max_abs_diff` only as diagnostic context.
     int64_t violations;
     double  max_rel;
     double  max_abs_diff;
@@ -336,19 +357,29 @@ struct Score {
 // so a near-zero-magnitude reference cell -- where a genuine, tiny absolute
 // error reads as an enormous relative error -- is not flagged; see the
 // tolerance-contract comment on WOQ_MAX_REL_TOL and the file header for the
-// fix-cycle-4 precedent this mirrors. `out.size() != ref.size()` is a hard
-// failure: returns Score{-1, 0.0, 0.0} rather than silently scoring the
-// shorter of the two via std::min.
+// fix-cycle-4 precedent this mirrors. The returned `max_rel`/`max_abs_diff`
+// are the UNFILTERED whole-output extrema (see the Score comment) -- only
+// `violations` reflects the abs_floor gate. `out.size() != ref.size()` is a
+// hard failure: returns Score{-1, +inf, +inf} rather than silently scoring
+// the shorter of the two via std::min; the infinities make a naive
+// `max_rel <= tol` check fail closed too, not just a `violations == 0` check.
 Score max_rel_violations(const std::vector<double> & out,
                          const std::vector<double> & ref,
                          double                      rel_tol,
                          double                      abs_floor = DEFAULT_ABS_FLOOR) {
     if (out.size() != ref.size()) {
+        // Flush stdout first: PASS/FAIL lines from `check()` go to stdout,
+        // which is block-buffered when captured/piped while stderr is not --
+        // without this the SIZE MISMATCH line can print before earlier PASS
+        // lines that logically preceded it (this repo has been bitten by
+        // stdout buffering scrambling test-result attribution before).
+        std::fflush(stdout);
         std::fprintf(stderr,
                      "max_rel_violations: SIZE MISMATCH out.size()=%zu ref.size()=%zu -- refusing to score, "
                      "returning the -1 sentinel\n",
                      out.size(), ref.size());
-        return Score{ -1, 0.0, 0.0 };
+        const double inf = std::numeric_limits<double>::infinity();
+        return Score{ -1, inf, inf };
     }
     Score s{ 0, 0.0, 0.0 };
     for (size_t i = 0; i < out.size(); ++i) {
@@ -364,6 +395,52 @@ Score max_rel_violations(const std::vector<double> & out,
 }
 
 // -----------------------------------------------------------------------------
+// Small helpers shared by the cases below (each was previously duplicated
+// 2-3 times inline; factored out so the shape a downstream G4-G8 test copies
+// is the helper, not a repeated loop body).
+// -----------------------------------------------------------------------------
+
+// Element count where a[i] != b[i]. A size mismatch returns 0 without
+// indexing out of bounds rather than crashing -- the caller's own size check
+// (run separately, before this is called) is what turns a wrong-sized buffer
+// into a visible FAIL; this helper's only job is to not crash on it.
+int64_t count_mismatches(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size()) {
+        return 0;
+    }
+    int64_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+bool all_finite(const std::vector<double> & v) {
+    for (double x : v) {
+        if (!std::isfinite(x)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// sqrt(sum((a-b)^2) / sum(b^2)): a whole-output relative error dominated by
+// the large-magnitude cells, not fooled by near-zero cells the way a
+// per-element relative metric is (see max_rel_violations' scoping note and
+// case_reference_gemm_gptoss_shape below for why that matters here).
+double frobenius_rel(const std::vector<double> & a, const std::vector<double> & b) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double diff = a[i] - b[i];
+        num += diff * diff;
+        den += b[i] * b[i];
+    }
+    return std::sqrt(num / std::max(den, 1e-300));
+}
+
+// -----------------------------------------------------------------------------
 // Cases
 // -----------------------------------------------------------------------------
 
@@ -371,6 +448,12 @@ Score max_rel_violations(const std::vector<double> & out,
 // weights must be bit-identical. Positive control at the end proves the check
 // is not vacuously true.
 bool case_cross_decoder_equality() {
+    // Snapshotted rather than re-deriving `soa_mismatches == 0 && ... ` by
+    // hand at the return: a fifth check added to this function and forgotten
+    // in a hand-written return expression would silently narrow the
+    // main-level gate while the PASS line still printed.
+    const int entry_failures = failures;
+
     const int64_t nrows        = 44;   // deliberately not a multiple of tile_n_total (16):
     const int64_t ncols        = 128;  // exercises the XMX_TILED per-group tail
     const int64_t tile_n_total = 16;   // caps.N=16, optimal_tiles_n=1 (convert.cpp:2111-2146 comment)
@@ -409,18 +492,11 @@ bool case_cross_decoder_equality() {
               " soa_decoded=" + std::to_string(soa_decoded.size()) +
               " xmx_decoded=" + std::to_string(xmx_tiled_decoded.size()) + " expected=" + std::to_string(ref.size()));
     if (!sizes_ok) {
-        return false;
+        return failures == entry_failures;
     }
 
-    int64_t soa_mismatches = 0, xmx_mismatches = 0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        if (soa_decoded[i] != ref[i]) {
-            ++soa_mismatches;
-        }
-        if (xmx_tiled_decoded[i] != ref[i]) {
-            ++xmx_mismatches;
-        }
-    }
+    const int64_t soa_mismatches = count_mismatches(soa_decoded, ref);
+    const int64_t xmx_mismatches = count_mismatches(xmx_tiled_decoded, ref);
     check(soa_mismatches == 0, "soa-decode-matches-dequantize_row_mxfp4",
           "mismatches=" + std::to_string(soa_mismatches) + "/" + std::to_string(ref.size()));
     check(xmx_mismatches == 0, "xmx_tiled-decode-matches-dequantize_row_mxfp4",
@@ -432,14 +508,7 @@ bool case_cross_decoder_equality() {
     std::vector<uint8_t> soa_corrupt = soa;
     soa_corrupt[0] ^= 0xFF;
     const std::vector<float> soa_corrupt_decoded = decode_soa_mxfp4(soa_corrupt.data(), nrows, ncols);
-    int64_t                  soa_corrupt_diffs   = 0;
-    if (soa_corrupt_decoded.size() == ref.size()) {
-        for (size_t i = 0; i < ref.size(); ++i) {
-            if (soa_corrupt_decoded[i] != ref[i]) {
-                ++soa_corrupt_diffs;
-            }
-        }
-    }
+    const int64_t            soa_corrupt_diffs   = count_mismatches(soa_corrupt_decoded, ref);
     check(soa_corrupt_diffs > 0, "corrupted-soa-byte-diverges-from-reference (positive control)",
           "diffs=" + std::to_string(soa_corrupt_diffs));
 
@@ -462,18 +531,11 @@ bool case_cross_decoder_equality() {
     xmx_corrupt[(size_t) corrupt_byte_off] ^= 0xFF;
     const std::vector<float> xmx_corrupt_decoded =
         decode_xmx_tiled_mxfp4(xmx_corrupt.data(), nrows, ncols, tile_n_total);
-    int64_t xmx_corrupt_diffs = 0;
-    if (xmx_corrupt_decoded.size() == ref.size()) {
-        for (size_t i = 0; i < ref.size(); ++i) {
-            if (xmx_corrupt_decoded[i] != ref[i]) {
-                ++xmx_corrupt_diffs;
-            }
-        }
-    }
+    const int64_t xmx_corrupt_diffs = count_mismatches(xmx_corrupt_decoded, ref);
     check(xmx_corrupt_diffs > 0, "corrupted-xmx_tiled-byte-diverges-from-reference (positive control)",
           "diffs=" + std::to_string(xmx_corrupt_diffs));
 
-    return soa_mismatches == 0 && xmx_mismatches == 0 && soa_corrupt_diffs > 0 && xmx_corrupt_diffs > 0;
+    return failures == entry_failures;
 }
 
 // max_rel_violations sanity: identical vectors score zero; a single
@@ -505,21 +567,23 @@ void case_scorer_sanity() {
     check(floor_score.violations == 1, "scorer-abs-floor-excludes-near-zero-noise-but-flags-a-real-5pct-deviation",
           "violations=" + std::to_string(floor_score.violations) + " max_rel=" + std::to_string(floor_score.max_rel));
 
-    // Size mismatch is a hard failure, not a silent std::min(out, ref).
+    // Size mismatch is a hard failure, not a silent std::min(out, ref): all
+    // three fields must fail closed, not just `violations`, so a caller
+    // checking `max_rel <= tol` instead of `violations == 0` also rejects it.
     std::vector<double> short_vec = { 1.0, 2.0 };
     const Score         mismatch  = max_rel_violations(short_vec, ref, WOQ_MAX_REL_TOL);
-    check(mismatch.violations == -1, "scorer-hard-fails-on-size-mismatch-sentinel",
-          "violations=" + std::to_string(mismatch.violations) + " (out.size=" + std::to_string(short_vec.size()) +
-              " ref.size=" + std::to_string(ref.size()) + ")");
+    check(mismatch.violations == -1 && std::isinf(mismatch.max_rel) && std::isinf(mismatch.max_abs_diff),
+          "scorer-hard-fails-on-size-mismatch-sentinel",
+          "violations=" + std::to_string(mismatch.violations) + " max_rel=" + std::to_string(mismatch.max_rel) +
+              " max_abs_diff=" + std::to_string(mismatch.max_abs_diff) +
+              " (out.size=" + std::to_string(short_vec.size()) + " ref.size=" + std::to_string(ref.size()) + ")");
 }
 
 // A hand-checkable GEMM: one MXFP4 block (K=32), weight values chosen from
 // the e2m1 table directly (so the decoded float is exact), activation all
 // ones so Y == sum(decoded weight row). ACT_F16 must reproduce this exactly
-// (1.0 round-trips through fp16 losslessly); ACT_Q8_1 must be close (int8
-// quantization of a constant row is exact too: id = amax/127, so 1.0 maps to
-// round(127/amax * amax)=127... the quantizer's own rounding error is what is
-// being sanity-checked here, not assumed away).
+// (1.0 round-trips through fp16 losslessly); ACT_Q8_1's expected tolerance is
+// explained where it is checked below, not assumed away here.
 void case_reference_gemm_hand_checked() {
     const int64_t            nrows = 1, ncols = XMX_K;  // K=32, one MXFP4 block, N=1
     // e2m1 table indices 0,1,2,3 (values 0,1,2,3) repeated to fill 32 elements,
@@ -583,9 +647,24 @@ void case_reference_gemm_gptoss_shape() {
 
     const std::vector<uint8_t> soa = build_soa_from_aos(aos, N, K);
     const std::vector<float>   Wd  = decode_soa_mxfp4(soa.data(), N, K);
-    check(Wd.size() == (size_t) (N * K), "decoded-weight-has-full-shape", "size=" + std::to_string(Wd.size()));
+    // decode_soa_mxfp4 constructs `out` at exactly `nrows * ncols` unconditionally
+    // (see :194 above) -- a real assertion on that invariant, not a check() that
+    // could never fire and inflate the PASS count.
+    GGML_ASSERT(Wd.size() == (size_t) (N * K));
 
     std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+
+    // The no-quantization exact double GEMM (used only for the Frobenius
+    // sanity checks below, never for the timed gate) is run at M in
+    // {1, 32, 512} only, not the full sweep: its frob_rel is flat across M
+    // (measured ~0.0038 for q8_1, ~0.00018 for f16 at every M tried), so the
+    // other four points re-measure a constant while costing real wall time
+    // (exact_gemm_double's own M=512 pass is ~2.5s) -- restricting it keeps
+    // the binary well clear of the 10s bar that gates reference_gemm at
+    // M=512 specifically (unaffected by this restriction; see below).
+    auto needs_exact_check = [](int64_t M) {
+        return M == 1 || M == 32 || M == 512;
+    };
 
     for (int64_t M : Ms) {
         std::vector<float> X((size_t) (M * K));
@@ -598,17 +677,24 @@ void case_reference_gemm_gptoss_shape() {
         const auto                t1      = std::chrono::steady_clock::now();
         const double              elapsed = std::chrono::duration<double>(t1 - t0).count();
 
-        check(Y.size() == (size_t) (M * N), "reference_gemm-output-size M=" + std::to_string(M),
-              "size=" + std::to_string(Y.size()));
+        // reference_gemm always returns exactly M*N elements (:283 above) --
+        // a real assertion, not a check() that could never fire.
+        GGML_ASSERT(Y.size() == (size_t) (M * N));
+        check(all_finite(Y), "reference_gemm-output-finite M=" + std::to_string(M), "");
 
-        bool all_finite = true;
-        for (double v : Y) {
-            if (!std::isfinite(v)) {
-                all_finite = false;
-                break;
-            }
+        if (M == 512) {
+            // This is THE criterion: reference_gemm itself, timed, at the
+            // GPT-OSS M=512 shape, independent of whether the exact-GEMM
+            // sanity cross-check below runs for this M.
+            check(elapsed < 10.0, "reference_gemm-M512-K2880-N2880-under-10s (timed criterion arm)",
+                  "elapsed=" + std::to_string(elapsed) + "s");
         }
-        check(all_finite, "reference_gemm-output-finite M=" + std::to_string(M), "");
+
+        if (!needs_exact_check(M)) {
+            std::printf("    reference_gemm M=%lld N=%lld K=%lld act=q8_1: %.3fs (exact cross-check skipped)\n",
+                        (long long) M, (long long) N, (long long) K, elapsed);
+            continue;
+        }
 
         // Sanity vs the no-quantization exact double GEMM, scored with a
         // Frobenius-norm relative error rather than max_rel_violations.
@@ -626,53 +712,31 @@ void case_reference_gemm_gptoss_shape() {
         // documented, for comparing two encodings of the SAME activation
         // representation (a real kernel vs this oracle), where it is the
         // right tool.
-        const std::vector<double> exact = exact_gemm_double(X, Wd, M, N, K);
-        double                    num = 0.0, den = 0.0;
-        for (size_t i = 0; i < Y.size(); ++i) {
-            const double diff = Y[i] - exact[i];
-            num += diff * diff;
-            den += exact[i] * exact[i];
-        }
-        const double frob_rel = std::sqrt(num / std::max(den, 1e-300));
+        const std::vector<double> exact    = exact_gemm_double(X, Wd, M, N, K);
+        const double              frob_rel = frobenius_rel(Y, exact);
         check(frob_rel < 0.05, "reference_gemm-q8_1-frobenius-rel-error-vs-exact M=" + std::to_string(M),
               "frob_rel=" + std::to_string(frob_rel));
 
-        if (M == 512) {
-            check(elapsed < 10.0, "reference_gemm-M512-K2880-N2880-under-10s",
-                  "elapsed=" + std::to_string(elapsed) + "s");
-        }
         std::printf("    reference_gemm M=%lld N=%lld K=%lld act=q8_1: %.3fs frob_rel_vs_exact=%.5f\n", (long long) M,
                     (long long) N, (long long) K, elapsed, frob_rel);
 
         // ACT_F16 arm at the two shapes the down-stream kernels will be
         // timed at most closely (a mid-size M and the full M=512): the
         // sweep above only exercised the ACT_Q8_1 arm at the GPT-OSS shape,
-        // leaving ACT_F16 checked only by the 1x1x32 hand case.
+        // leaving ACT_F16 checked only by the 1x1x32 hand case. Both M=32
+        // and M=512 are in the exact-check set above, so `exact` is always
+        // available here.
         if (M == 32 || M == 512) {
             const auto                t0f      = std::chrono::steady_clock::now();
             const std::vector<double> Yf16     = reference_gemm(X, Wd, M, N, K, Activation::ACT_F16);
             const auto                t1f      = std::chrono::steady_clock::now();
             const double              elapsedf = std::chrono::duration<double>(t1f - t0f).count();
 
-            check(Yf16.size() == (size_t) (M * N), "reference_gemm-f16-output-size M=" + std::to_string(M),
-                  "size=" + std::to_string(Yf16.size()));
+            // Same invariant as the ACT_Q8_1 arm above -- a real assertion.
+            GGML_ASSERT(Yf16.size() == (size_t) (M * N));
+            check(all_finite(Yf16), "reference_gemm-f16-output-finite M=" + std::to_string(M), "");
 
-            bool f16_all_finite = true;
-            for (double v : Yf16) {
-                if (!std::isfinite(v)) {
-                    f16_all_finite = false;
-                    break;
-                }
-            }
-            check(f16_all_finite, "reference_gemm-f16-output-finite M=" + std::to_string(M), "");
-
-            double num_f16 = 0.0, den_f16 = 0.0;
-            for (size_t i = 0; i < Yf16.size(); ++i) {
-                const double diff = Yf16[i] - exact[i];
-                num_f16 += diff * diff;
-                den_f16 += exact[i] * exact[i];
-            }
-            const double frob_rel_f16 = std::sqrt(num_f16 / std::max(den_f16, 1e-300));
+            const double frob_rel_f16 = frobenius_rel(Yf16, exact);
             // fp16 activation rounding is far tighter than q8_1's 8-bit
             // quantization, so this bound is far tighter than the 0.05 used
             // for the ACT_Q8_1 arm above.

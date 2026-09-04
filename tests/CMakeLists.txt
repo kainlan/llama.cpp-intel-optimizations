@@ -2701,8 +2701,10 @@ set_tests_properties(test-sycl-q8-dense-layout-rule PROPERTIES LABELS "main;sycl
 # reference_gemm() + max_rel_violations(..., 0.0258 -- the proven 2-D WOQ
 # GEMM arm's hardware verdict, llama.cpp-sr83 fix cycle 2, documented at
 # ggml/src/ggml-sycl/gemm.hpp, not tests/test-sycl-mxfp4-woq-gemm-bench.cpp).
-# Pure C++, links only ggml through llama-common -- no SYCL, no device, so it
-# runs in every sweep at any parallelism.
+# Pure C++ -- touches no device and enumerates no SYCL device (in a
+# GGML_SYCL=ON build it links libggml-sycl transitively through
+# llama-common, same as any other llama_build_and_test target, but never
+# calls into it), so it runs in every sweep at any parallelism.
 llama_build_and_test(test-sycl-mxfp4-stored-layout-gemm-oracle.cpp)
 target_include_directories(test-sycl-mxfp4-stored-layout-gemm-oracle PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 set_tests_properties(test-sycl-mxfp4-stored-layout-gemm-oracle PROPERTIES LABELS "main;sycl;mxfp4;host")
