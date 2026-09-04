@@ -789,6 +789,39 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh
     )
     set_tests_properties(test-bench-guard PROPERTIES SKIP_RETURN_CODE 77)
+
+    # sycl-decode-mode-capture unit tests (plan task S4, llama.cpp-gvu7): the
+    # one-run freq/throttle/RssAnon timeline + kprof capture for the B70
+    # GPT-OSS decode slow mode. Invokes bench-guard.sh (above) as a child for
+    # all host-corruption preflight; this suite exercises only the capture
+    # script itself, against a fake sysfs tree and a fake bench command --
+    # no GPU, safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-decode-mode-capture
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-mode-capture.sh
+    )
+    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above:
+    # llama_test_cmd's LABEL is a single-valued (oneValueArgs) argument, so
+    # the embedded ";" in "sycl;source" splits into two separate arguments
+    # when cmake_parse_arguments consumes it -- LABEL takes only "sycl", and
+    # "source" silently falls into UNPARSED_ARGUMENTS, which the function
+    # never reads. llama_test_pytest's own LABEL is multi-valued precisely
+    # to avoid this (see its own doc comment above), which is why an earlier
+    # round of this comment cited a llama_test_pytest call as precedent for
+    # llama_test_cmd's LABEL argument -- llama_test_pytest is a different
+    # function with a different LABEL, and the precedent didn't transfer
+    # (round-3 review, llama.cpp-gvu7). No fixed TIMEOUT is set here despite
+    # the neighbouring test-sycl-handle-policy registration carrying one:
+    # this suite's own runtime varies with host load by design (see its own
+    # file header), and a fixed timeout tuned for a quiet host would flake
+    # under load the same way an under-provisioned test fixture already did
+    # once (quality review, finding 8).
+    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT WIN32)
