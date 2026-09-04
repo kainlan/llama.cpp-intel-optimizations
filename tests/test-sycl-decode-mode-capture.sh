@@ -220,6 +220,49 @@ max_rss="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } EN
 [ "$max_rss" -gt 32768 ] \
     || { echo "FAIL: expected a sampled RssAnon > 32768 kB (fixture holds ~64 MiB); got max=$max_rss kB -- RssAnon may be tracking a wrapper, not the bench"; fail=1; }
 
+# --- regression: proof B (llama.cpp-gvu7 review). While the card is
+# (simulated) busy, bench-guard's OWN preflight throttle/tenant poll loop
+# forks its own `sleep 5` directly under the guard -- structural leaf
+# descent WILL transiently latch onto that (expected, self-correcting, not
+# a bug: it is genuinely the deepest live process at that instant). The
+# regression this guards is whether tracking permanently sticks there once
+# the real chain forms, the way a comm denylist for {timeout, env} did (it
+# does not reject "sleep") in an earlier, already-replaced version of this
+# script. mk_tree_busy_then_free starts throttle/status=1 and flips it to 0
+# via a background subshell after ~6s, mirroring the reviewer's own repro;
+# bench-guard's fixed 5s poll interval means at least one of its own poll
+# `sleep`s is observed before the card clears. --max-wait 20 gives ample
+# budget past the ~10s worst case (two 5s poll cycles) before bench-guard
+# itself would refuse.
+mk_tree_busy_then_free() {
+    local d="$T/sys/class/drm/card9/device/tile0/gt0/freq0"
+    mkdir -p "$d/throttle"
+    printf '1\n' > "$d/throttle/status"
+    printf '1800\n' > "$d/act_freq"
+    ( sleep 6; printf '0\n' > "$d/throttle/status"; printf '0\n' > "$d/act_freq" ) &
+}
+
+out_busy="$T/out-busycard"
+mk_tree_busy_then_free
+mk_meminfo 3000000
+bench="$(mk_fake_bench_grow 40.0)"
+export FAKE_BENCH_PIDFILE="$T/fake-bench-busy.pid"
+"$CAPTURE" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 20 \
+    --out "$out_busy" -- "$bench" || { echo "FAIL: busy-card run failed"; fail=1; }
+unset FAKE_BENCH_PIDFILE
+wait 2>/dev/null || true
+
+[ -s "$T/fake-bench-busy.pid" ] || { echo "FAIL: fake bench never wrote its own pid (busy-card)"; fail=1; }
+want_busy_pid="$(cat "$T/fake-bench-busy.pid")"
+grep -q "^bench_pid=$want_busy_pid comm=" "$out_busy/host.txt" \
+    || { echo "FAIL: expected bench_pid=$want_busy_pid in host.txt after busy-card recovery (got: $(grep '^bench_pid=' "$out_busy/host.txt" 2>/dev/null))"; fail=1; }
+grep -qE '^bench_pid=[0-9]+ comm=(sleep|timeout) ' "$out_busy/host.txt" \
+    && { echo "FAIL: host.txt still names a wrapper after busy-card recovery: $(grep '^bench_pid=' "$out_busy/host.txt")"; fail=1; }
+max_rss_busy="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } END { print max + 0 }' "$out_busy/timeline.tsv")"
+[ "$max_rss_busy" -gt 32768 ] \
+    || { echo "FAIL: expected a sampled RssAnon > 32768 kB after busy-card recovery; got max=$max_rss_busy kB"; fail=1; }
+
 # --- tg128 parsing must be anchored to an actual markdown table row and
 # validated as numeric (llama.cpp-gvu7 review): a bare substring grep over
 # the whole log also matches bench-guard's own header line (which echoes the
