@@ -3409,6 +3409,15 @@ struct ggml_tensor_extra_gpu {
     std::atomic<int>      refcount{ 1 };
     uint64_t              cache_uuid = 0;                                   // Monotonic cache identity for weights
     uint64_t              model_id   = 0;                                   // Model identifier for cache keys
+    // Stamped by ggml_backend_sycl_buffer_init_tensor() from the owning compute
+    // buffer's ggml_backend_sycl_buffer_context::alloc_generation (llama.cpp-dfo0,
+    // plan task L2). Lets buffer_reset() tell a graph REUSE (extra stamped with
+    // the current generation) from a graph REBUILD (extra stamped two
+    // generations back, whose ggml_tensor struct has since been re-initialised
+    // over the same ggml_init mem_buffer) without ever dereferencing the stale
+    // tensor pointer. Meaningless for WEIGHTS-usage extras, which never go
+    // through buffer_reset's COMPUTE branch.
+    uint64_t              alloc_generation = 0;
     void *                data_device[GGML_SYCL_MAX_DEVICES];               // 1 pointer for each device for split
                                                                             // tensors (legacy — use data_handle)
     ggml_sycl::mem_handle data_handle[GGML_SYCL_MAX_DEVICES];               // Smart handles (P12 migration)

@@ -2607,6 +2607,49 @@ set_tests_properties(test-sycl-tensor-placement PROPERTIES
 # touches a SYCL device or queue.
 endif() # static SYCL backend fixture
 
+# Test: ggml_backend_sycl_buffer_reset's COMPUTE branch must bound the compute
+# buffer's tensor_extras vector across repeated graph REBUILDS, not just
+# repeated graph REUSES (llama.cpp-dfo0, plan task L2). Alternates two
+# differently-shaped graphs through ggml_backend_sched, each built in a fresh
+# ggml_context over the same raw mem_buffer (mirrors llm_graph_result::reset,
+# src/llama-graph.cpp), and reads the post-release extras count via the
+# GGML_SYCL_PRIVATE_TESTING-only debug accessor -- ggml_backend_sched does not
+# hand test code the compute buffer it allocates internally, so the accessor
+# is process-global by design; single-threaded test use only.
+#
+# Loads no model (a synthetic Q8_0 weight, allocated once) and runs a tiny
+# fixed-size graph 20 times: not in the model-loading OOM-hazard family this
+# repo tracks (test-llama-archs, test-thread-safety, test-backend-ops), so no
+# RUN_SERIAL / never-loop caveat applies here.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-compute-buffer-extra-reuse
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-compute-buffer-extra-reuse.cpp
+)
+target_include_directories(test-sycl-compute-buffer-extra-reuse PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-compute-buffer-extra-reuse PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-compute-buffer-extra-reuse PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-compute-buffer-extra-reuse PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+# ggml_backend_sycl_debug_last_compute_buffer_extra_count() exists only under
+# GGML_SYCL_PRIVATE_TESTING; the ordinary DSO does not export it.
+target_link_libraries(test-sycl-compute-buffer-extra-reuse PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-compute-buffer-extra-reuse COMMAND test-sycl-compute-buffer-extra-reuse)
+set_tests_properties(test-sycl-compute-buffer-extra-reuse PROPERTIES
+    LABELS "sycl;memory;compute-buffer;tensor-extras;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+endif() # static SYCL backend fixture
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-tensor-usage
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-tensor-usage.cpp
