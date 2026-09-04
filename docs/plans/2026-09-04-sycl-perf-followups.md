@@ -202,7 +202,7 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 
 **Gotchas:**
 - Never dereference `v[i].first` for a stale entry; the struct memory was re-initialised.
-- `release_extra_gpu` must run with no device work in flight that references the extra's handles; `buffer_reset` is called before the new graph is allocated, after the previous compute finished (sched synchronises) — state this in a comment, and keep the WEIGHTS path untouched.
+- `release_extra_gpu` must run with no device work in flight that references the extra's handles. **Amendment 2026-09-04 (llama.cpp-kqy7 c-cnko/c-2d63):** the original wording here claimed "sched synchronises" before the reset; that is false on the ordinary path (the only synchronize is the realloc fallback at ggml-backend.cpp:~2297; graph_compute is async). The real argument, which the landed comment states: the one-generation lag means a released extra's graph was rebuilt a full generation earlier, and `release_extra_gpu` is called with an empty streams vector so no device-storage release runs (the arena lease stays owned by the buffer). Keep the WEIGHTS path untouched.
 - `ggml-sycl.cpp` hotspot: this task holds it first; S3/P2/G7 rebase after.
 
 ---
