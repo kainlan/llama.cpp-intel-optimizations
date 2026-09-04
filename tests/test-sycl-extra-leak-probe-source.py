@@ -117,6 +117,36 @@ def ws_count(text, needle):
     return len(list(ws_pattern(needle).finditer(text)))
 
 
+def matching_paren(text, open_idx):
+    """String/escape-aware matching ')' for the '(' at open_idx (sibling of
+    matching_brace, needed to slice exactly one call expression instead of
+    stopping at the first ';' -- a printf-style format string can embed a ';'
+    of its own, which would truncate a naive slice before real arguments)."""
+    assert text[open_idx] == "("
+    depth = 0
+    state = "code"
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if state == "code":
+            if ch == '"':
+                state = "str"
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif state == "str":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                state = "code"
+        i += 1
+    raise AssertionError("unbalanced parens")
+
+
 def function_body(text, signature):
     idx = ws_find(text, signature)
     assert idx >= 0, f"missing definition: {signature}"
@@ -143,15 +173,23 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     body = function_body(backend, RESET_SIG)
     assert "GGML_LOG_WARN(" in body, "the probe must log via GGML_LOG_WARN, not GGML_LOG_INFO/DEBUG"
     warn_idx = body.find("GGML_LOG_WARN(")
-    call_end = body.find(";", warn_idx)
-    assert call_end > warn_idx, "malformed GGML_LOG_WARN( call in buffer_reset"
-    warn_call = body[warn_idx:call_end]
+    # Slice the whole call expression via a paren-depth/string-aware scan, not
+    # a naive find(";", ...): the format string can itself embed a ';', which
+    # would truncate the slice before real arguments and make this check pass
+    # or fail on the wrong text (llama.cpp-i0oh spec review round 2, nit 2).
+    open_idx = warn_idx + len("GGML_LOG_WARN")
+    assert body[open_idx] == "(", "GGML_LOG_WARN must be followed directly by '(' -- malformed call"
+    close_idx = matching_paren(body, open_idx)
+    warn_call = body[warn_idx : close_idx + 1]
     assert PROBE_TAG in warn_call, f"the probe's GGML_LOG_WARN call must include the stable tag {PROBE_TAG}"
     # Named sum_of_sizes, not cumulative: it is a running sum of the per-call
     # vector *sizes* (a triangular series), not a byte-accurate leak count --
     # see the lead's spec-review finding on llama.cpp-i0oh (c-cqpq, F1). The
     # per-call `preserving %zu` field is the real leak proxy.
     assert "sum_of_sizes=" in warn_call, "the probe must report a running sum_of_sizes, not just this call's count"
+    # Regression guard for the rename itself (llama.cpp-i0oh spec review round
+    # 2, nit 3): `cumulative=` must not creep back into the probe block.
+    assert "cumulative=" not in body, "the probe must not reintroduce the misleading 'cumulative=' field name"
 
 
 def test_probe_is_zero_cost_when_the_env_var_is_unset():
