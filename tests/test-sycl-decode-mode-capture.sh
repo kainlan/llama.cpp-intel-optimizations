@@ -73,13 +73,16 @@ EOF
 # an external `sleep`, then busy-waits on the builtin $SECONDS variable
 # instead. This is required for the pid/RSS regression check below: leaf
 # descent tracks the CURRENT deepest live descendant, so a fixture that
-# forks anything (mk_fake_bench's own `sleep 2`, for instance) would have the
-# tracked leaf move onto that child partway through, no longer matching this
-# script's own memory or its own pid written to FAKE_BENCH_PIDFILE. Doubling
-# a 1-byte string 24 times reaches 16 MiB almost instantly and holds bash's
-# own RssAnon at tens of MB throughout the busy-wait -- comfortably above the
-# ~1.2 MB a `timeout`/`env`/`sleep` wrapper reports (verified empirically
-# during this fix: peak ~44 MB, no child ever observed via `pgrep -P`).
+# forks anything (mk_fake_bench's own `sleep 2`, for instance, or even a
+# transient `$(head -c 64M /dev/zero | tr '\0' a)` pipeline) would have the
+# tracked leaf move onto that child, no longer matching this script's own
+# memory or its own pid written to FAKE_BENCH_PIDFILE. Doubling a 1-byte
+# string 26 times reaches 64 MiB almost instantly and holds bash's own
+# RssAnon around that scale throughout the busy-wait -- comfortably above
+# both the ~1.2 MB a `timeout`/`env`/`sleep` wrapper reports and the 32768 kB
+# (32 MiB) assertion threshold below, with margin (verified empirically
+# during this fix: peak ~66 MB for a 64 MiB string, no child ever observed
+# via `pgrep -P`).
 mk_fake_bench_grow() {
     local tg="$1" path="$T/fakebench-grow.sh"
     cat > "$path" <<EOF
@@ -87,7 +90,7 @@ mk_fake_bench_grow() {
 if [ -n "\${FAKE_BENCH_PIDFILE:-}" ]; then echo "\$\$" > "\${FAKE_BENCH_PIDFILE}"; fi
 s="x"
 i=0
-while [ "\$i" -lt 24 ]; do
+while [ "\$i" -lt 26 ]; do
     s="\$s\$s"
     i=\$((i + 1))
 done
@@ -210,9 +213,12 @@ want_pid="$(cat "$T/fake-bench.pid")"
 grep -q "^bench_pid=$want_pid comm=" "$out_pid/host.txt" \
     || { echo "FAIL: expected bench_pid=$want_pid in host.txt (got: $(grep '^bench_pid=' "$out_pid/host.txt" 2>/dev/null))"; fail=1; }
 
+# 32768 kB (32 MiB): a `timeout`/`env`/`sleep` wrapper can never reach this
+# (~1.2 MB observed), and the fixture's ~64 MiB steady-state RssAnon clears
+# it with roughly 2x margin.
 max_rss="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } END { print max + 0 }' "$out_pid/timeline.tsv")"
-[ "$max_rss" -gt 5000 ] \
-    || { echo "FAIL: expected a sampled RssAnon > 5000 kB (fixture holds tens of MB); got max=$max_rss kB -- RssAnon may be tracking a wrapper, not the bench"; fail=1; }
+[ "$max_rss" -gt 32768 ] \
+    || { echo "FAIL: expected a sampled RssAnon > 32768 kB (fixture holds ~64 MiB); got max=$max_rss kB -- RssAnon may be tracking a wrapper, not the bench"; fail=1; }
 
 # --- tg128 parsing must be anchored to an actual markdown table row and
 # validated as numeric (llama.cpp-gvu7 review): a bare substring grep over

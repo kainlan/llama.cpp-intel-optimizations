@@ -13,6 +13,15 @@
 #                           trailing "bench_pid=... comm=... cmdline=..." line
 #                           recording exactly what timeline.tsv's RssAnon
 #                           column tracked (or "unknown" if never resolved).
+#                           TRUNCATED at the start of every invocation (never
+#                           appended across runs): re-running a capture into
+#                           an existing --out dir starts host.txt fresh
+#                           rather than accumulating prior runs' blocks
+#                           underneath the new ones. timeline.tsv and mode.txt
+#                           are already overwritten wholesale by their own
+#                           writers; host.txt is the one file this script
+#                           otherwise only appends to, so it is the one that
+#                           needs an explicit truncate.
 #   <dir>/kprof*         -- GGML_SYCL_KERNEL_PROFILE CSV for the run.
 #   <dir>/mode.txt       -- "tg128=<value> mode=slow|fast|unknown" (thresholds
 #                           32/36 tok/s), the same line printed to stdout.
