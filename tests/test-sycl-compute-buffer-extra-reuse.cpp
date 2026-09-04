@@ -38,11 +38,21 @@
 // binary: nothing is ever released, so the count this test prints grows by
 // ~n_tensors_B (3) every iteration instead of staying <= 2*n_tensors_B.
 //
+// ggml_backend_sched_new() asserts its LAST backend entry is a CPU device
+// (ggml-backend.cpp:2518); this test still runs everything on SYCL (the CPU
+// backend is present only to satisfy that structural requirement, matching
+// how llama.cpp itself always registers a CPU backend), and asserts the
+// per-iteration extras count is > 0 once steady state is reached so a
+// misplacement onto the CPU backend (where the SYCL debug accessor would
+// silently read 0 forever, making the "count stayed bounded" assertion pass
+// for the wrong reason) fails loudly instead of passing vacuously.
+//
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-compute-buffer-extra-reuse
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
@@ -110,6 +120,17 @@ int main(int, char ** argv) {
         return LLAMA_TEST_EXIT_SKIP;
     }
 
+    // ggml_backend_sched_new() requires its last backend to be a CPU device
+    // (ggml-backend.cpp:2518, GGML_ASSERT) -- present as a structural
+    // fallback only; every op in this graph (rms_norm, quantized mul_mat) is
+    // SYCL-supported, so nothing is expected to actually dispatch here.
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!cpu) {
+        fprintf(stderr, "FAIL: ggml_backend_cpu_init failed\n");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
     // Persistent Q8_0 weight, allocated once in its own WEIGHTS-usage buffer --
     // mirrors how llama.cpp's model weights outlive every ephemeral per-decode
     // graph context and are referenced by pointer from each rebuild.
@@ -121,6 +142,7 @@ int main(int, char ** argv) {
     ggml_context * wctx = ggml_init(wparams);
     if (!wctx) {
         fprintf(stderr, "FAIL: ggml_init (weight context) failed\n");
+        ggml_backend_free(cpu);
         ggml_backend_free(backend);
         return 1;
     }
@@ -131,6 +153,7 @@ int main(int, char ** argv) {
     if (!weight_buf) {
         fprintf(stderr, "FAIL: failed to allocate the weight buffer\n");
         ggml_free(wctx);
+        ggml_backend_free(cpu);
         ggml_backend_free(backend);
         return 1;
     }
@@ -144,12 +167,13 @@ int main(int, char ** argv) {
         ggml_backend_tensor_set(weight, zeros.data(), 0, zeros.size());
     }
 
-    ggml_backend_t       backends[1] = { backend };
-    ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 1, 4096, false, true);
+    ggml_backend_t       backends[2] = { backend, cpu };  // CPU MUST be last -- see the comment above.
+    ggml_backend_sched_t sched       = ggml_backend_sched_new(backends, nullptr, 2, 4096, false, true);
     if (!sched) {
         fprintf(stderr, "FAIL: ggml_backend_sched_new failed\n");
         ggml_backend_buffer_free(weight_buf);
         ggml_free(wctx);
+        ggml_backend_free(cpu);
         ggml_backend_free(backend);
         return 1;
     }
@@ -169,7 +193,25 @@ int main(int, char ** argv) {
     size_t last_extras = 0;
 
     for (int iter = 0; iter < N_ITERS && ok; ++iter) {
-        const int64_t n_tokens = (iter % 2 == 0) ? N_TOKENS_A : N_TOKENS_B;
+        // The LARGER shape must run first (llama.cpp-dfo0 plan task L2, spec
+        // review c-cnko #2): iteration 0 is what sizes the compute buffer, and a
+        // later iteration whose tensors exceed that recorded size_max forces
+        // ggml_gallocr_alloc_graph to reallocate (ggml-alloc.c ggml_gallocr_
+        // needs_realloc -> ggml_backend_sched's reserve fallback) -- which frees
+        // the old ggml_backend_sycl_buffer_context and replaces it with a fresh
+        // one at generation 0, an empty tensor_extras, invalidating both the
+        // GREEN/RED arithmetic below and the iter>=1 positive control (a freshly
+        // reallocated buffer legitimately reads 0). Running N_TOKENS_B (1024)
+        // first reserves a buffer both shapes fit for the rest of the run.
+        const int64_t n_tokens = (iter % 2 == 0) ? N_TOKENS_B : N_TOKENS_A;
+
+        // ggml_backend_sched_alloc_graph() asserts !sched->is_alloc
+        // (ggml-backend.cpp:2656), set true by the previous iteration's alloc and
+        // cleared ONLY by ggml_backend_sched_reset() -- mirroring how
+        // llama_context resets its scheduler before every rebuild
+        // (src/llama-context.cpp:1830). Without this, iteration 1 aborts
+        // (llama.cpp-dfo0 plan task L2, spec review c-cnko #1).
+        ggml_backend_sched_reset(sched);
 
         ggml_init_params iparams = {
             /*.mem_size   =*/mem_size,
@@ -223,6 +265,22 @@ int main(int, char ** argv) {
             ok = false;
             break;
         }
+        // Positive control for the accessor itself: from iteration 1 onward
+        // (iteration 0's pre-reset snapshot is legitimately 0, taken before
+        // any tensor has ever been stamped) the count must be > 0. A silent
+        // misplacement onto the CPU backend added above would never touch
+        // the SYCL COMPUTE buffer's tensor_extras at all, leaving this
+        // accessor stuck at 0 forever -- which the `<= bound` check above
+        // would otherwise pass vacuously, exactly the "an empty probe is not
+        // a measurement" trap.
+        if (iter >= 1 && last_extras == 0) {
+            fprintf(stderr,
+                    "FAIL: compute buffer tensor_extras count is 0 at iteration %d -- graph tensors are not "
+                    "landing on the SYCL COMPUTE buffer this accessor reads (misassigned to the CPU backend?)\n",
+                    iter);
+            ok = false;
+            break;
+        }
     }
 
     printf("max_extras_observed=%zu (bound=%zu)\n", max_extras, 2 * N_TENSORS_PER_GRAPH);
@@ -230,6 +288,7 @@ int main(int, char ** argv) {
     ggml_backend_sched_free(sched);
     ggml_backend_buffer_free(weight_buf);
     ggml_free(wctx);
+    ggml_backend_free(cpu);
     ggml_backend_free(backend);
 
     if (!ok) {

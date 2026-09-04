@@ -1066,8 +1066,9 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 // Process-global by design: ggml_backend_sched does not hand test code the
 // compute buffer it allocates internally, so this reads the last COMPUTE-usage
 // ggml_backend_sycl_buffer_reset's post-release tensor_extras vector size,
-// across whichever compute buffer it last reset. Not meaningful with more than
-// one compute buffer resetting concurrently -- single-threaded test use only.
+// across whichever compute buffer (or, for a multi-chunk buffer, whichever
+// single chunk) it last reset. Not meaningful with more than one compute
+// buffer/chunk resetting concurrently -- single-threaded test use only.
 GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_compute_buffer_extra_count(void);
 #endif
 

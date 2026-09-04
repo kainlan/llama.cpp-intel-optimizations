@@ -229,7 +229,10 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     # a naive find(";", ...): the format string can itself embed a ';', which
     # would truncate the slice before real arguments and make this check pass
     # or fail on the wrong text (llama.cpp-i0oh spec review round 2, nit 2).
-    open_idx = warn_idx + len("GGML_LOG_WARN")
+    # Derived from the match itself (not warn_idx + len("GGML_LOG_WARN")),
+    # consistent with WARN_CALL_RE's whitespace tolerance and the two release-
+    # bookkeeping tests below (llama.cpp-dfo0 plan task L2, spec review c-cnko #7).
+    open_idx = warn_match.end() - 1
     assert body[open_idx] == "(", "GGML_LOG_WARN must be followed directly by '(' -- malformed call"
     close_idx = matching_paren(body, open_idx)
     warn_call = body[warn_idx : close_idx + 1]
@@ -295,7 +298,14 @@ def test_soa_debug_line_reports_release_bookkeeping():
     # ("the [SOA-DEBUG] and probe lines updated to report released=<n> kept=<m>").
     body = function_body(backend, RESET_SIG)
     assert SOA_DEBUG_TAG in body, f"buffer_reset must still emit a {SOA_DEBUG_TAG} line for the COMPUTE branch"
-    soa_idx = body.find(SOA_DEBUG_TAG)
+    # Anchor on "compute buffer=" rather than the bare tag: buffer_reset emits
+    # TWO [SOA-DEBUG] lines (this function's COMPUTE branch, and the teardown
+    # loop further down for the WEIGHTS path), and body.find(SOA_DEBUG_TAG)
+    # would silently pick whichever comes first in the source regardless of
+    # which one is actually the COMPUTE line -- "compute buffer=" is unique to
+    # the COMPUTE branch's format string.
+    soa_idx = body.find("compute buffer=")
+    assert soa_idx >= 0, "expected a 'compute buffer=' field on the COMPUTE branch's SOA-DEBUG line"
     # Slice out just the GGML_SYCL_DEBUG(...) call that carries this tag, using
     # the same comment/string-aware paren scan as the WARN checks above rather
     # than a raw find(";", ...) -- the format string itself can embed one.
