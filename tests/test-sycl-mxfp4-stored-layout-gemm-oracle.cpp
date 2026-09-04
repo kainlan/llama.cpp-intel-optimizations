@@ -32,11 +32,31 @@
 //      the GPT-OSS expert shape (K=N=2880) for every M this track's kernels
 //      will be scored at.
 //
-//   3. `max_rel_violations(out, ref, tol)` is the shared scorer every later
-//      G4-G8 numerics test calls. The tolerance contract it is built around:
-//      the existing oneDNN WOQ 2-D arm passes
-//      tests/test-sycl-mxfp4-woq-gemm-bench.cpp at max_rel <= 0.0258
-//      (WOQ_MAX_REL_TOL below) -- later kernels are held to the same bar.
+//   3. `max_rel_violations(out, ref, rel_tol, abs_floor)` is the shared
+//      scorer every later G4-G8 numerics test calls, for comparing a real
+//      device kernel against this oracle at the SAME activation
+//      representation (NOT for comparing two different activation
+//      representations against each other -- see the Frobenius-norm note on
+//      case_reference_gemm_gptoss_shape's own sanity check below, which
+//      deliberately does NOT use this scorer). The tolerance contract it is
+//      built around: the proven 2-D WOQ GEMM arm's hardware verdict
+//      (llama.cpp-sr83 fix cycle 2, team-lead hardware verdict 2026-08-22,
+//      documented at ggml/src/ggml-sycl/gemm.hpp near the pp_woq_3d_enabled
+//      env latch, echoed at ggml-sycl.cpp's kCompareRelThreshold comment and
+//      docs/backend/sycl-env-vars.md's GGML_SYCL_MOE_PP_WOQ_3D row) is clean
+//      across every role and block at max_rel <= 0.0258 (WOQ_MAX_REL_TOL
+//      below) -- later kernels are held to the same rel_tol bar. A cell only
+//      counts as a violation when BOTH its relative error exceeds rel_tol
+//      AND its absolute error exceeds abs_floor (default 0.01): a genuine
+//      device fp32 epilogue vs this oracle's double reference routinely
+//      produces ~1e-6 absolute error that reads as a huge RELATIVE error on
+//      a near-zero-magnitude cell -- the exact pathology
+//      tests/test-sycl-mxfp4-woq-gemm-bench.cpp's own "FIX CYCLE #4"
+//      (its lines ~927-932) documents and fixes with an abs-OR-rel gate;
+//      this per-element abs-AND-rel form is the equivalent guard for a
+//      per-element violation count rather than a single whole-output
+//      pass/fail. A size mismatch between `out` and `ref` is a hard failure
+//      (Score.violations == -1, never silently scored via std::min sizes).
 //
 // Formula sources (read-only; this file reproduces them independently rather
 // than including the production headers, which pull in SYCL):
@@ -91,9 +111,23 @@ constexpr int64_t XMX_K        = QK_MXFP4;   // 32 elements per MXFP4 block
 constexpr int64_t PACKED_BYTES = XMX_K / 2;  // 16 nibble-packed bytes per block
 
 // The tolerance every downstream stored-layout MXFP4 kernel is scored
-// against, taken from the existing oneDNN WOQ 2-D arm's passing bound
-// (tests/test-sycl-mxfp4-woq-gemm-bench.cpp).
+// against: the proven 2-D WOQ GEMM arm's hardware verdict (llama.cpp-sr83
+// fix cycle 2, team-lead hardware verdict 2026-08-22) -- clean across every
+// role and block at max_rel <= 0.0258. Documented at
+// ggml/src/ggml-sycl/gemm.hpp near the pp_woq_3d_enabled env latch, echoed
+// at ggml-sycl.cpp's kCompareRelThreshold comment and
+// docs/backend/sycl-env-vars.md's GGML_SYCL_MOE_PP_WOQ_3D row (NOT
+// tests/test-sycl-mxfp4-woq-gemm-bench.cpp, whose own pass criterion uses
+// abs_tol=0.01/rel_tol=0.02 and never states 0.0258 -- an earlier version of
+// this file cited that test file for the value; it does not appear there).
 constexpr double WOQ_MAX_REL_TOL = 0.0258;
+
+// The absolute-error floor paired with WOQ_MAX_REL_TOL in max_rel_violations:
+// a cell only counts as a violation when its relative error exceeds
+// WOQ_MAX_REL_TOL AND its absolute error exceeds this floor -- excludes the
+// near-zero-cell relative-error artifact fix-cycle-4 documents (see the file
+// header and max_rel_violations below).
+constexpr double DEFAULT_ABS_FLOOR = 0.01;
 
 // -----------------------------------------------------------------------------
 // Layout writers: build each stored byte layout from an AOS block_mxfp4 array
@@ -285,22 +319,44 @@ std::vector<double> exact_gemm_double(const std::vector<float> & X,
 }
 
 struct Score {
+    // -1 is the reserved SIZE-MISMATCH sentinel (see max_rel_violations):
+    // `out.size() != ref.size()` is a hard failure, never silently scored
+    // over the shorter of the two. Any real count is >= 0, so a caller that
+    // naively checks `violations == 0` for "pass" still correctly rejects
+    // this sentinel; callers that want to distinguish "no violations" from
+    // "could not be scored" should check `violations < 0` explicitly.
     int64_t violations;
     double  max_rel;
     double  max_abs_diff;
 };
 
 // The shared scorer every later G4-G8 numerics test calls: counts elements
-// whose relative error against `ref` exceeds `tol`.
-Score max_rel_violations(const std::vector<double> & out, const std::vector<double> & ref, double tol) {
-    Score        s{ 0, 0.0, 0.0 };
-    const size_t n = std::min(out.size(), ref.size());
-    for (size_t i = 0; i < n; ++i) {
+// whose relative error against `ref` exceeds `rel_tol` AND whose absolute
+// error exceeds `abs_floor`. Both conditions are required (not either alone)
+// so a near-zero-magnitude reference cell -- where a genuine, tiny absolute
+// error reads as an enormous relative error -- is not flagged; see the
+// tolerance-contract comment on WOQ_MAX_REL_TOL and the file header for the
+// fix-cycle-4 precedent this mirrors. `out.size() != ref.size()` is a hard
+// failure: returns Score{-1, 0.0, 0.0} rather than silently scoring the
+// shorter of the two via std::min.
+Score max_rel_violations(const std::vector<double> & out,
+                         const std::vector<double> & ref,
+                         double                      rel_tol,
+                         double                      abs_floor = DEFAULT_ABS_FLOOR) {
+    if (out.size() != ref.size()) {
+        std::fprintf(stderr,
+                     "max_rel_violations: SIZE MISMATCH out.size()=%zu ref.size()=%zu -- refusing to score, "
+                     "returning the -1 sentinel\n",
+                     out.size(), ref.size());
+        return Score{ -1, 0.0, 0.0 };
+    }
+    Score s{ 0, 0.0, 0.0 };
+    for (size_t i = 0; i < out.size(); ++i) {
         const double diff = std::fabs(out[i] - ref[i]);
         const double rel  = diff / std::max(1e-12, std::fabs(ref[i]));
         s.max_abs_diff    = std::max(s.max_abs_diff, diff);
         s.max_rel         = std::max(s.max_rel, rel);
-        if (rel > tol) {
+        if (rel > rel_tol && diff > abs_floor) {
             ++s.violations;
         }
     }
@@ -434,6 +490,27 @@ void case_scorer_sanity() {
     const Score deviated = max_rel_violations(perturbed, ref, WOQ_MAX_REL_TOL);
     check(deviated.violations == 1, "scorer-catches-out-of-tolerance-element",
           "violations=" + std::to_string(deviated.violations) + " max_rel=" + std::to_string(deviated.max_rel));
+
+    // abs_floor semantics (team-lead finding, fix-cycle-4 precedent): a
+    // near-zero reference cell perturbed by a small ABSOLUTE amount (5e-3,
+    // under the default 0.01 floor) must NOT be flagged even though its
+    // RELATIVE error is enormous -- that is device-epilogue-vs-double-
+    // reference noise, not a kernel bug. A normal-magnitude cell (30.0)
+    // perturbed by a genuine 5% must still be flagged. One call, one
+    // expected violation, so the abs_floor is proven to suppress exactly
+    // the near-zero cell and nothing else.
+    std::vector<double> ref_floor   = { 0.001, 30.0 };
+    std::vector<double> out_floor   = { 0.001 + 5e-3, 30.0 * 1.05 };
+    const Score         floor_score = max_rel_violations(out_floor, ref_floor, WOQ_MAX_REL_TOL);
+    check(floor_score.violations == 1, "scorer-abs-floor-excludes-near-zero-noise-but-flags-a-real-5pct-deviation",
+          "violations=" + std::to_string(floor_score.violations) + " max_rel=" + std::to_string(floor_score.max_rel));
+
+    // Size mismatch is a hard failure, not a silent std::min(out, ref).
+    std::vector<double> short_vec = { 1.0, 2.0 };
+    const Score         mismatch  = max_rel_violations(short_vec, ref, WOQ_MAX_REL_TOL);
+    check(mismatch.violations == -1, "scorer-hard-fails-on-size-mismatch-sentinel",
+          "violations=" + std::to_string(mismatch.violations) + " (out.size=" + std::to_string(short_vec.size()) +
+              " ref.size=" + std::to_string(ref.size()) + ")");
 }
 
 // A hand-checkable GEMM: one MXFP4 block (K=32), weight values chosen from
@@ -566,6 +643,45 @@ void case_reference_gemm_gptoss_shape() {
         }
         std::printf("    reference_gemm M=%lld N=%lld K=%lld act=q8_1: %.3fs frob_rel_vs_exact=%.5f\n", (long long) M,
                     (long long) N, (long long) K, elapsed, frob_rel);
+
+        // ACT_F16 arm at the two shapes the down-stream kernels will be
+        // timed at most closely (a mid-size M and the full M=512): the
+        // sweep above only exercised the ACT_Q8_1 arm at the GPT-OSS shape,
+        // leaving ACT_F16 checked only by the 1x1x32 hand case.
+        if (M == 32 || M == 512) {
+            const auto                t0f      = std::chrono::steady_clock::now();
+            const std::vector<double> Yf16     = reference_gemm(X, Wd, M, N, K, Activation::ACT_F16);
+            const auto                t1f      = std::chrono::steady_clock::now();
+            const double              elapsedf = std::chrono::duration<double>(t1f - t0f).count();
+
+            check(Yf16.size() == (size_t) (M * N), "reference_gemm-f16-output-size M=" + std::to_string(M),
+                  "size=" + std::to_string(Yf16.size()));
+
+            bool f16_all_finite = true;
+            for (double v : Yf16) {
+                if (!std::isfinite(v)) {
+                    f16_all_finite = false;
+                    break;
+                }
+            }
+            check(f16_all_finite, "reference_gemm-f16-output-finite M=" + std::to_string(M), "");
+
+            double num_f16 = 0.0, den_f16 = 0.0;
+            for (size_t i = 0; i < Yf16.size(); ++i) {
+                const double diff = Yf16[i] - exact[i];
+                num_f16 += diff * diff;
+                den_f16 += exact[i] * exact[i];
+            }
+            const double frob_rel_f16 = std::sqrt(num_f16 / std::max(den_f16, 1e-300));
+            // fp16 activation rounding is far tighter than q8_1's 8-bit
+            // quantization, so this bound is far tighter than the 0.05 used
+            // for the ACT_Q8_1 arm above.
+            check(frob_rel_f16 < 0.01, "reference_gemm-f16-frobenius-rel-error-vs-exact M=" + std::to_string(M),
+                  "frob_rel=" + std::to_string(frob_rel_f16));
+
+            std::printf("    reference_gemm M=%lld N=%lld K=%lld act=f16:  %.3fs frob_rel_vs_exact=%.5f\n",
+                        (long long) M, (long long) N, (long long) K, elapsedf, frob_rel_f16);
+        }
     }
 }
 
