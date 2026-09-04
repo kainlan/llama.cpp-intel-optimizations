@@ -237,10 +237,13 @@ int main() {
     int         violations = 0;
     float       max_diff   = 0.0f;
     float       max_rel    = 0.0f;
+    // Per-element combined tolerance (matches test-sycl-mmvq-q8-0-soa-numerics.cpp) replaces the
+    // old aggregate OR check; the dropped `min_abs > 1.0f` gate was a false-failure trap for any
+    // fixture with a legitimately small reference magnitude, not a correctness safeguard.
     for (int i = 0; i < nrows * batch; ++i) {
         const float ref  = ref_output[i];
         const float diff = std::fabs(gpu_output[i] - ref);
-        max_diff = std::max(max_diff, diff);
+        max_diff         = std::max(max_diff, diff);
         if (std::fabs(ref) > 1e-6f) {
             max_rel = std::max(max_rel, diff / std::fabs(ref));
         }
@@ -252,8 +255,8 @@ int main() {
         }
     }
     const bool pass = violations == 0;
-    printf("Max diff: %.6e, max rel: %.6e, violations=%d/%d (tol rel=%.1e abs=%.1e)\n", max_diff, max_rel, violations,
-           nrows * batch, rel_tol, abs_tol);
+    printf("Max diff: %.6e, max rel: %.6e, violations=%d/%d (first 8 printed) (tol rel=%.1e abs=%.1e)\n", max_diff,
+           max_rel, violations, nrows * batch, rel_tol, abs_tol);
     printf("Result: %s\n", pass ? "PASS" : "FAIL");
 
     ggml_backend_buffer_free(weight_buf);
