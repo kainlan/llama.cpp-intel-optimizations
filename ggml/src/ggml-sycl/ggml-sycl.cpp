@@ -34856,8 +34856,25 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         GGML_ASSERT(ggml_backend_buffer_has_stable_base(buffer) &&
                     "COMPUTE buffer_reset skip requires STABLE_BASE: tensor->data pointers must be stable");
+        ggml_backend_sycl_buffer_context * ctx        = (ggml_backend_sycl_buffer_context *) buffer->context;
+        // llama.cpp-dfo0 probe: a graph REBUILD (llm_graph_result::reset re-inits the ggml
+        // context) mints fresh tensor structs, so init_tensor allocates a new extra per tensor
+        // and the ones preserved here become unreachable. Count them so the leak is measurable.
+        static const bool                  leak_probe = [] {
+            const char * e = std::getenv("GGML_SYCL_EXTRA_LEAK_PROBE");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (leak_probe && ctx != nullptr) {
+            static std::atomic<size_t> preserved_total{ 0 };
+            const size_t               n     = ctx->tensor_extras.size();
+            const size_t               total = preserved_total.fetch_add(n, std::memory_order_relaxed) + n;
+            GGML_LOG_WARN(
+                "[EXTRA-LEAK-PROBE] buf=%p preserving %zu extras this call, cumulative=%zu (~%.1f MB @ sizeof=%zu)\n",
+                (void *) buffer, n, total, (double) total * sizeof(ggml_tensor_extra_gpu) / (1024.0 * 1024.0),
+                sizeof(ggml_tensor_extra_gpu));
+        }
         GGML_SYCL_DEBUG("[SOA-DEBUG] buffer_reset: PRESERVING %zu extras for compute buffer=%p\n",
-                        ((ggml_backend_sycl_buffer_context *) buffer->context)->tensor_extras.size(), (void *) buffer);
+                        ctx ? ctx->tensor_extras.size() : (size_t) 0, (void *) buffer);
         return;
     }
 
