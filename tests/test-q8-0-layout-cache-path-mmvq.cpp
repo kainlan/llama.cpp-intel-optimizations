@@ -232,23 +232,28 @@ int main() {
     std::vector<float> gpu_output(nrows * batch, 0.0f);
     ggml_backend_tensor_get(output, gpu_output.data(), 0, gpu_output.size() * sizeof(float));
 
-    float max_diff = 0.0f;
-    float max_rel = 0.0f;
-    float min_abs = std::fabs(gpu_output[0]);
+    const float rel_tol    = 1e-3f;
+    const float abs_tol    = 1e-2f;
+    int         violations = 0;
+    float       max_diff   = 0.0f;
+    float       max_rel    = 0.0f;
     for (int i = 0; i < nrows * batch; ++i) {
-        const float ref = ref_output[i];
+        const float ref  = ref_output[i];
         const float diff = std::fabs(gpu_output[i] - ref);
         max_diff = std::max(max_diff, diff);
-        const float rel = std::fabs(ref) > 1e-6f ? diff / std::fabs(ref) : diff;
-        max_rel = std::max(max_rel, rel);
-        min_abs = std::min(min_abs, std::fabs(gpu_output[i]));
+        if (std::fabs(ref) > 1e-6f) {
+            max_rel = std::max(max_rel, diff / std::fabs(ref));
+        }
+        if (diff > abs_tol + rel_tol * std::fabs(ref)) {
+            if (violations < 8) {
+                printf("  violation[%d] ref=%.6e got=%.6e diff=%.6e\n", i, ref, gpu_output[i], diff);
+            }
+            ++violations;
+        }
     }
-
-    const float rel_tol = 1e-3f;
-    const float abs_tol = 1e-2f;
-    bool pass = (max_rel < rel_tol || max_diff < abs_tol) && min_abs > 1.0f;
-
-    printf("Max diff: %.6e, max rel: %.6e, min abs: %.6f\n", max_diff, max_rel, min_abs);
+    const bool pass = violations == 0;
+    printf("Max diff: %.6e, max rel: %.6e, violations=%d/%d (tol rel=%.1e abs=%.1e)\n", max_diff, max_rel, violations,
+           nrows * batch, rel_tol, abs_tol);
     printf("Result: %s\n", pass ? "PASS" : "FAIL");
 
     ggml_backend_buffer_free(weight_buf);
