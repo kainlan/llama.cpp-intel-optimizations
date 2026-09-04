@@ -400,12 +400,14 @@ Score max_rel_violations(const std::vector<double> & out,
 // is the helper, not a repeated loop body).
 // -----------------------------------------------------------------------------
 
-// Element count where a[i] != b[i]. A size mismatch returns -1 (not 0 --
-// every call site's own PASS value, so 0 would silently read as "no
-// mismatches") without indexing out of bounds rather than crashing; the
-// caller's own size check (run separately, before this is called) is what
-// normally prevents this path, but the sentinel keeps a mismatched pair
-// fail-closed even if that guard were ever skipped.
+// Element count where a[i] != b[i]. A size mismatch returns -1 (not 0 -- the
+// PASS value at the two `== 0` call sites, soa_mismatches/xmx_mismatches,
+// where 0 would have silently read as "no mismatches"; the two `> 0`
+// positive-control sites already treated 0 as FAIL, so they were never at
+// risk) without indexing out of bounds rather than crashing; the caller's
+// own size check (run separately, before this is called) is what normally
+// prevents this path, but the sentinel keeps a mismatched pair fail-closed
+// even if that guard were ever skipped.
 int64_t count_mismatches(const std::vector<float> & a, const std::vector<float> & b) {
     if (a.size() != b.size()) {
         return -1;
@@ -582,6 +584,21 @@ void case_scorer_sanity() {
           "violations=" + std::to_string(mismatch.violations) + " max_rel=" + std::to_string(mismatch.max_rel) +
               " max_abs_diff=" + std::to_string(mismatch.max_abs_diff) +
               " (out.size=" + std::to_string(short_vec.size()) + " ref.size=" + std::to_string(ref.size()) + ")");
+
+    // count_mismatches unit checks, mirroring the scorer's own size-mismatch
+    // test above: a known mismatch count on equal-size vectors (positive
+    // case), and the -1 sentinel on a size mismatch (fail-closed case).
+    std::vector<float> fa               = { 1.0f, 2.0f, 3.0f, 4.0f };
+    std::vector<float> fb               = { 1.0f, 2.5f, 3.0f, 4.5f };  // differs at indices 1 and 3
+    const int64_t      known_mismatches = count_mismatches(fa, fb);
+    check(known_mismatches == 2, "count-mismatches-counts-a-known-mismatch-count",
+          "got=" + std::to_string(known_mismatches));
+
+    std::vector<float> fc                      = { 1.0f, 2.0f };  // shorter than fa
+    const int64_t      count_mismatch_sentinel = count_mismatches(fa, fc);
+    check(count_mismatch_sentinel == -1, "count-mismatches-hard-fails-on-size-mismatch-sentinel",
+          "got=" + std::to_string(count_mismatch_sentinel) + " (a.size=" + std::to_string(fa.size()) +
+              " b.size=" + std::to_string(fc.size()) + ")");
 }
 
 // A hand-checkable GEMM: one MXFP4 block (K=32), weight values chosen from
@@ -675,7 +692,7 @@ void case_reference_gemm_gptoss_shape() {
     // and 512 both being in that set without re-checking it locally. Assert
     // the dependency here so a future edit that drops either value from
     // needs_exact_check fails loudly instead of silently deleting two real
-    // checks (or reading a stale `exact` from a previous loop iteration).
+    // checks.
     GGML_ASSERT(needs_exact_check(32) && needs_exact_check(512));
 
     for (int64_t M : Ms) {
