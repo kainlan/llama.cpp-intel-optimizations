@@ -789,6 +789,21 @@ if (NOT WIN32)
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh
     )
     set_tests_properties(test-bench-guard PROPERTIES SKIP_RETURN_CODE 77)
+
+    # sycl-decode-mode-capture unit tests (plan task S4, llama.cpp-gvu7): the
+    # one-run freq/throttle/RssAnon timeline + kprof capture for the B70
+    # GPT-OSS decode slow mode. Invokes bench-guard.sh (above) as a child for
+    # all host-corruption preflight; this suite exercises only the capture
+    # script itself, against a fake sysfs tree and a fake bench command --
+    # no GPU, safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-decode-mode-capture
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-mode-capture.sh
+    )
+    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES LABELS "sycl;source")
 endif()
 
 if (NOT WIN32)
