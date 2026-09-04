@@ -244,7 +244,8 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     # Named sum_of_sizes, not cumulative: it is a running sum of the per-call
     # vector *sizes* (a triangular series), not a byte-accurate leak count --
     # see the lead's spec-review finding on llama.cpp-i0oh (c-cqpq, F1). The
-    # per-call `preserving %zu` field is the real leak proxy.
+    # per-call `kept=%zu` field is the real leak proxy (renamed from
+    # `preserving %zu` by quality review c-z4cf #5, round-2 fix c-b7j9 #2).
     assert "sum_of_sizes=" in warn_call, "the probe must report a running sum_of_sizes, not just this call's count"
     # Regression guard for the rename itself (llama.cpp-i0oh spec review round
     # 2, nit 3): `cumulative=` must not creep back into the probe block.

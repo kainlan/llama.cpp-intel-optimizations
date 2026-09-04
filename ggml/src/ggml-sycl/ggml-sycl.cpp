@@ -23767,10 +23767,10 @@ struct ggml_backend_sycl_buffer_context {
     // that branch never dereferences `.first` (llama.cpp-dfo0 plan task L2, spec
     // review c-cnko #8; line cite removed per c-z4cf #3, it drifts).
     // ggml_sycl_invalidate_backend_buffer_weights() (reached from buffer_clear()
-    // below) DOES walk this vector and dereference
-    // `.first` -- L2's generation-stamped release shrinks that exposure window (a
-    // stale entry now survives at most one extra reset instead of indefinitely) but
-    // does not remove it.
+    // below) DOES walk this vector and dereference `.first` -- L2's
+    // generation-stamped release shrinks that exposure window (a stale entry
+    // now survives at most one extra reset instead of indefinitely) but does
+    // not remove it.
     std::vector<std::pair<ggml_tensor *, ggml_tensor_extra_gpu *>> tensor_extras;
     // Incremented on every COMPUTE-usage buffer_reset (llama.cpp-dfo0, plan task
     // L2). init_tensor stamps each extra with the generation current when it
@@ -24169,12 +24169,13 @@ static bool ggml_sycl_init_cross_device_control_tensor(ggml_backend_sycl_buffer_
         owner->control_host_allocs.push_back({ control_ptr, size, std::move(control_handle) });
     }
 
-    // Not stamped here: this function is called unconditionally near the top of
-    // ggml_backend_sycl_buffer_init_tensor (before the view check), and control
-    // tensors have view_src == NULL, so execution falls through to that caller's
+    // Not stamped here: this function's one caller (ggml_backend_sycl_buffer_
+    // init_tensor, guarded there by ggml_sycl_tensor_is_cross_device_control())
+    // never returns early and runs before the view check, and control tensors
+    // have view_src == NULL, so execution falls through to that caller's
     // universal "ensure data_device populated" block, which stamps
     // alloc_generation on its reuse path (llama.cpp-dfo0 plan task L2, quality
-    // review c-2d63/c-z4cf #9).
+    // review c-2d63/c-z4cf #9, reworded per round-2 c-b7j9 #3).
     ggml_tensor_extra_gpu * extra = nullptr;
     if (tensor->extra != nullptr) {
         extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);

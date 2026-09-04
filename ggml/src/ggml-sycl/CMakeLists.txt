@@ -2648,10 +2648,11 @@ set_tests_properties(test-sycl-tensor-usage PROPERTIES
 # fixed-size graph 20 times: not in the model-loading OOM-hazard family this
 # repo tracks (test-llama-archs, test-thread-safety, test-backend-ops), so no
 # never-loop caveat applies here. RUN_SERIAL TRUE is still set below, matching
-# every other gpu-serial-labelled GPU test in this file (e.g.
-# test-dmmv-q4-0-coalesced, test-layout-cache) -- one GPU test process at a
-# time on this host, regardless of OOM risk (llama.cpp-dfo0 plan task L2,
-# quality review c-z4cf #2).
+# every other gpu-serial-labelled GPU test in this repo (test-layout-cache,
+# tests/CMakeLists.txt:2242; test-sycl-mmvq-q8-0-soa-numerics,
+# tests/CMakeLists.txt:2307) -- one GPU test process at a time on this host,
+# regardless of OOM risk (llama.cpp-dfo0 plan task L2, quality review
+# c-z4cf #2, round-2 citation fix c-b7j9 #1).
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
