@@ -44,25 +44,88 @@ expect_status() {
 }
 
 # mk_fake_bench: a fake "llama-bench" that prints a canned markdown tg128 row
-# embedding $1 as the t/s figure, then sleeps 2s so the sampler (0.5s
-# cadence) gets several samples. The capture script's pid discovery walks the
-# guard -> timeout -> command process tree by ancestry only (no name/comm
-# match), so this bash-script fixture is found the same way a real
-# llama-bench binary would be, comm quirks and all (a shebang script reports
-# comm="bash" here, not its own basename -- see find_bench_pid's comment in
-# the script). If FAKE_BENCH_PIDFILE is set in the environment (exported by
-# the caller), the script writes its OWN pid ($$) there before sleeping --
-# this is the ground truth the pid-discovery regression check below compares
-# host.txt's recorded bench_pid against.
+# embedding $1 as the t/s figure, then sleeps 2s (an EXTERNAL `sleep`, so this
+# script forks a child partway through its life) so the sampler (0.5s
+# cadence) gets several samples. The capture script's pid discovery is pure
+# structural leaf descent (no name/comm matching at all -- see
+# find_bench_pid's comment in the script), so once this script forks `sleep`
+# the leaf being tracked moves from this script to that child; that's fine
+# for the tests below that only need SOME pid to be resolved (mode/tg128
+# parsing, timeline shape, host.txt shape). It is deliberately NOT used for
+# the pid/RSS regression check further down, which needs the tracked leaf to
+# stay this script's own process throughout -- see mk_fake_bench_grow.
 mk_fake_bench() {
     local tg="$1" path="$T/fakebench.sh"
     cat > "$path" <<EOF
 #!/usr/bin/env bash
-if [ -n "\${FAKE_BENCH_PIDFILE:-}" ]; then echo "\$\$" > "\${FAKE_BENCH_PIDFILE}"; fi
 echo '| model | size | params | backend | ngl | test | t/s |'
 echo '|---|---|---|---|---|---|---|'
 echo "| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | $tg ± 0.31 |"
 sleep 2
+EOF
+    chmod +x "$path"
+    echo "$path"
+}
+
+# mk_fake_bench_grow: like mk_fake_bench, but NEVER forks any subprocess --
+# it grows and holds a large string in its OWN bash memory (a doubling loop,
+# pure `[`/`:`/arithmetic/string-concatenation builtins) instead of calling
+# an external `sleep`, then busy-waits on the builtin $SECONDS variable
+# instead. This is required for the pid/RSS regression check below: leaf
+# descent tracks the CURRENT deepest live descendant, so a fixture that
+# forks anything (mk_fake_bench's own `sleep 2`, for instance) would have the
+# tracked leaf move onto that child partway through, no longer matching this
+# script's own memory or its own pid written to FAKE_BENCH_PIDFILE. Doubling
+# a 1-byte string 24 times reaches 16 MiB almost instantly and holds bash's
+# own RssAnon at tens of MB throughout the busy-wait -- comfortably above the
+# ~1.2 MB a `timeout`/`env`/`sleep` wrapper reports (verified empirically
+# during this fix: peak ~44 MB, no child ever observed via `pgrep -P`).
+mk_fake_bench_grow() {
+    local tg="$1" path="$T/fakebench-grow.sh"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+if [ -n "\${FAKE_BENCH_PIDFILE:-}" ]; then echo "\$\$" > "\${FAKE_BENCH_PIDFILE}"; fi
+s="x"
+i=0
+while [ "\$i" -lt 24 ]; do
+    s="\$s\$s"
+    i=\$((i + 1))
+done
+echo '| model | size | params | backend | ngl | test | t/s |'
+echo '|---|---|---|---|---|---|---|'
+echo "| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | $tg ± 0.31 |"
+end=\$((SECONDS + 2))
+while [ "\$SECONDS" -lt "\$end" ]; do :; done
+EOF
+    chmod +x "$path"
+    echo "$path"
+}
+
+# mk_fake_bench_crash: exits nonzero with no markdown table at all --
+# simulates a bench that crashed before producing results. Used to prove
+# parse_tg128 reports "" (mode=unknown) rather than matching some unrelated
+# line that happens to contain the substring "tg128".
+mk_fake_bench_crash() {
+    local path="$T/fakebench-crash.sh"
+    cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+echo "some crash output, no results table" >&2
+exit 1
+EOF
+    chmod +x "$path"
+    echo "$path"
+}
+
+# mk_fake_bench_nonnumeric: a well-formed markdown tg128 ROW whose t/s cell
+# is garbage ("#") rather than a number -- the crash signature the review
+# found in practice, distinct from mk_fake_bench_crash's "no row at all".
+mk_fake_bench_nonnumeric() {
+    local path="$T/fakebench-nonnumeric.sh"
+    cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+echo '| model | size | params | backend | ngl | test | t/s |'
+echo '|---|---|---|---|---|---|---|'
+echo '| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | # |'
 EOF
     chmod +x "$path"
     echo "$path"
@@ -109,12 +172,6 @@ head -1 "$out_slow/timeline.tsv" | grep -qE '^t_s	act_freq	cur_freq	throttle_sta
 awk -F'\t' 'NR>1 { if ($3 != "-" || $5 != "-") bad=1 } END { exit bad ? 1 : 0 }' "$out_slow/timeline.tsv" \
     || { echo "FAIL: expected '-' placeholder for missing cur_freq/reason_pl2 sysfs files"; fail=1; }
 
-# The bench pid must have been resolved for at least one sample (RssAnon not
-# "-" throughout) -- proves --bench-name pid discovery actually worked, not
-# just that the placeholder path was taken the whole time.
-awk -F'\t' 'NR>1 && $6 != "-" { found=1 } END { exit found ? 0 : 1 }' "$out_slow/timeline.tsv" \
-    || { echo "FAIL: expected at least one resolved RssAnon sample (bench pid never found)"; fail=1; }
-
 # --- host.txt: before/after blocks with the required fields ---
 
 [ -f "$out_slow/host.txt" ] || { echo "FAIL: host.txt missing"; fail=1; }
@@ -127,20 +184,24 @@ grep -q "MemAvailable:" "$out_slow/host.txt" || { echo "FAIL: host.txt missing M
 grep -qE '^bench_pid=[0-9]+ comm=' "$out_slow/host.txt" \
     || { echo "FAIL: host.txt missing a resolved bench_pid=<pid> comm=... audit line (got: $(grep '^bench_pid=' "$out_slow/host.txt" 2>/dev/null))"; fail=1; }
 
-# --- regression: RssAnon must track the ACTUAL bench pid, never a wrapper
-# (llama.cpp-gvu7 review). An earlier version's pid discovery raced ahead of
-# `timeout` forking its child, fell back to the guard's OWN direct child --
-# i.e. `timeout` itself -- froze on that pid for the whole run (never
-# re-resolved), and no existing assertion caught it: "at least one non-'-'
-# RssAnon sample" is trivially true for `timeout`'s ~1.2 MB too. This exports
-# FAKE_BENCH_PIDFILE so the fake bench records its OWN real pid, and checks
-# host.txt's audit line against that ground truth -- a check the old
-# (uncommitted, verified separately on a scratch copy) two-hop-plus-fallback
-# code fails, since it reports timeout's pid instead. ---
+# --- regression: RssAnon must track the ACTUAL bench pid and its ACTUAL
+# memory, never a wrapper (llama.cpp-gvu7 review, two rounds). Two earlier
+# versions' pid discovery each latched onto the wrong process for the whole
+# run and no prior assertion caught either: a fallback to the guard's own
+# direct child froze on `timeout` (reproduced on B70 hardware as a constant
+# ~1.2 MB RssAnon across 77 rows), and a {timeout,env} comm denylist latched
+# onto bench-guard's OWN throttle/tenant poll `sleep` instead. "At least one
+# non-'-' RssAnon sample" is trivially true of any of those wrappers too, so
+# this replaces that control with two checks that are NOT: mk_fake_bench_grow
+# writes its own real pid to FAKE_BENCH_PIDFILE and holds tens of MB of its
+# own memory throughout (see that fixture's comment for why it never forks),
+# so host.txt's audit line must equal that ground-truth pid, AND the
+# timeline's peak RssAnon must clear a threshold no mere wrapper process
+# could reach. ---
 
 out_pid="$T/out-pidcheck"
 mk_tree 0 0; mk_meminfo 3000000
-bench="$(mk_fake_bench 40.0)"
+bench="$(mk_fake_bench_grow 40.0)"
 export FAKE_BENCH_PIDFILE="$T/fake-bench.pid"
 run_capture "$out_pid" -- "$bench" || { echo "FAIL: pid-check run failed"; fail=1; }
 unset FAKE_BENCH_PIDFILE
@@ -148,6 +209,35 @@ unset FAKE_BENCH_PIDFILE
 want_pid="$(cat "$T/fake-bench.pid")"
 grep -q "^bench_pid=$want_pid comm=" "$out_pid/host.txt" \
     || { echo "FAIL: expected bench_pid=$want_pid in host.txt (got: $(grep '^bench_pid=' "$out_pid/host.txt" 2>/dev/null))"; fail=1; }
+
+max_rss="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } END { print max + 0 }' "$out_pid/timeline.tsv")"
+[ "$max_rss" -gt 5000 ] \
+    || { echo "FAIL: expected a sampled RssAnon > 5000 kB (fixture holds tens of MB); got max=$max_rss kB -- RssAnon may be tracking a wrapper, not the bench"; fail=1; }
+
+# --- tg128 parsing must be anchored to an actual markdown table row and
+# validated as numeric (llama.cpp-gvu7 review): a bare substring grep over
+# the whole log also matches bench-guard's own header line (which echoes the
+# wrapped command, including GGML_SYCL_KERNEL_PROFILE_OUTPUT="$OUT/kprof" --
+# an --out dir whose path happens to contain "tg128" puts that word in a
+# non-data line too), and a non-numeric cell must not fall through
+# compute_mode's `v + 0` coercion into a false mode=slow. ---
+
+out_crash="$T/tg128-run1"    # path itself contains "tg128", by design
+mk_tree 0 0; mk_meminfo 3000000
+bench="$(mk_fake_bench_crash)"
+crash_rc=0
+run_capture "$out_crash" -- "$bench" || crash_rc=$?
+[ "$crash_rc" -eq 1 ] || { echo "FAIL: expected the crashed bench's own exit code (1) to propagate, got $crash_rc"; fail=1; }
+[ -f "$out_crash/mode.txt" ] || { echo "FAIL: mode.txt missing for a non-refusal crash"; fail=1; }
+grep -qx "tg128=unknown mode=unknown" "$out_crash/mode.txt" \
+    || { echo "FAIL: expected tg128=unknown mode=unknown for a no-results-table run whose --out path contains 'tg128' (got: $(cat "$out_crash/mode.txt" 2>/dev/null))"; fail=1; }
+
+out_nonnum="$T/out-nonnumeric"
+mk_tree 0 0; mk_meminfo 3000000
+bench="$(mk_fake_bench_nonnumeric)"
+run_capture "$out_nonnum" -- "$bench" || { echo "FAIL: non-numeric-cell run failed"; fail=1; }
+grep -qx "tg128=unknown mode=unknown" "$out_nonnum/mode.txt" 2>/dev/null \
+    || { echo "FAIL: expected tg128=unknown mode=unknown for a non-numeric t/s cell (got: $(cat "$out_nonnum/mode.txt" 2>/dev/null))"; fail=1; }
 
 # --- exit status mirrors the underlying run (0 on a clean run) ---
 

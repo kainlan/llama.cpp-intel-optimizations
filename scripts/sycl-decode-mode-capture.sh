@@ -54,6 +54,10 @@ esac; done
 [ -x "$BENCH_GUARD" ] || { echo "sycl-decode-mode-capture: $BENCH_GUARD not found or not executable" >&2; exit 2; }
 
 mkdir -p "$OUT"
+# host_snapshot (below) APPENDS; truncate once here so re-running a capture
+# into an existing --out dir doesn't accumulate stale before/after blocks
+# and audit lines from a prior run underneath the new ones.
+: > "$OUT/host.txt"
 
 # --- card derivation (mirrors bench-guard.sh; skipped when --sysfs-card is given) ---
 if [ -z "$SYSFS_CARD" ]; then
@@ -106,77 +110,72 @@ host_snapshot() {
     } >> "$OUT/host.txt"
 }
 
-# find_bench_pid: bench-guard.sh runs the wrapped command as its own child
-# under `timeout -k 15 <budget>`, so the bench sits below a `timeout` process
-# that is ITSELF a direct child of the guard. Only ever descends through a
-# direct child of the guard whose comm is literally "timeout" -- every OTHER
-# direct child of the guard is ignored outright, never accepted and never
-# descended into. This is deliberately strict, not merely a name filter on
-# the final candidate: bench-guard.sh is a shell script that runs many of its
-# own external helpers (mktemp, awk, cat, journalctl, pgrep, and -- caught by
-# hardware testing, llama.cpp-gvu7 review -- the `rm -f "$tmp_out"` its own
-# EXIT trap runs right as it finishes) as transient direct children of
-# itself. Those are indistinguishable from the wrapped command by comm alone
-# (none of them is named "timeout" or "env" either), so a filter that simply
-# rejected "timeout"/"env" and accepted anything else, as an earlier version
-# of this function did, would occasionally sample bench-guard's own trap
-# cleanup instead of the bench -- reproduced on hardware as
-# `comm=rm cmdline=rm -f /tmp/tmp.XXXXXX`. Requiring the `timeout` hop first
-# means only the wrapped command's own subtree is ever eligible.
+# find_bench_pid: STRUCTURAL leaf descent -- no comm/name filtering at all.
+# Walks `pgrep -P` from guard_pid down to whatever is CURRENTLY the innermost
+# live descendant and returns that. The wrapped command sits under
+# `timeout -k 15 <budget>`, and `env VAR=1 CMD` execve()s CMD in place (no
+# extra fork), so once that chain has formed its leaf IS the bench -- no
+# special-casing of either wrapper is needed. Returns nothing if guard_pid
+# currently has no descendants.
 #
-# Below the `timeout` hop, `env VAR=1 CMD` execve()s CMD in place (no extra
-# fork) so a compiled binary like llama-bench keeps its own comm at that hop
-# and is accepted immediately; a shebang script (as used by the test
-# fixture) reports comm="bash" here via binfmt_script's interpreter swap,
-# which is also accepted immediately (it is not "env") rather than descending
-# further into whatever the script itself later forks (e.g. a `sleep` child)
-# -- the bench's own top-level process is what RssAnon should track, not its
-# leaf descendant.
-#
-# An earlier version also fell back to returning the guard's own direct
-# child (i.e. "timeout" itself, unresolved further) whenever the first probe
-# raced ahead of timeout forking its child, and then never re-tried, so
-# every RssAnon sample for the whole run read the ~1.2 MB wrapper instead of
-# an 11 GB model process. There is no such fallback here: a `timeout` hop
-# with nothing (yet) beneath it simply yields no candidate this attempt, and
-# the caller re-invokes this function every sampling tick until one appears.
+# Two name-based filters were tried here before this and both failed
+# (llama.cpp-gvu7 review, hardware + hermetic testing):
+#   - accepting the guard's own direct child unconditionally as a fallback
+#     froze on `timeout` itself when the wrapped command hadn't forked yet,
+#     reproduced on B70 hardware as a constant ~1.2 MB RssAnon across a whole
+#     77-row run;
+#   - requiring a literal "timeout" comm before descending (this function's
+#     immediately preceding version) fixed that, but the reviewer then
+#     showed bench-guard's OWN throttle/tenant poll loop forks a `sleep`
+#     directly under the guard while it waits for a busy card -- a denylist
+#     tuned for {timeout, env} does not reject "sleep", nor would it reject
+#     "df"/"awk"/"cat" from bench-guard's other internal pipelines.
+# Comm alone cannot distinguish the wrapped command from bench-guard's own
+# subprocesses, because both are transient children somewhere under
+# guard_pid at one point or another. Leaf descent sidesteps the question:
+# it tracks WHERE the live tree currently bottoms out, and the caller
+# re-derives that every sampling tick (see the re-resolve condition below)
+# rather than trusting one resolution for the rest of the run -- so a
+# transient false latch (e.g. onto bench-guard's own poll `sleep`) corrects
+# itself within one tick once that process exits or grows a child of its
+# own, instead of freezing on it.
 find_bench_pid() {
-    local guard_pid="$1" tpid p c comm depth
-    local -a queue next
-    for tpid in $(pgrep -P "$guard_pid" 2>/dev/null || true); do
-        comm="$(cat "/proc/$tpid/comm" 2>/dev/null || echo "")"
-        [ "$comm" = "timeout" ] || continue
-
-        queue=("$tpid")
-        depth=0
-        while [ "$depth" -lt 5 ] && [ "${#queue[@]}" -gt 0 ]; do
-            next=()
-            for p in "${queue[@]}"; do
-                for c in $(pgrep -P "$p" 2>/dev/null || true); do
-                    comm="$(cat "/proc/$c/comm" 2>/dev/null || echo "")"
-                    case "$comm" in
-                        env) next+=("$c");;
-                        *) echo "$c"; return 0;;
-                    esac
-                done
-            done
-            queue=("${next[@]}")
-            depth=$((depth + 1))
-        done
+    local pid="$1" child
+    while :; do
+        child="$(pgrep -P "$pid" 2>/dev/null | head -1 || true)"
+        [ -n "$child" ] || break
+        pid="$child"
     done
+    if [ "$pid" != "$1" ]; then
+        echo "$pid"
+        return 0
+    fi
     return 1
 }
 
 parse_tg128() {
     local log="$1" line value
     [ -r "$log" ] || { echo ""; return 0; }
-    line="$(grep -F 'tg128' "$log" 2>/dev/null | tail -1 || true)"
+    # Anchor to an actual markdown TABLE ROW (a line beginning with '|' that
+    # has a "tg128" cell) -- a bare substring grep also matches bench-guard's
+    # own header line, which echoes the full wrapped command including
+    # GGML_SYCL_KERNEL_PROFILE_OUTPUT="$OUT/kprof": an --out directory named
+    # e.g. b70-tg128-run1 puts the literal text "tg128" in that non-data
+    # line too (llama.cpp-gvu7 review, reproduced hermetically).
+    line="$(grep -E '^\|.*tg128' "$log" 2>/dev/null | tail -1 || true)"
     [ -n "$line" ] || { echo ""; return 0; }
-    # Markdown table row: take the last non-empty '|'-delimited cell (the t/s
-    # column), which looks like "39.52 ± 0.31".
+    # Take the last non-empty '|'-delimited cell (the t/s column), which
+    # looks like "39.52 ± 0.31".
     value="$(printf '%s\n' "$line" | awk -F'|' '{ for (i=NF; i>=1; i--) { s=$i; gsub(/^[ \t]+|[ \t]+$/, "", s); if (s != "") { print s; exit } } }')"
     [ -n "$value" ] || { echo ""; return 0; }
-    printf '%s\n' "$value" | awk '{print $1}'
+    value="$(printf '%s\n' "$value" | awk '{print $1}')"
+    # Reject anything that is not a plain decimal number. compute_mode feeds
+    # this to awk's `v + 0`, which silently coerces non-numeric garbage (a
+    # crashed bench can leave a cell like "#") to 0 and reports mode=slow --
+    # the exact verdict this capture exists to detect -- so a value that
+    # fails this check must become "" (mode=unknown), never pass through.
+    printf '%s\n' "$value" | grep -qE '^[0-9]+([.][0-9]+)?$' || { echo ""; return 0; }
+    echo "$value"
 }
 
 compute_mode() {
@@ -196,32 +195,74 @@ guard_pid=$!
 : > "$OUT/timeline.tsv"
 printf 't_s\tact_freq\tcur_freq\tthrottle_status\treason_pl2\trss_anon_kb\n' >> "$OUT/timeline.tsv"
 
-bench_pid="" bench_comm="-" bench_cmdline="-"
+bench_pid="" bench_comm="-" bench_cmdline="-" bench_found_deep=0
 start_ts="$(date +%s.%N)"
 while kill -0 "$guard_pid" 2>/dev/null; do
-    # Re-resolve whenever we don't have a live candidate -- not capped at a
-    # fixed attempt count, so a slow-to-fork command is still found later in
-    # the run, and a candidate that exits mid-run (unexpected, but cheap to
-    # handle) triggers a fresh resolution rather than sampling a dead pid.
-    # Bounded only by the guard's own lifetime (the enclosing `while`); a run
-    # that never resolves still proceeds, recording "-" for RssAnon. A failed
-    # RE-resolution attempt (no candidate found THIS tick) deliberately does
-    # NOT clear bench_pid/bench_comm/bench_cmdline: the bench typically dies
-    # of natural causes moments before the guard itself exits (its own
-    # postflight still has to run), and blanking the audit fields at that
-    # point would report "bench_pid=unknown" alongside stale comm/cmdline
-    # from the process that actually ran -- inconsistent and less useful than
-    # keeping the last real resolution on record. RssAnon sampling below
-    # already degrades to "-" on its own once /proc/<pid>/status is gone, so
-    # nothing here causes a dead pid's memory to be misreported.
-    if [ -z "$bench_pid" ] || ! kill -0 "$bench_pid" 2>/dev/null; then
+    # Re-resolve on EVERY tick while the current candidate is not a settled
+    # leaf: empty (never found, or the guard currently has no descendants),
+    # STILL HAS A CHILD of its own (the live tree moved deeper since the
+    # last tick -- e.g. bench-guard's poll `sleep` exited and `timeout`'s
+    # chain has now formed beneath the guard, or the bench itself spawned a
+    # subprocess), or dead. This is what makes a transient false latch (a
+    # brief bench-guard internal helper, or its own throttle/tenant poll
+    # `sleep`) self-correct within one sampling tick instead of freezing for
+    # the run -- there is no attempt cap and no cached "resolved, stop
+    # looking" state. A failed re-resolution attempt (no descendant found
+    # THIS tick) deliberately does NOT clear bench_pid/bench_comm/
+    # bench_cmdline: the bench typically dies of natural causes moments
+    # before the guard itself exits (its own postflight still has to run),
+    # and blanking the audit fields at that point would report
+    # "bench_pid=unknown" alongside stale comm/cmdline from the process that
+    # actually ran -- inconsistent and less useful than keeping the last
+    # real resolution on record. RssAnon sampling below already degrades to
+    # "-" on its own once /proc/<pid>/status is gone, so nothing here causes
+    # a dead pid's memory to be misreported.
+    if [ -z "$bench_pid" ] \
+        || [ -n "$(pgrep -P "$bench_pid" 2>/dev/null | head -1 || true)" ] \
+        || [ ! -r "/proc/$bench_pid/status" ]; then
         new_pid="$(find_bench_pid "$guard_pid" || true)"
         if [ -n "$new_pid" ]; then
-            bench_pid="$new_pid"
-            bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
-            bench_cmdline="$(tr '\0' ' ' < "/proc/$bench_pid/cmdline" 2>/dev/null || true)"
-            bench_cmdline="${bench_cmdline:0:120}"
-            [ -n "$bench_cmdline" ] || bench_cmdline="-"
+            # A SUCCESSFUL resolution can still be the WRONG process: pure
+            # leaf descent finds whatever currently has no children, and
+            # `timeout` briefly satisfies that too, in the narrow window
+            # after the wrapped command exits (and its slot is reaped) but
+            # before `timeout` itself notices and exits -- observed directly
+            # while testing this fix. `timeout` is always a DIRECT child of
+            # the guard (depth 1); the wrapped command is always at least
+            # one hop deeper (depth 2+, since `env VAR=1 CMD` execve()s CMD
+            # in place with no extra hop of its own). So once a resolution
+            # has EVER gone deeper than depth 1, a later resolution landing
+            # back on a direct child of the guard means the real subtree has
+            # emptied out (the bench finished), not that tracking should
+            # regress to the wrapper -- ignore it and keep the last real
+            # (deeper) resolution on record. Before anything has gone deep
+            # yet, a depth-1 candidate is accepted normally (covers a
+            # hypothetical future bench-guard.sh that runs the command
+            # without an intermediate `timeout` layer at all).
+            # Field 4 of /proc/PID/stat is PPID; this assumes comm (field 2,
+            # parenthesised) has no embedded whitespace, true for every comm
+            # this script ever sees (bash, timeout, env, sleep, llama-bench).
+            new_ppid="$(awk '{print $4}' "/proc/$new_pid/stat" 2>/dev/null || true)"
+            if [ "$new_ppid" = "$guard_pid" ] && [ "$bench_found_deep" -eq 1 ]; then
+                :
+            else
+                bench_pid="$new_pid"
+                bench_comm="$(cat "/proc/$bench_pid/comm" 2>/dev/null || echo -)"
+                # -r guards against a shell-level redirection error hitting
+                # stderr when a fast-dying candidate (e.g. a bench that
+                # crashes almost immediately) exits in the gap between
+                # resolution and this read -- `< missing-file` fails before
+                # `tr`'s own `2>/dev/null` can apply, since input
+                # redirection is set up before the command runs.
+                if [ -r "/proc/$bench_pid/cmdline" ]; then
+                    bench_cmdline="$(tr '\0' ' ' < "/proc/$bench_pid/cmdline" 2>/dev/null || true)"
+                else
+                    bench_cmdline=""
+                fi
+                bench_cmdline="${bench_cmdline:0:120}"
+                [ -n "$bench_cmdline" ] || bench_cmdline="-"
+                [ "$new_ppid" = "$guard_pid" ] || bench_found_deep=1
+            fi
         fi
     fi
 
