@@ -271,7 +271,7 @@ def test_mmvq_q4_0_and_kquant_decode_arms_have_named_profile_labels() -> None:
         "mulmat.mmvq.q4_0_coalesced": slice_between(
             mmvq,
             "static void coalesced_mul_mat_vec_q4_0_q8_1_sycl",
-            "static void coalesced_mul_mat_vec_q8_0_q8_1_sycl",
+            "// Q8_0 Warp-Coalesced MMVQ Kernel",
         ),
         "mulmat.mmvq.q4_0_aos": slice_between(
             mmvq,
@@ -292,3 +292,21 @@ def test_mmvq_q4_0_and_kquant_decode_arms_have_named_profile_labels() -> None:
     for label, body in bodies.items():
         assert f'"{label}"' in body, f"{label}: missing profile label"
         assert "ggml_sycl_profile_submit(" in body, f"{label}: launch is not wrapped in ggml_sycl_profile_submit"
+
+
+if __name__ == "__main__":
+    import sys
+
+    failures = 0
+    for fn_name, fn in sorted(list(globals().items())):
+        if fn_name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {fn_name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {fn_name}: {exc}")
+    if failures:
+        print(f"{failures} test(s) failed")
+        sys.exit(1)
+    print("all tests passed")

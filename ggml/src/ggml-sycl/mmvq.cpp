@@ -4631,7 +4631,9 @@ static void mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const int slm_y_ds_size  = blocks_per_row + 1;  // +1 for padding
 
     // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 AOS multirow decode arm --
-    // the dispatched-tg-fast executor for Mistral Q4_0 -- previously dark to
+    // the tg-fast fallback when the weight is not SOA/COALESCED-reordered;
+    // on the 2026-09-04 B50 capture Mistral Q4_0 resolved to the coalesced
+    // arm (llama.cpp-qmwx c-9fme) -- previously dark to
     // GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 AOS sibling below.
     ggml_sycl_profile_label profile_label{};
     profile_label.name                 = "mulmat.mmvq.q4_0_aos";
