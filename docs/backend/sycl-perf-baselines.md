@@ -105,6 +105,56 @@ Each rule below cost a round of discarded measurements.
 
 ---
 
+## 2026-09-04 snapshot — master `2c2570fe3`, driver 26.31 (NOT bench-guard VALID; not gates)
+
+Taken after the llama.cpp-pktr / llama.cpp-6cgq merges, on the rebuilt master in the main
+checkout. **These rows are orientation, not baselines**, and the reason is recorded rather than
+smoothed over: `scripts/bench-guard.sh` refused every run (`REFUSED: Shmem 10506304 kB above
+ceiling 10485760 kB`) because other live sessions held ~9.7 GB of ordinary tmpfs (3.6 GB under
+`/tmp/5onn-focused40`, 1.2 GB `/tmp/research`, 3.2 GB of `/dev/shm/29ds-*` still being
+written) — 20 MB over the ceiling, and not GPU-BO shmem at all. The guard cannot tell tmpfs
+files from TTM backing; until it subtracts tmpfs usage (or the ceiling is revisited) the
+5-process protocol above cannot run on this host while those sessions are live. Runs below
+are raw `llama-bench -p 512 -n 128 -r 2`, throttle `status=0 reason_pl2=0` sampled before and
+after each, no other render-node tenant, ambient load ~17, 1-4 processes per cell (the
+in-process `±` is printed where it is the only spread available).
+
+| model | B70 pp512 / tg128 | B50 pp512 / tg128 | processes |
+|---|---:|---:|---|
+| Mistral 7B Q4_0 | 3224 / 104.6 | 1319 / 46.1 | 1 each |
+| gemma4 E4B Q8_0 (`/Storage/GenAI/models/stock-gemma-4-E4B-it.Q8_0.gguf`) | 2936 ± 88 / 68.5 ± 1.3 | 1648 ± 25 / 34.0 ± 0.2 | 1 each; matches the pktr A/B (67.4 / 33.8 over 2 pairs) |
+| GPT-OSS 20B MXFP4 | 1704, 1778 / 40.1, 39.7 (fast mode) | 874, 865 / 31.8, 31.8 | 2 pairs vs a pre-pktr control: control 1773, 1730 / 38.4, 38.5 and 864, 872 / 31.5, 31.5 — no regression, B70 tg +2-4% |
+
+Mistral Q8_0 (from the pktr round-5 A/B, same code): B70 2309 / 65.2, B50 1130 / 27.2.
+
+Two things this snapshot established that the gate tables above cannot show:
+
+1. **B70 GPT-OSS decode is bimodal** — ~28 tok/s in rare transient windows (2 of 13 master
+   runs, consecutive; also one pre-merge pair) vs 39-40 normally, with the throttle sysfs
+   clean. The documented ~44 B70 GPT-OSS tg floor predates driver 26.31; ~39-40 is what this
+   tree does. Three consecutive runs in one mode before calling either a regression or a
+   recovery (llama.cpp-gvu7).
+2. **pp512 is a ONE-ubatch measurement and hides a prefill collapse past it** — measured the
+   same day, `llama-bench -p 128,512,1024,2048 -n 0 -r 2`, tok/s:
+
+   | card | model | pp128 | pp512 | pp1024 | pp2048 |
+   |---|---|---:|---:|---:|---:|
+   | B70 | Mistral 7B Q4_0 | 1315 | 3320 | 1437 | 1474 |
+   | B70 | gemma4 E4B Q8_0 | 1353 | 3252 | 974 | 1063 |
+   | B70 | GPT-OSS 20B MXFP4 | 532 | 1655 | 878 | 919 |
+   | B50 | Mistral 7B Q4_0 | 469 | 1325 | 862 | 857 |
+   | B50 | gemma4 E4B Q8_0 | 607 | 1629 | 728 | 773 |
+   | B50 | GPT-OSS 20B MXFP4 | 291 | 840 | 580 | 586 |
+
+   `-p 1024 -ub 1024` (one ubatch) runs at 4053 tok/s on the B70, so the GEMMs scale; every
+   ubatch after the first costs ~200 ms of host time, which `perf` attributes 79-81% to
+   `ggml_sycl::onednn_woq::pack_q4_0_aos_to_s4` (a CPU repack of the Q4_0 weights into oneDNN
+   WoQ form, redone per ubatch). Tracked as **llama.cpp-dfo0 (P1)**. Until it lands, any
+   prefill claim must carry a pp1024 or pp2048 point; the long-prompt table planned under
+   llama.cpp-bn5k item 3 (pp2048 / pp8192) is still owed.
+
+---
+
 ## Current baselines — GPT-OSS 20B MXFP4, FA-on
 
 ⚠️ **OWNER RULING 2026-08-25 (llama.cpp-iikr, ticket comment c-mnd7): the
