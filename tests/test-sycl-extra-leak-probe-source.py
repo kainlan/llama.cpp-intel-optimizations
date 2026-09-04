@@ -82,15 +82,50 @@ def matching_brace(text, open_idx):
     raise AssertionError("unbalanced braces")
 
 
+def ws_pattern(needle):
+    """Compile a regex matching `needle` where a line wrap is tolerated at ANY
+    boundary (self-contained copy of test-sycl-q8-dense-layout-rule-source.py's
+    helper, per this fork's one-file-per-gate convention): a reflowed signature
+    (e.g. a future clang-format pass wrapping the parameter list) must not read
+    as "missing definition"."""
+    marked = re.sub(r"([(),*&])", r" \1 ", needle)
+    raw_tokens = marked.split()
+    assert raw_tokens, "empty needle"
+
+    def is_word(tok):
+        return re.fullmatch(r"\w+", tok) is not None
+
+    parts = [re.escape(raw_tokens[0])]
+    for i in range(1, len(raw_tokens)):
+        sep = r"\s+" if is_word(raw_tokens[i - 1]) and is_word(raw_tokens[i]) else r"\s*"
+        parts.append(sep)
+        parts.append(re.escape(raw_tokens[i]))
+    return re.compile("".join(parts))
+
+
+def ws_find(text, needle, start=0):
+    """First match position of `needle` in `text`, boundary-flexible (see
+    ws_pattern). Returns -1 if not found; the returned position is a real
+    offset into the ORIGINAL text."""
+    m = ws_pattern(needle).search(text, start)
+    return m.start() if m else -1
+
+
+def ws_count(text, needle):
+    """Number of boundary-flexible matches of `needle` in `text` (see
+    ws_pattern) -- for a "defined exactly once" style check."""
+    return len(list(ws_pattern(needle).finditer(text)))
+
+
 def function_body(text, signature):
-    idx = text.find(signature)
+    idx = ws_find(text, signature)
     assert idx >= 0, f"missing definition: {signature}"
     open_idx = text.find("{", idx)
     return text[open_idx : matching_brace(text, open_idx) + 1]
 
 
 def test_buffer_reset_defined_exactly_once():
-    assert backend.count(RESET_SIG) == 1, "ggml_backend_sycl_buffer_reset must be defined exactly once"
+    assert ws_count(backend, RESET_SIG) == 1, "ggml_backend_sycl_buffer_reset must be defined exactly once"
 
 
 def test_probe_exists_and_is_env_gated():
@@ -112,7 +147,11 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     assert call_end > warn_idx, "malformed GGML_LOG_WARN( call in buffer_reset"
     warn_call = body[warn_idx:call_end]
     assert PROBE_TAG in warn_call, f"the probe's GGML_LOG_WARN call must include the stable tag {PROBE_TAG}"
-    assert "cumulative=" in warn_call, "the probe must report a cumulative running total, not just this call's count"
+    # Named sum_of_sizes, not cumulative: it is a running sum of the per-call
+    # vector *sizes* (a triangular series), not a byte-accurate leak count --
+    # see the lead's spec-review finding on llama.cpp-i0oh (c-cqpq, F1). The
+    # per-call `preserving %zu` field is the real leak proxy.
+    assert "sum_of_sizes=" in warn_call, "the probe must report a running sum_of_sizes, not just this call's count"
 
 
 def test_probe_is_zero_cost_when_the_env_var_is_unset():

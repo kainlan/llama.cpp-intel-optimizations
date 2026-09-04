@@ -34860,16 +34860,25 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
         // llama.cpp-dfo0 probe: a graph REBUILD (llm_graph_result::reset re-inits the ggml
         // context) mints fresh tensor structs, so init_tensor allocates a new extra per tensor
         // and the ones preserved here become unreachable. Count them so the leak is measurable.
+        // NOTE: llama-bench installs a null log callback unless run with -v, which swallows
+        // this WARN the same as it swallows GGML_LOG_INFO -- pass -v to see these lines there
+        // (llama-cli/llama-completion print WARN at default verbosity, no flag needed).
         static const bool                  leak_probe = [] {
             const char * e = std::getenv("GGML_SYCL_EXTRA_LEAK_PROBE");
             return e != nullptr && e[0] == '1';
         }();
         if (leak_probe && ctx != nullptr) {
+            // preserved_total is a running SUM OF THE PER-CALL VECTOR SIZES, not a count of
+            // distinct leaked extras: the COMPUTE path never clears tensor_extras (the early
+            // return below skips the teardown loop), so `n` grows monotonically and this sum
+            // is a triangular series (~calls^2), not linear in bytes actually leaked. Use `n`
+            // (this call's preserving count) times sizeof for the real per-call leak estimate;
+            // sum_of_sizes is diagnostic context only -- do not compare it against RSS growth.
             static std::atomic<size_t> preserved_total{ 0 };
             const size_t               n     = ctx->tensor_extras.size();
             const size_t               total = preserved_total.fetch_add(n, std::memory_order_relaxed) + n;
             GGML_LOG_WARN(
-                "[EXTRA-LEAK-PROBE] buf=%p preserving %zu extras this call, cumulative=%zu (~%.1f MB @ sizeof=%zu)\n",
+                "[EXTRA-LEAK-PROBE] buf=%p preserving %zu extras this call, sum_of_sizes=%zu (~%.1f MB @ sizeof=%zu)\n",
                 (void *) buffer, n, total, (double) total * sizeof(ggml_tensor_extra_gpu) / (1024.0 * 1024.0),
                 sizeof(ggml_tensor_extra_gpu));
         }
