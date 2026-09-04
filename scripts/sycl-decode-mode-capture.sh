@@ -13,7 +13,14 @@
 #                           same pid resolved on three consecutive ticks -- so
 #                           a transient bench-guard helper (its throttle/
 #                           tenant poll sleep, df, journalctl, ...) is never
-#                           attributed a row, even briefly.
+#                           attributed a row, even briefly. Consequence: a
+#                           wrapped command shorter than ~1.5s is never
+#                           confirmed at all, so its ENTIRE run gets an
+#                           all-"-" bench_pid/rss_anon_kb column (host.txt's
+#                           audit line still names it if resolved, since that
+#                           commit happens independently of row attribution)
+#                           -- acceptable for this script's stated purpose,
+#                           llama-bench decode runs of tens of seconds.
 #   <dir>/host.txt       -- loadavg, ffmpeg tenant count, Shmem, MemAvailable,
 #                           taken once before and once after the run, plus a
 #                           trailing "bench_pid=... comm=... cmdline=..." line
@@ -231,18 +238,27 @@ while kill -0 "$guard_pid" 2>/dev/null; do
     # 0.8s fake journalctl, standing in for the ~10ms a real one measures)
     # showed a genuine ~20% false-confirmation rate (1/5 on a first run,
     # reproduced) -- two 0.5s-spaced samples CAN both land inside an
-    # 0.8s-long process's lifetime purely by phase-alignment luck, so "gone
-    # by the next tick" is not actually true of every short-lived helper.
-    # Three consecutive 0.5s ticks span a full 1.0s; a process cannot be
-    # observed at three points 0.5s apart unless it lives at least 1.0s, so
-    # anything shorter-lived than that -- covering every real helper this
-    # script has ever measured, real or adversarial -- can NEVER pass this
-    # bar, not merely rarely. The bench, which runs for many seconds, is
-    # unaffected either way. Confirmation is temporal, not structural, so
-    # re-resolution is never frozen once a candidate has been confirmed --
-    # the guard's own PREFLIGHT `df` is depth 3 too, and freezing on "seen
-    # something deep once" would let a stale confirmed candidate block
-    # noticing the real bench replace it.
+    # 0.8s-long process's lifetime purely by phase-alignment luck. Three
+    # consecutive 0.5s ticks span a full 1.0s, so a process cannot be
+    # observed at three points 0.5s apart unless it lives at least that
+    # long -- the REAL bound (round-3 review, measured on this fixed
+    # script): an 0.8s helper is excluded 8/8, a 1.4s helper 5/5, but a
+    # 2.5s helper IS confirmed 4/4 (it overwrites the audit line and two
+    # tail timeline rows per run). No practical exposure follows from that:
+    # real `journalctl -k ...` measured 0.01-0.02s and real `df -k -t
+    # tmpfs` measured ~0.00s, two orders of magnitude under the bound. The
+    # bench, which runs for many seconds, is unaffected either way.
+    # Confirmation is temporal, not structural, so re-resolution is never
+    # frozen once a candidate has been confirmed -- the guard's own
+    # PREFLIGHT `df` is depth 3 too, and freezing on "seen something deep
+    # once" would let a stale confirmed candidate block noticing the real
+    # bench replace it. If the >1.4s helper class ever needs closing rather
+    # than bounding: this script sets GGML_SYCL_KERNEL_PROFILE_OUTPUT on
+    # the wrapped command only (see the env call below), and bench-guard's
+    # own helpers inherit its environment without that variable, so
+    # requiring the string in /proc/PID/environ would identify the bench
+    # subtree independently of depth, comm, and timing -- not implemented,
+    # since nothing measured needs it yet.
     new_pid="$(find_bench_pid "$guard_pid" || true)"
     if [ -n "$new_pid" ] && [ "$new_pid" = "$pending_pid" ]; then
         pending_confirms=$((pending_confirms + 1))
@@ -280,9 +296,20 @@ while kill -0 "$guard_pid" 2>/dev/null; do
         # display-layer only: a depth-1 candidate can still be committed to
         # the audit fields (so a run that ends before the real bench ever
         # forms still reports something rather than "unknown"), it is just
-        # never given a timeline row. Field 4 of /proc/PID/stat is PPID;
-        # this assumes comm (field 2, parenthesised) has no embedded
-        # whitespace, true for every comm this script ever sees.
+        # never given a timeline row. This assumes bench-guard.sh keeps
+        # wrapping the command in `timeout` (its own header already pins
+        # `timeout -k 15` as load-bearing); if that ever stops holding, the
+        # bench itself lands at depth 1 and bench_reportable never becomes
+        # 1 -- confirmed by deleting `timeout` from a scratch bench-guard.sh
+        # and re-running (round-3 review): the timeline carries ZERO
+        # attributed rows for the whole capture while host.txt's audit line
+        # still names the real bench correctly. That fails CLOSED (data
+        # loss, an all-"-" timeline with a populated audit line), never
+        # misattribution (a wrong pid/comm on a row), and the two states
+        # remain distinguishable from the output alone. Field 4 of
+        # /proc/PID/stat is PPID; this assumes comm (field 2, parenthesised)
+        # has no embedded whitespace, true for every comm this script ever
+        # sees.
         bench_ppid="$(awk '{print $4}' "/proc/$bench_pid/stat" 2>/dev/null || true)"
         if [ -n "$bench_ppid" ] && [ "$bench_ppid" != "$guard_pid" ]; then
             bench_reportable=1

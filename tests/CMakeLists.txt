@@ -801,9 +801,21 @@ if (NOT WIN32)
         NAME test-sycl-decode-mode-capture
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-mode-capture.sh
-        LABEL "sycl;source"
     )
     set_tests_properties(test-sycl-decode-mode-capture PROPERTIES SKIP_RETURN_CODE 77)
+    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above: LABEL there
+    # is a oneValueArg (:66) parsed from unquoted ${ARGN} (:68), so the
+    # embedded ";" splits into two arguments -- LABEL takes only "sycl" and
+    # "source" silently falls into UNPARSED_ARGUMENTS, which the function
+    # never reads (see :110-113 for the same mechanism explained, in the
+    # comment on why llama_test_pytest's own LABEL had to be made
+    # multi-valued instead). A round-2 nit suggested that form, citing the
+    # multi-label call at :660 as precedent -- but that call is
+    # llama_test_pytest, not llama_test_cmd, and carries the multi-valued
+    # LABEL this function does not (round-3 review, llama.cpp-gvu7). Restored
+    # to the two-call form every other multi-label registration in this file
+    # uses (:385, :400, :421, :441, :817, :830, ...).
+    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES LABELS "sycl;source")
 endif()
 
 if (NOT WIN32)
