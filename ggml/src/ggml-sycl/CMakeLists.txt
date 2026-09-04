@@ -3108,6 +3108,44 @@ set_tests_properties(test-sycl-fattn-xmx-policy PROPERTIES
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
+# D=512 tile decode flash-attention numerics guard (llama.cpp-zwsj / plan Task
+# P3, llama.cpp-ebxw part 2): builds a real GGML_OP_FLASH_ATTN_EXT op at
+# ne01=1 through the public backend API (ggml_backend_sycl_init + graph
+# compute), so it needs no private-fixtures layout-override seam -- unlike
+# test-q8-0-layout-cache-path-mmvq.cpp, this op is not a cached dense weight,
+# so a plain device buffer allocation exercises the real dispatch. Registered
+# in the SHAPE of that file's registration per the task brief: ENVIRONMENT
+# with LD_LIBRARY_PATH + ONEAPI_DEVICE_SELECTOR=level_zero:1, LABELS, TIMEOUT,
+# no PASS_REGULAR_EXPRESSION (the test's own pass/fail line is validated by
+# its exit code, not a log-scraped regex).
+add_executable(test-sycl-fattn-tile-d512-decode
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-fattn-tile-d512-decode.cpp
+)
+target_include_directories(test-sycl-fattn-tile-d512-decode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-fattn-tile-d512-decode PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-fattn-tile-d512-decode PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-fattn-tile-d512-decode PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-fattn-tile-d512-decode PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-fattn-tile-d512-decode PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-fattn-tile-d512-decode COMMAND test-sycl-fattn-tile-d512-decode)
+set_tests_properties(test-sycl-fattn-tile-d512-decode PROPERTIES
+    LABELS "sycl;fattn;tile;d512;decode;numerics;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-kernel-selection
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kernel-selection.cpp
 )
