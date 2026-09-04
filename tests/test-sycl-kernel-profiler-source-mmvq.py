@@ -258,3 +258,37 @@ def test_mmv_id_bench_rejects_down_q8_dpas_tile_rows_to_preserve_output_contract
     assert "if (args.down_q8_dpas_tile_rows != 0)" in mmv_id_body
     assert "mxfp4_down_q8_dpas_tile_sycl" not in mmv_id_body
     assert "/*weights=*/nullptr" not in mmv_id_body
+
+
+def test_mmvq_q4_0_and_kquant_decode_arms_have_named_profile_labels() -> None:
+    mmvq = MMVQ.read_text(encoding="utf-8")
+    bodies = {
+        "mulmat.mmvq.q4_0_soa": slice_between(
+            mmvq,
+            "static void reorder_mul_mat_vec_q4_0_q8_1_sycl",
+            "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
+        ),
+        "mulmat.mmvq.q4_0_coalesced": slice_between(
+            mmvq,
+            "static void coalesced_mul_mat_vec_q4_0_q8_1_sycl",
+            "static void coalesced_mul_mat_vec_q8_0_q8_1_sycl",
+        ),
+        "mulmat.mmvq.q4_0_aos": slice_between(
+            mmvq,
+            "static void mul_mat_vec_q4_0_q8_1_sycl",
+            "// MoE dispatch: Q4_0 with expert routing via ids tensor (GPU-side, no host sync)",
+        ),
+        "mulmat.mmvq.q4_k_soa": slice_between(
+            mmvq,
+            "static void reorder_mul_mat_vec_q4_k_q8_1_sycl",
+            "static void mul_mat_vec_q5_K_q8_1_sycl",
+        ),
+        "mulmat.mmvq.q6_k_soa": slice_between(
+            mmvq,
+            "static void reorder_mul_mat_vec_q6_k_q8_1_sycl",
+            "static void mul_mat_vec_q6_K_q8_1_sycl",
+        ),
+    }
+    for label, body in bodies.items():
+        assert f'"{label}"' in body, f"{label}: missing profile label"
+        assert "ggml_sycl_profile_submit(" in body, f"{label}: launch is not wrapped in ggml_sycl_profile_submit"
