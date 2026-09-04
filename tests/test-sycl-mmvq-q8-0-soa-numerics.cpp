@@ -90,6 +90,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -388,6 +389,13 @@ static void run_shape(ggml_backend_t backend, const char * label, int ncols, int
 }
 
 int main() {
+    // ctest supplies ONEAPI_DEVICE_SELECTOR via the registration's ENVIRONMENT; this is
+    // only a fallback for bare invocation and must be set before the SYCL runtime
+    // enumerates devices (unpinned, the iGPU's 231 GB "VRAM" is claimed -- llama.cpp-403s).
+    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
+        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+    }
+
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
         std::printf("SKIP: no SYCL GPU device available\n");
