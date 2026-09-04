@@ -29,8 +29,10 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -9475,6 +9477,15 @@ static void reorder_mul_mat_vec_mxfp4_q8_1_id_pair_glu_split_sycl_rows(const voi
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch, bool TG1Index>
 struct mxfp4_pair_glu_xmx_tiled_dpas_m2_kernel;
+// llama.cpp-lis9 (plan Task G2): opt-in CU-scaled K-split for the m2 gate/up
+// decode kernel above. TG1Index is deliberately not a parameter here -- the
+// split path is scope-limited to the TG1Index=false (default) launch shape,
+// the one llama.cpp-ulp9 profiled; GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX stays on
+// the unmodified S=1 kernel regardless of GGML_SYCL_MXFP4_GATEUP_KSPLIT (see
+// the ksplit_kernel/gateup_ksplit branch in
+// mxfp4_pair_glu_xmx_tiled_dpas_m2_submit below).
+template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_kernel;
+template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_v2_dpas_m2_kernel;
 template <int Repeat, int GLU_OP, bool Prefetch> struct mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_kernel;
 template <int Repeat, int GLU_OP> struct mxfp4_pair_glu_xmx_tiled_dpas_m4_kernel;
@@ -10269,6 +10280,447 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                     up_group0 += kt_group_stride;
                     gate_group1 += kt_group_stride;
                     up_group1 += kt_group_stride;
+                }
+
+                float * dst_out =
+                    reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
+                                              static_cast<int64_t>(iid1) * dst_nb2);
+#pragma unroll
+                for (int r = 0; r < Repeat; ++r) {
+                    const int row = static_cast<int>(tile_m0) * Repeat + r;
+                    if (row < nrows_per_expert) {
+                        float gate_value = gate_acc0[r];
+                        float up_value   = up_acc0[r];
+                        if (gate_bias) {
+                            gate_value += *(const float *) ((const char *) gate_bias +
+                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                            static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        if (up_bias) {
+                            up_value += *(const float *) ((const char *) up_bias +
+                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                          static_cast<int64_t>(row) * sizeof(float));
+                        }
+                        const float value = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                        block_store<float, 1>(dst_out + row, value);
+                    }
+                }
+                if (have_m1) {
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        const int row = static_cast<int>(tile_m1) * Repeat + r;
+                        if (row < nrows_per_expert) {
+                            float gate_value = gate_acc1[r];
+                            float up_value   = up_acc1[r];
+                            if (gate_bias) {
+                                gate_value += *(const float *) ((const char *) gate_bias +
+                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
+                                                                static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            if (up_bias) {
+                                up_value += *(const float *) ((const char *) up_bias +
+                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
+                                                              static_cast<int64_t>(row) * sizeof(float));
+                            }
+                            const float value =
+                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
+                            block_store<float, 1>(dst_out + row, value);
+                        }
+                    }
+                }
+            });
+        });
+    });
+    // clang-format on
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp-lis9 (plan Task G2, parent llama.cpp-30ak7 lever 2): opt-in
+// CU-scaled K-split for the m2 gate/up decode kernel above.
+// GGML_SYCL_MXFP4_GATEUP_KSPLIT (default 1) selects S; S<=1 keeps the
+// unmodified mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl kernel above completely
+// untouched (see the submit wrapper's early-out) -- this section adds a
+// SEPARATE pair of kernels rather than editing that one in place, so the
+// S=1/B50/default path is guaranteed byte-for-byte the pre-existing
+// behaviour with zero risk from this change.
+//
+// Design: each original launch thread (one per M-tile-pair) becomes S
+// threads, one per K-tile sub-range (mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl
+// below); each writes its partial gate/up sums (pre-bias, pre-GLU -- the GLU
+// nonlinearity is only correct once summed over the FULL K range) to a
+// scratch buffer. A second, tiny reduction kernel
+// (mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl) sums the S partials per
+// tile-pair and applies the bias/GLU epilogue -- deliberately re-derived here
+// rather than factored out of the kernel above, so that kernel's working
+// code is not touched by this change at all (see the note above).
+//
+// llama.cpp-lis9's numerics gate (tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp)
+// requires the SAME profile row name ("mxfp4.gateup.xmx_tiled_dpas_m2") to
+// gain a ";ksplit=<S>" metadata tag rather than routing to a differently
+// named row -- mxfp4_gateup_m2_ksplit_partial_metadata() below reuses the
+// unmodified kernel's exact base metadata string for that reason; only the
+// combine kernel below gets its own distinct profile name, since it has no
+// counterpart in the S=1 path to be compared against.
+static const char * mxfp4_gateup_m2_ksplit_partial_metadata(int ksplit) {
+    // Cached for the process lifetime (ggml_sycl_profile_label::metadata is a
+    // raw `const char *`, not an owning std::string -- sycl-kernel-profiler.hpp
+    // -- so a temporary built per call would dangle once record_event reads it
+    // asynchronously). unordered_map values are node-stable: inserting a new
+    // key never invalidates an existing value's address.
+    static std::mutex                           mtx;
+    static std::unordered_map<int, std::string> cache;
+    std::lock_guard<std::mutex>                 lock(mtx);
+    auto                                        it = cache.find(ksplit);
+    if (it == cache.end()) {
+        it = cache
+                 .emplace(ksplit, std::string("path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;"
+                                              "ksplit=") +
+                                      std::to_string(ksplit))
+                 .first;
+    }
+    return it->second.c_str();
+}
+
+struct mxfp4_moe_gateup_ksplit_scratch {
+    size_t                capacity     = 0;
+    int                   owner_device = -1;
+    ggml_sycl::mem_handle handle;
+};
+
+static thread_local mxfp4_moe_gateup_ksplit_scratch g_mxfp4_moe_gateup_ksplit_scratch;
+
+// Mirrors mxfp4_moe_tg_reuse_get_or_alloc_device_scratch's owner-first
+// unified_allocate pattern above (same alloc_role/runtime_category):
+// SYCL Memory Ownership (CLAUDE.md) forbids sycl::malloc_device /
+// side caches outside the unified-cache allocator, so this reuse cache's
+// mem_handle is the allocation's sole owner for as long as it is kept.
+static float * mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(sycl::queue * stream, int device, size_t required_floats) {
+    const size_t required_bytes = required_floats * sizeof(float);
+    if (required_bytes == 0) {
+        return nullptr;
+    }
+    auto & cache = g_mxfp4_moe_gateup_ksplit_scratch;
+    if (cache.handle.valid() && cache.capacity >= required_bytes && cache.owner_device == device) {
+        auto resolved = cache.handle.resolve(device);
+        return resolved ? reinterpret_cast<float *>(resolved.ptr) : nullptr;
+    }
+    cache.handle       = {};
+    cache.capacity     = 0;
+    cache.owner_device = -1;
+
+    ggml_sycl::alloc_request req{};
+    req.queue                          = stream;
+    req.device                         = device;
+    req.size                           = required_bytes;
+    req.intent.role                    = ggml_sycl::alloc_role::EXPERT_STAGING;
+    req.intent.category                = ggml_sycl::runtime_category::STAGING;
+    req.intent.constraints.must_device = true;
+    cache.handle                       = ggml_sycl::unified_allocate(req);
+    if (!cache.handle.valid()) {
+        cache.handle = {};
+        return nullptr;
+    }
+    auto resolved = cache.handle.resolve(device);
+    if (!resolved || !resolved.ptr || !resolved.on_device) {
+        cache.handle = {};
+        return nullptr;
+    }
+    cache.capacity     = cache.handle.size();
+    cache.owner_device = cache.handle.device();
+    return reinterpret_cast<float *>(resolved.ptr);
+}
+
+// Partial-sum pass: launches tiles*ksplit threads (tiles = the S=1 kernel's
+// own launch size). Each thread reduces one contiguous K-tile sub-range
+// ([kt_start, kt_end), a near-equal partition of [0, k_tiles) -- k_tiles need
+// not be a multiple of ksplit, e.g. GPT-OSS's 90/4 = 22 remainder 2, so the
+// first `k_tiles % ksplit` parts get one extra tile) and writes its raw
+// gate/up sums (gate_acc0, up_acc0, gate_acc1, up_acc1 -- 4*Repeat floats, no
+// bias, no GLU) to `partial`. Structurally identical to
+// mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl above up through the K loop; only the
+// loop bounds/pointer offsets and the tail (write partials instead of
+// apply-epilogue-and-store) differ.
+template <int Repeat, int GLU_OP, bool Prefetch>
+static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl(sycl::queue &        queue,
+                                                                const void * const * gate_ptrs,
+                                                                const void * const * up_ptrs,
+                                                                const int8_t *       b_packed,
+                                                                const float *        y_scales,
+                                                                const int32_t *      ids,
+                                                                int                  ncols,
+                                                                int                  nrows_per_expert,
+                                                                int                  total_batches,
+                                                                int                  n_tokens,
+                                                                int64_t              ids_nb0,
+                                                                int64_t              ids_nb1,
+                                                                int                  tile_n_total,
+                                                                int                  ksplit,
+                                                                float *              partial,
+                                                                const sycl::event &  pack_event) {
+    constexpr int exec_n            = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per             = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an                = Repeat * k_per;
+    constexpr int bn                = k_per * exec_n;
+    constexpr int partials_per_tile = 4 * Repeat;
+
+    const int64_t m_tiles      = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs = (m_tiles + 1) / 2;
+    const int64_t k_tiles      = ncols / k_per;
+    const int64_t tiles        = static_cast<int64_t>(total_batches) * m_tile_pairs;
+    const int64_t launch_size  = tiles * static_cast<int64_t>(ksplit);
+
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", mxfp4_gateup_m2_ksplit_partial_metadata(ksplit));
+    // clang-format off
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
+        h.depends_on(pack_event);
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_kernel<Repeat, GLU_OP, Prefetch>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(launch_size)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t global_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t tile_idx   = global_idx / ksplit;
+                const int     k_part     = static_cast<int>(global_idx - tile_idx * static_cast<int64_t>(ksplit));
+                const int64_t group      = tile_idx / m_tile_pairs;
+                const int64_t pair_m     = tile_idx - group * m_tile_pairs;
+                const int64_t tile_m0    = pair_m * 2;
+                const int64_t tile_m1    = tile_m0 + 1;
+                const bool    have_m1    = tile_m1 < m_tiles;
+                const int     id         = static_cast<int>(group / n_tokens);
+                const int     iid1       = static_cast<int>(group - static_cast<int64_t>(id) * n_tokens);
+                const int32_t expert_id =
+                    ids ? *(const int32_t *) ((const char *) ids + static_cast<int64_t>(iid1) * ids_nb1 +
+                                              static_cast<int64_t>(id) * ids_nb0) :
+                          static_cast<int32_t>(group);
+
+                float * out = partial + tile_idx * static_cast<int64_t>(ksplit * partials_per_tile) +
+                             static_cast<int64_t>(k_part) * partials_per_tile;
+
+                const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
+                const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
+                if (!gate_base || !up_base) {
+                    // Matches the unmodified kernel's early-return (leaves
+                    // dst_out untouched) -- the combine kernel below redoes
+                    // this exact check and returns without writing dst_out
+                    // when it fires, so the zeros written here are never read.
+#pragma unroll
+                    for (int i = 0; i < partials_per_tile; ++i) {
+                        out[i] = 0.0f;
+                    }
+                    return;
+                }
+
+                const int64_t n_tile_groups_n = (nrows_per_expert + tile_n_total - 1) / tile_n_total;
+                const int64_t group_bytes     = tile_n_total * (1 + k_per / 2);
+                const int64_t kt_group_stride = n_tile_groups_n * group_bytes;
+
+                const int64_t xmx_row_start0    = tile_m0 * Repeat;
+                const int64_t xmx_group_n0      = xmx_row_start0 / tile_n_total;
+                const int64_t xmx_row_in_group0 = xmx_row_start0 - xmx_group_n0 * tile_n_total;
+                const int64_t xmx_row_start1    = tile_m1 * Repeat;
+                const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
+                const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
+
+                // Near-equal contiguous partition of [0, k_tiles) into
+                // `ksplit` parts; the first (k_tiles % ksplit) parts absorb
+                // the remainder tile.
+                const int64_t k_tiles_base = k_tiles / static_cast<int64_t>(ksplit);
+                const int64_t k_tiles_rem  = k_tiles % static_cast<int64_t>(ksplit);
+                const int64_t kt_start =
+                    static_cast<int64_t>(k_part) * k_tiles_base +
+                    (static_cast<int64_t>(k_part) < k_tiles_rem ? static_cast<int64_t>(k_part) : k_tiles_rem);
+                const int64_t kt_count = k_tiles_base + (static_cast<int64_t>(k_part) < k_tiles_rem ? 1 : 0);
+                const int64_t kt_end   = kt_start + kt_count;
+
+                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes + kt_start * kt_group_stride;
+                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes + kt_start * kt_group_stride;
+                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes + kt_start * kt_group_stride;
+                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes + kt_start * kt_group_stride;
+                const int8_t *  b_ptr       = b_packed + (group * k_tiles + kt_start) * bn;
+
+                simd<float, Repeat> gate_acc0 = 0.0f;
+                simd<float, Repeat> up_acc0   = 0.0f;
+                simd<float, Repeat> gate_acc1 = 0.0f;
+                simd<float, Repeat> up_acc1   = 0.0f;
+                for (int64_t kt = kt_start; kt < kt_end; ++kt) {
+                    if constexpr (Prefetch) {
+                        constexpr int prefetch_distance = 10;
+                        const int64_t kt_prefetch       = kt + prefetch_distance;
+                        if (kt_prefetch < kt_end) {
+                            const uint8_t * gate_prefetch0 = gate_group0 + prefetch_distance * kt_group_stride;
+                            const uint8_t * up_prefetch0   = up_group0 + prefetch_distance * kt_group_stride;
+                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch0, tile_n_total, xmx_row_in_group0);
+                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch0, tile_n_total, xmx_row_in_group0);
+                            if (have_m1) {
+                                const uint8_t * gate_prefetch1 = gate_group1 + prefetch_distance * kt_group_stride;
+                                const uint8_t * up_prefetch1   = up_group1 + prefetch_distance * kt_group_stride;
+                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch1, tile_n_total,
+                                                                         xmx_row_in_group1);
+                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch1, tile_n_total, xmx_row_in_group1);
+                            }
+                            mxfp4_xmx_tiled_prefetch_bytes<bn>(
+                                reinterpret_cast<const uint8_t *>(b_ptr + prefetch_distance * bn));
+                            mxfp4_xmx_tiled_prefetch_line(reinterpret_cast<const uint8_t *>(
+                                y_scales + ((group * k_tiles + kt_prefetch) * exec_n)));
+                        }
+                    }
+
+                    simd<int8_t, bn> b_vec   = block_load<int8_t, bn>(b_ptr);
+                    simd<float, 1>   y_scale = block_load<float, 1>(y_scales + (group * k_tiles + kt) * exec_n);
+
+                    simd<int8_t, an>    gate_a_vec0;
+                    simd<int8_t, an>    up_a_vec0;
+                    simd<float, Repeat> gate_w_scale0;
+                    simd<float, Repeat> up_w_scale0;
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
+                                                                  gate_a_vec0, gate_w_scale0);
+                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
+                                                                  up_w_scale0);
+
+                    simd<int, Repeat * exec_n> gate_part0 = 0;
+                    simd<int, Repeat * exec_n> up_part0   = 0;
+                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
+                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
+#pragma unroll
+                    for (int r = 0; r < Repeat; ++r) {
+                        simd<int, 1>   gate_i = gate_part0.template select<1, 1>(r * exec_n);
+                        simd<int, 1>   up_i   = up_part0.template select<1, 1>(r * exec_n);
+                        simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale0[r]);
+                        simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale0[r]);
+                        gate_acc0[r] += gate_f[0];
+                        up_acc0[r] += up_f[0];
+                    }
+
+                    if (have_m1) {
+                        simd<int8_t, an>    gate_a_vec1;
+                        simd<int8_t, an>    up_a_vec1;
+                        simd<float, Repeat> gate_w_scale1;
+                        simd<float, Repeat> up_w_scale1;
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
+                                                                      gate_a_vec1, gate_w_scale1);
+                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
+                                                                      up_a_vec1, up_w_scale1);
+
+                        simd<int, Repeat * exec_n> gate_part1 = 0;
+                        simd<int, Repeat * exec_n> up_part1   = 0;
+                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
+                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
+#pragma unroll
+                        for (int r = 0; r < Repeat; ++r) {
+                            simd<int, 1>   gate_i = gate_part1.template select<1, 1>(r * exec_n);
+                            simd<int, 1>   up_i   = up_part1.template select<1, 1>(r * exec_n);
+                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale1[r]);
+                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale1[r]);
+                            gate_acc1[r] += gate_f[0];
+                            up_acc1[r] += up_f[0];
+                        }
+                    }
+
+                    b_ptr += bn;
+                    gate_group0 += kt_group_stride;
+                    up_group0 += kt_group_stride;
+                    gate_group1 += kt_group_stride;
+                    up_group1 += kt_group_stride;
+                }
+
+#pragma unroll
+                for (int r = 0; r < Repeat; ++r) {
+                    out[r]              = gate_acc0[r];
+                    out[Repeat + r]     = up_acc0[r];
+                    out[2 * Repeat + r] = gate_acc1[r];
+                    out[3 * Repeat + r] = up_acc1[r];
+                }
+            });
+        });
+    });
+    // clang-format on
+}
+
+// Combine pass: launches `tiles` threads (one per M-tile-pair, same geometry
+// as the S=1 kernel's own launch) that sum each tile-pair's `ksplit`
+// partials and apply the bias/GLU epilogue -- the SAME math, in the SAME
+// order (partials summed BEFORE bias/GLU), as the unmodified kernel's own
+// tail above.
+template <int Repeat, int GLU_OP>
+static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl(sycl::queue &        queue,
+                                                                 const void * const * gate_ptrs,
+                                                                 const void * const * up_ptrs,
+                                                                 const float *        partial,
+                                                                 float *              dst_glu,
+                                                                 const int32_t *      ids,
+                                                                 const float *        gate_bias,
+                                                                 const float *        up_bias,
+                                                                 int                  nrows_per_expert,
+                                                                 int                  total_batches,
+                                                                 int                  n_tokens,
+                                                                 int64_t              ids_nb0,
+                                                                 int64_t              ids_nb1,
+                                                                 int64_t              dst_nb1,
+                                                                 int64_t              dst_nb2,
+                                                                 int64_t              gate_bias_nb1,
+                                                                 int64_t              up_bias_nb1,
+                                                                 float                alpha,
+                                                                 float                limit,
+                                                                 int                  ksplit,
+                                                                 const sycl::event &  partial_event) {
+    const int64_t m_tiles           = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs      = (m_tiles + 1) / 2;
+    const int64_t tiles             = static_cast<int64_t>(total_batches) * m_tile_pairs;
+    constexpr int partials_per_tile = 4 * Repeat;
+
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2_ksplit_combine",
+                           "path=packed-q8-m2;role=gateup;phase=combine;tiles=static;total_batches=runtime");
+    // clang-format off
+    return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & h) {
+        h.depends_on(partial_event);
+        h.parallel_for<mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_kernel<Repeat, GLU_OP>>(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(tiles)), sycl::range<1>(1)),
+            [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                using namespace sycl::ext::intel::esimd;
+                const int64_t tile_idx = static_cast<int64_t>(item.get_global_id(0));
+                const int64_t group    = tile_idx / m_tile_pairs;
+                const int64_t pair_m   = tile_idx - group * m_tile_pairs;
+                const int64_t tile_m0  = pair_m * 2;
+                const int64_t tile_m1  = tile_m0 + 1;
+                const bool    have_m1  = tile_m1 < m_tiles;
+                const int     id       = static_cast<int>(group / n_tokens);
+                const int     iid1     = static_cast<int>(group - static_cast<int64_t>(id) * n_tokens);
+                const int32_t expert_id =
+                    ids ? *(const int32_t *) ((const char *) ids + static_cast<int64_t>(iid1) * ids_nb1 +
+                                              static_cast<int64_t>(id) * ids_nb0) :
+                          static_cast<int32_t>(group);
+
+                const void * gate_base = gate_ptrs[expert_id];
+                const void * up_base   = up_ptrs[expert_id];
+                if (!gate_base || !up_base) {
+                    // Matches the partial kernel's own early-return: dst_out
+                    // stays untouched for this tile, exactly as the S=1
+                    // kernel leaves it.
+                    return;
+                }
+
+                simd<float, Repeat> gate_acc0 = 0.0f;
+                simd<float, Repeat> up_acc0   = 0.0f;
+                simd<float, Repeat> gate_acc1 = 0.0f;
+                simd<float, Repeat> up_acc1   = 0.0f;
+                const float * part_base = partial + tile_idx * static_cast<int64_t>(ksplit * partials_per_tile);
+#pragma unroll
+                for (int k_part = 0; k_part < 4; ++k_part) {
+                    if (k_part >= ksplit) {
+                        break;
+                    }
+                    const float *       p_base  = part_base + static_cast<int64_t>(k_part) * partials_per_tile;
+                    simd<float, Repeat> p_gate0 = block_load<float, Repeat>(p_base);
+                    simd<float, Repeat> p_up0   = block_load<float, Repeat>(p_base + Repeat);
+                    simd<float, Repeat> p_gate1 = block_load<float, Repeat>(p_base + 2 * Repeat);
+                    simd<float, Repeat> p_up1   = block_load<float, Repeat>(p_base + 3 * Repeat);
+                    gate_acc0 += p_gate0;
+                    up_acc0 += p_up0;
+                    gate_acc1 += p_gate1;
+                    up_acc1 += p_up1;
                 }
 
                 float * dst_out =
@@ -14782,6 +15234,76 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_submit(sycl::queue &        que
         tile_n_total, pack_event);
 }
 
+// llama.cpp-lis9 (plan Task G2): the ksplit>1 dispatch for
+// mxfp4_pair_glu_xmx_tiled_dpas_m2_submit below. Scratch failure (allocator
+// refusal / out of budget) falls back to the unmodified S=1 kernel rather
+// than losing the dispatch outright.
+template <int Repeat, bool Prefetch>
+static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit(sycl::queue &        queue,
+                                                                  const void * const * gate_ptrs,
+                                                                  const void * const * up_ptrs,
+                                                                  const int8_t *       b_packed,
+                                                                  const float *        y_scales,
+                                                                  float *              dst_glu,
+                                                                  const int32_t *      ids,
+                                                                  const float *        gate_bias,
+                                                                  const float *        up_bias,
+                                                                  int                  ncols,
+                                                                  int                  nrows_per_expert,
+                                                                  int                  total_batches,
+                                                                  int                  n_tokens,
+                                                                  int64_t              ids_nb0,
+                                                                  int64_t              ids_nb1,
+                                                                  int64_t              dst_nb1,
+                                                                  int64_t              dst_nb2,
+                                                                  int64_t              gate_bias_nb1,
+                                                                  int64_t              up_bias_nb1,
+                                                                  int                  glu_op,
+                                                                  float                alpha,
+                                                                  float                limit,
+                                                                  int                  tile_n_total,
+                                                                  int                  ksplit,
+                                                                  int                  device,
+                                                                  const sycl::event &  pack_event) {
+    const int64_t m_tiles           = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
+    const int64_t m_tile_pairs      = (m_tiles + 1) / 2;
+    const int64_t tiles             = static_cast<int64_t>(total_batches) * m_tile_pairs;
+    constexpr int partials_per_tile = 4 * Repeat;
+    const size_t  required_floats =
+        static_cast<size_t>(tiles) * static_cast<size_t>(ksplit) * static_cast<size_t>(partials_per_tile);
+
+    float * partial = mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(&queue, device, required_floats);
+    if (!partial) {
+        if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+            return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch, false>(
+                queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols,
+                nrows_per_expert, total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1,
+                up_bias_nb1, alpha, limit, tile_n_total, pack_event);
+        }
+        return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch, false>(
+            queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols, nrows_per_expert,
+            total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit,
+            tile_n_total, pack_event);
+    }
+
+    sycl::event partial_event;
+    if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+        partial_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch>(
+            queue, gate_ptrs, up_ptrs, b_packed, y_scales, ids, ncols, nrows_per_expert, total_batches, n_tokens,
+            ids_nb0, ids_nb1, tile_n_total, ksplit, partial, pack_event);
+        return mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
+            queue, gate_ptrs, up_ptrs, partial, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches,
+            n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, ksplit,
+            partial_event);
+    }
+    partial_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch>(
+        queue, gate_ptrs, up_ptrs, b_packed, y_scales, ids, ncols, nrows_per_expert, total_batches, n_tokens, ids_nb0,
+        ids_nb1, tile_n_total, ksplit, partial, pack_event);
+    return mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
+        queue, gate_ptrs, up_ptrs, partial, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches, n_tokens,
+        ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, ksplit, partial_event);
+}
+
 template <int Repeat, bool Prefetch = false>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        queue,
                                                            const void * const * gate_ptrs,
@@ -14807,6 +15329,22 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        
                                                            float                limit,
                                                            int                  tile_n_total,
                                                            const sycl::event &  pack_event) {
+    // llama.cpp-lis9 (plan Task G2): the TG1Index=true path (n_tokens==1
+    // under GGML_SYCL_MOE_GATEUP_M2_TG1_INDEX) is out of scope for the
+    // K-split -- see mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_kernel's
+    // forward-declaration comment above -- so ksplit is only consulted when
+    // that path is NOT taken; S=1 (the default) always falls through to the
+    // unmodified kernel below regardless.
+    if (!(mxfp4_moe_gateup_m2_tg1_index_enabled() && n_tokens == 1)) {
+        const int device = ggml_sycl_get_device_id_from_queue(queue);
+        const int ksplit = ggml_sycl_mxfp4_gateup_ksplit(device);
+        if (ksplit > 1) {
+            return mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit<Repeat, Prefetch>(
+                queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols,
+                nrows_per_expert, total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1,
+                up_bias_nb1, glu_op, alpha, limit, tile_n_total, ksplit, device, pack_event);
+        }
+    }
     if (mxfp4_moe_gateup_m2_tg1_index_enabled() && n_tokens == 1) {
         if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
             return mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch, true>(

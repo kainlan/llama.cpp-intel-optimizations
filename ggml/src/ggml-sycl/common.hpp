@@ -887,6 +887,21 @@ int ggml_sycl_get_device_id_from_queue(sycl::queue & queue);
 // one of ours, so only value equality -- not a queue lookup -- is available).
 int ggml_sycl_get_device_id_from_device(const sycl::device & dev);
 
+// GGML_SYCL_MXFP4_GATEUP_KSPLIT: split the gate/up decode DPAS kernel's K
+// reduction (mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl, mmvq.cpp) across S
+// work-items per M-tile-pair, combined by a second small reduction kernel,
+// to raise occupancy on high-CU cards (llama.cpp-30ak7 lever 2,
+// llama.cpp-lis9; llama.cpp-ulp9 found the B70 launch flat from k=1 to k=8
+// experts, elbow between k=8 and k=16). Default 1 = today's single-thread-
+// per-tile-pair behaviour, byte-for-byte unchanged (no combine kernel runs,
+// no scratch is allocated). "auto" = clamp(compute_units / 128, 1, 4); a
+// 128-CU card (the B50) resolves to exactly 1, so the unmodified path is
+// also what "auto" selects there -- llama.cpp-ulp9 found the B50 launch
+// already near its own occupancy elbow, so splitting it further would only
+// add combine overhead. Explicit integer values are clamped into [1, 4],
+// the only range the kernel's K-tile partition (mmvq.cpp) is exercised at.
+int ggml_sycl_mxfp4_gateup_ksplit(int device);
+
 inline dpct::err0 ggml_sycl_set_device(const int device) try {
     int current_device_id;
     SYCL_CHECK(CHECK_TRY_ERROR(current_device_id = get_current_device_id()));

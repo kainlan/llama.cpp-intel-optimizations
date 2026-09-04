@@ -938,6 +938,79 @@ bool gpu_has_xmx(sycl::device & dev) {
     return dev.has(sycl::aspect::ext_intel_matrix);
 }
 
+namespace {
+
+enum class mxfp4_gateup_ksplit_mode { EXPLICIT, AUTO };
+
+struct mxfp4_gateup_ksplit_config {
+    mxfp4_gateup_ksplit_mode mode           = mxfp4_gateup_ksplit_mode::EXPLICIT;
+    int                      explicit_value = 1;
+};
+
+// Read once per process (llama.cpp-lis9, plan Task G2): every other
+// GGML_SYCL_* accessor in this fork follows this same
+// static-const-immediately-invoked-lambda idiom (e.g.
+// mxfp4_moe_gateup_m2_tg1_index_enabled, mmvq.cpp), and the numerics test
+// for this accessor (tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp)
+// relies on that: it forks a fresh process per S value specifically because
+// a second setenv() within one process would be silently ignored here.
+mxfp4_gateup_ksplit_config mxfp4_gateup_ksplit_parse_env() {
+    mxfp4_gateup_ksplit_config cfg;
+    const char *               env = std::getenv("GGML_SYCL_MXFP4_GATEUP_KSPLIT");
+    if (!env || env[0] == '\0') {
+        return cfg;
+    }
+    if (std::strcmp(env, "auto") == 0) {
+        cfg.mode = mxfp4_gateup_ksplit_mode::AUTO;
+        return cfg;
+    }
+    char *     end    = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0') {
+        fprintf(stderr,
+                "[SYCL] unknown GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s (expected \"auto\" or an integer), falling "
+                "back to 1\n",
+                env);
+        return cfg;
+    }
+    cfg.explicit_value = static_cast<int>(parsed);
+    return cfg;
+}
+
+int clamp_ksplit(int value) {
+    if (value < 1) {
+        return 1;
+    }
+    if (value > 4) {
+        return 4;
+    }
+    return value;
+}
+
+}  // namespace
+
+int ggml_sycl_mxfp4_gateup_ksplit(int device) {
+    static const mxfp4_gateup_ksplit_config cfg = mxfp4_gateup_ksplit_parse_env();
+
+    if (cfg.mode == mxfp4_gateup_ksplit_mode::EXPLICIT) {
+        return clamp_ksplit(cfg.explicit_value);
+    }
+
+    // "auto": clamp(compute_units / 128, 1, 4). A 128-CU card (the B50)
+    // resolves to compute_units/128 == 1 exactly, so this formula alone
+    // -- with no separate compute_units <= 128 special case -- already gives
+    // S=1 there; a query failure (device out of range, or the capability
+    // query itself failing at common.cpp's query_xmx_capabilities) defaults
+    // compute_units to 0, which also resolves to S=1, the safe unmodified
+    // path.
+    uint32_t compute_units = 0;
+    if (device >= 0 && device < ggml_sycl_info().device_count) {
+        compute_units = ggml_sycl_info().devices[device].xmx_caps.compute_units;
+    }
+    const int scaled = compute_units > 0 ? static_cast<int>(compute_units / 128) : 1;
+    return clamp_ksplit(scaled);
+}
+
 XMXCapabilities query_xmx_capabilities(sycl::device & dev) {
     XMXCapabilities caps;
 
