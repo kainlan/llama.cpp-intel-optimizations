@@ -292,6 +292,7 @@ def test_mmvq_q4_0_and_kquant_decode_arms_have_named_profile_labels() -> None:
     for label, body in bodies.items():
         assert f'"{label}"' in body, f"{label}: missing profile label"
         assert "ggml_sycl_profile_submit(" in body, f"{label}: launch is not wrapped in ggml_sycl_profile_submit"
+        assert "stream->submit(" not in body, f"{label}: a bare stream->submit() remains"
 
 
 if __name__ == "__main__":
