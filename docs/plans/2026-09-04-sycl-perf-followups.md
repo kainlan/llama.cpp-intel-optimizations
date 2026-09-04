@@ -801,7 +801,7 @@ Option C (owner ruling 2026-08-23) is a large-N MXFP4 GEMM reading the stored SO
 
 - [ ] `decode_soa_mxfp4(const uint8_t * buf, int64_t nrows, int64_t ncols) -> std::vector<float>` and `decode_xmx_tiled_mxfp4(const uint8_t * buf, int64_t nrows, int64_t ncols, int tile_n_total) -> std::vector<float>` produce identical matrices for a weight tensor materialized both ways by the existing converters (`reorder_mxfp4_to_xmx_tiled` in `moe-tile-convert.cpp` and the SOA reorder in `convert.cpp`), tested on a random MXFP4 tensor built with `ggml_quantize_chunk`. The converters are SYCL device kernels, so this host test constructs both layouts itself from the documented formulas (`quants.hpp:190-211` for SOA; `moe-xmx-fused.hpp:118-153` and the inverse map at `convert.cpp:2111-2146` for XMX_TILED) and uses `dequantize_row_mxfp4` on the AOS source as the third, independent decode — all three matrices must be identical.
 - [ ] `reference_gemm(X, W_decoded, M, N, K, act = {f16 | q8_1})` returns doubles; a deterministic seed; runtime under 10 s for M=512 (use OpenMP-free plain loops; 512×2880×2880 = 4.2 GFLOP in double is ~4 s).
-- [ ] Tolerance contract documented in the header: the existing oneDNN WOQ 2-D arm passes `tests/test-sycl-mxfp4-woq-gemm-bench.cpp`'s max_rel ≤ 0.0258; the oracle exposes `max_rel_violations(out, ref, 0.0258)` as the shared scorer every later task calls.
+- [ ] Tolerance contract documented in the header: the 0.0258 max_rel bound is the sr83 hardware verdict recorded at `ggml/src/ggml-sycl/gemm.hpp:1324` (echoed at `ggml-sycl.cpp:75996` and in `docs/backend/sycl-env-vars.md`; the woq bench file itself uses abs 0.01 / rel 0.02 OR-ed); the oracle exposes `max_rel_violations(out, ref, 0.0258, abs_floor = 0.01)` — a violation only when `rel > tol && abs > abs_floor`, because an fp32 device epilogue against a double reference carries ~1e-6 absolute error that is a large relative error on near-zero cells — as the shared scorer every later task calls; a size mismatch between `out` and `ref` is a hard failure, never scored over the overlap.
 - [ ] Registered and green: `ctest -R '^test-sycl-mxfp4-stored-layout-gemm-oracle$'`.
 
 **Implementation Guide:** RED = the cross-decoder equality test (fails until both decoders exist); GREEN = the two decoders and the reference GEMM. Copy the E8M0 scale decode (`2^(e-127)`) and the FP4 e2m1 value table from `ggml-common.h`'s `kvalues_mxfp4` — do not hand-type the table.
@@ -832,7 +832,7 @@ git commit -m "test(sycl): host oracle for MXFP4 GEMMs on the stored SOA/XMX_TIL
 
 **Acceptance Criteria:**
 
-- [ ] Numerics: 0 violations at max_rel 0.0258 vs the G3 oracle for the four M values, both cards (lead runs).
+- [ ] Numerics: 0 violations from the G3 scorer (rel 0.0258 with the 0.01 absolute floor) vs the G3 oracle for the four M values, both cards (lead runs).
 - [ ] Bandwidth: at M=8 the kernel reads each expert's bytes once; profile row `mxfp4.stored_gemm.soa` shows ≥ 50% of peak on the B50 (the decode kernel's own level).
 - [ ] No production dispatch touched; `ggml-sycl.cpp` unchanged in this task.
 
