@@ -1,0 +1,10 @@
+=== before ===
+loadavg: 25.45 25.62 24.85 44/4804 1745564
+ffmpeg_count: 30
+Shmem: 9504148 kB
+MemAvailable: 213309136 kB
+=== after ===
+loadavg: 26.24 25.77 24.93 44/4772 1755545
+ffmpeg_count: 30
+Shmem: 9493108 kB
+MemAvailable: 213034104 kB
