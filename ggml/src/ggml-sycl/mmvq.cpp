@@ -3507,14 +3507,26 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_0>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(
-                    vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
-                    fused_add_row_base);
-            });
+    // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 SOA decode arm, previously
+    // dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 arms below.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q4_0_soa";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_0>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0>>(
+                        vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0,
+                        fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -3894,13 +3906,26 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_coalesced_kernel_name<GGML_TYPE_Q4_0>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q4_0_coalesced(vx, vy, dst, ncols, nrows, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
-                                           fused_add_row_base);
-            });
+    // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 COALESCED decode arm,
+    // previously dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0
+    // coalesced sibling below.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q4_0_coalesced";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_coalesced_kernel_name<GGML_TYPE_Q4_0>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q4_0_coalesced(vx, vy, dst, ncols, nrows, nd_item, fused_add, fused_add_ne0,
+                                               fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -4605,19 +4630,34 @@ static void mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const int slm_y_qs_size  = blocks_per_row * MMVQ_SLM_Y_QS_STRIDE;
     const int slm_y_ds_size  = blocks_per_row + 1;  // +1 for padding
 
-    stream->submit([&](sycl::handler & cgh) {
-        // Allocate SLM for Y-vector (shared across all rows in work-group)
-        sycl::local_accessor<int, 1>         slm_y_qs(slm_y_qs_size, cgh);
-        sycl::local_accessor<sycl::half2, 1> slm_y_ds(slm_y_ds_size, cgh);
+    // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 AOS multirow decode arm --
+    // the tg-fast fallback when the weight is not SOA/COALESCED-reordered;
+    // on the 2026-09-04 B50 capture Mistral Q4_0 resolved to the coalesced
+    // arm (llama.cpp-qmwx, comment c-9fme) -- previously dark to
+    // GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 AOS sibling below.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q4_0_aos";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
 
-        cgh.parallel_for<mmvq_multirow_kernel_name<GGML_TYPE_Q4_0>>(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_multirow<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1_slm,
-                                       NROWS_PER_WG>(vx, vy, dst, ncols, nrows, item_ct1, slm_y_qs.get_pointer(),
-                                                     slm_y_ds.get_pointer(), fused_add, fused_add_ne0, fused_add_nb0,
-                                                     fused_add_row_base);
-            });
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            // Allocate SLM for Y-vector (shared across all rows in work-group)
+            sycl::local_accessor<int, 1>         slm_y_qs(slm_y_qs_size, cgh);
+            sycl::local_accessor<sycl::half2, 1> slm_y_ds(slm_y_ds_size, cgh);
+
+            cgh.parallel_for<mmvq_multirow_kernel_name<GGML_TYPE_Q4_0>>(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_multirow<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1_slm,
+                                           NROWS_PER_WG>(vx, vy, dst, ncols, nrows, item_ct1, slm_y_qs.get_pointer(),
+                                                         slm_y_ds.get_pointer(), fused_add, fused_add_ne0,
+                                                         fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -4959,14 +4999,26 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_K>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
-                    vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0, fused_add_nb0,
-                    fused_add_row_base);
-            });
+    // P4 TG-cost-visibility (llama.cpp-0av5): Q4_K SOA decode arm, previously
+    // dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 arms above.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q4_k_soa";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q4_K>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                        vx, vy, dst, ncols, nrows, total_nrows, row_low, nd_item, fused_add, fused_add_ne0,
+                        fused_add_nb0, fused_add_row_base);
+                });
+        });
     });
 }
 
@@ -5010,13 +5062,26 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void *    vx,
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, padded_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q6_K>>(
-            sycl::nd_range<3>(global_size, workgroup_size),
-            [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows, total_nrows,
-                                                                              row_low, nd_item);
-            });
+    // P4 TG-cost-visibility (llama.cpp-0av5): Q6_K SOA decode arm (the LM
+    // head for K-quant models), previously dark to GGML_SYCL_KERNEL_PROFILE;
+    // same wrapper as the Q8_0 arms above.
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name                 = "mulmat.mmvq.q6_k_soa";
+    profile_label.category             = "mulmat";
+    profile_label.queue_kind           = "compute";
+    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    profile_label.metadata             = profile_metadata.c_str();
+    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+
+    (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
+        return profiled_queue.submit([&](sycl::handler & cgh) {
+            cgh.parallel_for<mmvq_reorder_kernel_name<GGML_TYPE_Q6_K>>(
+                sycl::nd_range<3>(global_size, workgroup_size),
+                [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(vx, vy, dst, ncols, nrows,
+                                                                                  total_nrows, row_low, nd_item);
+                });
+        });
     });
 }
 
