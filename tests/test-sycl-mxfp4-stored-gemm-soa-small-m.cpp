@@ -128,35 +128,105 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     ggml_backend_tensor_set(t_act_qs, pack.qs.data(), 0, pack.qs.size());
     ggml_backend_tensor_set(t_act_sc, pack.scales.data(), 0, pack.scales.size() * sizeof(float));
 
-    // NOT ggml_sycl_get_device(0).default_queue(): that raw dpct device queue
-    // only carries sycl::property::queue::enable_profiling when
-    // DPCT_PROFILING_ENABLED was defined at compile time, which it is not
-    // here -- a run under GGML_SYCL_KERNEL_PROFILE=1 then silently records
-    // zero-duration/failed-timestamp samples for every kernel this test
-    // submits. ctx->stream() is the SAME queue production dispatch (and the
-    // sibling GPU tests that go through ggml_backend_graph_compute) submits
-    // on: once the unified cache exists for this device -- which the buffer
-    // allocations above already created -- it resolves to the cache's owner
-    // queue, unconditionally constructed with default_queue_properties()
-    // (common.hpp), which DOES always set enable_profiling.
+    // NOT ggml_sycl_get_device(0).default_queue(): ctx->stream() is the same
+    // queue production dispatch (and the sibling GPU tests that go through
+    // ggml_backend_graph_compute) submits on -- the correct USM/context
+    // owner for the buffers allocated above. It does NOT, however,
+    // reliably carry sycl::property::queue::enable_profiling in this test
+    // process; see the diagnosis on the profiling-queue construction below.
     auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     sycl::queue & q        = *sycl_ctx->stream();
 
-    if (std::getenv("GGML_SYCL_KERNEL_PROFILE")) {
+    const bool profiling_requested = std::getenv("GGML_SYCL_KERNEL_PROFILE") != nullptr;
+
+    // Diagnosed at llama.cpp-6f73 (round 3): `q` (ctx->stream()) reliably
+    // lacks sycl::property::queue::enable_profiling in THIS test process,
+    // even though it is the identical unified-cache owner queue a sibling
+    // GPU test profiles correctly through. Root cause: with one visible GPU
+    // (the standard ONEAPI_DEVICE_SELECTOR=level_zero:N pin), the cache's
+    // owner queue is dpct's raw device default queue, whose profiling
+    // support depends on DPCT_PROFILING_ENABLED being defined in whichever
+    // translation unit's copy of dpct's header-only inline queue-
+    // construction functions the linker resolves for the process. That
+    // macro is private to the `ggml-sycl` CMake target; this test's own TU
+    // also instantiates those inlines (via `#include "ggml-sycl/common.hpp"`,
+    // needed for ggml_backend_sycl_context/stream()) WITHOUT it, and the
+    // executable's copy interposes over the library's -- a pre-existing
+    // hazard for any test binary that includes common.hpp directly, not
+    // specific to this kernel and not something G4 fixes here (filed
+    // separately). The local, correct-regardless-of-that-hazard fix: when
+    // profiling is requested, build our OWN queue sharing q's context and
+    // device (so USM allocated against that context stays valid) with the
+    // property set directly, instead of depending on however q itself was
+    // constructed.
+    sycl::queue submit_q = profiling_requested ?
+                               sycl::queue(q.get_context(), q.get_device(),
+                                           sycl::property_list{ sycl::property::queue::in_order{},
+                                                                sycl::property::queue::enable_profiling{} }) :
+                               q;
+
+    if (profiling_requested) {
+        // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
+        // print the properties the queue we are ABOUT TO SUBMIT ON actually
+        // carries, and assert on THAT queue -- not on `q`, which is known to
+        // lack the property under a single-GPU selector; asserting on `q`
+        // would fire even after the fix above and prove nothing new.
+        const bool has_profiling = submit_q.has_property<sycl::property::queue::enable_profiling>();
+        const bool is_in_order   = submit_q.has_property<sycl::property::queue::in_order>();
+        std::printf("  queue diag: has_property(enable_profiling)=%d has_property(in_order)=%d addr=%p\n",
+                    (int) has_profiling, (int) is_in_order, (void *) &submit_q);
+        GGML_ASSERT(has_profiling);
+
         // Bytes moved per call, for deriving the mxfp4.stored_gemm.soa
         // profile row's bandwidth: the whole expert's SOA buffer (17 bytes
         // per 32-element block: 16 nibble-packed + 1 E8M0 scale byte) plus
-        // the M x n_k int8 activation codes plus the M x n_out f32 output.
-        const double bytes_moved =
-            (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k + (double) M * (double) n_out * 4.0;
+        // the M x n_k int8 activation codes, the M x (n_k/32) f32 activation
+        // scales (llama.cpp-6f73 c-gngd -- omitted before, closing the
+        // 4,521,600 vs 4,524,480 gap against the kernel's own
+        // profile_label.bytes), plus the M x n_out f32 output.
+        const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
+                                   (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,
                     (long long) n_k, bytes_moved);
     }
 
     sycl::event event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
-        q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data), static_cast<const float *>(t_act_sc->data),
-        static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k, {});
-    event.wait();
+        submit_q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
+        static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k,
+        {});
+
+    if (profiling_requested) {
+        // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
+        // query the SAME event the profiler records, the same way the
+        // profiler does (wait_and_throw, then command_start/command_end),
+        // and print either the raw timestamps or the exception -- this is
+        // exactly the condition sycl-kernel-profiler.cpp's
+        // drain_pending_events hits, reproduced by hand outside the profiler
+        // machinery.
+        std::printf("  event diag: backend=%d (level_zero=%d)\n", (int) event.get_backend(),
+                    (int) sycl::backend::ext_oneapi_level_zero);
+        try {
+            const auto status = event.get_info<sycl::info::event::command_execution_status>();
+            std::printf("  event diag: execution_status=%d (complete=%d)\n", (int) status,
+                        (int) sycl::info::event_command_status::complete);
+        } catch (const sycl::exception & e) {
+            std::printf("  event diag: get_info(command_execution_status) EXCEPTION: %s\n", e.what());
+        }
+        try {
+            event.wait_and_throw();
+            const uint64_t start = event.get_profiling_info<sycl::info::event_profiling::command_start>();
+            const uint64_t end   = event.get_profiling_info<sycl::info::event_profiling::command_end>();
+            std::printf("  event diag: command_start=%llu command_end=%llu (end>=start: %d)\n",
+                        (unsigned long long) start, (unsigned long long) end, (int) (end >= start));
+        } catch (const sycl::exception & e) {
+            std::printf("  event diag: wait_and_throw/get_profiling_info EXCEPTION: %s (code=%d)\n", e.what(),
+                        (int) e.code().value());
+        } catch (const std::exception & e) {
+            std::printf("  event diag: wait_and_throw/get_profiling_info std::exception: %s\n", e.what());
+        }
+    } else {
+        event.wait();
+    }
 
     std::vector<float> gpu_out((size_t) (M * n_out));
     ggml_backend_tensor_get(t_dst, gpu_out.data(), 0, gpu_out.size() * sizeof(float));

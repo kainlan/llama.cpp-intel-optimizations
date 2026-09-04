@@ -156,34 +156,15 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     const int64_t act_row_stride_q = static_cast<int64_t>(n_k);
     const int64_t act_row_stride_s = k_tiles;
 
-    // Local work-group size, and the padded global range it divides evenly:
-    // each of the n_tiles work-items is fully independent (no barrier, no
-    // SLM, no cross-lane communication -- every operand is either private or
-    // read-only), so grouping GGML_SYCL_MXFP4_MOE_XMX_SG of them (this
-    // hardware's native sub-group width, already used elsewhere in this
-    // backend) into one SYCL work-group is a pure launch-geometry change: it
-    // lets the driver co-schedule a full sub-group of independent DPAS
-    // issuers instead of dispatching n_tiles separate singleton work-groups,
-    // without altering any work-item's math (llama.cpp-6f73 c-ru7x item 3 --
-    // occupancy at N=2880 was 180 singleton work-groups on a 128-CU card,
-    // the first lever for the >=50% peak-bandwidth criterion). Extra padding
-    // lanes past n_tiles are guarded off below before touching any operand.
-    constexpr int64_t local_wg     = (int64_t) GGML_SYCL_MXFP4_MOE_XMX_SG;
-    const int64_t     padded_tiles = ((n_tiles + local_wg - 1) / local_wg) * local_wg;
-
     return queue.submit([&](sycl::handler & h) {
         if (!deps.empty()) {
             h.depends_on(deps);
         }
         h.parallel_for<mxfp4_soa_gemm_int8_dpas_kernel<M_TILE>>(
-            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(padded_tiles)),
-                              sycl::range<1>(static_cast<size_t>(local_wg))),
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(n_tiles)), sycl::range<1>(1)),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 using namespace sycl::ext::intel::esimd;
                 const int64_t n_tile = static_cast<int64_t>(item.get_global_id(0));
-                if (n_tile >= n_tiles) {
-                    return;
-                }
                 const int64_t n_base = n_tile * exec_n;
 
                 simd<float, M_TILE * exec_n> acc = 0.0f;
@@ -237,13 +218,21 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
                             for (int kk = 0; kk < k_per; ++kk) {
                                 b_vec[(kk / 4) * exec_n * 4 + n * 4 + (kk % 4)] = vals[kk];
                             }
-                            // block_load, not a scalar dereference, matching
-                            // mxfp4_soa_load_a_vec's own scale read
-                            // (mmvq.cpp:7591) for consistency with the
-                            // reference path this addressing mirrors.
-                            const uint8_t *  scale_ptr  = soa_base + total_qs_size + row * k_tiles + kt;
-                            simd<uint8_t, 1> scale_byte = block_load<uint8_t, 1>(scale_ptr);
-                            w_scale[n]                  = mxfp4_stored_gemm_e8m0_half_esimd(scale_byte[0]);
+                            // Plain scalar dereference, not block_load: the
+                            // production reference (mxfp4_soa_load_a_vec,
+                            // mmvq.cpp:7591) uses block_load<uint8_t,1> here,
+                            // but that assumes 4-byte alignment of a
+                            // 1-byte-granularity pointer per the oneAPI ESIMD
+                            // header, which is not actually guaranteed for
+                            // this address. Fixing that would mean adding
+                            // `overaligned_tag<1>{}` at both this site and
+                            // the production one, and touching mmvq.cpp is
+                            // outside this task's scope -- so this reverts to
+                            // the plain, definitely-correct scalar read
+                            // rather than copying the questionable pattern
+                            // (llama.cpp-6f73 c-gngd).
+                            const uint8_t scale_byte = soa_base[total_qs_size + row * k_tiles + kt];
+                            w_scale[n]               = mxfp4_stored_gemm_e8m0_half_esimd(scale_byte);
                         }
                     }
 
