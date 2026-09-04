@@ -12,7 +12,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CAPTURE="$ROOT_DIR/scripts/sycl-decode-mode-capture.sh"
 GUARD="$ROOT_DIR/scripts/bench-guard.sh"
-[ -x "$CAPTURE" ] || { echo "SKIP: sycl-decode-mode-capture.sh not present"; exit 77; }
+# CAPTURE ships in the SAME commit as this test (scripts/sycl-decode-mode-
+# capture.sh and this file were never landed separately, unlike the RED
+# phase before the script existed at all) -- its absence here is a defect
+# (a lost mode bit, a bad path, a botched merge), not a legitimate "not
+# built yet" skip, so this fails closed rather than exiting 77
+# (llama.cpp-gvu7 review, round 2, nit 4). bench-guard.sh is a pre-existing,
+# separately-shipped script this test invokes as a child; a checkout
+# missing it is a different, genuinely skippable situation.
+[ -x "$CAPTURE" ] || { echo "FAIL: $CAPTURE is missing or not executable -- it ships in the same commit as this test, so its absence is a defect" >&2; exit 1; }
 [ -x "$GUARD" ] || { echo "SKIP: bench-guard.sh not present"; exit 77; }
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
@@ -54,6 +62,18 @@ expect_status() {
 # parsing, timeline shape, host.txt shape). It is deliberately NOT used for
 # the pid/RSS regression check further down, which needs the tracked leaf to
 # stay this script's own process throughout -- see mk_fake_bench_grow.
+# `sleep 4`, not 2: pid commitment now needs three consecutive 0.5s ticks to
+# land on the SAME resolved pid (llama.cpp-gvu7 review, round 2), and this
+# suite's own per-tick overhead (several subprocess forks per sample) under
+# this host's permanent ambient load can push the EFFECTIVE tick spacing
+# well past 0.5s -- caught directly by a flake loop: `sleep 2` left too
+# little margin and the "bench_pid resolved" check below intermittently saw
+# "unknown" (2/10 runs, all with 3+ real ticks simply not fitting in 2s).
+# 4s is ample margin for three ticks even under load; mk_fake_bench_grow's
+# own busy-wait is not similarly extended because its scripts stay leaf
+# from the moment they start (no forked child to hand tracking off to), so
+# they warm up faster in practice -- but if that ever flakes too, the fix
+# is the same: more real time, not fewer required ticks.
 mk_fake_bench() {
     local tg="$1" path="$T/fakebench.sh"
     cat > "$path" <<EOF
@@ -61,7 +81,7 @@ mk_fake_bench() {
 echo '| model | size | params | backend | ngl | test | t/s |'
 echo '|---|---|---|---|---|---|---|'
 echo "| gpt-oss 20B MXFP4 | 12.83 GiB | 20.91 B | SYCL | 99 | tg128 | $tg ± 0.31 |"
-sleep 2
+sleep 4
 EOF
     chmod +x "$path"
     echo "$path"
@@ -167,7 +187,7 @@ grep -q "mode=unknown" "$out_mid/mode.txt" 2>/dev/null || { echo "FAIL: expected
 [ -s "$out_slow/timeline.tsv" ] || { echo "FAIL: timeline.tsv missing/empty"; fail=1; }
 rows=$(( $(wc -l < "$out_slow/timeline.tsv") - 1 ))
 [ "$rows" -ge 3 ] || { echo "FAIL: expected >= 3 timeline data rows, got $rows"; fail=1; }
-head -1 "$out_slow/timeline.tsv" | grep -qE '^t_s	act_freq	cur_freq	throttle_status	reason_pl2	rss_anon_kb$' \
+head -1 "$out_slow/timeline.tsv" | grep -qE '^t_s	act_freq	cur_freq	throttle_status	reason_pl2	bench_pid	rss_anon_kb$' \
     || { echo "FAIL: timeline.tsv header wrong: $(head -1 "$out_slow/timeline.tsv")"; fail=1; }
 
 # cur_freq and throttle/reason_pl2 were never created by mk_tree above --
@@ -215,21 +235,23 @@ grep -q "^bench_pid=$want_pid comm=" "$out_pid/host.txt" \
 
 # 32768 kB (32 MiB): a `timeout`/`env`/`sleep` wrapper can never reach this
 # (~1.2 MB observed), and the fixture's ~64 MiB steady-state RssAnon clears
-# it with roughly 2x margin.
-max_rss="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } END { print max + 0 }' "$out_pid/timeline.tsv")"
+# it with roughly 2x margin. Column 7 (rss_anon_kb) -- column 6 is now the
+# bench_pid the review added.
+max_rss="$(awk -F'\t' 'NR>1 && $7 != "-" { v = $7 + 0; if (v > max) max = v } END { print max + 0 }' "$out_pid/timeline.tsv")"
 [ "$max_rss" -gt 32768 ] \
     || { echo "FAIL: expected a sampled RssAnon > 32768 kB (fixture holds ~64 MiB); got max=$max_rss kB -- RssAnon may be tracking a wrapper, not the bench"; fail=1; }
 
-# --- regression: proof B (llama.cpp-gvu7 review). While the card is
-# (simulated) busy, bench-guard's OWN preflight throttle/tenant poll loop
-# forks its own `sleep 5` directly under the guard -- structural leaf
-# descent WILL transiently latch onto that (expected, self-correcting, not
-# a bug: it is genuinely the deepest live process at that instant). The
-# regression this guards is whether tracking permanently sticks there once
-# the real chain forms, the way a comm denylist for {timeout, env} did (it
-# does not reject "sleep") in an earlier, already-replaced version of this
-# script. mk_tree_busy_then_free starts throttle/status=1 and flips it to 0
-# via a background subshell after ~6s, mirroring the reviewer's own repro;
+# --- regression: proof B (llama.cpp-gvu7 review, rounds 2 and 3). While
+# the card is (simulated) busy, bench-guard's OWN preflight throttle/tenant
+# poll loop forks its own `sleep 5` directly under the guard -- structural
+# leaf descent WILL transiently latch onto that (expected: it is genuinely
+# the deepest live process at that instant; `sleep` easily survives the
+# two-tick confirmation below too, since it runs for the full 5s poll
+# interval = 10 ticks, far more than two). What must NOT happen: those
+# pre-bench rows must never be attributed to "the bench" -- the review's
+# round-2 ruling on the header's own claim ("RssAnon of the bench pid").
+# mk_tree_busy_then_free starts throttle/status=1 and flips it to 0 via a
+# background subshell after ~6s, mirroring the reviewer's own repro;
 # bench-guard's fixed 5s poll interval means at least one of its own poll
 # `sleep`s is observed before the card clears. --max-wait 20 gives ample
 # budget past the ~10s worst case (two 5s poll cycles) before bench-guard
@@ -259,9 +281,57 @@ grep -q "^bench_pid=$want_busy_pid comm=" "$out_busy/host.txt" \
     || { echo "FAIL: expected bench_pid=$want_busy_pid in host.txt after busy-card recovery (got: $(grep '^bench_pid=' "$out_busy/host.txt" 2>/dev/null))"; fail=1; }
 grep -qE '^bench_pid=[0-9]+ comm=(sleep|timeout) ' "$out_busy/host.txt" \
     && { echo "FAIL: host.txt still names a wrapper after busy-card recovery: $(grep '^bench_pid=' "$out_busy/host.txt")"; fail=1; }
-max_rss_busy="$(awk -F'\t' 'NR>1 && $6 != "-" { v = $6 + 0; if (v > max) max = v } END { print max + 0 }' "$out_busy/timeline.tsv")"
+
+# Row-level attribution (column 6 is bench_pid, column 7 is rss_anon_kb):
+# every row while bench_pid reads "-" (the pre-bench/poll-sleep phase) must
+# ALSO read "-" for RssAnon -- never the poll sleep's ~1.2 MB attributed to
+# "the bench" -- and every row that DOES carry a bench_pid must carry the
+# fixture's own real pid, never a wrapper's.
+bad_attribution="$(awk -F'\t' -v want="$want_busy_pid" '
+    NR>1 {
+        if ($6 == "-") { if ($7 != "-") print "pre-bench row has a non-\"-\" RssAnon: " $0 }
+        else if ($6 != want) { print "row bench_pid is not the fixture'"'"'s pid: " $0 }
+        else { seen_real = 1 }
+    }
+    END { if (!seen_real) print "no row ever carried the real bench pid" }
+' "$out_busy/timeline.tsv")"
+[ -z "$bad_attribution" ] \
+    || { echo "FAIL: busy-card timeline row attribution wrong:"; echo "$bad_attribution"; fail=1; }
+
+max_rss_busy="$(awk -F'\t' 'NR>1 && $7 != "-" { v = $7 + 0; if (v > max) max = v } END { print max + 0 }' "$out_busy/timeline.tsv")"
 [ "$max_rss_busy" -gt 32768 ] \
     || { echo "FAIL: expected a sampled RssAnon > 32768 kB after busy-card recovery; got max=$max_rss_busy kB"; fail=1; }
+
+# --- regression: a SHORT-LIVED helper that is NOT a direct child of the
+# guard (so the depth gate above cannot exclude it, unlike bench-guard's
+# poll `sleep`) must never overwrite the audit line once the real bench has
+# already been confirmed (llama.cpp-gvu7 review, round 2, finding 1).
+# bench-guard's postflight runs kernel_log() -- and thus --journalctl-cmd --
+# strictly AFTER the wrapped command exits, at depth 2 under the guard (a
+# command substitution's subshell, then the command itself). An 0.8s fake
+# journalctl stands in for the ~10ms real one (measured by the reviewer),
+# giving the 0.5s-tick confirmation window a real chance to be fooled if
+# two-tick confirmation alone were the only protection -- it is not: a
+# candidate is only ever committed as a REPLACEMENT for an existing
+# bench_pid, and by the time journalctl runs the real bench has already
+# been confirmed and is dead, so this exercises exactly that replacement
+# path. ---
+
+out_helper="$T/out-helper-race"
+mk_tree 0 0; mk_meminfo 3000000
+bench="$(mk_fake_bench_grow 40.0)"
+export FAKE_BENCH_PIDFILE="$T/fake-bench-helper.pid"
+"$CAPTURE" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd "/usr/bin/sleep 0.8" --max-wait 1 \
+    --out "$out_helper" -- "$bench" || { echo "FAIL: helper-race run failed"; fail=1; }
+unset FAKE_BENCH_PIDFILE
+
+[ -s "$T/fake-bench-helper.pid" ] || { echo "FAIL: fake bench never wrote its own pid (helper-race)"; fail=1; }
+want_helper_pid="$(cat "$T/fake-bench-helper.pid")"
+grep -q "^bench_pid=$want_helper_pid comm=" "$out_helper/host.txt" \
+    || { echo "FAIL: expected bench_pid=$want_helper_pid in host.txt after the postflight helper race (got: $(grep '^bench_pid=' "$out_helper/host.txt" 2>/dev/null))"; fail=1; }
+grep -qE '^bench_pid=[0-9]+ comm=sleep ' "$out_helper/host.txt" \
+    && { echo "FAIL: host.txt names the postflight journalctl helper, not the bench: $(grep '^bench_pid=' "$out_helper/host.txt")"; fail=1; }
 
 # --- tg128 parsing must be anchored to an actual markdown table row and
 # validated as numeric (llama.cpp-gvu7 review): a bare substring grep over

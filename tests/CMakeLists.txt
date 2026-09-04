@@ -801,9 +801,9 @@ if (NOT WIN32)
         NAME test-sycl-decode-mode-capture
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-decode-mode-capture.sh
+        LABEL "sycl;source"
     )
     set_tests_properties(test-sycl-decode-mode-capture PROPERTIES SKIP_RETURN_CODE 77)
-    set_tests_properties(test-sycl-decode-mode-capture PROPERTIES LABELS "sycl;source")
 endif()
 
 if (NOT WIN32)
