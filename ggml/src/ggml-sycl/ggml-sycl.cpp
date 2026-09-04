@@ -26670,7 +26670,8 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
     }
     const tensor_usage usage = ggml_sycl_get_tensor_usage(tensor);
     if (resolved == GGML_LAYOUT_COALESCED && tensor->type == GGML_TYPE_Q8_0 &&
-        (usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT)) {
+        (usage == tensor_usage::EMBEDDING || usage == tensor_usage::OUTPUT_WEIGHT ||
+         usage == tensor_usage::ATTENTION_WEIGHT || usage == tensor_usage::FFN_WEIGHT)) {
         // llama.cpp-os8k: infer_tensor_usage() classifies EMBEDDING with a
         // bare strstr(name, "token_embd") substring match, so it also
         // catches "per_layer_token_embd.weight" (gemma3n/gemma4's
@@ -26690,17 +26691,26 @@ layout_mode ggml_sycl_adjust_layout_for_tensor(const ggml_tensor * tensor, layou
         // it always had. OUTPUT_WEIGHT is not re-gated here: its own name
         // check in infer_tensor_usage() (exact "output.weight" or a
         // ".output.weight" suffix) is already precise, not a loose substring.
+        //
+        // llama.cpp-pktr: the same tile-alignment net now also covers dense
+        // ATTENTION_WEIGHT/FFN_WEIGHT Q8_0 projections (Q/K/V/O, gate/up/down).
+        // Measured on gemma4-E4B (K=2560, 80 blocks/row -- not a multiple of
+        // MMVQ_COALESCED_TILE_BLOCKS), SOA beats COALESCED by up to 14 points
+        // of achieved bandwidth (82%->96% B50, 77%->89% B70) on gate/up and
+        // q/k/v/o; tile-aligned dense shapes (Mistral K=4096/14336, gemma4
+        // down-proj K=10240, gemma4 q/k/v K=2048) keep COALESCED ahead by
+        // 2-9 points, so this net only ever DEMOTES a COALESCED resolution --
+        // it never touches an AOS/SOA result already forced upstream by
+        // GGML_SYCL_Q8_DENSE_AOS=1 or GGML_SYCL_Q8_DENSE_LAYOUT=soa in
+        // layout_policy::get_optimal() (common.hpp), because those already
+        // leave `resolved` != GGML_LAYOUT_COALESCED before this block runs.
         if (usage == tensor_usage::EMBEDDING && !ggml_sycl_is_canonical_tied_embedding_name(tensor->name)) {
             resolved = GGML_LAYOUT_AOS;
-        } else {
-            const int64_t ncols          = tensor->ne[0];
-            const int64_t blocks_per_row = ncols > 0 ? ncols / QK8_0 : 0;
-            if (blocks_per_row <= 0 || (ncols % QK8_0) != 0 || (blocks_per_row % MMVQ_COALESCED_TILE_BLOCKS) != 0) {
-                // Q8_0 coalesced kernels support padded tail tiles, but the large
-                // decode output projection pays for the padded K tile every token.
-                // Keep embedding/output weights on SOA unless the row is naturally tile-aligned.
-                resolved = GGML_LAYOUT_SOA;
-            }
+        } else if (!ggml_sycl_q8_0_coalesced_tile_aligned(tensor->ne[0])) {
+            // Q8_0 coalesced kernels support padded tail tiles, but a
+            // non-tile-aligned row pays for that padding every token.
+            // Keep the weight on SOA unless its row is naturally tile-aligned.
+            resolved = GGML_LAYOUT_SOA;
         }
     }
     if (resolved == GGML_LAYOUT_SOA && !ggml_sycl_layout_supports_soa(tensor->type)) {
@@ -42320,9 +42330,64 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *                     dst,
 // Forward declaration: cached-env gate for the Q8_0 COALESCED oneDNN dequant
 // arm (defined later, near the other cached-env kernel-selection helpers).
 static bool ggml_sycl_q8_0_onednn_coalesced_enabled();
-// llama.cpp-nz1k: cached-env gate for the Q8_0 SOA oneDNN WoQ-int8 arm
-// (defined next to ggml_sycl_q8_0_onednn_coalesced_enabled below).
+// llama.cpp-nz1k: cached-env gate for the Q8_0 SOA oneDNN WoQ-int8 EXECUTE arm
+// (defined next to ggml_sycl_q8_0_onednn_coalesced_enabled below). Default
+// OFF; unchanged by llama.cpp-pktr.
 static bool ggml_sycl_onednn_woq_q8_enabled();
+// llama.cpp-pktr: cached-env gate for ONEDNN_SOA kernel-choice ELIGIBILITY
+// (mirrors ggml_sycl_q8_0_onednn_coalesced_enabled -- default ON, opt out with
+// GGML_SYCL_Q8_ONEDNN_SOA=0). Distinct from ggml_sycl_onednn_woq_q8_enabled()
+// above: this gate only decides whether the ONEDNN_SOA kernel choice may be
+// selected at all; the WoQ-int8 execute path inside ggml_sycl_op_mul_mat_sycl
+// still requires GGML_SYCL_ONEDNN_WOQ_Q8=1 separately, and with it off the
+// selected ONEDNN_SOA kernel serves PP via the SOA-aware f16 dequant +
+// row_gemm fallback in that same function (COALESCED-parity oneDNN f16 GEMM).
+static bool ggml_sycl_q8_0_onednn_soa_enabled();
+
+// llama.cpp-pktr: ggml_sycl_get_weight_layout_ptr(tensor, device, target)
+// does not verify resolved == target, so a lookup's own success/failure
+// must never stand in for "the planner chose this layout" (llama.cpp-pktr spec review round 1
+// finding 1 caused a real B50 regression this way -- see the commit
+// history on llama.cpp-pktr for the full incident, not repeated here).
+// Decide a Q8_0 weight's materialized layout ONCE, from
+// ggml_sycl_resolve() -- not get_effective_layout_mode(extra), which is
+// lazily written only as a side effect of this same getter and can read
+// stale AOS for a weight the unified cache staged straight to a device
+// plane. Every Q8_0-specific lookup in ggml_sycl_op_mul_mat_sycl must gate
+// on the EXACT layout it requests (SOA lookup on == SOA, COALESCED lookup
+// on == COALESCED) -- never one as the fallback of the other, and never
+// both live for one dispatch (one layout per weight). Non-Q8_0 callers
+// return GGML_LAYOUT_AOS without touching the cache at all. The residual
+// divergence between this resolution and ggml_sycl_op_mul_mat's own
+// weight-handle read (its "layout_ptr" fallback branch and multi-device/
+// TP-buffer src0_dd_i sources) is tracked on llama.cpp-ftnh, not closed
+// here.
+static layout_mode ggml_sycl_q8_0_dense_planned_layout(const ggml_tensor * src0, int device) {
+    if (!src0 || src0->type != GGML_TYPE_Q8_0) {
+        return GGML_LAYOUT_AOS;
+    }
+    const ggml_sycl::resolved_ptr resolved = ggml_sycl_resolve(src0, device);
+    return (resolved && resolved.on_device) ? resolved.layout : GGML_LAYOUT_AOS;
+}
+
+// llama.cpp-pktr: mirrors the onednn_woq_q8 trace inside
+// ggml_sycl_op_mul_mat_sycl so a mixed-layout dispatch (some Q8_0 weights
+// planned SOA, some COALESCED) is confirmable end-to-end from
+// GGML_SYCL_MUL_MAT_ROUTE_TRACE=1 -- previously only the SOA half of the
+// dequant fallback ever printed anything. Trace-gated only, no cost at
+// default (ggml_sycl_mul_mat_route_trace_enabled() short-circuits before
+// the atomic increment).
+static void ggml_sycl_trace_q8_0_coalesced_dequant(const ggml_tensor * src0, const char * arm) {
+    if (!ggml_sycl_mul_mat_route_trace_enabled()) {
+        return;
+    }
+    static std::atomic<int> coalesced_trace_count{ 0 };
+    const int               trace_idx = coalesced_trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx < ggml_sycl_mul_mat_route_trace_limit()) {
+        fprintf(stderr, "[MUL-MAT-ROUTE] q8_0_dequant idx=%d src0=%s layout=coalesced arm=%s\n", trace_idx,
+                src0->name ? src0->name : "?", arm);
+    }
+}
 
 inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                                       const ggml_tensor *         src0,
@@ -42357,6 +42422,12 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
 #endif
     const char *    src1_device_base  = static_cast<const char *>(ggml_sycl_resolve_tensor_ptr(src1, ctx.device));
     const uint8_t * src0_host_storage = static_cast<const uint8_t *>(ggml_sycl_host_data(src0));
+    // llama.cpp-pktr: decided once here so both the f16 dequant arm below
+    // (inside the use_fp16 branch) and the llama.cpp-dkw0 fp32 dequant arm
+    // (that branch's else) gate their Q8_0 layout lookups on the same
+    // value -- see ggml_sycl_q8_0_dense_planned_layout's own comment above
+    // for why and what it does not (yet) cover.
+    const layout_mode q8_0_dense_planned_layout = ggml_sycl_q8_0_dense_planned_layout(src0, ctx.device);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         sycl::half * src0_pp_scratch = nullptr;
@@ -42501,17 +42572,32 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             }
         }
         // -----------------------------------------------------------------
-        // llama.cpp-nz1k (prefill L2b phase 1): Q8_0 SOA oneDNN WoQ-int8 arm.
-        // Reached through the ONEDNN_SOA kernel choice (pick_kernel_for_layout /
-        // k_mul_mat_priority), itself eligible only under
-        // GGML_SYCL_ONEDNN_WOQ_Q8=1 for a Q8_0 weight. The arm then requires the
-        // weight to be MATERIALIZED SOA by the planner: for dense projections
-        // that means GGML_SYCL_Q8_DENSE_LAYOUT=soa, while a weight that is
-        // already SOA (e.g. a tile-misaligned Q8_0 head) takes the arm under
-        // WOQ_Q8=1 alone. It applies the codebase's standard eligibility
-        // predicate, ggml_sycl_can_use_layout_for_kernel, before the lookup --
-        // the same gate every kernel-selection site uses. That is not a proof
-        // the getter cannot materialize (for an evictable host-buffered weight
+        // llama.cpp-nz1k (prefill L2b phase 1), extended by llama.cpp-pktr:
+        // Q8_0 SOA oneDNN WoQ-int8 arm. Reached through the ONEDNN_SOA kernel
+        // choice (pick_kernel_for_layout / k_mul_mat_priority), eligible by
+        // default under ggml_sycl_q8_0_onednn_soa_enabled()
+        // (GGML_SYCL_Q8_ONEDNN_SOA) for a Q8_0 weight -- the pktr per-weight
+        // layout rule now materializes tile-misaligned dense ATTENTION/FFN
+        // Q8_0 rows SOA at default env, alongside the pre-existing
+        // GGML_SYCL_Q8_DENSE_LAYOUT=soa opt-in.
+        //
+        // llama.cpp-pktr: the SOA-plane LOOKUP below (writing q8_0_soa_ptr) no
+        // longer requires GGML_SYCL_ONEDNN_WOQ_Q8=1 -- it must run whenever the
+        // kernel choice was ONEDNN_SOA, WoQ execute enabled or not, because the
+        // SOA-aware f16 dequant + row_gemm fallback further down this function
+        // needs q8_0_soa_ptr to interpret src0_dd_i's bytes correctly (they are
+        // the SOA plane, not AOS, once ONEDNN_SOA was selected). Only the
+        // prepare/stage/execute of the int8-plane WoQ primitive itself
+        // (immediately below, guarded by ggml_sycl_onednn_woq_q8_enabled(),
+        // default OFF) is gated on that separate opt-in; with it off this
+        // block still declines into the fallback dequant with a decline
+        // reason of "woq_disabled", never "soa_plane_not_resident", because
+        // the plane WAS found.
+        //
+        // It applies the codebase's standard eligibility predicate,
+        // ggml_sycl_can_use_layout_for_kernel, before the lookup -- the same
+        // gate every kernel-selection site uses. That is not a proof the
+        // getter cannot materialize (for an evictable host-buffered weight
         // the predicate accepts any layout); it is the same exposure every
         // other selection site carries. Probe llama.cpp-ovkn's V4
         // form: f16 activations x the stored int8 qs plane read as-is, K/32
@@ -42523,13 +42609,16 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
         // made; ruling 4: transient format staging of device-resident data, not
         // a second stored layout). Declines -- never errors -- into the SOA f16
         // dequant + row_gemm below when the rows are partial, K is not a block
-        // multiple, the SOA plane is not resident, the scratch is absent, or
-        // oneDNN refuses the primitive / throws. INVARIANT: q8_0_soa_ptr is
-        // non-null only when full_rows && k_blocked hold, because the SOA-aware
-        // fallback dequant is full-tensor/row-0-based.
+        // multiple, the SOA plane is not resident, WoQ execute is disabled, the
+        // scratch is absent, or oneDNN refuses the primitive / throws.
+        // INVARIANT: q8_0_soa_ptr is non-null only when full_rows && k_blocked
+        // hold, because the SOA-aware fallback dequant is full-tensor/row-0-based.
+        //
+        // llama.cpp-pktr: gated on q8_0_dense_planned_layout == SOA (see
+        // that helper's comment above the function for why).
         // -----------------------------------------------------------------
         void * q8_0_soa_ptr = nullptr;
-        if (!used_woq && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_onednn_woq_q8_enabled() && row_diff > 0 &&
+        if (!used_woq && src0->type == GGML_TYPE_Q8_0 && q8_0_dense_planned_layout == GGML_LAYOUT_SOA && row_diff > 0 &&
             ggml_is_contiguous(src0)) {
             // Full-rows test FIRST, and the SOA plane is looked up only when it
             // holds (same shape as the Q4_0 WoQ arm above): the SOA-aware
@@ -42559,6 +42648,8 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 decline = "k_not_block_multiple";
             } else if (!q8_0_soa_ptr) {
                 decline = "soa_plane_not_resident";
+            } else if (!ggml_sycl_onednn_woq_q8_enabled()) {
+                decline = "woq_disabled";
             } else if (!src0_pp_scratch) {
                 decline = "no_pp_scratch";
             }
@@ -42624,9 +42715,11 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 // miss, host tier, etc.) this falls straight through to the unmodified
                 // AOS dequant below, never erroring.
                 void * q8_0_coalesced_ptr = nullptr;
-                // llama.cpp-nz1k: skip the COALESCED lookup when the weight is
-                // SOA-planned -- never request a layout the planner did not choose.
-                if (!q8_0_soa_ptr && src0->type == GGML_TYPE_Q8_0 && ggml_sycl_q8_0_onednn_coalesced_enabled()) {
+                // llama.cpp-pktr: gated on q8_0_dense_planned_layout ==
+                // COALESCED, not on whether the SOA lookup above declined
+                // (see that helper's comment above the function for why).
+                if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED && src0->type == GGML_TYPE_Q8_0 &&
+                    ggml_sycl_q8_0_onednn_coalesced_enabled()) {
                     void * candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
                     if (candidate) {
                         const sycl::usm::alloc ptr_type = ggml_sycl_get_alloc_type(candidate);
@@ -42648,6 +42741,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                     const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
                     dequantize_row_q8_0_coalesced_to_fp16_rowmajor(q8_0_coalesced_ptr, dst_f16, blocks_per_row,
                                                                    static_cast<int>(row_diff), stream);
+                    ggml_sycl_trace_q8_0_coalesced_dequant(src0, "dequant_f16");
                     // llama.cpp-dkw0 (worktree-only diagnostic): rather than
                     // re-deriving the COALESCED tile/word-plane byte layout
                     // offline (high risk of a self-inflicted transcription
@@ -42776,8 +42870,21 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             // host tier, GGML_SYCL_Q8_ONEDNN_COALESCED=0 never materialized
             // it, etc.) this falls straight through to the unmodified
             // to_fp32_sycl() path below, never erroring.
+            //
+            // llama.cpp-pktr: gated on q8_0_dense_planned_layout ==
+            // COALESCED (see that helper's comment above the function) --
+            // this lookup used to fire for any Q8_0 weight unconditionally,
+            // which could hand a tile-misaligned/SOA-planned weight's SOA
+            // plane to this coalesced dequant. No SOA-aware fp32 dequant
+            // kernel exists (only dequantize_row_q8_0_soa_to_fp16_rowmajor,
+            // no _to_fp32 sibling), so a planned-SOA weight here declines
+            // and falls to the generic to_fp32_sycl() path below, same as
+            // any other decline reason; that path's own correctness for a
+            // genuinely SOA-materialized weight, and the src0_full_tensor
+            // gap noted above, are separate pre-existing questions the lead
+            // is tracking, not fixed here.
             void * dkw0_q8_0_coalesced_ptr = nullptr;
-            if (src0->type == GGML_TYPE_Q8_0) {
+            if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED && src0->type == GGML_TYPE_Q8_0) {
                 void * dkw0_candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);
                 if (dkw0_candidate) {
                     const sycl::usm::alloc dkw0_ptr_type = ggml_sycl_get_alloc_type(dkw0_candidate);
@@ -42790,6 +42897,7 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
                 const int blocks_per_row = static_cast<int>(ne00 / QK8_0);
                 dequantize_row_q8_0_coalesced_to_fp32_rowmajor(dkw0_q8_0_coalesced_ptr, src0_ddq_as_f32.get(),
                                                                blocks_per_row, static_cast<int>(row_diff), stream);
+                ggml_sycl_trace_q8_0_coalesced_dequant(src0, "dequant_fp32");
             } else {
                 const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(src0->type, dst, src0_full_tensor);
                 GGML_ASSERT(to_fp32_sycl != nullptr);
@@ -57916,9 +58024,16 @@ static constexpr ggml_sycl_mul_mat_kernel k_mul_mat_priority[] = {
     // Q8_0 and preceded ONEDNN_AOS (last entry), which is why the arm never fired (llama.cpp-e3xj).
     ggml_sycl_mul_mat_kernel::ONEDNN_COALESCED,
     ggml_sycl_mul_mat_kernel::MMQ_COALESCED,
-    // ONEDNN_SOA must precede MMQ_SOA for the same reason (llama.cpp-nz1k). It
-    // is eligible only for Q8_0 under GGML_SYCL_ONEDNN_WOQ_Q8=1, so the default
-    // ordering of everything else is unchanged.
+    // ONEDNN_SOA must precede MMQ_SOA for the same reason (llama.cpp-nz1k).
+    // llama.cpp-pktr: it is eligible for Q8_0 by DEFAULT now
+    // (ggml_sycl_q8_0_onednn_soa_enabled(), GGML_SYCL_Q8_ONEDNN_SOA, default
+    // ON) -- GGML_SYCL_ONEDNN_WOQ_Q8 no longer gates this kernel-choice
+    // eligibility at all, only the int8-plane WoQ EXECUTE arm inside
+    // ggml_sycl_op_mul_mat_sycl. This entry only competes for a Q8_0 weight
+    // the planner resolved SOA (a COALESCED-planned weight never reaches
+    // it, same as ONEDNN_COALESCED above never competes for an SOA-planned
+    // one), so this ordering change alone does not move any other type's
+    // priority.
     ggml_sycl_mul_mat_kernel::ONEDNN_SOA,
     ggml_sycl_mul_mat_kernel::MMQ_SOA,
     ggml_sycl_mul_mat_kernel::MMQ_AOS,
@@ -57986,19 +58101,47 @@ static bool ggml_sycl_q8_0_onednn_coalesced_enabled() {
     return enabled != 0;
 }
 
-// llama.cpp-nz1k (prefill L2b phase 1): opt-in oneDNN WoQ-int8 PP arm for Q8_0
-// dense weights materialized SOA (GGML_SYCL_Q8_DENSE_LAYOUT=soa, common.hpp
-// layout_policy): f16 activations x the stored int8 qs plane with K/32 grouped
-// f16 scales, no per-call weight dequant (DnnlGemmWrapper::woq_gemm_q8_0,
-// dispatched through the ONEDNN_SOA kernel choice). Default OFF this campaign
-// (ruling 9 / nz1k c-c4jp): the arm is a phase-1 interim that stages only the
-// scale plane per call; phase 2 (llama.cpp-2zsc) stores the d plane in oneDNN
+// llama.cpp-nz1k (prefill L2b phase 1): opt-in oneDNN WoQ-int8 PP EXECUTE arm
+// for Q8_0 dense weights materialized SOA: f16 activations x the stored int8
+// qs plane with K/32 grouped f16 scales, no per-call weight dequant
+// (DnnlGemmWrapper::woq_gemm_q8_0). Default OFF this campaign (ruling 9 /
+// nz1k c-c4jp): the arm is a phase-1 interim that stages only the scale
+// plane per call; phase 2 (llama.cpp-2zsc) stores the d plane in oneDNN
 // order and the default is decided there with the A/B numbers.
+//
+// llama.cpp-pktr: this gate now controls ONLY the WoQ-int8 execute path
+// inside ggml_sycl_op_mul_mat_sycl (prepare + woq_gemm_q8_0), not whether the
+// ONEDNN_SOA kernel choice is eligible at all -- see
+// ggml_sycl_q8_0_onednn_soa_enabled() below for that. With this OFF (the
+// default), an ONEDNN_SOA-selected batch still reaches oneDNN PP through the
+// SOA-aware f16 dequant + row_gemm fallback in the same function; only the
+// int8-plane WoQ path itself requires opting in here.
 static bool ggml_sycl_onednn_woq_q8_enabled() {
     static int enabled = -1;
     if (enabled < 0) {
         const char * env = std::getenv("GGML_SYCL_ONEDNN_WOQ_Q8");
         enabled          = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// llama.cpp-pktr: eligibility gate for the ONEDNN_SOA kernel choice itself
+// (k_mul_mat_priority, the override-check switch, ggml_sycl_select_preferred_kernel,
+// and pick_kernel_for_layout's GGML_LAYOUT_SOA case). Default ON, mirroring
+// ggml_sycl_q8_0_onednn_coalesced_enabled() above -- the pktr per-weight
+// layout rule (ggml_sycl_q8_0_coalesced_tile_aligned, common.hpp) now
+// materializes tile-misaligned dense Q8_0 projections (e.g. gemma4-E4B's
+// K=2560 gate/up/q/k/v/o, 80 blocks/row) SOA at DEFAULT env, and those PP
+// batches need a route to oneDNN GEMM parity with ONEDNN_COALESCED just as
+// much as the nz1k opt-in SOA weights did; MMQ_SOA alone (~3 TFLOPS) would
+// trade prefill down. Set GGML_SYCL_Q8_ONEDNN_SOA=0 to opt out and keep
+// MMQ_SOA. Distinct from, and does not imply, ggml_sycl_onednn_woq_q8_enabled()
+// -- see that function's comment for how the two combine.
+static bool ggml_sycl_q8_0_onednn_soa_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * env = std::getenv("GGML_SYCL_Q8_ONEDNN_SOA");
+        enabled          = (env == nullptr || std::atoi(env) != 0) ? 1 : 0;
     }
     return enabled != 0;
 }
@@ -58333,9 +58476,11 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
                     break;
                 case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
 #if GGML_SYCL_DNNL
-                    // llama.cpp-nz1k: Q8_0 only, SOA-capable type, and the opt-in env.
+                    // llama.cpp-pktr: Q8_0 only, SOA-capable type, default-ON
+                    // eligibility gate (see ggml_sycl_q8_0_onednn_soa_enabled()
+                    // for why this is no longer the WoQ-execute env).
                     if (src0->type != GGML_TYPE_Q8_0 || !ggml_sycl_layout_supports_soa(src0->type) ||
-                        !ggml_sycl_onednn_woq_q8_enabled()) {
+                        !ggml_sycl_q8_0_onednn_soa_enabled()) {
                         override_ok = false;
                     }
 #else
@@ -58480,9 +58625,10 @@ std::optional<ggml_sycl_mul_mat_kernel> ggml_sycl_select_preferred_kernel(
 
             case ggml_sycl_mul_mat_kernel::ONEDNN_SOA:
 #if GGML_SYCL_DNNL
-                // llama.cpp-nz1k: eligible only under GGML_SYCL_ONEDNN_WOQ_Q8=1.
+                // llama.cpp-pktr: eligible by default; see
+                // ggml_sycl_q8_0_onednn_soa_enabled() (GGML_SYCL_Q8_ONEDNN_SOA).
                 if (src0->type == GGML_TYPE_Q8_0 && ggml_sycl_layout_supports_soa(src0->type) &&
-                    ggml_sycl_onednn_woq_q8_enabled()) {
+                    ggml_sycl_q8_0_onednn_soa_enabled()) {
                     return kernel;
                 }
 #endif
@@ -58786,9 +58932,15 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
             // independent GGML_LAYOUT_COALESCED weight lookup regardless of this field.
             decision.onednn_path = OneDnnPath::DequantFp16;
         } else if (kernel == ggml_sycl_mul_mat_kernel::ONEDNN_SOA) {
-            // Diagnostic only (llama.cpp-nz1k): the arm is WoQ-first and falls
-            // back to the SOA f16 dequant inside ggml_sycl_op_mul_mat_sycl.
-            decision.onednn_path = OneDnnPath::WoQ;
+            // Diagnostic only (llama.cpp-nz1k, corrected llama.cpp-pktr spec
+            // review finding 4): the arm is WoQ-first only when
+            // GGML_SYCL_ONEDNN_WOQ_Q8 is actually enabled (default OFF, see
+            // ggml_sycl_onednn_woq_q8_enabled()) -- at default env this
+            // kernel choice never attempts the WoQ execute path at all and
+            // goes straight to the SOA f16 dequant inside
+            // ggml_sycl_op_mul_mat_sycl, so labelling it WoQ unconditionally
+            // named a path that does not run.
+            decision.onednn_path = ggml_sycl_onednn_woq_q8_enabled() ? OneDnnPath::WoQ : OneDnnPath::DequantFp16;
         }
     };
 
@@ -58822,10 +58974,16 @@ MatmulDecision UnifiedMatmulOrchestrator::select(const ggml_tensor *            
                     layout_kernel = ggml_sycl_mul_mat_kernel::MMVQ_SOA;
 #if GGML_SYCL_DNNL
                 } else if (src0->type == GGML_TYPE_Q8_0 && ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
-                           ggml_sycl_onednn_woq_q8_enabled()) {
-                    // llama.cpp-nz1k: opt-in oneDNN WoQ-int8 arm for SOA Q8_0 PP
-                    // batches (GGML_SYCL_ONEDNN_WOQ_Q8=1). Default lands on
-                    // MMQ_SOA exactly as before.
+                           ggml_sycl_q8_0_onednn_soa_enabled()) {
+                    // llama.cpp-pktr: default-ON oneDNN arm for SOA Q8_0 PP
+                    // batches (opt out with GGML_SYCL_Q8_ONEDNN_SOA=0), so
+                    // tile-misaligned dense weights the pktr layout rule now
+                    // materializes SOA (e.g. gemma4-E4B K=2560) reach oneDNN
+                    // GEMM parity instead of MMQ_SOA (~3 TFLOPS). The
+                    // WoQ-int8 int8-plane path inside ggml_sycl_op_mul_mat_sycl
+                    // is separately gated by GGML_SYCL_ONEDNN_WOQ_Q8 (default
+                    // OFF); with it off this kernel choice still serves PP via
+                    // that function's SOA-aware f16 dequant + row_gemm fallback.
                     layout_kernel = ggml_sycl_mul_mat_kernel::ONEDNN_SOA;
 #endif
                 } else {

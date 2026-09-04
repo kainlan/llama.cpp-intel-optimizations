@@ -21903,26 +21903,46 @@ static size_t planner_layout_bytes_for_expert(const placement_tensor_info & tens
     return planner_layout_bytes_for_dims(tensor.type, tensor.ne[0], tensor.ne[1], layout, fallback_bytes);
 }
 
+// llama.cpp-pktr: shared by both planner_default_device_layout overloads
+// below -- demotes a COALESCED resolution to SOA for a tile-misaligned
+// Q8_0 dense row, mirroring ggml_sycl_adjust_layout_for_tensor's runtime
+// net (ggml-sycl.cpp). See the comment on the first overload below for why
+// this planning-time mirror matters.
+static ggml_layout_mode planner_demote_coalesced_if_misaligned(ggml_layout_mode layout, ggml_type type, int64_t ne00) {
+    if (layout == GGML_LAYOUT_COALESCED && type == GGML_TYPE_Q8_0 && !ggml_sycl_q8_0_coalesced_tile_aligned(ne00)) {
+        return GGML_LAYOUT_SOA;
+    }
+    return layout;
+}
+
 // llama.cpp-os8k: same scoping as ggml_sycl_adjust_layout_for_tensor in
 // ggml-sycl.cpp, through the shared ggml_sycl_is_canonical_tied_embedding_name
 // (common.hpp) -- infer_tensor_usage()'s EMBEDDING match is a bare
 // strstr(name, "token_embd") substring, so it also covers gemma3n/gemma4's
 // "per_layer_token_embd.weight", a much larger GET_ROWS-only table.
 //
-// Defensive, NOT load-bearing today: dense non-layer weights never reach
-// planner_default_device_layout(). The tensor_info overload is only called
-// under `n_experts > 0 && usage == MOE_EXPERT_WEIGHT`; of the entry overload's
-// callers, two skip `expert_id < 0` and the dense-only one skips
-// `entry.layer_id < 0` -- and p4_extract_layer_id() returns -1 for any name
-// without "blk.", which is both token_embd.weight and per_layer_token_embd.
-// They take the hard-coded `entry.layout = GGML_LAYOUT_AOS` dense path
-// instead, which charges AOS bytes == SOA bytes, so nothing drifts against
-// the runtime's SOA choice for the head. The guard exists so that wiring
-// dense weights through this function later cannot re-open the
-// per_layer_token_embd leak; whoever does that must also mirror
-// ggml_sycl_adjust_layout_for_tensor's tile-alignment net here, because
-// planner_layout_bytes_coalesced_for_dims() charges whole 32-block tiles
-// (~19% over for a K=2560 head).
+// Defensive, NOT load-bearing for EMBEDDING/OUTPUT_WEIGHT today: dense
+// non-layer weights never reach planner_default_device_layout(). The
+// tensor_info overload is only called under `n_experts > 0 && usage ==
+// MOE_EXPERT_WEIGHT`; of the entry overload's callers, two skip
+// `expert_id < 0` and p4_extract_layer_id() returns -1 for any name without
+// "blk.", which is both token_embd.weight and per_layer_token_embd -- so
+// EMBEDDING/OUTPUT_WEIGHT entries take the hard-coded `entry.layout =
+// GGML_LAYOUT_AOS` dense path instead, which charges AOS bytes == SOA bytes,
+// so nothing drifts against the runtime's SOA choice for the head.
+//
+// llama.cpp-pktr: this IS load-bearing for ATTENTION_WEIGHT/FFN_WEIGHT, in
+// MULTI-DEVICE planning specifically -- the entry overload's dense
+// re-placement caller (add_no_p2p_candidate_dense_alternates) reaches that
+// overload for per-layer dense weights (`entry.layer_id >= 0`), but only
+// when it itself runs, gated on `use_cohesive_no_p2p_moe && n_layers > 0 &&
+// device_budgets.size() > 1`. A single-device plan never invokes that
+// caller, so agreement there is an accident of the path not running at
+// all, not evidence the mirror above (planner_demote_coalesced_if_misaligned)
+// is unneeded. This chokepoint must mirror ggml_sycl_adjust_layout_for_tensor's
+// tile-alignment predicate (ggml_sycl_q8_0_coalesced_tile_aligned,
+// common.hpp) or its byte-charging and re-placement decisions target a
+// layout runtime never materializes -- the drift this comment warns about.
 static ggml_layout_mode planner_default_device_layout(const placement_tensor_info & tensor,
                                                       tensor_usage                  usage,
                                                       int                           device_id) {
@@ -21949,7 +21969,8 @@ static ggml_layout_mode planner_default_device_layout(const placement_tensor_inf
             !ggml_sycl_is_canonical_tied_embedding_name(tensor.name.c_str())) {
             return GGML_LAYOUT_AOS;
         }
-        const ggml_layout_mode layout = layout_policy::get_optimal(tensor.type, usage, device_id);
+        const ggml_layout_mode layout = planner_demote_coalesced_if_misaligned(
+            layout_policy::get_optimal(tensor.type, usage, device_id), tensor.type, tensor.ne[0]);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
         }
@@ -21979,7 +22000,8 @@ static ggml_layout_mode planner_default_device_layout(const placement_entry & en
             !ggml_sycl_is_canonical_tied_embedding_name(entry.name.c_str())) {
             return GGML_LAYOUT_AOS;
         }
-        const ggml_layout_mode layout = layout_policy::get_optimal(entry.type, usage, device_id);
+        const ggml_layout_mode layout = planner_demote_coalesced_if_misaligned(
+            layout_policy::get_optimal(entry.type, usage, device_id), entry.type, entry.ne[0]);
         if (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_COALESCED) {
             return layout;
         }
