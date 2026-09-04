@@ -87,7 +87,10 @@
 #include "ggml.h"
 #include "test-skip.h"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -388,12 +391,17 @@ static void run_shape(ggml_backend_t backend, const char * label, int ncols, int
     compare("soa-vs-coalesced", soa, coalesced, kernel_rel_tol, kernel_abs_tol);
 }
 
-int main() {
-    // ctest supplies ONEAPI_DEVICE_SELECTOR via the registration's ENVIRONMENT; this is
-    // only a fallback for bare invocation and must be set before the SYCL runtime
-    // enumerates devices (unpinned, the iGPU's 231 GB "VRAM" is claimed -- llama.cpp-403s).
+int main(int, char ** argv) {
+    // ctest supplies ONEAPI_DEVICE_SELECTOR via the registration's ENVIRONMENT. Bare
+    // invocation falls back to the B50, but setenv() here is too late: libccl's static
+    // initializer constructs a sycl::event at load, which makes libsycl memoize the
+    // selector before main() runs (llama.cpp-2x3m, gdb-traced 2026-09-04). Re-exec so
+    // the child starts with the variable set (llama.cpp-403s: unpinned, the iGPU's
+    // 231 GB "VRAM" is claimed).
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
+        execv("/proc/self/exe", argv);
+        std::fprintf(stderr, "warning: re-exec failed (%s); continuing unpinned\n", std::strerror(errno));
     }
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
