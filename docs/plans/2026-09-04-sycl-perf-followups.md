@@ -24,7 +24,7 @@
 | Track | Tasks | Description |
 |-------|-------|-------------|
 | L | L1, L2, L3, L4 | P1: compute-buffer extra leak → prefill collapse past one ubatch; long-prompt baselines |
-| E | S1, S2, S3, S4, S5 | Small fixes: tolerance predicate, selector fallback + doc row, comment polish, slow-mode capture script, bench-guard tmpfs |
+| E | S1, S2, S3, S4, S5, S6 (added 2026-09-04) | Small fixes: tolerance predicate, selector fallback + doc row, comment polish, slow-mode capture script, bench-guard tmpfs |
 | C | P1, P2, P3, P4 | Profiler coverage for Q4_0 decode; gemma4 decode tail (F32 matvec, D=512 attention, norm-fusion spike) |
 | D | G1, G2 | GPT-OSS decode: gate/up occupancy sweep, CU-scaled K-split |
 | F | G3, G4, G5, G6, G7, G8 | MXFP4 prefill option C: oracle → small-M SOA → large-M SOA → XMX_TILED → dispatch (opt-in) → default flip |
@@ -326,6 +326,18 @@ git commit -m "test(sycl): per-element tolerance in test-q8-0-layout-cache-path-
 ---
 
 ### Task S2: Device-selector fallback in `test-sycl-mmvq-q8-0-soa-numerics` and the ONEDNN_SOA doc row (llama.cpp-wti1)
+
+> **Amendment 2026-09-04 (execution, llama.cpp-2x3m c-oftt / c-tb0e):** two corrections to the text below.
+> (1) The RED probe `grep -c 'Arrow Lake'` returns 0 even when the iGPU is enumerated: the runtime names it
+> `Intel Graphics`; probe `grep -c 'level_zero:gpu:2'` (1 when unpinned) instead. (2) The prescribed
+> `if (!getenv) setenv(...)` prologue (the `test-sycl-zone-reset-live-refusal.cpp:258-265` form) is a
+> silent no-op in every binary linked against `libccl.so.1`: oneCCL's static initializer
+> (`_GLOBAL__sub_I_comm.cpp`) constructs a `sycl::event` at load, so libsycl memoizes
+> `ONEAPI_DEVICE_SELECTOR` before `main()` (gdb-traced). The landed form re-execs:
+> `int main(int, char ** argv)`; if unset, `setenv(...) == 0 && execv("/proc/self/exe", argv)`, warn and
+> fall through on failure. The twenty siblings carrying the old form are fail-open the same way; that sweep is
+> **Task S6** (llama.cpp-5q1r, Track E, depends on S2), not part of S2.
+
 
 **Track:** E
 **Depends on:** None
