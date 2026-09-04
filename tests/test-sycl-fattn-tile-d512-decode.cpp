@@ -42,23 +42,45 @@
 // each of those n_kv values still produces a numerically correct kernel
 // after any tiering change under test.
 //
-// COVERAGE ADDED FOR THE ESIMD TIER (spec review llama.cpp-zwsj/c-7iey,
-// findings 2 and 4): the ESIMD decode tier (llama.cpp-zwsj Phase 2) engages
-// at ne01<=8, not just ne01=1 -- a 2..8-token ubatch (speculative-decode
-// step) is a real, reachable shape this file's original ne01=1-only
-// coverage never exercised, and `launch_fattn_esimd_f16_optimized`'s
-// per-query mask indexing (`stride_mask * query_idx`, fattn-esimd-f16.hpp)
-// was entirely untested since every case passed mask=nullptr. One case
-// below uses ne01=4 WITH a real per-query causal-style mask (query qr may
-// see kv positions <= n_kv-ne01+qr, matching a genuine speculative-decode
-// causal pattern; masked positions carry -10000.0f, matching this fork's
-// bench_sycl_fattn_gptoss.cpp convention). Separately, H_kv=1 (this file's
-// only GQA shape until now) makes kv_head = head/gqa_ratio identically 0
-// for every one of the 8 Q heads, so a wrong head-mapping bug in the
-// ESIMD kernel's own gqa_ratio/kv_head computation (fattn-esimd-f16.hpp,
-// independent of the tile kernel's) would be undetectable; one case below
-// uses H_q=8/H_kv=2 (gqa_ratio=4) so a mis-mapped head produces an
-// observable difference.
+// COVERAGE ADDED FOR THE ESIMD TIER, ROUND 1 (spec review llama.cpp-zwsj/
+// c-7iey, findings 2 and 4): `launch_fattn_esimd_f16_optimized`'s per-query
+// mask indexing (`stride_mask * query_idx`, fattn-esimd-f16.hpp) was
+// entirely untested (every case passed mask=nullptr), and H_kv=1 (this
+// file's only GQA shape until then) makes kv_head = head/gqa_ratio
+// identically 0 for every one of the 8 Q heads, so a wrong head-mapping
+// bug in the ESIMD kernel's own gqa_ratio/kv_head computation would be
+// undetectable. Round 1 added an ne01=4 case with a real per-query
+// causal-style mask (query qr may see kv positions <= n_kv-ne01+qr,
+// matching a genuine speculative-decode causal pattern; masked positions
+// carry -10000.0f, matching this fork's bench-sycl-fattn-gptoss.cpp
+// convention) and an H_q=8/H_kv=2 (gqa_ratio=4) case.
+//
+// ROUND 2, A REAL DEFECT (spec review llama.cpp-zwsj/c-7iey round 2,
+// finding A): running round 1's ne01=4+mask case on hardware found
+// launch_fattn_esimd_f16_optimized<512,...> returns GARBAGE for it (94%
+// of elements wrong, max_diff ~1.6) while the tile kernel agrees with the
+// same CPU reference to ~3.6e-3 (its own known f16 precision floor, not a
+// defect) -- proving the reference and mask construction are correct and
+// the ESIMD D=512 dispatch is wrong for ne01>1. The plan's ne01<=8
+// engagement range for the ESIMD tier could not be verified correct
+// without hardware to debug it against, so fattn.cpp's D==512 branch was
+// narrowed to engage the ESIMD tier at ne01==1 ONLY -- a dispatch refusal,
+// not a kernel fix -- and ne01 in 2..8 now falls through to the tile route
+// unconditionally (see that file's finding-A comment for the full
+// reasoning, including why this is also gemma4's actual production
+// decode shape). Two consequences for THIS file's coverage:
+//   - The ne01=4+mask case now tests the REFUSAL BOUNDARY, not the ESIMD
+//     tier's multi-query correctness: both toggle states must now route
+//     it through the (unchanged) tile kernel and agree with each other
+//     and the reference within tolerance.
+//   - The production shape (ne01=1 WITH a mask -- llama always passes a
+//     KQ mask to flash attention, even at single-token decode) had NEVER
+//     been tested; two new cases add it at n_kv=512 and n_kv=4096. A plain
+//     causal mask at ne01=1 sees every kv position (visible_upto=n_kv-1),
+//     a no-op, so these cases pass a `window` narrower than n_kv,
+//     masking out the leading half of positions -- matching a
+//     sliding-window layer and genuinely exercising the mask path (see
+//     build_causal_like_mask()'s comment).
 //
 // REFERENCE: double-precision CPU softmax(scale * Q K^T) V, transcribed
 // directly (no shared code with the kernel or with any other reference
@@ -70,41 +92,71 @@
 // F32 Q; K/V are F16, the only type ggml_sycl_fattn_d512_tile_admissible()
 // accepts).
 //
-// TOLERANCE: `1e-3 + 1e-3*|ref|` per element, per this task's own acceptance
-// criterion -- generous relative to test-sycl-mmvq-q8-0-soa-numerics.cpp's
-// `1e-3/1e-2` precedent for a similarly reduced-precision GPU accumulation,
-// because flash_attn_tile<>'s VKQ accumulator is sycl::half2 under
-// SYCL_FAST_FP16 (always true in this build; CLAUDE.md's GGML_SYCL_F16=ON
-// note), not f32 -- a whole-context weighted sum of V accumulated in f16 at
-// n_kv=4096 is expected to carry more rounding error than a single Q8_0 x
-// Q8_1 dot product does, and the ticket's own acceptance line spells out
-// this tolerance rather than leaving it to be re-derived.
+// METRIC (spec review llama.cpp-zwsj/c-7iey round 2, finding B -- REPLACES
+// the round-1 per-element `1e-3 + 1e-3*|ref|` predicate entirely): hardware
+// testing at the round-1 amplitude (below) found the tile kernel's own
+// correct f16 accumulation error is 2.0e-3 to 5.0e-3 ABSOLUTE on |out| in
+// the 0.3-0.9 range -- 2 to 5x the round-1 abs tolerance -- so that
+// predicate FAILED THE CORRECT TILE KERNEL on every single case. Per-
+// element tolerance and mutant-sensitivity are in direct tension here: the
+// tile kernel's real error is concentrated in a SMALL FRACTION of elements
+// (4/4096 to 411/16384 observed, i.e. 0.1%-2.5%) with occasional larger
+// deviations, so any per-element bound loose enough to admit that outlier
+// tail is also loose enough to admit a UNIFORM few-percent multiplicative
+// bug in every element, since the two error shapes look identical to a
+// max-diff-based check.
 //
-// DISCRIMINATING DATA (spec review llama.cpp-zwsj/c-7iey, finding 3): Q/K
-// magnitude is deliberately wide (U(-3,3), not the original U(-0.1,0.1))
-// so the QK logits actually spread -- at the old amplitude the softmax was
+// The fix is to compare on NMSE (normalized mean squared error,
+// `mse(ref,got)/mse(ref,0)`) instead -- the exact metric and comparator
+// tests/test-backend-ops.cpp uses for GGML_OP_FLASH_ATTN_EXT
+// (`test_flash_attn_ext::max_nmse_err()` = 5e-4) -- because NMSE aggregates
+// over the WHOLE output vector: a sparse outlier tail contributes only its
+// own small fraction to the sum (numerically small even when individual
+// diffs are 5e-3), while a uniform multiplicative bug contributes to EVERY
+// term and is scale-invariant by construction (a 1% multiplicative error
+// has NMSE = 0.01^2 = 1e-4 exactly, regardless of n_kv or amplitude -- this
+// also makes the round-1 "degenerate near-zero reference" concern moot for
+// the NMSE term itself, since NMSE is already normalized by the reference's
+// own scale). A GROSS per-element check (any single |diff| > 0.05) is kept
+// alongside NMSE specifically to catch finding A's failure mode (94% wrong,
+// max_diff ~1.6) even if some future shape's NMSE were diluted by a huge N.
+//
+// Threshold chosen: NMSE <= 5e-4, matching upstream's own precedent for
+// this exact op family (not a value invented for this file). Verified with
+// the mutant the review specified (scratch-only, not committed): a
+// standalone host program computed the SAME double-precision reference
+// (same RNG seeds, same amplitude below) and simulated an ESIMD-tier
+// output scaled by 1.01x (a uniform 1% multiplicative bug). Its NMSE is
+// EXACTLY 1e-4 at every n_kv (mathematically -- (scale-1)^2, independent
+// of amplitude or shape) -- 5x BELOW the 5e-4 threshold. This is an HONEST
+// LIMIT, not an oversight: matching a pessimistic per-element analysis of
+// the tile kernel's own reported (violations, max_diff) data at n_kv=4096
+// (177/4096 elements at up to 5.04e-3 abs, on a reference whose own
+// mse(ref,0) is 1.02e-2) gives an NMSE upper bound in the SAME 1e-4-to-3e-4
+// neighbourhood -- i.e. at large n_kv, a uniform 1% bias and this fork's
+// OWN correct f16 tile-kernel noise are not reliably separable by ANY
+// per-vector norm, because their aggregate magnitudes coincide. This is
+// not unique to this file: upstream's own 5e-4 threshold for the identical
+// op would not reliably separate them either. What NMSE (plus the gross
+// check) DOES robustly catch is finding A's class of defect -- for that
+// failure NMSE is far above 1.0 (order-of-magnitude wrong on 94% of
+// elements) and the gross check trips immediately (max_diff ~1.6 >> 0.05)
+// -- which is this guard's actual job; a 1%-level regression on a landed,
+// numerically-stable kernel is caught instead by the byte-identical
+// gemma4 completion gate the lead runs separately (both toggle states
+// verified identical in c-rbbd), not by this file's per-shape NMSE.
+//
+// AMPLITUDE (spec review llama.cpp-zwsj/c-7iey round 1, finding 3): Q/K
+// magnitude is deliberately wide (U(-3,3), not U(-0.1,0.1)) so the QK
+// logits actually spread -- at the narrow amplitude the softmax was
 // essentially uniform (logit stddev ~3.3e-3) and the output collapsed to
-// the plain mean of n_kv V samples, which SHRINKS as n_kv grows (law of
-// large numbers): |ref| ~1.0e-2 at n_kv=32 but ~9.0e-4 at n_kv=4096 --
-// smaller than the 1e-3 absolute floor itself, so a several-percent kernel
-// error was mathematically invisible at the largest n_kv case, the one
-// this file exists to cover. Widening Q/K raises the logit stddev to
-// ~O(1), which makes the softmax genuinely peaked (the max logit among
-// n_kv samples grows with n_kv too, via extreme-value scaling, so peakedness
-// does not degrade at large n_kv either) -- the output then tracks a
-// dominant V sample's magnitude (~O(1), V ~ U(-1,1)) rather than an
-// n_kv-shrinking average. run_shape() asserts `max|ref| >= 100*abs_tol` for
-// exactly this reason: a degenerate near-zero reference must fail the guard
-// by construction, not silently pass on the tolerance floor. Verified with
-// the mutant the review specified (scratch-only, not committed): scaling a
-// simulated kernel output by 1.01x relative to the reference (H_q=8,
-// H_kv=1, no mask). At the OLD amplitude (Q/K/V all U(-0.1,0.1)): max|ref|
-// 3.6e-2/7.6e-3/2.6e-3 and 0/4096 violations at every one of n_kv in
-// {32,512,4096} -- invisible, matching the review's own estimate. At the
-// NEW amplitude (Q/K U(-3,3), V U(-1,1)): max|ref| 8.9e-1/6.7e-1/3.2e-1
-// and 3010/2282/1104 violations out of 4096 at the same three n_kv values
-// -- the identical 1% mutant is now caught at every point, and every
-// max|ref| clears the 100*abs_tol=0.1 floor by 3x-9x.
+// the plain mean of n_kv V samples, degenerate for a DIFFERENT reason NMSE
+// does not fix: it barely exercises the softmax/max-tracking mechanism at
+// all (any reasonable "average of V" implementation would pass). Widening
+// Q/K raises the logit stddev to ~O(1), making the softmax genuinely
+// peaked at every n_kv and the output track a dominant V sample's
+// magnitude (V ~ U(-1,1)) -- a real exercise of the attention mechanism,
+// independent of the metric-choice fix above.
 //
 // DISPATCH VISIBILITY: this file does not assert which named kernel ran --
 // that is the lead's job, either from a GGML_SYCL_KERNEL_PROFILE capture
@@ -192,23 +244,34 @@ static void fill_f16_random(std::vector<ggml_fp16_t> & out, int64_t n, std::mt19
     }
 }
 
-// A genuine speculative-decode-style causal mask: query row qr (0-indexed,
-// out of ne01) may see kv positions t <= n_kv - ne01 + qr, i.e. the ne01
-// queries occupy the LAST ne01 kv-cache slots in order, each seeing
-// everything up to and including its own slot. This masks a different,
-// growing prefix of positions for higher qr -- a real per-query pattern,
-// not a uniform stand-in for "no mask". Masked positions carry -10000.0f
-// (matching this fork's bench-sycl-fattn-gptoss.cpp convention); visible
-// positions carry 0.0f. Layout ne=[n_kv, ne01, 1, 1] contiguous (flat index
-// t + n_kv*qr), matching what ggml_flash_attn_ext's own mask-shape asserts
-// require here (mask->ne[2]=1 divides Q->ne[2]=H_q trivially; mask->ne[3]=1
-// divides Q->ne[3]=1).
-static void build_causal_like_mask(std::vector<ggml_fp16_t> & out, int n_kv, int ne01) {
+// A genuine speculative-decode-style causal (optionally windowed) mask:
+// query row qr (0-indexed, out of ne01) may see kv positions in
+// [visible_from, visible_upto] where visible_upto = n_kv - ne01 + qr (the
+// ne01 queries occupy the LAST ne01 kv-cache slots in order, each seeing
+// everything up to and including its own slot) and visible_from =
+// max(0, visible_upto - window + 1). `window` defaults to n_kv (no lower
+// bound -- plain causal, masking a different, growing SUFFIX of positions
+// for higher qr); a smaller window ALSO masks a PREFIX, matching a
+// sliding-window layer -- the only way to exercise the mask path at
+// ne01=1 at all, since a plain causal mask at ne01=1 sees every position
+// (visible_upto = n_kv-1) and is a no-op. Masked positions carry
+// -10000.0f (matching this fork's bench-sycl-fattn-gptoss.cpp convention);
+// visible positions carry 0.0f. Layout ne=[n_kv, ne01, 1, 1] contiguous
+// (flat index t + n_kv*qr), matching what ggml_flash_attn_ext's own
+// mask-shape asserts require here (mask->ne[2]=1 divides Q->ne[2]=H_q
+// trivially; mask->ne[3]=1 divides Q->ne[3]=1).
+static void build_causal_like_mask(std::vector<ggml_fp16_t> & out, int n_kv, int ne01, int window = -1) {
+    if (window <= 0 || window > n_kv) {
+        window = n_kv;
+    }
     out.assign((size_t) n_kv * ne01, ggml_fp32_to_fp16(0.0f));
     for (int qr = 0; qr < ne01; ++qr) {
-        const int visible_upto = n_kv - ne01 + qr;  // inclusive
-        for (int t = visible_upto + 1; t < n_kv; ++t) {
-            out[(size_t) t + (size_t) n_kv * qr] = ggml_fp32_to_fp16(-10000.0f);
+        const int visible_upto = n_kv - ne01 + qr;                        // inclusive
+        const int visible_from = std::max(0, visible_upto - window + 1);  // inclusive
+        for (int t = 0; t < n_kv; ++t) {
+            if (t < visible_from || t > visible_upto) {
+                out[(size_t) t + (size_t) n_kv * qr] = ggml_fp32_to_fp16(-10000.0f);
+            }
         }
     }
 }
@@ -282,33 +345,43 @@ static void compute_reference(const std::vector<float> &       Q,
     }
 }
 
-// Per-element |got-ref| <= abs_tol + rel_tol*|ref| with a violation counter,
-// matching test-sycl-mmvq-q8-0-soa-numerics.cpp's compare() convention.
-static void compare(const char *               what,
-                    const std::vector<float> & got,
-                    const std::vector<float> & ref,
-                    float                      rel_tol,
-                    float                      abs_tol) {
+// NMSE (mse(ref,got)/mse(ref,0)) plus a gross per-element check, replacing
+// the round-1 per-element |got-ref| <= abs_tol + rel_tol*|ref| predicate --
+// see the file header "METRIC" note for why (round 2, finding B: that
+// predicate failed the CORRECT tile kernel on hardware). NMSE_MAX matches
+// tests/test-backend-ops.cpp's test_flash_attn_ext::max_nmse_err() for the
+// SAME op; GROSS_ABS_MAX exists only to catch a finding-A-class failure
+// (a wrong dispatch/kernel, not a precision difference) even if NMSE were
+// ever diluted by a very large output vector.
+static constexpr double NMSE_MAX      = 5e-4;
+static constexpr float  GROSS_ABS_MAX = 0.05f;
+
+static void compare(const char * what, const std::vector<float> & got, const std::vector<float> & ref) {
     if (got.empty() || ref.empty() || got.size() != ref.size()) {
         std::printf("FAIL [%s]: size mismatch or missing output (got=%zu ref=%zu)\n", what, got.size(), ref.size());
         ++g_failures;
         return;
     }
-    float  max_diff   = 0.0f;
-    float  max_rel    = 0.0f;
-    size_t violations = 0;
+    double mse_diff = 0.0;
+    double mse_ref  = 0.0;
+    float  max_diff = 0.0f;
     for (size_t i = 0; i < got.size(); ++i) {
-        const float diff = std::fabs(got[i] - ref[i]);
-        max_diff         = std::max(max_diff, diff);
-        const float rel  = std::fabs(ref[i]) > 1e-6f ? diff / std::fabs(ref[i]) : diff;
-        max_rel          = std::max(max_rel, rel);
-        if (diff > abs_tol + rel_tol * std::fabs(ref[i])) {
-            ++violations;
-        }
+        const double diff = (double) got[i] - (double) ref[i];
+        mse_diff += diff * diff;
+        mse_ref += (double) ref[i] * (double) ref[i];
+        max_diff = std::max(max_diff, (float) std::fabs(diff));
     }
-    const bool ok = violations == 0;
-    std::printf("%s [%s]: max_diff=%.6e max_rel=%.6e violations=%zu/%zu (tol rel=%.1e abs=%.1e)\n", ok ? "OK" : "FAIL",
-                what, max_diff, max_rel, violations, got.size(), rel_tol, abs_tol);
+    if (mse_ref <= 0.0) {
+        std::printf("FAIL [%s]: degenerate all-zero reference -- NMSE denominator is zero\n", what);
+        ++g_failures;
+        return;
+    }
+    const double nmse     = mse_diff / mse_ref;
+    const bool   nmse_ok  = nmse <= NMSE_MAX;
+    const bool   gross_ok = max_diff <= GROSS_ABS_MAX;
+    const bool   ok       = nmse_ok && gross_ok;
+    std::printf("%s [%s]: nmse=%.6e (max %.1e) max_diff=%.6e (gross max %.2f) n=%zu\n", ok ? "OK" : "FAIL", what, nmse,
+                NMSE_MAX, max_diff, (double) GROSS_ABS_MAX, got.size());
     if (!ok) {
         ++g_failures;
     }
@@ -317,9 +390,20 @@ static void compare(const char *               what,
 // ne01=1, use_mask=false is the original decode-shaped, mask-free case;
 // ne01>1 and/or use_mask=true exercise the coverage the spec review added
 // (findings 2 and 4 -- see the file header "COVERAGE ADDED FOR THE ESIMD
-// TIER" note).
-static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv, int ne01 = 1, bool use_mask = false) {
-    std::printf("== shape D=%d H_q=%d H_kv=%d n_kv=%d ne01=%d mask=%d ==\n", D, H_q, H_kv, n_kv, ne01, (int) use_mask);
+// TIER" notes). `window` (default -1 = plain causal, no lower bound) is
+// forwarded to build_causal_like_mask() -- pass a value < n_kv to also mask
+// a PREFIX, the only way to exercise the mask path at ne01=1 (see that
+// function's comment).
+static void run_shape(ggml_backend_t backend,
+                      int            D,
+                      int            H_q,
+                      int            H_kv,
+                      int            n_kv,
+                      int            ne01     = 1,
+                      bool           use_mask = false,
+                      int            window   = -1) {
+    std::printf("== shape D=%d H_q=%d H_kv=%d n_kv=%d ne01=%d mask=%d window=%d ==\n", D, H_q, H_kv, n_kv, ne01,
+                (int) use_mask, window);
 
     std::mt19937 rng(0xd512u ^ ((unsigned) n_kv * 2654435761u) ^ ((unsigned) H_q * 40503u) ^
                      ((unsigned) H_kv * 0x9e3779b9u) ^ ((unsigned) ne01 * 0x85ebca6bu));
@@ -328,19 +412,18 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
     std::vector<ggml_fp16_t> k_data;
     std::vector<ggml_fp16_t> v_data;
     // Wide magnitude (spec review llama.cpp-zwsj/c-7iey, finding 3 -- see
-    // the file header "DISCRIMINATING DATA" note): U(-0.1,0.1) made the
-    // softmax near-uniform and the reference collapse to an n_kv-shrinking
-    // average, invisible to the tolerance floor at large n_kv. Q/K at
-    // U(-3,3) gives a logit stddev of order 1, a genuinely peaked softmax at
-    // every n_kv, and an output magnitude that tracks V's amplitude
-    // (U(-1,1)) instead of shrinking.
+    // the file header "AMPLITUDE" note): U(-0.1,0.1) made the softmax
+    // near-uniform, barely exercising the softmax/max-tracking mechanism.
+    // Q/K at U(-3,3) gives a logit stddev of order 1, a genuinely peaked
+    // softmax at every n_kv, and an output magnitude that tracks V's
+    // amplitude (U(-1,1)) instead of collapsing to an averaged mean.
     fill_f32_random(q_data, (int64_t) D * ne01 * H_q, rng, -3.0f, 3.0f);
     fill_f16_random(k_data, (int64_t) D * n_kv * H_kv, rng, -3.0f, 3.0f);
     fill_f16_random(v_data, (int64_t) D * n_kv * H_kv, rng, -1.0f, 1.0f);
 
     std::vector<ggml_fp16_t> mask_data;
     if (use_mask) {
-        build_causal_like_mask(mask_data, n_kv, ne01);
+        build_causal_like_mask(mask_data, n_kv, ne01, window);
     }
 
     const float scale = 1.0f / std::sqrt((float) D);
@@ -348,26 +431,14 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
     std::vector<float> ref;
     compute_reference(q_data, k_data, v_data, use_mask ? &mask_data : nullptr, D, H_q, H_kv, n_kv, ne01, scale, ref);
 
-    // Fail-closed floor (spec review llama.cpp-zwsj/c-7iey, finding 3): a
-    // degenerate near-zero reference must never let the comparison below
-    // pass by construction on the tolerance floor alone. abs_tol is 1e-3
-    // (see the compare() call below); 100x it is the same floor the review
-    // specified.
-    float max_abs_ref = 0.0f;
-    for (float v : ref) {
-        max_abs_ref = std::max(max_abs_ref, std::fabs(v));
-    }
-    char label[96];
-    std::snprintf(label, sizeof(label), "D512-decode-vs-cpu-reference n_kv=%d ne01=%d H_kv=%d mask=%d", n_kv, ne01,
-                  H_kv, (int) use_mask);
-    if (max_abs_ref < 100.0f * 1e-3f) {
-        std::printf(
-            "FAIL [%s]: degenerate reference, max|ref|=%.6e < 1.0e-01 (100*abs_tol) -- fixture "
-            "produced a near-zero signal that would let the tolerance floor pass vacuously\n",
-            label, max_abs_ref);
-        ++g_failures;
-        return;
-    }
+    // No separate degeneracy-floor check here (round 1 had one, keyed off
+    // the old per-element abs_tol): NMSE is already normalized by the
+    // reference's own scale, so compare() below detects a genuinely
+    // all-zero reference on its own (mse_ref <= 0.0) -- see the file
+    // header "METRIC" note.
+    char label[112];
+    std::snprintf(label, sizeof(label), "D512-decode-vs-cpu-reference n_kv=%d ne01=%d H_kv=%d mask=%d window=%d", n_kv,
+                  ne01, H_kv, (int) use_mask, window);
 
     ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
@@ -458,9 +529,9 @@ static void run_shape(ggml_backend_t backend, int D, int H_q, int H_kv, int n_kv
 
     cleanup();
 
-    // 1e-3 + 1e-3*|ref| per element -- this task's own acceptance criterion;
-    // see the file header for why it is looser than the Q8_0 MMVQ precedent.
-    compare(label, gpu_output, ref, /*rel_tol=*/1e-3f, /*abs_tol=*/1e-3f);
+    // NMSE + gross check -- see the file header "METRIC" note for why this
+    // replaced the round-1 per-element abs/rel tolerance.
+    compare(label, gpu_output, ref);
 }
 
 // Runs the full n_kv sweep against whichever D=512 decode route the CURRENT
@@ -488,14 +559,32 @@ static int run_state_in_current_process(const char * state_label) {
     run_shape(backend, D, H_q, H_kv, 32);
     run_shape(backend, D, H_q, H_kv, 512);
     run_shape(backend, D, H_q, H_kv, 4096);
-    // Spec review llama.cpp-zwsj/c-7iey finding 2: ne01=4 (speculative-decode-
-    // shaped ubatch, within the tier's ne01<=8 engagement range) WITH a real
-    // per-query mask, exercising the ESIMD kernel's per-query mask indexing.
+    // Spec review llama.cpp-zwsj/c-7iey round 2, finding A: the PRODUCTION
+    // decode shape -- ne01=1 WITH a mask (llama always passes a KQ mask to
+    // flash attention, even at single-token decode) -- had never been
+    // tested. A plain causal mask at ne01=1 sees every kv position (a
+    // no-op), so `window` restricts visibility to the last half of n_kv,
+    // matching a sliding-window layer and genuinely exercising the mask
+    // path. This is the shape the ESIMD tier now engages on in production
+    // (ne01==1 only, after the finding-A dispatch refusal below).
+    run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/1, /*use_mask=*/true, /*window=*/256);
+    run_shape(backend, D, H_q, H_kv, 4096, /*ne01=*/1, /*use_mask=*/true, /*window=*/2048);
+    // Spec review llama.cpp-zwsj/c-7iey round 1, finding 2 / round 2, finding
+    // A: ne01=4 (speculative-decode-shaped ubatch) WITH a real per-query
+    // mask. Round 1 added this to exercise the ESIMD kernel's per-query mask
+    // indexing; running it on hardware found launch_fattn_esimd_f16_
+    // optimized<512,...> returns garbage for it (round 2, finding A -- see
+    // the file header). fattn.cpp's D==512 branch now engages the ESIMD
+    // tier at ne01==1 ONLY, so this shape is refused into the tile route
+    // REGARDLESS of the toggle -- this case now tests THAT refusal (both
+    // toggle states must agree with each other and the reference), not the
+    // ESIMD tier's multi-query correctness.
     run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/4, /*use_mask=*/true);
-    // Spec review llama.cpp-zwsj/c-7iey finding 4: H_kv=2 (gqa_ratio=4, not
-    // the degenerate kv_head==0-for-every-head case H_kv=1 gives), so a
-    // mis-mapped GQA head in the ESIMD kernel's own gqa_ratio/kv_head
-    // computation would be observable.
+    // Spec review llama.cpp-zwsj/c-7iey round 1, finding 4: H_kv=2
+    // (gqa_ratio=4, not the degenerate kv_head==0-for-every-head case
+    // H_kv=1 gives), so a mis-mapped GQA head in the ESIMD kernel's own
+    // gqa_ratio/kv_head computation would be observable. ne01=1 -- the only
+    // shape the ESIMD tier engages on after the finding-A narrowing.
     run_shape(backend, D, H_q, /*H_kv=*/2, 512);
 
     ggml_backend_free(backend);

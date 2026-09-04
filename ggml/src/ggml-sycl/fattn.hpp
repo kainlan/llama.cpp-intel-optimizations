@@ -61,14 +61,24 @@ bool ggml_sycl_fa_tile_d512_enabled();
 // flat in n_kv (115-134 us at n_kv in {32,128,512,2048}) -- a fixed
 // per-launch cost of one work-group doing the whole D=512 reduction
 // serially, not per-key work, so split-KV cannot help it. This variable
-// instead routes ne01<=8 D=512 calls to fattn_esimd_f16<512, float>()
+// instead routes ne01==1 D=512 calls to fattn_esimd_f16<512, float>()
 // (fattn-esimd-f16.hpp) -- the SAME partitioned decode kernel already
 // verified for D<=256 (its "optimized" variant has no D<=256-specific
 // branching; the D==128 special-casing in that header belongs to the
 // separate BATCHED prefill kernel, not this one), just newly instantiated
 // at D=512. Default **ON**; `=0` falls back to the tile route
-// unconditionally at any ne01. Prefill (ne01>8) is unaffected either way --
-// it always uses the tile route, which this variable does not touch.
+// unconditionally at any ne01.
+//
+// ⚠️ NARROWED FROM ne01<=8 TO ne01==1 (spec review llama.cpp-zwsj/c-7iey
+// round 2, finding A): hardware testing found launch_fattn_esimd_f16_
+// optimized<512,...> returns garbage for a real masked ne01=4 op (94% of
+// elements wrong) while ne01==1 measured correct on both cards. Root cause
+// (D=512-specific vs a latent bug shared with the D<=256 ESIMD multi-query
+// path, never exercised by any production caller before this ticket) is
+// NOT established -- see fattn.cpp's D==512 branch for the full note.
+// ne01 in 2..8 and prefill (ne01>8) both fall through to the tile route
+// unconditionally regardless of this switch, which this variable does not
+// touch.
 // Shared by the D==512 dispatch branch (fattn.cpp, caching it in its own
 // function-local static, mirroring ggml_sycl_fa_tile_d512_enabled()'s
 // call-site pattern) and the numerics test, which needs the live value
