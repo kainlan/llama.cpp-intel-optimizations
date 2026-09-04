@@ -34863,7 +34863,8 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
         // this WARN the same as it swallows GGML_LOG_INFO -- pass -v to see these lines there
         // (llama-cli/llama-completion print WARN at default verbosity, no flag needed).
         // ctx is loaded lazily below, inside the probe/debug guards, so the unset-env,
-        // debug-off hot path does no extra work beyond the cached bool test.
+        // debug-off hot path does no extra work beyond the magic-static guard load and the
+        // cached bool test.
         static const bool leak_probe = [] {
             const char * e = std::getenv("GGML_SYCL_EXTRA_LEAK_PROBE");
             return e != nullptr && e[0] == '1';
@@ -34874,10 +34875,16 @@ static void ggml_backend_sycl_buffer_reset(ggml_backend_buffer_t buffer) {
                 // preserved_total is a running SUM OF THE PER-CALL VECTOR SIZES, not a count of
                 // distinct leaked extras: the COMPUTE path never clears tensor_extras (the early
                 // return below skips the teardown loop), so `n` grows monotonically and this sum
-                // is a triangular series (~calls^2), not linear in bytes actually leaked. The MB
-                // figure is computed from THIS call's `n` only (the real per-decode leak
-                // estimate); sum_of_sizes is trailing diagnostic context -- never quote its MB
-                // equivalent as "leaked" and never compare it against RSS growth.
+                // is a triangular series (~calls^2), not linear in bytes actually leaked. It is
+                // also PROCESS-WIDE across ALL COMPUTE buffers (one function-local static),
+                // whereas `buf=%p` and `preserving` below are this call's single buffer --
+                // ggml_vbuffer_reset resets multiple chunks and ggml_gallocr_alloc_graph loops
+                // over buffer types, so several buf=%p values can appear per graph allocation.
+                // The MB figure is this call's `n` x sizeof -- the bytes CURRENTLY HELD by this
+                // buffer's extras vector, which is the figure to compare against RSS growth; the
+                // per-rebuild leak is the DELTA between consecutive lines, not this MB itself.
+                // sum_of_sizes is trailing diagnostic context only -- never quote its MB
+                // equivalent as "leaked".
                 static std::atomic<size_t> preserved_total{ 0 };
                 const size_t               n     = ctx->tensor_extras.size();
                 const size_t               total = preserved_total.fetch_add(n, std::memory_order_relaxed) + n;

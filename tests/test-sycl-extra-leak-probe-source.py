@@ -118,30 +118,60 @@ def ws_count(text, needle):
 
 
 def matching_paren(text, open_idx):
-    """String/escape-aware matching ')' for the '(' at open_idx (sibling of
-    matching_brace, needed to slice exactly one call expression instead of
-    stopping at the first ';' -- a printf-style format string can embed a ';'
-    of its own, which would truncate a naive slice before real arguments)."""
+    """Comment/string-aware matching ')' for the '(' at open_idx (sibling of
+    matching_brace above -- same "code"/"line"/"block"/"str"/"chr" states,
+    needed to slice exactly one call expression instead of stopping at the
+    first ';' -- a printf-style format string can embed a ';' of its own,
+    which would truncate a naive slice before real arguments). Without the
+    comment/char-literal states this used to have (spec review round 3, Q2),
+    a '//' comment or a ')' char literal inside the argument list either
+    raised a misleading "unbalanced parens" or truncated the slice early --
+    fail-open for any assertion on the truncated text."""
     assert text[open_idx] == "("
     depth = 0
     state = "code"
     i = open_idx
     while i < len(text):
         ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
         if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block"
+                i += 2
+                continue
             if ch == '"':
                 state = "str"
+            elif ch == "'":
+                state = "chr"
             elif ch == "(":
                 depth += 1
             elif ch == ")":
                 depth -= 1
                 if depth == 0:
                     return i
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
         elif state == "str":
             if ch == "\\":
                 i += 2
                 continue
             if ch == '"':
+                state = "code"
+        elif state == "chr":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
                 state = "code"
         i += 1
     raise AssertionError("unbalanced parens")
@@ -190,6 +220,13 @@ def test_probe_logs_at_warn_with_the_stable_tag():
     # Regression guard for the rename itself (llama.cpp-i0oh spec review round
     # 2, nit 3): `cumulative=` must not creep back into the probe block.
     assert "cumulative=" not in body, "the probe must not reintroduce the misleading 'cumulative=' field name"
+    # Pin the round-2 should-fix itself (spec review round 3, Q3): the printed
+    # MB must be computed from THIS call's `n`, not from the triangular
+    # sum_of_sizes running total -- a revert of just the MB argument (leaving
+    # the sum_of_sizes= field name alone) would otherwise stay green.
+    assert re.search(r"\(\s*double\s*\)\s*n\s*\*\s*sizeof", warn_call), (
+        "the MB figure must be computed from THIS call's n, not the triangular sum_of_sizes"
+    )
 
 
 def test_probe_is_zero_cost_when_the_env_var_is_unset():
@@ -204,7 +241,12 @@ def test_probe_is_zero_cost_when_the_env_var_is_unset():
     flag_idx = flag_match.start()
     warn_idx = body.find("GGML_LOG_WARN(")
     assert flag_idx < warn_idx, "the cached flag must be declared before the WARN call it gates"
-    if_idx = body.find("if (leak_probe", flag_idx)
+    # Whitespace-flexible, consistent with the regex four lines above (spec
+    # review round 3, Q6): an exact literal here is the same clang-format
+    # brittleness the file argues against just above it.
+    if_match = re.search(r"if\s*\(\s*leak_probe", body[flag_idx:])
+    assert if_match, "the WARN call must be inside an `if (leak_probe ...)` guard"
+    if_idx = flag_idx + if_match.start()
     assert 0 <= if_idx < warn_idx, "the WARN call must be inside an `if (leak_probe ...)` guard"
 
 
