@@ -3661,6 +3661,38 @@ set_tests_properties(test-q8-0-layout-cache-path-mmvq PROPERTIES
 endif() # static SYCL backend fixture
 
 if (NOT GGML_BACKEND_DL)
+add_executable(test-sycl-mxfp4-stored-gemm-soa-small-m
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mxfp4-stored-gemm-soa-small-m.cpp
+)
+target_include_directories(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-mxfp4-stored-gemm-soa-small-m PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-mxfp4-stored-gemm-soa-small-m COMMAND test-sycl-mxfp4-stored-gemm-soa-small-m)
+# SKIP_RETURN_CODE must land in the same change as the test's exit-77 skip
+# path (llama.cpp-vexg precedent): without it ctest scores 77 as a hard
+# failure, turning a legitimate no-device skip into a red test.
+set_tests_properties(test-sycl-mxfp4-stored-gemm-soa-small-m PROPERTIES
+    LABELS "sycl;mxfp4;stored_gemm;tdd;vtfs"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
+endif() # static SYCL backend fixture
+
+if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-cpu-dispatch
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-cpu-dispatch.cpp
 )
