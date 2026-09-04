@@ -23,9 +23,9 @@
 
 | Track | Tasks | Description |
 |-------|-------|-------------|
-| L | L1, L2, L3, L4 | P1: compute-buffer extra leak → prefill collapse past one ubatch; long-prompt baselines |
+| L | L1, L2, L2b (added 2026-09-04), L3, L4 | P1: compute-buffer extra leak → prefill collapse past one ubatch; long-prompt baselines |
 | E | S1, S2, S3, S4, S5, S6 (added 2026-09-04) | Small fixes: tolerance predicate, selector fallback + doc row, comment polish, slow-mode capture script, bench-guard tmpfs |
-| C | P1, P2, P3, P4 | Profiler coverage for Q4_0 decode; gemma4 decode tail (F32 matvec, D=512 attention, norm-fusion spike) |
+| C | P1, P2, P3, P4, P5 (added 2026-09-04) | Profiler coverage for Q4_0 decode; gemma4 decode tail (F32 matvec, D=512 attention, norm-fusion spike) |
 | D | G1, G2 | GPT-OSS decode: gate/up occupancy sweep, CU-scaled K-split |
 | F | G3, G4, G5, G6, G7, G8 | MXFP4 prefill option C: oracle → small-M SOA → large-M SOA → XMX_TILED → dispatch (opt-in) → default flip |
 
@@ -206,6 +206,15 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 - `ggml-sycl.cpp` hotspot: this task holds it first; S3/P2/G7 rebase after.
 
 ---
+
+> **Amendment 2026-09-04 (execution, llama.cpp-kqy7 / llama.cpp-dfo0 c-hwke):** L2 bounds the COMPUTE-buffer
+> extras (hardware: `released=838 kept=582` every rebuild vs the L1 control growing to 9218) but the pp1024
+> RssAnon still grows ~300 MB per decode. A jemalloc heap profile attributed the residual to
+> `tiered_kv_buffer_init_tensor`, which allocates a fresh `ggml_tensor_extra_gpu` for every KV VIEW tensor on every
+> rebuild (96 per rebuild) and never releases it. That is **Task L2b** (llama.cpp-asdt, Track L, depends on L2,
+> before S3 in the ggml-sycl.cpp hotspot order); the "RssAnon flat after the first decode" acceptance moves from
+> L2 to L2b. Graph replay, oneDNN (GEMM/PP/SDPA), the unified-kernel dispatch and glibc retention were each tested
+> and refuted for the residual (kqy7 c-53px, c-8r4m, c-vufg).
 
 ### Task L3: Prefill scaling gate and per-ubatch residual (llama.cpp-dfo0, step 3)
 
@@ -594,6 +603,12 @@ git commit -m "feat(sycl): profile labels on the Q4_0 and K-quant decode matvec 
 - Q4_1/Q5_0/Q5_1/Q2_K/Q3_K/IQ* arms and the MMQ persistent-TG / XMX f16 paths stay dark; file them as a follow-up ticket in the commit message, do not widen this task.
 
 ---
+
+> **Amendment 2026-09-04 (execution, llama.cpp-qmwx c-njp3):** P1 landed (bfc2a5fac). The Q4_0 decode arm that
+> actually runs for Mistral Q4_0 on this build is the COALESCED one (81-96% of 224 GB/s on the B50), not the AOS
+> arm named in P1's file-scope line. **Task P5** (llama.cpp-jnfo, Track C, depends on P1): convert all eight
+> hand-rolled label blocks in mmvq.cpp to `mmvq_profile_label()` and set `profile_label.bytes` so bandwidth reads
+> off the CSV.
 
 ### Task P2: Native F32 matvec for F32 weights at batch 1 (gemma4 altup projections) (llama.cpp-ebxw part 1)
 
