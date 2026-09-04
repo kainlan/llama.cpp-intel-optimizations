@@ -185,14 +185,25 @@ parse_cell() {
         }
     ' "$log" | tail -1)"
     [ -n "$line" ] || { echo ""; return 0; }
-    value="$(printf '%s\n' "$line" | awk -F'|' '{
+    # Here-string, not `printf ... | awk '{... exit}'` -- this awk program
+    # exits after its first non-empty field, and under `set -o pipefail`
+    # an early-exiting consumer can SIGPIPE a still-writing producer;
+    # `<<<` feeds the string without a pipe at all, removing the question
+    # (rev-y3z0-spec-2 finding N1, same shape as finding 7 in the prior
+    # round, missed there because this second pipeline wasn't the one
+    # `grep -q` sat on). The trailing `{print $1}` awk below never exits
+    # early (no early `exit`, just falls off the end of its one line of
+    # input), so it carried no SIGPIPE risk either way, but is converted
+    # too for the same reason removing finding 7's pipe was worth it:
+    # one fewer process, one fewer thing to reason about.
+    value="$(awk -F'|' '{
         for (i=NF; i>=1; i--) {
             s=$i; gsub(/^[ \t]+|[ \t]+$/, "", s)
             if (s != "") { print s; exit }
         }
-    }')"
+    }' <<< "$line")"
     [ -n "$value" ] || { echo ""; return 0; }
-    value="$(printf '%s\n' "$value" | awk '{print $1}')"
+    value="$(awk '{print $1}' <<< "$value")"
     # Bash regex match, not `printf ... | grep -qE` -- `grep -q` exits on
     # its first match and can SIGPIPE a still-writing producer under
     # `set -o pipefail`; here the producer is a single ten-byte `printf`,
@@ -264,13 +275,32 @@ for model_entry in "${MODELS[@]}"; do
         # printed a full healthy table and then exited 134 used to be
         # reported PASS, and a SUSPECT-stamped GT-reset run got an ordinary
         # verdict from its numbers). Treated exactly like the preflight-
-        # refusal case above: an ERROR row, never a computed verdict.
+        # refusal case above: an ERROR row, never a computed verdict --
+        # but reported as two DISTINCT labels (rev-y3z0-spec-2 finding N4),
+        # since "the bench itself failed" (rc!=0) and "the bench succeeded
+        # but the guard's own postflight flagged the run" (VALID-stamp
+        # missing) are different failure modes with different next steps,
+        # and a single "not-valid" label read wrong for the first one.
         header_line="$(head -1 "$logfile" 2>/dev/null || true)"
-        if [ "$rc" -ne 0 ] || [[ "$header_line" != "# bench-guard: VALID"* ]]; then
-            reason="guard-rc=$rc"
-            [ -n "$header_line" ] && reason="$reason header=${header_line:0:80}"
+
+        if [ "$rc" -ne 0 ]; then
             printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:not-valid($reason)"
+                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=$rc"
+            any_error=1
+            rm -f "$logfile"
+            continue
+        fi
+
+        # Exact-token match, not a glob prefix (rev-y3z0-spec-2 finding
+        # N3): bench-guard.sh's own verdict_line is either exactly "VALID"
+        # or "SUSPECT:<reasons>" (never any other word), but the OLD glob
+        # `"# bench-guard: VALID"*` would also have accepted a hypothetical
+        # "# bench-guard: VALIDATED ..." line -- "VALID" must be followed
+        # by end-of-string or whitespace, never another word character.
+        valid_re='^# bench-guard: VALID($|[[:space:]])'
+        if ! [[ "$header_line" =~ $valid_re ]]; then
+            printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
+                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:guard-not-valid(header=${header_line:0:80})"
             any_error=1
             rm -f "$logfile"
             continue

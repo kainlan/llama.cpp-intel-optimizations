@@ -283,6 +283,12 @@ $out"; fail=1; }
 echo "$out" | grep -qi "ERROR" || { echo "FAIL: expected an ERROR row/summary (got: $out)"; fail=1; }
 echo "$out" | grep -qi "PASS" && { echo "FAIL: a crashed run must never report PASS (got: $out)"; fail=1; }
 echo "$out" | grep -q "990.00" && { echo "FAIL: a crashed run's numbers must not be printed as measured (got: $out)"; fail=1; }
+# rev-y3z0-spec-2 finding N4: a non-zero BENCH exit gets its own distinct
+# label (ERROR:bench-rc=<n>), never the "the guard's postflight flagged
+# this" label a SUSPECT run gets below -- the two are different failure
+# modes with different next steps for whoever reads the table.
+echo "$out" | grep -q "ERROR:bench-rc=134" || { echo "FAIL: expected the distinct label ERROR:bench-rc=134 for a non-zero bench exit (got: $out)"; fail=1; }
+echo "$out" | grep -q "ERROR:guard-not-valid" && { echo "FAIL: a non-zero bench exit must use ERROR:bench-rc=, not ERROR:guard-not-valid (got: $out)"; fail=1; }
 
 # --- Case 8 (rev-y3z0-spec-1 finding 2, part B): a bench-guard log
 # stamped SUSPECT (here: a fake journalctl reporting a GT reset, i.e. a
@@ -296,6 +302,50 @@ out="$("$SCALING" --bench "$BENCH2" --only mistral,b70 "${GUARD_HOOKS[@]}" \
 $out"; fail=1; }
 echo "$out" | grep -qi "ERROR" || { echo "FAIL: expected an ERROR row/summary for the SUSPECT run (got: $out)"; fail=1; }
 echo "$out" | grep -qi "PASS" && { echo "FAIL: a SUSPECT run must never report PASS (got: $out)"; fail=1; }
+# rev-y3z0-spec-2 finding N4: the guard's own postflight (VALID-stamp
+# missing, here from a fake GT-reset journalctl) gets the distinct
+# ERROR:guard-not-valid label, never ERROR:bench-rc= -- the wrapped bench
+# itself exited 0 here (its healthy table is the reason the "must never
+# report PASS" assertion above matters at all), so a bench-rc label would
+# misreport WHICH layer flagged the run.
+echo "$out" | grep -q "ERROR:guard-not-valid" || { echo "FAIL: expected the distinct label ERROR:guard-not-valid for a SUSPECT-stamped run (got: $out)"; fail=1; }
+echo "$out" | grep -q "ERROR:bench-rc=" && { echo "FAIL: a SUSPECT run (bench itself exited 0) must use ERROR:guard-not-valid, not ERROR:bench-rc= (got: $out)"; fail=1; }
+
+# --- Case 8 (rev-y3z0-spec-2 finding N3): a positive control on the
+# exact-token VALID match. A second stub guard stamps its --log header
+# "# bench-guard: VALIDATED (should NOT count as VALID)" -- a real
+# bench-guard.sh never emits this (its verdict_line is always exactly
+# "VALID" or "SUSPECT:<reasons>"), but the OLD glob match
+# (`"# bench-guard: VALID"*`) would have accepted this header as a real
+# VALID stamp and gone on to compute an ordinary verdict from the healthy
+# table underneath it. The fixed exact-token regex must reject it as
+# ERROR:guard-not-valid instead.
+STUB_GUARD_VALIDATED="$T/stub-guard-validated.sh"
+cat > "$STUB_GUARD_VALIDATED" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+LOG=""
+while [ $# -gt 0 ]; do case "$1" in
+    --log) LOG="$2"; shift 2;;
+    --sysfs-card|--meminfo|--pgrep-cmd|--df-cmd|--journalctl-cmd|--max-wait|--budget) shift 2;;
+    --) shift; break;;
+    *) shift;;
+esac; done
+rc=0
+if [ -n "$LOG" ]; then
+    { echo "# bench-guard: VALIDATED (should NOT count as VALID)"; "$@"; } > "$LOG" 2>&1 || rc=$?
+else
+    "$@" || rc=$?
+fi
+exit "$rc"
+EOF
+chmod +x "$STUB_GUARD_VALIDATED"
+out="$("$SCALING" --bench "$BENCH2" --guard "$STUB_GUARD_VALIDATED" --only mistral,b70 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: a 'VALIDATED' (not 'VALID') header must exit 2 (ERROR), got $rc. Output:
+$out"; fail=1; }
+echo "$out" | grep -q "ERROR:guard-not-valid" || { echo "FAIL: a 'VALIDATED' header must be rejected as ERROR:guard-not-valid, not accepted as VALID (got: $out)"; fail=1; }
+echo "$out" | grep -qi "PASS" && { echo "FAIL: a 'VALIDATED' header must never be accepted as a real VALID stamp (got: $out)"; fail=1; }
+
 
 # --- Case 9 (rev-y3z0-spec-1 finding 4): precedence. One pair genuinely
 # FAILs (ratio<0.9, from the real collapse numbers), the other cannot be
@@ -341,6 +391,19 @@ out="$("$SCALING" --bench "$BENCH2" --only mistral,B70 "${GUARD_HOOKS[@]}" 2>&1)
 $out"; fail=1; }
 echo "$out" | grep -qi "valid keys" || { echo "FAIL: the error must name the valid --only keys (got: $out)"; fail=1; }
 echo "$out" | grep -qi "^OK" && { echo "FAIL: a typo'd --only must never read as OK (got: $out)"; fail=1; }
+# rev-y3z0-spec-2 finding N2: the table HEADER (its last field is the bare
+# word "status" -- every data/error row instead ends "PASS", "FAIL(...)",
+# or an "ERROR:..." label) must never print at all. Without this, a
+# mutant that deletes the UP-FRONT --only validation and relies solely on
+# the post-loop "any_measured==0" fallback would still pass every other
+# assertion in this case: the header is printed unconditionally BEFORE
+# the main loop runs, so removing only the up-front check still yields
+# rc=2 and the same "valid keys" message from the fallback, just with the
+# header already on stdout by the time it fires. This assertion is what
+# actually pins "the up-front check runs", not merely "some check runs
+# eventually" -- demonstrated with a scratch mutant (up-front validation
+# loop commented out) in this round's commit body.
+echo "$out" | grep -qw "status" && { echo "FAIL: the table header must never print for a rejected --only -- this means the UP-FRONT --only validation did not run before the header printf, and only the post-loop fallback caught it (got: $out)"; fail=1; }
 
 # --- Case 11 (rev-y3z0-spec-1 finding 5): a REAL-shaped table -- fa
 # column, `±` spread, ngl=-1, surrounding log noise exactly like a real
