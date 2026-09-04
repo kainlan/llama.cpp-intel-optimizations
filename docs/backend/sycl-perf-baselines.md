@@ -30,8 +30,12 @@ loop, which is why it runs last):
 
 - **Stale GPU tenant** — any live `llama-cli|llama-bench|llama-completion`
   process.
-- **Shmem ceiling** — `Shmem` in `/proc/meminfo` above 10 GB (the TTM-shmem OOM
-  signature this repo has hit repeatedly).
+- **Shmem ceiling** — `Shmem` in `/proc/meminfo`, net of the summed "Used" of
+  tmpfs mounts (`df -k -t tmpfs`, overridable with `--df-cmd`), above 10 GB
+  (the TTM-shmem OOM signature this repo has hit repeatedly). This became net
+  of tmpfs on 2026-09-04, after the guard refused every baseline run because
+  other sessions' ordinary `/tmp`/`/dev/shm` files — not GPU-BO backing — held
+  ~9.7 GB of Shmem.
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is

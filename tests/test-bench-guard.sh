@@ -50,6 +50,11 @@ expect_status 3 "high Shmem must refuse" -- run_guard "false"
 mk_meminfo 3000000
 expect_status 0 "clean host must run" -- run_guard "false"
 
+# tmpfs files are not GPU-BO shmem: Shmem 30 GB with 29 GB of tmpfs files must run
+mk_meminfo 30000000
+printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 33554432 29000000 4554432 87%% /tmp\n' > "$T/df.txt"
+expect_status 0 "high Shmem explained by tmpfs must run" -- "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd "cat $T/df.txt" --max-wait 1 -- true
+
 # Selector-to-PCI derivation must be an EXACT match. level_zero:0,1 (and
 # anything else that isn't precisely "level_zero:0" or "level_zero:1") must
 # NOT glob-match one of them -- it must fall through to the explicit

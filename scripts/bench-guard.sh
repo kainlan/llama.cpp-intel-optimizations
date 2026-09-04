@@ -5,7 +5,11 @@
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
 # already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
-# --pgrep-cmd, --journalctl-cmd) so the logic is testable without hardware.
+# --pgrep-cmd, --journalctl-cmd, --df-cmd) so the logic is testable without
+# hardware. The Shmem ceiling check compares Shmem net of tmpfs file usage
+# (summed "Used" from `df -k -t tmpfs`, override with --df-cmd): ordinary
+# tmpfs files (/tmp, /dev/shm) count toward Shmem in /proc/meminfo alongside
+# TTM GPU-BO backing, and the ceiling exists for the latter, not the former.
 #
 # On a clean host: runs the wrapped command under `timeout -k 15 <budget>`
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
@@ -29,7 +33,7 @@
 # the explicit "cannot derive card" refusal instead of silently picking one
 # of the cards it names.
 set -euo pipefail
-SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
+SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
@@ -38,6 +42,7 @@ while [ $# -gt 0 ]; do case "$1" in
     --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
     --meminfo)         MEMINFO="$2";        shift 2;;
     --pgrep-cmd)       PGREP_CMD="$2";      shift 2;;
+    --df-cmd)          DF_CMD="$2";         shift 2;;
     --max-wait)        MAX_WAIT="$2";       shift 2;;
     --pci)             PCI="$2";            shift 2;;
     --log)             LOG="$2";            shift 2;;
@@ -74,8 +79,10 @@ tenants() {
 t="$(tenants | grep -E 'llama' || true)"
 [ -z "$t" ] || refuse "stale GPU tenant(s): $t"
 
-shmem_kb() { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
-[ "$(shmem_kb)" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $(shmem_kb) kB above ceiling $SHMEM_CEIL_KB kB"
+shmem_kb()  { awk '/^Shmem:/{print $2}' "$MEMINFO"; }
+tmpfs_kb()  { { if [ -n "$DF_CMD" ]; then eval "$DF_CMD"; else df -k -t tmpfs 2>/dev/null; fi; } | awk 'NR>1{s+=$3} END{print s+0}'; }
+eff_shmem_kb() { local s t; s=$(shmem_kb); t=$(tmpfs_kb); [ "$s" -gt "$t" ] && echo $((s - t)) || echo 0; }
+[ "$(eff_shmem_kb)" -le "$SHMEM_CEIL_KB" ] || refuse "Shmem $(shmem_kb) kB minus tmpfs $(tmpfs_kb) kB = $(eff_shmem_kb) kB above ceiling $SHMEM_CEIL_KB kB"
 
 # Poll throttle/act_freq up to --max-wait, checking the deadline BEFORE each
 # sleep and capping each sleep to the time actually remaining -- so
@@ -92,7 +99,7 @@ while :; do
     waited=$((waited + interval))
 done
 
-pre_shmem="$(shmem_kb)"
+pre_shmem="$(eff_shmem_kb)"
 pre_thr="$st"
 
 # -e-safe capture: `cmd; rc=$?` would trip `set -e` the instant the wrapped
@@ -108,7 +115,7 @@ else
     timeout -k 15 "$BUDGET" "$@" || rc=$?
 fi
 
-post_shmem="$(shmem_kb)"
+post_shmem="$(eff_shmem_kb)"
 post_thr="$(cat "$FREQ/throttle/status")"
 
 verdict="VALID"
