@@ -69,16 +69,16 @@ bool ggml_sycl_fa_tile_d512_enabled();
 // at D=512. Default **ON**; `=0` falls back to the tile route
 // unconditionally at any ne01.
 //
-// ⚠️ NARROWED FROM ne01<=8 TO ne01==1 (spec review llama.cpp-zwsj/c-7iey
-// round 2, finding A): hardware testing found launch_fattn_esimd_f16_
+// ⚠️ NARROWED FROM ne01<=8 TO ne01==1 (lead hardware finding, llama.cpp-zwsj/
+// c-1ha7, finding A): hardware testing found launch_fattn_esimd_f16_
 // optimized<512,...> returns garbage for a real masked ne01=4 op (94% of
 // elements wrong) while ne01==1 measured correct on both cards. Root cause
 // (D=512-specific vs a latent bug shared with the D<=256 ESIMD multi-query
 // path, never exercised by any production caller before this ticket) is
-// NOT established -- see fattn.cpp's D==512 branch for the full note.
-// ne01 in 2..8 and prefill (ne01>8) both fall through to the tile route
-// unconditionally regardless of this switch, which this variable does not
-// touch.
+// NOT established -- tracked as follow-up on llama.cpp-wais; see fattn.cpp's
+// D==512 branch for the full note. ne01 in 2..8 and prefill (ne01>8) both
+// fall through to the tile route unconditionally regardless of this
+// switch, which this variable does not touch.
 // Shared by the D==512 dispatch branch (fattn.cpp, caching it in its own
 // function-local static, mirroring ggml_sycl_fa_tile_d512_enabled()'s
 // call-site pattern) and the numerics test, which needs the live value

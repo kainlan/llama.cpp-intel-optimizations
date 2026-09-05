@@ -1,31 +1,32 @@
-// GPU numerics guard for the D=512 flash-attention TILE decode path
-// (submit_fattn_tile_d512 / launch_fattn_tile_d512, fattn-tile.hpp) -- the
-// "fattn.decode.tile_d512" kernel gemma4's seven D=512 global-attention
-// layers run every decode token (llama.cpp-ebxw part 2, llama.cpp-zwsj / plan
+// GPU numerics guard for the D=512 decode-shaped flash-attention routes --
+// both the "fattn.decode.tile_d512" kernel (submit_fattn_tile_d512 /
+// launch_fattn_tile_d512, fattn-tile.hpp) and, since llama.cpp-zwsj Phase 2,
+// the "fattn.decode.esimd_partitioned" ESIMD tier that now serves ne01==1
+// by default -- gemma4's seven D=512 global-attention layers run one or the
+// other every decode token (llama.cpp-ebxw part 2, llama.cpp-zwsj / plan
 // Task P3). Built as a REGRESSION GUARD, not a discovery test: it must PASS
-// on the current (un-tiered) kernel first, and stays green across the
-// planned decode-shaped split-KV/ESIMD specialisation the spike may add.
+// on the current kernel(s) first, and covers BOTH routes via the TWO-STATE
+// DRIVER below, since GGML_SYCL_FA_D512_DECODE_ESIMD selects between them.
+//
+// SEVEN CASES (run_state_in_current_process()): ne01=1 mask=nullptr at
+// n_kv in {32,512,4096}; ne01=1 WITH a real (windowed) mask at n_kv=512 and
+// n_kv=4096 -- the actual production decode shape, llama always passes a
+// KQ mask even at single-token decode; ne01=4 WITH a mask, which the ESIMD
+// tier REFUSES into the tile route regardless of the toggle (see the
+// ROUND 2 note below and llama.cpp-wais); H_q=8/H_kv=2 at ne01=1. Every
+// ne01=1 case (masked or not) resolves through the toggle's selected
+// route; only the ne01=4 case is pinned to tile unconditionally.
 //
 // SHAPE: this is the exact shape the D=512 route has no alternative for.
 // ggml_sycl_flash_attn_ext_supported() (fattn.cpp) admits D=512 only via
 // EITHER the oneDNN SDPA route (llama.cpp-jahv, requires ne01 >=
-// GGML_SYCL_FA_ONEDNN_MIN_NCOLS, default 8) or this tile route
-// (llama.cpp-dtpk, no ne01 floor). At ne01=1 (decode) the oneDNN route is
-// structurally unreachable regardless of scale, so every case below --
-// mask=nullptr, standard 1/sqrt(D) scale -- resolves through
-// launch_fattn_tile_d512() and its ncols2==1 fallback tier
-// (submit_fattn_tile_d512<512,512,2,1,...> at ne01=1, fattn-tile.hpp). This
-// mirrors test-sycl-fattn-onednn-gates.cpp's own
+// GGML_SYCL_FA_ONEDNN_MIN_NCOLS, default 8) or this file's two routes
+// (llama.cpp-dtpk's tile, llama.cpp-zwsj's ESIMD tier, no ne01 floor).
+// At ne01=1 (decode) the oneDNN route is structurally unreachable
+// regardless of scale. This mirrors test-sycl-fattn-onednn-gates.cpp's own
 // build_d512_tile_flash_attn_ext_op()/test_supports_op_admits_d512_tile_decode_shape
 // admission case (same file, ne01_q=1) -- that test proves the op is
-// ADMITTED into this route; this file proves the route's OUTPUT is correct.
-//
-// mask is intentionally omitted (src[3] = nullptr): at decode every prior KV
-// position is valid for the new token, so a real KQ mask here would be all
-// zeros -- functionally identical to no mask, and omitting it keeps this
-// file state-independent of GGML_SYCL_FLASH_ATTN_EXT's use_gqa_opt branch
-// (which requires a mask; see launch_fattn_tile_d512's own comment on why
-// DV==512 makes ne01 irrelevant to that branch's own gqa_ratio<=4 gate).
+// ADMITTED into these routes; this file proves their OUTPUT is correct.
 //
 // GQA SHAPE: gemma4's exact H_q/H_kv for its D=512 global-attention layers
 // is not recorded on llama.cpp-ebxw (checked; the profiling comments there
@@ -52,10 +53,11 @@
 // undetectable. Round 1 added an ne01=4 case with a real per-query
 // causal-style mask (query qr may see kv positions <= n_kv-ne01+qr,
 // matching a genuine speculative-decode causal pattern; masked positions
-// carry -10000.0f, matching this fork's bench-sycl-fattn-gptoss.cpp
-// convention) and an H_q=8/H_kv=2 (gqa_ratio=4) case.
+// originally carried -10000.0f -- switched to -INFINITY in spec review
+// llama.cpp-zwsj/c-ej1v nit 5, see build_causal_like_mask()'s comment)
+// and an H_q=8/H_kv=2 (gqa_ratio=4) case.
 //
-// ROUND 2, A REAL DEFECT (spec review llama.cpp-zwsj/c-7iey round 2,
+// ROUND 2, A REAL DEFECT (lead hardware finding, llama.cpp-zwsj/c-1ha7;
 // finding A): running round 1's ne01=4+mask case on hardware found
 // launch_fattn_esimd_f16_optimized<512,...> returns GARBAGE for it (94%
 // of elements wrong, max_diff ~1.6) while the tile kernel agrees with the
@@ -68,11 +70,16 @@
 // not a kernel fix -- and ne01 in 2..8 now falls through to the tile route
 // unconditionally (see that file's finding-A comment for the full
 // reasoning, including why this is also gemma4's actual production
-// decode shape). Two consequences for THIS file's coverage:
+// decode shape). Root cause (D=512-specific vs. shared with the D<=256
+// ESIMD family's own multi-query path) is not established; tracked as
+// follow-up work on llama.cpp-wais, which owns a D=256 ne01=4 mask=1
+// control to decide shared-kernel vs D=512-specific. Two consequences for
+// THIS file's coverage:
 //   - The ne01=4+mask case now tests the REFUSAL BOUNDARY, not the ESIMD
-//     tier's multi-query correctness: both toggle states must now route
-//     it through the (unchanged) tile kernel and agree with each other
-//     and the reference within tolerance.
+//     tier's multi-query correctness: BOTH toggle states must route it
+//     through the (unchanged) tile kernel and each independently agree
+//     with the reference within tolerance (the two states are never
+//     cross-compared directly in this driver -- see main()'s comment).
 //   - The production shape (ne01=1 WITH a mask -- llama always passes a
 //     KQ mask to flash attention, even at single-token decode) had NEVER
 //     been tested; two new cases add it at n_kv=512 and n_kv=4096. A plain
@@ -92,7 +99,7 @@
 // F32 Q; K/V are F16, the only type ggml_sycl_fattn_d512_tile_admissible()
 // accepts).
 //
-// METRIC (spec review llama.cpp-zwsj/c-7iey round 2, finding B -- REPLACES
+// METRIC (lead hardware finding, llama.cpp-zwsj/c-1ha7, finding B -- REPLACES
 // the round-1 per-element `1e-3 + 1e-3*|ref|` predicate entirely): hardware
 // testing at the round-1 amplitude (below) found the tile kernel's own
 // correct f16 accumulation error is 2.0e-3 to 5.0e-3 ABSOLUTE on |out| in
@@ -121,7 +128,7 @@
 // alongside NMSE specifically to catch finding A's failure mode (94% wrong,
 // max_diff ~1.6) even if some future shape's NMSE were diluted by a huge N.
 //
-// Threshold: NMSE <= 5e-5 (spec review llama.cpp-zwsj/c-7iey round 3,
+// Threshold: NMSE <= 5e-5 (lead hardware finding, llama.cpp-zwsj/c-j4k7,
 // superseding a round-2 choice of 5e-4 -- upstream's own precedent for
 // this exact op family, which turned out too loose here: see NMSE_MAX's
 // own comment for why). Verified with the mutant the review specified
@@ -250,11 +257,21 @@ static void fill_f16_random(std::vector<ggml_fp16_t> & out, int64_t n, std::mt19
 // sliding-window layer -- the only way to exercise the mask path at
 // ne01=1 at all, since a plain causal mask at ne01=1 sees every position
 // (visible_upto = n_kv-1) and is a no-op. Masked positions carry
-// -10000.0f (matching this fork's bench-sycl-fattn-gptoss.cpp convention);
-// visible positions carry 0.0f. Layout ne=[n_kv, ne01, 1, 1] contiguous
-// (flat index t + n_kv*qr), matching what ggml_flash_attn_ext's own
-// mask-shape asserts require here (mask->ne[2]=1 divides Q->ne[2]=H_q
-// trivially; mask->ne[3]=1 divides Q->ne[3]=1).
+// -INFINITY (matching llama's own KQ_mask convention, src/llama-graph.cpp;
+// this fork's bench-sycl-fattn-gptoss.cpp uses -10000.0f instead, but that
+// bench never runs through the CPU reference below, so there is no reason
+// to match it here in preference to the real convention). Verified benign
+// for both kernels' arithmetic: `grep -c INFINITY` is 0 in both
+// fattn-tile.hpp and fattn-esimd-f16.hpp, so neither branches on infinity
+// -- each simply adds the mask value to the score, and compute_reference()
+// below does the same, so exp(-inf - finite_max) = 0 exactly as a real
+// -10000.0f underflow would, with no risk of a masked position ever being
+// the row's own max (every query row has >=1 visible, finite-logit
+// position by construction, since window >= 1). visible positions carry
+// 0.0f. Layout ne=[n_kv, ne01, 1, 1] contiguous (flat index t + n_kv*qr),
+// matching what ggml_flash_attn_ext's own mask-shape asserts require here
+// (mask->ne[2]=1 divides Q->ne[2]=H_q trivially; mask->ne[3]=1 divides
+// Q->ne[3]=1).
 static void build_causal_like_mask(std::vector<ggml_fp16_t> & out, int n_kv, int ne01, int window = -1) {
     if (window <= 0 || window > n_kv) {
         window = n_kv;
@@ -265,7 +282,7 @@ static void build_causal_like_mask(std::vector<ggml_fp16_t> & out, int n_kv, int
         const int visible_from = std::max(0, visible_upto - window + 1);  // inclusive
         for (int t = 0; t < n_kv; ++t) {
             if (t < visible_from || t > visible_upto) {
-                out[(size_t) t + (size_t) n_kv * qr] = ggml_fp32_to_fp16(-10000.0f);
+                out[(size_t) t + (size_t) n_kv * qr] = ggml_fp32_to_fp16(-INFINITY);
             }
         }
     }
@@ -348,7 +365,7 @@ static void compute_reference(const std::vector<float> &       Q,
 // not a precision difference) even if NMSE were ever diluted by a very
 // large output vector.
 //
-// NMSE_MAX = 5e-5 (spec review llama.cpp-zwsj/c-7iey round 3): the
+// NMSE_MAX = 5e-5 (lead hardware finding, llama.cpp-zwsj/c-j4k7): the
 // round-2 choice, 5e-4 (tests/test-backend-ops.cpp's own
 // test_flash_attn_ext::max_nmse_err() for this exact op), let the 1%
 // mutant through -- 1e-4 < 5e-4 -- because the round-2 estimate of the
@@ -472,11 +489,9 @@ static void run_shape(ggml_backend_t backend,
         ggml_set_name(mask, "fattn_d512_decode_mask");
     }
 
-    // No mask (src[3] = nullptr) at ne01=1: at single-token decode every
-    // prior KV position is valid, so a real causal mask here would be
-    // all-zero -- see the file header for why this is the representative
-    // shape, not a shortcut. The ne01>1 cases use a real per-query mask
-    // instead (see build_causal_like_mask()).
+    // `mask` is nullptr for the mask-free cases, or the windowed/causal
+    // tensor built above (use_mask) -- see build_causal_like_mask()'s
+    // comment for how each case's mask is shaped.
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
     ggml_set_name(out, "fattn_d512_decode_out");
 
@@ -567,27 +582,31 @@ static int run_state_in_current_process(const char * state_label) {
     run_shape(backend, D, H_q, H_kv, 32);
     run_shape(backend, D, H_q, H_kv, 512);
     run_shape(backend, D, H_q, H_kv, 4096);
-    // Spec review llama.cpp-zwsj/c-7iey round 2, finding A: the PRODUCTION
-    // decode shape -- ne01=1 WITH a mask (llama always passes a KQ mask to
-    // flash attention, even at single-token decode) -- had never been
-    // tested. A plain causal mask at ne01=1 sees every kv position (a
-    // no-op), so `window` restricts visibility to the last half of n_kv,
-    // matching a sliding-window layer and genuinely exercising the mask
-    // path. This is the shape the ESIMD tier now engages on in production
-    // (ne01==1 only, after the finding-A dispatch refusal below).
+    // Lead hardware finding llama.cpp-zwsj/c-1ha7: the PRODUCTION decode
+    // shape -- ne01=1 WITH a mask (llama always passes a KQ mask to flash
+    // attention, even at single-token decode) -- had never been tested. A
+    // plain causal mask at ne01=1 sees every kv position (a no-op), so
+    // `window` restricts visibility to the last half of n_kv, matching a
+    // sliding-window layer and genuinely exercising the mask path. This is
+    // the shape the ESIMD tier now engages on in production (ne01==1
+    // only, after the finding-A dispatch refusal below).
     run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/1, /*use_mask=*/true, /*window=*/256);
     run_shape(backend, D, H_q, H_kv, 4096, /*ne01=*/1, /*use_mask=*/true, /*window=*/2048);
-    // Spec review llama.cpp-zwsj/c-7iey round 1, finding 2 / round 2, finding
-    // A: ne01=4 (speculative-decode-shaped ubatch) WITH a real per-query
-    // mask. Round 1 added this to exercise the ESIMD kernel's per-query mask
-    // indexing; running it on hardware found launch_fattn_esimd_f16_
-    // optimized<512,...> returns garbage for it (round 2, finding A -- see
-    // the file header). fattn.cpp's D==512 branch now engages the ESIMD
-    // tier at ne01==1 ONLY, so this shape is refused into the tile route
-    // REGARDLESS of the toggle -- this case now tests THAT refusal (both
-    // toggle states must agree with each other and the reference), not the
-    // ESIMD tier's multi-query correctness.
-    run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/4, /*use_mask=*/true);
+    // Spec review llama.cpp-zwsj/c-7iey round 1, finding 2 / lead hardware
+    // finding c-1ha7, finding A: ne01=4 (speculative-decode-shaped ubatch)
+    // WITH a real per-query mask. Round 1 added this to exercise the ESIMD
+    // kernel's per-query mask indexing; running it on hardware found
+    // launch_fattn_esimd_f16_optimized<512,...> returns garbage for it
+    // (finding A -- see the file header, and llama.cpp-wais for the open
+    // root-cause follow-up). fattn.cpp's D==512 branch now engages the
+    // ESIMD tier at ne01==1 ONLY, so this shape is refused into the tile
+    // route REGARDLESS of the toggle -- this case now tests THAT refusal
+    // (each toggle state independently agrees with the reference; the two
+    // states are not cross-compared here -- see main()'s comment), not
+    // the ESIMD tier's multi-query correctness. `window` narrows visibility
+    // so the mask is load-bearing (a plain causal window here would mask
+    // only 3 of 512 positions per query, per spec review c-ej1v nit 6).
+    run_shape(backend, D, H_q, H_kv, 512, /*ne01=*/4, /*use_mask=*/true, /*window=*/128);
     // Spec review llama.cpp-zwsj/c-7iey round 1, finding 4: H_kv=2
     // (gqa_ratio=4, not the degenerate kv_head==0-for-every-head case
     // H_kv=1 gives), so a mis-mapped GQA head in the ESIMD kernel's own
@@ -659,6 +678,11 @@ int main(int, char ** argv) {
     // in one process. If the first child reports no device (SKIP), the
     // second would report the same thing for the same reason, so skip
     // immediately rather than forking a second child that cannot succeed.
+    // Each child is scored ONLY against the CPU reference (run_shape's own
+    // compare() call) -- the two states' outputs are never cross-compared
+    // against each other here, so "both states pass" means "both
+    // independently agree with the reference," not "the two states agree
+    // with each other" (spec review llama.cpp-zwsj/c-ej1v nit 7).
     const int rc_esimd = run_state_in_child(argv, "1");
     if (rc_esimd == LLAMA_TEST_EXIT_SKIP) {
         std::printf("SKIP: no SYCL GPU device available (state=1 child)\n");

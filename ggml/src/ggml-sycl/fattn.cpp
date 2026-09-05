@@ -3939,29 +3939,32 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         // called at ne01<=1/decode), so D=512 is a template instantiation,
         // not a new algorithm.
         //
-        // ne01 GATE, NARROWED FROM <=8 TO ==1 (spec review llama.cpp-zwsj/
-        // c-7iey round 2, finding A): the plan's own ne01<=8 engagement
-        // range was FALSIFIED on hardware -- the lead's guard run found
-        // launch_fattn_esimd_f16_optimized<512,...> returns garbage
-        // (max_diff 1.59, 94% of elements wrong) for a real, masked ne01=4
-        // op, while the SAME shape through the tile kernel and the SAME
-        // reference agree to ~3.6e-3 (the tile kernel's own known f16
-        // precision floor, not a defect). ne01==1 (this file's own guard's
-        // now-added mask=1 cases) measured correct on hardware. Root cause
-        // is NOT established -- it is unknown whether the multi-query mask
-        // path is broken specifically at D=512 or is a latent bug shared
-        // with the D<=256 ESIMD family that nothing has exercised before
-        // (no production caller reaches this kernel with ne01>1 either;
-        // launch_fattn_esimd_f16_batched is the D<=256 family's OWN
-        // multi-query answer, and this ticket did not touch it). Rather
-        // than ship a blind kernel patch with no hardware to verify it,
-        // this narrows engagement to the ONE shape measured correct --
-        // ne01==1, which is also gemma4's actual production decode shape
-        // (llama always decodes one token at a time outside speculative
-        // decoding). ne01 in 2..8 now falls through to the tile route
-        // unconditionally, regardless of the toggle -- see the guard's
-        // ne01=4 case, which now asserts the REFUSAL, not the tier's
-        // multi-query correctness.
+        // ne01 GATE, NARROWED FROM <=8 TO ==1 (lead hardware finding,
+        // llama.cpp-zwsj/c-1ha7, finding A): the plan's own ne01<=8
+        // engagement range was FALSIFIED on hardware -- the lead's guard
+        // run found launch_fattn_esimd_f16_optimized<512,...> returns
+        // garbage (max_diff 1.59, 94% of elements wrong) for a real,
+        // masked ne01=4 op, while the SAME shape through the tile kernel
+        // and the SAME reference agree to ~3.6e-3 (the tile kernel's own
+        // known f16 precision floor, not a defect). ne01==1 (this file's
+        // own guard's now-added mask=1 cases) measured correct on
+        // hardware. Root cause is NOT established -- it is unknown
+        // whether the multi-query mask path is broken specifically at
+        // D=512 or is a latent bug shared with the D<=256 ESIMD family
+        // that nothing has exercised before (no production caller reaches
+        // this kernel with ne01>1 either; launch_fattn_esimd_f16_batched
+        // is the D<=256 family's OWN multi-query answer, and this ticket
+        // did not touch it). Rather than ship a blind kernel patch with no
+        // hardware to verify it, this narrows engagement to the ONE shape
+        // measured correct -- ne01==1, which is also gemma4's actual
+        // production decode shape (llama always decodes one token at a
+        // time outside speculative decoding). ne01 in 2..8 now falls
+        // through to the tile route unconditionally, regardless of the
+        // toggle -- see the guard's ne01=4 case, which now asserts the
+        // REFUSAL, not the tier's multi-query correctness. Root-cause
+        // follow-up (a D=256 ne01=4 mask=1 control to decide shared-kernel
+        // vs D=512-specific, to decide whether this gate can re-widen)
+        // tracked as llama.cpp-wais.
         //
         // Reuses ggml_sycl_fattn_d512_tile_admissible()'s screen rather
         // than a second copy: it already requires exactly what this route
