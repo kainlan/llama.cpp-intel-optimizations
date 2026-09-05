@@ -216,6 +216,26 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > L2 to L2b. Graph replay, oneDNN (GEMM/PP/SDPA), the unified-kernel dispatch and glibc retention were each tested
 > and refuted for the residual (kqy7 c-53px, c-8r4m, c-vufg).
 
+> **Amendment 2026-09-04 (execution, llama.cpp-asdt c-qnq7, commit 50f075464): L2b lands but does NOT close the
+> pp1024 acceptance.** The KV-view-extras fix is correct and tested (ctest GREEN on both cards; a design review
+> found and closed a real same-graph collision -- two DIFFERENT, both-live views of the same K tensor at the
+> same offset within one graph, e.g. `get_k`'s attention window vs `cpy_k`'s `ggml_set_rows()` whole-tensor
+> result -- via a process-wide rebuild epoch instead of the unsafe key-only release-and-replace a first draft
+> used). Measured on hardware (level_zero:1, `-p 1024 -n 0 -r 5`, RssAnon sampled on the bench pid): the fix
+> reduces the L2-alone residual from ~310 to ~250 MB/decode, a ~60 MB/decode drop that lines up closely with the
+> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,704 B * 96 views/rebuild *
+> 2 rebuilds/pp1024-decode` =~ 51 MB/decode; `process_ubatch()` calls `ggml_backend_sched_alloc_graph()` once per
+> ubatch, so `n_ubatch=512` gives exactly 2 rebuilds for a pp1024 decode). So the fix is closing the mechanism it
+> was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
+> predecessor attributed to it: ~250 of that ~300 MB/decode remains unaccounted for. The **acceptance criterion
+> stays open** pending a fresh jemalloc profile on the post-L2b binary to attribute the true dominant residual;
+> do not re-close L2b's acceptance line until that lands. Code-only checks (no GPU) ruled out three candidate
+> causes for the gap: layer K/V tensors are roots, not views-of-views (`src/llama-kv-cache.cpp` constructor,
+> `ggml_new_tensor_3d`, `view_src == nullptr`); the per-rebuild epoch counter demonstrably advances twice per
+> pp1024 decode as designed; and the debug accessor reads the same `view_extras` container the release path
+> prunes (single-KV-buffer models only -- an ISWA/SWA model with two live tiered KV buffers would need its own
+> check, not applicable to the Mistral gate this was measured against).
+
 ### Task L3: Prefill scaling gate and per-ubatch residual (llama.cpp-dfo0, step 3)
 
 **Track:** L
