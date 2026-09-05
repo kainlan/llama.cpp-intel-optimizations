@@ -822,6 +822,28 @@ if (NOT WIN32)
         LABELS "sycl;source"
         SKIP_RETURN_CODE 77
     )
+
+    # sycl-prefill-scaling unit tests (plan task L3, llama.cpp-dfo0): the
+    # pp128/512/1024/2048 markdown-table parser and the ratio1024=pp1024/
+    # pp512 >= 0.9 scaling-collapse verdict, for all six model/card pairs.
+    # Invokes bench-guard.sh (above) as a child for all host-corruption
+    # preflight, exactly like test-sycl-decode-mode-capture above; this
+    # suite exercises only the parser and verdict logic, against a fake
+    # sysfs tree and a fake `llama-bench` -- no GPU, safe at any
+    # parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-prefill-scaling
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-prefill-scaling.sh
+    )
+    # Same LABEL caveat as test-sycl-decode-mode-capture above applies here
+    # (llama_test_cmd's LABEL is single-valued) -- set via
+    # set_tests_properties instead.
+    set_tests_properties(test-sycl-prefill-scaling PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 endif()
 
 if (NOT WIN32)
