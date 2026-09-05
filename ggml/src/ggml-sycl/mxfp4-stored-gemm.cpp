@@ -109,27 +109,6 @@ SYCL_ESIMD_FUNCTION inline sycl::ext::intel::esimd::simd<int8_t, N> mxfp4_stored
     return values;
 }
 
-// Cache-line software-prefetch hint, reproduced from mmvq.cpp's
-// mxfp4_xmx_tiled_prefetch_line (mmvq.cpp:~7603, file-local there, so not
-// linkable from here -- same borrow-and-rename precedent as the two helpers
-// above). Round 4 spec finding (llama.cpp-6f73, candidate (c)): this kernel's
-// k-loop issues each k-tile's loads immediately before the DPAS that
-// consumes them, so with no loads in flight the DMA/cache latency of every
-// load is fully exposed on every iteration instead of overlapping with the
-// DPAS/accumulate of the PREVIOUS iteration. `prefetch<>` is a pure hardware
-// hint (streaming L1, uncached L2, matching the reference kernel's own
-// hints for a single-pass GEMM with no reuse) -- it has no result register
-// and cannot change the read values, so it cannot introduce a correctness
-// regression the way the round-3 wide-coalesced-load rewrite did.
-SYCL_ESIMD_FUNCTION inline void mxfp4_stored_gemm_prefetch_line(const uint8_t * ptr) {
-    using namespace sycl::ext::intel::esimd;
-    const uintptr_t  aligned_addr = reinterpret_cast<uintptr_t>(ptr) & ~uintptr_t{ 63 };
-    const uint32_t * aligned_ptr  = reinterpret_cast<const uint32_t *>(aligned_addr);
-    constexpr auto   props =
-        properties{ cache_hint_L1<cache_hint::streaming>, cache_hint_L2<cache_hint::uncached>, alignment<64> };
-    prefetch<uint32_t, 16>(aligned_ptr, 0, simd_mask<1>(1), props);
-}
-
 // The generalised kernel: one work-GROUP per N-tile (16 output rows,
 // GGML_SYCL_MXFP4_MOE_XMX_N -- the DPAS execution-size hardware constant),
 // with K_PARTITIONS work-ITEMS per group splitting the K reduction (llama.cpp-6f73
@@ -246,45 +225,7 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
 
                 simd<float, acc_width> acc = 0.0f;
 
-                // Software prefetch distance (round 4 fix, candidate (c)):
-                // small relative to kt_per_partition (12 at the canonical
-                // N=2880/K=2880 shape) so the tail of the per-partition
-                // range still gets prefetched at least once, while still
-                // getting several k-tiles' worth of loads in flight ahead
-                // of the DPAS that consumes them. Matches the *shape* of
-                // the reference kernel's prefetch_distance=10 (mmvq.cpp);
-                // the smaller distance here is deliberate, not copied
-                // verbatim, because this partition's own iteration count is
-                // itself much smaller (12 vs the reference's un-split ~90).
-                constexpr int64_t prefetch_distance = 3;
-
                 for (int64_t kt = kt_start; kt < kt_end; ++kt) {
-                    // Issue next iterations' loads as prefetch hints before
-                    // this iteration's own (blocking) loads below, so their
-                    // latency overlaps with this iteration's DPAS/accumulate
-                    // instead of being fully exposed on every iteration --
-                    // this is the fix for "8 partitions look serialized"
-                    // (round 4 spec finding): each work-item's own k-loop
-                    // had no loads in flight, independent of the other
-                    // partitions' concurrency.
-                    const int64_t kt_prefetch = kt + prefetch_distance;
-                    if (kt_prefetch < kt_end) {
-#    pragma unroll
-                        for (int r = 0; r < M_TILE; ++r) {
-                            mxfp4_stored_gemm_prefetch_line(
-                                reinterpret_cast<const uint8_t *>(act_qs + r * act_row_stride_q + kt_prefetch * k_per));
-                        }
-#    pragma unroll
-                        for (int n = 0; n < exec_n; ++n) {
-                            const int64_t row = n_base + n;
-                            if (row < n_out) {
-                                mxfp4_stored_gemm_prefetch_line(soa_base + row * row_qs_stride +
-                                                                kt_prefetch * packed_bytes);
-                                mxfp4_stored_gemm_prefetch_line(soa_base + total_qs_size + row * k_tiles + kt_prefetch);
-                            }
-                        }
-                    }
-
                     // Activation "A" operand: M_TILE rows x 32 int8 q8_1 codes,
                     // plain row-major (no VNNI packing for A).
                     simd<int8_t, an> a_vec;
