@@ -173,9 +173,17 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     // co-resident on one CU without oversubscribing it; N-tiling itself is
     // deliberately UNCHANGED (n_tiles work-groups, same as before) -- this is
     // a single, isolated lever, not combined with a second untested change
-    // in the same commit. If K_PARTITIONS=8 undershoots the >=50% peak-
-    // bandwidth target, tiling N for more resident work-groups per CU is the
-    // next, separate lever (not applied here).
+    // in the same commit. K_PARTITIONS=8 DOES undershoot the >=50% peak-
+    // bandwidth target this task set out to reach (measured best case:
+    // ~15% of B50 peak at M=8; two further levers -- batched/coalesced
+    // weight loads, then software prefetch -- both REGRESSED it instead of
+    // closing the gap, see this file's git history for llama.cpp-6f73
+    // rounds 4-5). This kernel is checked in at this K_PARTITIONS=8 state as
+    // a numerically verified checkpoint; the bandwidth criterion itself is
+    // carried forward to the follow-up task llama.cpp-kcya (tiling N for
+    // more resident work-groups per CU, or reworking to the single-item-
+    // per-tile + deep-prefetch shape mxfp4_pair_glu_xmx_tiled_dpas_m2 uses,
+    // are both candidate levers there -- not attempted here).
     constexpr int K_PARTITIONS = 8;  // power of 2, required by the tree reduction below
 
     // SLM budget: K_PARTITIONS partial accumulators, acc_width floats each.
