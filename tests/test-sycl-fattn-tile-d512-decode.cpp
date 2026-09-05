@@ -351,6 +351,14 @@ static void compute_reference(const std::vector<float> &       Q,
                     acc += weight[(size_t) t] * v;
                 }
                 const size_t out_idx = (size_t) d + (size_t) D * h + (size_t) D * H_q * qr;
+                // denom > 0.0 is UNREACHABLE by construction, not a real
+                // decode path: every query row has >=1 visible (finite-
+                // logit) kv position, since build_causal_like_mask()
+                // clamps window into [1, n_kv] (see its comment), so denom
+                // (a sum of >=1 positive exp() terms) can never be zero
+                // here. Kept as a defensive fallback rather than removed;
+                // if a future case ever allowed an empty window, this
+                // would need to be a loud failure instead of a silent 0.
                 out[out_idx]         = (float) (denom > 0.0 ? acc / denom : 0.0);
             }
         }
@@ -359,7 +367,7 @@ static void compute_reference(const std::vector<float> &       Q,
 
 // NMSE (mse(ref,got)/mse(ref,0)) plus a gross per-element check, replacing
 // the round-1 per-element |got-ref| <= abs_tol + rel_tol*|ref| predicate --
-// see the file header "METRIC" note for why (round 2, finding B: that
+// see the file header "METRIC" note for why (c-1ha7, finding B: that
 // predicate failed the CORRECT tile kernel on hardware). GROSS_ABS_MAX
 // exists only to catch a finding-A-class failure (a wrong dispatch/kernel,
 // not a precision difference) even if NMSE were ever diluted by a very
