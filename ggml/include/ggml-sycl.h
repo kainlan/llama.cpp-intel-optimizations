@@ -1070,6 +1070,13 @@ GGML_BACKEND_API bool ggml_backend_sycl_has_active_placement_plan(void);
 // single chunk) it last reset. Not meaningful with more than one compute
 // buffer/chunk resetting concurrently -- single-threaded test use only.
 GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_compute_buffer_extra_count(void);
+
+// llama.cpp-asdt, plan task L2b: analogous accessor for the tiered KV
+// buffer's per-view-tensor extras. Process-global by design (same reason as
+// above); reads the current view_extras vector size of whichever tiered KV
+// buffer last processed a view tensor's init_tensor call. Single-threaded
+// test use only.
+GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_kv_view_extra_count(void);
 #endif
 
 #ifdef __cplusplus
