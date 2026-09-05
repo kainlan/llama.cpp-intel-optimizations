@@ -373,8 +373,8 @@ int run_child(const std::string & out_prefix) {
         args.nb12               = shape.q8_row_size;
         args.dst_nb1           = static_cast<int64_t>(kNTokens) * static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
         args.dst_nb2           = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
-        args.gate_bias_nb1      = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
-        args.up_bias_nb1        = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
+        args.gate_bias_nb1     = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
+        args.up_bias_nb1       = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
         args.rows_per_wg       = 8;
         args.xmx_tiled         = true;
         args.xmx_tiled_pack_q8 = true;
@@ -699,9 +699,23 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "FAILED: test-sycl-mxfp4-gateup-ksplit-numerics\n");
         return 1;
     }
+
+    // llama.cpp-lis9 spec round 2 (nit 1): state exactly what was checked --
+    // built from kNumKsplitPoints/ksplits rather than hardcoded, so this
+    // message can never drift out of sync with what the test above actually
+    // ran (it did, once: this used to hardcode "1,2,4" after S=3 was added).
+    std::string checked_values;
+    for (int i = 0; i < kNumKsplitPoints; ++i) {
+        if (i > 0) {
+            checked_values += ",";
+        }
+        checked_values += std::to_string(ksplits[i]);
+    }
     std::fprintf(stderr,
-                 "PASS: test-sycl-mxfp4-gateup-ksplit-numerics (ksplit=1,2,4 agree; ksplit= metadata "
-                 "present for 2 and 4)\n");
+                 "PASS: test-sycl-mxfp4-gateup-ksplit-numerics (ksplit={%s} all agree with ksplit=%d; "
+                 "'ksplit=<S>' metadata present and the combine-kernel profile row exists for every S>1; "
+                 "S=1 carries neither)\n",
+                 checked_values.c_str(), ksplits[0]);
     return 0;
 }
 
