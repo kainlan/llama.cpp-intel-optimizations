@@ -211,39 +211,154 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
 
                 simd<float, acc_width> acc = 0.0f;
 
-                for (int64_t kt = kt_start; kt < kt_end; ++kt) {
-                    // Activation "A" operand: M_TILE rows x 32 int8 q8_1 codes,
-                    // plain row-major (no VNNI packing for A).
-                    simd<int8_t, an> a_vec;
-                    // Plain C array, not a simd<> vector: y_scale is only
-                    // ever read back one SCALAR element at a time (never as
-                    // a whole-width DPAS operand), and `simd<float,
-                    // M_TILE>::operator[]` returns a simd_view rather than a
-                    // plain float in this ESIMD version -- multiplying that
-                    // simd_view directly against the exec_n-wide `w_scale`
-                    // vector below has no matching operator*. A plain float
-                    // sidesteps the mismatch entirely, matching how
-                    // mxfp4_dpas_down_single_col_sycl extracts its own
-                    // per-row scalar scale (`const float w_scale =
-                    // w_scale_vec[r];`) before using it in a mixed
-                    // vector*scalar multiply.
-                    float            y_scale[M_TILE];
+            // The DPAS math below (per k-tile: build a_vec, dpas,
+            // scale-then-accumulate) is factored into a MACRO, not a
+            // lambda, so the fast (chunked-load) and remainder loops
+            // share IDENTICAL per-k-tile logic -- only how B_VEC/
+            // W_SCALE are SOURCED differs between them, never the math
+            // itself. A lambda would be the natural C++ tool here, but
+            // fattn-esimd-f16.hpp (this same file's own proven SLM/
+            // partitioned-reduction reference) documents "lambdas don't
+            // work in ESIMD kernels" and uses exactly this macro idiom
+            // (its own COMPUTE_KV_PTRS) for the identical reason.
+#    define ACCUMULATE_ONE_KT(KT, B_VEC, W_SCALE)                                                                       \
+        do {                                                                                                            \
+            /* xmx::dpas's B operand must be a concrete simd<int8_t,bn>, */                                             \
+            /* not a simd_view -- passing (B_VEC) directly when the caller */                                           \
+            /* supplies a select<>() slice (the fast path's chunk-extracted */                                          \
+            /* view) fails to resolve against dpas's overload set ("could */                                            \
+            /* not match sycl::ext::intel::esimd::simd against simd_view"). */                                          \
+            /* A copy-construction here materializes the view into a real */                                            \
+            /* simd<> first; the remainder path's plain simd<> arguments */                                             \
+            /* copy-construct just as validly. */                                                                       \
+            simd<int8_t, bn>    b_vec_local   = (B_VEC);                                                                \
+            simd<float, exec_n> w_scale_local = (W_SCALE);                                                              \
+            /* Activation "A" operand: M_TILE rows x 32 int8 q8_1 codes, */                                             \
+            /* plain row-major (no VNNI packing for A). */                                                              \
+            simd<int8_t, an>    a_vec;                                                                                  \
+            /* Plain C array, not a simd<> vector: y_scale is only ever */                                              \
+            /* read back one SCALAR element at a time (never as a */                                                    \
+            /* whole-width DPAS operand), and simd<float,M_TILE>:: */                                                   \
+            /* operator[] returns a simd_view rather than a plain float */                                              \
+            /* in this ESIMD version -- multiplying that simd_view */                                                   \
+            /* directly against the exec_n-wide scale vector below has */                                               \
+            /* no matching operator*. A plain float sidesteps the */                                                    \
+            /* mismatch, matching mxfp4_dpas_down_single_col_sycl's own */                                              \
+            /* per-row scalar scale extraction. */                                                                      \
+            float               y_scale[M_TILE];                                                                        \
+            _Pragma("unroll") for (int r = 0; r < M_TILE; ++r) {                                                        \
+                const int8_t * qs_ptr                      = act_qs + r * act_row_stride_q + (KT) * k_per;              \
+                a_vec.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(qs_ptr);                         \
+                y_scale[r]                                 = act_scales[r * act_row_stride_s + (KT)];                   \
+            }                                                                                                           \
+                                                                                                                        \
+            simd<int, M_TILE * exec_n> part = 0;                                                                        \
+            part                            = xmx::dpas<8, M_TILE, int, int, int8_t, int8_t>(part, b_vec_local, a_vec); \
+                                                                                                                        \
+            /* Both weight and activation scales vary per K block (MXFP4 */                                             \
+            /* sub-block scaling and q8_1 block scaling respectively), */                                               \
+            /* so the multiply happens per k-tile -- not once after the */                                              \
+            /* full K reduction. Mirrors mxfp4_dpas_down_single_col_sycl's */                                           \
+            /* epilogue exactly. */                                                                                     \
+            _Pragma("unroll") for (int r = 0; r < M_TILE; ++r) {                                                        \
+                simd<int, exec_n>   row_i                  = part.template select<exec_n, 1>(r * exec_n);               \
+                simd<float, exec_n> row_f                  = convert<float>(row_i) * (w_scale_local * y_scale[r]);      \
+                acc.template select<exec_n, 1>(r * exec_n) = acc.template select<exec_n, 1>(r * exec_n) + row_f;        \
+            }                                                                                                           \
+        } while (0)
+
+                int64_t kt = kt_start;
+
+                // FAST PATH (llama.cpp-6f73, spec finding round 3 -- measured
+                // 34f170d60/2ff74942f's bandwidth at ~45 GB/s on the B50, 3x
+                // short of target; mxfp4_pair_glu_xmx_tiled_dpas_m2,
+                // mmvq.cpp:10034, reaches ~195 GB/s reading the SAME MXFP4
+                // SOA-family bytes on the SAME card): batches CHUNK_KT=2
+                // k-tiles' WEIGHT reads (packed nibbles + E8M0 scale) into
+                // ONE combined load per output row instead of CHUNK_KT
+                // separate small reads. SOA stores one row's k-tiles
+                // CONTIGUOUSLY (row_qs_stride = k_tiles*packed_bytes), so
+                // CHUNK_KT consecutive k-tiles for a fixed row are one
+                // contiguous byte run -- halving the weight-side transaction
+                // count (exec_n=16 rows x 2 reads/k-tile before, x 2
+                // reads/2-k-tiles now), the dominant contributor since it is
+                // 2x the activation side's <= M_TILE=8 reads/k-tile (left
+                // unbatched here; the smaller, already-cheaper side). The
+                // CROSS-row stride between the 16 output rows
+                // (row_qs_stride bytes apart) is unavoidable under SOA
+                // regardless of this batching -- m2's XMX_TILED layout
+                // groups rows contiguously instead specifically to avoid
+                // that gather, which is why it does not need this at all;
+                // SOA (this task's own scope, the "down" role) has no such
+                // layout freedom, so batching K instead of N is the
+                // available lever. CHUNK_KT=2 (not 4) to bound the
+                // temporary b_chunk register footprint (bn*CHUNK_KT =
+                // 1024 B) against GRF pressure from the DPAS operands
+                // already live per iteration.
+                constexpr int64_t CHUNK_KT = 2;
+                for (; kt + CHUNK_KT <= kt_end; kt += CHUNK_KT) {
+                    simd<int8_t, bn * CHUNK_KT>    b_chunk       = 0;
+                    simd<float, exec_n * CHUNK_KT> w_scale_chunk = 0.0f;
 #    pragma unroll
-                    for (int r = 0; r < M_TILE; ++r) {
-                        const int8_t * qs_ptr                      = act_qs + r * act_row_stride_q + kt * k_per;
-                        a_vec.template select<k_per, 1>(r * k_per) = block_load<int8_t, k_per>(qs_ptr);
-                        y_scale[r]                                 = act_scales[r * act_row_stride_s + kt];
+                    for (int n = 0; n < exec_n; ++n) {
+                        const int64_t row = n_base + n;
+                        if (row < n_out) {
+                            const uint8_t * packed_ptr = soa_base + row * row_qs_stride + kt * packed_bytes;
+                            simd<uint8_t, packed_bytes * CHUNK_KT> packed_chunk =
+                                block_load<uint8_t, packed_bytes * CHUNK_KT>(packed_ptr);
+                            // Plain scalar base, not block_load, matching the
+                            // remainder path below (c-gngd: block_load here
+                            // assumes 4-byte alignment of a 1-byte-
+                            // granularity pointer that is not guaranteed;
+                            // "neither site" uses it, see the remainder
+                            // path's own comment).
+                            const uint8_t * scale_ptr = soa_base + total_qs_size + row * k_tiles + kt;
+#    pragma unroll
+                            for (int c = 0; c < CHUNK_KT; ++c) {
+                                simd<uint8_t, packed_bytes> packed =
+                                    packed_chunk.template select<packed_bytes, 1>(c * packed_bytes);
+                                simd<uint8_t, k_per> codes;
+                                codes.template select<packed_bytes, 1>(0)            = packed & uint8_t{ 0x0f };
+                                codes.template select<packed_bytes, 1>(packed_bytes) = packed >> 4;
+                                simd<int8_t, k_per> vals = mxfp4_stored_gemm_code_values_esimd<k_per>(codes);
+#    pragma unroll
+                                for (int kk = 0; kk < k_per; ++kk) {
+                                    b_chunk[c * bn + (kk / 4) * exec_n * 4 + n * 4 + (kk % 4)] = vals[kk];
+                                }
+                                w_scale_chunk[c * exec_n + n] = mxfp4_stored_gemm_e8m0_half_esimd(scale_ptr[c]);
+                            }
+                        }
                     }
 
-                    // Weight "B" operand: 16 output rows x 32 MXFP4 elements,
-                    // decoded from the raw stored SOA bytes and VNNI-packed
-                    // ((kk/4)*exec_n*4 + n*4 + (kk%4)) -- the same int8
-                    // B-operand addressing this backend's own activation
-                    // packers already use (mmvq.cpp's
-                    // mxfp4_dpas_pack_q8_single_col_groups_sycl), applied here
-                    // to the weight side instead. Rows past n_out are left as
-                    // zero (both codes and scale), matching the boundary
-                    // check mxfp4_soa_load_a_vec uses on the decode path.
+#    pragma unroll
+                    for (int c = 0; c < CHUNK_KT; ++c) {
+                        // Each B_VEC/W_SCALE argument below is wrapped in its
+                        // own parentheses: the preprocessor's macro-argument
+                        // scanner tracks nesting via () only, not <>, so the
+                        // comma inside `select<bn, 1>` would otherwise be
+                        // misread as a 4th macro argument separator.
+                        ACCUMULATE_ONE_KT(kt + c, (b_chunk.template select<bn, 1>(c * bn)),
+                                          (w_scale_chunk.template select<exec_n, 1>(c * exec_n)));
+                    }
+                }
+
+                // REMAINDER: fewer than CHUNK_KT k-tiles left in this
+                // partition's range (only reachable when k_tiles is not a
+                // multiple of K_PARTITIONS*CHUNK_KT -- for this task's
+                // actual shapes, K=2880 => k_tiles=90, K_PARTITIONS=8,
+                // CHUNK_KT=2, every partition's range is even-length and
+                // this loop never executes; kept for correctness at other
+                // n_k values the entry point's contract still allows).
+                // Weight "B" operand: 16 output rows x 32 MXFP4 elements,
+                // decoded from the raw stored SOA bytes and VNNI-packed
+                // ((kk/4)*exec_n*4 + n*4 + (kk%4)) -- the same int8
+                // B-operand addressing this backend's own activation
+                // packers already use (mmvq.cpp's
+                // mxfp4_dpas_pack_q8_single_col_groups_sycl), applied here
+                // to the weight side instead. Rows past n_out are left as
+                // zero (both codes and scale), matching the boundary check
+                // mxfp4_soa_load_a_vec uses on the decode path.
+                for (; kt < kt_end; ++kt) {
                     simd<int8_t, bn>    b_vec   = 0;
                     simd<float, exec_n> w_scale = 0.0f;
 #    pragma unroll
@@ -277,22 +392,9 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
                             w_scale[n]               = mxfp4_stored_gemm_e8m0_half_esimd(scale_byte);
                         }
                     }
-
-                    simd<int, M_TILE * exec_n> part = 0;
-                    part = xmx::dpas<8, M_TILE, int, int, int8_t, int8_t>(part, b_vec, a_vec);
-
-                // Both weight and activation scales vary per K block (MXFP4
-                // sub-block scaling and q8_1 block scaling respectively), so
-                // the multiply happens INSIDE this loop, per k-tile -- not
-                // once after the full K reduction. Mirrors
-                // mxfp4_dpas_down_single_col_sycl's epilogue exactly.
-#    pragma unroll
-                    for (int r = 0; r < M_TILE; ++r) {
-                        simd<int, exec_n>   row_i                  = part.template select<exec_n, 1>(r * exec_n);
-                        simd<float, exec_n> row_f                  = convert<float>(row_i) * (w_scale * y_scale[r]);
-                        acc.template select<exec_n, 1>(r * exec_n) = acc.template select<exec_n, 1>(r * exec_n) + row_f;
-                    }
+                    ACCUMULATE_ONE_KT(kt, b_vec, w_scale);
                 }
+#    undef ACCUMULATE_ONE_KT
 
                 // Combine the K_PARTITIONS work-items' partial accumulators
                 // via an SLM hierarchical (tree) reduction -- same structure
