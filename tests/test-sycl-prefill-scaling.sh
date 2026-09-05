@@ -536,14 +536,28 @@ for _ in $(seq 1 50); do
     # way a tested `if`/`&&`/`||` condition is, so without this guard the
     # very first no-match iteration silently aborts the whole suite (no
     # FAIL line, just a bare non-zero exit) rather than looping again.
-    candidate="$(pgrep -P "$scaling_pid" -f bench-guard.sh)" || true
+    candidate="$(pgrep -P "$scaling_pid" -f bench-guard.sh 2>/dev/null)" || true
     candidate="${candidate%%$'\n'*}"
     if [ -n "$candidate" ]; then guard_pid="$candidate"; break; fi
     sleep 0.1
 done
 [ -n "$guard_pid" ] || { echo "FAIL: could not find the bench-guard.sh child of pid $scaling_pid within the poll bound -- this control is vacuous"; fail=1; }
-cmdline_lines="$(tr '\0' '\n' < "/proc/$guard_pid/cmdline" 2>/dev/null)"
-our_logfile="$(awk '/^--log$/{want=1; next} want{print; want=0}' <<< "$cmdline_lines")"
+# `|| true`: if bench-guard.sh has already exited between the poll match
+# just above and this read (a genuine race, not merely hypothetical --
+# see case 13 below for a deterministic reproduction), `/proc/$guard_pid`
+# is gone and the redirect fails. Like the pgrep assignments above, this
+# is a bare `var=$(cmd)` NOT exempted from `set -e` by a tested
+# if/&&/||, so without the guard the whole suite would abort silently
+# (llama.cpp-y3z0 quality review round 3, finding 1) -- the empty-
+# `our_logfile` outcome that follows is already handled by the next line.
+cmdline_lines="$(tr '\0' '\n' < "/proc/$guard_pid/cmdline" 2>/dev/null)" || true
+# `exit` after the first print (llama.cpp-y3z0 quality review round 3,
+# nit): take only the FIRST value following a `--log` token, not every
+# one -- safe here even though case 12's script-side parse_cell avoids
+# `exit` in its own awk, because THIS awk's input is a here-string built
+# entirely in memory (no live producer process it could ever SIGPIPE),
+# unlike a pipe from a still-writing command.
+our_logfile="$(awk '/^--log$/{want=1; next} want{print; exit}' <<< "$cmdline_lines")"
 [ -n "$our_logfile" ] || { echo "FAIL: could not extract the --log path from bench-guard.sh's cmdline -- this control is vacuous"; fail=1; }
 # Positive control: confirm the logfile actually exists before the kill,
 # so an absent-after-kill result below can't be a vacuous "nothing was
@@ -569,12 +583,28 @@ wait "$scaling_pid" 2>/dev/null || true
 # Same `|| true` reasoning as the polling loop above: pgrep/ps exiting
 # non-zero here (no such child, or it already exited) is an expected,
 # handled case (the `[ -n ... ]` guards below), not a script-aborting one.
-timeout_pid="$(pgrep -P "$guard_pid")" || true
+timeout_pid="$(pgrep -P "$guard_pid" 2>/dev/null)" || true
 timeout_pid="${timeout_pid%%$'\n'*}"
 if [ -n "$timeout_pid" ]; then
     timeout_pgid="$(ps -o pgid= -p "$timeout_pid" 2>/dev/null)" || true
     timeout_pgid="${timeout_pgid//[[:space:]]/}"
-    [ -n "$timeout_pgid" ] && kill -TERM -"$timeout_pgid" 2>/dev/null || true
+    # Self-check before signalling ANY process group (llama.cpp-y3z0
+    # quality review round 3, finding 2): $timeout_pgid is never verified
+    # against this suite's OWN process group before use. If `pgrep -P
+    # "$guard_pid"` ever returned a non-leader child whose pgid happened
+    # to equal the suite's own -- e.g. bench-guard.sh's foreground child
+    # were reparented or matched some other way -- `kill -TERM -pgid`
+    # would SIGTERM the WHOLE test run's own process group, and under
+    # ctest, ctest itself. Refuse loudly instead of ever signalling a
+    # group that could be ours.
+    self_pgid="$(ps -o pgid= -p $$ 2>/dev/null)" || true
+    self_pgid="${self_pgid//[[:space:]]/}"
+    if [ -n "$timeout_pgid" ] && [ "$timeout_pgid" = "$self_pgid" ]; then
+        echo "FAIL: refusing to signal pgid $timeout_pgid -- it matches this suite's own process group ($self_pgid); killing it would SIGTERM the whole test run" >&2
+        fail=1
+    elif [ -n "$timeout_pgid" ]; then
+        kill -TERM -"$timeout_pgid" 2>/dev/null || true
+    fi
 fi
 # Bounded wait for bench-guard.sh itself to exit as a result, then a hard
 # fallback so this case can never itself leave something running
@@ -587,5 +617,58 @@ done
 [ "$guard_gone" -eq 1 ] || kill -KILL "$guard_pid" "$timeout_pid" 2>/dev/null || true
 kill -0 "$guard_pid" 2>/dev/null && { echo "FAIL: bench-guard.sh (pid $guard_pid) is still running after this case's cleanup -- it must not survive past the suite"; fail=1; }
 [ -n "$timeout_pid" ] && kill -0 "$timeout_pid" 2>/dev/null && { echo "FAIL: the wrapped bench's process tree (pid $timeout_pid) is still running after this case's cleanup"; fail=1; }
+
+# --- Case 13 (llama.cpp-y3z0 quality review round 3, finding 1): a
+# DETERMINISTIC reproduction of the race case 12's cmdline read is
+# exposed to -- bench-guard.sh exiting between the poll match and the
+# `/proc/$guard_pid/cmdline` read. Racing the actual timing against the
+# real script is inherently flaky (the window is a handful of
+# microseconds), so instead of trying to hit that window live, this
+# case proves the underlying mechanism directly and deterministically:
+# spawn a trivial child, `wait` for it to fully exit and be reaped (at
+# which point its pid is definitively dead, no timing involved), then
+# run the EXACT bare-assignment shape case 12 uses against that
+# now-dead pid's /proc/cmdline, once unguarded and once with the `|| true`
+# case 12 actually ships. The unguarded form must abort under set -e
+# (never reaching its own echo); the guarded form must survive.
+dead_pid_holder_sh="$T/dead-pid-holder.sh"
+cat > "$dead_pid_holder_sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$dead_pid_holder_sh"
+"$dead_pid_holder_sh" &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null || true
+# Positive control: confirm this pid is genuinely dead before trusting
+# either sub-script's result below -- a live (recycled) pid here would
+# make both sub-scripts succeed, silently voiding the whole case.
+kill -0 "$dead_pid" 2>/dev/null && { echo "FAIL: pid $dead_pid did not actually die after wait -- this control is vacuous"; fail=1; }
+
+UNGUARDED_RACE_SH="$T/unguarded-race.sh"
+cat > "$UNGUARDED_RACE_SH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cmdline_lines="\$(tr '\\0' '\\n' < "/proc/$dead_pid/cmdline" 2>/dev/null)"
+echo "REACHED"
+EOF
+chmod +x "$UNGUARDED_RACE_SH"
+
+GUARDED_RACE_SH="$T/guarded-race.sh"
+cat > "$GUARDED_RACE_SH" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cmdline_lines="\$(tr '\\0' '\\n' < "/proc/$dead_pid/cmdline" 2>/dev/null)" || true
+echo "REACHED"
+EOF
+chmod +x "$GUARDED_RACE_SH"
+
+unguarded_out="$("$UNGUARDED_RACE_SH" 2>&1)" && unguarded_rc=0 || unguarded_rc=$?
+[ "$unguarded_rc" -ne 0 ] || { echo "FAIL: expected the UNGUARDED race-read form to abort under set -e against a dead pid (got rc=0, output: $unguarded_out) -- this control is vacuous"; fail=1; }
+echo "$unguarded_out" | grep -q "REACHED" && { echo "FAIL: the unguarded form must never reach its own echo (got: $unguarded_out)"; fail=1; }
+
+guarded_out="$("$GUARDED_RACE_SH" 2>&1)" && guarded_rc=0 || guarded_rc=$?
+[ "$guarded_rc" -eq 0 ] || { echo "FAIL: expected the || true -guarded form (the one case 12 actually ships) to survive the same dead-pid read, got rc=$guarded_rc, output: $guarded_out"; fail=1; }
+echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must reach its own echo after the dead-pid read (got: $guarded_out)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1
