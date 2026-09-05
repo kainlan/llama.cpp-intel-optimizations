@@ -15,8 +15,8 @@
 # itself a gate.
 #
 # Exit codes:
-#   0  every requested pair was actually measured, and ratio1024 >= 0.9 on
-#      every one of them (in-gate)
+#   0  every requested pair ran, produced parseable numbers, and had
+#      ratio1024 >= 0.9 on every one of them (in-gate)
 #   1  at least one MEASURED pair has ratio1024 < 0.9 (VERDICT FAIL -- a
 #      real scaling regression). Takes precedence over 2 below: a genuine
 #      regression on one pair must not be hidden behind an unrelated
@@ -38,10 +38,17 @@
 # CLAUDE.md mandates for any GPU measurement applies here too -- this script
 # never re-implements that logic, only invokes bench-guard.sh as a child and
 # forwards its test hooks (--sysfs-card/--meminfo/--pgrep-cmd/--df-cmd/
-# --journalctl-cmd/--max-wait) unchanged, exactly the way
+# --journalctl-cmd/--max-wait/--budget) unchanged, exactly the way
 # scripts/sycl-decode-mode-capture.sh does for the same reason. Do not add
 # -r above 2 at pp2048 (per the plan's own gotcha) -- change PP_VALUES/-r
 # only with that in mind.
+#
+# --budget overrides bench-guard.sh's own `timeout -k 15 <budget>` wrapped
+# around the bench (default 900s) -- not a test-only hook: a GPT-OSS 20B
+# `-p 2048 -r 2` leg is the plausible case for needing more than 900s, and
+# an operator running the real gate has no other way to raise it
+# (llama.cpp-y3z0 quality review round 1, finding 3 -- this was accepted
+# and forwarded already, just missing from this list).
 #
 # ONEAPI_DEVICE_SELECTOR is set as a prefix-assignment on the bench-guard.sh
 # INVOCATION itself (`ONEAPI_DEVICE_SELECTOR="$c_selector" "$GUARD" ...`),
@@ -51,8 +58,9 @@
 # the guard unable to derive a card at all in production use (every pair
 # refused with "cannot derive card ... got ''", or one stray inherited value
 # silently preflighting the wrong card for three of the six pairs -- fixed
-# post-review, rev-y3z0-spec-1 finding 1). A bash prefix-assignment exports
-# the variable for the WHOLE lifetime of the prefixed command, so bench-
+# post-review, llama.cpp-y3z0 spec review round 1 finding 1. A bash
+# prefix-assignment exports the variable for the WHOLE lifetime of the
+# prefixed command, so bench-
 # guard's own child (the wrapped bench, run via `timeout -k 15 ... "$@"`)
 # inherits it too -- no separate `env ...` wrapper on the bench is needed.
 #
@@ -136,8 +144,8 @@ is_valid_key() {
 # Validate every --only token BEFORE touching bench-guard or printing
 # anything -- an unmatched filter (a typo, wrong case, unknown model/card)
 # must be a loud usage error, never a silently empty, exit-0 "OK" table
-# (rev-y3z0-spec-1 finding 3: --only mistral,B70 used to print the header
-# alone and exit 0).
+# (llama.cpp-y3z0 spec review round 1, finding 3: --only mistral,B70 used
+# to print the header alone and exit 0).
 for o in "${ONLY[@]}"; do
     is_valid_key "$o" || {
         echo "sycl-prefill-scaling: --only '$o' does not name one of the six pairs. Valid keys: ${VALID_KEYS[*]}" >&2
@@ -189,12 +197,13 @@ parse_cell() {
     # exits after its first non-empty field, and under `set -o pipefail`
     # an early-exiting consumer can SIGPIPE a still-writing producer;
     # `<<<` feeds the string without a pipe at all, removing the question
-    # (rev-y3z0-spec-2 finding N1, same shape as finding 7 in the prior
-    # round, missed there because this second pipeline wasn't the one
-    # `grep -q` sat on). The trailing `{print $1}` awk below never exits
-    # early (no early `exit`, just falls off the end of its one line of
-    # input), so it carried no SIGPIPE risk either way, but is converted
-    # too for the same reason removing finding 7's pipe was worth it:
+    # (llama.cpp-y3z0 spec review round 2, finding N1 -- same shape as
+    # finding 7 in round 1, missed there because this second pipeline
+    # wasn't the one `grep -q` sat on). The trailing `{print $1}` awk
+    # below never exits early (no early `exit`, just falls off the end of
+    # its one line of input), so it carried no SIGPIPE risk either way,
+    # but is converted too for the same reason removing finding 7's pipe
+    # was worth it:
     # one fewer process, one fewer thing to reason about.
     value="$(awk -F'|' '{
         for (i=NF; i>=1; i--) {
@@ -208,24 +217,47 @@ parse_cell() {
     # its first match and can SIGPIPE a still-writing producer under
     # `set -o pipefail`; here the producer is a single ten-byte `printf`,
     # so the race is latent, not live, but removing the pipe removes the
-    # question entirely (rev-y3z0-spec-1 finding 7).
+    # question entirely (llama.cpp-y3z0 spec review round 1 finding 7).
     [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo ""; return 0; }
     echo "$value"
 }
 
-printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-    "model" "card" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
+# row: the nine-column table format, named once (llama.cpp-y3z0 quality
+# review round 1, nit 4 -- this printf used to be duplicated verbatim six
+# times, so a column change had to be made in six places in lockstep, and
+# a header/row drift would not have been caught by any assertion).
+row() { printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
 
-# any_fail / any_error / any_measured decide the FINAL exit code only after
+row "model" "card" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
+
+# any_fail / any_error / any_selected decide the FINAL exit code only after
 # every requested pair has been attempted -- never derived incrementally
 # with a single `overall_rc` variable a later pair could accidentally
-# lower. Precedence (rev-y3z0-spec-1 finding 4): a real ratio<0.9 on any
-# MEASURED pair outranks an unrelated measurement gap elsewhere, since a
-# genuine regression must never be masked by an unrelated "could not
-# measure" on a different pair.
+# lower. Precedence (llama.cpp-y3z0 spec review round 1, finding 4): a
+# real ratio<0.9 on any MEASURED pair outranks an unrelated measurement
+# gap elsewhere, since a genuine regression must never be masked by an
+# unrelated "could not measure" on a different pair.
 any_fail=0
 any_error=0
-any_measured=0
+any_selected=0
+
+# logfile: reused each iteration, reclaimed by an EXIT trap set ONCE here
+# (not a RETURN trap -- this loop runs at top-level script scope, not
+# inside a function, so RETURN would never fire, which is what an earlier
+# version of this comment got right and then drew the wrong conclusion
+# from -- "no RETURN trap fires" is not the same claim as "no trap is
+# needed"). Mirrors the idiom scripts/bench-guard.sh:151-152 itself uses
+# for its own temp file (`tmp_out="$(mktemp)"; trap 'rm -f "$tmp_out"' EXIT`):
+# without it, a SIGTERM/Ctrl-C mid-bench leaves that iteration's temp log
+# behind (llama.cpp-y3z0 quality review round 1, finding 1 -- demonstrated
+# with a slow fake bench killed 3s in: the file survived the kill). The
+# per-iteration `rm -f "$logfile"` calls below are kept: they free the
+# file promptly on every NORMAL exit path (rc==3, non-VALID/non-zero,
+# parse-failure, success), so the trap only ever has real work to do on an
+# abnormal exit; `${logfile:-}` guards the trap firing before the first
+# `mktemp` ever runs.
+logfile=""
+trap 'rm -f "${logfile:-}"' EXIT
 
 for model_entry in "${MODELS[@]}"; do
     IFS='|' read -r m_key m_label m_path <<< "$model_entry"
@@ -233,7 +265,7 @@ for model_entry in "${MODELS[@]}"; do
         IFS='|' read -r c_key c_label c_selector <<< "$card_entry"
         pair_key="$m_key,$c_key"
         only_selected "$pair_key" || continue
-        any_measured=1
+        any_selected=1
 
         GUARD_ARGS=()
         [ -n "$SYSFS_CARD" ] && GUARD_ARGS+=(--sysfs-card "$SYSFS_CARD")
@@ -244,11 +276,6 @@ for model_entry in "${MODELS[@]}"; do
         [ -n "$MAX_WAIT" ] && GUARD_ARGS+=(--max-wait "$MAX_WAIT")
         [ -n "$BUDGET" ] && GUARD_ARGS+=(--budget "$BUDGET")
 
-        # No trap here: this loop runs at top-level script scope, not
-        # inside a function, so a RETURN trap would never fire -- cleanup
-        # is instead the explicit `rm -f "$logfile"` on every exit path
-        # below (rc==3, non-VALID/non-zero, parse-failure, and the normal
-        # success path).
         logfile="$(mktemp)"
 
         # ONEAPI_DEVICE_SELECTOR is a prefix-assignment on the GUARD
@@ -260,8 +287,24 @@ for model_entry in "${MODELS[@]}"; do
             || rc=$?
 
         if [ "$rc" -eq 3 ]; then
-            printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-guard-refused"
+            # bench-guard's own refuse() calls `exit 3` at PREFLIGHT, before
+            # the wrapped command ever runs, and before --log is ever
+            # written to (bench-guard.sh's own --log write happens only
+            # after the wrapped command has run) -- so a genuine preflight
+            # refusal leaves $logfile exactly as `mktemp` created it: empty.
+            # But bench-guard MIRRORS the wrapped command's own exit status
+            # (bench-guard.sh's final `exit "$rc"`), so a bench that itself
+            # exits status 3 for its own reasons produces a NON-empty
+            # logfile (the --log header is written unconditionally once the
+            # wrapped command has finished) and rc==3 alone cannot tell the
+            # two apart (llama.cpp-y3z0 quality review round 1, finding 7 --
+            # the same "which layer flagged this" mislabel finding N4 fixed
+            # for the rc!=0/SUSPECT paths below). Distinguish by content.
+            if [ -s "$logfile" ]; then
+                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=3"
+            else
+                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-guard-refused"
+            fi
             any_error=1
             rm -f "$logfile"
             continue
@@ -271,36 +314,36 @@ for model_entry in "${MODELS[@]}"; do
         # line is not stamped VALID (SUSPECT: a kernel GPU fault, a
         # timeout kill, or Shmem growth mid-run -- see bench-guard.sh's own
         # header), both mean "this pair's numbers cannot be trusted", not
-        # "measure it anyway" (rev-y3z0-spec-1 finding 2: a fake bench that
-        # printed a full healthy table and then exited 134 used to be
-        # reported PASS, and a SUSPECT-stamped GT-reset run got an ordinary
-        # verdict from its numbers). Treated exactly like the preflight-
-        # refusal case above: an ERROR row, never a computed verdict --
-        # but reported as two DISTINCT labels (rev-y3z0-spec-2 finding N4),
-        # since "the bench itself failed" (rc!=0) and "the bench succeeded
+        # "measure it anyway" (llama.cpp-y3z0 spec review round 1, finding
+        # 2: a fake bench that printed a full healthy table and then
+        # exited 134 used to be reported PASS, and a SUSPECT-stamped
+        # GT-reset run got an ordinary verdict from its numbers). Treated
+        # exactly like the preflight-refusal case above: an ERROR row,
+        # never a computed verdict -- but reported as two DISTINCT labels
+        # (llama.cpp-y3z0 spec review round 2, finding N4), since "the
+        # bench itself failed" (rc!=0) and "the bench succeeded
         # but the guard's own postflight flagged the run" (VALID-stamp
         # missing) are different failure modes with different next steps,
         # and a single "not-valid" label read wrong for the first one.
         header_line="$(head -1 "$logfile" 2>/dev/null || true)"
 
         if [ "$rc" -ne 0 ]; then
-            printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=$rc"
+            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=$rc"
             any_error=1
             rm -f "$logfile"
             continue
         fi
 
-        # Exact-token match, not a glob prefix (rev-y3z0-spec-2 finding
-        # N3): bench-guard.sh's own verdict_line is either exactly "VALID"
-        # or "SUSPECT:<reasons>" (never any other word), but the OLD glob
-        # `"# bench-guard: VALID"*` would also have accepted a hypothetical
-        # "# bench-guard: VALIDATED ..." line -- "VALID" must be followed
-        # by end-of-string or whitespace, never another word character.
+        # Exact-token match, not a glob prefix (llama.cpp-y3z0 spec review
+        # round 2, finding N3): bench-guard.sh's own verdict_line is either
+        # exactly "VALID" or "SUSPECT:<reasons>" (never any other word),
+        # but the OLD glob `"# bench-guard: VALID"*` would also have
+        # accepted a hypothetical "# bench-guard: VALIDATED ..." line --
+        # "VALID" must be followed by end-of-string or whitespace, never
+        # another word character.
         valid_re='^# bench-guard: VALID($|[[:space:]])'
         if ! [[ "$header_line" =~ $valid_re ]]; then
-            printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-                "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:guard-not-valid(header=${header_line:0:80})"
+            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:guard-not-valid(header=${header_line:0:80})"
             any_error=1
             rm -f "$logfile"
             continue
@@ -313,8 +356,7 @@ for model_entry in "${MODELS[@]}"; do
         rm -f "$logfile"
 
         if [ -z "$pp128" ] || [ -z "$pp512" ] || [ -z "$pp1024" ] || [ -z "$pp2048" ]; then
-            printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-                "$m_label" "$c_label" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
+            row "$m_label" "$c_label" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
             any_error=1
             continue
         fi
@@ -339,17 +381,17 @@ for model_entry in "${MODELS[@]}"; do
             status="PASS"
         fi
 
-        printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' \
-            "$m_label" "$c_label" "$pp128" "$pp512" "$pp1024" "$pp2048" \
+        row "$m_label" "$c_label" "$pp128" "$pp512" "$pp1024" "$pp2048" \
             "ratio1024=$ratio1024" "intercept_ms=$intercept_ms" "$status"
     done
 done
 
-# Defensive fallback (rev-y3z0-spec-1 finding 3): the upfront --only
-# validation above should make this unreachable in practice, but a future
-# edit that adds an ONLY-independent way to select zero pairs must still
-# fail loud rather than print a bare header and exit 0.
-if [ "$any_measured" -eq 0 ]; then
+# Defensive fallback (llama.cpp-y3z0 spec review round 1, finding 3): the
+# upfront --only validation above should make this unreachable in
+# practice, but a future edit that adds an ONLY-independent way to select
+# zero pairs must still fail loud rather than print a bare header and
+# exit 0.
+if [ "$any_selected" -eq 0 ]; then
     echo "sycl-prefill-scaling: no pair was selected to run (empty --only match) -- valid keys: ${VALID_KEYS[*]}" >&2
     exit 2
 fi
