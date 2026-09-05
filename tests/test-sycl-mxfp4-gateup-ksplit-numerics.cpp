@@ -197,6 +197,22 @@ void fill_activation_row(uint8_t * row, uint32_t seed) {
     }
 }
 
+// llama.cpp-lis9 spec round 1 (should-fix 3): GPT-OSS's gate/up experts
+// carry biases, and the combine kernel's bias-add (mxfp4_bundle4_store_glu_tile,
+// mmvq.cpp) was otherwise never exercised by this test -- gate_bias/up_bias
+// defaulted to nullptr, so every S value took the same "no bias" branch and
+// the S=2/S=4-vs-S=1 comparison never touched that code path. Deterministic,
+// non-zero, and modest in magnitude (same RNG family as the activations)
+// so the bias-add is exercised without dominating the GLU output's
+// dynamic range.
+void fill_bias(std::vector<float> & bias, uint32_t seed) {
+    std::mt19937                          rng(seed);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    for (float & v : bias) {
+        v = dist(rng);
+    }
+}
+
 // Exception-safe device selection (sycl::device's default ctor throws
 // uncaught on a device-less host -- see
 // ggml/src/ggml-sycl/tests/sycl-test-skip.hpp's rationale, not reachable
@@ -245,6 +261,11 @@ int run_child(const std::string & out_prefix) {
     }
     const int32_t h_ids[kNIds] = { 0, 1, 2, 3 };
 
+    std::vector<float> h_gate_bias(static_cast<size_t>(kNExperts) * static_cast<size_t>(kNrowsPerExpert));
+    std::vector<float> h_up_bias(static_cast<size_t>(kNExperts) * static_cast<size_t>(kNrowsPerExpert));
+    fill_bias(h_gate_bias, 4000u);
+    fill_bias(h_up_bias, 5000u);
+
     std::vector<uint8_t *> d_gate(kNExperts, nullptr);
     std::vector<uint8_t *> d_up(kNExperts, nullptr);
     for (int e = 0; e < kNExperts; ++e) {
@@ -258,6 +279,8 @@ int run_child(const std::string & out_prefix) {
     int32_t *     d_ids        = sycl::malloc_device<int32_t>(kNIds, q);
     int8_t *      d_b_packed   = sycl::malloc_device<int8_t>(shape.b_packed_elems, q);
     float *       d_y_scales   = sycl::malloc_device<float>(shape.y_scales_elems, q);
+    float *       d_gate_bias  = sycl::malloc_device<float>(h_gate_bias.size(), q);
+    float *       d_up_bias    = sycl::malloc_device<float>(h_up_bias.size(), q);
 
     auto free_all = [&]() {
         for (int e = 0; e < kNExperts; ++e) {
@@ -289,9 +312,16 @@ int run_child(const std::string & out_prefix) {
         if (d_y_scales) {
             sycl::free(d_y_scales, q);
         }
+        if (d_gate_bias) {
+            sycl::free(d_gate_bias, q);
+        }
+        if (d_up_bias) {
+            sycl::free(d_up_bias, q);
+        }
     };
 
-    bool alloc_ok = d_activation && d_output && d_gate_ptrs && d_up_ptrs && d_ids && d_b_packed && d_y_scales;
+    bool alloc_ok = d_activation && d_output && d_gate_ptrs && d_up_ptrs && d_ids && d_b_packed && d_y_scales &&
+                    d_gate_bias && d_up_bias;
     for (int e = 0; e < kNExperts; ++e) {
         alloc_ok = alloc_ok && d_gate[e] && d_up[e];
     }
@@ -310,6 +340,8 @@ int run_child(const std::string & out_prefix) {
         }
         q.memcpy(d_activation, h_activation.data(), shape.activation_bytes).wait();
         q.memcpy(d_ids, h_ids, sizeof(h_ids)).wait();
+        q.memcpy(d_gate_bias, h_gate_bias.data(), h_gate_bias.size() * sizeof(float)).wait();
+        q.memcpy(d_up_bias, h_up_bias.data(), h_up_bias.size() * sizeof(float)).wait();
         q.memset(d_output, 0, shape.output_floats * sizeof(float)).wait();
 
         ggml_sycl::mxfp4_pair_glu_bench_args args{};
@@ -319,6 +351,8 @@ int run_child(const std::string & out_prefix) {
         args.activations_q8_soa = d_activation;
         args.output             = d_output;
         args.ids                = d_ids;
+        args.gate_bias          = d_gate_bias;
+        args.up_bias            = d_up_bias;
         args.dpas_b_packed      = d_b_packed;
         args.dpas_y_scales      = d_y_scales;
         args.ncols              = kNcols;
@@ -339,6 +373,8 @@ int run_child(const std::string & out_prefix) {
         args.nb12               = shape.q8_row_size;
         args.dst_nb1           = static_cast<int64_t>(kNTokens) * static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
         args.dst_nb2           = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
+        args.gate_bias_nb1      = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
+        args.up_bias_nb1        = static_cast<int64_t>(kNrowsPerExpert) * sizeof(float);
         args.rows_per_wg       = 8;
         args.xmx_tiled         = true;
         args.xmx_tiled_pack_q8 = true;
@@ -503,18 +539,25 @@ int main(int argc, char ** argv) {
     const shape_layout shape  = compute_shape();
     const pid_t        my_pid = getpid();
 
-    const int    ksplits[] = { 1, 2, 4 };
-    child_result results[3];
-    std::string  prefixes[3];
+    // llama.cpp-lis9 spec round 1 (nit 8): S=3 exercises the non-divisible
+    // K-tile partition (GPT-OSS: k_tiles=90, 90/3=30 exactly -- so S=4
+    // remains the only point covering a REMAINDER partition, 90/4=22 r2;
+    // S=3 is covered here for a clean-division split ratio between the
+    // already-covered S=2 (90/2=45) and S=4 cases). kNumKsplitPoints must
+    // match the length of `ksplits` below.
+    constexpr int kNumKsplitPoints          = 4;
+    const int     ksplits[kNumKsplitPoints] = { 1, 2, 3, 4 };
+    child_result  results[kNumKsplitPoints];
+    std::string   prefixes[kNumKsplitPoints];
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kNumKsplitPoints; ++i) {
         prefixes[i] = "/tmp/test-sycl-mxfp4-gateup-ksplit-numerics-" + std::to_string(static_cast<long>(my_pid)) +
                       "-s" + std::to_string(ksplits[i]);
         results[i] = run_one_ksplit(argv[0], ksplits[i], shape.output_floats, prefixes[i]);
     }
 
     auto cleanup = [&]() {
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < kNumKsplitPoints; ++i) {
             std::remove((prefixes[i] + ".floats").c_str());
             std::remove((prefixes[i] + ".csv").c_str());
         }
@@ -530,7 +573,7 @@ int main(int argc, char ** argv) {
         cleanup();
         return LLAMA_TEST_EXIT_SKIP;
     }
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < kNumKsplitPoints; ++i) {
         if (results[i].rc == LLAMA_TEST_EXIT_SKIP) {
             std::fprintf(stderr,
                          "SKIP: ksplit=%d child reported no XMX GPU device after ksplit=1 succeeded; "
@@ -562,7 +605,8 @@ int main(int argc, char ** argv) {
     std::string metadata;
 
     // S=1 must be byte-for-byte the current behaviour: no combine kernel
-    // runs, so the profile row must carry no "ksplit=" tag at all.
+    // runs, so the profile row must carry no "ksplit=" tag at all, and the
+    // combine kernel's own row must not exist either.
     if (!find_csv_metadata(results[0].csv, "mxfp4.gateup.xmx_tiled_dpas_m2", metadata)) {
         std::fprintf(stderr,
                      "FAIL: no 'mxfp4.gateup.xmx_tiled_dpas_m2' profile row for ksplit=1 "
@@ -575,29 +619,42 @@ int main(int argc, char ** argv) {
                      metadata.c_str());
         all_ok = false;
     }
+    std::string combine_metadata;
+    if (find_csv_metadata(results[0].csv, "mxfp4.gateup.xmx_tiled_dpas_m2_ksplit_combine", combine_metadata)) {
+        std::fprintf(stderr,
+                     "FAIL: ksplit=1 unexpectedly produced a "
+                     "'mxfp4.gateup.xmx_tiled_dpas_m2_ksplit_combine' profile row -- the combine kernel "
+                     "must not run at all on the S=1 fast path\n");
+        all_ok = false;
+    }
 
-    // S=2 and S=4: the profile row must name the split factor. THIS IS THE
-    // RED SIGNAL before GREEN: today GGML_SYCL_MXFP4_GATEUP_KSPLIT is
-    // unknown to the kernel, S is silently 1 regardless of the env var, and
-    // no row ever carries "ksplit=2" or "ksplit=4".
-    for (int i = 1; i < 3; ++i) {
+    // S=2, S=3 and S=4: the partial-sum row must name the split factor, and
+    // the combine kernel's own row must exist (nit 4 -- count >= 1). THIS IS
+    // THE RED SIGNAL before GREEN: today GGML_SYCL_MXFP4_GATEUP_KSPLIT is
+    // unknown to the kernel, S is silently 1 regardless of the env var, no
+    // row ever carries "ksplit=2"/"ksplit=3"/"ksplit=4", and the combine row
+    // never appears at all.
+    for (int i = 1; i < kNumKsplitPoints; ++i) {
         const std::string tag = "ksplit=" + std::to_string(ksplits[i]);
         if (!find_csv_metadata(results[i].csv, "mxfp4.gateup.xmx_tiled_dpas_m2", metadata)) {
             std::fprintf(stderr, "FAIL: no 'mxfp4.gateup.xmx_tiled_dpas_m2' profile row for ksplit=%d\n", ksplits[i]);
             all_ok = false;
-            continue;
-        }
-        if (metadata.find(tag) == std::string::npos) {
+        } else if (metadata.find(tag) == std::string::npos) {
             std::fprintf(stderr, "FAIL: ksplit=%d profile row metadata=\"%s\" does not contain \"%s\"\n", ksplits[i],
                          metadata.c_str(), tag.c_str());
             all_ok = false;
         }
+        if (!find_csv_metadata(results[i].csv, "mxfp4.gateup.xmx_tiled_dpas_m2_ksplit_combine", combine_metadata)) {
+            std::fprintf(stderr, "FAIL: no 'mxfp4.gateup.xmx_tiled_dpas_m2_ksplit_combine' profile row for ksplit=%d\n",
+                         ksplits[i]);
+            all_ok = false;
+        }
     }
 
-    // Numerics: S=2/S=4 must agree with S=1 per element. DPAS int8
+    // Numerics: S=2/S=3/S=4 must agree with S=1 per element. DPAS int8
     // accumulation is exact; the float combine across k-parts reorders
     // additions, so this is a tolerance check, not bit-equality.
-    for (int i = 1; i < 3; ++i) {
+    for (int i = 1; i < kNumKsplitPoints; ++i) {
         size_t mismatches   = 0;
         float  max_abs_diff = 0.0f;
         size_t worst_idx    = 0;

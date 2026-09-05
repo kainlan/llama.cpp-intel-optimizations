@@ -900,7 +900,18 @@ int ggml_sycl_get_device_id_from_device(const sycl::device & dev);
 // already near its own occupancy elbow, so splitting it further would only
 // add combine overhead. Explicit integer values are clamped into [1, 4],
 // the only range the kernel's K-tile partition (mmvq.cpp) is exercised at.
+// Pass device=-1 when ggml_sycl_mxfp4_gateup_ksplit_is_auto() is false: the
+// EXPLICIT branch never reads `device`, so -1 is safe and lets the caller
+// skip a device-id lookup entirely on that (overwhelmingly common, default)
+// path (llama.cpp-lis9 spec round 1, nit 7).
 int ggml_sycl_mxfp4_gateup_ksplit(int device);
+
+// True only for GGML_SYCL_MXFP4_GATEUP_KSPLIT=auto -- the one mode whose
+// resolution actually depends on which device is asked. Check this BEFORE
+// looking up a device id for ggml_sycl_mxfp4_gateup_ksplit(); every other
+// mode (unset, or an explicit integer) resolves identically regardless of
+// device, so a caller on that path can pass -1 and skip the lookup.
+bool ggml_sycl_mxfp4_gateup_ksplit_is_auto();
 
 inline dpct::err0 ggml_sycl_set_device(const int device) try {
     int current_device_id;

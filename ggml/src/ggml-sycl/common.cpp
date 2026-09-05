@@ -987,12 +987,28 @@ int clamp_ksplit(int value) {
     return value;
 }
 
+// Memoized once, shared by both accessors below (llama.cpp-lis9 spec round 1,
+// nit 7's fix reuses this rather than each accessor keeping its own copy of
+// the env parse).
+const mxfp4_gateup_ksplit_config & mxfp4_gateup_ksplit_cfg() {
+    static const mxfp4_gateup_ksplit_config cfg = mxfp4_gateup_ksplit_parse_env();
+    return cfg;
+}
+
 }  // namespace
 
+bool ggml_sycl_mxfp4_gateup_ksplit_is_auto() {
+    return mxfp4_gateup_ksplit_cfg().mode == mxfp4_gateup_ksplit_mode::AUTO;
+}
+
 int ggml_sycl_mxfp4_gateup_ksplit(int device) {
-    static const mxfp4_gateup_ksplit_config cfg = mxfp4_gateup_ksplit_parse_env();
+    const mxfp4_gateup_ksplit_config & cfg = mxfp4_gateup_ksplit_cfg();
 
     if (cfg.mode == mxfp4_gateup_ksplit_mode::EXPLICIT) {
+        // `device` is unused on this branch by design -- see
+        // ggml_sycl_mxfp4_gateup_ksplit_is_auto()'s doc comment (common.hpp):
+        // callers on the hot (non-auto) path pass -1 here specifically to
+        // avoid a device-id lookup they do not need.
         return clamp_ksplit(cfg.explicit_value);
     }
 

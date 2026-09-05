@@ -3974,10 +3974,12 @@ endif()
 # K-split of the MXFP4 gate/up decode DPAS kernel
 # (GGML_SYCL_MXFP4_GATEUP_KSPLIT). Forks+execv's itself per S value (see the
 # source file's own header comment), so it needs its OWN process image, not
-# just a plain in-process call -- and LD_LIBRARY_PATH must survive the
-# execv() re-exec, which is why it is also exported into the process
-# environment (not just supplied by ctest's ENVIRONMENT property, which a
-# re-exec'd child does not automatically inherit if unset by the parent).
+# just a plain in-process call. This needs no special ENVIRONMENT handling
+# for that: execv() (unlike execve() with an explicit envp) leaves the
+# calling process's entire environment untouched, so LD_LIBRARY_PATH and
+# ONEAPI_DEVICE_SELECTOR from ctest's ENVIRONMENT property below reach every
+# re-exec'd child automatically, the same way they reach the top-level
+# process ctest launches.
 if (NOT GGML_BACKEND_DL)
     add_executable(test-sycl-mxfp4-gateup-ksplit-numerics
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp

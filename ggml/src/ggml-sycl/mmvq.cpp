@@ -10285,48 +10285,29 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                 float * dst_out =
                     reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
                                               static_cast<int64_t>(iid1) * dst_nb2);
-#pragma unroll
-                for (int r = 0; r < Repeat; ++r) {
-                    const int row = static_cast<int>(tile_m0) * Repeat + r;
-                    if (row < nrows_per_expert) {
-                        float gate_value = gate_acc0[r];
-                        float up_value   = up_acc0[r];
-                        if (gate_bias) {
-                            gate_value += *(const float *) ((const char *) gate_bias +
-                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                            static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        if (up_bias) {
-                            up_value += *(const float *) ((const char *) up_bias +
-                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                          static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        const float value = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                        block_store<float, 1>(dst_out + row, value);
-                    }
-                }
+                // llama.cpp-lis9 spec round 1 (should-fix 1): shares its
+                // epilogue with the ksplit combine kernel below (and with
+                // mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl, its original
+                // user) via mxfp4_bundle4_store_glu_tile instead of an inline
+                // duplicate. Behaviour-preserving: the helper's full_tile
+                // fast path adds the SAME bias (unconditional add, since
+                // every row in a full tile is valid, exactly matching this
+                // loop's `row < nrows_per_expert` condition when the tile is
+                // full) and computes the SAME
+                // mmvq_moe_apply_pair_glu_esimd<GLU_OP> value per row; a
+                // partial tile skips the bias add and the store for
+                // out-of-range rows exactly as this loop's row check did.
+                // Only the store's SIMD width changes (vectorized vs
+                // per-element), never the computed values.
+                mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(dst_out, gate_acc0, up_acc0, gate_bias, up_bias,
+                                                             gate_bias_nb1, up_bias_nb1, expert_id,
+                                                             static_cast<int>(tile_m0) * Repeat, nrows_per_expert,
+                                                             alpha, limit);
                 if (have_m1) {
-#pragma unroll
-                    for (int r = 0; r < Repeat; ++r) {
-                        const int row = static_cast<int>(tile_m1) * Repeat + r;
-                        if (row < nrows_per_expert) {
-                            float gate_value = gate_acc1[r];
-                            float up_value   = up_acc1[r];
-                            if (gate_bias) {
-                                gate_value += *(const float *) ((const char *) gate_bias +
-                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                                static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            if (up_bias) {
-                                up_value += *(const float *) ((const char *) up_bias +
-                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                              static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            const float value =
-                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                            block_store<float, 1>(dst_out + row, value);
-                        }
-                    }
+                    mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(dst_out, gate_acc1, up_acc1, gate_bias, up_bias,
+                                                                 gate_bias_nb1, up_bias_nb1, expert_id,
+                                                                 static_cast<int>(tile_m1) * Repeat, nrows_per_expert,
+                                                                 alpha, limit);
                 }
             });
         });
@@ -10385,6 +10366,13 @@ struct mxfp4_moe_gateup_ksplit_scratch {
     size_t                capacity     = 0;
     int                   owner_device = -1;
     ggml_sycl::mem_handle handle;
+    // llama.cpp-lis9 spec round 1 (should-fix 2): the combine kernel's
+    // returned event, the last submission that reads `handle`'s bytes. Set
+    // by mxfp4_moe_gateup_ksplit_scratch_mark_ready() right after that
+    // submission; consulted on the NEXT get_or_alloc_scratch call, so a grow
+    // never drops a handle a still-in-flight combine kernel may be reading.
+    sycl::event           ready_event     = {};
+    bool                  ready_event_set = false;
 };
 
 static thread_local mxfp4_moe_gateup_ksplit_scratch g_mxfp4_moe_gateup_ksplit_scratch;
@@ -10404,9 +10392,34 @@ static float * mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(sycl::queue * stream
         auto resolved = cache.handle.resolve(device);
         return resolved ? reinterpret_cast<float *>(resolved.ptr) : nullptr;
     }
-    cache.handle       = {};
-    cache.capacity     = 0;
-    cache.owner_device = -1;
+    // llama.cpp-lis9 spec round 1 (should-fix 2): retire, don't drop. A prior
+    // launch's combine kernel may still be reading `cache.handle` when a
+    // LARGER launch (bigger total_batches/ksplit) needs to grow the buffer --
+    // dropping the handle here would let the allocator reclaim/reuse that
+    // memory while that read is still in flight. Mirrors
+    // mxfp4_moe_tg_reuse_get_or_alloc_q8's identical retire-then-replace
+    // sequence above (this file, ~line 1962): capture the old owner and its
+    // ready event, THEN clear the cache, THEN hand the owner to
+    // retain_handles_until_event -- no host wait, the allocator frees it only
+    // once that event actually completes.
+    ggml_sycl::mem_handle retired_owner     = cache.handle;
+    sycl::event           retired_event     = cache.ready_event;
+    const bool            retired_event_set = cache.ready_event_set;
+    cache.handle                            = {};
+    cache.capacity                          = 0;
+    cache.owner_device                      = -1;
+    cache.ready_event                       = {};
+    cache.ready_event_set                   = false;
+    if (retired_owner.valid()) {
+        if (retired_event_set) {
+            std::vector<ggml_sycl::mem_handle> retired_handles;
+            retired_handles.push_back(std::move(retired_owner));
+            ggml_sycl::retain_handles_until_event(std::move(retired_handles), std::move(retired_event));
+        }
+        // No ready event was ever recorded (the very first allocation, before
+        // any combine kernel has run against it) -- nothing has read it yet,
+        // so there is nothing to retire against; let it release immediately.
+    }
 
     ggml_sycl::alloc_request req{};
     req.queue                          = stream;
@@ -10415,6 +10428,14 @@ static float * mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(sycl::queue * stream
     req.intent.role                    = ggml_sycl::alloc_role::EXPERT_STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
+    // llama.cpp-lis9 spec round 1 (nit 6): the ksplit partial kernel's
+    // block_store and the combine kernel's block_load both move
+    // simd<float, Repeat> vectors through this buffer; request an explicit
+    // alignment rather than relying on whatever the allocator's default
+    // happens to be. 64 bytes covers Repeat*sizeof(float) for every Repeat
+    // this file uses (8 -> 32 bytes) with room to spare, and matches a cache
+    // line.
+    req.alignment                      = 64;
     cache.handle                       = ggml_sycl::unified_allocate(req);
     if (!cache.handle.valid()) {
         cache.handle = {};
@@ -10428,6 +10449,22 @@ static float * mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(sycl::queue * stream
     cache.capacity     = cache.handle.size();
     cache.owner_device = cache.handle.device();
     return reinterpret_cast<float *>(resolved.ptr);
+}
+
+// llama.cpp-lis9 spec round 1 (should-fix 2): records the combine kernel's
+// returned event as the scratch's retirement fence for the NEXT
+// get_or_alloc_scratch call. Must be called only when the scratch this event
+// reads is the CURRENT cache entry (device unchanged since the alloc) --
+// mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit calls it immediately after
+// submitting the combine kernel against the same `partial` pointer it just
+// got from get_or_alloc_scratch, so this invariant holds by construction.
+static void mxfp4_moe_gateup_ksplit_scratch_mark_ready(int device, const sycl::event & event) {
+    auto & cache = g_mxfp4_moe_gateup_ksplit_scratch;
+    if (!cache.handle.valid() || cache.owner_device != device) {
+        return;
+    }
+    cache.ready_event     = event;
+    cache.ready_event_set = true;
 }
 
 // Partial-sum pass: launches tiles*ksplit threads (tiles = the S=1 kernel's
@@ -10726,48 +10763,18 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl(sycl::queue &  
                 float * dst_out =
                     reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
                                               static_cast<int64_t>(iid1) * dst_nb2);
-#pragma unroll
-                for (int r = 0; r < Repeat; ++r) {
-                    const int row = static_cast<int>(tile_m0) * Repeat + r;
-                    if (row < nrows_per_expert) {
-                        float gate_value = gate_acc0[r];
-                        float up_value   = up_acc0[r];
-                        if (gate_bias) {
-                            gate_value += *(const float *) ((const char *) gate_bias +
-                                                            static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                            static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        if (up_bias) {
-                            up_value += *(const float *) ((const char *) up_bias +
-                                                          static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                          static_cast<int64_t>(row) * sizeof(float));
-                        }
-                        const float value = mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                        block_store<float, 1>(dst_out + row, value);
-                    }
-                }
+                // llama.cpp-lis9 spec round 1 (should-fix 1): same shared
+                // epilogue the S=1 kernel's own tail now calls above --
+                // identical bias-then-GLU-then-store math either way.
+                mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(dst_out, gate_acc0, up_acc0, gate_bias, up_bias,
+                                                             gate_bias_nb1, up_bias_nb1, expert_id,
+                                                             static_cast<int>(tile_m0) * Repeat, nrows_per_expert,
+                                                             alpha, limit);
                 if (have_m1) {
-#pragma unroll
-                    for (int r = 0; r < Repeat; ++r) {
-                        const int row = static_cast<int>(tile_m1) * Repeat + r;
-                        if (row < nrows_per_expert) {
-                            float gate_value = gate_acc1[r];
-                            float up_value   = up_acc1[r];
-                            if (gate_bias) {
-                                gate_value += *(const float *) ((const char *) gate_bias +
-                                                                static_cast<int64_t>(expert_id) * gate_bias_nb1 +
-                                                                static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            if (up_bias) {
-                                up_value += *(const float *) ((const char *) up_bias +
-                                                              static_cast<int64_t>(expert_id) * up_bias_nb1 +
-                                                              static_cast<int64_t>(row) * sizeof(float));
-                            }
-                            const float value =
-                                mmvq_moe_apply_pair_glu_esimd<GLU_OP>(gate_value, up_value, alpha, limit);
-                            block_store<float, 1>(dst_out + row, value);
-                        }
-                    }
+                    mxfp4_bundle4_store_glu_tile<Repeat, GLU_OP>(dst_out, gate_acc1, up_acc1, gate_bias, up_bias,
+                                                                 gate_bias_nb1, up_bias_nb1, expert_id,
+                                                                 static_cast<int>(tile_m1) * Repeat, nrows_per_expert,
+                                                                 alpha, limit);
                 }
             });
         });
@@ -15287,21 +15294,30 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit(sycl::queue & 
     }
 
     sycl::event partial_event;
+    sycl::event combine_event;
     if (glu_op == GGML_GLU_OP_SWIGLU_OAI) {
         partial_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI, Prefetch>(
             queue, gate_ptrs, up_ptrs, b_packed, y_scales, ids, ncols, nrows_per_expert, total_batches, n_tokens,
             ids_nb0, ids_nb1, tile_n_total, ksplit, partial, pack_event);
-        return mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
+        combine_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU_OAI>(
+            queue, gate_ptrs, up_ptrs, partial, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches,
+            n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, ksplit,
+            partial_event);
+    } else {
+        partial_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch>(
+            queue, gate_ptrs, up_ptrs, b_packed, y_scales, ids, ncols, nrows_per_expert, total_batches, n_tokens,
+            ids_nb0, ids_nb1, tile_n_total, ksplit, partial, pack_event);
+        combine_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
             queue, gate_ptrs, up_ptrs, partial, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches,
             n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, ksplit,
             partial_event);
     }
-    partial_event = mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl<Repeat, GGML_GLU_OP_SWIGLU, Prefetch>(
-        queue, gate_ptrs, up_ptrs, b_packed, y_scales, ids, ncols, nrows_per_expert, total_batches, n_tokens, ids_nb0,
-        ids_nb1, tile_n_total, ksplit, partial, pack_event);
-    return mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl<Repeat, GGML_GLU_OP_SWIGLU>(
-        queue, gate_ptrs, up_ptrs, partial, dst_glu, ids, gate_bias, up_bias, nrows_per_expert, total_batches, n_tokens,
-        ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1, up_bias_nb1, alpha, limit, ksplit, partial_event);
+    // llama.cpp-lis9 spec round 1 (should-fix 2): record this launch's own
+    // combine event as the scratch's retirement fence, so a LATER call that
+    // needs to grow the buffer retires this handle against it instead of
+    // dropping it while this combine kernel may still be reading `partial`.
+    mxfp4_moe_gateup_ksplit_scratch_mark_ready(device, combine_event);
+    return combine_event;
 }
 
 template <int Repeat, bool Prefetch = false>
@@ -15336,9 +15352,20 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_submit(sycl::queue &        
     // that path is NOT taken; S=1 (the default) always falls through to the
     // unmodified kernel below regardless.
     if (!(mxfp4_moe_gateup_m2_tg1_index_enabled() && n_tokens == 1)) {
-        const int device = ggml_sycl_get_device_id_from_queue(queue);
+        // llama.cpp-lis9 spec round 1 (nit 7): only "auto" needs a device id
+        // to resolve ksplit -- pass -1 otherwise so the default (unset,
+        // ksplit=1) route pays for no device-id lookup at all beyond the one
+        // mmvq_profile_label already does inside the S=1 kernel it falls
+        // through to below.
+        int       device = ggml_sycl_mxfp4_gateup_ksplit_is_auto() ? ggml_sycl_get_device_id_from_queue(queue) : -1;
         const int ksplit = ggml_sycl_mxfp4_gateup_ksplit(device);
         if (ksplit > 1) {
+            if (device < 0) {
+                // EXPLICIT mode with ksplit > 1 (e.g. GGML_SYCL_MXFP4_GATEUP_KSPLIT=2):
+                // the accessor above did not need a device id, but the scratch
+                // allocation and combine-kernel dispatch below do.
+                device = ggml_sycl_get_device_id_from_queue(queue);
+            }
             return mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit<Repeat, Prefetch>(
                 queue, gate_ptrs, up_ptrs, b_packed, y_scales, dst_glu, ids, gate_bias, up_bias, ncols,
                 nrows_per_expert, total_batches, n_tokens, ids_nb0, ids_nb1, dst_nb1, dst_nb2, gate_bias_nb1,
