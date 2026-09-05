@@ -246,9 +246,12 @@ any_selected=0
 # inside a function, so RETURN would never fire, which is what an earlier
 # version of this comment got right and then drew the wrong conclusion
 # from -- "no RETURN trap fires" is not the same claim as "no trap is
-# needed"). Mirrors the idiom scripts/bench-guard.sh:151-152 itself uses
-# for its own temp file (`tmp_out="$(mktemp)"; trap 'rm -f "$tmp_out"' EXIT`):
-# without it, a SIGTERM/Ctrl-C mid-bench leaves that iteration's temp log
+# needed"). Mirrors the idiom scripts/bench-guard.sh itself uses for its
+# own temp file (its `tmp_out` variable, set via `tmp_out="$(mktemp)"`
+# then `trap 'rm -f "$tmp_out"' EXIT` -- cited by symbol, not a line
+# number, since line numbers drift and this one already had, per
+# llama.cpp-y3z0 quality review round 2, nit N2): without it, a
+# SIGTERM/Ctrl-C mid-bench leaves that iteration's temp log
 # behind (llama.cpp-y3z0 quality review round 1, finding 1 -- demonstrated
 # with a slow fake bench killed 3s in: the file survived the kill). The
 # per-iteration `rm -f "$logfile"` calls below are kept: they free the

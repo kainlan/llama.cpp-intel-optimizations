@@ -195,7 +195,7 @@ echo "$out" | grep -qi "refus\|error" || { echo "FAIL: refusal must be reported 
 echo "$out" | grep -q "ERROR:bench-guard-refused" || { echo "FAIL: expected the ERROR:bench-guard-refused label (got: $out)"; fail=1; }
 echo "$out" | grep -q "ERROR:bench-rc=" && { echo "FAIL: a genuine preflight refusal must use ERROR:bench-guard-refused, not ERROR:bench-rc= (got: $out)"; fail=1; }
 
-# --- Case 5b (quality review round 1, finding 7): rc==3 is ambiguous by
+# --- Case 5b (llama.cpp-y3z0 quality review round 1, finding 7): rc==3 is ambiguous by
 # itself -- bench-guard mirrors the WRAPPED command's own exit status, so
 # a bench that itself exits status 3 (nothing to do with a preflight
 # refusal) also makes bench-guard's own process exit 3. Distinguished by
@@ -465,7 +465,7 @@ echo "$out" | grep -q "1437.33" || { echo "FAIL: pp1024 value missing (got: $out
 echo "$out" | grep -q "1474.44" || { echo "FAIL: pp2048 value missing (got: $out)"; fail=1; }
 echo "$out" | grep -q "9999.99" && { echo "FAIL: the decoy row's bogus value must never leak into the parsed table (got: $out)"; fail=1; }
 
-# --- Case 12 (quality review round 1, finding 1): a run interrupted
+# --- Case 12 (llama.cpp-y3z0 quality review round 1, finding 1): a run interrupted
 # mid-bench (SIGTERM) must not leave ITS OWN temp log behind. A slow fake
 # bench sleeps well past the time this case needs; the script is launched
 # in the background under a DEDICATED TMPDIR (isolates its temp files
@@ -489,10 +489,14 @@ echo "$out" | grep -q "9999.99" && { echo "FAIL: the decoy row's bogus value mus
 # bench-guard.sh's pre-existing behaviour and entirely out of scope here;
 # asserting "the directory is empty" would make this test depend on a
 # process-group/signal-propagation property this task never touched.
+# A short bound (not 30s): case 12's own cleanup below kills this tree
+# explicitly, but a short sleep also means that IF the cleanup somehow
+# missed it, the orphan still expires quickly rather than outliving the
+# whole suite (llama.cpp-y3z0 quality review round 2, finding N5).
 SLOW_BENCH="$T/fake-bench-slow.sh"
 cat > "$SLOW_BENCH" <<'EOF'
 #!/usr/bin/env bash
-sleep 30
+sleep 6
 EOF
 chmod +x "$SLOW_BENCH"
 
@@ -501,17 +505,45 @@ mkdir -p "$TMPDIR_SCOPED"
 env TMPDIR="$TMPDIR_SCOPED" "$SCALING" --bench "$SLOW_BENCH" --only mistral,b70 "${GUARD_HOOKS[@]}" \
     >/dev/null 2>&1 &
 scaling_pid=$!
-# Margin for process startup and bench-guard's own (fast, against this
-# fixture tree) preflight -- not for anything the slow bench itself does,
-# since it is still sleeping when the kill below fires.
-sleep 3
+
 # Identify OUR script's logfile precisely: find the bench-guard.sh CHILD
 # of $scaling_pid and read the path following `--log` out of its own
 # /proc cmdline (NUL-separated argv, exactly as sycl-decode-mode-capture's
 # own pid-discovery conventions read /proc/PID/{comm,cmdline,stat}).
-guard_pid="$(pgrep -P "$scaling_pid" -f bench-guard.sh | head -1)"
-[ -n "$guard_pid" ] || { echo "FAIL: could not find the bench-guard.sh child of pid $scaling_pid -- this control is vacuous"; fail=1; }
-our_logfile="$(tr '\0' '\n' < "/proc/$guard_pid/cmdline" 2>/dev/null | awk '/^--log$/{getline; print; exit}')"
+#
+# Bounded poll, not a flat `sleep N` (llama.cpp-y3z0 quality review round
+# 2, finding N4): waits only as long as bench-guard.sh's own preflight
+# actually takes (fast, against this fixture tree) instead of a fixed
+# guess, capped at ~5s.
+#
+# Neither lookup uses a pipe with an early-exiting consumer
+# (llama.cpp-y3z0 quality review round 2, finding N3 -- round 2's N1 had
+# already removed this shape from the SCRIPT; this case reintroduced it
+# in the TEST). `pgrep | head -1` and `... | awk '{...; exit}'` both let
+# their consumer stop reading before the producer is necessarily done
+# writing, which is a bare assignment under this suite's own
+# `set -o pipefail` -- a 141 there aborts the suite with no FAIL line,
+# not a caught assertion. Replaced with: a bash parameter expansion
+# (`${var%%$'\n'*}`) to take the first line, which is not a pipe at all;
+# and an awk program with no `exit`, fed via here-string, which reads
+# its input to EOF exactly like the sole safe pipeline reader
+# (`awk ... | tail -1`) this suite's script side already relies on.
+guard_pid=""
+for _ in $(seq 1 50); do
+    # `|| true`: pgrep exits 1 when it finds no match -- expected on the
+    # early iterations, before bench-guard.sh has even forked yet -- and
+    # a bare `var=$(cmd)` assignment is NOT exempted from `set -e` the
+    # way a tested `if`/`&&`/`||` condition is, so without this guard the
+    # very first no-match iteration silently aborts the whole suite (no
+    # FAIL line, just a bare non-zero exit) rather than looping again.
+    candidate="$(pgrep -P "$scaling_pid" -f bench-guard.sh)" || true
+    candidate="${candidate%%$'\n'*}"
+    if [ -n "$candidate" ]; then guard_pid="$candidate"; break; fi
+    sleep 0.1
+done
+[ -n "$guard_pid" ] || { echo "FAIL: could not find the bench-guard.sh child of pid $scaling_pid within the poll bound -- this control is vacuous"; fail=1; }
+cmdline_lines="$(tr '\0' '\n' < "/proc/$guard_pid/cmdline" 2>/dev/null)"
+our_logfile="$(awk '/^--log$/{want=1; next} want{print; want=0}' <<< "$cmdline_lines")"
 [ -n "$our_logfile" ] || { echo "FAIL: could not extract the --log path from bench-guard.sh's cmdline -- this control is vacuous"; fail=1; }
 # Positive control: confirm the logfile actually exists before the kill,
 # so an absent-after-kill result below can't be a vacuous "nothing was
@@ -520,5 +552,40 @@ our_logfile="$(tr '\0' '\n' < "/proc/$guard_pid/cmdline" 2>/dev/null | awk '/^--
 kill -TERM "$scaling_pid" 2>/dev/null || true
 wait "$scaling_pid" 2>/dev/null || true
 [ -f "$our_logfile" ] && { echo "FAIL: SIGTERM mid-bench left $our_logfile behind (expected the EXIT trap to clean it up)"; fail=1; }
+
+# Cleanup (llama.cpp-y3z0 quality review round 2, finding N5): killing
+# only $scaling_pid leaves bench-guard.sh's own subtree running as an
+# orphan (see the process-group explanation above the assertions), which
+# means every invocation of this suite would otherwise leave a stray
+# bench-guard/timeout/sleep tree alive for the rest of the fake bench's
+# duration -- one per run, stacking under a concurrent sweep. Find the
+# `timeout` process bench-guard.sh is still waiting on (its own direct
+# child; GNU `timeout` places the command it wraps in a NEW process group
+# so it can kill any children of its own on a real timeout) and kill THAT
+# process group. bench-guard.sh is synchronously waiting on exactly that
+# child, so killing it lets bench-guard.sh's own postflight and EXIT trap
+# run and exit on its own -- no separate signal to bench-guard.sh itself
+# is needed.
+# Same `|| true` reasoning as the polling loop above: pgrep/ps exiting
+# non-zero here (no such child, or it already exited) is an expected,
+# handled case (the `[ -n ... ]` guards below), not a script-aborting one.
+timeout_pid="$(pgrep -P "$guard_pid")" || true
+timeout_pid="${timeout_pid%%$'\n'*}"
+if [ -n "$timeout_pid" ]; then
+    timeout_pgid="$(ps -o pgid= -p "$timeout_pid" 2>/dev/null)" || true
+    timeout_pgid="${timeout_pgid//[[:space:]]/}"
+    [ -n "$timeout_pgid" ] && kill -TERM -"$timeout_pgid" 2>/dev/null || true
+fi
+# Bounded wait for bench-guard.sh itself to exit as a result, then a hard
+# fallback so this case can never itself leave something running
+# regardless of how bench-guard.sh reacts.
+guard_gone=0
+for _ in $(seq 1 50); do
+    kill -0 "$guard_pid" 2>/dev/null || { guard_gone=1; break; }
+    sleep 0.1
+done
+[ "$guard_gone" -eq 1 ] || kill -KILL "$guard_pid" "$timeout_pid" 2>/dev/null || true
+kill -0 "$guard_pid" 2>/dev/null && { echo "FAIL: bench-guard.sh (pid $guard_pid) is still running after this case's cleanup -- it must not survive past the suite"; fail=1; }
+[ -n "$timeout_pid" ] && kill -0 "$timeout_pid" 2>/dev/null && { echo "FAIL: the wrapped bench's process tree (pid $timeout_pid) is still running after this case's cleanup"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1
