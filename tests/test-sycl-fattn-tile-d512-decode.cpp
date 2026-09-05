@@ -121,30 +121,25 @@
 // alongside NMSE specifically to catch finding A's failure mode (94% wrong,
 // max_diff ~1.6) even if some future shape's NMSE were diluted by a huge N.
 //
-// Threshold chosen: NMSE <= 5e-4, matching upstream's own precedent for
-// this exact op family (not a value invented for this file). Verified with
-// the mutant the review specified (scratch-only, not committed): a
-// standalone host program computed the SAME double-precision reference
-// (same RNG seeds, same amplitude below) and simulated an ESIMD-tier
-// output scaled by 1.01x (a uniform 1% multiplicative bug). Its NMSE is
-// EXACTLY 1e-4 at every n_kv (mathematically -- (scale-1)^2, independent
-// of amplitude or shape) -- 5x BELOW the 5e-4 threshold. This is an HONEST
-// LIMIT, not an oversight: matching a pessimistic per-element analysis of
-// the tile kernel's own reported (violations, max_diff) data at n_kv=4096
-// (177/4096 elements at up to 5.04e-3 abs, on a reference whose own
-// mse(ref,0) is 1.02e-2) gives an NMSE upper bound in the SAME 1e-4-to-3e-4
-// neighbourhood -- i.e. at large n_kv, a uniform 1% bias and this fork's
-// OWN correct f16 tile-kernel noise are not reliably separable by ANY
-// per-vector norm, because their aggregate magnitudes coincide. This is
-// not unique to this file: upstream's own 5e-4 threshold for the identical
-// op would not reliably separate them either. What NMSE (plus the gross
-// check) DOES robustly catch is finding A's class of defect -- for that
-// failure NMSE is far above 1.0 (order-of-magnitude wrong on 94% of
-// elements) and the gross check trips immediately (max_diff ~1.6 >> 0.05)
-// -- which is this guard's actual job; a 1%-level regression on a landed,
-// numerically-stable kernel is caught instead by the byte-identical
-// gemma4 completion gate the lead runs separately (both toggle states
-// verified identical in c-rbbd), not by this file's per-shape NMSE.
+// Threshold: NMSE <= 5e-5 (spec review llama.cpp-zwsj/c-7iey round 3,
+// superseding a round-2 choice of 5e-4 -- upstream's own precedent for
+// this exact op family, which turned out too loose here: see NMSE_MAX's
+// own comment for why). Verified with the mutant the review specified
+// (scratch-only, not committed): a standalone host program computed the
+// SAME double-precision reference (same RNG seeds, same amplitude below)
+// and simulated an output scaled by 1.01x (a uniform 1% multiplicative
+// bug). Its NMSE is EXACTLY 1e-4 at every n_kv (mathematically --
+// (scale-1)^2, independent of amplitude, mask, or shape) -- 2x ABOVE the
+// 5e-5 threshold, so the mutant is now CAUGHT everywhere. The lead's
+// hardware-measured NMSE for the (correct) tile kernel against this same
+// reference -- 8.25e-7/4.40e-6/2.49e-5/1.48e-5 across the n_kv=32, 512,
+// 4096-unmasked, and 4096-masked cases -- clears 5e-5 with >=2x headroom
+// at every point (worst case 2.49e-5, 2.0x below); the ESIMD tier's own
+// measured NMSE (~1e-13, both toggle states, every case) clears it by
+// nine orders of magnitude. What NMSE (plus the gross check) ALSO
+// robustly catches is finding A's class of defect -- for that failure
+// NMSE is far above 1.0 (order-of-magnitude wrong on 94% of elements) and
+// the gross check trips immediately (max_diff ~1.6 >> 0.05).
 //
 // AMPLITUDE (spec review llama.cpp-zwsj/c-7iey round 1, finding 3): Q/K
 // magnitude is deliberately wide (U(-3,3), not U(-0.1,0.1)) so the QK
@@ -348,12 +343,25 @@ static void compute_reference(const std::vector<float> &       Q,
 // NMSE (mse(ref,got)/mse(ref,0)) plus a gross per-element check, replacing
 // the round-1 per-element |got-ref| <= abs_tol + rel_tol*|ref| predicate --
 // see the file header "METRIC" note for why (round 2, finding B: that
-// predicate failed the CORRECT tile kernel on hardware). NMSE_MAX matches
-// tests/test-backend-ops.cpp's test_flash_attn_ext::max_nmse_err() for the
-// SAME op; GROSS_ABS_MAX exists only to catch a finding-A-class failure
-// (a wrong dispatch/kernel, not a precision difference) even if NMSE were
-// ever diluted by a very large output vector.
-static constexpr double NMSE_MAX      = 5e-4;
+// predicate failed the CORRECT tile kernel on hardware). GROSS_ABS_MAX
+// exists only to catch a finding-A-class failure (a wrong dispatch/kernel,
+// not a precision difference) even if NMSE were ever diluted by a very
+// large output vector.
+//
+// NMSE_MAX = 5e-5 (spec review llama.cpp-zwsj/c-7iey round 3): the
+// round-2 choice, 5e-4 (tests/test-backend-ops.cpp's own
+// test_flash_attn_ext::max_nmse_err() for this exact op), let the 1%
+// mutant through -- 1e-4 < 5e-4 -- because the round-2 estimate of the
+// tile kernel's real NMSE (a pessimistic per-element upper bound, since no
+// real per-element data was available) was 1e-4 to 3e-4, an order of
+// magnitude too high. The lead's HARDWARE-MEASURED NMSE against the same
+// double-precision reference this file uses: 8.25e-7 (n_kv=32), 4.40e-6
+// (n_kv=512), 2.49e-5 (n_kv=4096, unmasked), 1.48e-5 (n_kv=4096, masked);
+// ESIMD tier ~1e-13 (near machine precision) in every state. 5e-5 sits
+// >=2x ABOVE the worst measured correct-kernel value (2.49e-5) and exactly
+// 2x BELOW the 1% mutant's 1e-4 -- see the file header "METRIC" note for
+// the mutant re-verification at this threshold.
+static constexpr double NMSE_MAX      = 5e-5;
 static constexpr float  GROSS_ABS_MAX = 0.05f;
 
 static void compare(const char * what, const std::vector<float> & got, const std::vector<float> & ref) {
