@@ -1077,6 +1077,12 @@ GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_compute_buffer_extra_count(
 // buffer last processed a view tensor's init_tensor call. Single-threaded
 // test use only.
 GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_kv_view_extra_count(void);
+
+// llama.cpp-asdt, plan task L2b (jemalloc-profile bug fix): counts extras
+// actually still allocated (marked debug_is_kv_view_extra, not yet deleted),
+// unlike the container-membership accessor above -- see its own comment in
+// ggml-sycl.cpp for why that distinction matters.
+GGML_BACKEND_API size_t ggml_backend_sycl_debug_live_kv_view_extra_count(void);
 #endif
 
 #ifdef __cplusplus

@@ -3428,6 +3428,21 @@ struct ggml_tensor_extra_gpu {
     // review c-z4cf #10).
     uint64_t alloc_generation = 0;
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
+    // creation, by tiered_kv_buffer_init_tensor's view branch. Lets
+    // release_extra_gpu() attribute an actual deletion to the KV-view live
+    // counter (g_sycl_debug_live_kv_view_extra_count, common.cpp) regardless
+    // of which code path's release call is the one that drops this extra's
+    // refcount to zero -- a container-membership count (view_extras.size())
+    // cannot see an extra that was popped from that container but leaked
+    // because a release call was missing (exactly the bug this field's
+    // counter caught: a shared entry's refcount was 1 + share_count, but the
+    // eviction path released only once). Private-testing only: zero cost and
+    // no ABI impact in production builds.
+    bool debug_is_kv_view_extra = false;
+#endif
+
     // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
     // Use this instead of data_device[dev] directly for incremental migration.
     // An out-of-range dev returns nullptr like any other "no usable pointer for
@@ -4176,6 +4191,18 @@ struct ggml_tensor_extra_gpu {
 
 void retain_extra_gpu(ggml_tensor_extra_gpu * extra);
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams = {});
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): counts extras
+// currently marked debug_is_kv_view_extra that have NOT yet actually been
+// deleted -- release_extra_gpu() decrements it exactly where it deletes such
+// an extra, regardless of which call site's release was the one that
+// dropped the refcount to zero. Unlike a container-membership count
+// (ctx->view_extras.size()), this cannot be fooled by an entry that was
+// popped from tracking but never actually freed. Single-threaded test use
+// only, like every other GGML_SYCL_PRIVATE_TESTING debug counter here.
+extern std::atomic<size_t> g_sycl_debug_live_kv_view_extra_count;
+#endif
 
 // =============================================================================
 // Helper: Get effective reorder_mode from unified layout.mode or legacy path

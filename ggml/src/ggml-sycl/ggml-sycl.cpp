@@ -36055,7 +36055,16 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
 #endif
                 return GGML_STATUS_SUCCESS;
             }
-            release_extra_gpu(candidate.extra);
+            // llama.cpp-asdt bug fix (jemalloc profile, kqy7 c-qnq7): a
+            // shared entry accumulated share_count additional
+            // retain_extra_gpu() calls beyond its own creation, so its
+            // refcount is 1 + share_count -- release it that many times, not
+            // once, or it never reaches zero and leaks (this was the actual
+            // ~250 MB/decode residual: 448 live 320 KB objects on a pp1024x3
+            // jemalloc profile, one per shared key per rebuild).
+            for (uint32_t r = 0; r <= candidate.share_count; ++r) {
+                release_extra_gpu(candidate.extra);
+            }
             ctx->view_extras[i] = ctx->view_extras.back();
             ctx->view_extras.pop_back();
             break;
@@ -36084,6 +36093,15 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
                 if (src_ptr != nullptr) {
                     if (!tensor->extra) {
                         tensor->extra = new ggml_tensor_extra_gpu{};
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+                        // llama.cpp-asdt (plan task L2b, jemalloc-profile bug
+                        // fix): mark and count this extra so release_extra_gpu()
+                        // can attribute its eventual deletion to the live-KV-view
+                        // counter, whichever call site's release actually frees
+                        // it -- see g_sycl_debug_live_kv_view_extra_count.
+                        static_cast<ggml_tensor_extra_gpu *>(tensor->extra)->debug_is_kv_view_extra = true;
+                        g_sycl_debug_live_kv_view_extra_count.fetch_add(1, std::memory_order_relaxed);
+#endif
                     }
                     auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
                     extra->set_data_device(d, static_cast<char *>(src_ptr) + tensor->view_offs, GGML_LAYOUT_AOS,
@@ -36230,6 +36248,18 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
 // rebuilds instead of growing every rebuild.
 GGML_BACKEND_API size_t ggml_backend_sycl_debug_last_kv_view_extra_count(void) {
     return g_sycl_debug_last_kv_view_extra_count.load(std::memory_order_relaxed);
+}
+
+// llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): counts extras
+// actually still allocated (not yet deleted), unlike the accessor above,
+// which counts entries in ctx->view_extras and cannot see an extra that was
+// popped from that container but never actually freed because a release
+// call was missing -- exactly how the shared-entry refcount bug (a shared
+// entry's refcount was 1 + share_count, but the eviction path released only
+// once) escaped the entries-only accessor. See
+// g_sycl_debug_live_kv_view_extra_count's declaration in common.hpp.
+GGML_BACKEND_API size_t ggml_backend_sycl_debug_live_kv_view_extra_count(void) {
+    return g_sycl_debug_live_kv_view_extra_count.load(std::memory_order_relaxed);
 }
 #endif
 

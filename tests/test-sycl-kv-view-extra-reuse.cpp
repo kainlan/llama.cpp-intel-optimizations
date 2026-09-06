@@ -84,6 +84,26 @@
 // it the instant the narrow view is processed, so the wide ggml_cont's
 // readback comes back corrupt (or the process crashes) instead of all-zero.
 //
+// A SECOND, separate bug (found by a hardware jemalloc profile after the
+// epoch fix above landed, still visible on kv_view_extras staying flat):
+// the older-epoch release branch called release_extra_gpu() exactly ONCE
+// regardless of how many times the same-epoch share branch had called
+// retain_extra_gpu() on that entry (kv_view_extra_entry::share_count). A
+// shared entry's refcount is 1 + share_count, so one release call leaves it
+// at share_count (never zero, never freed) while the entry is popped from
+// view_extras -- an orphaned, un-tracked, un-freed extra every rebuild for
+// every key that was ever shared. kv_view_extras (container membership)
+// cannot see this, since the orphan is no longer in the container; that is
+// why this test also reads ggml_backend_sycl_debug_live_kv_view_extra_count()
+// (extras actually not-yet-deleted, tracked via a debug_is_kv_view_extra flag
+// release_extra_gpu() checks right before its one and only `delete extra`)
+// and asserts IT stays flat at N_VIEWS_PER_GRAPH too. RED for this bug: revert
+// the release loop (`for (uint32_t r = 0; r <= candidate.share_count; ++r)
+// release_extra_gpu(...)`) back to a single `release_extra_gpu(candidate.
+// extra);` call -- kv_view_extras stays flat (this bug is invisible to it)
+// but kv_view_extras_live grows by one every iteration (this test's layer-0 K
+// key is shared every iteration, so it leaks on every single rebuild).
+//
 // ggml_backend_sched_new() asserts its LAST backend entry is a CPU device
 // (ggml-backend.cpp:2518); this test still runs everything on SYCL (the CPU
 // backend is present only to satisfy that structural requirement, matching
@@ -309,6 +329,8 @@ int main(int, char ** argv) {
 
     size_t max_extras  = 0;
     size_t last_extras = 0;
+    size_t max_live    = 0;
+    size_t last_live   = 0;
 
     for (int iter = 0; iter < N_ITERS && ok; ++iter) {
         // The LARGER shape must run first (same reasoning as the COMPUTE
@@ -410,10 +432,15 @@ int main(int, char ** argv) {
         }
 
         last_extras = ggml_backend_sycl_debug_last_kv_view_extra_count();
+        last_live   = ggml_backend_sycl_debug_live_kv_view_extra_count();
         if (last_extras > max_extras) {
             max_extras = last_extras;
         }
-        printf("iter=%d n_kv=%lld kv_view_extras=%zu\n", iter, (long long) n_kv, last_extras);
+        if (last_live > max_live) {
+            max_live = last_live;
+        }
+        printf("iter=%d n_kv=%lld kv_view_extras=%zu kv_view_extras_live=%zu\n", iter, (long long) n_kv, last_extras,
+               last_live);
 
         ggml_free(ctx);
 
@@ -425,9 +452,27 @@ int main(int, char ** argv) {
             ok = false;
             break;
         }
+        // llama.cpp-asdt bug fix (jemalloc profile): the container-membership
+        // count above cannot see an extra that was popped from view_extras
+        // but never actually freed because a release call was missing (a
+        // shared entry's refcount is 1 + share_count; releasing it fewer
+        // times than that leaks it invisibly to last_extras). This is the
+        // check that actually catches that bug -- it must equal last_extras
+        // (one live object per tracked key) whenever the fix is correct, and
+        // grows without bound pre-fix (this test's layer-0 K key is shared
+        // every iteration, so it leaks one 277 KB extra per rebuild).
+        if (last_live != N_VIEWS_PER_GRAPH) {
+            fprintf(stderr,
+                    "FAIL: tiered KV buffer LIVE extra count %zu != N_VIEWS_PER_GRAPH=%zu at iteration %d -- a "
+                    "shared entry's extra was not released enough times to actually free it\n",
+                    last_live, N_VIEWS_PER_GRAPH, iter);
+            ok = false;
+            break;
+        }
     }
 
-    printf("max_extras_observed=%zu (expected flat at %zu)\n", max_extras, N_VIEWS_PER_GRAPH);
+    printf("max_extras_observed=%zu max_live_observed=%zu (both expected flat at %zu)\n", max_extras, max_live,
+           N_VIEWS_PER_GRAPH);
 
     if (sched) {
         ggml_backend_sched_free(sched);
