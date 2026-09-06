@@ -28,7 +28,7 @@
 // GPT-OSS gate/up size (K=2880, N=2880, 4 experts, 1 token -- total_batches=4,
 // matching the 720-thread launch llama.cpp-ulp9 profiled).
 //
-// Run S in {1, 2, 4} and compare S=2/S=4 against S=1 (not a CPU reference:
+// Run S in {1, 2, 3, 4} and compare S=2/S=3/S=4 against S=1 (not a CPU reference:
 // the plan's acceptance criterion is internal agreement -- DPAS int8
 // accumulation is exact, so any drift is purely how the K-split float
 // combine reorders the final scale-and-sum, bounded by
@@ -655,17 +655,33 @@ int main(int argc, char ** argv) {
     // accumulation is exact; the float combine across k-parts reorders
     // additions, so this is a tolerance check, not bit-equality.
     for (int i = 1; i < kNumKsplitPoints; ++i) {
-        size_t mismatches   = 0;
-        float  max_abs_diff = 0.0f;
-        size_t worst_idx    = 0;
+        size_t mismatches         = 0;
+        float  max_abs_diff       = 0.0f;
+        size_t worst_idx          = 0;
+        bool   worst_is_nonfinite = false;
         for (size_t j = 0; j < shape.output_floats; ++j) {
-            const float ref  = results[0].floats[j];
-            const float got  = results[i].floats[j];
-            const float diff = std::fabs(ref - got);
-            const float tol  = 1e-4f + 1e-3f * std::fabs(ref);
-            if (!std::isfinite(got) || diff > tol) {
+            const float ref           = results[0].floats[j];
+            const float got           = results[i].floats[j];
+            const bool  got_nonfinite = !std::isfinite(got);
+            const float diff          = std::fabs(ref - got);
+            const float tol           = 1e-4f + 1e-3f * std::fabs(ref);
+            if (got_nonfinite || diff > tol) {
                 ++mismatches;
-                if (diff > max_abs_diff) {
+                // llama.cpp-lis9 quality round 1 (nit 9): a non-finite `got`
+                // makes `diff` NaN, and `diff > max_abs_diff` is FALSE for a
+                // NaN diff (IEEE 754 comparisons with NaN are always false)
+                // -- so tracking only "the running max" left worst_idx stuck
+                // at its initial 0 forever whenever the FIRST mismatch
+                // happened to be non-finite, and the FAIL message below
+                // pointed at an unrelated element instead of the actual
+                // non-finite one. Track "first non-finite wins outright,
+                // and stays won" as its own state rather than folding it
+                // into the diff comparison.
+                if (got_nonfinite && !worst_is_nonfinite) {
+                    worst_is_nonfinite = true;
+                    worst_idx          = j;
+                    max_abs_diff       = diff;
+                } else if (!worst_is_nonfinite && diff > max_abs_diff) {
                     max_abs_diff = diff;
                     worst_idx    = j;
                 }

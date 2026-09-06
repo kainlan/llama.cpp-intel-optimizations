@@ -18,6 +18,7 @@
 #include "unified-cache.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -964,13 +965,33 @@ mxfp4_gateup_ksplit_config mxfp4_gateup_ksplit_parse_env() {
         cfg.mode = mxfp4_gateup_ksplit_mode::AUTO;
         return cfg;
     }
-    char *     end    = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (end == env || *end != '\0') {
-        fprintf(stderr,
-                "[SYCL] unknown GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s (expected \"auto\" or an integer), falling "
-                "back to 1\n",
-                env);
+    // llama.cpp-lis9 quality round 1 (nits 5, 6): use the fork's
+    // invalid-env-value convention (GGML_LOG_WARN, e.g.
+    // mmvq_parse_env_mb_value at mmvq.cpp:~22322) instead of a raw fprintf,
+    // and detect strtol overflow via errno -- strtol saturates to
+    // LONG_MIN/LONG_MAX on overflow WITHOUT failing the endptr check below
+    // (it still consumes every digit), so an overflowing value would
+    // otherwise reach `static_cast<int>(parsed)` below with `parsed` outside
+    // int's range: an out-of-range integer conversion, UB pre-C++20 and
+    // implementation-defined after. Reset errno first -- strtol does not
+    // clear a stale value from an earlier call.
+    errno              = 0;
+    char *     end     = nullptr;
+    const long parsed  = std::strtol(env, &end, 10);
+    const bool garbage = (end == env) || (*end != '\0');
+    if (garbage) {
+        GGML_LOG_WARN(
+            "[SYCL] unknown GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s (expected \"auto\" or an integer), falling "
+            "back to 1\n",
+            env);
+        return cfg;
+    }
+    if (errno == ERANGE) {
+        // Clamp on the `long` value's sign, never on a truncated int: casting
+        // an out-of-int-range `long` to `int` first (then clamping that) is
+        // exactly the UB this branch exists to avoid.
+        GGML_LOG_WARN("[SYCL] GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s is out of range; clamping to [1, 4]\n", env);
+        cfg.explicit_value = parsed > 0 ? 4 : 1;
         return cfg;
     }
     cfg.explicit_value = static_cast<int>(parsed);

@@ -10106,6 +10106,143 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
     // clang-format on
 }
 
+// llama.cpp-lis9 quality round 1 (should-fix 3): the K-tile reduction loop
+// shared by mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl below (S=1: kt_start=0,
+// kt_end=k_tiles, its ENTIRE k_tiles range) and
+// mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl further below (S>1: one
+// [kt_start, kt_end) sub-range per k_part) -- previously duplicated ~100
+// lines apart, differing only in the K-range and the four pointers' initial
+// offset for that range. `gate_group0_base`/`up_group0_base`/
+// `gate_group1_base`/`up_group1_base` are the tile-pair's row-group pointers
+// BEFORE any K offset (gate_base + xmx_group_n0 * group_bytes, etc.); this
+// function applies the `kt_start * kt_group_stride` / `kt_start * bn` offset
+// itself, so callers never need to. Accumulators are taken by reference so
+// each caller keeps its own simd<> locals declared exactly where they were
+// before this refactor -- calling this with (0, k_tiles) reproduces the S=1
+// kernel's prior loop exactly, instruction for instruction, so its emitted
+// code and profiled mean are not expected to change.
+template <int Repeat, bool Prefetch>
+SYCL_ESIMD_FUNCTION inline void mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce(
+    const uint8_t *                                gate_group0_base,
+    const uint8_t *                                up_group0_base,
+    const uint8_t *                                gate_group1_base,
+    const uint8_t *                                up_group1_base,
+    bool                                           have_m1,
+    int64_t                                        xmx_row_in_group0,
+    int64_t                                        xmx_row_in_group1,
+    int                                            tile_n_total,
+    int64_t                                        kt_group_stride,
+    const int8_t *                                 b_packed,
+    const float *                                  y_scales,
+    int64_t                                        group,
+    int64_t                                        k_tiles,
+    int64_t                                        kt_start,
+    int64_t                                        kt_end,
+    sycl::ext::intel::esimd::simd<float, Repeat> & gate_acc0,
+    sycl::ext::intel::esimd::simd<float, Repeat> & up_acc0,
+    sycl::ext::intel::esimd::simd<float, Repeat> & gate_acc1,
+    sycl::ext::intel::esimd::simd<float, Repeat> & up_acc1) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
+    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
+    constexpr int an     = Repeat * k_per;
+    constexpr int bn     = k_per * exec_n;
+
+    const uint8_t * gate_group0 = gate_group0_base + kt_start * kt_group_stride;
+    const uint8_t * up_group0   = up_group0_base + kt_start * kt_group_stride;
+    const uint8_t * gate_group1 = gate_group1_base + kt_start * kt_group_stride;
+    const uint8_t * up_group1   = up_group1_base + kt_start * kt_group_stride;
+    const int8_t *  b_ptr       = b_packed + (group * k_tiles + kt_start) * bn;
+
+    for (int64_t kt = kt_start; kt < kt_end; ++kt) {
+        if constexpr (Prefetch) {
+            constexpr int prefetch_distance = 10;
+            const int64_t kt_prefetch       = kt + prefetch_distance;
+            if (kt_prefetch < kt_end) {
+                const uint8_t * gate_prefetch0 = gate_group0 + prefetch_distance * kt_group_stride;
+                const uint8_t * up_prefetch0   = up_group0 + prefetch_distance * kt_group_stride;
+                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch0, tile_n_total, xmx_row_in_group0);
+                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch0, tile_n_total, xmx_row_in_group0);
+                if (have_m1) {
+                    const uint8_t * gate_prefetch1 = gate_group1 + prefetch_distance * kt_group_stride;
+                    const uint8_t * up_prefetch1   = up_group1 + prefetch_distance * kt_group_stride;
+                    mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch1, tile_n_total, xmx_row_in_group1);
+                    mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch1, tile_n_total, xmx_row_in_group1);
+                }
+                mxfp4_xmx_tiled_prefetch_bytes<bn>(reinterpret_cast<const uint8_t *>(b_ptr + prefetch_distance * bn));
+                mxfp4_xmx_tiled_prefetch_line(
+                    reinterpret_cast<const uint8_t *>(y_scales + ((group * k_tiles + kt_prefetch) * exec_n)));
+            }
+        }
+
+        simd<int8_t, bn> b_vec   = block_load<int8_t, bn>(b_ptr);
+        simd<float, 1>   y_scale = block_load<float, 1>(y_scales + (group * k_tiles + kt) * exec_n);
+
+        simd<int8_t, an>    gate_a_vec0;
+        simd<int8_t, an>    up_a_vec0;
+        simd<float, Repeat> gate_w_scale0;
+        simd<float, Repeat> up_w_scale0;
+        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0, gate_a_vec0,
+                                                      gate_w_scale0);
+        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
+                                                      up_w_scale0);
+
+        simd<int, Repeat * exec_n> gate_part0 = 0;
+        simd<int, Repeat * exec_n> up_part0   = 0;
+        gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
+        up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
+#pragma unroll
+        for (int r = 0; r < Repeat; ++r) {
+            simd<int, 1>   gate_i = gate_part0.template select<1, 1>(r * exec_n);
+            simd<int, 1>   up_i   = up_part0.template select<1, 1>(r * exec_n);
+            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale0[r]);
+            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale0[r]);
+            gate_acc0[r] += gate_f[0];
+            up_acc0[r] += up_f[0];
+        }
+
+        if (have_m1) {
+            simd<int8_t, an>    gate_a_vec1;
+            simd<int8_t, an>    up_a_vec1;
+            simd<float, Repeat> gate_w_scale1;
+            simd<float, Repeat> up_w_scale1;
+            mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1, gate_a_vec1,
+                                                          gate_w_scale1);
+            mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1, up_a_vec1,
+                                                          up_w_scale1);
+
+            simd<int, Repeat * exec_n> gate_part1 = 0;
+            simd<int, Repeat * exec_n> up_part1   = 0;
+            gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
+            up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
+#pragma unroll
+            for (int r = 0; r < Repeat; ++r) {
+                simd<int, 1>   gate_i = gate_part1.template select<1, 1>(r * exec_n);
+                simd<int, 1>   up_i   = up_part1.template select<1, 1>(r * exec_n);
+                simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale1[r]);
+                simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale1[r]);
+                gate_acc1[r] += gate_f[0];
+                up_acc1[r] += up_f[0];
+            }
+        }
+
+        b_ptr += bn;
+        gate_group0 += kt_group_stride;
+        up_group0 += kt_group_stride;
+        gate_group1 += kt_group_stride;
+        up_group1 += kt_group_stride;
+    }
+}
+
+// llama.cpp-lis9 quality round 1 (nit 8): the one base metadata string this
+// kernel family's three profile labels build on -- the plain S=1 label
+// below, its TG1Index sibling (appends ";index=tg1"), and the ksplit partial
+// kernel's label (appends ";ksplit=<S>", mxfp4_gateup_m2_ksplit_partial_metadata
+// further below) -- kept as one constant instead of three copies of the same
+// literal.
+static constexpr const char * kMxfp4GateupM2BaseMetadata =
+    "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime";
+
 template <int Repeat, int GLU_OP, bool Prefetch, bool TG1Index>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        queue,
                                                          const void * const * gate_ptrs,
@@ -10130,10 +10267,13 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                                                          float                limit,
                                                          int                  tile_n_total,
                                                          const sycl::event &  pack_event) {
-    constexpr int exec_n = GGML_SYCL_MXFP4_MOE_XMX_N;
-    constexpr int k_per  = GGML_SYCL_MXFP4_MOE_XMX_K;
-    constexpr int an     = Repeat * k_per;
-    constexpr int bn     = k_per * exec_n;
+    // llama.cpp-lis9 quality round 1 (should-fix 3): exec_n/an/bn used to be
+    // needed here for the inline K-loop this function's body has since
+    // delegated to mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce, which
+    // re-derives them itself (they are the same GGML_SYCL_MXFP4_MOE_XMX_N/K
+    // compile-time constants either way). k_per is still needed here for
+    // group_bytes below.
+    constexpr int k_per = GGML_SYCL_MXFP4_MOE_XMX_K;
 
     const int64_t m_tiles      = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
     const int64_t m_tile_pairs = (m_tiles + 1) / 2;
@@ -10141,11 +10281,9 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
     const int64_t tiles        = static_cast<int64_t>(total_batches) * m_tile_pairs;
 
     ggml_sycl_profile_label profile_label =
-        TG1Index ?
-            mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2_tg1_index",
-                               "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;index=tg1") :
-            mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2",
-                               "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime");
+        TG1Index ? mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2_tg1_index",
+                                      "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;index=tg1") :
+                   mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", kMxfp4GateupM2BaseMetadata);
     // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
@@ -10191,96 +10329,21 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
                 const int64_t xmx_group_n1      = xmx_row_start1 / tile_n_total;
                 const int64_t xmx_row_in_group1 = xmx_row_start1 - xmx_group_n1 * tile_n_total;
 
-                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes;
-                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes;
-                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes;
-                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes;
-                const int8_t *  b_ptr       = b_packed + (group * k_tiles) * bn;
-
                 simd<float, Repeat> gate_acc0 = 0.0f;
                 simd<float, Repeat> up_acc0   = 0.0f;
                 simd<float, Repeat> gate_acc1 = 0.0f;
                 simd<float, Repeat> up_acc1   = 0.0f;
-                for (int64_t kt = 0; kt < k_tiles; ++kt) {
-                    if constexpr (Prefetch) {
-                        constexpr int prefetch_distance = 10;
-                        const int64_t kt_prefetch       = kt + prefetch_distance;
-                        if (kt_prefetch < k_tiles) {
-                            const uint8_t * gate_prefetch0 = gate_group0 + prefetch_distance * kt_group_stride;
-                            const uint8_t * up_prefetch0   = up_group0 + prefetch_distance * kt_group_stride;
-                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch0, tile_n_total, xmx_row_in_group0);
-                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch0, tile_n_total, xmx_row_in_group0);
-                            if (have_m1) {
-                                const uint8_t * gate_prefetch1 = gate_group1 + prefetch_distance * kt_group_stride;
-                                const uint8_t * up_prefetch1   = up_group1 + prefetch_distance * kt_group_stride;
-                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch1, tile_n_total,
-                                                                         xmx_row_in_group1);
-                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch1, tile_n_total, xmx_row_in_group1);
-                            }
-                            mxfp4_xmx_tiled_prefetch_bytes<bn>(
-                                reinterpret_cast<const uint8_t *>(b_ptr + prefetch_distance * bn));
-                            mxfp4_xmx_tiled_prefetch_line(reinterpret_cast<const uint8_t *>(
-                                y_scales + ((group * k_tiles + kt_prefetch) * exec_n)));
-                        }
-                    }
-
-                    simd<int8_t, bn> b_vec   = block_load<int8_t, bn>(b_ptr);
-                    simd<float, 1>   y_scale = block_load<float, 1>(y_scales + (group * k_tiles + kt) * exec_n);
-
-                    simd<int8_t, an>    gate_a_vec0;
-                    simd<int8_t, an>    up_a_vec0;
-                    simd<float, Repeat> gate_w_scale0;
-                    simd<float, Repeat> up_w_scale0;
-                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
-                                                                  gate_a_vec0, gate_w_scale0);
-                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
-                                                                  up_w_scale0);
-
-                    simd<int, Repeat * exec_n> gate_part0 = 0;
-                    simd<int, Repeat * exec_n> up_part0   = 0;
-                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
-                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
-#pragma unroll
-                    for (int r = 0; r < Repeat; ++r) {
-                        simd<int, 1>   gate_i = gate_part0.template select<1, 1>(r * exec_n);
-                        simd<int, 1>   up_i   = up_part0.template select<1, 1>(r * exec_n);
-                        simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale0[r]);
-                        simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale0[r]);
-                        gate_acc0[r] += gate_f[0];
-                        up_acc0[r] += up_f[0];
-                    }
-
-                    if (have_m1) {
-                        simd<int8_t, an>    gate_a_vec1;
-                        simd<int8_t, an>    up_a_vec1;
-                        simd<float, Repeat> gate_w_scale1;
-                        simd<float, Repeat> up_w_scale1;
-                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
-                                                                      gate_a_vec1, gate_w_scale1);
-                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
-                                                                      up_a_vec1, up_w_scale1);
-
-                        simd<int, Repeat * exec_n> gate_part1 = 0;
-                        simd<int, Repeat * exec_n> up_part1   = 0;
-                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
-                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
-#pragma unroll
-                        for (int r = 0; r < Repeat; ++r) {
-                            simd<int, 1>   gate_i = gate_part1.template select<1, 1>(r * exec_n);
-                            simd<int, 1>   up_i   = up_part1.template select<1, 1>(r * exec_n);
-                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale1[r]);
-                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale1[r]);
-                            gate_acc1[r] += gate_f[0];
-                            up_acc1[r] += up_f[0];
-                        }
-                    }
-
-                    b_ptr += bn;
-                    gate_group0 += kt_group_stride;
-                    up_group0 += kt_group_stride;
-                    gate_group1 += kt_group_stride;
-                    up_group1 += kt_group_stride;
-                }
+                // llama.cpp-lis9 quality round 1 (should-fix 3): the K-tile
+                // reduction loop this replaced is now shared with the ksplit
+                // partial kernel below via mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce
+                // (defined above, right before this function). Calling it
+                // with (kt_start=0, kt_end=k_tiles) -- the whole range --
+                // reproduces the exact loop that used to be written out here.
+                mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce<Repeat, Prefetch>(
+                    gate_base + xmx_group_n0 * group_bytes, up_base + xmx_group_n0 * group_bytes,
+                    gate_base + xmx_group_n1 * group_bytes, up_base + xmx_group_n1 * group_bytes, have_m1,
+                    xmx_row_in_group0, xmx_row_in_group1, tile_n_total, kt_group_stride, b_packed, y_scales, group,
+                    k_tiles, 0, k_tiles, gate_acc0, up_acc0, gate_acc1, up_acc1);
 
                 float * dst_out =
                     reinterpret_cast<float *>(reinterpret_cast<char *>(dst_glu) + static_cast<int64_t>(id) * dst_nb1 +
@@ -10318,12 +10381,19 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
 // ---------------------------------------------------------------------------
 // llama.cpp-lis9 (plan Task G2, parent llama.cpp-30ak7 lever 2): opt-in
 // CU-scaled K-split for the m2 gate/up decode kernel above.
-// GGML_SYCL_MXFP4_GATEUP_KSPLIT (default 1) selects S; S<=1 keeps the
-// unmodified mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl kernel above completely
-// untouched (see the submit wrapper's early-out) -- this section adds a
-// SEPARATE pair of kernels rather than editing that one in place, so the
-// S=1/B50/default path is guaranteed byte-for-byte the pre-existing
-// behaviour with zero risk from this change.
+// GGML_SYCL_MXFP4_GATEUP_KSPLIT (default 1) selects S. S<=1 keeps the
+// unmodified mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl kernel above as the
+// dispatch target (see the submit wrapper's early-out): its K-reduction loop
+// and DPAS calls are still untouched by this section. As of the spec
+// round-1 fix, though, its EPILOGUE is not independent of this section --
+// the tail above now calls mxfp4_bundle4_store_glu_tile, the same shared
+// helper the combine kernel below calls, deliberately (spec round 1
+// should-fix 1: two copies of that epilogue had drifted apart once already).
+// So "S<=1 keeps the kernel untouched" is true of the reduction/DPAS body,
+// not of the whole function; this section is not risk-free with respect to
+// that shared epilogue, which is exactly why quality round 1 asked that
+// its behaviour-preservation be argued explicitly (see the comment at the
+// call site above) rather than merely asserted.
 //
 // Design: each original launch thread (one per M-tile-pair) becomes S
 // threads, one per K-tile sub-range (mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl
@@ -10331,9 +10401,7 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
 // nonlinearity is only correct once summed over the FULL K range) to a
 // scratch buffer. A second, tiny reduction kernel
 // (mxfp4_pair_glu_xmx_tiled_dpas_m2_combine_sycl) sums the S partials per
-// tile-pair and applies the bias/GLU epilogue -- deliberately re-derived here
-// rather than factored out of the kernel above, so that kernel's working
-// code is not touched by this change at all (see the note above).
+// tile-pair and applies the bias/GLU epilogue via that same shared helper.
 //
 // llama.cpp-lis9's numerics gate (tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp)
 // requires the SAME profile row name ("mxfp4.gateup.xmx_tiled_dpas_m2") to
@@ -10353,11 +10421,10 @@ static const char * mxfp4_gateup_m2_ksplit_partial_metadata(int ksplit) {
     std::lock_guard<std::mutex>                 lock(mtx);
     auto                                        it = cache.find(ksplit);
     if (it == cache.end()) {
-        it = cache
-                 .emplace(ksplit, std::string("path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;"
-                                              "ksplit=") +
-                                      std::to_string(ksplit))
-                 .first;
+        // llama.cpp-lis9 quality round 1 (nit 8): built from
+        // kMxfp4GateupM2BaseMetadata (defined right before the S=1 kernel
+        // above) rather than a second copy of the same literal.
+        it = cache.emplace(ksplit, std::string(kMxfp4GateupM2BaseMetadata) + ";ksplit=" + std::to_string(ksplit)).first;
     }
     return it->second.c_str();
 }
@@ -10389,6 +10456,22 @@ static float * mxfp4_moe_gateup_ksplit_get_or_alloc_scratch(sycl::queue * stream
     }
     auto & cache = g_mxfp4_moe_gateup_ksplit_scratch;
     if (cache.handle.valid() && cache.capacity >= required_bytes && cache.owner_device == device) {
+        // llama.cpp-lis9 quality round 1 (nit 7): this non-grow reuse path
+        // adds no explicit dependency on `cache.ready_event` before handing
+        // the same buffer back for a NEW partial-kernel submission to write
+        // into -- unlike the sibling mxfp4_moe_tg_reuse family, which threads
+        // its own ready event through mxfp4_moe_tg_reuse_append_ready_dep()
+        // for exactly this reason. That is safe here ONLY because `stream`
+        // is the backend's in-order queue: every submit() on it (this
+        // dispatch's own pack_event-dependent partial kernel, and the PRIOR
+        // dispatch's combine kernel that produced `ready_event`) executes in
+        // queue program order, so the previous combine kernel's read of this
+        // buffer is already ordered before this call's write without an
+        // explicit dependency (dpct::device_ext::default_queue() ->
+        // in_order_queue(), constructed with sycl::property::queue::in_order()
+        // -- dpct/helper.hpp). If this scratch is ever reached from a queue
+        // NOT obtained that way, this reasoning no longer holds and an
+        // explicit dependency (mirroring append_ready_dep) becomes required.
         auto resolved = cache.handle.resolve(device);
         return resolved ? reinterpret_cast<float *>(resolved.ptr) : nullptr;
     }
@@ -10494,10 +10577,11 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl(sycl::queue &   
                                                                 int                  ksplit,
                                                                 float *              partial,
                                                                 const sycl::event &  pack_event) {
-    constexpr int exec_n            = GGML_SYCL_MXFP4_MOE_XMX_N;
+    // llama.cpp-lis9 quality round 1 (should-fix 3): exec_n/an/bn used to be
+    // needed here for the inline K-loop this function's body has since
+    // delegated to mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce, which
+    // re-derives them itself. k_per is still needed here for group_bytes.
     constexpr int k_per             = GGML_SYCL_MXFP4_MOE_XMX_K;
-    constexpr int an                = Repeat * k_per;
-    constexpr int bn                = k_per * exec_n;
     constexpr int partials_per_tile = 4 * Repeat;
 
     const int64_t m_tiles      = (static_cast<int64_t>(nrows_per_expert) + Repeat - 1) / Repeat;
@@ -10537,14 +10621,13 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl(sycl::queue &   
                 const uint8_t * gate_base = reinterpret_cast<const uint8_t *>(gate_ptrs[expert_id]);
                 const uint8_t * up_base   = reinterpret_cast<const uint8_t *>(up_ptrs[expert_id]);
                 if (!gate_base || !up_base) {
-                    // Matches the unmodified kernel's early-return (leaves
-                    // dst_out untouched) -- the combine kernel below redoes
-                    // this exact check and returns without writing dst_out
-                    // when it fires, so the zeros written here are never read.
-#pragma unroll
-                    for (int i = 0; i < partials_per_tile; ++i) {
-                        out[i] = 0.0f;
-                    }
+                    // llama.cpp-lis9 quality round 1 (should-fix 2): no
+                    // zero-fill needed here -- the combine kernel below
+                    // redoes this exact check on the SAME (gate_ptrs,
+                    // up_ptrs, expert_id), so it returns before ever reading
+                    // `out`/`partial` for this tile-pair. A write nothing
+                    // downstream reads is dead code, not a correctness
+                    // requirement.
                     return;
                 }
 
@@ -10570,104 +10653,35 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl(sycl::queue &   
                 const int64_t kt_count = k_tiles_base + (static_cast<int64_t>(k_part) < k_tiles_rem ? 1 : 0);
                 const int64_t kt_end   = kt_start + kt_count;
 
-                const uint8_t * gate_group0 = gate_base + xmx_group_n0 * group_bytes + kt_start * kt_group_stride;
-                const uint8_t * up_group0   = up_base + xmx_group_n0 * group_bytes + kt_start * kt_group_stride;
-                const uint8_t * gate_group1 = gate_base + xmx_group_n1 * group_bytes + kt_start * kt_group_stride;
-                const uint8_t * up_group1   = up_base + xmx_group_n1 * group_bytes + kt_start * kt_group_stride;
-                const int8_t *  b_ptr       = b_packed + (group * k_tiles + kt_start) * bn;
-
                 simd<float, Repeat> gate_acc0 = 0.0f;
                 simd<float, Repeat> up_acc0   = 0.0f;
                 simd<float, Repeat> gate_acc1 = 0.0f;
                 simd<float, Repeat> up_acc1   = 0.0f;
-                for (int64_t kt = kt_start; kt < kt_end; ++kt) {
-                    if constexpr (Prefetch) {
-                        constexpr int prefetch_distance = 10;
-                        const int64_t kt_prefetch       = kt + prefetch_distance;
-                        if (kt_prefetch < kt_end) {
-                            const uint8_t * gate_prefetch0 = gate_group0 + prefetch_distance * kt_group_stride;
-                            const uint8_t * up_prefetch0   = up_group0 + prefetch_distance * kt_group_stride;
-                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch0, tile_n_total, xmx_row_in_group0);
-                            mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch0, tile_n_total, xmx_row_in_group0);
-                            if (have_m1) {
-                                const uint8_t * gate_prefetch1 = gate_group1 + prefetch_distance * kt_group_stride;
-                                const uint8_t * up_prefetch1   = up_group1 + prefetch_distance * kt_group_stride;
-                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(gate_prefetch1, tile_n_total,
-                                                                         xmx_row_in_group1);
-                                mxfp4_xmx_tiled_prefetch_a_group<Repeat>(up_prefetch1, tile_n_total, xmx_row_in_group1);
-                            }
-                            mxfp4_xmx_tiled_prefetch_bytes<bn>(
-                                reinterpret_cast<const uint8_t *>(b_ptr + prefetch_distance * bn));
-                            mxfp4_xmx_tiled_prefetch_line(reinterpret_cast<const uint8_t *>(
-                                y_scales + ((group * k_tiles + kt_prefetch) * exec_n)));
-                        }
-                    }
+                // llama.cpp-lis9 quality round 1 (should-fix 3): shared with
+                // the S=1 kernel above via mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce
+                // (defined further above, right before that kernel); this
+                // call's only difference from that one is the [kt_start,
+                // kt_end) sub-range instead of the whole [0, k_tiles). The
+                // helper applies the kt_start offset to the base pointers
+                // itself, so the base pointers passed here are the SAME
+                // unoffset row-group pointers the S=1 kernel passes.
+                mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce<Repeat, Prefetch>(
+                    gate_base + xmx_group_n0 * group_bytes, up_base + xmx_group_n0 * group_bytes,
+                    gate_base + xmx_group_n1 * group_bytes, up_base + xmx_group_n1 * group_bytes, have_m1,
+                    xmx_row_in_group0, xmx_row_in_group1, tile_n_total, kt_group_stride, b_packed, y_scales, group,
+                    k_tiles, kt_start, kt_end, gate_acc0, up_acc0, gate_acc1, up_acc1);
 
-                    simd<int8_t, bn> b_vec   = block_load<int8_t, bn>(b_ptr);
-                    simd<float, 1>   y_scale = block_load<float, 1>(y_scales + (group * k_tiles + kt) * exec_n);
-
-                    simd<int8_t, an>    gate_a_vec0;
-                    simd<int8_t, an>    up_a_vec0;
-                    simd<float, Repeat> gate_w_scale0;
-                    simd<float, Repeat> up_w_scale0;
-                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group0, tile_n_total, xmx_row_in_group0,
-                                                                  gate_a_vec0, gate_w_scale0);
-                    mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group0, tile_n_total, xmx_row_in_group0, up_a_vec0,
-                                                                  up_w_scale0);
-
-                    simd<int, Repeat * exec_n> gate_part0 = 0;
-                    simd<int, Repeat * exec_n> up_part0   = 0;
-                    gate_part0 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part0, b_vec, gate_a_vec0);
-                    up_part0   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part0, b_vec, up_a_vec0);
-#pragma unroll
-                    for (int r = 0; r < Repeat; ++r) {
-                        simd<int, 1>   gate_i = gate_part0.template select<1, 1>(r * exec_n);
-                        simd<int, 1>   up_i   = up_part0.template select<1, 1>(r * exec_n);
-                        simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale0[r]);
-                        simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale0[r]);
-                        gate_acc0[r] += gate_f[0];
-                        up_acc0[r] += up_f[0];
-                    }
-
-                    if (have_m1) {
-                        simd<int8_t, an>    gate_a_vec1;
-                        simd<int8_t, an>    up_a_vec1;
-                        simd<float, Repeat> gate_w_scale1;
-                        simd<float, Repeat> up_w_scale1;
-                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(gate_group1, tile_n_total, xmx_row_in_group1,
-                                                                      gate_a_vec1, gate_w_scale1);
-                        mxfp4_xmx_tiled_load_a_vec_from_group<Repeat>(up_group1, tile_n_total, xmx_row_in_group1,
-                                                                      up_a_vec1, up_w_scale1);
-
-                        simd<int, Repeat * exec_n> gate_part1 = 0;
-                        simd<int, Repeat * exec_n> up_part1   = 0;
-                        gate_part1 = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(gate_part1, b_vec, gate_a_vec1);
-                        up_part1   = xmx::dpas<8, Repeat, int, int, int8_t, int8_t>(up_part1, b_vec, up_a_vec1);
-#pragma unroll
-                        for (int r = 0; r < Repeat; ++r) {
-                            simd<int, 1>   gate_i = gate_part1.template select<1, 1>(r * exec_n);
-                            simd<int, 1>   up_i   = up_part1.template select<1, 1>(r * exec_n);
-                            simd<float, 1> gate_f = convert<float>(gate_i) * (y_scale * gate_w_scale1[r]);
-                            simd<float, 1> up_f   = convert<float>(up_i) * (y_scale * up_w_scale1[r]);
-                            gate_acc1[r] += gate_f[0];
-                            up_acc1[r] += up_f[0];
-                        }
-                    }
-
-                    b_ptr += bn;
-                    gate_group0 += kt_group_stride;
-                    up_group0 += kt_group_stride;
-                    gate_group1 += kt_group_stride;
-                    up_group1 += kt_group_stride;
-                }
-
-#pragma unroll
-                for (int r = 0; r < Repeat; ++r) {
-                    out[r]              = gate_acc0[r];
-                    out[Repeat + r]     = up_acc0[r];
-                    out[2 * Repeat + r] = gate_acc1[r];
-                    out[3 * Repeat + r] = up_acc1[r];
-                }
+                // llama.cpp-lis9 quality round 1 (should-fix 2): four
+                // vectorized stores instead of 4*Repeat scalar ones -- each
+                // of the four `out + N*Repeat` slots is Repeat*sizeof(float)
+                // aligned by construction (partials_per_tile = 4*Repeat
+                // floats per tile, tile-aligned scratch -- see the
+                // alignment=64 request at get_or_alloc_scratch above), so a
+                // block_store<float, Repeat> is valid at each.
+                block_store<float, Repeat>(out, gate_acc0);
+                block_store<float, Repeat>(out + Repeat, up_acc0);
+                block_store<float, Repeat>(out + 2 * Repeat, gate_acc1);
+                block_store<float, Repeat>(out + 3 * Repeat, up_acc1);
             });
         });
     });
