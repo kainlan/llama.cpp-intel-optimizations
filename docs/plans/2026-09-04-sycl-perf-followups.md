@@ -236,6 +236,28 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > prunes (single-KV-buffer models only -- an ISWA/SWA model with two live tiered KV buffers would need its own
 > check, not applicable to the Mistral gate this was measured against).
 
+> **Amendment 2026-09-04 (attribution complete, lead): the ~250 MB/decode residual is NOT a further leak.**
+> A real bug was found and fixed in the same round: the older-epoch release branch called `release_extra_gpu()`
+> exactly once regardless of `kv_view_extra_entry::share_count`, so a shared entry's refcount (1 + share_count)
+> never reached zero and the object leaked, invisible to the entries-only `kv_view_extras` accessor -- fixed by
+> looping the release `1 + share_count` times, with a new live-object counter
+> (`ggml_backend_sycl_debug_live_kv_view_extra_count`, GGML_SYCL_PRIVATE_TESTING) that catches this class of bug
+> where a container-membership count cannot. But in-process jemalloc dumps plus the L1 probe (kept=838/
+> released=838 at every one of 12 resets) show the residual is explained without any further leak: growth tracks
+> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB) plus the KV views, then
+> decelerates after the ramp (+120/+60/+90/+90 MB) -- i.e. the residual is the SIZE of that bounded window and the
+> allocator churn of 277,704 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
+> `ggml_tensor_extra_gpu`, currently 277,704 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
+> on a 3-device box): the "RssAnon flat after the first decode" acceptance moves there. L2b closes as designed
+> (its own GPU test's flat `kv_view_extras`/`kv_view_extras_live` across 20 rebuilds), with the share_count bug
+> fixed in the same round. Five candidate mechanisms were checked and ruled out or found inapplicable to this
+> benchmark before the attribution above closed the search: the graph-lifetime handle-retention list
+> (`mem-handle.cpp` `graph_unwaitable`, cleared only at a PP<->TG phase boundary or backend teardown -- inapplicable
+> to a pure `-p 1024 -n 0` prefill-only run, which has no such transition); nine tensor-pointer-keyed maps in
+> `ggml-sycl.cpp` (all function-local, freed every call); `UnifiedKernel::plan_cache_valid_` (a single bounded
+> slot, not a growing map); the oneDNN scratch pointer tables in `unified-cache.hpp` (matched insert/erase pairs);
+> and `g_moe_down_sum_shadow_entries` (properly cleared, and MoE-only -- never populated for dense Mistral).
+
 ### Task L3: Prefill scaling gate and per-ubatch residual (llama.cpp-dfo0, step 3)
 
 **Track:** L
