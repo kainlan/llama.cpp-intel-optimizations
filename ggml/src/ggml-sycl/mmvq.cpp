@@ -10119,8 +10119,15 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_bundle4_dpas_m2_sycl(sycl::queue &  
 // itself, so callers never need to. Accumulators are taken by reference so
 // each caller keeps its own simd<> locals declared exactly where they were
 // before this refactor -- calling this with (0, k_tiles) reproduces the S=1
-// kernel's prior loop exactly, instruction for instruction, so its emitted
-// code and profiled mean are not expected to change.
+// kernel's prior loop exactly. That claim is checked at the source level
+// (quality round 2: brace-balanced extraction of the pre-refactor S=1 and
+// ksplit loop bodies plus this helper, whitespace-stripped and diffed --
+// identical apart from the two intended kt_start/kt_end edits), not by
+// disassembly -- the ESIMD backend is free to schedule a by-reference
+// simd<> differently, so no instruction-for-instruction claim is made here.
+// The runtime confirmation is the profiled mean: lead comment c-od2z
+// measured the B70 m2 kernel at 112.2 us (count 792) with this refactor in
+// place, unchanged from the pre-refactor baseline.
 template <int Repeat, bool Prefetch>
 SYCL_ESIMD_FUNCTION inline void mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce(
     const uint8_t *                                gate_group0_base,
@@ -10234,14 +10241,25 @@ SYCL_ESIMD_FUNCTION inline void mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce(
     }
 }
 
-// llama.cpp-lis9 quality round 1 (nit 8): the one base metadata string this
-// kernel family's three profile labels build on -- the plain S=1 label
-// below, its TG1Index sibling (appends ";index=tg1"), and the ksplit partial
-// kernel's label (appends ";ksplit=<S>", mxfp4_gateup_m2_ksplit_partial_metadata
-// further below) -- kept as one constant instead of three copies of the same
-// literal.
-static constexpr const char * kMxfp4GateupM2BaseMetadata =
-    "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime";
+// llama.cpp-lis9 quality round 1 (nit 8), corrected in quality round 2
+// (nits 2-3): the one base metadata string this kernel family's three
+// profile labels build on -- the plain S=1 label below, its TG1Index
+// sibling (appends ";index=tg1"), and the ksplit partial kernel's label
+// (appends ";ksplit=<S>", mxfp4_gateup_m2_ksplit_partial_metadata further
+// below). Round 1 only hoisted a `constexpr const char *`, which the
+// TG1Index label below could not build on (a `constexpr const char *`
+// cannot be preprocessor-concatenated, and mmvq_profile_label's metadata
+// parameter is a non-owning `const char *`, so no runtime std::string
+// concatenation can be handed to it either) -- it kept a full third copy of
+// the literal instead, silently defeating the "kept as one constant"
+// claim. `MXFP4_GATEUP_M2_BASE_METADATA` is the single source of truth as a
+// macro so the TG1Index label can compose it at compile time via ordinary
+// adjacent-string-literal concatenation; `mxfp4_gateup_m2_base_metadata`
+// remains as a `const char *` value for the two call sites (the S=1 label
+// below, and the ksplit metadata cache's std::string construction) that
+// need an actual value rather than a literal to paste.
+#define MXFP4_GATEUP_M2_BASE_METADATA "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime"
+static constexpr const char * mxfp4_gateup_m2_base_metadata = MXFP4_GATEUP_M2_BASE_METADATA;
 
 template <int Repeat, int GLU_OP, bool Prefetch, bool TG1Index>
 static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        queue,
@@ -10282,8 +10300,8 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
 
     ggml_sycl_profile_label profile_label =
         TG1Index ? mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2_tg1_index",
-                                      "path=packed-q8-m2;role=gateup;tiles=static;total_batches=runtime;index=tg1") :
-                   mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", kMxfp4GateupM2BaseMetadata);
+                                      MXFP4_GATEUP_M2_BASE_METADATA ";index=tg1") :
+                   mmvq_profile_label(queue, "mxfp4.gateup.xmx_tiled_dpas_m2", mxfp4_gateup_m2_base_metadata);
     // clang-format off
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
@@ -10383,17 +10401,25 @@ static sycl::event mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl(sycl::queue &        qu
 // CU-scaled K-split for the m2 gate/up decode kernel above.
 // GGML_SYCL_MXFP4_GATEUP_KSPLIT (default 1) selects S. S<=1 keeps the
 // unmodified mxfp4_pair_glu_xmx_tiled_dpas_m2_sycl kernel above as the
-// dispatch target (see the submit wrapper's early-out): its K-reduction loop
-// and DPAS calls are still untouched by this section. As of the spec
-// round-1 fix, though, its EPILOGUE is not independent of this section --
-// the tail above now calls mxfp4_bundle4_store_glu_tile, the same shared
-// helper the combine kernel below calls, deliberately (spec round 1
-// should-fix 1: two copies of that epilogue had drifted apart once already).
-// So "S<=1 keeps the kernel untouched" is true of the reduction/DPAS body,
-// not of the whole function; this section is not risk-free with respect to
-// that shared epilogue, which is exactly why quality round 1 asked that
-// its behaviour-preservation be argued explicitly (see the comment at the
-// call site above) rather than merely asserted.
+// dispatch target (see the submit wrapper's early-out) -- but "unmodified"
+// no longer means isolated from this section, and quality round 2 flagged
+// an earlier version of this comment for claiming otherwise. Both the
+// S=1 kernel's K-reduction/DPAS body (via mxfp4_pair_glu_xmx_tiled_dpas_m2_k_reduce,
+// defined above the S=1 kernel) and its epilogue (via
+// mxfp4_bundle4_store_glu_tile, spec round 1 should-fix 1) are now shared
+// with the ksplit kernels in this section: an edit to the prefetch
+// distance, a dpas call, the scale sequence, or the epilogue made for
+// ksplit's benefit lands on the S=1 dispatch path too. No part of the S=1
+// function is independent of this section any more. The safety argument
+// for the default S=1 path is therefore NOT isolation -- it is (a) the
+// byte-identity of the K-reduction extraction, verified at the source
+// level by brace-balanced extraction and whitespace-stripped comparison of
+// the pre-refactor S=1/ksplit loop bodies against the shared helper
+// (quality round 2), (b) the unmodified S=1 numerics gate and GPT-OSS chat
+// gates passing on the resulting binary, and (c) the B70/B50 A-B in lead
+// comment c-od2z (B70 m2 kernel 112.2 us / count 792, unchanged from the
+// pre-refactor baseline; B70 tg128 +6% under auto, B50 unchanged) -- not an
+// assertion that the code paths never touch each other.
 //
 // Design: each original launch thread (one per M-tile-pair) becomes S
 // threads, one per K-tile sub-range (mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_sycl
@@ -10422,9 +10448,10 @@ static const char * mxfp4_gateup_m2_ksplit_partial_metadata(int ksplit) {
     auto                                        it = cache.find(ksplit);
     if (it == cache.end()) {
         // llama.cpp-lis9 quality round 1 (nit 8): built from
-        // kMxfp4GateupM2BaseMetadata (defined right before the S=1 kernel
+        // mxfp4_gateup_m2_base_metadata (defined right before the S=1 kernel
         // above) rather than a second copy of the same literal.
-        it = cache.emplace(ksplit, std::string(kMxfp4GateupM2BaseMetadata) + ";ksplit=" + std::to_string(ksplit)).first;
+        it = cache.emplace(ksplit, std::string(mxfp4_gateup_m2_base_metadata) + ";ksplit=" + std::to_string(ksplit))
+                 .first;
     }
     return it->second.c_str();
 }
