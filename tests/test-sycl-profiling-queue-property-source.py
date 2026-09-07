@@ -200,6 +200,14 @@ def matching_paren(text, open_idx):
 # substring of a longer identifier immediately followed by ` (` (e.g. a
 # hypothetical `motif (...)` call).
 _IF_RE = re.compile(r"(?<![A-Za-z0-9_])if\s*\(")
+# Sibling patterns used to detect a plain `else` branch (quality review
+# c-efy0): _ELSE_RE finds the keyword itself; _IF_KEYWORD_RE (bare, no
+# trailing `\(` requirement -- unlike _IF_RE, which needs to anchor on a
+# call-like `if (`) is used just after an `else` match to tell an `else if`
+# (a separate if-statement, already discovered on its own by _IF_RE) apart
+# from a plain `else { ... }`.
+_ELSE_RE = re.compile(r"(?<![A-Za-z0-9_])else\b")
+_IF_KEYWORD_RE = re.compile(r"(?<![A-Za-z0-9_])if\b")
 
 
 def _mask_comments_and_strings(text):
@@ -226,7 +234,23 @@ def _mask_comments_and_strings(text):
     ever existed here, would not be masked out). This helper is scoped to
     one known, small, in-repo function body, not arbitrary/adversarial
     C++, and neither residual is expected to matter for it; not a
-    completeness claim for a general-purpose C++ tokenizer."""
+    completeness claim for a general-purpose C++ tokenizer.
+
+    FURTHER RESIDUALS, past this masker, in the enclosing-if/else scan
+    itself (quality review c-efy0, after fixing the plain-`else` false
+    PASS): a re-gate spelled as a `&&`/`||` short-circuit around the call
+    ITSELF rather than around an `if` (`total_gpus <= 1 &&
+    ensure_single_device_context_queue(...)`), a ternary re-gate
+    (`cond ? ensure_single_device_context_queue(...) : nullptr`), or a
+    `while` wrapper are none of them detected by this scan and would false
+    PASS. Deliberately not chased further: this gate exists to catch a
+    REBASE OR EDIT REVERTING THE SHIPPED, REVIEWED FORM back toward the
+    pre-fix `total_gpus > 1` gate (its actual, observed failure mode
+    twice already), not to reject arbitrary control flow a determined
+    rewrite could hide the call inside -- the GPU test's PHASE 2
+    (tests/test-sycl-profiling-queue-property.cpp) is the BEHAVIOURAL
+    check that would still catch any of those on hardware regardless of
+    how the source-level gate reads them."""
     # Same four-state machine as matching_brace()/matching_paren() above,
     # but building a masked copy instead of tracking depth. Every branch
     # explicitly sets `i` and `continue`s, so each character is visited
@@ -346,7 +370,17 @@ def _find_enclosing_if_conditions(body, call_idx):
     Matches `if (` against a comment/string-MASKED copy of `body` (c-12xi's
     other nit: a commented-out or quoted `if (...)` must not count), but
     extracts conditions and body spans from the ORIGINAL `body` text using
-    the masked copy's offsets, which are identical by construction."""
+    the masked copy's offsets, which are identical by construction.
+
+    Also checks a plain `else` branch when the call is not in the THEN
+    branch (quality review c-efy0): `if (total_gpus <= 1) { keep dpct
+    default } else { if (!cache_queue) { call } }` is the pre-fix bug
+    verbatim, and a scan that only ever looked inside THEN branches missed
+    it entirely -- the call there is guarded by the NEGATION of the if's
+    condition, reported as `!(<condition>)`. `else if` is deliberately NOT
+    handled here: it is its own separate `if (`, already discovered on its
+    own by this same scan. See _mask_comments_and_strings()'s docstring for
+    named residual spellings this scan still does not detect, and why."""
     masked = _mask_comments_and_strings(body)
     found = []  # (body_start, condition), any order; sorted by body_start below
     for m in _IF_RE.finditer(masked):
@@ -370,6 +404,39 @@ def _find_enclosing_if_conditions(body, call_idx):
             body_start, body_end = after_ws, semi_idx
         if body_start < call_idx <= body_end:
             found.append((body_start, condition))
+            continue
+        # The call is not in the THEN branch -- check for a plain `else`
+        # (quality review c-efy0): `if (total_gpus <= 1) { keep dpct
+        # default } else { if (!cache_queue) { call } }` is the pre-fix bug
+        # verbatim, and a check that only ever looked at THEN branches
+        # missed it entirely (false PASS -- extracted only ["!cache_queue"]
+        # from the inner if, never seeing the outer condition at all). If
+        # the call falls inside a plain `else` body (not `else if`, which
+        # is its own separate `if (` already discovered by this same loop
+        # on its next iteration), the call is guarded by the NEGATION of
+        # this if's condition.
+        rest_at = body[body_end + 1 :]
+        stripped_at = rest_at.lstrip()
+        after_then_ws = body_end + 1 + (len(rest_at) - len(stripped_at))
+        else_match = _ELSE_RE.match(masked, after_then_ws)
+        if not else_match:
+            continue
+        after_else = else_match.end()
+        rest_ae = body[after_else:]
+        stripped_ae = rest_ae.lstrip()
+        after_else_ws = after_else + (len(rest_ae) - len(stripped_ae))
+        if _IF_KEYWORD_RE.match(masked, after_else_ws):
+            continue  # `else if` -- handled as its own separate `if (` match
+        if body[after_else_ws : after_else_ws + 1] == "{":
+            else_body_start = after_else_ws
+            else_body_end = matching_brace(body, else_body_start)
+        else:
+            else_semi = body.find(";", after_else_ws)
+            if else_semi < 0:
+                continue
+            else_body_start, else_body_end = after_else_ws, else_semi
+        if else_body_start < call_idx <= else_body_end:
+            found.append((else_body_start, "!(" + condition + ")"))
     found.sort(key=lambda pair: pair[0])  # outermost (earliest body_start) first
     return [re.sub(r"\s+", "", c) for _, c in found]
 
@@ -446,6 +513,24 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
     }"""
     assert _ensure_call_guard_conditions(comment_spelled_if) == ["dev_count>1"], (
         "an `if (` spelled out inside a `//` comment must not be picked up as a real enclosing if"
+    )
+
+    # c-efy0: the pre-fix bug verbatim, spelled as a plain `else` rather
+    # than a re-gate wrapped around the call -- a scan that only ever
+    # looked inside THEN branches missed this entirely (false PASS,
+    # extracting only ["!cache_queue"] from the inner if).
+    else_branch_regate = """{
+        if (total_gpus <= 1) {
+            /* keep dpct default */
+        } else {
+            if (!cache_queue) {
+                cache_queue = ensure_single_device_context_queue(device_id);
+            }
+        }
+    }"""
+    assert _ensure_call_guard_conditions(else_branch_regate) == ["!(total_gpus<=1)", "!cache_queue"], (
+        "expected the else-branch's guard to be reported as the NEGATION of the if's condition, outermost "
+        "first, alongside the inner !cache_queue condition"
     )
 
 
