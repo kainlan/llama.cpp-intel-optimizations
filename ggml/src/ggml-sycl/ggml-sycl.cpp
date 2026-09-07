@@ -90884,13 +90884,21 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
             (void) moe_fusion_ensure_full_local_ptr_table_from_descriptor(*sycl_ctx, role, role_layer_hash);
         }
         if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[sycl_ctx->device]) {
-            capture_table_reject(extra, ggml_sycl::mem_handle{});
+            // weight_ext may already be allocated with a populated (but no
+            // longer valid) table handle here -- invalidate_backend_weight_
+            // mutation() clears moe_device_table_valid without clearing the
+            // handle itself -- so report the real handle when one exists
+            // rather than always synthesizing a default one for the reject
+            // diagnostics.
+            capture_table_reject(extra, extra->weight_ext ?
+                                            extra->weight_ext->moe_expert_ptrs_handle[sycl_ctx->device] :
+                                            ggml_sycl::mem_handle{});
             return set_identity_reject("role-device-table-missing");
         }
         // weight_ext is guaranteed non-null past this point: the checks
         // above only fall through when moe_device_table_valid is true,
         // which lives on weight_ext.
-        const ggml_sycl::mem_handle & table_handle       = extra->weight_ext->moe_expert_ptrs_handle[sycl_ctx->device];
+        const ggml_sycl::mem_handle & table_handle        = extra->weight_ext->moe_expert_ptrs_handle[sycl_ctx->device];
         const char *                  table_handle_reason = nullptr;
         if (!mix_handle(table_handle, true, &table_handle_reason)) {
             capture_table_reject(extra, table_handle);

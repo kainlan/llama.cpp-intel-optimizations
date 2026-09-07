@@ -1808,9 +1808,10 @@ static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *           
         *table_handle_out = extra->weight_ext->moe_expert_ptrs_handle[device];
     }
     if (retained_leases_out) {
-        const auto & leases = !extra->weight().moe_expert_ptrs_leases[device].empty() ?
-                                  extra->weight().moe_expert_ptrs_leases[device] :
-                                  extra->weight().moe_expert_handles[device];
+        // weight_ext is confirmed non-null by the guard above.
+        const auto & leases = !extra->weight_ext->moe_expert_ptrs_leases[device].empty() ?
+                                  extra->weight_ext->moe_expert_ptrs_leases[device] :
+                                  extra->weight_ext->moe_expert_handles[device];
         retained_leases_out->insert(retained_leases_out->end(), leases.begin(), leases.end());
     }
     return true;
