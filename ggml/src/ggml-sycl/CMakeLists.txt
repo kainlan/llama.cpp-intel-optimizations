@@ -3139,6 +3139,12 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-fattn-tile-d512-decode COMMAND test-sycl-fattn-tile-d512-decode)
 set_tests_properties(test-sycl-fattn-tile-d512-decode PROPERTIES
+    # No "0igs-batchN" token here, unlike the registrations this one is
+    # modelled on (e.g. test-sycl-fattn-xmx-policy, test-sycl-fattn-onednn-*,
+    # test-q8-0-layout-cache-path-mmvq): this test was added after that
+    # batch closed and is not a member of it. The omission is deliberate,
+    # not an oversight -- do not backfill a batch label just to match the
+    # sibling registrations' shape.
     LABELS "sycl;fattn;tile;d512;decode;numerics;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120

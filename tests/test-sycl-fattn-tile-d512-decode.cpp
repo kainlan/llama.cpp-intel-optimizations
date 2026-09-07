@@ -351,14 +351,15 @@ static void compute_reference(const std::vector<float> &       Q,
                     acc += weight[(size_t) t] * v;
                 }
                 const size_t out_idx = (size_t) d + (size_t) D * h + (size_t) D * H_q * qr;
-                // denom > 0.0 is UNREACHABLE by construction, not a real
-                // decode path: every query row has >=1 visible (finite-
-                // logit) kv position, since build_causal_like_mask()
-                // clamps window into [1, n_kv] (see its comment), so denom
-                // (a sum of >=1 positive exp() terms) can never be zero
-                // here. Kept as a defensive fallback rather than removed;
-                // if a future case ever allowed an empty window, this
-                // would need to be a loud failure instead of a silent 0.
+                // denom > 0.0 is always true here, so the ": 0.0" fallback
+                // below is UNREACHABLE by construction, not a real decode
+                // path: every query row has >=1 visible (finite-logit) kv
+                // position, since build_causal_like_mask() clamps window
+                // into [1, n_kv] (see its comment), so denom (a sum of >=1
+                // positive exp() terms) can never be zero here. The
+                // fallback is kept defensively rather than removed; if a
+                // future case ever allowed an empty window, this would
+                // need to be a loud failure instead of a silent 0.
                 out[out_idx]         = (float) (denom > 0.0 ? acc / denom : 0.0);
             }
         }
@@ -469,6 +470,11 @@ static void run_shape(ggml_backend_t backend,
     // reference's own scale, so compare() below detects a genuinely
     // all-zero reference on its own (mse_ref <= 0.0) -- see the file
     // header "METRIC" note.
+    // 112 is a headroom-padded magic size, not derived from a format-string
+    // bound: the longest label this test currently produces is 71 bytes
+    // (n_kv/ne01/window at their largest tested values). snprintf truncates
+    // silently rather than erroring if a future case exceeds 112, so a
+    // very long label would just print cut off, not fail loudly.
     char label[112];
     std::snprintf(label, sizeof(label), "D512-decode-vs-cpu-reference n_kv=%d ne01=%d H_kv=%d mask=%d window=%d", n_kv,
                   ne01, H_kv, (int) use_mask, window);

@@ -3869,7 +3869,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         // too coarse to ever let D=512 into the allowlist.
         //
         // llama.cpp-86a7 replaces it with a route-AWARE observation,
-        // recorded AFTER dispatch at each of this branch's two successful
+        // recorded AFTER dispatch at each of this branch's successful
         // exit points below, classified by fa_decode_kernel_observation::
         // observe() the same way dispatch_debug_kernel already does for
         // D<=256. tile_d512 is a native kernel using the identical
@@ -3993,6 +3993,11 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 // tile route's own defensive backstop: build_attn_mha()
                 // skips the F16 Q cast specifically for D==512).
                 fattn_esimd_f16<512, float>(params, *stream);
+                // d512_observe (== params.ne01 <= 1) is a tautology here --
+                // this arm is already gated on params.ne01 == 1 above -- but
+                // the check is kept for symmetry with this branch's other
+                // two observe() exits (onednn_d512, d512_tile), which are
+                // not similarly narrowed and do need the runtime test.
                 if (d512_observe) {
                     // Same allowlist bucket as the D<=256 decode path -- see
                     // fa_decode_kernel_observation::classify() (common.hpp):

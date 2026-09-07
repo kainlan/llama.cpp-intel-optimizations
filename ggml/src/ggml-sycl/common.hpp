@@ -6770,7 +6770,7 @@ struct ggml_backend_sycl_context {
     // selection for decode-shape (ne01<=1) FLASH_ATTN_EXT dispatches,
     // updated by the real dispatcher in fattn.cpp every time it selects a
     // kernel (ggml_sycl_flash_attn_ext_dispatch_ncols's dispatch_debug_kernel
-    // lambda for D<=256; the D==512 branch's own two dispatch exit points
+    // lambda for D<=256; the D==512 branch's own dispatch exit points
     // for D=512). The SYCL-graph gate reads this instead of re-deriving
     // eligibility from tensor shape in a second, independently-maintained
     // classifier -- "one check, one authority" (see the file's own dkw0/
