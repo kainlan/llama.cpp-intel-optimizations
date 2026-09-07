@@ -239,9 +239,9 @@ struct mxfp4_stored_gemm_ksplit_scratch {
     bool                  ready_event_set = false;
 };
 
-thread_local mxfp4_stored_gemm_ksplit_scratch g_mxfp4_stored_gemm_ksplit_scratch;
+static thread_local mxfp4_stored_gemm_ksplit_scratch g_mxfp4_stored_gemm_ksplit_scratch;
 
-float * mxfp4_stored_gemm_ksplit_get_or_alloc_scratch(sycl::queue * stream, int device, size_t required_floats) {
+static float * mxfp4_stored_gemm_ksplit_get_or_alloc_scratch(sycl::queue * stream, int device, size_t required_floats) {
     const size_t required_bytes = required_floats * sizeof(float);
     if (required_bytes == 0) {
         return nullptr;
@@ -295,7 +295,7 @@ float * mxfp4_stored_gemm_ksplit_get_or_alloc_scratch(sycl::queue * stream, int 
     return reinterpret_cast<float *>(resolved.ptr);
 }
 
-void mxfp4_stored_gemm_ksplit_scratch_mark_ready(int device, const sycl::event & event) {
+static void mxfp4_stored_gemm_ksplit_scratch_mark_ready(int device, const sycl::event & event) {
     auto & cache = g_mxfp4_stored_gemm_ksplit_scratch;
     if (!cache.handle.valid() || cache.owner_device != device) {
         return;
