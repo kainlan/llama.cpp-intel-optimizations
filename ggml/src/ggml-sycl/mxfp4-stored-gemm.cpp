@@ -625,9 +625,19 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_combine_launch(sycl::queue &       q
 
 // Top-level dispatcher: computes the launch geometry, then either runs a
 // single direct-write partial pass (ksplit == 1, or scratch allocation
-// failed) or the two-pass partial+combine split. Kept in this file's own
-// (non-anonymous-namespace) scope like the rest of this section -- still
-// `static`, internal linkage, not part of this file's public surface.
+// failed) or the two-pass partial+combine split.
+//
+// Placement (llama.cpp-kcya c-ekyq should-fix 2, correcting a false round-6
+// claim): this function sits OUTSIDE the anonymous namespace above (which
+// closes right before it), while its own two callees --
+// mxfp4_soa_gemm_int8_dpas_partial_launch and _combine_launch -- remain
+// INSIDE it. That is a change from the pre-round-6 tree: at base
+// 743cd163e this dispatcher was itself inside that same anonymous
+// namespace, alongside everything else in this section; round 6 moved it
+// out and left its callees where they were. `static` gives this function
+// internal linkage either way, so the move has no linkage or behavioural
+// effect -- it is not part of this file's public surface regardless of
+// which side of the namespace boundary it sits on.
 template <int M_TILE>
 static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                    queue,
                                                    const uint8_t *                  soa_base,

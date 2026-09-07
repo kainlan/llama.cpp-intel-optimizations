@@ -91,6 +91,17 @@ q8_1_activation_pack quantize_activations_q8_1(const float * x, int64_t M, int64
 // transparently degrades to a single unsplit pass writing straight to
 // dst_device instead -- correct but slower, never a hard failure.
 //
+// Release (llama.cpp-kcya c-ekyq nit 6): this scratch is never explicitly
+// freed by any call into this function. The thread_local cache holding
+// its mem_handle is only ever REPLACED (on a growth, retiring the old
+// handle against the still-in-flight combine event -- see above) or left
+// as-is (on a same-size-or-larger reuse); nothing in this file ever clears
+// it early. It is released only when the mem_handle's destructor runs,
+// which is at thread exit (the thread_local's own destruction) or process
+// teardown -- ordinary C++ static/thread storage duration semantics, not
+// an explicit release path this function provides. A caller that needs
+// the scratch reclaimed sooner has no call in this API to ask for that.
+//
 // The returned event completes the WHOLE dispatch: waiting on it
 // transitively waits for every kernel this call submitted, including an
 // internal partial pass a caller never sees directly. Its OWN profiling
