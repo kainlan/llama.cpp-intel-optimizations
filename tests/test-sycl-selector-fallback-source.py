@@ -328,7 +328,7 @@ def _has_canonical_inline_block(text):
     which would blank the pattern's own required quoted argument
     (`"ONEAPI_DEVICE_SELECTOR"`, `"/proc/self/exe"`) and make it unable to
     match ANY real call at all; see _mask_comments_only's docstring. See
-    test_execv_proof_ignores_commented_and_quoted_text below."""
+    test_execv_proof_ignores_commented_text below."""
     masked = _mask_comments_only(text)
     matches = list(SETENV_PATTERN.finditer(masked))
     if not matches:
@@ -369,14 +369,31 @@ def _is_char_literal_opener(text, i):
     return prefix == "" or prefix in _CHAR_LITERAL_PREFIXES
 
 
-def _mask_comments_and_literals(text):
-    """Returns a copy of `text` the same length, with every `//` line
-    comment, `/* */` block comment, string literal ("...") and char literal
-    ('...') replaced character-for-character by spaces (newlines inside a
-    masked span are kept as newlines, everything else becomes a space).
-    Every offset in the returned copy therefore still lines up 1:1 with
-    `text` -- a position or span found by scanning the MASKED copy can be
-    used directly to slice or search the ORIGINAL text.
+def _mask_scan(text, mask_literals):
+    """Shared implementation behind _mask_comments_and_literals (
+    mask_literals=True) and _mask_comments_only (mask_literals=False).
+
+    Quality round 1 (rev-aenv-quality-1, c-xtww should-fix 1) found the two
+    named functions had drifted into two independent ~35-line copies of the
+    same scanner, differing in exactly the one branch below (whether a
+    parsed literal's CONTENT is also blanked) -- factored into one scanner
+    with a flag so a future fix to the comment/literal-scanning logic (as
+    quality rounds 5-7 of the original 5q1r series each were, for the
+    literal-opener rule alone) cannot be applied to one copy and silently
+    missed in the other.
+
+    Returns a copy of `text` the same length, with every `//` line comment
+    and `/* */` block comment replaced character-for-character by spaces
+    (newlines inside a masked span are kept as newlines, everything else
+    becomes a space). String literals ("...") and char literals ('...') are
+    always PARSED with the same logic (so a `//`, a brace, or a quote inside
+    one still cannot be misread as a comment start or a literal boundary
+    elsewhere) -- `mask_literals` controls only whether their CONTENT is
+    also blanked (True, matching the comment treatment) or left unchanged in
+    the output (False). Every offset in the returned copy therefore still
+    lines up 1:1 with `text` -- a position or span found by scanning the
+    MASKED copy can be used directly to slice or search the ORIGINAL text,
+    regardless of which mode was used.
 
     Escapes inside a literal (`\\"`, `\\\\`, `\\'`) are honoured so an
     escaped quote does not end the literal early. A literal scan never
@@ -426,7 +443,13 @@ def _mask_comments_and_literals(text):
     Digit separators (`1'000'000`) are HANDLED as of quality round 6, and
     encoding-prefixed char literals (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) are
     HANDLED as of quality round 7 -- neither is a residual, listed here
-    only for contrast with the genuinely open items."""
+    only for contrast with the genuinely open items.
+
+    A raw string literal is also the residual gap common to mask_literals in
+    EITHER mode (B1, rev-final-1 c-91qe / llama.cpp-aenv): in principle one
+    could still smuggle unescaped comment-like or call-like text past this
+    scanner. No in-scope file uses one at the time of writing (same census
+    as above)."""
     out = []
     i = 0
     n = len(text)
@@ -461,7 +484,10 @@ def _mask_comments_and_literals(text):
                 out.append(text[i])
                 i += 1
                 continue
-            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            if mask_literals:
+                out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            else:
+                out.append(text[i:j])  # literal content preserved, NOT masked
             i = j
         else:
             out.append(text[i])
@@ -469,15 +495,21 @@ def _mask_comments_and_literals(text):
     return "".join(out)
 
 
+def _mask_comments_and_literals(text):
+    """Comments AND string/char literals blanked to spaces -- see
+    _mask_scan's docstring for the shared algorithm and its known
+    residuals. Used by _find_main_bodies for signature/brace scanning,
+    where literal CONTENT is irrelevant and must not be allowed to spoof a
+    `main(...) {` signature or a stray brace (quality rounds 3-5, c-autq /
+    c-q3hv / c-i7ep)."""
+    return _mask_scan(text, mask_literals=True)
+
+
 def _mask_comments_only(text):
-    """Like _mask_comments_and_literals above, but masks ONLY `//` and
-    `/* */` comments to spaces -- string and char literals are PARSED with
-    the exact same logic (so a `//`, a brace, or a quote inside one still
-    cannot be misread as a comment start or a literal boundary elsewhere),
-    but their CONTENT is left unchanged in the output, unlike
-    _mask_comments_and_literals which also blanks it. Length- and
-    position-preserving, same guarantee as _mask_comments_and_literals: a
-    span found in the returned copy can be used directly against `text`.
+    """Comments blanked to spaces; string/char literals are PARSED (so a
+    `//`, a brace, or a quote inside one still cannot be misread elsewhere)
+    but their CONTENT is left UNCHANGED -- see _mask_scan's docstring for
+    the shared algorithm and its known residuals.
 
     B1 (rev-final-1, c-91qe / llama.cpp-aenv): this exists because
     SETENV_PATTERN, EXECV_PATTERN, and HELPER_CALL_PATTERN all need their
@@ -498,54 +530,8 @@ def _mask_comments_only(text):
     comments) to spaces closes the demonstrated vulnerability (a comment
     quoting the execv() proof text right after a bare setenv(), or quoting
     the helper call outside main() -- llama.cpp-7wal) without touching any
-    real code's own string arguments.
-
-    Same known-residuals disclaimer as _mask_comments_and_literals: raw
-    string literals (`R"(...)"`) are not specially recognized, so a raw
-    string could in principle still smuggle unescaped comment-like or
-    call-like text past this masking. No in-scope file uses one at the time
-    of writing (see _mask_comments_and_literals' docstring for the same
-    census)."""
-    out = []
-    i = 0
-    n = len(text)
-    while i < n:
-        two = text[i : i + 2]
-        if two == "//":
-            j = text.find("\n", i)
-            end = j if j != -1 else n
-            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
-            i = end
-        elif two == "/*":
-            j = text.find("*/", i + 2)
-            end = (j + 2) if j != -1 else n
-            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
-            i = end
-        elif text[i] == '"' or (text[i] == "'" and _is_char_literal_opener(text, i)):
-            quote = text[i]
-            j = i + 1
-            closed = False
-            while j < n:
-                if text[j] == "\n":
-                    break
-                if text[j] == "\\" and j + 1 < n:
-                    j += 2
-                    continue
-                if text[j] == quote:
-                    j += 1
-                    closed = True
-                    break
-                j += 1
-            if not closed:
-                out.append(text[i])
-                i += 1
-                continue
-            out.append(text[i:j])  # literal content preserved, NOT masked
-            i = j
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
+    real code's own string arguments."""
+    return _mask_scan(text, mask_literals=False)
 
 
 def _find_main_bodies(text):
@@ -700,7 +686,19 @@ def _first_statement_verdict(text):
     instead -- was matched as if it were a real, second occurrence outside
     every computed main() body, false-failing an otherwise-compliant file
     (offender_call_outside_scanned_main). Masking removes that comment text
-    before either pattern is searched here."""
+    before either pattern is searched here.
+
+    Quality round 1 (rev-aenv-quality-1, c-xtww should-fix 2) found the
+    RELEVANCE scan below -- deciding whether a given main() body even
+    mentions the helper/setenv at all -- also still read raw `text`, one
+    level earlier than the outside-span scan above: a body whose ONLY
+    mention of the pattern is inside a COMMENT (e.g. a `#if 0`-guarded dead
+    main whose sole textual trace is `// sycl_test_selector_fallback(...)`)
+    set found_relevant_main and then ran the first-statement check against
+    that body's real (unrelated) first statement, misclassifying the whole
+    file offender_not_first_statement even when its real, live main() is
+    perfectly compliant. Now reads `masked[start:end]` for the same reason
+    every other structural search here does."""
     masked = _mask_comments_only(text)
     bodies = []
     for start, end, balanced in _find_main_bodies(text):
@@ -709,7 +707,7 @@ def _first_statement_verdict(text):
         bodies.append((start, end))
     found_relevant_main = False
     for start, end in bodies:
-        body = text[start:end]
+        body = masked[start:end]
         if not (HELPER_CALL_PATTERN.search(body) or SETENV_PATTERN.search(body)):
             continue
         found_relevant_main = True
@@ -1433,12 +1431,22 @@ def test_excluded_files_are_still_accounted_for():
     moment a currently-excluded file gains a real registration, a human
     should re-examine whether the exclusion (for whichever reason) still
     holds, rather than the exclusion silently continuing to skip a newly
-    built, ctest-registered test (spec round 1, c-k45u finding 3)."""
+    built, ctest-registered test (spec round 1, c-k45u finding 3).
+
+    Quality round 1 (rev-aenv-quality-1, c-xtww nit) found the SETENV_PATTERN
+    check below still searched raw text: a comment merely quoting
+    `setenv("ONEAPI_DEVICE_SELECTOR"` could keep this assertion passing even
+    after the file's real, bespoke setenv() call was removed, silently
+    voiding the "exclusion may no longer be needed" signal this guard exists
+    to produce. Searches `_mask_comments_only(text)` instead -- not
+    `_mask_comments_and_literals`, which would also blank the pattern's own
+    required quoted argument and make it unable to match a real call at
+    all (see that function's docstring)."""
     for rel in EXCLUDED_FILES:
         path = REPO_ROOT / rel
         assert path.is_file(), f"excluded file {rel} no longer exists -- update this gate's EXCLUDED_FILES"
         text = path.read_text(encoding="utf-8")
-        assert SETENV_PATTERN.search(text), (
+        assert SETENV_PATTERN.search(_mask_comments_only(text)), (
             f"excluded file {rel} no longer contains a bespoke ONEAPI_DEVICE_SELECTOR setenv() -- "
             "the exclusion may no longer be needed; re-check and drop it from EXCLUDED_FILES if so"
         )
@@ -1467,11 +1475,20 @@ def test_every_helper_caller_declares_argv_in_main():
     """A file calling sycl_test_selector_fallback(argv, ...) needs an argv to
     pass, so its main() must declare a char ** parameter -- otherwise the
     file would not compile, which would silently make this gate's GREEN
-    state meaningless (nothing was actually built to run)."""
+    state meaningless (nothing was actually built to run).
+
+    Quality round 1 (rev-aenv-quality-1, c-xtww nit) found the
+    HELPER_CALL_PATTERN check below still searched raw text: a comment
+    merely quoting `sycl_test_selector_fallback(` (with no real call in the
+    file) would require an argv-taking main() that has no actual reason to
+    exist, false-flagging a compliant file that uses the inline block
+    instead. Searches `_mask_comments_only(text)` instead -- not
+    `_mask_comments_and_literals`, which would also blank the pattern's own
+    required argument text (see that function's docstring)."""
     missing = []
     for path in _iter_source_files():
         text = path.read_text(encoding="utf-8")
-        if not HELPER_CALL_PATTERN.search(text):
+        if not HELPER_CALL_PATTERN.search(_mask_comments_only(text)):
             continue
         if not MAIN_WITH_ARGV_PATTERN.search(text):
             missing.append(path.relative_to(REPO_ROOT).as_posix())

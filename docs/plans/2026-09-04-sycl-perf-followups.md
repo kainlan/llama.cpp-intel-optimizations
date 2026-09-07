@@ -246,7 +246,8 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > (`ggml_backend_sycl_debug_live_kv_view_extra_count`, GGML_SYCL_PRIVATE_TESTING) that catches this class of bug
 > where a container-membership count cannot. But in-process jemalloc dumps plus the L1 probe (kept=838/
 > released=838 at every one of 12 resets) show the residual is explained without any further leak: growth tracks
-> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB) plus the KV views, then
+> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB -- pre-h9uv struct size,
+> S1/S2 llama.cpp-aenv; post-split the same 1676-extra window is 1676 x 25,048 B =~ 42 MB) plus the KV views, then
 > decelerates after the ramp (+120/+60/+90/+90 MB) -- i.e. the residual is the SIZE of that bounded window and the
 > allocator churn of 277,712 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
 > `ggml_tensor_extra_gpu`, currently 277,712 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays

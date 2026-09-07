@@ -392,9 +392,7 @@ sites (e.g. `mxfp4.pp.gemm.execute`'s 2-D fallback loop) predate that convention
 and still build their metadata unconditionally — a small per-call heap
 allocation with the profiler off; not fixed here.
 
-#### `failed_timestamps` / `graph_recorded` — what the column means, and why it
-currently collapses two different things into one number (S5, llama.cpp-aenv,
-rev-final-1 c-91qe; root cause llama.cpp-mmbg c-x4it)
+#### `failed_timestamps` / `graph_recorded` — one number, two causes today (S5, llama.cpp-aenv; root cause llama.cpp-mmbg c-x4it)
 
 `failed_timestamps` (CSV/JSON per-row column, `sycl-kernel-profiler.cpp`) counts
 a launch for which no usable device timing was obtained. It increments from

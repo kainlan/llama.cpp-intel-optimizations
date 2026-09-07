@@ -108,7 +108,7 @@
 //      pre-h9uv (S1/S2, llama.cpp-aenv) struct size -- the measurement
 //      predates the events/XMX/MoE split, and the 305 MiB total is derived
 //      from it (1152 x 277,712 B); post-split the same 1152-extra leak
-//      would be sizeof(ggml_tensor_extra_gpu) = 25,048 B each, ~28.9 MiB
+//      would be sizeof(ggml_tensor_extra_gpu) = 25,048 B each, ~27.5 MiB
 //      total, not 305 MiB -- see test-sycl-extra-gpu-size.cpp for the
 //      compile-verified current size.
 // Mutants 2 and 3 predate this test file's tracking accessors and were not
