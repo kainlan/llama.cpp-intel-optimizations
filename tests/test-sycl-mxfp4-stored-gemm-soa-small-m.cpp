@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -135,96 +136,63 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     ggml_backend_tensor_set(t_act_qs, pack.qs.data(), 0, pack.qs.size());
     ggml_backend_tensor_set(t_act_sc, pack.scales.data(), 0, pack.scales.size() * sizeof(float));
 
-    // NOT ggml_sycl_get_device(0).default_queue(): ctx->stream() is the same
-    // queue production dispatch (and the sibling GPU tests that go through
-    // ggml_backend_graph_compute) submits on -- the correct USM/context
-    // owner for the buffers allocated above. It does NOT, however,
-    // reliably carry sycl::property::queue::enable_profiling in this test
-    // process; see the diagnosis on the profiling-queue construction below.
+    // ctx->stream() is the same queue production dispatch (and the sibling
+    // GPU tests that go through ggml_backend_graph_compute) submits on --
+    // the correct USM/context owner for the buffers allocated above, and
+    // (llama.cpp-yke2, S7: unconditional sycl::property::queue::enable_profiling
+    // in dpct's create_queue_impl) now reliably carries
+    // sycl::property::queue::enable_profiling in every process, so it is
+    // used directly for both the uploads above and every kernel launch
+    // below -- no separate profiling-only queue construction, and no extra
+    // wait to order it against the uploads, is needed any more.
     auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     sycl::queue & q        = *sycl_ctx->stream();
 
     const bool profiling_requested = std::getenv("GGML_SYCL_KERNEL_PROFILE") != nullptr;
 
-    // The three ggml_backend_tensor_set calls above upload through `q`; the
-    // kernel below launches on a SEPARATE queue (`submit_q`, constructed
-    // next) whenever profiling is requested. Neither queue's in-order
-    // property orders work submitted to the OTHER one, so make every upload
-    // provably complete before that second queue is even built, rather than
-    // relying on however ggml_backend_tensor_set happens to synchronize
-    // internally today (llama.cpp-6f73 c-nvf1 should-fix 4). The
-    // non-profiling path is unaffected -- submit_q is a plain copy of `q`
-    // there, so the two calls are already ordered by that queue's own
-    // in-order property.
-    if (profiling_requested) {
-        q.wait();
-    }
-
-    // Diagnosed at llama.cpp-6f73 (round 3): `q` (ctx->stream()) reliably
-    // lacks sycl::property::queue::enable_profiling in THIS test process,
-    // even though it is the identical unified-cache owner queue a sibling
-    // GPU test profiles correctly through. Root cause: with one visible GPU
-    // (the standard ONEAPI_DEVICE_SELECTOR=level_zero:N pin), the cache's
-    // owner queue is dpct's raw device default queue, whose profiling
-    // support depends on DPCT_PROFILING_ENABLED being defined in whichever
-    // translation unit's copy of dpct's header-only inline queue-
-    // construction functions the linker resolves for the process. That
-    // macro is private to the `ggml-sycl` CMake target; this test's own TU
-    // also instantiates those inlines (via `#include "ggml-sycl/common.hpp"`,
-    // needed for ggml_backend_sycl_context/stream()) WITHOUT it, and the
-    // executable's copy interposes over the library's -- a pre-existing
-    // hazard for any test binary that includes common.hpp directly, not
-    // specific to this kernel and not something G4 fixes here (filed
-    // separately). The local, correct-regardless-of-that-hazard fix: when
-    // profiling is requested, build our OWN queue sharing q's context and
-    // device (so USM allocated against that context stays valid) with the
-    // property set directly, instead of depending on however q itself was
-    // constructed.
-    sycl::queue submit_q = profiling_requested ?
-                               sycl::queue(q.get_context(), q.get_device(),
-                                           sycl::property_list{ sycl::property::queue::in_order{},
-                                                                sycl::property::queue::enable_profiling{} }) :
-                               q;
+    // Bytes moved per call, for deriving per-launch bandwidth: the whole
+    // expert's SOA buffer (17 bytes per 32-element block: 16 nibble-packed +
+    // 1 E8M0 scale byte) plus the M x n_k int8 activation codes, the
+    // M x (n_k/32) f32 activation scales (llama.cpp-6f73 c-gngd -- omitted
+    // before, closing the 4,521,600 vs 4,524,480 gap against the kernel's
+    // own profile_label.bytes), plus the M x n_out f32 output. Computed here
+    // (function scope, not inside either `if (profiling_requested)` block
+    // below) so BOTH the queue-diag block's own bytes_moved print and the
+    // later per-launch-bandwidth block (llama.cpp-kcya) can see it -- it is
+    // pure arithmetic with no side effects, so computing it unconditionally
+    // costs nothing when profiling is not requested.
+    //
+    // Per-launch bandwidth is THIS figure divided by the mean device time
+    // for one launch (mean_ns), NOT the kernel-profiler CSV's aggregate
+    // `bytes` column divided by mean_ns: sycl-kernel-profiler.cpp's
+    // aggregate accumulates `aggregate.bytes += label.bytes` once per
+    // recorded launch, so that column is the SUM over `count` launches.
+    // Dividing the summed column by mean_ns overstates bandwidth by a
+    // factor of `count` (llama.cpp-6f73 c-irug: a naive read once gave 34%
+    // of peak where the true per-launch figure was 8.5%).
+    const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
+                               (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
 
     if (profiling_requested) {
-        // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
-        // print the properties the queue we are ABOUT TO SUBMIT ON actually
-        // carries, and assert on THAT queue -- not on `q`, which is known to
-        // lack the property under a single-GPU selector; asserting on `q`
-        // would fire even after the fix above and prove nothing new.
-        const bool has_profiling = submit_q.has_property<sycl::property::queue::enable_profiling>();
-        const bool is_in_order   = submit_q.has_property<sycl::property::queue::in_order>();
+        // Confirms llama.cpp-yke2's S7 (unconditional enable_profiling in
+        // dpct's create_queue_impl) actually reaches this queue: this used
+        // to fail under a single-GPU selector before S7 landed (llama.cpp-6f73,
+        // round 3), which is why this test built its own profiling-only
+        // queue rather than asserting on `q` directly -- that workaround is
+        // gone now that the assert below is expected to hold unconditionally.
+        const bool has_profiling = q.has_property<sycl::property::queue::enable_profiling>();
+        const bool is_in_order   = q.has_property<sycl::property::queue::in_order>();
         std::printf("  queue diag: has_property(enable_profiling)=%d has_property(in_order)=%d addr=%p\n",
-                    (int) has_profiling, (int) is_in_order, (void *) &submit_q);
+                    (int) has_profiling, (int) is_in_order, (void *) &q);
         GGML_ASSERT(has_profiling);
 
-        // Bytes moved per call, for deriving the mxfp4.stored_gemm.soa
-        // profile row's bandwidth: the whole expert's SOA buffer (17 bytes
-        // per 32-element block: 16 nibble-packed + 1 E8M0 scale byte) plus
-        // the M x n_k int8 activation codes, the M x (n_k/32) f32 activation
-        // scales (llama.cpp-6f73 c-gngd -- omitted before, closing the
-        // 4,521,600 vs 4,524,480 gap against the kernel's own
-        // profile_label.bytes), plus the M x n_out f32 output.
-        //
-        // Per-launch bandwidth is THIS figure divided by the mean device
-        // time for one launch (mean_ns), NOT the kernel-profiler CSV's
-        // aggregate `bytes` column divided by mean_ns: sycl-kernel-
-        // profiler.cpp's aggregate accumulates `aggregate.bytes +=
-        // label.bytes` once per recorded launch, so that column is the SUM
-        // over `count` launches. Dividing the summed column by mean_ns
-        // overstates bandwidth by a factor of `count` (llama.cpp-6f73
-        // c-irug: a naive read once gave 34% of peak where the true
-        // per-launch figure was 8.5%).
-        const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
-                                   (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,
                     (long long) n_k, bytes_moved);
     }
 
     sycl::event event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
-        submit_q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
-        static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k,
-        {});
+        q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data), static_cast<const float *>(t_act_sc->data),
+        static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k, {});
 
     if (profiling_requested) {
         // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
@@ -255,6 +223,68 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         } catch (const std::exception & e) {
             std::printf("  event diag: wait_and_throw/get_profiling_info std::exception: %s\n", e.what());
         }
+
+        // llama.cpp-kcya: per-launch bandwidth, timed independently of the
+        // event-diag block above. That block queries the SAME event the
+        // profiler records -- command_start/command_end on `event` alone --
+        // which is fine for a single-kernel dispatch but NOT for this
+        // kernel any more: ggml_sycl_mxfp4_soa_gemm_dpas is now a
+        // two-kernel (partial+combine) dispatch whenever ksplit > 1
+        // (mxfp4-stored-gemm.cpp), and a SYCL event's own profiling info
+        // covers only the ONE kernel it was returned from -- here, only the
+        // tiny combine kernel, not the much larger partial kernel that ran
+        // before it. Using that timestamp pair for bandwidth would silently
+        // UNDERSTATE elapsed time and OVERSTATE GB/s, exactly the class of
+        // trap this file's own bytes_moved comment above warns about for
+        // the CSV's aggregate `bytes` column. Host wall-clock around the
+        // WHOLE call -- including a wait on the returned event, which
+        // transitively waits for every kernel in the dependency chain, not
+        // just the last one -- does not have that blind spot, so that is
+        // what this print uses. It re-issues the SAME deterministic call
+        // (same inputs, same device buffers) additional times purely for
+        // timing; the output `run_gemm` ultimately returns and scores is
+        // read once, after this loop, so these extra launches cannot change
+        // the correctness verdict, only overwrite t_dst with the identical
+        // result.
+        //
+        // This fix has its own blind spot in the other direction
+        // (llama.cpp-kcya c-amir should-fix 4): the host wall-clock span
+        // ALSO includes host-side kernel-submission and wait overhead that
+        // the profiler's device-timed mean_ns rows do not, so this mean_ns
+        // is strictly LARGER (and the derived GB/s strictly smaller) than
+        // the true device time -- every historical figure in this ticket
+        // (e.g. 237 us, 103.6+5.6 us) is device-timed, so do not compare
+        // this print's numbers against them directly; use it only as a
+        // sanity floor on device bandwidth, and read the profiler CSV's
+        // .partial/.combine mean_ns for the number that matches history.
+        constexpr int       BW_WARMUP = 3;
+        constexpr int       BW_ITERS  = 20;
+        std::vector<double> call_ns;
+        call_ns.reserve(BW_ITERS);
+        for (int it = 0; it < BW_WARMUP + BW_ITERS; ++it) {
+            const auto  t0       = std::chrono::steady_clock::now();
+            sycl::event bw_event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
+                q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
+                static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out,
+                (int) n_k, {});
+            bw_event.wait();
+            const auto t1 = std::chrono::steady_clock::now();
+            if (it >= BW_WARMUP) {
+                call_ns.push_back((double) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            }
+        }
+        double mean_ns = 0.0;
+        for (double v : call_ns) {
+            mean_ns += v;
+        }
+        mean_ns /= (double) call_ns.size();
+        const double bw_gbps = bytes_moved / mean_ns;  // (bytes/ns) == GB/s
+        std::printf(
+            "  per_launch_bandwidth M=%lld n_out=%lld n_k=%lld bytes_moved=%.0f mean_ns=%.1f GBps=%.3f (n=%zu, "
+            "host wall-clock incl. every kernel in the dispatch -- NOT the event-diag "
+            "command_start/command_end above -- AND incl. host submit + wait overhead, so this is a LOWER BOUND "
+            "on device bandwidth, NOT comparable to the profiler's device-timed mean_ns rows)\n",
+            (long long) M, (long long) n_out, (long long) n_k, bytes_moved, mean_ns, bw_gbps, call_ns.size());
     } else {
         event.wait();
     }

@@ -71,10 +71,46 @@ struct q8_1_activation_pack {
 q8_1_activation_pack quantize_activations_q8_1(const float * x, int64_t M, int64_t K);
 
 // Runs the full-N, small-M SOA MXFP4 GEMM for ONE expert. The caller
-// allocates and populates all device buffers through the ordinary ggml/SYCL
-// backend allocator (which is the unified cache -- see
-// docs/backend/sycl-memory-design.md) and passes device pointers in; this
-// function performs no device allocation of its own.
+// allocates and populates the four device buffers below
+// (soa_weight_device, act_qs_device, act_scales_device, dst_device)
+// through the ordinary ggml/SYCL backend allocator (which is the unified
+// cache -- see docs/backend/sycl-memory-design.md) and passes device
+// pointers in.
+//
+// This function itself MAY allocate (llama.cpp-kcya round 6): when the
+// internal K-split factor resolves above 1, it allocates a device-side
+// partial-sum scratch buffer through the SAME unified cache
+// (ggml_sycl::unified_allocate, never a raw sycl::malloc_device -- see
+// mxfp4-stored-gemm.cpp's mxfp4_stored_gemm_ksplit_get_or_alloc_scratch),
+// owned end-to-end by a single mem_handle. That handle is cached
+// thread-local and reused/grown across calls -- a growth retires the old
+// handle against the combine kernel's completion event
+// (retain_handles_until_event) rather than dropping it while a submission
+// may still be reading it; the caller never sees or manages this scratch.
+// If the allocator refuses (budget/allocator failure), the call
+// transparently degrades to a single unsplit pass writing straight to
+// dst_device instead -- correct but slower, never a hard failure.
+//
+// Release (llama.cpp-kcya c-ekyq nit 6): this scratch is never explicitly
+// freed by any call into this function. The thread_local cache holding
+// its mem_handle is only ever REPLACED (on a growth, retiring the old
+// handle against the still-in-flight combine event -- see above) or left
+// as-is (on a same-size-or-larger reuse); nothing in this file ever clears
+// it early. It is released only when the mem_handle's destructor runs,
+// which is at thread exit (the thread_local's own destruction) or process
+// teardown -- ordinary C++ static/thread storage duration semantics, not
+// an explicit release path this function provides. A caller that needs
+// the scratch reclaimed sooner has no call in this API to ask for that.
+//
+// The returned event completes the WHOLE dispatch: waiting on it
+// transitively waits for every kernel this call submitted, including an
+// internal partial pass a caller never sees directly. Its OWN profiling
+// timestamps, however, cover only the LAST kernel submitted (SYCL event
+// profiling has no notion of "this event's dependency chain's total
+// time") -- see mxfp4-stored-gemm.cpp's dispatcher comment and this
+// kernel's own two profiler rows ("mxfp4.stored_gemm.soa.partial" /
+// ".combine") for the per-launch bandwidth this file's own tests derive
+// instead of trusting the returned event's timestamps directly.
 //
 // `soa_weight_device` and `act_qs_device` must each be at least 32-byte
 // aligned (GGML_ASSERT-checked): the kernel's `block_load<uint8_t, 16>` /
