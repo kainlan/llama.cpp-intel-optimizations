@@ -166,4 +166,66 @@ rc=0
 [ "$rc" -eq 124 ] || { echo "FAIL: timeout-killed command must exit 124 (got $rc)"; fail=1; }
 head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout kill must stamp SUSPECT with timeout-killed:rc=124"; fail=1; }
 
+# --- Live DRM/PCI derivation (llama.cpp-imns) ---
+#
+# Builds a fake --drm-root whose card-NUMBER order deliberately differs from
+# PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0), includes an
+# integrated GPU (card1 -> 00:02.0) that must be excluded, and a connector
+# entry (card0-DP-1) that must be ignored by name alone -- it gets a real
+# `device` symlink to the same discrete device as card2, so only the
+# card[0-9]+ filter (not an absent symlink) is what skips it.
+mk_drmroot() {
+    local d="$T/drmroot"
+    rm -rf "$d" "$T/devices"
+    mkdir -p "$T/devices/0000:09:00.0/tile0/gt0/freq0/throttle"
+    echo 0 > "$T/devices/0000:09:00.0/tile0/gt0/freq0/throttle/status"
+    echo 0 > "$T/devices/0000:09:00.0/tile0/gt0/freq0/act_freq"
+    echo 0x8086 > "$T/devices/0000:09:00.0/vendor"
+    echo 0x030000 > "$T/devices/0000:09:00.0/class"
+
+    mkdir -p "$T/devices/0000:00:02.0"
+    echo 0x8086 > "$T/devices/0000:00:02.0/vendor"
+    echo 0x030000 > "$T/devices/0000:00:02.0/class"
+
+    mkdir -p "$T/devices/0000:04:00.0/tile0/gt0/freq0/throttle"
+    echo 0 > "$T/devices/0000:04:00.0/tile0/gt0/freq0/throttle/status"
+    echo 0 > "$T/devices/0000:04:00.0/tile0/gt0/freq0/act_freq"
+    echo 0x8086 > "$T/devices/0000:04:00.0/vendor"
+    echo 0x030000 > "$T/devices/0000:04:00.0/class"
+
+    mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
+    ln -s "$T/devices/0000:09:00.0" "$d/card0/device"
+    ln -s "$T/devices/0000:00:02.0" "$d/card1/device"
+    ln -s "$T/devices/0000:04:00.0" "$d/card2/device"
+    ln -s "$T/devices/0000:04:00.0" "$d/card0-DP-1/device"
+}
+
+mk_drmroot; mk_meminfo 3000000
+env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz0.log" -- true || fail=1
+head -1 "$T/run-lz0.log" | grep -q "pci=0000:04:00.0" \
+    || { echo "FAIL: level_zero:0 must resolve to the LOWER PCI address 0000:04:00.0 (card0->09, card2->04; got: $(head -1 "$T/run-lz0.log")"; fail=1; }
+
+mk_meminfo 3000000
+env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz1.log" -- true || fail=1
+head -1 "$T/run-lz1.log" | grep -q "pci=0000:09:00.0" \
+    || { echo "FAIL: level_zero:1 must resolve to the HIGHER PCI address 0000:09:00.0 (got: $(head -1 "$T/run-lz1.log")"; fail=1; }
+
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: level_zero:2 (out of range) must refuse with exit 3, got $rc"; fail=1; }
+echo "$out" | grep -q "0000:04:00.0" && echo "$out" | grep -q "0000:09:00.0" \
+    || { echo "FAIL: out-of-range refusal must name both discrete cards found (got: $out)"; fail=1; }
+
+mkdir -p "$T/drmroot-igpu-only/card1"
+ln -s "$T/devices/0000:00:02.0" "$T/drmroot-igpu-only/card1/device"
+expect_status 3 "a DRM root with only an integrated GPU must refuse" -- \
+    env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-igpu-only" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+
+expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set" -- \
+    env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+
 [ "$fail" -eq 0 ] && echo "OK: all preflight refusals" || exit 1

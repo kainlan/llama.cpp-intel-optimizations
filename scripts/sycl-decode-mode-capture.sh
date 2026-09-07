@@ -78,12 +78,16 @@
 # the caller, not one filtered to llama tenants (llama.cpp-gvu7 quality
 # review).
 #
-# Card derivation for the sampler is a live PCI-symlink lookup, the same one
-# bench-guard.sh performs internally for its own preflight (0000:03:00.0 =
-# B70, level_zero:0; 0000:07:00.0 = B50, level_zero:1) -- copied here rather
-# than shared because bench-guard.sh does not expose its derived card to a
-# caller. Passing --sysfs-card explicitly (as the test suite does) makes both
-# this script and the bench-guard.sh child agree on the same fake tree.
+# Card derivation for the sampler is a live PCI-symlink lookup, copied here
+# rather than shared because bench-guard.sh does not expose its derived card
+# to a caller. Passing --sysfs-card explicitly (as the test suite does)
+# makes both this script and the bench-guard.sh child agree on the same fake
+# tree, which is why this script's own selector->PCI case below (still a
+# fixed 0000:03:00.0=B70/0000:07:00.0=B50 table, unlike bench-guard.sh's own
+# live derive_pci_for_selector as of llama.cpp-imns) is never exercised by
+# the test suite and is STALE against the current boot's 0000:04:00.0/
+# 0000:09:00.0 addresses -- tracked separately, out of llama.cpp-imns's
+# scope (bench-guard.sh only).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

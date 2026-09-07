@@ -49,9 +49,16 @@ loop, which is why it runs last):
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
-  derived **live** from the PCI device symlink (`readlink -f
-  /sys/class/drm/card*/device`) against `0000:03:00.0` (B70) or `0000:07:00.0`
-  (B50) — never a static `cardN` index; DRM numbering moves across boots.
+  derived **live**: the guard enumerates `/sys/class/drm/card*` (overridable
+  with `--drm-root`), keeps discrete Intel display controllers (excluding the
+  integrated GPU), sorts them by PCI address, and maps `level_zero:N` to the
+  N-th survivor — never a static `cardN` index or a fixed PCI-address table,
+  since both DRM numbering and the PCI bus addresses themselves move across
+  boots (`0000:03:00.0`/`0000:07:00.0` before the 2026-09-05 boot,
+  `0000:04:00.0`/`0000:09:00.0` after; the B70 has been the lower address on
+  every boot observed). `--pci`/`--sysfs-card` bypass the derivation
+  explicitly. See `scripts/bench-guard.sh`'s header comment for the full rule
+  (llama.cpp-imns).
 
 **A number whose log does not start with `# bench-guard: VALID` is not a
 baseline and must not be cited** — cite the SUSPECT reason instead, or re-run.
@@ -83,10 +90,14 @@ Each rule below cost a round of discarded measurements.
    sweep for holders:
 
    ```bash
-   # any process with non-zero drm-resident-vram0 on either card
+   # any process with non-zero drm-resident-vram0 on either card. The PCI
+   # addresses below are boot-dependent (moved from 0000:03:00.0/07:00.0 to
+   # 0000:04:00.0/09:00.0 on the 2026-09-05 boot) -- derive them live rather
+   # than trusting either literal form, e.g. with bench-guard.sh's own
+   # derive_pci_for_selector (llama.cpp-imns), or `lspci -d 8086: -nn`.
    for f in /proc/*/fdinfo/*; do
-       grep -l 'drm-pdev:.*0000:03:00.0' "$f" 2>/dev/null   # B70
-       grep -l 'drm-pdev:.*0000:07:00.0' "$f" 2>/dev/null   # B50
+       grep -l 'drm-pdev:.*0000:04:00.0' "$f" 2>/dev/null   # B70 (post 2026-09-05; was 03:00.0)
+       grep -l 'drm-pdev:.*0000:09:00.0' "$f" 2>/dev/null   # B50 (post 2026-09-05; was 07:00.0)
    done
    ```
 

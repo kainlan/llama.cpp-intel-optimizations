@@ -31,16 +31,26 @@
 # reset/guc_id/CAT error since the run started. A post-run throttle=1 reading
 # is NOT by itself suspect -- the run's own power draw asserts it.
 #
-# Default card mapping (this host, verify with --sysfs-card on other machines):
-#   level_zero:0 = B70 = PCI 0000:03:00.0 ; level_zero:1 = B50 = PCI 0000:07:00.0
-# Derivation is LIVE via the PCI device symlink, never the static card index
-# (CLAUDE.md: DRM numbering moves across boots). The selector match below is
-# EXACT ("level_zero:0", not a "level_zero:0*" glob) so a multi-device or
-# other-form selector (level_zero:0,1, level_zero:gpu, ...) falls through to
-# the explicit "cannot derive card" refusal instead of silently picking one
-# of the cards it names.
+# Card derivation is LIVE from DRM/PCI enumeration under --drm-root (default
+# /sys/class/drm), never a fixed PCI address table (CLAUDE.md: DRM numbering
+# AND PCI bus addresses move across boots -- verified 2026-09-05, when the
+# discrete cards moved from 0000:03:00.0/07:00.0 to 0000:04:00.0/09:00.0).
+# derive_pci_for_selector() below enumerates top-level cards (card[0-9]+
+# only -- connector entries like card1-DP-1 are excluded by name), keeps
+# discrete Intel display controllers (device/vendor 0x8086, device/class
+# 0x0300*, PCI bus != 0000:00 so the integrated GPU is excluded), sorts the
+# survivors by PCI address (lexical order on the zero-padded dddd:bb:dd.f
+# string is bus/device/function order), and maps level_zero:N to the N-th
+# survivor, zero-based. This assumes Level Zero orders the two discrete
+# cards by ascending PCI address -- true on every boot observed so far (the
+# B70 is always the lower address, i.e. level_zero:0). --pci ADDR and
+# --sysfs-card DIR remain explicit overrides that bypass the derivation
+# entirely. The selector match is EXACT (level_zero:<digit>, a single
+# digit) so a multi-device or other-form selector (level_zero:0,1,
+# level_zero:gpu, ...) falls through to the explicit "cannot derive card"
+# refusal instead of silently picking one of the cards it names.
 set -euo pipefail
-SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
+SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}" DRM_ROOT=/sys/class/drm
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
@@ -52,6 +62,7 @@ while [ $# -gt 0 ]; do case "$1" in
     --df-cmd)          DF_CMD="$2";         shift 2;;
     --max-wait)        MAX_WAIT="$2";       shift 2;;
     --pci)             PCI="$2";            shift 2;;
+    --drm-root)        DRM_ROOT="$2";       shift 2;;
     --log)             LOG="$2";            shift 2;;
     --budget)          BUDGET="$2";         shift 2;;
     --journalctl-cmd)  JOURNALCTL_CMD="$2"; shift 2;;
@@ -62,13 +73,56 @@ esac; done
 
 refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 
+# derive_pci_for_selector IDX -- enumerate top-level DRM cards under
+# $DRM_ROOT, keep discrete Intel display controllers, sort by PCI address,
+# and print the IDX-th (zero-based) survivor's PCI address on stdout.
+# Calls refuse() (exit 3) directly on any failure. Safe to invoke via a
+# plain command-substitution assignment (PCI="$(derive_pci_for_selector
+# ...)") even though that runs this function in a subshell: under `set -e`
+# a non-zero exit status from a command-substitution assignment still
+# aborts the whole script (unlike a pipeline stage, which pipefail is
+# needed for), so refuse()'s "exit 3" propagates rather than being
+# swallowed -- verified empirically, not folklore.
+derive_pci_for_selector() {
+    local idx="$1" c base pci vendor class
+    local -a entries=()
+    for c in "$DRM_ROOT"/card*; do
+        [ -e "$c" ] || continue
+        base="$(basename "$c")"
+        [[ "$base" =~ ^card[0-9]+$ ]] || continue   # skip connectors (card1-DP-1, ...)
+        pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"
+        [ -n "$pci" ] || continue
+        [ -r "$c/device/vendor" ] || continue
+        [ -r "$c/device/class" ] || continue
+        vendor="$(cat "$c/device/vendor" 2>/dev/null || true)"
+        [ "$vendor" = "0x8086" ] || continue
+        class="$(cat "$c/device/class" 2>/dev/null || true)"
+        case "$class" in 0x0300*) : ;; *) continue;; esac
+        case "$pci" in 0000:00:*) continue;; esac    # exclude the integrated GPU
+        entries+=("$base=$pci")
+    done
+    local -a sorted=()
+    if [ "${#entries[@]}" -gt 0 ]; then
+        # Lexical sort on field 2 (the PCI address) is bus/device/function
+        # order for the zero-padded dddd:bb:dd.f form; force LC_ALL=C so a
+        # non-C locale cannot reorder it.
+        mapfile -t sorted < <(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t '=' -k2,2)
+    fi
+    local n="${#sorted[@]}"
+    [ "$n" -gt 0 ] || refuse "no discrete Intel GPU display controller found under $DRM_ROOT"
+    [ "$idx" -lt "$n" ] || refuse "level_zero:$idx is out of range; found $n discrete Intel GPU(s): ${sorted[*]}"
+    printf '%s\n' "${sorted[$idx]}" | cut -d= -f2
+}
+
 if [ -z "$SYSFS_CARD" ]; then
-    if [ -z "$PCI" ]; then case "$SELECTOR" in
-        level_zero:0) PCI="0000:03:00.0";;
-        level_zero:1) PCI="0000:07:00.0";;
-        *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:0 or level_zero:1 (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
-    esac; fi
-    for c in /sys/class/drm/card*; do
+    if [ -z "$PCI" ]; then
+        case "$SELECTOR" in
+            level_zero:[0-9]) : ;;
+            *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
+        esac
+        PCI="$(derive_pci_for_selector "${SELECTOR#level_zero:}")"
+    fi
+    for c in "$DRM_ROOT"/card*; do
         [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
     done
     [ -n "$SYSFS_CARD" ] || refuse "no DRM card for PCI $PCI"
@@ -183,9 +237,13 @@ if kernel_log | grep -qiE 'GT reset|guc_id|CAT error'; then
 fi
 
 verdict_line="$verdict${reasons:+:$reasons}"
+# pci=/card= record which device was guarded. When --sysfs-card was passed
+# directly (bypassing derivation) and no --pci accompanied it, $PCI is
+# still empty here -- stamp the literal "override" rather than a blank.
+pci_for_log="${PCI:-override}"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict_line pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
 else

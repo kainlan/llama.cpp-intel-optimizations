@@ -12,6 +12,15 @@ replaced by an **Arc Pro B70** on 2026-07-24. `level_zero:0` is now the B70
 (Arc Pro B50, `0000:07:00.0`, Battlemage G21). The P2P restriction survived the
 swap intact — see "B70↔B50 P2P topology" below, which is the current record.
 
+⚠️ **PCI addresses moved again, independently of the card swap above:** on the
+2026-09-05 boot the discrete cards re-enumerated at `0000:04:00.0` (B70) and
+`0000:09:00.0` (B50) — the `03:00.0`/`07:00.0` addresses in this file (here and
+in the topology section below) are the addresses as measured on their
+respective dates, not a current fact. The PCI-topology argument itself
+(different root ports, no shared switch) is unaffected; only the literal
+addresses moved. Derive the live mapping rather than trusting either literal
+form (`scripts/bench-guard.sh`'s `derive_pci_for_selector`, llama.cpp-imns).
+
 ## Installed runtime (system default as of 2026-05-30)
 
 The system `libze_intel_gpu.so.1` is the patched 26.22/BMG-only build installed
