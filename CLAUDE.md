@@ -1011,6 +1011,10 @@ xe 0000:07:00.0: cannot be used for peer-to-peer DMA as the client and provider
 (0000:03:00.0) do not share an upstream bridge or whitelisted host bridge
 ```
 
+(Same refusal, same root ports, on the 2026-09-05 boot where the cards enumerate at
+`0000:04:00.0` / `0000:09:00.0`: `xe 0000:09:00.0: cannot be used for peer-to-peer DMA
+as the client and provider (0000:04:00.0) ...`. The addresses moved; the topology did not.)
+
 Measured behaviour, identical on B580 (historical) and B70 (2026-07-31): a 256 KiB
 direct device-to-device USM copy fails **both directions** with
 `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (error 39), on a card with 31.89 GiB free.
@@ -1060,9 +1064,18 @@ disambiguate it:
 
 | selector | card | PCI | render node | DRM card |
 |----------|------|-----|-------------|----------|
-| `level_zero:0` | Arc Pro B70 (G31) | `0000:03:00.0` | `renderD129` | `card0` |
-| `level_zero:1` | Arc Pro B50 (G21) | `0000:07:00.0` | `renderD130` | `card2` |
+| `level_zero:0` | Arc Pro B70 (G31) | `0000:04:00.0` (was `03:00.0` before the 2026-09-05 boot) | `renderD129` | `card0` |
+| `level_zero:1` | Arc Pro B50 (G21) | `0000:09:00.0` (was `07:00.0` before the 2026-09-05 boot) | `renderD130` | `card2` |
 | — | Arrow Lake-S iGPU | `0000:00:02.0` | `renderD128` | `card1` |
+
+⚠️ **The PCI addresses MOVED at the 2026-09-05 19:03 boot** (verified 2026-09-07 with
+`lspci` + the sysfs links below): B70 `03:00.0 → 04:00.0`, B50 `07:00.0 → 09:00.0`;
+render nodes, DRM card numbers, and the `level_zero:N` order did not move (level_zero:0
+still loads as "Arc Pro B70", level_zero:1 as "Arc Pro B50" in `llama-bench -v`). Any
+script that hardcodes a PCI address is stale on this boot: `scripts/bench-guard.sh` did
+and refused every run with `no DRM card for PCI 0000:03:00.0` (llama.cpp-imns; fixed to
+derive the card live from the DRM/PCI enumeration). Pre-2026-09-05 notes quoting
+`03:00.0`/`07:00.0` (the P2P section above included) are history, not the current map.
 
 ⚠️ **This table had `renderD128` and `renderD129` SWAPPED until 2026-07-30** — it
 listed the B70 as `renderD128`, which is actually the iGPU. Verified against the
@@ -1082,7 +1095,7 @@ for n in /sys/class/drm/renderD*; do
   printf '%s -> ' "$(basename $n)"
   readlink -f $n/device | grep -oE '[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]' | tail -1
 done
-# then name each PCI id:  lspci -s 03:00.0   ->  Battlemage G31 = B70
+# then name each PCI id:  lspci -s 04:00.0   ->  Battlemage G31 = B70   (03:00.0 before 2026-09-05)
 ```
 
 DRM `cardN` numbering and `renderDN` numbering are **independent** — do not infer
