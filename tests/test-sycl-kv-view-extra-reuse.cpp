@@ -71,18 +71,29 @@
 // one -- the failure mode is one cycle of delayed reclamation, not
 // corruption.
 //
-// RED/GREEN evidence (recorded here rather than reproduced by this file,
-// since RED requires a scratch source edit that must never land -- see the
-// commit message for what was actually observed): reverting the epoch check
-// in tiered_kv_buffer_init_tensor's view branch to unconditional release
-// (`if (candidate.view_src == tensor->view_src && candidate.view_offs ==
-// tensor->view_offs) { release_extra_gpu(...); ... }`, dropping the
-// candidate.epoch == current_epoch share branch) reproduces two distinct
-// pre-fix failures: (a) across rebuilds, the count this test prints grows by
-// 2*N_LAYERS every iteration instead of staying flat, and (b) within the
-// layer-0 same-graph case, the wide view's extra is released out from under
-// it the instant the narrow view is processed, so the wide ggml_cont's
-// readback comes back corrupt (or the process crashes) instead of all-zero.
+// RED/GREEN evidence for the epoch fix (recorded here rather than reproduced
+// by this file, since RED requires a scratch source edit that must never
+// land -- see the tracker for what was actually observed on hardware).
+// Reverting the epoch check in tiered_kv_buffer_init_tensor's view branch to
+// unconditional release (dropping only the `candidate.epoch ==
+// current_epoch` share branch, so every same-key match releases and
+// replaces regardless of epoch) is PREDICTED, not built or observed, to
+// reproduce the layer-0 same-graph collision: the wide attention view and
+// the narrow set_rows-result view share one key within a single graph, and
+// under this mutant the second arrival releases the first view's still-live
+// extra, so the earlier ggml_cont's readback comes back corrupt (or the
+// process crashes) instead of all-zero. It does NOT make the count this
+// test prints grow -- release-and-replace on every match still keeps
+// view_extras flat at N_VIEWS_PER_GRAPH, since this mutant removes only
+// SHARING, not release-and-replace itself. (An earlier draft of this
+// comment wrongly claimed this same mutant also grows the count by
+// 2*N_LAYERS per iteration -- spec review round 1, c-hh2r #1, caught that
+// growth is instead the signature of a more drastic mutant that removes the
+// view_extras tracking and release logic entirely, reverting to the pre-
+// L2b baseline this ticket's own description measured directly on
+// hardware: 1152 live 277,704 B extras after 12 rebuilds, ~150 MB/rebuild,
+// never released. That mutant predates this test file's tracking accessors
+// and was not built either.)
 //
 // A SECOND, separate bug (found by a hardware jemalloc profile after the
 // epoch fix above landed, still visible on kv_view_extras staying flat):
@@ -97,12 +108,19 @@
 // why this test also reads ggml_backend_sycl_debug_live_kv_view_extra_count()
 // (extras actually not-yet-deleted, tracked via a debug_is_kv_view_extra flag
 // release_extra_gpu() checks right before its one and only `delete extra`)
-// and asserts IT stays flat at N_VIEWS_PER_GRAPH too. RED for this bug: revert
-// the release loop (`for (uint32_t r = 0; r <= candidate.share_count; ++r)
-// release_extra_gpu(...)`) back to a single `release_extra_gpu(candidate.
-// extra);` call -- kv_view_extras stays flat (this bug is invisible to it)
-// but kv_view_extras_live grows by one every iteration (this test's layer-0 K
-// key is shared every iteration, so it leaks on every single rebuild).
+// and asserts IT stays flat at N_VIEWS_PER_GRAPH too. The RED that was
+// ACTUALLY OBSERVED for this bug is a hardware jemalloc profile of the
+// pre-fix build (tracker comments c-871e / c-0p3n on llama.cpp-asdt): 448
+// live 320 KB extras allocated in tiered_kv_buffer_init_tensor via
+// ggml_backend_view_init after four pp1024 decodes, reproduced identically
+// under GGML_SYCL_DISABLE_GRAPH=1. The mutant this test's own tracking
+// would need to reproduce that in-process is PREDICTED, not built or
+// observed: revert the release loop (`for (uint32_t r = 0; r <=
+// candidate.share_count; ++r) release_extra_gpu(...)`) back to a single
+// `release_extra_gpu(candidate.extra);` call -- kv_view_extras should stay
+// flat (this bug is invisible to it) while kv_view_extras_live should grow
+// by one every iteration (this test's layer-0 K key is shared every
+// iteration, so it would leak one 277 KB extra per rebuild).
 //
 // ggml_backend_sched_new() asserts its LAST backend entry is a CPU device
 // (ggml-backend.cpp:2518); this test still runs everything on SYCL (the CPU

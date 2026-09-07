@@ -229,14 +229,18 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
 > predecessor attributed to it: ~250 of that ~300 MB/decode remains unaccounted for. The **acceptance criterion
 > stays open** pending a fresh jemalloc profile on the post-L2b binary to attribute the true dominant residual;
-> do not re-close L2b's acceptance line until that lands. Code-only checks (no GPU) ruled out three candidate
+> do not re-close L2b's acceptance line until that lands. **Superseded by the amendment below** (attribution
+> complete, llama.cpp-asdt c-871e): a reader who stops at this paragraph gets the wrong instruction -- the
+> profile this paragraph asked for has since landed and the acceptance criterion has moved. Code-only checks
+> (no GPU) ruled out three candidate
 > causes for the gap: layer K/V tensors are roots, not views-of-views (`src/llama-kv-cache.cpp` constructor,
 > `ggml_new_tensor_3d`, `view_src == nullptr`); the per-rebuild epoch counter demonstrably advances twice per
 > pp1024 decode as designed; and the debug accessor reads the same `view_extras` container the release path
 > prunes (single-KV-buffer models only -- an ISWA/SWA model with two live tiered KV buffers would need its own
 > check, not applicable to the Mistral gate this was measured against).
 
-> **Amendment 2026-09-04 (attribution complete, lead): the ~250 MB/decode residual is NOT a further leak.**
+> **Amendment 2026-09-06 (attribution complete, llama.cpp-asdt c-871e / c-s9wr): the ~250 MB/decode residual is
+> NOT a further leak.**
 > A real bug was found and fixed in the same round: the older-epoch release branch called `release_extra_gpu()`
 > exactly once regardless of `kv_view_extra_entry::share_count`, so a shared entry's refcount (1 + share_count)
 > never reached zero and the object leaked, invisible to the entries-only `kv_view_extras` accessor -- fixed by
@@ -257,6 +261,13 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > `ggml-sycl.cpp` (all function-local, freed every call); `UnifiedKernel::plan_cache_valid_` (a single bounded
 > slot, not a growing map); the oneDNN scratch pointer tables in `unified-cache.hpp` (matched insert/erase pairs);
 > and `g_moe_down_sum_shadow_entries` (properly cleared, and MoE-only -- never populated for dense Mistral).
+>
+> **Confirmed on the share_count-fix binary (llama.cpp-asdt c-s9wr, 2026-09-06):** pp1024 `-n 0 -r 5` RssAnon
+> on the bench pid, quiet host, Mistral Q4_0 level_zero:1: 479 MB flat through load, ramps to 1388 MB filling
+> L2's bounded window across the first two rebuilds, then FLAT at 1388 MB for every remaining decode. Against
+> the original "flat after the first decode +/- 50 MB" wording: flat after the second decode, to +/- 0 MB. The
+> per-decode creep this task was opened to fix is gone; what remains is the bounded window's size, which is
+> `llama.cpp-h9uv`'s to shrink.
 
 ### Task L3: Prefill scaling gate and per-ubatch residual (llama.cpp-dfo0, step 3)
 

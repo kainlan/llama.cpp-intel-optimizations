@@ -1177,8 +1177,11 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
     extra->clear_moe_storage_handles();
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): this is the
-    // one place that actually deletes `extra` (every early return above
-    // means the refcount did not reach zero). Attribute the deletion to the
+    // one place release_extra_gpu() deletes `extra` (every early return
+    // above means the refcount did not reach zero; a second, unrelated
+    // `delete extra` exists at ggml-sycl.cpp:13605 for an extra that failed
+    // device-id resolution three lines after its own allocation, which a
+    // KV-view extra can never reach). Attribute the deletion to the
     // live-KV-view counter regardless of which call site's release brought
     // it here -- see g_sycl_debug_live_kv_view_extra_count's declaration.
     if (extra->debug_is_kv_view_extra) {

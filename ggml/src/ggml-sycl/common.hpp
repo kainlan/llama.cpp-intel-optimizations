@@ -3428,7 +3428,6 @@ struct ggml_tensor_extra_gpu {
     // review c-z4cf #10).
     uint64_t alloc_generation = 0;
 
-#if defined(GGML_SYCL_PRIVATE_TESTING)
     // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
     // creation, by tiered_kv_buffer_init_tensor's view branch. Lets
     // release_extra_gpu() attribute an actual deletion to the KV-view live
@@ -3438,10 +3437,24 @@ struct ggml_tensor_extra_gpu {
     // cannot see an extra that was popped from that container but leaked
     // because a release call was missing (exactly the bug this field's
     // counter caught: a shared entry's refcount was 1 + share_count, but the
-    // eviction path released only once). Private-testing only: zero cost and
-    // no ABI impact in production builds.
+    // eviction path released only once).
+    //
+    // Deliberately UNCONDITIONAL, not guarded by GGML_SYCL_PRIVATE_TESTING
+    // (spec review round 1, c-hh2r #2): this struct is defined once in
+    // common.hpp and included by every SYCL backend TU, but three ctest
+    // targets (test-mem-handle-wrong-device, test-mem-handle-byte-contract,
+    // test-sycl-runtime-alloc; see ggml/src/ggml-sycl/CMakeLists.txt) compile
+    // unified-cache.cpp/mem-handle.cpp WITH GGML_SYCL_PRIVATE_TESTING=1 and
+    // link the ordinary (non-testing) libggml-sycl. A conditional member here
+    // would make this one class have two different layouts/sizes across TUs
+    // linked into the same binary -- an ODR violation that is silently latent
+    // today (no member of this struct happens to be touched from those two
+    // TUs) and would become memory corruption the moment one is. A bare
+    // `bool` costs nothing next to this struct's 277,704 B, so there is no
+    // reason to take the risk for it. Only the counter and its accessors stay
+    // guarded below -- they are free functions, not part of this struct's
+    // layout, so guarding them cannot cause an ODR mismatch.
     bool debug_is_kv_view_extra = false;
-#endif
 
     // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
     // Use this instead of data_device[dev] directly for incremental migration.
