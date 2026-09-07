@@ -1792,8 +1792,10 @@ static bool run_dense_attention_ffn_layout_test() {
     // MMVQ_COALESCED_TILE_BLOCKS) must stay COALESCED: the pktr block in
     // ggml_sycl_adjust_layout_for_tensor's dense-usage branch is gated on
     // `tensor->type == GGML_TYPE_Q8_0` and a Q4_0 tensor never enters it, so
-    // this exercises the ordinary layout_policy::get_optimal() path with the
-    // type guard simply out of the way.
+    // this case passes GGML_LAYOUT_COALESCED as the target and exercises
+    // ggml_sycl_adjust_layout_for_tensor validating/demoting a caller-
+    // supplied target with the type guard simply out of the way (the
+    // function never calls get_optimal()).
     {
         ggml_tensor q4_0_attn_q{};
         q4_0_attn_q.type  = GGML_TYPE_Q4_0;
