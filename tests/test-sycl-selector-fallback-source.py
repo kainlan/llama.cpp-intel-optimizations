@@ -440,6 +440,22 @@ def _mask_scan(text, mask_literals):
         `ENTRY(argc, argv) { ... }`) is invisible to MAIN_SIGNATURE_PATTERN
         regardless of masking; this was already true before masking existed
         and is unrelated to it.
+      - A `#if 0` (or any always-false preprocessor guard) wrapping a real
+        `execv("/proc/self/exe", argv);` call satisfies the execv() proof
+        for a preceding bare setenv(), even though that execv() never
+        actually compiles or runs: `if (!getenv("ONEAPI_DEVICE_SELECTOR")) {
+        setenv(...); #if 0 execv("/proc/self/exe", argv); #endif }`
+        classifies `compliant` on both master and this branch. This is NOT
+        a masking gap -- `#if 0 ... #endif` is real, unmasked code, and
+        _first_real_offset (used to find main()'s first REAL statement)
+        deliberately SKIPS preprocessor lines when looking for that first
+        statement, but the execv() proof WINDOW search
+        (_has_canonical_inline_block / _first_statement_is_valid) has no
+        equivalent preprocessor-awareness and simply looks for the pattern
+        text within N characters, disabled or not. Pre-existing (not
+        introduced by the B1/7wal masking fix, spec round 1 rev-aenv-spec-1
+        c-ng46); tracked as its own follow-up, llama.cpp-ur8d -- do not fix
+        the proof window as part of this task.
     Digit separators (`1'000'000`) are HANDLED as of quality round 6, and
     encoding-prefixed char literals (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) are
     HANDLED as of quality round 7 -- neither is a residual, listed here

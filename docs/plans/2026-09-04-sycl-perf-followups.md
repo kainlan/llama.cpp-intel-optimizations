@@ -1010,8 +1010,9 @@ above).
 | B50 M=8 N=K=2880 | 129.6 us | 103.6 + 5.6 = **~109.2 us** | ~2.2x vs round 3's 237.5 us round-1 baseline; ~20% of B50 peak |
 | B70 M=8 N=K=2880 | 56.8 us | 43.4 + 6.0 = **~49.4 us** | tracks the B50 improvement |
 
-(Also documented at `docs/backend/sycl-env-vars.md:354`, `GGML_SYCL_STORED_GEMM_DEBUG`
-entry: "checkpoint: B50 M=8 N=K=2880 237 us -> ~109 us".)
+(Also documented in `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_STORED_GEMM_DEBUG`
+entry (no line number cited -- table rows shift; grep the variable name):
+"checkpoint: B50 M=8 N=K=2880 237 us -> ~109 us".)
 
 **Numerics:** 17/17 cases, 0 violations, both cards (c-wjse) — the same oracle as the G4
 checkpoint above, still clean after the round-6 rework.
