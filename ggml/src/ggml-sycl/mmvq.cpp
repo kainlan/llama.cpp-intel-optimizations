@@ -1785,22 +1785,27 @@ static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *           
         return false;
     }
 
+    // This whole function is a read-only table-identity check (never
+    // mutates), so it must never call the lazy weight() -- an unallocated
+    // weight_ext is exactly the "no table" state every check below already
+    // treats as a mismatch.
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-    if (!extra->weight().moe_device_table_valid[device] || !extra->weight().moe_expert_ptrs_handle[device].valid()) {
+    if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[device] ||
+        !extra->weight_ext->moe_expert_ptrs_handle[device].valid()) {
         return false;
     }
-    auto resolved = extra->weight().moe_expert_ptrs_handle[device].resolve(device);
+    auto resolved = extra->weight_ext->moe_expert_ptrs_handle[device].resolve(device);
     if (!resolved || resolved.ptr != ptrs || !resolved.on_device) {
         return false;
     }
     const size_t min_table_bytes = static_cast<size_t>(std::max<int64_t>(tensor->ne[2], 1)) * sizeof(void *);
-    if (extra->weight().moe_expert_ptrs_size[device] < min_table_bytes ||
-        extra->weight().moe_expert_ptrs_handle[device].size() < min_table_bytes) {
+    if (extra->weight_ext->moe_expert_ptrs_size[device] < min_table_bytes ||
+        extra->weight_ext->moe_expert_ptrs_handle[device].size() < min_table_bytes) {
         return false;
     }
 
     if (table_handle_out) {
-        *table_handle_out = extra->weight().moe_expert_ptrs_handle[device];
+        *table_handle_out = extra->weight_ext->moe_expert_ptrs_handle[device];
     }
     if (retained_leases_out) {
         const auto & leases = !extra->weight().moe_expert_ptrs_leases[device].empty() ?
@@ -16603,8 +16608,8 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
 
         void * compact = ggml_sycl::moe_get_compact_ptrs(ctx.device, bytes);
         if (compact) {
-            const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
-            const bool   on_device                                   = !bufs || bufs->compact_on_device;
+            const auto * bufs      = ggml_sycl::moe_get_inference_buffers(ctx.device);
+            const bool   on_device = !bufs || bufs->compact_on_device;
             extra->weight().moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
             extra->weight().moe_expert_ptrs_compact_size[ctx.device]          = bytes;
             extra->weight().moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
@@ -16626,7 +16631,7 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact pointer list (%zu bytes)\n", bytes);
                 return false;
             }
-            compact                                                  = compact_resolved.ptr;
+            compact                                                           = compact_resolved.ptr;
             extra->weight().moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
             extra->weight().moe_expert_ptrs_compact_size[ctx.device]          = bytes;
             extra->weight().moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
@@ -16637,8 +16642,8 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
     if (extra->moe_compact_missing_ptr(ctx.device) == nullptr) {
         int * missing = ggml_sycl::moe_get_compact_missing_flag(ctx.device);
         if (missing) {
-            const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
-            const bool   on_device                                   = !bufs || bufs->compact_missing_on_device;
+            const auto * bufs      = ggml_sycl::moe_get_inference_buffers(ctx.device);
+            const bool   on_device = !bufs || bufs->compact_missing_on_device;
             extra->weight().moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
             extra->weight().moe_expert_ptrs_missing_handle[ctx.device] =
                 ggml_sycl::mem_handle::from_chunk_ptr(missing, ctx.device, GGML_LAYOUT_AOS, on_device);
@@ -16658,7 +16663,7 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
                 GGML_LOG_ERROR("[MOE] Failed to allocate compact list missing flag\n");
                 return false;
             }
-            missing                                                  = static_cast<int *>(missing_resolved.ptr);
+            missing = static_cast<int *>(missing_resolved.ptr);
             extra->weight().moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
             extra->weight().moe_expert_ptrs_missing_handle[ctx.device]        = std::move(missing_handle);
         }

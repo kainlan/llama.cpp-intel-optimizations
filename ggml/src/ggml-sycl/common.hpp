@@ -4313,9 +4313,10 @@ struct ggml_tensor_extra_gpu {
                                             bool                  require_all    = false,
                                             bool                  require_device = false) const {
         payload.clear();
-        return count == 0 || (weight_ext && weight_ext->build_moe_ptr_payload_from_handles(dev, count, payload,
-                                                                                            require_all,
-                                                                                            require_device));
+        if (weight_ext) {
+            return weight_ext->build_moe_ptr_payload_from_handles(dev, count, payload, require_all, require_device);
+        }
+        return count == 0 && ggml_sycl_valid_device_index(dev);
     }
 
     bool build_moe_layout_ptr_payload_from_handles(int                   dev,
@@ -4326,9 +4327,11 @@ struct ggml_tensor_extra_gpu {
                                                    ggml_layout_mode      layout,
                                                    size_t                expected_expert_bytes) const {
         payload.clear();
-        return count == 0 || (weight_ext && weight_ext->build_moe_layout_ptr_payload_from_handles(
-                                                dev, count, payload, require_all, require_device, layout,
-                                                expected_expert_bytes));
+        if (weight_ext) {
+            return weight_ext->build_moe_layout_ptr_payload_from_handles(dev, count, payload, require_all,
+                                                                         require_device, layout, expected_expert_bytes);
+        }
+        return count == 0 && ggml_sycl_valid_device_index(dev) && expected_expert_bytes != 0;
     }
 
     bool remember_moe_storage_handle(int                   expert_id,
@@ -4338,7 +4341,7 @@ struct ggml_tensor_extra_gpu {
                                      size_t                logical_offset,
                                      size_t                logical_bytes) {
         return weight().remember_moe_storage_handle(expert_id, layout, std::move(h), ready_event, logical_offset,
-                                                     logical_bytes);
+                                                    logical_bytes);
     }
 
     bool resolve_moe_storage_record(int                                  expert_id,
@@ -4373,8 +4376,7 @@ struct ggml_tensor_extra_gpu {
                                            ggml_layout_mode            layout,
                                            int                         owner_device,
                                            moe_expert_storage_record * out_record) {
-        return weight_ext && weight_ext->take_moe_storage_handle_on_device(expert_id, layout, owner_device,
-                                                                            out_record);
+        return weight_ext && weight_ext->take_moe_storage_handle_on_device(expert_id, layout, owner_device, out_record);
     }
 
     void clear_moe_storage_handles() {

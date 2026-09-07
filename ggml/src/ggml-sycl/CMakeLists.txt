@@ -2674,25 +2674,32 @@ endif() # static SYCL backend fixture
 # the same class of ordering bug as the sycl-unified-private-seams Python
 # test's find_package(Python3) above it. Down here, alongside the other
 # tests that already depend on it, is registration-order-safe.
+# It needs SYCL_LINK_ONLY_TEST_OPTIONS (-fsycl -Wno-narrowing) per rule 1
+# above solely because common.hpp pulls in SYCL headers for sycl::event and
+# dpct::event_ptr -- there is no device kernel here and no ggml-sycl link.
 add_executable(test-sycl-extra-gpu-size
     tests/test-sycl-extra-gpu-size.cpp)
 target_include_directories(test-sycl-extra-gpu-size PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
 )
+target_compile_options(test-sycl-extra-gpu-size PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-extra-gpu-size PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
 target_compile_definitions(test-sycl-extra-gpu-size PRIVATE
     GGML_SYCL_WARP_SIZE=32
     GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
 )
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-extra-gpu-size PRIVATE IntelSYCL::SYCL_CXX)
-endif()
 set_target_properties(test-sycl-extra-gpu-size PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME sycl-extra-gpu-size COMMAND test-sycl-extra-gpu-size)
-set_tests_properties(sycl-extra-gpu-size PROPERTIES LABELS "sycl;memory;host;tdd")
+set_tests_properties(sycl-extra-gpu-size PROPERTIES
+    # No ONEAPI_DEVICE_SELECTOR: this test never creates a queue. LD_LIBRARY_PATH
+    # is still needed -- the binary links the SYCL runtime because of the headers.
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    LABELS "sycl;memory;host;tdd"
+    TIMEOUT 30
+)
 
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-compute-buffer-extra-reuse

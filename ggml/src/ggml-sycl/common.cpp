@@ -1223,8 +1223,11 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
         // rebuild activation releases, exactly reintroducing the churn this
         // struct split exists to remove. An activation/view extra never has
         // weight_ext set (nothing on that path ever touches it), so this
-        // block is a no-op for them, same as before the split.
-        if (extra->weight_ext) {
+        // sweep is a no-op for them, same as before the split. Hoisted into
+        // one local rather than re-testing extra->weight_ext at each of the
+        // two blocks below that need it.
+        const bool has_weight_ext = extra->weight_ext != nullptr;
+        if (has_weight_ext) {
             for (int64_t is = 0; is < GGML_SYCL_MAX_STREAMS; ++is) {
                 if (extra->weight_ext->events[i][is] != nullptr) {
                     SYCL_CHECK(CHECK_TRY_ERROR(dpct::destroy_event(extra->weight_ext->events[i][is])));
@@ -1274,7 +1277,7 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             extra->weight_ext->xmx_mxfp4_tiled_aos_staging_size[i]   = 0;
         }
 
-        if (extra->weight_ext) {
+        if (has_weight_ext) {
             extra->weight_ext->moe_expert_ptrs_handle[i]        = {};
             extra->weight_ext->moe_expert_ptrs_size[i]          = 0;
             extra->weight_ext->moe_expert_ptrs_from_prealloc[i] = false;

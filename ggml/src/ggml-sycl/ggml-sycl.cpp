@@ -18819,7 +18819,7 @@ static thread_local std::unordered_map<int, moe_gate_up_pair> g_moe_gate_up_pair
 // legitimate re-materialization (weight evicted/reloaded, generation bumped)
 // re-arms the attempt instead of being suppressed forever. A SUCCESSFUL build
 // does not need an entry here: moe_fusion_full_local_ptr_table() memoizes
-// success itself via extra->moe_full_local_probe_{generation,layout,ok}[device],
+// success itself via extra->weight().moe_full_local_probe_{generation,layout,ok}[device],
 // so later tokens hit that probe directly and never re-enter the build path.
 static thread_local std::unordered_map<int64_t, uint64_t>     g_moe_decode_ptr_table_build_failed_generation;
 static thread_local std::unordered_set<int>                   g_moe_precomputed_down_layer_skip;
@@ -19246,8 +19246,11 @@ static bool ggml_sycl_moe_tensor_has_secondary_device_route(const ggml_tensor * 
         return false;
     }
 
-    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra)) {
-        for (const auto & kv : extra->weight().moe_expert_storage_handles) {
+    // Read-only route query: an unallocated weight_ext has the same empty
+    // moe_expert_storage_handles map a freshly-constructed one would, so
+    // null-check rather than allocate via weight() here.
+    if (auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra); extra && extra->weight_ext) {
+        for (const auto & kv : extra->weight_ext->moe_expert_storage_handles) {
             const auto stored_layout = static_cast<ggml_layout_mode>(static_cast<uint32_t>(kv.first >> 32));
             if (stored_layout != layout) {
                 continue;
@@ -24307,7 +24310,7 @@ static void ggml_sycl_invalidate_backend_weight_mutation(ggml_backend_sycl_buffe
     }
     extra->weight().moe_device_table_valid[ctx->device]          = false;
     extra->weight().moe_full_local_probe_generation[ctx->device] = 0;
-    extra->layout_dirty                                 = true;
+    extra->layout_dirty                                          = true;
 
     const ggml_sycl_cache_id cache_key = ggml_backend_sycl_get_weight_cache_key(tensor, ctx->device);
     if (cache_key.valid) {
@@ -27310,11 +27313,18 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
     const bool cache_ok     = extra && device >= 0 && device < GGML_SYCL_MAX_DEVICES;
     const int  cache_bucket = host_weights ? 1 : 0;
     const int  phase_bucket = n_tokens > 1 ? 1 : 0;
-    if (cache_ok && extra->weight().moe_planned_layout_valid[device][cache_bucket][phase_bucket] &&
-        extra->weight().moe_planned_layout_generation[device][cache_bucket][phase_bucket] ==
-            extra->weight().moe_expert_storage_generation) {
+    // Cache lookup, not a producer: a miss (including "weight_ext never
+    // allocated yet") falls through to the recompute path below, so this
+    // check must not force-allocate the ~250 KB extension via weight() just
+    // to discover there is nothing cached. cache_ok itself stays weight_ext-
+    // agnostic -- remember_layout() below legitimately lazily allocates
+    // weight_ext via weight() on a tensor's first successful layout compute.
+    if (cache_ok && extra->weight_ext &&
+        extra->weight_ext->moe_planned_layout_valid[device][cache_bucket][phase_bucket] &&
+        extra->weight_ext->moe_planned_layout_generation[device][cache_bucket][phase_bucket] ==
+            extra->weight_ext->moe_expert_storage_generation) {
         const layout_mode     cached_layout =
-            extra->weight().moe_planned_layout_cache[device][cache_bucket][phase_bucket];
+            extra->weight_ext->moe_planned_layout_cache[device][cache_bucket][phase_bucket];
         const moe_tensor_type cached_moe_kind  = src0 ? moe_classify_tensor(src0->name) : MOE_TENSOR_UNKNOWN;
         const bool            prompt_mxfp4_moe = n_tokens > 1 && src0 && src0->type == GGML_TYPE_MXFP4 &&
                                       (cached_moe_kind == MOE_TENSOR_GATE || cached_moe_kind == MOE_TENSOR_UP ||
@@ -27337,7 +27347,8 @@ static layout_mode ggml_sycl_select_moe_planned_graph_layout(const ggml_tensor *
                    ggml_sycl_moe_planned_layout_complete(src0, device, cached_layout)) {
             return cached_layout;
         }
-        extra->weight().moe_planned_layout_valid[device][cache_bucket][phase_bucket] = false;
+        // weight_ext is confirmed non-null by the guard entering this block.
+        extra->weight_ext->moe_planned_layout_valid[device][cache_bucket][phase_bucket] = false;
     }
 
     auto remember_layout = [&](layout_mode layout) {
@@ -53230,7 +53241,7 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
     const int64_t n_experts = src0->ne[2] > 0 ? src0->ne[2] : 1;
     sycl::queue & q         = *ctx.stream();
 
-    const int  table_index     = ggml_sycl_moe_ptr_table_index(device, layer_hash);
+    const int  table_index = ggml_sycl_moe_ptr_table_index(device, layer_hash);
     const bool table_was_valid =
         extra->weight().moe_device_table_valid[device] && extra->moe_ptrs_ptr_raw(device) != nullptr &&
         extra->weight().moe_expert_ptrs_size[device] == static_cast<size_t>(n_experts) * sizeof(void *);
@@ -53291,8 +53302,8 @@ static const void * const * ggml_sycl_upload_moe_transient_ptr_table(
             // "mem_handle/copy-assign".
             expert_handles[slot].tag_persistent_lease_site(
                 "extra->weight().moe_expert_handles[]/upload_moe_transient_ptr_table");
-            ptr_payload[slot]    = resolved.ptr;
-            any_updated          = true;
+            ptr_payload[slot] = resolved.ptr;
+            any_updated       = true;
         }
         leases.push_back(std::move(handle));
         if (slot_info.has_ready_event) {
@@ -53863,9 +53874,9 @@ static void ggml_sycl_update_moe_hotset(ggml_sycl::unified_cache *   cache,
     for (int64_t i = 0; i < n_experts; ++i) {
         indices[static_cast<size_t>(i)] = static_cast<int>(i);
     }
-    std::partial_sort(indices.begin(), indices.begin() + max_hot_experts, indices.end(), [&](int a, int b) {
-        return extra->weight().moe_expert_scores[a] > extra->weight().moe_expert_scores[b];
-    });
+    auto & scores = extra->weight().moe_expert_scores;
+    std::partial_sort(indices.begin(), indices.begin() + max_hot_experts, indices.end(),
+                      [&](int a, int b) { return scores[a] > scores[b]; });
     cache->clear_hot_experts(layer_id);
     for (size_t i = 0; i < max_hot_experts; ++i) {
         const int          expert_id = indices[i];
@@ -71385,7 +71396,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (pair_layout_ok && decode_ptr_table_build_enabled) {
                     // Build once, not once per token: a SUCCESSFUL build below is picked
                     // up by moe_fusion_full_local_ptr_table()'s own success memoization
-                    // (extra->moe_full_local_probe_{generation,layout,ok}[device]), so the
+                    // (extra->weight().moe_full_local_probe_{generation,layout,ok}[device]), so the
                     // gate_full_table/up_full_table query above this block already returns
                     // non-null on every later call and this if-block is skipped entirely --
                     // no per-token rebuild. What that probe does NOT cover is a PERMANENT
@@ -90862,23 +90873,32 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
         if (!extra) {
             return set_identity_reject("role-extra-missing");
         }
-        const ggml_sycl::mem_handle & table_handle = extra->weight().moe_expert_ptrs_handle[sycl_ctx->device];
-        if (!extra->weight().moe_device_table_valid[sycl_ctx->device]) {
+        // Diagnostic-only reads before the table is confirmed present: an
+        // extra with no weight_ext yet is exactly the "table not valid"
+        // state, so null-check rather than allocate via weight() here.
+        // capture_table_reject() only needs SOME handle value for logging on
+        // the early-reject path -- a default-constructed one reports the
+        // same "invalid" fields a never-populated array slot would.
+        if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[sycl_ctx->device]) {
             const int role_layer_hash = moe_cache_layer_id(role.weight->name ? role.weight->name : "");
             (void) moe_fusion_ensure_full_local_ptr_table_from_descriptor(*sycl_ctx, role, role_layer_hash);
         }
-        if (!extra->weight().moe_device_table_valid[sycl_ctx->device]) {
-            capture_table_reject(extra, table_handle);
+        if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[sycl_ctx->device]) {
+            capture_table_reject(extra, ggml_sycl::mem_handle{});
             return set_identity_reject("role-device-table-missing");
         }
-        const char * table_handle_reason = nullptr;
+        // weight_ext is guaranteed non-null past this point: the checks
+        // above only fall through when moe_device_table_valid is true,
+        // which lives on weight_ext.
+        const ggml_sycl::mem_handle & table_handle       = extra->weight_ext->moe_expert_ptrs_handle[sycl_ctx->device];
+        const char *                  table_handle_reason = nullptr;
         if (!mix_handle(table_handle, true, &table_handle_reason)) {
             capture_table_reject(extra, table_handle);
             return set_identity_reject(table_handle_reason ? table_handle_reason : "role-device-table-handle");
         }
         mix(static_cast<uint64_t>(role.layout));
         mix(static_cast<uint64_t>(role.expert_handles.size()));
-        mix(static_cast<uint64_t>(extra->weight().moe_expert_ptrs_size[sycl_ctx->device]));
+        mix(static_cast<uint64_t>(extra->weight_ext->moe_expert_ptrs_size[sycl_ctx->device]));
         mix(static_cast<uint64_t>(role.weight->ne[0]));
         mix(static_cast<uint64_t>(role.weight->ne[1]));
         mix(static_cast<uint64_t>(role.weight->ne[2]));
