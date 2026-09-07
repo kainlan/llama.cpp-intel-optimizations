@@ -224,7 +224,7 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > result -- via a process-wide rebuild epoch instead of the unsafe key-only release-and-replace a first draft
 > used). Measured on hardware (level_zero:1, `-p 1024 -n 0 -r 5`, RssAnon sampled on the bench pid): the fix
 > reduces the L2-alone residual from ~310 to ~250 MB/decode, a ~60 MB/decode drop that lines up closely with the
-> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,704 B * 96 views/rebuild *
+> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,712 B * 96 views/rebuild *
 > 2 rebuilds/pp1024-decode` =~ 51 MB/decode; `process_ubatch()` calls `ggml_backend_sched_alloc_graph()` once per
 > ubatch, so `n_ubatch=512` gives exactly 2 rebuilds for a pp1024 decode). So the fix is closing the mechanism it
 > was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
@@ -246,10 +246,11 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > (`ggml_backend_sycl_debug_live_kv_view_extra_count`, GGML_SYCL_PRIVATE_TESTING) that catches this class of bug
 > where a container-membership count cannot. But in-process jemalloc dumps plus the L1 probe (kept=838/
 > released=838 at every one of 12 resets) show the residual is explained without any further leak: growth tracks
-> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB) plus the KV views, then
+> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB -- pre-h9uv struct size,
+> S1/S2 llama.cpp-aenv; post-split the same 1676-extra window is 1676 x 25,048 B =~ 42 MB) plus the KV views, then
 > decelerates after the ramp (+120/+60/+90/+90 MB) -- i.e. the residual is the SIZE of that bounded window and the
-> allocator churn of 277,704 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
-> `ggml_tensor_extra_gpu`, currently 277,704 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
+> allocator churn of 277,712 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
+> `ggml_tensor_extra_gpu`, currently 277,712 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
 > on a 3-device box): the "RssAnon flat after the first decode" acceptance moves there. L2b closes as designed
 > (its own GPU test's flat `kv_view_extras`/`kv_view_extras_live` across 20 rebuilds), with the share_count bug
 > fixed in the same round. Five candidate mechanisms were checked and ruled out or found inapplicable to this
@@ -993,6 +994,52 @@ distance (10, vs this kernel's regressed attempt at 3 over a ~12-iteration trip 
 suggesting the K-split/SLM-reduction shape itself, not any one lever within it, may be why
 this checkpoint undershoots the criterion, which is why llama.cpp-kcya's candidate levers
 include reworking to that shape rather than only tuning the current one further.
+
+**Amendment 2026-09-07 (kcya checkpoint, llama.cpp-kcya, lead ruling c-b8oq): the bandwidth
+criterion is WITHDRAWN as this task's gate and carried forward to llama.cpp-wjqn — do NOT
+read the numbers below as meeting `>= 50%` of peak.**
+
+**What changed (round 6, commit `d2b1e14ed`):** single-item work-groups replaced the
+8-way `K_PARTITIONS` + SLM-tree-reduction shape above with a K-split **partial pass +
+combine kernel** over the same, unchanged stored-SOA layout — no barrier, no SLM,
+prefetch distance 10 (matching the production reference kernel's, see the comparison
+above).
+
+| card | G4 checkpoint (round 3) | kcya round 6 (partial + combine) | speedup |
+|---|---:|---:|---:|
+| B50 M=8 N=K=2880 | 129.6 us | 103.6 + 5.6 = **~109.2 us** | ~2.2x vs round 3's 237.5 us round-1 baseline; ~20% of B50 peak |
+| B70 M=8 N=K=2880 | 56.8 us | 43.4 + 6.0 = **~49.4 us** | tracks the B50 improvement |
+
+(Also documented in `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_STORED_GEMM_DEBUG`
+entry (no line number cited -- table rows shift; grep the variable name):
+"checkpoint: B50 M=8 N=K=2880 237 us -> ~109 us".)
+
+**Numerics:** 17/17 cases, 0 violations, both cards (c-wjse) — the same oracle as the G4
+checkpoint above, still clean after the round-6 rework.
+
+**Criterion status:** the `>= 50%`-of-peak bandwidth bar this task inherited from G4 is
+**withdrawn, not met.** ~109.2 us on the B50 is ~20% of the 224 GB/s peak this table's
+header cites — better than G4's ~15.6%, still well short of the bar. The lead ruling
+(c-b8oq) moves the carried criterion to **llama.cpp-wjqn** (the lane-contiguous /
+group-repacked layout variant, the G5-G8 layout work) rather than continuing to gate
+kcya on a figure a seventh round of tuning has now twice failed to close. The kernel
+remains **not wired into dispatch**; production throughput is unaffected either way.
+
+**Refuted levers (do not re-run):**
+  - `GGML_SYCL_STORED_GEMM_KSPLIT` sweep 6/12/18/30/45/90 on the B50: partial-pass time
+    138.9/104.4/103.8/102.2/99.6/117.2 us — invariant beyond `ksplit=12`, i.e.
+    **issue-bound, not occupancy-bound.** More partitions do not help.
+  - Round 7 instruction-count levers (hoisted per-row scale bytes; 16-lane
+    `lsc_gather` for the `qs` rows behind `GGML_SYCL_STORED_GEMM_GATHER`; cached
+    L1/L2 hints behind `GGML_SYCL_STORED_GEMM_STREAMHINT`) were numerically WRONG
+    (gather: 0/18 correct; hoist-only: 14/18 correct) and the nearly-correct
+    hoist-only variant was also ~20% SLOWER (126 us). Preserved for the record on
+    side branch `spike/kcya-round7` at `56314f3d2`, deliberately NOT merged.
+  - Diagnosis (c-srck): the row-major stored-SOA layout forces ~40 distinct cache
+    lines per K-step, versus ~11-13 for the reference `m2` kernel's group packing —
+    no addressing-formula change over the SAME bytes can make the read
+    lane-contiguous. This is why the carried criterion needs a LAYOUT change
+    (llama.cpp-wjqn), not another kernel-internals lever on kcya.
 
 ---
 

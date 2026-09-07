@@ -350,6 +350,7 @@ For the architectural contract and migration history behind these two rows, see
 | `GGML_SYCL_SAFE_MODE=1` | Drain the SYCL queue after every op submit so a fault surfaces at the op that caused it (2-3x slowdown, implies `GGML_SYCL_DISABLE_GRAPH=1`). Useful for CI canaries and correlating intermittent hangs 1:1 with their triggering op. |
 | `GGML_SYCL_FUSION_BIT1_REACH_DEBUG=1` | Default OFF (`ggml-sycl.cpp:83907`). Logs one `[FUSION-BIT1-GUARD]` line per bit1 fusion candidate: `is_weight`, the accumulated `view_offs`, `nb[0]`, element size, the per-operand `safe` verdict, and the full gate chain. Built for the gemma3n cross-model investigation (`llama.cpp-8t4s`), and still the way to answer "did the 81gx view-offset guard classify this operand correctly?" — in the healthy 2-arch run at HEAD, all 44 of gemma3n's unsafe views log `is_weight=0` and are refused. Diagnostic only; the block is guarded by the flag. |
 | `GGML_SYCL_HANDLE_STRICT=1` | Default OFF; reports `ggml_tensor_extra_gpu` `data_handle`/`data_device` divergence (first 16 only) without needing `GGML_SYCL_DEBUG=1`. Diagnostic only, no perf effect. Plan: `docs/plans/2026-07-30-extra-device-indexed-handle-storage.md`. |
+| `GGML_SYCL_EXTRA_LEAK_PROBE=1` | Default OFF (`ggml-sycl.cpp`, `ggml_backend_sycl_buffer_reset`'s COMPUTE-buffer branch; llama.cpp-dfo0 plan tasks L1/L2). At `GGML_LOG_WARN`, one `[EXTRA-LEAK-PROBE] buf=%p kept=%zu extras this call (~%.1f MB), sum_of_sizes=%zu @ sizeof=%zu released=%zu gen=%llu` line per compute-buffer reset. Field semantics: `buf=` this call's single buffer (`ggml_vbuffer_reset` resets multiple chunks and `ggml_gallocr_alloc_graph` loops over buffer types, so several `buf=` values can appear per graph allocation); `kept=` the post-release size of THIS buffer's `tensor_extras` vector — the figure to compare against RSS growth, and what should stay BOUNDED across rebuilds rather than grow every one (the L1/L2 fix this probe verifies); the `~%.1f MB` figure is `kept * sizeof(ggml_tensor_extra_gpu)`, this call's own bytes only; `sum_of_sizes=` is a PROCESS-WIDE running total of `kept` across every call (one function-local `static std::atomic`, all compute buffers) — trailing diagnostic context only, never quote its MB equivalent as "leaked" and never compare it against RSS growth (it only ever grows); `sizeof=` is `sizeof(ggml_tensor_extra_gpu)` read live, so it self-reports the post-h9uv-split size (25,048 B) without needing a separate update when the struct changes — see S1/S2, llama.cpp-aenv, and `ggml/src/ggml-sycl/tests/test-sycl-extra-gpu-size.cpp`; `released=`/`gen=` are the same per-call counters `GGML_SYCL_DEBUG`'s adjacent `[SOA-DEBUG]` line already prints, repeated here so a `-v` capture (needed to see `GGML_LOG_WARN` under `llama-bench`; see the CPU-fallback-blindness section above) does not require enabling both. `kept` and the `n` used for the MB figure are the SAME NUMBER by construction (read right after the release loop) and are printed once, as `kept=`, not twice under two names. Used by: the L1 probe (this variable's original purpose), the L2/L2b compute-buffer- and KV-view-extra-reuse GPU tests (`tests/test-sycl-compute-buffer-extra-reuse.cpp`, `tests/test-sycl-kv-view-extra-reuse.cpp` — both read RSS/counters independently and do not require this flag, but a hardware capture with it enabled is how the L1/L2 fixes were originally verified), and llama.cpp-h9uv's own acceptance criterion (the per-reset MB probe this variable provides, referenced directly in `test-sycl-extra-gpu-size.cpp`'s header comment). The release loop that fixes the underlying leak always runs regardless of this flag — it is the correctness fix, not a diagnostic; this flag only gates the logging and the atomic bookkeeping above it, so the unset-env hot path costs one magic-static guard load plus a cached bool test. |
 | `GGML_SYCL_MOE_LAYOUT_DEBUG=1` | Emit the `[MOE-LAYOUT]` per-pass summary unconditionally. The down-i8 / gateup-i8 lines already fire on ANY decline without this; the variable adds the lines a fully-successful pass would otherwise not print. |
 | `GGML_SYCL_STORED_GEMM_DEBUG=1` | Default OFF (`mxfp4-stored-gemm.cpp`, llama.cpp-kcya round 6, the non-dispatched stored-SOA small-M MXFP4 GEMM kernel). Prints one `[mxfp4-stored-gemm]` launch-geometry line per `ggml_sycl_mxfp4_soa_gemm_dpas` call, all ten fields in the order printed: `M_TILE` (1/2/4/8), `n_out`, `n_k`, `compute_units` (as queried for the K-split heuristic below), `n_tiles` (N-tiles, one work-group per 16 output rows), `k_tiles`, the resolved `ksplit`, `partial_work_items` (`n_tiles * ksplit`, always launched), `combine_work_items` (`n_tiles` when `ksplit > 1`, else **0** — the combine kernel is never submitted on the `ksplit <= 1` direct-write path, and this print says so rather than advertising a launch that does not happen), and `k_tiles_per_partition(max)` — the size of the FIRST `k_tiles % ksplit` partitions; the remaining partitions process one tile fewer (e.g. at the B50's default geometry, k_tiles=90/ksplit=12, six partitions process 8 tiles and the other six process 7 — the printed max is the size of that first group, not "every partition but the last"). Built for comparing this kernel's launch shape against the production reference kernel's (`mxfp4_pair_glu_xmx_tiled_dpas_m2`, `mmvq.cpp`) without a GPU-side profiler. Diagnostic only; no perf effect when unset. Sibling `GGML_SYCL_STORED_GEMM_KSPLIT=<N>` overrides the K-split factor this print reports: accepted only when it parses as an integer AND is `> 0`, then clamped at the UPPER end to `k_tiles`; a non-positive or non-numeric value is IGNORED outright (the computed heuristic runs instead), it is not clamped up to 1. **Profiler `bytes` reconciliation** (llama.cpp-kcya c-amir should-fix 3): with `GGML_SYCL_KERNEL_PROFILE=1`, this kernel emits two rows, `mxfp4.stored_gemm.soa.partial` and `.combine`. On the `ksplit <= 1` path the single `.partial` row's `bytes` equals the useful weight + activation + dst traffic — the SAME figure a caller-side `bytes_moved` calculation (e.g. the test's own) would compute. On the `ksplit > 1` path the two rows' `bytes` ALSO include the K-split's internal scratch round-trip (written by `.partial`, read back by `.combine`) — real DRAM traffic this dispatch causes, so it belongs in the profiler's own accounting, but not "useful" work a caller cares about, so a caller-side `bytes_moved` figure deliberately excludes it. Do not sum the two rows' `bytes` and expect a caller's `bytes_moved` to fall out on that path; do still sum their `mean_ns` for one logical launch's total device time (see `mxfp4-stored-gemm.cpp`'s dispatcher comment). This variable belongs to llama.cpp-kcya, which carried this kernel's `>= 50%-of-peak` bandwidth criterion forward to **llama.cpp-wjqn** (the lane-contiguous/group-repacked layout variant this needs) after two hardware rounds (checkpoint: B50 M=8 N=K=2880 237 us -> ~109 us, round 7's instruction-count levers refuted on `spike/kcya-round7`) rather than closing it on kcya itself. |
 | `GGML_SYCL_MOE_DOWN_I8_MAX_TENSORS=<N>` | Hard cap on how many down tensors the MoE I8 layout pass upgrades. Unset (or negative) = no cap, the shipping behaviour; `0` disables the upgrade. **Diagnostic only — do not set in production.** See the measured cost below. |
@@ -390,6 +391,69 @@ built only under `ggml_sycl_kernel_profile_enabled()`. Older per-batch-element
 sites (e.g. `mxfp4.pp.gemm.execute`'s 2-D fallback loop) predate that convention
 and still build their metadata unconditionally — a small per-call heap
 allocation with the profiler off; not fixed here.
+
+#### `failed_timestamps` / `graph_recorded` — one number, two causes today (S5, llama.cpp-aenv; root cause llama.cpp-mmbg c-x4it)
+
+`failed_timestamps` (CSV/JSON per-row column, `sycl-kernel-profiler.cpp`) counts
+a launch for which no usable device timing was obtained. It increments from
+exactly four production sites in `flush_pending_events`, ALL of which hardcode
+`graph_recorded=false` regardless of what actually happened:
+
+  - `status_error` — the pre-wait `command_execution_status` query threw.
+  - `wait_error` — `event.wait_and_throw()` threw.
+  - `invalid_range` — `command_end < command_start` (a real device-timestamp
+    anomaly).
+  - `query_failed` — `command_start`/`command_end`/`command_submit` retrieval
+    itself threw, after the wait already succeeded.
+
+These four causes are genuinely different (a queue/device fault vs. a garbled
+but present timestamp vs. an event that simply carries no profiling info at
+all), but the CSV's `failed_timestamps` integer and its neighboring
+`graph_recorded` boolean (`format_csv_rows`/`format_json_rows`) do not
+distinguish them in any real capture, because every production call site that
+increments the counter passes the same hardcoded `false` for `graph_recorded`.
+The ONLY caller anywhere in the tree that ever passes `true` is the test hook
+`ggml_sycl_kernel_profile_add_failed_timestamp_for_test`, used solely by
+`tests/test-sycl-kernel-profiler.cpp`. So `graph_recorded` is always `0` in
+every production/hardware capture today, and cannot currently be used to tell
+apart a genuine instrument failure from the shape below.
+
+**The dominant real-world cause is not an instrument failure at all.**
+llama.cpp-mmbg (root cause comment c-x4it) found that with SYCL command-graph
+replay enabled (the default), every `mulmat.mmvq.*` decode row reports
+`failed_timestamps == count/2` — e.g. `count=128 failed_timestamps=64` — while
+`GGML_SYCL_DISABLE_GRAPH=1` on the identical workload gives `failed_timestamps=0`
+at 4.5x the `count` (576 vs 128), with IDENTICAL `mean_ns` across both arms. The
+reading: replayed graph launches are not counted by the profiler at all (a
+separate, already-documented gap — see `kernel-profiler-count-excludes-
+recorded-kernels`), so what the profiler DOES see, with graph replay on, is only
+the warm-up pass that RECORDS the command graph — half direct submissions
+(timestamped normally, `ok`) and half record-mode submissions whose
+`sycl::event` carries no usable profiling info (one of the four causes above,
+almost always `query_failed` or `invalid_range` in practice). The half that
+fails is not broken instrumentation and not a device/queue fault; it is the
+graph-recording pass being counted as if it were an ordinary timestamped
+launch. `failed_timestamps == count/2` on a graph-replay-eligible kernel family
+is this shape, not noise, and not evidence of a profiler regression.
+
+**Consequence for reading any capture:** you cannot currently tell, from the
+CSV/JSON alone, whether a given `failed_timestamps` count is (a) the expected
+record-pass shape above, (b) a genuine device/queue-level timing failure, or
+(c) some mix, because `graph_recorded` never reaches `1` in a production run to
+disambiguate. As a practical proxy: `failed_timestamps` at or near `count/2`
+with `mean_ns` otherwise stable and plausible is almost certainly (a); a
+`failed_timestamps` count with no such clean fraction, or accompanied by
+implausible/zero `mean_ns`, warrants treating it as (b) and reproducing with
+`GGML_SYCL_DISABLE_GRAPH=1` to rule the graph-recording pass out (as the mmbg
+capture above did).
+
+**This documents the CURRENT semantics only; it does not fix them.** The code
+fix — plumbing the actual graph-capture-active state into the four production
+call sites so record-pass launches are tagged `graph_recorded=1` and excluded
+from `failed_timestamps` rather than counted as failures, after which
+per-token attribution needs the separate replay count — is tracked on
+llama.cpp-mmbg and intentionally NOT made here; this task (llama.cpp-aenv) is
+documentation only.
 
 ### `GGML_SYCL_E2E_TG_PROFILE` — the `device_us` column is host-only
 

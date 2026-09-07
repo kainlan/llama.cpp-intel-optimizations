@@ -12,7 +12,11 @@
 // addresses old ones occupied. init_tensor then allocates a brand-new extra per
 // tensor, and the previously "preserved" entries become permanently unreachable
 // -- measured on hardware (llama.cpp-dfo0 c-wx3o/c-pozz) at 838 extras/rebuild,
-// ~465 MB host RSS growth per pp1024 decode, with no bound.
+// ~465 MB host RSS growth per pp1024 decode, with no bound. That measurement
+// predates llama.cpp-h9uv's struct split (pre-h9uv sizeof(ggml_tensor_extra_gpu)
+// = 277,712 B); post-split the same 838-extra/rebuild leak would be
+// sizeof(ggml_tensor_extra_gpu) = 25,048 B each, ~21 MB per rebuild -- see
+// test-sycl-extra-gpu-size.cpp for the compile-verified current size.
 //
 // This test alternates two DIFFERENTLY-SHAPED graphs through the same
 // ggml_backend_sched, each built in a FRESH ggml_context over the SAME raw
