@@ -3431,276 +3431,35 @@ static inline bool ggml_sycl_valid_device_index(int dev) {
     return dev >= 0 && dev < GGML_SYCL_MAX_DEVICES;
 }
 
-struct ggml_tensor_extra_gpu {
-    std::atomic<int>      refcount{ 1 };
-    uint64_t              cache_uuid = 0;                                   // Monotonic cache identity for weights
-    uint64_t              model_id   = 0;                                   // Model identifier for cache keys
-    void *                data_device[GGML_SYCL_MAX_DEVICES];               // 1 pointer for each device for split
-                                                                            // tensors (legacy — use data_handle)
-    ggml_sycl::mem_handle data_handle[GGML_SYCL_MAX_DEVICES];               // Smart handles (P12 migration)
-    size_t                data_device_size[GGML_SYCL_MAX_DEVICES] = { 0 };  // Allocation sizes for data_device
+// Lazily-allocated weight-only extension of ggml_tensor_extra_gpu
+// (llama.cpp-h9uv, right-sizing the 277,712 B struct GGML_SYCL_MAX_DEVICES=48
+// produced). Holds state that applies ONLY to WEIGHT tensors: MoE expert
+// pointer tables/storage, XMX MXFP4 tiled dequant caching, and the row-split
+// TP synchronization events used by ggml_backend_sycl_split_buffer_set_tensor.
+// None of this is ever touched for an activation or KV-view extra in a
+// production code path (grep audit: every external site lives inside a MoE-
+// or XMX-specific function, or in release_extra_gpu()'s generic sweep, which
+// is null-guarded rather than lazily allocating -- see below). Moving it
+// behind a lazily-constructed std::unique_ptr means the ~250 KB this struct
+// carries is paid only by tensors that actually use it, not by the 838
+// activation/view extras a single graph rebuild allocates and releases
+// (llama.cpp-dfo0 plan task L1/L2 hardware evidence).
+struct ggml_tensor_extra_gpu_weight_ext {
+    dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
 
-    // Stamped by ggml_backend_sycl_buffer_init_tensor() from the owning compute
-    // buffer's ggml_backend_sycl_buffer_context::alloc_generation (llama.cpp-dfo0,
-    // plan task L2). Lets buffer_reset() tell a graph REUSE (extra stamped with
-    // the current generation) from a graph REBUILD (extra stamped two
-    // generations back, whose ggml_tensor struct has since been re-initialised
-    // over the same ggml_init mem_buffer) without ever dereferencing the stale
-    // tensor pointer. Meaningless for WEIGHTS-usage extras, which never go
-    // through buffer_reset's COMPUTE branch.
-    // Moved past the refcount/cache_uuid/.../data_device_size block (rather than
-    // sitting inside it) so this single field's declaration doesn't split that
-    // block's clang-format alignment group (llama.cpp-dfo0 plan task L2, quality
-    // review c-z4cf #10).
-    uint64_t alloc_generation = 0;
+    // XMX tile-aligned MXFP4 layout (cached at first use). The layout record is
+    // a non-owning view; this handle owns the allocation lifetime.
+    size_t                xmx_mxfp4_tiled_size = 0;
+    ggml_sycl::mem_handle xmx_mxfp4_tiled_handle[GGML_SYCL_MAX_DEVICES];
 
-    // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
-    // creation, by tiered_kv_buffer_init_tensor's view branch. Lets
-    // release_extra_gpu() attribute an actual deletion to the KV-view live
-    // counter (g_sycl_debug_live_kv_view_extra_count, common.cpp) regardless
-    // of which code path's release call is the one that drops this extra's
-    // refcount to zero -- a container-membership count (view_extras.size())
-    // cannot see an extra that was popped from that container but leaked
-    // because a release call was missing (exactly the bug this field's
-    // counter caught: a shared entry's refcount was 1 + share_count, but the
-    // eviction path released only once).
-    //
-    // Deliberately UNCONDITIONAL, not guarded by GGML_SYCL_PRIVATE_TESTING
-    // (spec review round 1, c-hh2r #2; enumeration corrected in round 2,
-    // c-p2eh #3): this struct is defined once in common.hpp and included by
-    // every SYCL backend TU, but three ctest targets (test-mem-handle-wrong-
-    // device, test-mem-handle-byte-contract, test-sycl-runtime-alloc; see
-    // ggml/src/ggml-sycl/CMakeLists.txt) compile the SYCL TUs they need
-    // directly WITH GGML_SYCL_PRIVATE_TESTING=1 and link the ordinary
-    // (non-testing) libggml-sycl -- naming a fixed pair of TUs here would
-    // rot the moment a target's source list changes, since the set is not
-    // even identical across the three targets (e.g. test-sycl-runtime-alloc
-    // compiles unified-cache.cpp but not mem-handle.cpp). A conditional
-    // member here would make this one class have two different
-    // layouts/sizes across TUs linked into the same binary -- an ODR
-    // violation that is silently latent today (no member of this struct
-    // happens to be touched from any of those directly-compiled TUs) and
-    // would become memory corruption the moment one is. A bare `bool` costs
-    // nothing next to this struct's 277,704 B, so there is no reason to
-    // take the risk for it. Only the counter and its accessors stay guarded
-    // below -- they are free functions, not part of this struct's layout,
-    // so guarding them cannot cause an ODR mismatch.
-    bool debug_is_kv_view_extra = false;
+    // Temporary AoS staging for MXFP4 tiled conversion (host -> device).
+    size_t                xmx_mxfp4_tiled_aos_staging_size[GGML_SYCL_MAX_DEVICES] = { 0 };
+    ggml_sycl::mem_handle xmx_mxfp4_tiled_aos_staging_handle[GGML_SYCL_MAX_DEVICES];
 
-    // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
-    // Use this instead of data_device[dev] directly for incremental migration.
-    // An out-of-range dev returns nullptr like any other "no usable pointer for
-    // this device" case, so the ~60 call sites that already null-check need no
-    // change; without it the very first statement below reads past the end of
-    // data_handle[].
-    void * data_device_ptr(int dev) const {
-        if (!ggml_sycl_valid_device_index(dev)) {
-            return nullptr;
-        }
-        const auto & handle = data_handle[dev];
-        if (handle.device() == dev || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
-            auto resolved = handle.resolve(dev);
-            if (resolved) {
-                if (data_device[dev] != nullptr && data_device[dev] != resolved.ptr) {
-                    static std::atomic<int> stale_raw_warns{ 0 };
-                    if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
-                        stale_raw_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
-                        GGML_LOG_WARN(
-                            "[SYCL] extra data_handle/raw pointer mismatch dev=%d handle=%p raw=%p; "
-                            "using mem_handle\n",
-                            dev, resolved.ptr, data_device[dev]);
-                    }
-                }
-                return resolved.ptr;
-            }
-        }
-        void * ptr = data_device[dev];
-        if (!ptr) {
-            return nullptr;
-        }
-        const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
-        if (info && info->type == ggml_sycl::alloc_type::DEVICE) {
-            return info->device_id == dev ? ptr : nullptr;
-        }
-        if (info && (info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
-            return ptr;
-        }
-        return nullptr;
-    }
-
-    // Checked form of data_device_ptr().  data_device_ptr() returns nullptr when
-    // the legacy fallback finds a DEVICE allocation registered to a different
-    // device; callers that skip the null check then do pointer arithmetic on it
-    // and fault inside a device memcpy.  Prefer this at every dereference site.
-    // An out-of-range dev is reported here rather than delegated: data_device_ptr()
-    // indexes data_handle[dev] on entry, and the diagnostic below indexes all three
-    // per-device arrays, so both would read out of bounds before this could report
-    // anything.
-    void * data_device_ptr_checked(int dev, const char * caller) const {
-        if (!ggml_sycl_valid_device_index(dev)) {
-            GGML_LOG_ERROR("[SYCL] %s: device index out of range: dev=%d (valid 0..%d)\n", caller ? caller : "?", dev,
-                           GGML_SYCL_MAX_DEVICES - 1);
-            GGML_ABORT("data_device_ptr_checked: device index out of range");
-        }
-        void * ptr = data_device_ptr(dev);
-        if (ptr == nullptr) {
-            GGML_LOG_ERROR(
-                "[SYCL] %s: no usable device pointer for dev=%d "
-                "(handle_dev=%d raw=%p size=%zu)\n",
-                caller ? caller : "?", dev, data_handle[dev].device(), data_device[dev], data_device_size[dev]);
-            GGML_ABORT("data_device_ptr_checked: no usable device pointer");
-        }
-        return ptr;
-    }
-
-    // Set data pointer for a device.  Updates both legacy data_device and the
-    // smart handle.  Device pointers must go through the chunk-aware bridge so
-    // arena-backed runtime storage is leased by the handle instead of being
-    // cached as an unowned raw pointer.
-    // An out-of-range dev aborts rather than being ignored.  There is no
-    // sentinel to return, and dropping the write would leave the tensor with no
-    // storage authority on that device -- the symptom would then surface far
-    // away as a null pointer or a wrong result, which is the failure mode this
-    // guard exists to prevent.  Same shape as data_device_ptr_checked().
-    void set_data_device(int dev, void * ptr, ggml_layout_mode layout = GGML_LAYOUT_AOS, bool on_device = true) {
-        if (!ggml_sycl_valid_device_index(dev)) {
-            GGML_LOG_ERROR("[SYCL] set_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
-                           GGML_SYCL_MAX_DEVICES - 1);
-            GGML_ABORT("set_data_device: device index out of range");
-        }
-        data_device[dev] = ptr;
-        if (ptr) {
-            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
-        } else {
-            data_handle[dev] = ggml_sycl::mem_handle{};
-        }
-    }
-
-    // Handle-taking sibling of set_data_device() (llama.cpp-1df8). The raw-pointer
-    // overload above always reconstructs a handle via from_chunk_ptr(), which is
-    // correct ONLY when `ptr` resolves to an arena chunk lease -- for a pointer
-    // backed by an EXTERNAL_EXACT allocation (e.g. the TP/runtime staging cache's
-    // device buffer; see ggml_sycl_get_data_ptr_slow's staged_handle comment)
-    // from_chunk_ptr() cannot find a chunk and silently downgrades to an
-    // unprotected DIRECT handle with nothing keeping the allocation alive. Call
-    // this instead when the caller already holds the OWNING handle so data_handle
-    // shares that ownership directly, with no raw-pointer reconstruction step.
-    // Not a general replacement for set_data_device(): only use it where the
-    // caller's handle is itself the allocation's owner (or a share of it).
-    void set_data_device_handle(int dev, ggml_sycl::mem_handle handle) {
-        if (!ggml_sycl_valid_device_index(dev)) {
-            GGML_LOG_ERROR("[SYCL] set_data_device_handle: device index out of range: dev=%d (valid 0..%d)\n", dev,
-                           GGML_SYCL_MAX_DEVICES - 1);
-            GGML_ABORT("set_data_device_handle: device index out of range");
-        }
-        auto resolved = handle.resolve(dev);
-        if (!resolved.ptr) {
-            data_device[dev] = nullptr;
-            data_handle[dev] = ggml_sycl::mem_handle{};
-            return;
-        }
-        data_device[dev] = resolved.ptr;
-        data_handle[dev] = std::move(handle);
-    }
-
-    bool set_owned_data_device(int                     dev,
-                               ggml_sycl::alloc_handle owner,
-                               size_t                  bytes,
-                               ggml_layout_mode        layout = GGML_LAYOUT_AOS) {
-        // Aborts rather than returning false: `false` here already means "the
-        // owner is not usable, fall back", a recoverable condition callers
-        // handle.  Reusing it for an out-of-range dev would hide a caller bug
-        // behind a plausible fallback path.
-        if (!ggml_sycl_valid_device_index(dev)) {
-            GGML_LOG_ERROR("[SYCL] set_owned_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
-                           GGML_SYCL_MAX_DEVICES - 1);
-            GGML_ABORT("set_owned_data_device: device index out of range");
-        }
-        data_device[dev]      = nullptr;
-        data_handle[dev]      = ggml_sycl::mem_handle{};
-        data_device_size[dev] = 0;
-        if (!owner.ptr) {
-            return false;
-        }
-
-        data_handle[dev] = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), layout);
-        auto resolved    = data_handle[dev].resolve(dev);
-        if (!resolved) {
-            data_handle[dev] = ggml_sycl::mem_handle{};
-            return false;
-        }
-        data_device[dev]      = resolved.ptr;
-        data_device_size[dev] = bytes;
-        return true;
-    }
-
-    // Clear only tensor-storage authority. Backend metadata such as TP state,
-    // layout policy, graph/MoE tables, and events is intentionally preserved.
-    void clear_data_authority() {
-        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
-            data_device[d]      = nullptr;
-            data_handle[d]      = ggml_sycl::mem_handle{};
-            data_device_size[d] = 0;
-            resolved_ptr[d]     = nullptr;
-            resolved_gen[d]     = 0;
-        }
-    }
-
-    // Install storage for a synthetic direct slice/view tensor. The caller may
-    // provide the source handle that resolved to ptr; when it matches, the
-    // temporary tensor keeps the same lifetime/refcount authority. Otherwise we
-    // fall back to a DIRECT handle and emit a bounded debug warning.
-    void install_direct_slice_storage(int                           dev,
-                                      void *                        ptr,
-                                      size_t                        bytes,
-                                      ggml_layout_mode              storage_layout = GGML_LAYOUT_AOS,
-                                      bool                          on_device      = true,
-                                      const ggml_sycl::mem_handle * source_handle  = nullptr) {
-        // Checked before clear_data_authority() so a bad index cannot drop the
-        // existing storage authority on the way to failing.  Aborts for the
-        // same reason as set_data_device(): void return, no sentinel, and a
-        // skipped install surfaces only much later.
-        if (!ggml_sycl_valid_device_index(dev)) {
-            GGML_LOG_ERROR("[SYCL] install_direct_slice_storage: device index out of range: dev=%d (valid 0..%d)\n",
-                           dev, GGML_SYCL_MAX_DEVICES - 1);
-            GGML_ABORT("install_direct_slice_storage: device index out of range");
-        }
-
-        clear_data_authority();
-
-        data_device[dev]      = ptr;
-        data_device_size[dev] = bytes;
-
-        bool installed_source_handle = false;
-        if (source_handle != nullptr && source_handle->valid()) {
-            auto resolved = source_handle->resolve(dev);
-            if (resolved.ptr == ptr) {
-                data_handle[dev]        = *source_handle;
-                installed_source_handle = true;
-            } else {
-                static std::atomic<int> mismatch_warns{ 0 };
-                if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
-                    mismatch_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
-                    GGML_LOG_WARN(
-                        "[SYCL] direct slice source handle mismatch dev=%d handle=%p slice=%p; "
-                        "using direct handle\n",
-                        dev, resolved.ptr, ptr);
-                }
-            }
-        }
-
-        if (!installed_source_handle) {
-            data_handle[dev] = on_device ? ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true) :
-                                           ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false,
-                                                                              ggml_sycl::mem_handle::HOST_DEVICE);
-        }
-
-        layout.mode        = storage_layout;
-        layout.size        = bytes;
-        layout.owns_memory = false;
-        layout.device_id   = on_device ? dev : ggml_sycl::mem_handle::HOST_DEVICE;
-        layout.data_ptr    = ptr;
-    }
+    // Track async tile conversion completion for graph compatibility
+    sycl::event xmx_mxfp4_tiled_conversion_evt[GGML_SYCL_MAX_DEVICES];
+    bool        xmx_mxfp4_tiled_conversion_complete[GGML_SYCL_MAX_DEVICES] = { false };
+    std::mutex  xmx_tiled_conversion_mutex[GGML_SYCL_MAX_DEVICES];  // Protect concurrent access
 
     // Accessor: resolve xmx_mxfp4_tiled through its owning smart handle.
     // An out-of-range dev returns nullptr, matching data_device_ptr() and the
@@ -3828,52 +3587,6 @@ struct ggml_tensor_extra_gpu {
         }
         return count == 0 || populated != 0;
     }
-
-    // Cached layout pointer resolution — avoids repeated string hashing, mutex
-    // acquisition, and hash map lookups in get_layout_ptr_impl() on the hot path.
-    // Populated on first resolve; invalidated by setting resolved_gen to 0 on eviction.
-    void *   resolved_ptr[GGML_SYCL_MAX_DEVICES] = { nullptr };
-    uint32_t resolved_gen[GGML_SYCL_MAX_DEVICES] = { 0 };                   // generation counter
-
-    dpct::event_ptr  events[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];  // events for synchronizing multiple GPUs
-    optimize_feature optimized_feature = {};  // Must have = {} to ensure default member initializers apply
-
-    // Unified layout descriptor (new system - coexists with optimize_feature during migration)
-    tensor_layout_info layout;
-    bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
-
-    tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
-    bool          tp_type_cached = false;                   // Whether tp_type has been computed
-
-    // Tensor Parallelism sharding info
-    // When TP is enabled, this tensor may hold only a shard of the full weight
-    bool    tp_sharded        = false;  // True if this tensor holds a shard
-    bool    tp_usm_host       = false;  // True if allocated with malloc_host (cross-device accessible)
-    int64_t tp_original_ne[4] = { 0 };  // Original (full) dimensions before sharding
-    int64_t tp_local_ne[4]    = { 0 };  // Local dimensions of the shard
-    int64_t tp_offset_ne[4]   = { 0 };  // Offset into the original tensor
-    int     tp_rank           = 0;      // Which rank this shard belongs to
-    int     tp_world_size     = 1;      // Total number of ranks
-
-    // XMX tile-aligned MXFP4 layout (cached at first use). The layout record is
-    // a non-owning view; this handle owns the allocation lifetime.
-    size_t                xmx_mxfp4_tiled_size = 0;
-    ggml_sycl::mem_handle xmx_mxfp4_tiled_handle[GGML_SYCL_MAX_DEVICES];
-
-    // Temporary AoS staging for MXFP4 tiled conversion (host -> device).
-    size_t                xmx_mxfp4_tiled_aos_staging_size[GGML_SYCL_MAX_DEVICES] = { 0 };
-    ggml_sycl::mem_handle xmx_mxfp4_tiled_aos_staging_handle[GGML_SYCL_MAX_DEVICES];
-
-    // Track async tile conversion completion for graph compatibility
-    sycl::event xmx_mxfp4_tiled_conversion_evt[GGML_SYCL_MAX_DEVICES];
-    bool        xmx_mxfp4_tiled_conversion_complete[GGML_SYCL_MAX_DEVICES] = { false };
-    std::mutex  xmx_tiled_conversion_mutex[GGML_SYCL_MAX_DEVICES];  // Protect concurrent access
-
-    // MoE expert ID for per-expert slice tensors dispatched by mul_mat_id.
-    // Set to >= 0 when this extra belongs to a per-expert slice; -1 otherwise.
-    // Used by ggml_backend_sycl_get_weight_cache_key to generate the correct
-    // expert-specific cache key (with ":eN" suffix) matching registration keys.
-    int moe_expert_id = -1;
 
     // MoE expert storage handles are the persistent ownership view for experts
     // returned by unified-cache allocation/registration. The key is
@@ -4231,6 +3944,452 @@ struct ggml_tensor_extra_gpu {
 
     // MoE expert hotness tracking (per layer)
     std::vector<float> moe_expert_scores;
+};
+
+struct ggml_tensor_extra_gpu {
+    std::atomic<int>      refcount{ 1 };
+    uint64_t              cache_uuid = 0;                                   // Monotonic cache identity for weights
+    uint64_t              model_id   = 0;                                   // Model identifier for cache keys
+    void *                data_device[GGML_SYCL_MAX_DEVICES];               // 1 pointer for each device for split
+                                                                            // tensors (legacy — use data_handle)
+    ggml_sycl::mem_handle data_handle[GGML_SYCL_MAX_DEVICES];               // Smart handles (P12 migration)
+    size_t                data_device_size[GGML_SYCL_MAX_DEVICES] = { 0 };  // Allocation sizes for data_device
+
+    // Stamped by ggml_backend_sycl_buffer_init_tensor() from the owning compute
+    // buffer's ggml_backend_sycl_buffer_context::alloc_generation (llama.cpp-dfo0,
+    // plan task L2). Lets buffer_reset() tell a graph REUSE (extra stamped with
+    // the current generation) from a graph REBUILD (extra stamped two
+    // generations back, whose ggml_tensor struct has since been re-initialised
+    // over the same ggml_init mem_buffer) without ever dereferencing the stale
+    // tensor pointer. Meaningless for WEIGHTS-usage extras, which never go
+    // through buffer_reset's COMPUTE branch.
+    // Moved past the refcount/cache_uuid/.../data_device_size block (rather than
+    // sitting inside it) so this single field's declaration doesn't split that
+    // block's clang-format alignment group (llama.cpp-dfo0 plan task L2, quality
+    // review c-z4cf #10).
+    uint64_t alloc_generation = 0;
+
+    // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): set once, at
+    // creation, by tiered_kv_buffer_init_tensor's view branch. Lets
+    // release_extra_gpu() attribute an actual deletion to the KV-view live
+    // counter (g_sycl_debug_live_kv_view_extra_count, common.cpp) regardless
+    // of which code path's release call is the one that drops this extra's
+    // refcount to zero -- a container-membership count (view_extras.size())
+    // cannot see an extra that was popped from that container but leaked
+    // because a release call was missing (exactly the bug this field's
+    // counter caught: a shared entry's refcount was 1 + share_count, but the
+    // eviction path released only once).
+    //
+    // Deliberately UNCONDITIONAL, not guarded by GGML_SYCL_PRIVATE_TESTING
+    // (spec review round 1, c-hh2r #2; enumeration corrected in round 2,
+    // c-p2eh #3): this struct is defined once in common.hpp and included by
+    // every SYCL backend TU, but three ctest targets (test-mem-handle-wrong-
+    // device, test-mem-handle-byte-contract, test-sycl-runtime-alloc; see
+    // ggml/src/ggml-sycl/CMakeLists.txt) compile the SYCL TUs they need
+    // directly WITH GGML_SYCL_PRIVATE_TESTING=1 and link the ordinary
+    // (non-testing) libggml-sycl -- naming a fixed pair of TUs here would
+    // rot the moment a target's source list changes, since the set is not
+    // even identical across the three targets (e.g. test-sycl-runtime-alloc
+    // compiles unified-cache.cpp but not mem-handle.cpp). A conditional
+    // member here would make this one class have two different
+    // layouts/sizes across TUs linked into the same binary -- an ODR
+    // violation that is silently latent today (no member of this struct
+    // happens to be touched from any of those directly-compiled TUs) and
+    // would become memory corruption the moment one is. A bare `bool` costs
+    // nothing next to this struct's 277,704 B, so there is no reason to
+    // take the risk for it. Only the counter and its accessors stay guarded
+    // below -- they are free functions, not part of this struct's layout,
+    // so guarding them cannot cause an ODR mismatch.
+    bool debug_is_kv_view_extra = false;
+
+    // Compatibility shim: resolve data_handle if set, else fall back to raw data_device.
+    // Use this instead of data_device[dev] directly for incremental migration.
+    // An out-of-range dev returns nullptr like any other "no usable pointer for
+    // this device" case, so the ~60 call sites that already null-check need no
+    // change; without it the very first statement below reads past the end of
+    // data_handle[].
+    void * data_device_ptr(int dev) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            return nullptr;
+        }
+        const auto & handle = data_handle[dev];
+        if (handle.device() == dev || handle.device() == ggml_sycl::mem_handle::HOST_DEVICE) {
+            auto resolved = handle.resolve(dev);
+            if (resolved) {
+                if (data_device[dev] != nullptr && data_device[dev] != resolved.ptr) {
+                    static std::atomic<int> stale_raw_warns{ 0 };
+                    if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
+                        stale_raw_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        GGML_LOG_WARN(
+                            "[SYCL] extra data_handle/raw pointer mismatch dev=%d handle=%p raw=%p; "
+                            "using mem_handle\n",
+                            dev, resolved.ptr, data_device[dev]);
+                    }
+                }
+                return resolved.ptr;
+            }
+        }
+        void * ptr = data_device[dev];
+        if (!ptr) {
+            return nullptr;
+        }
+        const auto * info = ggml_sycl::alloc_registry::instance().lookup(ptr);
+        if (info && info->type == ggml_sycl::alloc_type::DEVICE) {
+            return info->device_id == dev ? ptr : nullptr;
+        }
+        if (info && (info->type == ggml_sycl::alloc_type::HOST_PINNED || info->type == ggml_sycl::alloc_type::SHARED)) {
+            return ptr;
+        }
+        return nullptr;
+    }
+
+    // Checked form of data_device_ptr().  data_device_ptr() returns nullptr when
+    // the legacy fallback finds a DEVICE allocation registered to a different
+    // device; callers that skip the null check then do pointer arithmetic on it
+    // and fault inside a device memcpy.  Prefer this at every dereference site.
+    // An out-of-range dev is reported here rather than delegated: data_device_ptr()
+    // indexes data_handle[dev] on entry, and the diagnostic below indexes all three
+    // per-device arrays, so both would read out of bounds before this could report
+    // anything.
+    void * data_device_ptr_checked(int dev, const char * caller) const {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] %s: device index out of range: dev=%d (valid 0..%d)\n", caller ? caller : "?", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("data_device_ptr_checked: device index out of range");
+        }
+        void * ptr = data_device_ptr(dev);
+        if (ptr == nullptr) {
+            GGML_LOG_ERROR(
+                "[SYCL] %s: no usable device pointer for dev=%d "
+                "(handle_dev=%d raw=%p size=%zu)\n",
+                caller ? caller : "?", dev, data_handle[dev].device(), data_device[dev], data_device_size[dev]);
+            GGML_ABORT("data_device_ptr_checked: no usable device pointer");
+        }
+        return ptr;
+    }
+
+    // Set data pointer for a device.  Updates both legacy data_device and the
+    // smart handle.  Device pointers must go through the chunk-aware bridge so
+    // arena-backed runtime storage is leased by the handle instead of being
+    // cached as an unowned raw pointer.
+    // An out-of-range dev aborts rather than being ignored.  There is no
+    // sentinel to return, and dropping the write would leave the tensor with no
+    // storage authority on that device -- the symptom would then surface far
+    // away as a null pointer or a wrong result, which is the failure mode this
+    // guard exists to prevent.  Same shape as data_device_ptr_checked().
+    void set_data_device(int dev, void * ptr, ggml_layout_mode layout = GGML_LAYOUT_AOS, bool on_device = true) {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_data_device: device index out of range");
+        }
+        data_device[dev] = ptr;
+        if (ptr) {
+            data_handle[dev] = ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, layout, on_device);
+        } else {
+            data_handle[dev] = ggml_sycl::mem_handle{};
+        }
+    }
+
+    // Handle-taking sibling of set_data_device() (llama.cpp-1df8). The raw-pointer
+    // overload above always reconstructs a handle via from_chunk_ptr(), which is
+    // correct ONLY when `ptr` resolves to an arena chunk lease -- for a pointer
+    // backed by an EXTERNAL_EXACT allocation (e.g. the TP/runtime staging cache's
+    // device buffer; see ggml_sycl_get_data_ptr_slow's staged_handle comment)
+    // from_chunk_ptr() cannot find a chunk and silently downgrades to an
+    // unprotected DIRECT handle with nothing keeping the allocation alive. Call
+    // this instead when the caller already holds the OWNING handle so data_handle
+    // shares that ownership directly, with no raw-pointer reconstruction step.
+    // Not a general replacement for set_data_device(): only use it where the
+    // caller's handle is itself the allocation's owner (or a share of it).
+    void set_data_device_handle(int dev, ggml_sycl::mem_handle handle) {
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_data_device_handle: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_data_device_handle: device index out of range");
+        }
+        auto resolved = handle.resolve(dev);
+        if (!resolved.ptr) {
+            data_device[dev] = nullptr;
+            data_handle[dev] = ggml_sycl::mem_handle{};
+            return;
+        }
+        data_device[dev] = resolved.ptr;
+        data_handle[dev] = std::move(handle);
+    }
+
+    bool set_owned_data_device(int                     dev,
+                               ggml_sycl::alloc_handle owner,
+                               size_t                  bytes,
+                               ggml_layout_mode        layout = GGML_LAYOUT_AOS) {
+        // Aborts rather than returning false: `false` here already means "the
+        // owner is not usable, fall back", a recoverable condition callers
+        // handle.  Reusing it for an out-of-range dev would hide a caller bug
+        // behind a plausible fallback path.
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] set_owned_data_device: device index out of range: dev=%d (valid 0..%d)\n", dev,
+                           GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("set_owned_data_device: device index out of range");
+        }
+        data_device[dev]      = nullptr;
+        data_handle[dev]      = ggml_sycl::mem_handle{};
+        data_device_size[dev] = 0;
+        if (!owner.ptr) {
+            return false;
+        }
+
+        data_handle[dev] = ggml_sycl::detail::from_legacy_owned_alloc(std::move(owner), layout);
+        auto resolved    = data_handle[dev].resolve(dev);
+        if (!resolved) {
+            data_handle[dev] = ggml_sycl::mem_handle{};
+            return false;
+        }
+        data_device[dev]      = resolved.ptr;
+        data_device_size[dev] = bytes;
+        return true;
+    }
+
+    // Clear only tensor-storage authority. Backend metadata such as TP state,
+    // layout policy, graph/MoE tables, and events is intentionally preserved.
+    void clear_data_authority() {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            data_device[d]      = nullptr;
+            data_handle[d]      = ggml_sycl::mem_handle{};
+            data_device_size[d] = 0;
+            resolved_ptr[d]     = nullptr;
+            resolved_gen[d]     = 0;
+        }
+    }
+
+    // Install storage for a synthetic direct slice/view tensor. The caller may
+    // provide the source handle that resolved to ptr; when it matches, the
+    // temporary tensor keeps the same lifetime/refcount authority. Otherwise we
+    // fall back to a DIRECT handle and emit a bounded debug warning.
+    void install_direct_slice_storage(int                           dev,
+                                      void *                        ptr,
+                                      size_t                        bytes,
+                                      ggml_layout_mode              storage_layout = GGML_LAYOUT_AOS,
+                                      bool                          on_device      = true,
+                                      const ggml_sycl::mem_handle * source_handle  = nullptr) {
+        // Checked before clear_data_authority() so a bad index cannot drop the
+        // existing storage authority on the way to failing.  Aborts for the
+        // same reason as set_data_device(): void return, no sentinel, and a
+        // skipped install surfaces only much later.
+        if (!ggml_sycl_valid_device_index(dev)) {
+            GGML_LOG_ERROR("[SYCL] install_direct_slice_storage: device index out of range: dev=%d (valid 0..%d)\n",
+                           dev, GGML_SYCL_MAX_DEVICES - 1);
+            GGML_ABORT("install_direct_slice_storage: device index out of range");
+        }
+
+        clear_data_authority();
+
+        data_device[dev]      = ptr;
+        data_device_size[dev] = bytes;
+
+        bool installed_source_handle = false;
+        if (source_handle != nullptr && source_handle->valid()) {
+            auto resolved = source_handle->resolve(dev);
+            if (resolved.ptr == ptr) {
+                data_handle[dev]        = *source_handle;
+                installed_source_handle = true;
+            } else {
+                static std::atomic<int> mismatch_warns{ 0 };
+                if ((g_ggml_sycl_debug || g_ggml_sycl_handle_strict) &&
+                    mismatch_warns.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    GGML_LOG_WARN(
+                        "[SYCL] direct slice source handle mismatch dev=%d handle=%p slice=%p; "
+                        "using direct handle\n",
+                        dev, resolved.ptr, ptr);
+                }
+            }
+        }
+
+        if (!installed_source_handle) {
+            data_handle[dev] = on_device ? ggml_sycl::mem_handle::from_chunk_ptr(ptr, dev, storage_layout, true) :
+                                           ggml_sycl::mem_handle::from_direct(ptr, storage_layout, false,
+                                                                              ggml_sycl::mem_handle::HOST_DEVICE);
+        }
+
+        layout.mode        = storage_layout;
+        layout.size        = bytes;
+        layout.owns_memory = false;
+        layout.device_id   = on_device ? dev : ggml_sycl::mem_handle::HOST_DEVICE;
+        layout.data_ptr    = ptr;
+    }
+
+    // Cached layout pointer resolution — avoids repeated string hashing, mutex
+    // acquisition, and hash map lookups in get_layout_ptr_impl() on the hot path.
+    // Populated on first resolve; invalidated by setting resolved_gen to 0 on eviction.
+    void *   resolved_ptr[GGML_SYCL_MAX_DEVICES] = { nullptr };
+    uint32_t resolved_gen[GGML_SYCL_MAX_DEVICES] = { 0 };                   // generation counter
+    optimize_feature optimized_feature = {};  // Must have = {} to ensure default member initializers apply
+
+    // Unified layout descriptor (new system - coexists with optimize_feature during migration)
+    tensor_layout_info layout;
+    bool               layout_dirty = false;                // Weight data overwritten; layout must be re-materialized
+
+    tp_layer_type tp_type        = tp_layer_type::TP_NONE;  // Cached TP type (set once, avoids string compare)
+    bool          tp_type_cached = false;                   // Whether tp_type has been computed
+
+    // Tensor Parallelism sharding info
+    // When TP is enabled, this tensor may hold only a shard of the full weight
+    bool    tp_sharded        = false;  // True if this tensor holds a shard
+    bool    tp_usm_host       = false;  // True if allocated with malloc_host (cross-device accessible)
+    int64_t tp_original_ne[4] = { 0 };  // Original (full) dimensions before sharding
+    int64_t tp_local_ne[4]    = { 0 };  // Local dimensions of the shard
+    int64_t tp_offset_ne[4]   = { 0 };  // Offset into the original tensor
+    int     tp_rank           = 0;      // Which rank this shard belongs to
+    int     tp_world_size     = 1;      // Total number of ranks
+
+    // MoE expert ID for per-expert slice tensors dispatched by mul_mat_id.
+    // Set to >= 0 when this extra belongs to a per-expert slice; -1 otherwise.
+    // Used by ggml_backend_sycl_get_weight_cache_key to generate the correct
+    // expert-specific cache key (with ":eN" suffix) matching registration keys.
+    int moe_expert_id = -1;
+
+    // Weight-only extension (llama.cpp-h9uv): MoE expert tables, XMX MXFP4
+    // tiled dequant cache, and split-buffer TP events. Lazily constructed by
+    // weight()/weight()-forwarding methods on first touch from a weight-only
+    // code path; stays null for every activation/view extra, which is the
+    // entire point of the split -- see the comment on
+    // ggml_tensor_extra_gpu_weight_ext above. Kept public like every other
+    // member of this struct; prefer the forwarding methods below over poking
+    // at it directly outside common.hpp so a missing entry point isn't
+    // reinvented at a new call site.
+    std::unique_ptr<ggml_tensor_extra_gpu_weight_ext> weight_ext;
+
+    // Lazily default-constructs weight_ext if absent and returns a reference.
+    // Only call this from a code path that legitimately deals with a weight
+    // tensor (MoE dispatch, XMX tiling, split-buffer TP setup) -- calling it
+    // from a generic per-extra sweep (like release_extra_gpu) would force-
+    // allocate the ~250 KB extension for every activation extra too, exactly
+    // undoing the point of this split. release_extra_gpu() therefore never
+    // calls this; it null-checks weight_ext directly instead.
+    ggml_tensor_extra_gpu_weight_ext & weight() {
+        if (!weight_ext) {
+            weight_ext = std::make_unique<ggml_tensor_extra_gpu_weight_ext>();
+        }
+        return *weight_ext;
+    }
+
+    // Nested-type aliases so `ggml_tensor_extra_gpu::moe_expert_storage_record`
+    // and `ggml_tensor_extra_gpu::resolved_moe_expert_storage_record` (used as
+    // qualified type names at ~17 call sites in ggml-sycl.cpp) keep resolving
+    // after the underlying definitions moved into ggml_tensor_extra_gpu_weight_ext.
+    using moe_expert_storage_record          = ggml_tensor_extra_gpu_weight_ext::moe_expert_storage_record;
+    using resolved_moe_expert_storage_record = ggml_tensor_extra_gpu_weight_ext::resolved_moe_expert_storage_record;
+
+    // Same reason as the type aliases above: `ggml_tensor_extra_gpu::
+    // moe_storage_handle_key(...)` is called qualified at a couple of sites
+    // (it needs no instance -- it is a pure key encoder), so it keeps a
+    // static forwarder here rather than only existing on the extension.
+    static uint64_t moe_storage_handle_key(int expert_id, ggml_layout_mode layout) {
+        return ggml_tensor_extra_gpu_weight_ext::moe_storage_handle_key(expert_id, layout);
+    }
+
+    // Thin forwarders to the weight-only extension. Signatures are IDENTICAL
+    // to the pre-split methods so every existing call site is unchanged.
+    // Read-only accessors return the "not present" default (nullptr/false/
+    // cleared-and-false) without allocating weight_ext; mutators lazily
+    // create it via weight() since they only run for a tensor that is, by
+    // construction, already being treated as a weight/MoE tensor.
+    void * xmx_tiled_ptr(int dev) const { return weight_ext ? weight_ext->xmx_tiled_ptr(dev) : nullptr; }
+
+    void * xmx_staging_ptr(int dev) const { return weight_ext ? weight_ext->xmx_staging_ptr(dev) : nullptr; }
+
+    void * moe_ptrs_ptr_raw(int dev) const { return weight_ext ? weight_ext->moe_ptrs_ptr_raw(dev) : nullptr; }
+
+    void * moe_ptrs_ptr(int dev) const { return weight_ext ? weight_ext->moe_ptrs_ptr(dev) : nullptr; }
+
+    void * moe_compact_ptr(int dev) const { return weight_ext ? weight_ext->moe_compact_ptr(dev) : nullptr; }
+
+    int * moe_compact_missing_ptr(int dev) const {
+        return weight_ext ? weight_ext->moe_compact_missing_ptr(dev) : nullptr;
+    }
+
+    bool build_moe_ptr_payload_from_handles(int                   dev,
+                                            size_t                count,
+                                            std::vector<void *> & payload,
+                                            bool                  require_all    = false,
+                                            bool                  require_device = false) const {
+        payload.clear();
+        if (weight_ext) {
+            return weight_ext->build_moe_ptr_payload_from_handles(dev, count, payload, require_all, require_device);
+        }
+        return count == 0 && ggml_sycl_valid_device_index(dev);
+    }
+
+    bool build_moe_layout_ptr_payload_from_handles(int                   dev,
+                                                   size_t                count,
+                                                   std::vector<void *> & payload,
+                                                   bool                  require_all,
+                                                   bool                  require_device,
+                                                   ggml_layout_mode      layout,
+                                                   size_t                expected_expert_bytes) const {
+        payload.clear();
+        if (weight_ext) {
+            return weight_ext->build_moe_layout_ptr_payload_from_handles(dev, count, payload, require_all,
+                                                                         require_device, layout, expected_expert_bytes);
+        }
+        return count == 0 && ggml_sycl_valid_device_index(dev) && expected_expert_bytes != 0;
+    }
+
+    bool remember_moe_storage_handle(int                   expert_id,
+                                     ggml_layout_mode      layout,
+                                     ggml_sycl::mem_handle h,
+                                     const sycl::event *   ready_event,
+                                     size_t                logical_offset,
+                                     size_t                logical_bytes) {
+        return weight().remember_moe_storage_handle(expert_id, layout, std::move(h), ready_event, logical_offset,
+                                                    logical_bytes);
+    }
+
+    bool resolve_moe_storage_record(int                                  expert_id,
+                                    ggml_layout_mode                     layout,
+                                    int                                  owner_device,
+                                    size_t                               expected_bytes,
+                                    resolved_moe_expert_storage_record * out) const {
+        if (weight_ext) {
+            return weight_ext->resolve_moe_storage_record(expert_id, layout, owner_device, expected_bytes, out);
+        }
+        if (out) {
+            *out = {};
+        }
+        return false;
+    }
+
+    const moe_expert_storage_record * find_moe_storage_handle(int expert_id, ggml_layout_mode layout) const {
+        return weight_ext ? weight_ext->find_moe_storage_handle(expert_id, layout) : nullptr;
+    }
+
+    const moe_expert_storage_record * find_moe_storage_handle_on_device(int              expert_id,
+                                                                        ggml_layout_mode layout,
+                                                                        int              owner_device) const {
+        return weight_ext ? weight_ext->find_moe_storage_handle_on_device(expert_id, layout, owner_device) : nullptr;
+    }
+
+    bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {
+        return weight_ext && weight_ext->forget_moe_storage_handle_on_device(expert_id, layout, owner_device);
+    }
+
+    bool take_moe_storage_handle_on_device(int                         expert_id,
+                                           ggml_layout_mode            layout,
+                                           int                         owner_device,
+                                           moe_expert_storage_record * out_record) {
+        return weight_ext && weight_ext->take_moe_storage_handle_on_device(expert_id, layout, owner_device, out_record);
+    }
+
+    void clear_moe_storage_handles() {
+        if (weight_ext) {
+            weight_ext->clear_moe_storage_handles();
+        }
+    }
+
+    void clear_moe_storage_handles_for_owner(int owner_device) {
+        if (weight_ext) {
+            weight_ext->clear_moe_storage_handles_for_owner(owner_device);
+        }
+    }
 };
 
 void retain_extra_gpu(ggml_tensor_extra_gpu * extra);
