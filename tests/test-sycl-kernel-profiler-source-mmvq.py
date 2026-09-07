@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HEADER = ROOT / "ggml" / "src" / "ggml-sycl" / "sycl-kernel-profiler.hpp"
@@ -347,16 +348,41 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
             "static void mul_mat_vec_q6_K_q8_1_sycl",
         ),
     }
+    # (block_type, QK_constant) the bytes formula must reference for each arm, so a
+    # copy-paste that swaps another type's block size into this arm's bytes line is
+    # caught rather than merely checking that *some* profile_label.bytes exists.
+    bytes_formula = {
+        "mulmat.mmvq.q4_0_soa":       ("block_q4_0", "QK4_0"),
+        "mulmat.mmvq.q8_0_soa":       ("block_q8_0", "QK8_0"),
+        "mulmat.mmvq.q4_0_coalesced": ("block_q4_0", "QK4_0"),
+        "mulmat.mmvq.q8_0_coalesced": ("block_q8_0", "QK8_0"),
+        "mulmat.mmvq.q4_0_aos":       ("block_q4_0", "QK4_0"),
+        "mulmat.mmvq.q8_0_aos":       ("block_q8_0", "QK8_0"),
+        "mulmat.mmvq.q4_k_soa":       ("block_q4_K", "QK_K"),
+        "mulmat.mmvq.q6_k_soa":       ("block_q6_K", "QK_K"),
+    }
     assert len(bodies) == 8
+    assert set(bytes_formula) == set(bodies)
     for label, body in bodies.items():
         assert f'"{label}"' in body, f"{label}: missing profile label"
         assert "mmvq_profile_label(" in body, f"{label}: does not call the shared mmvq_profile_label() helper"
         assert "profile_label.bytes" in body, f"{label}: does not set profile_label.bytes"
-        assert "profile_label.category             = " not in body, f"{label}: still hand-assigns .category"
-        assert "profile_label.queue_kind           = " not in body, f"{label}: still hand-assigns .queue_kind"
-        assert (
-            "profile_label.device               = ggml_sycl_get_device_id_from_queue" not in body
-        ), f"{label}: still hand-assigns .device"
+        # Whitespace-proof: match the field assignment regardless of the column
+        # alignment clang-format happens to choose, so a hand-assignment reintroduced
+        # with different spacing is still caught.
+        for field in ("category", "queue_kind", "device"):
+            assert not re.search(rf"profile_label\.{field}\s*=", body), f"{label}: still hand-assigns .{field}"
+
+        bytes_assignment = re.search(r"profile_label\.bytes\s*=\s*([^;]+);", body)
+        assert bytes_assignment, f"{label}: no profile_label.bytes = ...; assignment found"
+        bytes_expr = bytes_assignment.group(1)
+        block_type, qk_const = bytes_formula[label]
+        assert f"sizeof({block_type})" in bytes_expr, (
+            f"{label}: bytes formula does not reference sizeof({block_type}): {bytes_expr!r}"
+        )
+        assert re.search(rf"\b{qk_const}\b", bytes_expr), (
+            f"{label}: bytes formula does not reference {qk_const}: {bytes_expr!r}"
+        )
 
 
 if __name__ == "__main__":

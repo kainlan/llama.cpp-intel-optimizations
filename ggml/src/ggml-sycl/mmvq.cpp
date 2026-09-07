@@ -3560,8 +3560,8 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -3912,8 +3912,8 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q4_0_coalesced", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_0) / QK4_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -4188,8 +4188,8 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -4636,8 +4636,8 @@ static void mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q4_0_aos", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_0) / QK4_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -4833,8 +4833,8 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_aos", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -5000,8 +5000,8 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q4_k_soa", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_K) / QK_K;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
@@ -5063,8 +5063,8 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void *    vx,
     const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
     ggml_sycl_profile_label profile_label =
         mmvq_profile_label(*stream, "mulmat.mmvq.q6_k_soa", profile_metadata.c_str(), "mulmat");
-    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
-    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    // bytes: per-launch weight bytes; the CSV column sums over launch count -- see the
+    // mulmat.mmvq.q4_0_soa site above for the full CSV-aggregation note.
     profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q6_K) / QK_K;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
