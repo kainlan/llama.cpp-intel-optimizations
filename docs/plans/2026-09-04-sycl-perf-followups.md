@@ -1007,7 +1007,7 @@ above).
 
 | card | G4 checkpoint (round 3) | kcya round 6 (partial + combine) | speedup |
 |---|---:|---:|---:|
-| B50 M=8 N=K=2880 | 129.6 us | 103.6 + 5.6 = **~109.2 us** | ~2.2x vs round 3's 237.5 us round-1 baseline; ~20% of B50 peak |
+| B50 M=8 N=K=2880 | 129.6 us | 103.6 + 5.6 = **~109.2 us** | ~2.2x vs round 3's 237.5 us round-1 baseline; ~18% of B50 peak |
 | B70 M=8 N=K=2880 | 56.8 us | 43.4 + 6.0 = **~49.4 us** | tracks the B50 improvement |
 
 (Also documented in `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_STORED_GEMM_DEBUG`
@@ -1155,11 +1155,11 @@ Models read from `/Storage/GenAI/models` (the `/models` mergerfs was down after 
   test-sycl-mxfp4-stored-gemm-soa-small-m, test-sycl-compute-buffer-extra-reuse,
   test-sycl-kv-view-extra-reuse, test-sycl-selector-fallback-source,
   test-sycl-profiling-queue-property-source: all `100% tests passed`.
-- Python gates on the final tree: selector-fallback 17/17, profiling-queue-property 11/11.
+- Python gates on the final tree: selector-fallback 17/17 at 6e54ba2eb and 18/18 after the 3tqc merge 8d981ecba, profiling-queue-property 11/11.
 - `GGML_SYCL_EXTRA_LEAK_PROBE=1` pp1024 `-r 5` B50: every reset `kept=838 (~20.0 MB) released=838
-  @ sizeof=25048` (was ~221.9 MB per reset at sizeof=277,704 before h9uv); pp1024 1298.6 t/s (record only).
+  @ sizeof=25048` (was ~221.9 MB per reset at sizeof=277,712 before h9uv); pp1024 1298.6 t/s (record only).
 - Shmem 0.51-0.53 GB throughout, MemAvailable >= 221 GB, zero GT reset / guc_id / CAT error lines.
 Deferred until `/models` returns: the L4 long-prompt baselines and the L3 real six-pair table (their
 scripts hardcode `/models`). Final integration reviews on llama.cpp-vtfs: c-91qe (fixed by
-llama.cpp-aenv), c-s29e (fixed by llama.cpp-3tqc); the RssAnon-flat criterion is recorded on
+llama.cpp-aenv), c-s29e (fixed by llama.cpp-3tqc), c-6mg8 (round 3, PASS); the RssAnon-flat criterion is recorded on
 llama.cpp-h9uv as a plateau at 619 MB from decode 2 (two-generation window by L2's design).
