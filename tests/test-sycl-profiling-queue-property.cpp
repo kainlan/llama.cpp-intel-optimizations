@@ -149,13 +149,18 @@ int main(int, char ** argv) {
     void *        q_pre_cache_addr = (void *) &q_pre_cache;
 
     // Force cache creation for this device the same way real weight/compute
-    // allocation does: ggml_backend_sycl_buffer_type_alloc_buffer()
-    // (ggml-sycl.cpp) unconditionally calls the CREATING accessor
-    // ggml_sycl::get_unified_cache_for_device() before it does anything
-    // else, for every allocation regardless of KV/compute/weights policy --
-    // so a single small buffer allocation through the backend's default
-    // buffer type is sufficient, without needing to load a real model (the
-    // heavier approach test-sycl-two-context-ownership.cpp uses).
+    // allocation does, so a single small buffer allocation through the
+    // backend's default buffer type is sufficient here, without needing to
+    // load a real model (the heavier approach
+    // test-sycl-two-context-ownership.cpp uses). Neither call site below is
+    // itself unconditional, but between them cache creation is reached on
+    // every configuration this test runs under: with the VRAM arena enabled
+    // (the default), ggml_backend_sycl_buffer_type_alloc_buffer()
+    // (ggml-sycl.cpp:35280) calls the CREATING accessor
+    // ggml_sycl::get_unified_cache_for_device() when routing through the
+    // RUNTIME zone; regardless of the arena, unified_alloc()'s DEVICE_VRAM
+    // tier (unified-cache.cpp:12640) calls the same creating accessor to
+    // read the cache's current VRAM usage as part of its overcommit guard.
     ggml_init_params params = { 4 * 1024, nullptr, true };
     ggml_context *   ctx    = ggml_init(params);
     if (!ctx) {
