@@ -3511,13 +3511,12 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
 
     // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 SOA decode arm, previously
     // dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 arms below.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q4_0_soa";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q4_0_soa", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_0) / QK4_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -3558,13 +3557,12 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     // P4 TG-cost-visibility (llama.cpp-os8k): SOA-layout arm of the same
     // Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS sibling,
     // further down this file) comment for the full rationale.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q8_0_soa";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_soa", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -3911,13 +3909,12 @@ static void coalesced_mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     // P4 TG-cost-visibility (llama.cpp-0av5): Q4_0 COALESCED decode arm,
     // previously dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0
     // coalesced sibling below.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q4_0_coalesced";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q4_0_coalesced", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_0) / QK4_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4188,13 +4185,12 @@ static void coalesced_mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     // P4 TG-cost-visibility (llama.cpp-os8k): COALESCED-layout arm of the
     // same Q8_0 decode dispatch -- see mul_mat_vec_q8_0_q8_1_sycl's (AOS
     // sibling) comment above for the full rationale.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q8_0_coalesced";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_coalesced", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4637,13 +4633,12 @@ static void mul_mat_vec_q4_0_q8_1_sycl(const void *    vx,
     // on the 2026-09-04 B50 capture Mistral Q4_0 resolved to the coalesced
     // arm (llama.cpp-qmwx, comment c-9fme) -- previously dark to
     // GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 AOS sibling below.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q4_0_aos";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q4_0_aos", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_0) / QK4_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -4835,13 +4830,12 @@ static void mul_mat_vec_q8_0_q8_1_sycl(const void *    vx,
     // ggml_sycl_mmvq_dispatch) get the identical treatment for the same
     // reason -- which of the three actually fires depends on this weight's
     // resolved layout, not knowable from this function alone.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q8_0_aos";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q8_0_aos", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q8_0) / QK8_0;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -5003,13 +4997,12 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void *    vx,
 
     // P4 TG-cost-visibility (llama.cpp-0av5): Q4_K SOA decode arm, previously
     // dark to GGML_SYCL_KERNEL_PROFILE; same wrapper as the Q8_0 arms above.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q4_k_soa";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q4_k_soa", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q4_K) / QK_K;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
@@ -5067,13 +5060,12 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void *    vx,
     // P4 TG-cost-visibility (llama.cpp-0av5): Q6_K SOA decode arm (the LM
     // head for K-quant models), previously dark to GGML_SYCL_KERNEL_PROFILE;
     // same wrapper as the Q8_0 arms above.
-    ggml_sycl_profile_label profile_label{};
-    profile_label.name                 = "mulmat.mmvq.q6_k_soa";
-    profile_label.category             = "mulmat";
-    profile_label.queue_kind           = "compute";
-    const std::string profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
-    profile_label.metadata             = profile_metadata.c_str();
-    profile_label.device               = ggml_sycl_get_device_id_from_queue(*stream);
+    const std::string       profile_metadata = "ncols=" + std::to_string(ncols) + ";nrows=" + std::to_string(nrows);
+    ggml_sycl_profile_label profile_label =
+        mmvq_profile_label(*stream, "mulmat.mmvq.q6_k_soa", profile_metadata.c_str(), "mulmat");
+    // The profiler CSV `bytes` column is the SUM over count launches (sycl-kernel-profiler.cpp
+    // aggregate.bytes += label.bytes), so this is the per-launch weight-bytes figure, not a total.
+    profile_label.bytes = (size_t) ncols * nrows * sizeof(block_q6_K) / QK_K;
 
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
