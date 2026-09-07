@@ -141,11 +141,7 @@ static bool test_graph_scratch_owner_survives_pool_reset_and_growth() {
 #endif
 
 int main(int, char ** argv) {
-#if defined(GGML_USE_SYCL)
     sycl_test_selector_fallback(argv, "level_zero:0");
-#else
-    (void) argv;
-#endif
     int failed = 0;
     failed += !test_mxfp4_coalesced_decode_scratch_uses_graph_shape();
     failed += !test_unsupported_dense_dtype_has_zero_demand();

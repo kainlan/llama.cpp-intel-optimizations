@@ -21,21 +21,19 @@ int main() {
 }
 #else
 
-#    include "ggml-sycl/compute-buffer-manager.hpp"
-#    include "sycl-selector-fallback.hpp"
-
-#    include <sycl/sycl.hpp>
+#include "ggml-sycl/compute-buffer-manager.hpp"
+#include "sycl-selector-fallback.hpp"
+#include <sycl/sycl.hpp>
 
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
 
-#    define TEST_ASSERT(cond, msg)                                        \
-        do {                                                              \
-            if (!(cond)) {                                                \
-                fprintf(stderr, "  FAIL: %s (line %d)\n", msg, __LINE__); \
-                return false;                                             \
-            }                                                             \
-        } while (0)
+#define TEST_ASSERT(cond, msg) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "  FAIL: %s (line %d)\n", msg, __LINE__); \
+        return false; \
+    } \
+} while (0)
 
 #define RUN_TEST(test_fn) do { \
     printf("Running %s...\n", #test_fn); \

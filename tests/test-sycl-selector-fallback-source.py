@@ -117,13 +117,24 @@ CMAKE_FILES = (TESTS_CMAKE, GGML_SYCL_CMAKE)
 SETENV_PATTERN = re.compile(r'setenv\(\s*"ONEAPI_DEVICE_SELECTOR"')
 EXECV_PATTERN = re.compile(r'execv\(\s*"/proc/self/exe"')
 HELPER_CALL_PATTERN = re.compile(r"sycl_test_selector_fallback\s*\(")
+# The canonical inline block's guard, both accepted spellings: `!getenv(...)`
+# and `!std::getenv(...)`. Quality round 1 (rev-5q1r-quality-1, c-h331
+# should-fix 1) found the earlier `remainder.lstrip(...).startswith("if")`
+# check accepted ANY first statement beginning with the two letters "if" --
+# `if (want_debug()) { enable_debug(); }` or a bare `iface_init();` (which
+# merely starts with the same two characters) both read as compliant as long
+# as the canonical block appeared somewhere later in the 500-char window.
+INLINE_GUARD_PATTERN = re.compile(r'if\s*\(\s*!\s*(?:std::)?getenv\s*\(\s*"ONEAPI_DEVICE_SELECTOR"')
 MAIN_WITH_ARGV_PATTERN = re.compile(r"int\s+main\s*\([^)]*char\s*\*\*\s*argv[^)]*\)")
 MAIN_SIGNATURE_PATTERN = re.compile(r"int\s+main\s*\([^)]*\)\s*\{")
 
 _WHITESPACE = re.compile(r"\s+")
 _LINE_COMMENT = re.compile(r"//[^\n]*")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-_PP_LINE = re.compile(r"#[^\n]*")
+# A preprocessor directive line, following backslash-newline continuations
+# (a multi-line `#define X(a) \` in main()'s preamble must be skipped whole,
+# not just its first physical line -- quality round 1, c-h331 nit 4).
+_PP_LINE = re.compile(r"#[^\n]*(?:\\\n[^\n]*)*")
 
 # Files that setenv("ONEAPI_DEVICE_SELECTOR" in their own main() but are
 # deliberately NOT part of this port (llama.cpp-5q1r, lead guidance c-kjzk),
@@ -132,17 +143,23 @@ _PP_LINE = re.compile(r"#[^\n]*")
 # and see test_excluded_files_are_still_accounted_for, which makes an
 # exclusion self-expire the moment its stated reason stops being true.
 EXCLUDED_FILES = {
-    # Not registered in EITHER CMakeLists.txt (`grep -rn
-    # "test-tiled-weight-loading" tests/CMakeLists.txt
-    # ggml/src/ggml-sycl/CMakeLists.txt` returns nothing) -- dead source,
-    # nothing to build or gate. Its ONEAPI_DEVICE_SELECTOR usage is also a
-    # different mechanism from every other file here: most occurrences are
-    # inside subprocess COMMAND STRINGS (`std::string(...) + binary + ...`)
-    # that set the variable for a CHILD llama-cli process it shells out to
-    # via run_command() -- a fresh process with its own libccl load, immune
-    # to this process's memoization. Only its own top-level main() setenv()
-    # shares the bug shape, and porting a file nothing builds would not fix
-    # anything a test run could observe.
+    # THE DISCRIMINATING REASON (quality round 1, c-h331 nit 6: an earlier
+    # version of this comment led with "not registered in either
+    # CMakeLists.txt", which does NOT discriminate -- tests/test-sycl-
+    # compute-buffers.cpp and tests/test-sycl-pointer-types.cpp are equally
+    # unregistered and are both ported and gated. What actually justifies
+    # excluding THIS file is its mechanism): most of this file's
+    # ONEAPI_DEVICE_SELECTOR occurrences are inside subprocess COMMAND
+    # STRINGS (`std::string(...) + binary + ...`) that set the variable for
+    # a CHILD llama-cli process it shells out to via run_command() -- a
+    # fresh process with its own libccl load, immune to this process's
+    # memoization. Only its own top-level main() setenv() shares the bug
+    # shape this gate is about. It is ALSO not registered in either
+    # CMakeLists.txt (`grep -rn "test-tiled-weight-loading"
+    # tests/CMakeLists.txt ggml/src/ggml-sycl/CMakeLists.txt` returns
+    # nothing) -- dead source, nothing to build or gate -- but that fact
+    # alone would not be enough to justify excluding it, since plenty of
+    # ported, gated files share it.
     "tests/test-tiled-weight-loading.cpp",
 }
 
@@ -183,8 +200,20 @@ def _has_canonical_inline_block(text):
 def _find_main_bodies(text):
     """Yields (body_start, body_end) character offsets for the region
     strictly between each main(...) function's opening brace and its
-    matching closing brace (found by depth-counted brace scanning, so
-    nested braces inside the body do not end it early)."""
+    matching closing brace, found by depth-counted brace scanning.
+
+    LIMITATION (quality round 1, c-h331 nit 3): this scanner is NOT
+    string/comment aware -- a `{` or `}` inside a string literal or a
+    comment (e.g. `printf("open brace: {\\n")` or `// note: }`) is counted
+    as a real brace and can mis-bound a main() body. This fails CLOSED, not
+    open: a stray brace can only make the counted body end too early or too
+    late, which in practice makes an otherwise-compliant file read as
+    offender_not_first_statement (verified: both a string-literal `{` and a
+    line-comment `}` placed before a correct call still classify as an
+    offender, never as a false compliant). Proper string/comment-aware
+    scanning would remove this blind spot; it has not been implemented
+    because every real hit today is fail-closed and a human reads the
+    failure message rather than trusting a silent false pass."""
     for m in MAIN_SIGNATURE_PATTERN.finditer(text):
         start = m.end()
         depth = 1
@@ -219,15 +248,26 @@ def _first_real_offset(text, start, end):
 
 def _first_statement_is_valid(text, offset):
     """True if the real code starting at `offset` is either a direct call
-    to the shared helper, or the `if` guard opening the canonical inline
-    re-exec block (identified structurally: the setenv() call inside it is
-    close to `offset`, and is itself followed by execv() within a short
-    window)."""
+    to the shared helper, or specifically the canonical inline block's
+    guarding `if (!getenv("ONEAPI_DEVICE_SELECTOR"` / `if
+    (!std::getenv("ONEAPI_DEVICE_SELECTOR"` (INLINE_GUARD_PATTERN), whose
+    setenv() is itself followed by execv() within a short window.
+
+    Quality round 1 (rev-5q1r-quality-1, c-h331 should-fix 1) found the
+    predecessor of this check -- `remainder.lstrip(" \\t").startswith("if")`
+    -- accepted ANY first statement merely beginning with the two letters
+    "if", not specifically the ONEAPI_DEVICE_SELECTOR guard: both
+    `if (want_debug()) { enable_debug(); }` and a bare `iface_init();`
+    (which does not even start with "if (", just the substring "if") read as
+    compliant as long as the canonical block appeared later in the 500-char
+    window. INLINE_GUARD_PATTERN anchors the match to the guard's actual
+    condition instead of its first two characters."""
     remainder = text[offset : offset + 500]
     if HELPER_CALL_PATTERN.match(remainder):
         return True
-    if remainder.lstrip(" \t").startswith("if"):
-        setenv_m = SETENV_PATTERN.search(remainder)
+    guard_m = INLINE_GUARD_PATTERN.match(remainder)
+    if guard_m:
+        setenv_m = SETENV_PATTERN.search(remainder, guard_m.end())
         if setenv_m and setenv_m.start() < 200:
             window = remainder[setenv_m.end() : setenv_m.end() + 400]
             if EXECV_PATTERN.search(window):
@@ -274,7 +314,7 @@ def _classify(text):
 def _offenders():
     offenders = []
     for path in _iter_source_files():
-        verdict = _classify(path.read_text())
+        verdict = _classify(path.read_text(encoding="utf-8"))
         if verdict.startswith("offender"):
             rel = path.relative_to(REPO_ROOT).as_posix()
             offenders.append(f"{rel} ({verdict})")
@@ -420,6 +460,64 @@ def test_first_statement_position_is_checked():
     assert _classify(setenv_outside_main) == "offender_not_first_statement"
 
 
+def test_inline_guard_pattern_is_specific():
+    """Fixture proving the inline-form first-statement check is anchored to
+    the actual ONEAPI_DEVICE_SELECTOR guard, not to any statement that
+    merely starts with the two letters "if" -- quality round 1
+    (rev-5q1r-quality-1, c-h331 should-fix 1) constructed exactly these two
+    counter-examples against the predecessor check
+    (`remainder.lstrip(" \\t").startswith("if")`), both of which it wrongly
+    accepted as compliant because the canonical block happened to appear
+    later in the same 500-char lookahead window."""
+    unrelated_if_before_block = (
+        'int main(int, char ** argv) {\n'
+        '    if (want_debug()) { enable_debug(); }\n'
+        '    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(unrelated_if_before_block) == "offender_not_first_statement"
+
+    if_prefixed_identifier_before_block = (
+        'int main(int, char ** argv) {\n'
+        '    iface_init();\n'
+        '    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(if_prefixed_identifier_before_block) == "offender_not_first_statement"
+
+    # Both canonical spellings of the guard must still be accepted when they
+    # genuinely are the first statement.
+    bare_getenv_first = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(bare_getenv_first) == "compliant"
+
+    std_getenv_first = (
+        'int main(int, char ** argv) {\n'
+        '    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(std_getenv_first) == "compliant"
+
+
 def test_recursive_scan_reaches_known_subdirectories():
     """Confirms rglob (not glob) is actually used and actually descends --
     spec round 2 (c-xicg finding 4) found *.cpp files in subdirectories of
@@ -452,14 +550,14 @@ def test_excluded_files_are_still_accounted_for():
     for rel in EXCLUDED_FILES:
         path = REPO_ROOT / rel
         assert path.is_file(), f"excluded file {rel} no longer exists -- update this gate's EXCLUDED_FILES"
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         assert SETENV_PATTERN.search(text), (
             f"excluded file {rel} no longer contains a bespoke ONEAPI_DEVICE_SELECTOR setenv() -- "
             "the exclusion may no longer be needed; re-check and drop it from EXCLUDED_FILES if so"
         )
         stem = path.stem  # basename without .cpp -- the CMake target/source name
         for cmake_path in CMAKE_FILES:
-            cmake_text = cmake_path.read_text()
+            cmake_text = cmake_path.read_text(encoding="utf-8")
             assert stem not in cmake_text, (
                 f"excluded file {rel} (target name '{stem}') now appears in "
                 f"{cmake_path.relative_to(REPO_ROOT)} -- it has been registered, so the "
@@ -471,7 +569,7 @@ def test_excluded_files_are_still_accounted_for():
 def test_helper_header_exists_and_defines_the_function():
     header = TESTS_DIR / "sycl-selector-fallback.hpp"
     assert header.is_file(), "tests/sycl-selector-fallback.hpp is missing"
-    text = header.read_text()
+    text = header.read_text(encoding="utf-8")
     assert "sycl_test_selector_fallback" in text
     assert "execv(" in text, "the helper must re-exec, not just setenv()"
     assert 'setenv("ONEAPI_DEVICE_SELECTOR"' in text, "the helper must set ONEAPI_DEVICE_SELECTOR itself"
@@ -484,7 +582,7 @@ def test_every_helper_caller_declares_argv_in_main():
     state meaningless (nothing was actually built to run)."""
     missing = []
     for path in _iter_source_files():
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         if not HELPER_CALL_PATTERN.search(text):
             continue
         if not MAIN_WITH_ARGV_PATTERN.search(text):

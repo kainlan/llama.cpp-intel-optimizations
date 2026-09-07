@@ -3,16 +3,16 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-integrity
 
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
-#include "ggml.h"
-#include "sycl-selector-fallback.hpp"
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-sycl.h"
+#include "sycl-selector-fallback.hpp"
 
 #if !defined(GGML_USE_SYCL)
 int main() {

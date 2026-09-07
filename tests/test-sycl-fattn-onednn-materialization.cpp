@@ -28,8 +28,8 @@
 #include "ggml-sycl/unified-cache.hpp"
 #include "sycl-selector-fallback.hpp"
 
-#include <cmath>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>

@@ -7,10 +7,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "ggml.h"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
-#include "ggml.h"
 #include "sycl-selector-fallback.hpp"
 
 #include <cstdio>

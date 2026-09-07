@@ -44,18 +44,18 @@
 // CLAUDE.md describes ("Host-resident weights -> CPU dispatch, not GPU PCIe
 // zero-copy").  The cases below split the two axes apart instead.
 
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
-#include "ggml-sycl/ggml-sycl-test.hpp"
-#include "ggml.h"
-#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-sycl.h"
+#include "ggml-sycl/ggml-sycl-test.hpp"
+#include "sycl-selector-fallback.hpp"
 
 #if !defined(GGML_USE_SYCL)
 int main() {

@@ -4,8 +4,8 @@
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-concurrent
 
 #include "ggml-sycl.h"
-#include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+#include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
 

@@ -7,18 +7,18 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-mxfp4-xmx-tiled
 
+#include "test-skip.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <random>
+#include <sycl/sycl.hpp>
+
 #include "ggml-common.h"
 #include "ggml-sycl/moe-tile-convert.hpp"
 #include "ggml-sycl/moe-xmx-fused.hpp"
 #include "sycl-selector-fallback.hpp"
-#include "test-skip.h"
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <random>
-#include <sycl/sycl.hpp>
-#include <vector>
 
 #if !SYCL_XMX_MOE_AVAILABLE
 int main() {

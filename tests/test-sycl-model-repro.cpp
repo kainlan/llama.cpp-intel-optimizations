@@ -3,18 +3,18 @@
 // Usage:
 //   LLAMA_SYCL_TEST_MODEL=/path/to/model.gguf ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-model-repro
 
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
-#include "llama.h"
-#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#include "llama.h"
+#include "ggml-cpu.h"
+#include "ggml-sycl.h"
+#include "sycl-selector-fallback.hpp"
 
 #if !defined(GGML_USE_SYCL)
 int main() {

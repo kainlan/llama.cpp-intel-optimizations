@@ -4,8 +4,8 @@
 #include "ggml-sycl.h"
 #include "sycl-selector-fallback.hpp"
 
-#include <cstdio>
 #include <cstdlib>
+#include <cstdio>
 #include <sycl/sycl.hpp>
 
 #if !defined(GGML_USE_SYCL)
