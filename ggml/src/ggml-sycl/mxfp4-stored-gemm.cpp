@@ -187,10 +187,12 @@ SYCL_ESIMD_FUNCTION inline void mxfp4_stored_gemm_prefetch_line(const uint8_t * 
 // capped at k_tiles (a partition with zero k-tiles to reduce contributes
 // nothing but launch overhead).
 //
-// GGML_SYCL_STORED_GEMM_KSPLIT overrides the computed value outright (any
-// positive integer, clamped to [1, k_tiles]) -- the fast, no-rebuild knob
-// this task's hardware round-trips are expected to sweep; see this
-// commit's body for the values already tried.
+// GGML_SYCL_STORED_GEMM_KSPLIT overrides the computed value outright: any
+// positive integer is accepted; non-positive or non-numeric values are
+// ignored (the heuristic above runs instead), and the accepted value is
+// clamped to k_tiles at the UPPER end only, never clamped up to 1 -- the
+// fast, no-rebuild knob this task's hardware round-trips are expected to
+// sweep; see this commit's body for the values already tried.
 int mxfp4_stored_gemm_ksplit_for(sycl::queue & queue, int64_t n_tiles, int64_t k_tiles) {
     if (n_tiles <= 0 || k_tiles <= 0) {
         return 1;
