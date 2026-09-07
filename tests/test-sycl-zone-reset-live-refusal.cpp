@@ -47,6 +47,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -254,14 +255,11 @@ void test_host_zone(int device, sycl::queue * queue) {
 
 }  // namespace
 
-int main() {
-    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {
-        // Match the sibling SYCL gates: pin the validation card so a bare ctest
-        // run cannot perturb a measurement on the other GPU. ctest also sets
-        // this via ENVIRONMENT; this is only a fallback for bare invocation and
-        // must be set before the SYCL runtime enumerates devices.
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
-    }
+int main(int, char ** argv) {
+    // Match the sibling SYCL gates: pin the validation card so a bare ctest
+    // run cannot perturb a measurement on the other GPU. ctest also sets this
+    // via ENVIRONMENT; this is only a fallback for bare invocation.
+    sycl_test_selector_fallback(argv, "level_zero:1");
 
     const int device = 0;  // in-process index after selector filtering
 

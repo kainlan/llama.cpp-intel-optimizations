@@ -6,9 +6,10 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/mem-handle.hpp"
-#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
+#include "ggml-sycl/moe-resolved-batch.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+#include "sycl-selector-fallback.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -661,10 +662,8 @@ static bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
     return true;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     ggml_sycl::unified_cache * cache = nullptr;
     sycl::queue *              q     = nullptr;

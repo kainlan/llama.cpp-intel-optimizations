@@ -21,18 +21,21 @@ int main() {
 }
 #else
 
-#include "ggml-sycl/compute-buffer-manager.hpp"
-#include <sycl/sycl.hpp>
+#    include "ggml-sycl/compute-buffer-manager.hpp"
+#    include "sycl-selector-fallback.hpp"
+
+#    include <sycl/sycl.hpp>
 
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
 
-#define TEST_ASSERT(cond, msg) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "  FAIL: %s (line %d)\n", msg, __LINE__); \
-        return false; \
-    } \
-} while (0)
+#    define TEST_ASSERT(cond, msg)                                        \
+        do {                                                              \
+            if (!(cond)) {                                                \
+                fprintf(stderr, "  FAIL: %s (line %d)\n", msg, __LINE__); \
+                return false;                                             \
+            }                                                             \
+        } while (0)
 
 #define RUN_TEST(test_fn) do { \
     printf("Running %s...\n", #test_fn); \
@@ -225,10 +228,8 @@ static bool test_stats_tracking() {
     return true;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
     printf("SYCL Compute Buffer Management Tests\n");
     printf("=====================================\n\n");
     try {

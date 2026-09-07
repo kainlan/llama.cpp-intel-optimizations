@@ -1,5 +1,6 @@
 #include "ggml-backend-impl.h"
 #include "ggml-sycl/fattn-onednn.hpp"
+#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
 
 #include <sys/wait.h>
@@ -364,9 +365,10 @@ static int run_descriptor_tests() {
     // Keep progress/final markers deterministic even when CTest redirects output.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+    // The selector fallback runs at the top of main(), before fork(), not here:
+    // it must be the first statement of the whole process (see
+    // sycl-selector-fallback.hpp) -- by the time this (forked child) runs,
+    // libccl has already memoized whatever main() pinned.
     if (!configure_bounded_runtime()) {
         std::fprintf(stderr, "FAIL: could not configure bounded SYCL test allocations\n");
         return 1;
@@ -460,7 +462,9 @@ static int run_descriptor_tests() {
     return ok ? 0 : 1;
 }
 
-int main() {
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
+
     // Run SYCL in a fresh child so waitpid gives an unambiguous mutation proof:
     // the numerical failure must be WIFEXITED with status 1, never a signal.
     const pid_t child = fork();

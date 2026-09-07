@@ -3,17 +3,18 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-layout-bytes
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-quants.h"
+#include "ggml-sycl.h"
+#include "ggml-sycl/common.hpp"
+#include "ggml-sycl/ggml-sycl-test.hpp"
+#include "ggml.h"
+#include "sycl-selector-fallback.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
-#include "ggml-sycl/ggml-sycl-test.hpp"
-#include "ggml-sycl/common.hpp"
-#include "ggml-quants.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -30,10 +31,8 @@ static bool expect_eq(const char * label, size_t got, size_t expected) {
     return true;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {

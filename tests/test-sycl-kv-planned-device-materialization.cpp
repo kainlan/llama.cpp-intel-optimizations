@@ -7,10 +7,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
-#include "ggml.h"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+#include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,10 +31,8 @@ int main() {
             }                                         \
         } while (0)
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0,1", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0,1");
     setenv("GGML_SYCL_KV_HOST", "0", 1);
     setenv("GGML_SYCL_VRAM_ARENA", "0", 1);
     setenv("GGML_SYCL_ALLOC_PHASE_GATE", "0", 1);

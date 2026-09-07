@@ -2806,6 +2806,21 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# llama.cpp-5q1r (plan task S6): source gate asserting every tests/*.cpp that
+# setenv()s ONEAPI_DEVICE_SELECTOR in its own main() does so through the
+# shared tests/sycl-selector-fallback.hpp re-exec helper, not a no-op bare
+# setenv() or an independent execv() copy -- see that file and the gate
+# script's own docstring for why a plain setenv() cannot work here. Host-only,
+# reads the sources as text. Same registration shape as
+# test-sycl-extra-leak-probe-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-selector-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-selector-fallback-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
 # llama.cpp-pktr: test-sycl-layout-choice.cpp is already registered, in
 # ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
 # ctest name differs from the executable target name). Do not register it

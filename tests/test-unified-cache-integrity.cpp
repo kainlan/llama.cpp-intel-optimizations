@@ -3,15 +3,16 @@
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-unified-cache-integrity
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-sycl.h"
+#include "ggml.h"
+#include "sycl-selector-fallback.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
-
-#include "ggml.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -135,10 +136,8 @@ static bool stress_layout_cache(ggml_context * ctx,
     return ok;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     try {
         sycl::queue q;

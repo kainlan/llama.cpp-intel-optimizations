@@ -3,17 +3,18 @@
 // Usage:
 //   LLAMA_SYCL_TEST_MODEL=/path/to/model.gguf ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-model-repro
 
+#include "ggml-cpu.h"
+#include "ggml-sycl.h"
+#include "llama.h"
+#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
-
-#include "llama.h"
-#include "ggml-cpu.h"
-#include "ggml-sycl.h"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -40,9 +41,7 @@ static const char * pick_model_path(int argc, char ** argv) {
 }
 
 int main(int argc, char ** argv) {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+    sycl_test_selector_fallback(argv, "level_zero:0");
     setenv("GGML_SYCL_HOST_CACHE_GUARD", "1", 1);
     setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);
 
