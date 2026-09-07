@@ -18,22 +18,36 @@ unmodified tree) via GGML_SYCL_YKE2_UNIFIED_CACHE_SOURCE,
 GGML_SYCL_YKE2_DPCT_HELPER_SOURCE and GGML_SYCL_YKE2_GGML_SYCL_CMAKE_SOURCE;
 the defaults are the in-tree files.
 
-CONTRACT (quality review c-4rrx): every check in this file that looks for a
-TOKEN -- a signature, a brace, a call, an `if`/`else` keyword, a macro
-directive, a known-buggy pattern -- reads a MASKED copy of the relevant
-text (via _mask_comments_and_strings()), never the original; a token
-search against unmasked text is foolable in both directions by an
+CONTRACT (quality review c-4rrx, extended c-qnbs): every check in this file
+that looks for a TOKEN -- a signature, a brace, a call, an `if`/`else`
+keyword, a macro directive, a known-buggy pattern -- reads a MASKED copy of
+the relevant text (via _mask_comments_and_strings()), never the original; a
+token search against unmasked text is foolable in both directions by an
 explanatory comment quoting it. Only the REPORTING/EXTRACTION of already-
 located condition TEXT (for an error message, or a returned list of
-conditions) reads the original. The two exceptions are matching_brace()/
-matching_paren(), which are themselves already comment/string-aware
-internally for finding a closing delimiter (that is the whole reason
-_mask_comments_and_strings() is needed only for the *initial* token scan),
-and the two `sycl_cmake_source`/`pre_sycl_cmake` substring checks, which
-stay on the raw CMakeLists.txt text by design -- _mask_comments_and_strings()
-only understands C++ comment syntax (`//`, `/* */`), not CMake's `#`, so
-"masking" a CMake file with it would not actually mask anything and would
-misleadingly imply protection that is not there.
+conditions) reads the original. THREE exceptions:
+
+  - matching_brace()/matching_paren(), which are themselves already
+    comment/string-aware internally for finding a closing delimiter (that
+    is the whole reason _mask_comments_and_strings() is needed only for
+    the *initial* token scan).
+  - The two `sycl_cmake_source`/`pre_sycl_cmake` substring checks, which
+    stay on the raw CMakeLists.txt text by design --
+    _mask_comments_and_strings() only understands C++ comment syntax
+    (`//`, `/* */`), not CMake's `#`, so "masking" a CMake file with it
+    would not actually mask anything and would misleadingly imply
+    protection that is not there.
+  - _find_live_macro_directive(), which reads raw `helper_source` by
+    design rather than a masked copy: it is already
+    line-start-anchored (`^[ \t]*#...`), so a real preprocessor directive
+    must be the FIRST token on its line, which structurally excludes any
+    `//` line comment (those start with `/`, never `#`) without needing
+    masking at all. Its one named residual is the opposite direction from
+    every other check in this file: a directive-shaped line that happens
+    to sit at the start of a line INSIDE a `/* ... */` block comment would
+    still read as live -- a false FAIL, not the false PASS every other
+    unmasked check in this file was found to produce, and not yet observed
+    in practice.
 """
 
 import os
