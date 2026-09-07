@@ -136,56 +136,19 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     ggml_backend_tensor_set(t_act_qs, pack.qs.data(), 0, pack.qs.size());
     ggml_backend_tensor_set(t_act_sc, pack.scales.data(), 0, pack.scales.size() * sizeof(float));
 
-    // NOT ggml_sycl_get_device(0).default_queue(): ctx->stream() is the same
-    // queue production dispatch (and the sibling GPU tests that go through
-    // ggml_backend_graph_compute) submits on -- the correct USM/context
-    // owner for the buffers allocated above. It does NOT, however,
-    // reliably carry sycl::property::queue::enable_profiling in this test
-    // process; see the diagnosis on the profiling-queue construction below.
+    // ctx->stream() is the same queue production dispatch (and the sibling
+    // GPU tests that go through ggml_backend_graph_compute) submits on --
+    // the correct USM/context owner for the buffers allocated above, and
+    // (llama.cpp-yke2, S7: unconditional sycl::property::queue::enable_profiling
+    // in dpct's create_queue_impl) now reliably carries
+    // sycl::property::queue::enable_profiling in every process, so it is
+    // used directly for both the uploads above and every kernel launch
+    // below -- no separate profiling-only queue construction, and no extra
+    // wait to order it against the uploads, is needed any more.
     auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     sycl::queue & q        = *sycl_ctx->stream();
 
     const bool profiling_requested = std::getenv("GGML_SYCL_KERNEL_PROFILE") != nullptr;
-
-    // The three ggml_backend_tensor_set calls above upload through `q`; the
-    // kernel below launches on a SEPARATE queue (`submit_q`, constructed
-    // next) whenever profiling is requested. Neither queue's in-order
-    // property orders work submitted to the OTHER one, so make every upload
-    // provably complete before that second queue is even built, rather than
-    // relying on however ggml_backend_tensor_set happens to synchronize
-    // internally today (llama.cpp-6f73 c-nvf1 should-fix 4). The
-    // non-profiling path is unaffected -- submit_q is a plain copy of `q`
-    // there, so the two calls are already ordered by that queue's own
-    // in-order property.
-    if (profiling_requested) {
-        q.wait();
-    }
-
-    // Diagnosed at llama.cpp-6f73 (round 3): `q` (ctx->stream()) reliably
-    // lacks sycl::property::queue::enable_profiling in THIS test process,
-    // even though it is the identical unified-cache owner queue a sibling
-    // GPU test profiles correctly through. Root cause: with one visible GPU
-    // (the standard ONEAPI_DEVICE_SELECTOR=level_zero:N pin), the cache's
-    // owner queue is dpct's raw device default queue, whose profiling
-    // support depends on DPCT_PROFILING_ENABLED being defined in whichever
-    // translation unit's copy of dpct's header-only inline queue-
-    // construction functions the linker resolves for the process. That
-    // macro is private to the `ggml-sycl` CMake target; this test's own TU
-    // also instantiates those inlines (via `#include "ggml-sycl/common.hpp"`,
-    // needed for ggml_backend_sycl_context/stream()) WITHOUT it, and the
-    // executable's copy interposes over the library's -- a pre-existing
-    // hazard for any test binary that includes common.hpp directly, not
-    // specific to this kernel and not something G4 fixes here (filed
-    // separately). The local, correct-regardless-of-that-hazard fix: when
-    // profiling is requested, build our OWN queue sharing q's context and
-    // device (so USM allocated against that context stays valid) with the
-    // property set directly, instead of depending on however q itself was
-    // constructed.
-    sycl::queue submit_q = profiling_requested ?
-                               sycl::queue(q.get_context(), q.get_device(),
-                                           sycl::property_list{ sycl::property::queue::in_order{},
-                                                                sycl::property::queue::enable_profiling{} }) :
-                               q;
 
     // Bytes moved per call, for deriving per-launch bandwidth: the whole
     // expert's SOA buffer (17 bytes per 32-element block: 16 nibble-packed +
@@ -211,15 +174,16 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
                                (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
 
     if (profiling_requested) {
-        // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
-        // print the properties the queue we are ABOUT TO SUBMIT ON actually
-        // carries, and assert on THAT queue -- not on `q`, which is known to
-        // lack the property under a single-GPU selector; asserting on `q`
-        // would fire even after the fix above and prove nothing new.
-        const bool has_profiling = submit_q.has_property<sycl::property::queue::enable_profiling>();
-        const bool is_in_order   = submit_q.has_property<sycl::property::queue::in_order>();
+        // Confirms llama.cpp-yke2's S7 (unconditional enable_profiling in
+        // dpct's create_queue_impl) actually reaches this queue: this used
+        // to fail under a single-GPU selector before S7 landed (llama.cpp-6f73,
+        // round 3), which is why this test built its own profiling-only
+        // queue rather than asserting on `q` directly -- that workaround is
+        // gone now that the assert below is expected to hold unconditionally.
+        const bool has_profiling = q.has_property<sycl::property::queue::enable_profiling>();
+        const bool is_in_order   = q.has_property<sycl::property::queue::in_order>();
         std::printf("  queue diag: has_property(enable_profiling)=%d has_property(in_order)=%d addr=%p\n",
-                    (int) has_profiling, (int) is_in_order, (void *) &submit_q);
+                    (int) has_profiling, (int) is_in_order, (void *) &q);
         GGML_ASSERT(has_profiling);
 
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,
@@ -227,9 +191,8 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     }
 
     sycl::event event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
-        submit_q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
-        static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k,
-        {});
+        q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data), static_cast<const float *>(t_act_sc->data),
+        static_cast<float *>(t_dst->data), (int) M, (int) n_out, (int) n_k, {});
 
     if (profiling_requested) {
         // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
@@ -290,7 +253,7 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         for (int it = 0; it < BW_WARMUP + BW_ITERS; ++it) {
             const auto  t0       = std::chrono::steady_clock::now();
             sycl::event bw_event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
-                submit_q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
+                q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
                 static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out,
                 (int) n_k, {});
             bw_event.wait();
