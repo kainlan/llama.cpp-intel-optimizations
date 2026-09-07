@@ -76,14 +76,16 @@ q8_1_activation_pack quantize_activations_q8_1(const float * x, int64_t M, int64
 // docs/backend/sycl-memory-design.md) and passes device pointers in; this
 // function performs no device allocation of its own.
 //
-// `soa_weight_device`, `act_qs_device` and `act_scales_device` must each be
-// at least 32-byte aligned (GGML_ASSERT-checked): the kernel's
-// `block_load<int8_t, 32>` / `block_load<uint8_t, 16>` ESIMD reads off these
-// bases carry vector-alignment requirements that are satisfied only because
-// every offset the kernel computes is itself a multiple of the 32-element
-// block width -- a caller-supplied base that is not itself 32-byte aligned
-// would silently misalign every load from it (llama.cpp-6f73 c-nvf1
-// should-fix 5).
+// `soa_weight_device` and `act_qs_device` must each be at least 32-byte
+// aligned (GGML_ASSERT-checked): the kernel's `block_load<uint8_t, 16>` /
+// `block_load<int8_t, 32>` ESIMD reads off these two bases carry vector-
+// alignment requirements that are satisfied only because every offset the
+// kernel computes is itself a multiple of the 32-element block width -- a
+// caller-supplied base that is not itself 32-byte aligned would silently
+// misalign every load from it. `act_scales_device` carries no such
+// requirement (only ever scalar-subscripted, never block_loaded) and is
+// deliberately not asserted (llama.cpp-6f73 c-py5n should-fix 2, correcting
+// an over-broad round-1 claim).
 //
 //   soa_weight_device: device pointer to the expert's SOA MXFP4 weight
 //                       buffer (quants.hpp layout), n_out rows x n_k cols.

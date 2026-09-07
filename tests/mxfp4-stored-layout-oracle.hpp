@@ -35,7 +35,6 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <string>
 #include <vector>
 
 namespace {
@@ -212,12 +211,13 @@ std::vector<double> preprocess_activation(const std::vector<float> & X, int64_t 
             // the leading 2 bytes by LAYOUT instead of by member name: `d`
             // (ggml_half, fp16) is always the first 2 bytes of block_q8_1
             // regardless of which branch won -- only the accessor name
-            // changes, never the memory layout. Pinned so a future layout
-            // change to block_q8_1 fails the build instead of silently
-            // producing wrong scales (llama.cpp-6f73 c-nvf1 nit 11).
-            static_assert(sizeof(block_q8_1) == 2 * sizeof(ggml_half) + QK8_1,
-                          "block_q8_1 layout changed; the leading-2-byte read of `d` is no longer valid");
-            ggml_fp16_t d_bits;
+            // changes, never the memory layout. Already pinned tree-wide by
+            // ggml-common.h:269's own `static_assert(sizeof(block_q8_1) ==
+            // 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding")`
+            // -- a duplicate assert here would check nothing that assert
+            // does not already guarantee build-wide (llama.cpp-6f73 c-py5n
+            // nit, correcting round 1's redundant local static_assert).
+            ggml_fp16_t        d_bits;
             std::memcpy(&d_bits, &blk, sizeof(d_bits));
             const double d = (double) ggml_fp16_to_fp32(d_bits);
             for (int64_t j = 0; j < QK8_1; ++j) {

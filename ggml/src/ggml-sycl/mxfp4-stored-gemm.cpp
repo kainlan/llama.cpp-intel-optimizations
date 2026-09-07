@@ -10,6 +10,7 @@
 #include "unified-kernel.hpp"  // GGML_SYCL_ESIMD_AVAILABLE, esimd/xmx aliases, SYCL_ESIMD_KERNEL
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,12 +42,13 @@ q8_1_activation_pack quantize_activations_q8_1(const float * x, int64_t M, int64
             // GGML_COMMON_DECL. Read the leading 2 bytes by LAYOUT instead
             // of by member name: `d` (ggml_half, fp16) is always the first
             // 2 bytes of block_q8_1 regardless of which branch won -- only
-            // the accessor name changes, never the memory layout. Pinned so
-            // a future layout change to block_q8_1 fails the build instead
-            // of silently producing wrong scales (llama.cpp-6f73 c-nvf1
-            // nit 11).
-            static_assert(sizeof(block_q8_1) == 2 * sizeof(ggml_half) + QK8_1,
-                          "block_q8_1 layout changed; the leading-2-byte read of `d` is no longer valid");
+            // the accessor name changes, never the memory layout. Already
+            // pinned tree-wide by ggml-common.h:269's own
+            // `static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) +
+            // QK8_1, "wrong q8_1 block size/padding")` -- a duplicate
+            // assert here would check nothing that assert does not already
+            // guarantee build-wide (llama.cpp-6f73 c-py5n nit, correcting
+            // round 1's redundant local static_assert).
             ggml_fp16_t d_bits;
             std::memcpy(&d_bits, &blk, sizeof(d_bits));
             pack.scales[(size_t) (m * nb + b)] = ggml_fp16_to_fp32(d_bits);
@@ -74,18 +76,27 @@ namespace {
 
 // Private re-derivations of mmvq.cpp's mxfp4_e8m0_to_fp32_half_esimd /
 // mxfp4_code_values_esimd bit-tricks (mmvq.cpp:~7370-7405), renamed and
-// confined to this TU's anonymous namespace. Both symbols in mmvq.cpp
-// actually have EXTERNAL linkage (mxfp4_e8m0_to_fp32_half_esimd is a
-// non-static, non-inline, non-template file-scope function at mmvq.cpp:7368,
-// outside that file's own anonymous namespace at :823-957), so this file
-// COULD link against them; that is not the reason for a private copy. The
-// real reason: neither symbol is declared in any shared header, so reaching
-// them from here would mean hand-declaring a prototype for another TU's
-// internal helper -- worse than a small, self-contained re-derivation this
-// TU owns outright. Confining the copy to this TU's own anonymous namespace
-// (llama.cpp-6f73 c-nvf1) rules out any duplicate-symbol collision either
-// way, regardless of which linkage the mmvq.cpp originals carry. The
-// formulas are reproduced verbatim -- E8M0 "halved"
+// confined to this TU's anonymous namespace. The two symbols do NOT share
+// one linkage story (llama.cpp-6f73 c-py5n should-fix 1, correcting the
+// round-1 comment): mxfp4_e8m0_to_fp32_half_esimd is a plain, non-static,
+// non-template file-scope function at mmvq.cpp:7368, outside that file's
+// own anonymous namespace at :823-957 -- ordinary external linkage, and this
+// file COULD declare an extern prototype and link against the exact symbol
+// mmvq.cpp's object file emits. mxfp4_code_values_esimd (mmvq.cpp:7390-7391)
+// is instead an `inline` function TEMPLATE: its instantiations are formally
+// external linkage too, but the compiler is free to discard (COMDAT-fold or
+// simply never emit) any instantiation mmvq.cpp's own TU does not itself
+// use with matching template arguments -- there is no single, guaranteed
+// object-file symbol here to link against the way there is for the plain
+// function, only the template DEFINITION, which is not declared in any
+// shared header. Either way, the reason for a private copy is the same:
+// neither symbol is declared in any shared header, so reaching them from
+// here would mean hand-declaring a prototype (or including this file's
+// private definition) for another TU's internal helper -- worse than a
+// small, self-contained re-derivation this TU owns outright. Confining the
+// copy to this TU's own anonymous namespace rules out any duplicate-symbol
+// collision either way, regardless of which linkage story applies to which
+// original. The formulas are reproduced verbatim -- E8M0 "halved"
 // convention to match GGML_E8M0_TO_FP32_HALF, and the same e2m1
 // magnitude/sign decomposition for the 4-bit code table.
 //
@@ -208,14 +219,16 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     // Worst case (M_TILE=8): 8 * 128 * 4 B = 4 KiB, far under the 128 KiB
     // total SLM this hardware provides per fattn-esimd-f16.hpp:1315's
     // `constexpr size_t slm_budget = 128 * 1024; // Intel Arc has 128 KB
-    // SLM`. moe-xmx-fused.hpp:66 defaults the same notion of "SLM budget"
-    // to 65536 (64 KiB) for its own fused-MoE kernel, but that is a
-    // conservative per-kernel default read back from
-    // `FusedMoEConfig::from_device` (queryable via
-    // `sycl::info::device::local_mem_size`, xmx-esimd-common.hpp:98), not
-    // the hardware ceiling -- the 128 KiB figure is the actual device
-    // capacity and is what applies here. Enforced, not just asserted in
-    // prose, below.
+    // SLM`. moe-xmx-fused.hpp:66's `FusedMoEConfig::slm_size` member default
+    // (65536, 64 KiB) is a DIFFERENT number for a different reason: it is
+    // only the fallback `from_device()` falls back to when the actual
+    // per-device query (`xmx.slm_size`, sourced from
+    // `sycl::info::device::local_mem_size`, xmx-esimd-common.hpp:98) reports
+    // 0 -- on any device where that query succeeds, that struct's slm_size
+    // is the REAL queried capacity, not 65536. This kernel does not query
+    // the device at all; it asserts directly against Arc's known 128 KiB
+    // ceiling, which is the correct fixed bound to check a compile-time SLM
+    // size against here. Enforced, not just asserted in prose, below.
     constexpr size_t slm_acc_size = (size_t) K_PARTITIONS * acc_width * sizeof(float);
     static_assert(slm_acc_size <= 128 * 1024,
                   "mxfp4_soa_gemm_int8_dpas_launch: SLM accumulator storage exceeds the 128 KiB/work-group "
@@ -425,20 +438,21 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     GGML_ASSERT(dst_device != nullptr);
     GGML_ASSERT(n_out > 0);
     GGML_ASSERT(n_k > 0 && n_k % (int) GGML_SYCL_MXFP4_MOE_XMX_K == 0);
-    // 32-byte-aligned base pointers: `block_load<int8_t, 32>` (this file's
-    // activation load) and `block_load<uint8_t, 16>` (the weight load) carry
-    // ESIMD vector-alignment requirements, satisfied only because every
-    // offset the kernel computes off these three bases is itself a multiple
-    // of the vector width (`row_qs_stride` and `act_row_stride_q` are both
-    // multiples of 32) -- a caller passing a mid-buffer sub-pointer that is
-    // not itself 32-byte aligned would get a silent misaligned load (the one
-    // site where this could NOT be guaranteed already falls back to a plain
-    // scalar read instead, see the comment at the weight-scale-byte load
-    // below). Asserted here rather than left implicit (llama.cpp-6f73
-    // c-nvf1 should-fix 5).
+    // 32-byte-aligned base pointers, for the two device pointers the kernel
+    // actually vector-loads: `block_load<uint8_t, 16>` off `soa_weight_device`
+    // (the weight load) and `block_load<int8_t, 32>` off `act_qs_device`
+    // (the activation load) both carry ESIMD vector-alignment requirements,
+    // satisfied only because every offset the kernel computes off these two
+    // bases is itself a multiple of the vector width (`row_qs_stride` and
+    // `act_row_stride_q` are both multiples of 32) -- a caller passing a
+    // mid-buffer sub-pointer that is not itself 32-byte aligned would get a
+    // silent misaligned load. `act_scales_device` is deliberately NOT
+    // asserted here (llama.cpp-6f73 c-py5n should-fix 2, correcting round
+    // 1): it is only ever read by scalar subscript (`act_scales[...]`
+    // below), never block_loaded, so it carries no such alignment
+    // requirement and an assert on it would guard nothing.
     GGML_ASSERT(reinterpret_cast<uintptr_t>(soa_weight_device) % 32 == 0);
     GGML_ASSERT(reinterpret_cast<uintptr_t>(act_qs_device) % 32 == 0);
-    GGML_ASSERT(reinterpret_cast<uintptr_t>(act_scales_device) % 32 == 0);
 
 #if GGML_SYCL_ESIMD_AVAILABLE
     const auto * soa_base = static_cast<const uint8_t *>(soa_weight_device);

@@ -100,8 +100,11 @@ namespace {
 // test's harness, not something a later kernel's numerics gate (G4 onward)
 // needs or calls -- those use their own `g_failures`/`score_and_report`
 // pattern instead. Keeping this pair out of the header means a future test
-// that forgets to define its own equivalent gets a link error, not a
-// silently-never-read `failures` counter.
+// that forgets to define its own equivalent gets a compile error
+// (undeclared identifier -- these two names live only in this TU's
+// anonymous namespace now, not in the shared header), not a
+// silently-never-read `failures` counter (llama.cpp-6f73 c-py5n nit,
+// correcting round 1's "link error").
 int failures = 0;
 
 void check(bool ok, const std::string & name, const std::string & detail) {
