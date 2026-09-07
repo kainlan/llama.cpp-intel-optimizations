@@ -1786,25 +1786,26 @@ static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *           
     }
 
     auto * extra = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
-    if (!extra->moe_device_table_valid[device] || !extra->moe_expert_ptrs_handle[device].valid()) {
+    if (!extra->weight().moe_device_table_valid[device] || !extra->weight().moe_expert_ptrs_handle[device].valid()) {
         return false;
     }
-    auto resolved = extra->moe_expert_ptrs_handle[device].resolve(device);
+    auto resolved = extra->weight().moe_expert_ptrs_handle[device].resolve(device);
     if (!resolved || resolved.ptr != ptrs || !resolved.on_device) {
         return false;
     }
     const size_t min_table_bytes = static_cast<size_t>(std::max<int64_t>(tensor->ne[2], 1)) * sizeof(void *);
-    if (extra->moe_expert_ptrs_size[device] < min_table_bytes ||
-        extra->moe_expert_ptrs_handle[device].size() < min_table_bytes) {
+    if (extra->weight().moe_expert_ptrs_size[device] < min_table_bytes ||
+        extra->weight().moe_expert_ptrs_handle[device].size() < min_table_bytes) {
         return false;
     }
 
     if (table_handle_out) {
-        *table_handle_out = extra->moe_expert_ptrs_handle[device];
+        *table_handle_out = extra->weight().moe_expert_ptrs_handle[device];
     }
     if (retained_leases_out) {
-        const auto & leases = !extra->moe_expert_ptrs_leases[device].empty() ? extra->moe_expert_ptrs_leases[device] :
-                                                                               extra->moe_expert_handles[device];
+        const auto & leases = !extra->weight().moe_expert_ptrs_leases[device].empty() ?
+                                  extra->weight().moe_expert_ptrs_leases[device] :
+                                  extra->weight().moe_expert_handles[device];
         retained_leases_out->insert(retained_leases_out->end(), leases.begin(), leases.end());
     }
     return true;
@@ -16589,24 +16590,25 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
     sycl::queue * stream = ctx.stream();
     const size_t  bytes  = static_cast<size_t>(total_batches) * sizeof(void *);
 
-    if (extra->moe_compact_ptr(ctx.device) != nullptr && extra->moe_expert_ptrs_compact_capacity[ctx.device] >= bytes) {
-        extra->moe_expert_ptrs_compact_size[ctx.device] = bytes;
+    if (extra->moe_compact_ptr(ctx.device) != nullptr &&
+        extra->weight().moe_expert_ptrs_compact_capacity[ctx.device] >= bytes) {
+        extra->weight().moe_expert_ptrs_compact_size[ctx.device] = bytes;
     } else {
         if (extra->moe_compact_ptr(ctx.device) != nullptr) {
-            extra->moe_expert_ptrs_compact_handle[ctx.device]        = {};
-            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = 0;
-            extra->moe_expert_ptrs_compact_size[ctx.device]          = 0;
-            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
+            extra->weight().moe_expert_ptrs_compact_handle[ctx.device]        = {};
+            extra->weight().moe_expert_ptrs_compact_capacity[ctx.device]      = 0;
+            extra->weight().moe_expert_ptrs_compact_size[ctx.device]          = 0;
+            extra->weight().moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
         }
 
         void * compact = ggml_sycl::moe_get_compact_ptrs(ctx.device, bytes);
         if (compact) {
             const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
             const bool   on_device                                   = !bufs || bufs->compact_on_device;
-            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
-            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
-            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
-            extra->moe_expert_ptrs_compact_handle[ctx.device] =
+            extra->weight().moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
+            extra->weight().moe_expert_ptrs_compact_size[ctx.device]          = bytes;
+            extra->weight().moe_expert_ptrs_compact_from_prealloc[ctx.device] = true;
+            extra->weight().moe_expert_ptrs_compact_handle[ctx.device] =
                 ggml_sycl::mem_handle::from_chunk_ptr(compact, ctx.device, GGML_LAYOUT_AOS, on_device);
         } else if (!allow_alloc) {
             return false;
@@ -16625,10 +16627,10 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
                 return false;
             }
             compact                                                  = compact_resolved.ptr;
-            extra->moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
-            extra->moe_expert_ptrs_compact_size[ctx.device]          = bytes;
-            extra->moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
-            extra->moe_expert_ptrs_compact_handle[ctx.device]        = std::move(compact_handle);
+            extra->weight().moe_expert_ptrs_compact_capacity[ctx.device]      = bytes;
+            extra->weight().moe_expert_ptrs_compact_size[ctx.device]          = bytes;
+            extra->weight().moe_expert_ptrs_compact_from_prealloc[ctx.device] = false;
+            extra->weight().moe_expert_ptrs_compact_handle[ctx.device]        = std::move(compact_handle);
         }
     }
 
@@ -16637,8 +16639,8 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
         if (missing) {
             const auto * bufs                                        = ggml_sycl::moe_get_inference_buffers(ctx.device);
             const bool   on_device                                   = !bufs || bufs->compact_missing_on_device;
-            extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
-            extra->moe_expert_ptrs_missing_handle[ctx.device] =
+            extra->weight().moe_expert_ptrs_missing_from_prealloc[ctx.device] = true;
+            extra->weight().moe_expert_ptrs_missing_handle[ctx.device] =
                 ggml_sycl::mem_handle::from_chunk_ptr(missing, ctx.device, GGML_LAYOUT_AOS, on_device);
         } else if (!allow_alloc) {
             return false;
@@ -16657,8 +16659,8 @@ static bool ggml_sycl_moe_ensure_compact_storage(ggml_backend_sycl_context & ctx
                 return false;
             }
             missing                                                  = static_cast<int *>(missing_resolved.ptr);
-            extra->moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
-            extra->moe_expert_ptrs_missing_handle[ctx.device]        = std::move(missing_handle);
+            extra->weight().moe_expert_ptrs_missing_from_prealloc[ctx.device] = false;
+            extra->weight().moe_expert_ptrs_missing_handle[ctx.device]        = std::move(missing_handle);
         }
     }
 
@@ -17563,7 +17565,7 @@ bool mmvq_moe_batched_dispatch(ggml_backend_sycl_context &      ctx,
                     log_xmx_reject("group-alloc");
                     return false;
                 }
-                auto & grouped_scratch    = grouped_scratch_extra->moe_grouped_scratch[ctx.device];
+                auto & grouped_scratch    = grouped_scratch_extra->weight().moe_grouped_scratch[ctx.device];
                 auto   cached_i32_scratch = [&](ggml_sycl::mem_handle & cache_handle, size_t & cache_capacity,
                                               int32_t *& ptr, size_t count, const char * cohort) -> bool {
                     ptr = nullptr;
@@ -21583,8 +21585,13 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 }
                 ggml_sycl::mem_handle table_src = ggml_sycl::mem_handle::from_direct(
                     expert_ptr_payload.data(), GGML_LAYOUT_AOS, false, ggml_sycl::mem_handle::HOST_DEVICE, expert_ptr_payload.size() * sizeof(void *));
-                table_event     = ggml_sycl::mem_copy_async(src0_extra->moe_expert_ptrs_handle[ctx.device], table_src,
-                                                            expert_ptr_payload.size() * sizeof(void *), *stream);
+                // src0_extra is const here, so weight() (non-const, lazily
+                // allocating) isn't callable -- but moe_ptrs_ptr(ctx.device)
+                // above already returned non-null, which per its forwarder
+                // means weight_ext is already set, so this direct deref is safe.
+                table_event     = ggml_sycl::mem_copy_async(
+                    src0_extra->weight_ext->moe_expert_ptrs_handle[ctx.device], table_src,
+                    expert_ptr_payload.size() * sizeof(void *), *stream);
                 has_table_event = true;
             }
         } else {
@@ -21823,7 +21830,8 @@ bool ggml_sycl_mul_mat_id_vec_q(ggml_backend_sycl_context & ctx,
                 auto missing_host_handle =
                     ggml_sycl::mem_handle::from_direct(&missing_host, GGML_LAYOUT_AOS,
                                                        /*on_device=*/false, ggml_sycl::mem_handle::HOST_DEVICE, sizeof(missing_host));
-                ggml_sycl::mem_handle missing_device_handle = extra_mut->moe_expert_ptrs_missing_handle[ctx.device];
+                ggml_sycl::mem_handle missing_device_handle =
+                    extra_mut->weight().moe_expert_ptrs_missing_handle[ctx.device];
                 if (!missing_device_handle.valid()) {
                     const bool missing_on_device = ggml_sycl_get_alloc_type(missing_device) == sycl::usm::alloc::device;
                     missing_device_handle        = ggml_sycl::mem_handle::from_chunk_ptr(missing_device, ctx.device,

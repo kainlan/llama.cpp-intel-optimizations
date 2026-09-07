@@ -1213,9 +1213,22 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
     }
 
     for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
-        for (int64_t is = 0; is < GGML_SYCL_MAX_STREAMS; ++is) {
-            if (extra->events[i][is] != nullptr) {
-                SYCL_CHECK(CHECK_TRY_ERROR(dpct::destroy_event(extra->events[i][is])));
+        // llama.cpp-h9uv: events/xmx/moe live behind the lazily-allocated
+        // weight_ext extension now. This sweep runs for EVERY extra release
+        // (activation, KV-view, and weight alike -- see
+        // ggml_backend_sycl_buffer_reset's COMPUTE branch and
+        // ~ggml_backend_sycl_buffer_context() above), so it must null-check
+        // weight_ext rather than call weight() -- the lazy allocator would
+        // force-construct the ~250 KB extension on every one of the 838-per-
+        // rebuild activation releases, exactly reintroducing the churn this
+        // struct split exists to remove. An activation/view extra never has
+        // weight_ext set (nothing on that path ever touches it), so this
+        // block is a no-op for them, same as before the split.
+        if (extra->weight_ext) {
+            for (int64_t is = 0; is < GGML_SYCL_MAX_STREAMS; ++is) {
+                if (extra->weight_ext->events[i][is] != nullptr) {
+                    SYCL_CHECK(CHECK_TRY_ERROR(dpct::destroy_event(extra->weight_ext->events[i][is])));
+                }
             }
         }
         if (extra->data_device_ptr(i) != nullptr && streams.size() > 0) {
@@ -1251,27 +1264,31 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
                 extra->layout.owns_memory = false;
             }
             ggml_sycl_set_device(i);
-            extra->xmx_mxfp4_tiled_handle[i] = {};
+            // xmx_tiled_ptr(i) resolved non-null above, so weight_ext is set.
+            extra->weight_ext->xmx_mxfp4_tiled_handle[i] = {};
         }
         if (extra->xmx_staging_ptr(i) != nullptr && streams.size() > 0) {
             ggml_sycl_set_device(i);
-            extra->xmx_mxfp4_tiled_aos_staging_handle[i] = {};
-            extra->xmx_mxfp4_tiled_aos_staging_size[i]   = 0;
+            // xmx_staging_ptr(i) resolved non-null above, so weight_ext is set.
+            extra->weight_ext->xmx_mxfp4_tiled_aos_staging_handle[i] = {};
+            extra->weight_ext->xmx_mxfp4_tiled_aos_staging_size[i]   = 0;
         }
 
-        extra->moe_expert_ptrs_handle[i]        = {};
-        extra->moe_expert_ptrs_size[i]          = 0;
-        extra->moe_expert_ptrs_from_prealloc[i] = false;
-        extra->moe_device_table_valid[i]        = false;
-        extra->moe_expert_handles[i].clear();
-        extra->moe_expert_ptrs_leases[i].clear();
+        if (extra->weight_ext) {
+            extra->weight_ext->moe_expert_ptrs_handle[i]        = {};
+            extra->weight_ext->moe_expert_ptrs_size[i]          = 0;
+            extra->weight_ext->moe_expert_ptrs_from_prealloc[i] = false;
+            extra->weight_ext->moe_device_table_valid[i]        = false;
+            extra->weight_ext->moe_expert_handles[i].clear();
+            extra->weight_ext->moe_expert_ptrs_leases[i].clear();
 
-        extra->moe_expert_ptrs_compact_handle[i]        = {};
-        extra->moe_expert_ptrs_compact_size[i]          = 0;
-        extra->moe_expert_ptrs_compact_capacity[i]      = 0;
-        extra->moe_expert_ptrs_compact_from_prealloc[i] = false;
-        extra->moe_expert_ptrs_missing_handle[i]        = {};
-        extra->moe_expert_ptrs_missing_from_prealloc[i] = false;
+            extra->weight_ext->moe_expert_ptrs_compact_handle[i]        = {};
+            extra->weight_ext->moe_expert_ptrs_compact_size[i]          = 0;
+            extra->weight_ext->moe_expert_ptrs_compact_capacity[i]      = 0;
+            extra->weight_ext->moe_expert_ptrs_compact_from_prealloc[i] = false;
+            extra->weight_ext->moe_expert_ptrs_missing_handle[i]        = {};
+            extra->weight_ext->moe_expert_ptrs_missing_from_prealloc[i] = false;
+        }
     }
 
     // Release unified layout-managed memory (handles SOA, COALESCED, XMX_TILED buffers)

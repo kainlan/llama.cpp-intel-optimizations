@@ -2655,6 +2655,45 @@ set_tests_properties(test-sycl-tensor-usage PROPERTIES
 # c-z4cf #2, round-2 citation fix c-b7j9 #1).
 endif() # static SYCL backend fixture
 
+# llama.cpp-h9uv: right-sizing ggml_tensor_extra_gpu. Pure compile-time
+# static_assert checks over common.hpp -- no GPU, and no construction of
+# a ggml_tensor_extra_gpu (which would need mem-handle.cpp/unified-cache.cpp
+# linked in, like test-sycl-runtime-alloc above). common.hpp still needs
+# SYCL headers (sycl::event, dpct::event_ptr) to parse, so this compiles
+# with -fsycl and links IntelSYCL::SYCL_CXX, but touches no device at
+# runtime and builds in seconds, not the minutes those direct-source
+# fixtures take.
+#
+# Registered here rather than up near test-sycl-moe-fused-transaction: this
+# target's GGML_SYCL_DNNL=${GGML_SYCL_DNNL} compile definition needs that
+# variable already set. GGML_SYCL_DNNL defaults to 0 near the top of this
+# file and is only set to 1 later (after find_package(DNNL)), so a
+# registration above that point silently expands to
+# `-DGGML_SYCL_DNNL=` (empty), which fails every `#if GGML_SYCL_DNNL` in
+# common.hpp/unified-cache.hpp with "expected value in expression" --
+# the same class of ordering bug as the sycl-unified-private-seams Python
+# test's find_package(Python3) above it. Down here, alongside the other
+# tests that already depend on it, is registration-order-safe.
+add_executable(test-sycl-extra-gpu-size
+    tests/test-sycl-extra-gpu-size.cpp)
+target_include_directories(test-sycl-extra-gpu-size PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_definitions(test-sycl-extra-gpu-size PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-extra-gpu-size PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-extra-gpu-size PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-extra-gpu-size COMMAND test-sycl-extra-gpu-size)
+set_tests_properties(sycl-extra-gpu-size PROPERTIES LABELS "sycl;memory;host;tdd")
+
 if (NOT GGML_BACKEND_DL)
 add_executable(test-sycl-compute-buffer-extra-reuse
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-compute-buffer-extra-reuse.cpp
