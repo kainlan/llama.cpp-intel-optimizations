@@ -11888,18 +11888,39 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
-    // Get queue for this device.  With more than one visible GPU, use the same
-    // single-device context queue that routed execution uses.  Otherwise cache
-    // allocations can land in a default/multi-device context while the smart
-    // handle resolves into an isolated per-device execution queue, which is
-    // exactly the Level Zero DEVICE_LOST pattern this backend avoids.
-    int total_gpus = g_total_gpu_count;
-    if (total_gpus < 0) {
-        total_gpus = dpct::dev_mgr::instance().device_count();
-    }
-
+    // Get queue for this device.  Always prefer the single-device context
+    // queue ensure_single_device_context_queue() builds directly via `new
+    // sycl::queue(ctx, dev, default_queue_properties())` over
+    // ggml_sycl_get_device(device_id).default_queue() (dpct's raw,
+    // header-cached default queue).
+    //
+    // With more than one visible GPU this was already required: a
+    // default/multi-device context could otherwise diverge from the
+    // isolated per-device execution queue the smart handle resolves into --
+    // the Level Zero DEVICE_LOST pattern this backend avoids.
+    //
+    // This is now UNCONDITIONAL (llama.cpp-yke2), because dpct's default_queue()
+    // is not a safe cache-owner queue even with exactly one visible GPU.
+    // dpct::device_ext::init_queues()/create_queue_impl()
+    // (dpct/helper.hpp) are header-only inline functions that add
+    // sycl::property::queue::enable_profiling only `#ifdef
+    // DPCT_PROFILING_ENABLED` -- a macro private to the ggml-sycl CMake
+    // target. Any OTHER translation unit that includes
+    // ggml-sycl/common.hpp (transitively pulling in dpct/helper.hpp) --
+    // every GPU test that links ggml-sycl and touches
+    // ggml_backend_sycl_context, not just this file -- compiles its own
+    // copy of those inlines without the macro, and ordinary ELF symbol
+    // resolution lets that copy interpose over the library's for the whole
+    // process, silently dropping enable_profiling from a queue built via
+    // default_queue(). ensure_single_device_context_queue() sidesteps the
+    // hazard entirely: it never calls into dpct's cached default_queue()
+    // machinery, so no header interposition can touch it. Mirrors the
+    // resolution the plan's G4 test carried privately for the queue it
+    // constructed itself (test-sycl-mxfp4-stored-gemm-soa-small-m.cpp);
+    // this makes the same fix reach every consumer of the unified cache's
+    // queue, not just that one test.
     sycl::queue * cache_queue = queue_override;
-    if (!cache_queue && total_gpus > 1) {
+    if (!cache_queue) {
         cache_queue = ensure_single_device_context_queue(device_id);
     }
     sycl::queue & queue = cache_queue ? *cache_queue : ggml_sycl_get_device(device_id).default_queue();

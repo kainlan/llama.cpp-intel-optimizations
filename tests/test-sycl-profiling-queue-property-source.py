@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Source gate for llama.cpp-yke2 (test TUs that include ggml-sycl/common.hpp
+interpose dpct's inline queue construction without DPCT_PROFILING_ENABLED, so
+the single-GPU unified-cache owner queue silently loses enable_profiling).
+
+Two fixes, checked here:
+
+1. ggml/src/ggml-sycl/dpct/helper.hpp: dpct::device_ext::create_queue_impl()
+   (the header-only inline dpct::device_ext::default_queue() and every other
+   queue it constructs ultimately go through) used to add
+   sycl::property::queue::enable_profiling() only `#ifdef
+   DPCT_PROFILING_ENABLED` -- a macro that was a PRIVATE compile definition of
+   the `ggml-sycl` CMake target (ggml/src/ggml-sycl/CMakeLists.txt). Any OTHER
+   translation unit that includes this header (e.g. any GPU test that
+   includes ggml-sycl/common.hpp, which pulls this header in transitively)
+   compiles its own copy of these inlines WITHOUT the macro, and ordinary ELF
+   symbol resolution lets that copy interpose over the library's for the
+   whole process -- silently dropping enable_profiling from
+   dpct::device_ext::default_queue() (and the roughly five dozen call sites
+   across ggml-sycl.cpp/common.cpp/unified-cache.cpp/etc. that go through it)
+   in any such process, not just the unified cache's owner queue. A macro read
+   inside a header-only inline can never be interposition-safe -- the fix
+   makes the property addition UNCONDITIONAL source code instead (matching
+   this backend's own default_queue_properties(), ggml-sycl/common.hpp, which
+   has always added enable_profiling unconditionally for queues it constructs
+   directly), so every TU compiles an identical copy of these inlines
+   regardless of DPCT_PROFILING_ENABLED, and the now-dead compile definition
+   is removed from CMakeLists.txt.
+
+2. ggml/src/ggml-sycl/unified-cache.cpp's create_cache_for_device(): the
+   cache's owner queue used ensure_single_device_context_queue() (which never
+   touches dpct's default_queue() machinery at all, sidestepping fix 1's
+   mechanism entirely) only when MORE than one GPU was visible (`!cache_queue
+   && total_gpus > 1`), falling back to
+   ggml_sycl_get_device(device_id).default_queue() whenever exactly one GPU
+   was visible -- the configuration every canonical
+   ONEAPI_DEVICE_SELECTOR=level_zero:N run uses. The fix makes that call
+   unconditional, independent of fix 1.
+
+This gate checks the SOURCE TEXT only and does not touch a SYCL device. The
+runtime check is the GPU test tests/test-sycl-profiling-queue-property.cpp.
+
+Runs under pytest (llama_test_pytest registration) and as a plain script.
+Point it at alternate copies (to exercise the RED path against a deliberately
+unmodified tree) via GGML_SYCL_YKE2_UNIFIED_CACHE_SOURCE,
+GGML_SYCL_YKE2_DPCT_HELPER_SOURCE and GGML_SYCL_YKE2_GGML_SYCL_CMAKE_SOURCE;
+the defaults are the in-tree files.
+"""
+
+import os
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = Path(
+    os.environ.get(
+        "GGML_SYCL_YKE2_UNIFIED_CACHE_SOURCE",
+        str(ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"),
+    )
+)
+HELPER_SOURCE = Path(
+    os.environ.get(
+        "GGML_SYCL_YKE2_DPCT_HELPER_SOURCE",
+        str(ROOT / "ggml/src/ggml-sycl/dpct/helper.hpp"),
+    )
+)
+SYCL_CMAKE_SOURCE = Path(
+    os.environ.get(
+        "GGML_SYCL_YKE2_GGML_SYCL_CMAKE_SOURCE",
+        str(ROOT / "ggml/src/ggml-sycl/CMakeLists.txt"),
+    )
+)
+
+source = SOURCE.read_text()
+helper_source = HELPER_SOURCE.read_text()
+sycl_cmake_source = SYCL_CMAKE_SOURCE.read_text()
+
+FUNC_SIG = "static unified_cache * create_cache_for_device(int"
+ENSURE_CALL = "ensure_single_device_context_queue(device_id)"
+# The exact buggy pattern this gate must never see reappear (llama.cpp-yke2):
+# gating the single-device-context queue behind more than one visible GPU
+# left dpct's raw, interposition-vulnerable default_queue() as the single-GPU
+# cache-owner queue.
+BUGGY_GATE_RE = re.compile(r"!\s*cache_queue\s*&&\s*total_gpus\s*>\s*1")
+
+CREATE_QUEUE_IMPL_SIG = "sycl::queue create_queue_impl("
+ENABLE_PROFILING_CALL = "sycl::property::queue::enable_profiling()"
+DPCT_PROFILING_MACRO = "DPCT_PROFILING_ENABLED"
+
+# The commit this branch (task/S7) started from -- confirmed pre-fix for all
+# three files these checks read. Used only by the automated positive control
+# below (test_positive_control_gate_can_fail_on_the_known_pre_fix_revision),
+# so the RED half of RED->GREEN is re-verified on every run rather than
+# resting on a one-time manual check against a hand-saved scratch copy
+# (lead review requirement, llama.cpp-yke2).
+KNOWN_PRE_FIX_REVISION = "c4f25b31c"
+
+
+def matching_brace(text, open_idx):
+    """Comment/string-aware brace match (self-contained copy, per this
+    fork's one-file-per-gate convention -- see
+    tests/test-sycl-extra-leak-probe-source.py)."""
+    assert text[open_idx] == "{"
+    depth = 0
+    state = "code"
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block"
+                i += 2
+                continue
+            if ch == '"':
+                state = "str"
+            elif ch == "'":
+                prev = text[i - 1] if i > 0 else ""
+                if not (prev.isalnum() or prev == "_"):
+                    state = "chr"
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        elif state == "str":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                state = "code"
+        elif state == "chr":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
+                state = "code"
+        i += 1
+    raise AssertionError("unbalanced braces")
+
+
+def function_body(text, signature, start=0):
+    idx = text.find(signature, start)
+    assert idx >= 0, f"missing definition: {signature}"
+    open_idx = text.find("{", idx)
+    assert open_idx >= 0, f"no opening brace found after {signature}"
+    return text[open_idx : matching_brace(text, open_idx) + 1], idx
+
+
+def test_create_cache_for_device_defined_exactly_once():
+    assert source.count(FUNC_SIG) == 1, "create_cache_for_device must be defined exactly once"
+
+
+def test_ensure_single_device_context_queue_is_called_unconditionally():
+    body, _ = function_body(source, FUNC_SIG)
+    idx = body.find(ENSURE_CALL)
+    assert idx >= 0, f"create_cache_for_device must call {ENSURE_CALL}"
+    # Find the smallest enclosing `if ( ... )` immediately guarding this
+    # call: walk back from the call to the nearest preceding `if (`, then
+    # confirm the call sits directly inside that if's body (no other
+    # statement between the `{` and the call), so this cannot be fooled by
+    # an unrelated, earlier `if (total_gpus > 1)` elsewhere in the function.
+    if_idx = body.rfind("if (", 0, idx)
+    assert if_idx >= 0, f"expected an `if (` guarding the {ENSURE_CALL} call"
+    cond_open = if_idx + len("if (") - 1
+    cond_close = body.find(")", cond_open)
+    assert cond_close >= 0, "unterminated if-condition"
+    condition = body[cond_open + 1 : cond_close]
+    brace_open = body.find("{", cond_close)
+    assert brace_open >= 0, f"expected a brace-delimited if body after `if ({condition})`"
+    between = body[cond_close + 1 : brace_open].strip()
+    assert between == "", f"unexpected tokens between if-condition and its body: {between!r}"
+    guarded_body = body[brace_open : matching_brace(body, brace_open) + 1]
+    assert ENSURE_CALL in guarded_body, (
+        f"the nearest enclosing `if ({condition})` does not actually guard the {ENSURE_CALL} call"
+    )
+    assert "total_gpus" not in condition, (
+        f"the {ENSURE_CALL} call must not be gated on total_gpus (found condition `if ({condition})`); "
+        "this queue construction must be unconditional so a single visible GPU also gets a queue built "
+        "via ensure_single_device_context_queue() instead of dpct's interposition-vulnerable default_queue()"
+    )
+
+
+def test_buggy_multi_gpu_gate_pattern_is_absent():
+    # Regression guard for the exact pre-fix pattern, independent of the
+    # structural check above: `!cache_queue && total_gpus > 1` must not
+    # reappear anywhere in this function (e.g. reintroduced via a rebase or
+    # a copy-paste from the historical multi-GPU-only code path).
+    body, _ = function_body(source, FUNC_SIG)
+    assert not BUGGY_GATE_RE.search(body), (
+        "found the pre-fix gate pattern `!cache_queue && total_gpus > 1` -- "
+        "ensure_single_device_context_queue() must be called unconditionally (llama.cpp-yke2)"
+    )
+
+
+def test_fallback_to_raw_default_queue_still_exists_for_construction_failure():
+    # The fix removes the total_gpus > 1 GATE, not the fallback itself:
+    # ensure_single_device_context_queue() can still legitimately return
+    # nullptr if queue construction throws, and create_cache_for_device must
+    # still degrade to the raw default_queue() in that case rather than
+    # crashing on a null dereference.
+    body, _ = function_body(source, FUNC_SIG)
+    assert "ggml_sycl_get_device(device_id).default_queue()" in body, (
+        "create_cache_for_device must keep the default_queue() fallback for when "
+        "ensure_single_device_context_queue() fails to construct a queue"
+    )
+
+
+def _create_queue_impl_bodies():
+    bodies = []
+    start = 0
+    for _ in range(2):
+        body, idx = function_body(helper_source, CREATE_QUEUE_IMPL_SIG, start)
+        bodies.append(body)
+        start = idx + len(CREATE_QUEUE_IMPL_SIG)
+    return bodies
+
+
+def test_create_queue_impl_defined_exactly_twice():
+    # The two dpct::device_ext::create_queue_impl() overloads (with and
+    # without an explicit sycl::device parameter) -- both must be fixed, not
+    # just one, since dpct::device_ext::default_queue() and other call sites
+    # can reach either.
+    assert helper_source.count(CREATE_QUEUE_IMPL_SIG) == 2, (
+        "expected exactly two create_queue_impl(...) overloads in dpct/helper.hpp"
+    )
+
+
+def test_create_queue_impl_enables_profiling_unconditionally():
+    for body in _create_queue_impl_bodies():
+        assert ENABLE_PROFILING_CALL in body, (
+            f"create_queue_impl must unconditionally add {ENABLE_PROFILING_CALL} to its property_list "
+            "(llama.cpp-yke2) -- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
+            "in a header-only inline"
+        )
+        assert DPCT_PROFILING_MACRO not in body, (
+            f"create_queue_impl must not read {DPCT_PROFILING_MACRO} at all -- the property must be "
+            "unconditional source code, not gated on a macro that depends on which TU's copy of this "
+            "header-only inline the linker resolves"
+        )
+
+
+# Anchored to the START of a (stripped) line, so this cannot match the macro
+# name spelled out inside a `//` explanatory comment (e.g. this very fix's own
+# comment, which legitimately quotes the historical `#ifdef ...` directive it
+# removed) -- only an actual directive, whose `#` is the first non-whitespace
+# character on its line, counts as the live, interposition-vulnerable
+# mechanism this gate must catch.
+DPCT_PROFILING_MACRO_DIRECTIVE_RE = re.compile(
+    r"^\s*#\s*(?:ifdef|ifndef|if\s+defined|elif\s+defined)\s*\(?\s*" + re.escape(DPCT_PROFILING_MACRO),
+    re.MULTILINE,
+)
+
+
+def test_dpct_profiling_enabled_macro_is_gone_from_helper_hpp():
+    # A preprocessor-directive check, not a blanket string search: the macro
+    # NAME may legitimately still appear in an explanatory comment (e.g.
+    # describing the historical bug this fix removes), which is not the
+    # live, interposition-vulnerable mechanism this gate must catch --
+    # only an actual #ifdef/#ifndef/#if defined(...) directive reading it is.
+    match = DPCT_PROFILING_MACRO_DIRECTIVE_RE.search(helper_source)
+    assert not match, (
+        f"found a live preprocessor directive reading {DPCT_PROFILING_MACRO} in dpct/helper.hpp "
+        f"({match.group(0)!r}) -- the property must be unconditional source code (llama.cpp-yke2)"
+    )
+
+
+def test_ggml_sycl_cmake_no_longer_defines_dpct_profiling_enabled():
+    assert "target_compile_definitions(ggml-sycl PRIVATE DPCT_PROFILING_ENABLED)" not in sycl_cmake_source, (
+        f"ggml-sycl/CMakeLists.txt must no longer define {DPCT_PROFILING_MACRO} for the ggml-sycl target -- "
+        "it is dead once create_queue_impl() no longer reads it, and leaving it would misleadingly imply "
+        "the property is still opt-in/compile-time-gated (llama.cpp-yke2)"
+    )
+
+
+def _git_show(path):
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "show", f"{KNOWN_PRE_FIX_REVISION}:{path}"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"git show {KNOWN_PRE_FIX_REVISION}:{path} failed (rc={proc.returncode}): {proc.stderr}"
+    )
+    return proc.stdout
+
+
+def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
+    # RED counterpart to every GREEN check above, re-run automatically on
+    # every invocation of this file rather than resting on a one-time manual
+    # check against a hand-saved scratch copy (lead review requirement,
+    # llama.cpp-yke2): fetches the three pre-fix blobs via `git show
+    # <KNOWN_PRE_FIX_REVISION>:<path>` and re-applies the same structural
+    # assertions this file uses for GREEN, confirming each is actually
+    # capable of catching its own bug -- an assertion that can never fail is
+    # not a check.
+    pre_unified_cache = _git_show("ggml/src/ggml-sycl/unified-cache.cpp")
+    pre_helper = _git_show("ggml/src/ggml-sycl/dpct/helper.hpp")
+    pre_sycl_cmake = _git_show("ggml/src/ggml-sycl/CMakeLists.txt")
+
+    # 1. unified-cache.cpp: create_cache_for_device must still carry the
+    #    total_gpus > 1 gate at the pre-fix revision.
+    pre_cache_body, _ = function_body(pre_unified_cache, FUNC_SIG)
+    assert BUGGY_GATE_RE.search(pre_cache_body), (
+        f"expected the pre-fix gate pattern in {KNOWN_PRE_FIX_REVISION}'s create_cache_for_device -- "
+        "if this no longer fails, the positive control itself is void (llama.cpp-yke2)"
+    )
+
+    # 2. helper.hpp: both create_queue_impl overloads must still read the
+    #    macro, and a live directive must still be present, at the pre-fix
+    #    revision.
+    assert pre_helper.count(CREATE_QUEUE_IMPL_SIG) == 2, (
+        f"expected exactly two create_queue_impl(...) overloads in {KNOWN_PRE_FIX_REVISION}'s dpct/helper.hpp"
+    )
+    start = 0
+    for _ in range(2):
+        pre_impl_body, idx = function_body(pre_helper, CREATE_QUEUE_IMPL_SIG, start)
+        assert DPCT_PROFILING_MACRO in pre_impl_body, (
+            f"expected {DPCT_PROFILING_MACRO} still gating create_queue_impl in {KNOWN_PRE_FIX_REVISION}'s "
+            "dpct/helper.hpp -- if this no longer fails, the positive control itself is void"
+        )
+        start = idx + len(CREATE_QUEUE_IMPL_SIG)
+    assert DPCT_PROFILING_MACRO_DIRECTIVE_RE.search(pre_helper), (
+        f"expected a live #ifdef {DPCT_PROFILING_MACRO} directive in {KNOWN_PRE_FIX_REVISION}'s dpct/helper.hpp"
+    )
+
+    # 3. ggml-sycl/CMakeLists.txt: the compile definition must still be
+    #    present at the pre-fix revision.
+    assert "target_compile_definitions(ggml-sycl PRIVATE DPCT_PROFILING_ENABLED)" in pre_sycl_cmake, (
+        f"expected the DPCT_PROFILING_ENABLED compile definition in {KNOWN_PRE_FIX_REVISION}'s "
+        "ggml-sycl/CMakeLists.txt -- if this no longer fails, the positive control itself is void"
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    failures = 0
+    for fn_name, fn in sorted(list(globals().items())):
+        if fn_name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {fn_name}")
+            except AssertionError as exc:
+                failures += 1
+                print(f"FAIL {fn_name}: {exc}")
+    if failures:
+        print(f"{failures} test(s) failed")
+        sys.exit(1)
+    print("all tests passed")
