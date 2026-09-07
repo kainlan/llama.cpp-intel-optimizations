@@ -949,6 +949,51 @@ git commit -m "feat(sycl): full-N small-M MXFP4 GEMM on the stored SOA expert la
 
 **Gotchas:** new .cpp files need the SYCL compile flags the sibling entries in `ggml/src/ggml-sycl/CMakeLists.txt` use (copy an existing `mmvq.cpp` line); the kernel-name type must be unique (a duplicate SYCL kernel name across TUs is a link-time failure — 6cgq hit this).
 
+**Amendment 2026-09-06 (execution, llama.cpp-6f73)**
+
+**What happened:** the kernel and numerics test landed (`mxfp4-stored-gemm.{hpp,cpp}`,
+`tests/test-sycl-mxfp4-stored-gemm-soa-small-m.cpp`), through five measured rounds, and is
+checked in at its best verified state — a numerically correct checkpoint that does not meet
+this task's bandwidth criterion.
+
+**Five-round record** (per-launch device time at M=8, N=K=2880, GPT-OSS expert shape;
+B50 peak ≈ 224 GB/s):
+
+| round | change | B50 M=8 | B70 M=8 |
+|---|---|---:|---:|
+| 1 | initial single-item-per-tile launch | ~237.5 us | flat across N/cards (latency-floor signature) |
+| 3 | 8-way `K_PARTITIONS` split + SLM tree reduction | 130.3 us | 59.8 us |
+| 4 | + batched/coalesced weight loads (2-k-tile chunks) — REGRESSED vs round 3 | 152.9 us | — |
+| 5 | + software prefetch (round-3 base, prefetch_distance=3) — REGRESSED FURTHER | 286.4 us | 136.4 us |
+| **checkpoint** | = round 3, restored | **129.6 us** | **56.8 us** |
+
+(Round 2 was a spec-review revert of a misapplied sub-group padding value, not a
+throughput lever, and is omitted from this table.)
+
+**Criterion status:** numerics — MET (0 violations vs the Task G3 oracle, both cards, all
+four M values plus the N=37 boundary case). Bandwidth (`>= 50%` of B50 peak at M=8) — **NOT
+MET**: the checkpoint reaches 34.9 GB/s, i.e. **15.6% of peak**, and two further levers
+(coalesced loads, software prefetch — rounds 4 and 5 above) both regressed instead of
+closing the gap. This criterion is carried forward to the follow-up task **llama.cpp-kcya**
+rather than judged here; it is not silently dropped.
+
+**Profiler bytes-column trap:** the per-launch bandwidth figures above divide `bytes_moved`
+by the mean *per-launch* device time, not by the kernel-profiler CSV's aggregate `bytes`
+column — that column is the SUM of `label.bytes` over every recorded launch
+(`sycl-kernel-profiler.cpp`), so dividing it by `mean_ns` overstates bandwidth by a factor of
+`count`. This produced a real 4x misread once (round 1: 34% of peak from the raw CSV column
+vs the true 8.5% per-launch) and is now called out next to both bandwidth comments in the
+kernel and the test.
+
+**Comparison to the production reference kernel:** the reference decode kernel
+(`mxfp4_pair_glu_xmx_tiled_dpas_m2`, `mmvq.cpp`) reaches its throughput with 720 independent
+single-item work-groups and no K-split or SLM reduction at all, hiding load latency purely
+through occupancy (4x this kernel's 180 work-groups) and a much deeper software-prefetch
+distance (10, vs this kernel's regressed attempt at 3 over a ~12-iteration trip count) —
+suggesting the K-split/SLM-reduction shape itself, not any one lever within it, may be why
+this checkpoint undershoots the criterion, which is why llama.cpp-kcya's candidate levers
+include reworking to that shape rather than only tuning the current one further.
+
 ---
 
 ### Task G5: Large-M (≤ 512) MXFP4 GEMM on the SOA layout (down role) (llama.cpp-vtfs task 3)
