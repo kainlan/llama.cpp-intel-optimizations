@@ -92,6 +92,20 @@ mk_meminfo 3000000
 # (llama.cpp-y3z0 spec review round 1 finding 6).
 GUARD_HOOKS=(--sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1)
 
+# --models-dir / SYCL_PREFILL_SCALING_MODELS_DIR fixture (llama.cpp-5iba): the
+# script's real default model paths live under /models, which does not exist
+# in this sandboxed test checkout. Exporting the override ONCE, here, for the
+# WHOLE suite means every existing case below (1-13) keeps working unmodified
+# -- each already only ever passes -m through to a FAKE bench that ignores it
+# -- while still exercising the real model-existence-check code path this
+# task adds (which runs regardless of which bench is behind --bench). Cases
+# 14-16 below override --models-dir or the env var explicitly, on top of
+# this, to prove flag-wins-over-env and the missing-file refusal directly.
+FAKE_MODELS_DIR="$T/models"
+mkdir -p "$FAKE_MODELS_DIR"
+touch "$FAKE_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$FAKE_MODELS_DIR/gpt-oss-20b-mxfp4.gguf"
+export SYCL_PREFILL_SCALING_MODELS_DIR="$FAKE_MODELS_DIR"
+
 # mk_fake_bench: writes an executable at $1 that ignores every argument and
 # prints a markdown table with the four rows below verbatim on stdout, then
 # exits 0. Table shape (header, alignment row, four `test` rows) mirrors
@@ -126,6 +140,31 @@ cat <<'TABLE'
 build: df51c5130 (7412)
 TABLE
 exit ${exitcode}
+EOF
+    chmod +x "$path"
+}
+
+# mk_fake_bench_audit: like mk_fake_bench, but also appends the received
+# argv (verbatim, one line, via "$*") to $2 -- used by the --models-dir
+# cases below to prove which -m path the fake bench actually received, the
+# same way the stub guard elsewhere in this suite proves which
+# ONEAPI_DEVICE_SELECTOR it received.
+mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp2048
+    local path="$1" audit="$2" pp128="$3" pp512="$4" pp1024="$5" pp2048="$6"
+    cat > "$path" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$audit"
+cat <<'TABLE'
+| model                          |       size |     params | backend    | ngl |             test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | ----------------: | -------------------: |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |             pp128 |      ${pp128} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |             pp512 |      ${pp512} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |            pp1024 |     ${pp1024} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |            pp2048 |     ${pp2048} |
+
+build: df51c5130 (7412)
+TABLE
+exit 0
 EOF
     chmod +x "$path"
 }
@@ -670,5 +709,69 @@ echo "$unguarded_out" | grep -q "REACHED" && { echo "FAIL: the unguarded form mu
 guarded_out="$("$GUARDED_RACE_SH" 2>&1)" && guarded_rc=0 || guarded_rc=$?
 [ "$guarded_rc" -eq 0 ] || { echo "FAIL: expected the || true -guarded form (the one case 12 actually ships) to survive the same dead-pid read, got rc=$guarded_rc, output: $guarded_out"; fail=1; }
 echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must reach its own echo after the dead-pid read (got: $guarded_out)"; fail=1; }
+
+# --- Case 14 (llama.cpp-5iba): --models-dir DIR makes the fake bench
+# receive -m pointing at DIR's mistral file, proving the flag actually
+# changes the model path used, not merely that it is accepted as an arg.
+FLAG_MODELS_DIR="$T/models-flag"
+mkdir -p "$FLAG_MODELS_DIR"
+touch "$FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
+BENCH_ARGV_FLAG="$T/bench-argv-flag.log"
+: > "$BENCH_ARGV_FLAG"
+BENCH14="$T/fake-bench-models-dir-flag.sh"
+mk_fake_bench_audit "$BENCH14" "$BENCH_ARGV_FLAG" "1000.00" "1000.00" "900.00" "850.00"
+out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: --models-dir with a valid fixture file must PASS (exit 0), got $rc. Output:
+$out"; fail=1; }
+grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_FLAG" || { echo "FAIL: expected the fake bench to receive -m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf via --models-dir (audit: $(cat "$BENCH_ARGV_FLAG"))"; fail=1; }
+
+# --- Case 15 (llama.cpp-5iba): SYCL_PREFILL_SCALING_MODELS_DIR env var form
+# works on its own (a per-command prefix assignment here, distinct from the
+# whole-suite export above, so this case proves the mechanism directly), and
+# --models-dir wins when BOTH are given at once.
+ENV_MODELS_DIR="$T/models-env"
+mkdir -p "$ENV_MODELS_DIR"
+touch "$ENV_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
+BENCH_ARGV_ENV="$T/bench-argv-env.log"
+: > "$BENCH_ARGV_ENV"
+BENCH15="$T/fake-bench-models-dir-env.sh"
+mk_fake_bench_audit "$BENCH15" "$BENCH_ARGV_ENV" "1000.00" "1000.00" "900.00" "850.00"
+out="$(SYCL_PREFILL_SCALING_MODELS_DIR="$ENV_MODELS_DIR" "$SCALING" --bench "$BENCH15" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: SYCL_PREFILL_SCALING_MODELS_DIR alone must PASS (exit 0), got $rc. Output:
+$out"; fail=1; }
+grep -qF -- "-m $ENV_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_ENV" || { echo "FAIL: expected the fake bench to receive -m $ENV_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf via the env var alone (audit: $(cat "$BENCH_ARGV_ENV"))"; fail=1; }
+
+BENCH_ARGV_WINS="$T/bench-argv-flag-wins.log"
+: > "$BENCH_ARGV_WINS"
+BENCH15B="$T/fake-bench-models-dir-wins.sh"
+mk_fake_bench_audit "$BENCH15B" "$BENCH_ARGV_WINS" "1000.00" "1000.00" "900.00" "850.00"
+out="$(SYCL_PREFILL_SCALING_MODELS_DIR="$ENV_MODELS_DIR" "$SCALING" --bench "$BENCH15B" --models-dir "$FLAG_MODELS_DIR" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: --models-dir with the env var also set must still PASS (exit 0), got $rc. Output:
+$out"; fail=1; }
+grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_WINS" || { echo "FAIL: --models-dir must win over SYCL_PREFILL_SCALING_MODELS_DIR when both are given (audit: $(cat "$BENCH_ARGV_WINS"))"; fail=1; }
+grep -qF -- "$ENV_MODELS_DIR" "$BENCH_ARGV_WINS" && { echo "FAIL: the env var's path must not be used when --models-dir is also given (audit: $(cat "$BENCH_ARGV_WINS"))"; fail=1; }
+
+# --- Case 16 (llama.cpp-5iba): a --models-dir whose mistral file is absent
+# must refuse with exit 2, name the missing path in stderr, and never
+# invoke bench-guard at all -- BEFORE any GPU init, not after an
+# ERROR:bench-rc=1 row surfaces the problem late. A marker-guard records
+# whether it was ever run at all (a positive control on "zero invocations",
+# not merely "no VALID row printed").
+MISSING_MODELS_DIR="$T/models-missing"
+mkdir -p "$MISSING_MODELS_DIR"
+GUARD_MARKER="$T/guard-invoked-marker"
+rm -f "$GUARD_MARKER"
+MARKER_GUARD="$T/marker-guard.sh"
+cat > "$MARKER_GUARD" <<EOF
+#!/usr/bin/env bash
+touch "$GUARD_MARKER"
+exit 0
+EOF
+chmod +x "$MARKER_GUARD"
+out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$MISSING_MODELS_DIR" --only mistral,b70 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: a missing model file under --models-dir must exit 2, got $rc. Output:
+$out"; fail=1; }
+echo "$out" | grep -qF "$MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected the missing path $MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf named in the refusal (got: $out)"; fail=1; }
+[ -f "$GUARD_MARKER" ] && { echo "FAIL: bench-guard must not be invoked at all when a selected pair's model file is missing (marker exists)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1

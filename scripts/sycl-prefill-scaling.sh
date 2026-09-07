@@ -70,6 +70,21 @@
 # work. --bench (if given) wins over the env var, which wins over the
 # built-in default build/bin/llama-bench.
 #
+# --models-dir DIR / env SYCL_PREFILL_SCALING_MODELS_DIR: override the base
+# directory for the two /models-rooted entries in MODELS below (Mistral 7B
+# Q4_0, GPT-OSS 20B MXFP4) -- gemma4's path under /Storage/GenAI/models is
+# untouched by this, it already lives elsewhere. --models-dir (if given)
+# wins over the env var, which wins over the built-in default /models,
+# mirroring --bench/SYCL_PREFILL_SCALING_BENCH above exactly. Added because
+# /models (a USB-backed filesystem) was down for two days while being
+# migrated to bcachefs, with byte-identical copies available under
+# /Storage/GenAI/models, so the gate could not run at all in the meantime
+# (llama.cpp-5iba). Each SELECTED pair's model file is validated to exist
+# and be readable at parse time, before any bench-guard.sh invocation --
+# see the model-existence-check block below MODELS/CARDS: a missing model
+# used to surface only as an opaque ERROR:bench-rc=1 row after a full
+# GPU/driver init, not as an immediate, loud usage error naming the path.
+#
 # --guard PATH: override the bench-guard.sh invoked (default: the real
 # scripts/bench-guard.sh next to this script). Lets
 # tests/test-sycl-prefill-scaling.sh substitute a stub guard that records
@@ -88,11 +103,13 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GUARD="$SCRIPT_DIR/bench-guard.sh"
 
 BENCH="${SYCL_PREFILL_SCALING_BENCH:-$ROOT_DIR/build/bin/llama-bench}"
+MODELS_DIR="${SYCL_PREFILL_SCALING_MODELS_DIR:-/models}"
 declare -a ONLY=()
 SYSFS_CARD="" MEMINFO="" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT="" BUDGET=""
 
 while [ $# -gt 0 ]; do case "$1" in
     --bench)           BENCH="$2";          shift 2;;
+    --models-dir)      MODELS_DIR="$2";     shift 2;;
     --guard)           GUARD="$2";          shift 2;;
     --only)            ONLY+=("$2");        shift 2;;
     --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
@@ -108,10 +125,14 @@ esac; done
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 
 # --- the six model/card pairs (fixed matrix; see plan task L3) ---
-# Fields are '|'-delimited: key|label|<model path or selector>.
+# Fields are '|'-delimited: key|label|<model path or selector>. The mistral
+# and gptoss paths are rooted at MODELS_DIR (--models-dir /
+# SYCL_PREFILL_SCALING_MODELS_DIR, default /models -- see the file header);
+# gemma4 stays under /Storage/GenAI/models unconditionally, it was never
+# part of the /models outage this override exists for.
 MODELS=(
-    "mistral|Mistral 7B Q4_0|/models/mistral-7b-v0.1.Q4_0.gguf"
-    "gptoss|GPT-OSS 20B MXFP4|/models/gpt-oss-20b-mxfp4.gguf"
+    "mistral|Mistral 7B Q4_0|$MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
+    "gptoss|GPT-OSS 20B MXFP4|$MODELS_DIR/gpt-oss-20b-mxfp4.gguf"
     "gemma4|gemma4 E4B|/Storage/GenAI/models/stock-gemma-4-E4B-it.Q8_0.gguf"
 )
 CARDS=(
@@ -167,6 +188,29 @@ only_selected() {
     done
     return 1
 }
+
+# Model-file existence check (llama.cpp-5iba). Runs AFTER --only validation
+# above and BEFORE the first bench-guard invocation in the main loop below
+# -- and before this, only usage validation has happened, so nothing has
+# touched the GPU or a real sysfs tree yet. Checked only for SELECTED pairs
+# (only_selected), never the full six-pair matrix, so an --only run is never
+# blocked by an unrelated pair's model being absent. A missing or unreadable
+# file is a loud, immediate usage error naming the exact path (exit 2) --
+# without this, the same problem used to surface only as an opaque
+# ERROR:bench-rc=1 row after bench-guard.sh's full preflight and the
+# wrapped bench's own GPU/driver init had already run.
+for model_entry in "${MODELS[@]}"; do
+    IFS='|' read -r m_key _ m_path <<< "$model_entry"
+    for card_entry in "${CARDS[@]}"; do
+        IFS='|' read -r c_key _ _ <<< "$card_entry"
+        pair_key="$m_key,$c_key"
+        only_selected "$pair_key" || continue
+        [ -r "$m_path" ] || {
+            echo "sycl-prefill-scaling: model file not found or not readable: $m_path (pair $pair_key)" >&2
+            exit 2
+        }
+    done
+done
 
 # parse_cell: extracts the numeric t/s value (first token, spread stripped)
 # for the markdown table row whose `test` cell equals $2 exactly -- never a
