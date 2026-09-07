@@ -100,8 +100,11 @@
 //      print a count for (this test's accessor would read 0, not grow) --
 //      what grows instead is the LIVE extra population, exactly the
 //      hardware figure this ticket's own description measured directly:
-//      1152 live 277,704 B extras after 12 rebuilds, ~150 MB/rebuild,
-//      never released.
+//      1152 live 277,704 B extras after 12 rebuilds (~305 MiB total; quality
+//      review round 1, c-yrh7 #5: an earlier draft also quoted a per-rebuild
+//      rate that did not follow from these two numbers -- dropped rather
+//      than restated, since neither of the ticket's own derived rates
+//      closes against its own object count), never released.
 // Mutants 2 and 3 predate this test file's tracking accessors and were not
 // built.
 //
@@ -132,8 +135,8 @@
 // by one every iteration (this test's layer-0 K key is shared every
 // iteration, so it would leak one 277 KB extra per rebuild).
 //
-// ggml_backend_sched_new() asserts its LAST backend entry is a CPU device
-// (ggml-backend.cpp:2518); this test still runs everything on SYCL (the CPU
+// ggml_backend_sched_new()'s CPU-last GGML_ASSERT requires its LAST backend
+// entry to be a CPU device; this test still runs everything on SYCL (the CPU
 // backend is present only to satisfy that structural requirement, matching
 // how llama.cpp itself always registers a CPU backend), and asserts the
 // per-iteration count is > 0 once a rebuild has happened so a misplacement
@@ -232,6 +235,16 @@ int main(int, char ** argv) {
     // before main() runs, so a plain setenv() here is too late to steer device
     // selection (llama.cpp-2x3m c-oftt, gdb-traced): re-exec once with the
     // selector already in the environment.
+    //
+    // llama.cpp-asdt (quality review round 1, c-yrh7 #9): this is now the
+    // third verbatim copy of this block in tests/ (also
+    // test-sycl-compute-buffer-extra-reuse.cpp and
+    // test-sycl-mmvq-q8-0-soa-numerics.cpp). Plan task S6 (task/S6,
+    // b94ab152d, in review) introduces tests/sycl-selector-fallback.hpp with
+    // a shared `sycl_test_selector_fallback(argv, "level_zero:1")`, which
+    // will consolidate all three -- NOT adopted here since S6 is not on
+    // master yet; do not add a fourth copy either once it lands, switch to
+    // the header instead.
     if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
         setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
         execv("/proc/self/exe", argv);
@@ -246,10 +259,10 @@ int main(int, char ** argv) {
         return LLAMA_TEST_EXIT_SKIP;
     }
 
-    // ggml_backend_sched_new() requires its last backend to be a CPU device
-    // (ggml-backend.cpp:2518, GGML_ASSERT) -- present as a structural
-    // fallback only; every op in this graph (view, cont) is SYCL-supported,
-    // so nothing is expected to actually dispatch here.
+    // ggml_backend_sched_new()'s CPU-last GGML_ASSERT requires its last
+    // backend to be a CPU device -- present as a structural fallback only;
+    // every op in this graph (view, cont) is SYCL-supported, so nothing is
+    // expected to actually dispatch here.
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) {
         fprintf(stderr, "FAIL: ggml_backend_cpu_init failed\n");
@@ -473,10 +486,17 @@ int main(int, char ** argv) {
         ggml_free(ctx);
 
         if (last_extras != N_VIEWS_PER_GRAPH) {
+            // llama.cpp-asdt (quality review round 1, c-yrh7 #7): print both
+            // counts, not just the one that failed -- the per-iteration
+            // printf above goes to stdout while this goes to stderr, and
+            // ctest buffers those separately, so the two can land out of
+            // order and this FAIL can appear next to a different
+            // iteration's stdout line.
             fprintf(stderr,
-                    "FAIL: tiered KV buffer view_extras count %zu != N_VIEWS_PER_GRAPH=%zu at iteration %d -- view "
-                    "extras from a rebuilt graph are not being released (or are being over-released)\n",
-                    last_extras, N_VIEWS_PER_GRAPH, iter);
+                    "FAIL: tiered KV buffer view_extras count %zu != N_VIEWS_PER_GRAPH=%zu at iteration %d "
+                    "(kv_view_extras_live=%zu) -- view extras from a rebuilt graph are not being released (or are "
+                    "being over-released)\n",
+                    last_extras, N_VIEWS_PER_GRAPH, iter, last_live);
             ok = false;
             break;
         }
@@ -490,10 +510,13 @@ int main(int, char ** argv) {
         // grows without bound pre-fix (this test's layer-0 K key is shared
         // every iteration, so it leaks one 277 KB extra per rebuild).
         if (last_live != N_VIEWS_PER_GRAPH) {
+            // llama.cpp-asdt (quality review round 1, c-yrh7 #7): same
+            // reasoning as the FAIL above -- print both counts.
             fprintf(stderr,
-                    "FAIL: tiered KV buffer LIVE extra count %zu != N_VIEWS_PER_GRAPH=%zu at iteration %d -- a "
-                    "shared entry's extra was not released enough times to actually free it\n",
-                    last_live, N_VIEWS_PER_GRAPH, iter);
+                    "FAIL: tiered KV buffer LIVE extra count %zu != N_VIEWS_PER_GRAPH=%zu at iteration %d "
+                    "(kv_view_extras=%zu) -- a shared entry's extra was not released enough times to actually free "
+                    "it\n",
+                    last_live, N_VIEWS_PER_GRAPH, iter, last_extras);
             ok = false;
             break;
         }
@@ -506,6 +529,20 @@ int main(int, char ** argv) {
         ggml_backend_sched_free(sched);
     }
     ggml_backend_buffer_free(kv_buf);
+    // llama.cpp-asdt (quality review round 1, c-yrh7 #2): gate the teardown
+    // path too. This buffer owns every KV-view extra in the process, so
+    // after freeing it the live count must be exactly zero -- a teardown
+    // helper that released once per entry instead of 1 + share_count times
+    // would leak 277 KB per shared key here and the loop above would still
+    // have printed PASS on every iteration.
+    const size_t live_after_free = ggml_backend_sycl_debug_live_kv_view_extra_count();
+    if (ok && live_after_free != 0) {
+        fprintf(stderr,
+                "FAIL: %zu KV-view extras still live after buffer teardown -- "
+                "tiered_kv_buffer_release_view_extras did not release 1 + share_count times\n",
+                live_after_free);
+        ok = false;
+    }
     ggml_free(wctx);
     ggml_sycl::test_clear_kv_placement_plan();
     ggml_backend_free(cpu);

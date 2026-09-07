@@ -154,7 +154,7 @@ The early return's premise ("init_tensor is not called again") is true for a REU
 **Acceptance Criteria:**
 
 - [ ] The GPU test passes: extras count bounded across 20 alternating rebuilds; the same test with the fix reverted (scratch) fails (count grows by ~one graph's tensors per iteration) — record both counts in the commit.
-- [ ] Lead: `-p 1024 -n 0 -r 5` RssAnon flat after the first decode (± 50 MB), probe line shows `preserving` = current graph size only; `-p 512` unchanged.
+- [ ] Lead: `-p 1024 -n 0 -r 5` RssAnon flat after the first decode (± 50 MB), probe line shows `preserving` = current graph size only; `-p 512` unchanged. **[This criterion moved twice -- see the amendments below: first to L2b, then to llama.cpp-h9uv (quality review round 1, c-yrh7 #9).]**
 - [ ] Prefill recovery: pp1024 and pp2048 within 10% of pp512 tok/s at default `-ub` on both cards for Mistral Q4_0 (interleaved two-binary A/B vs the L1 binary, 2 pairs each; expected B70 pp1024 ≈ 3000+ vs 1437) — if the number moves less than that, the remaining per-ubatch cost is a different mechanism and L3 records it; this task still lands on the leak evidence alone.
 - [ ] All correctness gates unchanged (Mistral Q4/Q8 both cards, GPT-OSS chat, gemma4 identity).
 - [ ] The `[SOA-DEBUG]` and probe lines updated to report `released=<n> kept=<m>`.

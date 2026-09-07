@@ -34904,8 +34904,12 @@ static std::atomic<size_t> g_sycl_debug_last_compute_buffer_extra_count{ 0 };
 #endif
 
 // llama.cpp-asdt (plan task L2b): a process-wide, buffer-agnostic counter of
-// how many times ANY SYCL COMPUTE-usage buffer has been reset -- i.e. a
-// lower bound on how many real graph rebuilds have happened, since
+// how many times ANY SYCL COMPUTE-usage buffer has been reset. It advances
+// at least once per real graph rebuild, and possibly more than once when
+// several COMPUTE buffers or chunks are live (quality review round 1,
+// c-yrh7 #4: "lower bound on rebuilds" was backwards for that case -- more
+// resets per rebuild makes it an upper bound on rebuilds, not a lower one).
+// That over-count is harmless here, because
 // ggml_gallocr_alloc_graph's "reset buffers" loop (ggml-alloc.c) runs this
 // reset, for every COMPUTE buffer it owns, at the START of EVERY call,
 // strictly before the leaf/node allocation loop that (re)initialises view
@@ -35828,14 +35832,26 @@ struct kv_view_extra_entry {
     ggml_tensor_extra_gpu * extra;
     // Number of additional retain_extra_gpu() calls issued for `extra` via
     // the same-epoch share path below, beyond the one implied by this
-    // entry's own creation. release_extra_gpu() must be called exactly
-    // 1 + share_count times to return `extra`'s refcount to the state it was
-    // in before any of these retains -- teardown (tiered_kv_buffer_release_
-    // view_extras) does exactly that. Without this, a shared extra's
-    // refcount would never reach zero and its ~277 KB struct would leak at
-    // buffer teardown (a small, bounded, one-time leak -- not the per-decode
-    // growth this task fixes -- but still wrong).
+    // entry's own creation.
     uint32_t                share_count = 0;
+
+    // llama.cpp-asdt (quality review round 1, c-yrh7 #1): the single place
+    // that undoes every retain issued for `extra`. Both the init-time
+    // eviction site (tiered_kv_buffer_init_tensor's view branch) and buffer
+    // teardown (tiered_kv_buffer_release_view_extras) must release exactly
+    // 1 + share_count times to return `extra`'s refcount to the state it
+    // was in before any of the same-epoch share path's retains -- previously
+    // written out at both call sites, which is exactly how bfce5524b's bug
+    // shipped (the eviction site under-released while teardown was already
+    // correct). One routine means the two call sites cannot drift apart
+    // again. Without this, a shared extra's refcount never reaches zero and
+    // its ~277 KB struct leaks (at teardown, a small one-time leak; at
+    // eviction, the per-rebuild growth this task fixes).
+    void release_all() const {
+        for (uint32_t i = 0; i <= share_count; ++i) {
+            release_extra_gpu(extra);
+        }
+    }
 };
 
 struct tiered_kv_buffer_context {
@@ -35913,6 +35929,18 @@ struct tiered_kv_buffer_context {
     // (safe -- at least one real graph rebuild, evidenced by a COMPUTE
     // buffer reset, has happened since, so no tensor from that epoch can
     // still be live).
+    //
+    // Bound (quality review round 1, c-yrh7 #3): the vector's size is capped
+    // by the number of distinct (view_src, view_offs) keys the model's
+    // graphs ever produce -- 2 x n_layer x n_stream (one K key and one V key
+    // per layer per stream; the only varying offset in get_k/get_v is
+    // `ggml_row_size(...) * sinfo.s0`, src/llama-kv-cache.cpp:1394 and
+    // :1417/:1426), plus one key per layer for the k-shift rope view at
+    // offset n_embd_nope (src/llama-kv-cache.cpp:2084) on MLA models. Mistral
+    // (32 layers, single stream) is 64 entries; this test file's 3 layers
+    // give 6. The vector never shrinks except by same-key replacement, so a
+    // key that stops recurring keeps its ~277 KB extra alive until buffer
+    // teardown -- bounded, but the bound scales with n_stream.
     std::vector<kv_view_extra_entry> view_extras;
 };
 
@@ -35927,14 +35955,12 @@ static bool tiered_kv_layer_is_arena_kv(const kv_layer_alloc & la) {
 // the time this runs the ggml_context that owned those view tensors may
 // already be gone (destruction order: the buffer is freed before its owning
 // ggml_context, same as the COMPUTE buffer case), so `.view_src` is never
-// touched either. Each entry needs 1 + share_count releases to undo every
-// retain_extra_gpu() the same-epoch share path (tiered_kv_buffer_init_tensor)
-// issued against it -- see kv_view_extra_entry::share_count.
+// touched either. Each entry's release_all() undoes every retain_extra_gpu()
+// the same-epoch share path (tiered_kv_buffer_init_tensor) issued against
+// it -- see kv_view_extra_entry::release_all()'s comment.
 static void tiered_kv_buffer_release_view_extras(tiered_kv_buffer_context * ctx) {
     for (auto & entry : ctx->view_extras) {
-        for (uint32_t i = 0; i <= entry.share_count; ++i) {
-            release_extra_gpu(entry.extra);
-        }
+        entry.release_all();
     }
     ctx->view_extras.clear();
 }
@@ -35942,12 +35968,17 @@ static void tiered_kv_buffer_release_view_extras(tiered_kv_buffer_context * ctx)
 static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<tiered_kv_buffer_context *>(buffer->context);
     ggml_sycl_set_device(ctx->device);
+    // llama.cpp-asdt (quality review round 1, c-yrh7 #8): one call covers
+    // both exits below -- nothing between here and either exit reads
+    // ctx->view_extras, so hoisting this out of the vmem_pool branch (it
+    // used to be called once per exit) cannot change behavior, and a future
+    // early return added above the vmem branch can no longer skip it.
+    tiered_kv_buffer_release_view_extras(ctx);
 
     // P9: If vmem pool is active, destroy it (unmaps all physical pages + frees virtual range).
     // Per-layer allocs from vmem are sub-ranges of the virtual address space and must NOT
     // be individually freed.
     if (ctx->vmem_pool) {
-        tiered_kv_buffer_release_view_extras(ctx);
         for (auto & la : ctx->layer_allocs) {
             ggml_sycl_fattn_xmx_unregister_packed_k_range(la.ptr, la.size);
         }
@@ -35961,7 +35992,6 @@ static void tiered_kv_buffer_free(ggml_backend_buffer_t buffer) {
         delete ctx;
         return;
     }
-    tiered_kv_buffer_release_view_extras(ctx);
 
     // Free per-layer allocations. Every non-vmem layer allocation is owned by
     // a mem_handle created from the allocation-time handle; raw pointer
@@ -36058,13 +36088,13 @@ static enum ggml_status tiered_kv_buffer_init_tensor(ggml_backend_buffer_t buffe
             // llama.cpp-asdt bug fix (jemalloc profile, kqy7 c-qnq7): a
             // shared entry accumulated share_count additional
             // retain_extra_gpu() calls beyond its own creation, so its
-            // refcount is 1 + share_count -- release it that many times, not
-            // once, or it never reaches zero and leaks (this was the actual
-            // ~250 MB/decode residual: 448 live 320 KB objects on a pp1024x3
-            // jemalloc profile, one per shared key per rebuild).
-            for (uint32_t r = 0; r <= candidate.share_count; ++r) {
-                release_extra_gpu(candidate.extra);
-            }
+            // refcount is 1 + share_count -- release_all() undoes exactly
+            // that many, not once, or it never reaches zero and leaks (this
+            // was the actual ~250 MB/decode residual: 448 live 320 KB
+            // objects on a pp1024x3 jemalloc profile, one per shared key per
+            // rebuild). See kv_view_extra_entry::release_all()'s comment for
+            // why this must be the same routine teardown uses.
+            candidate.release_all();
             ctx->view_extras[i] = ctx->view_extras.back();
             ctx->view_extras.pop_back();
             break;
