@@ -137,33 +137,160 @@ def test_create_cache_for_device_defined_exactly_once():
     assert source.count(FUNC_SIG) == 1, "create_cache_for_device must be defined exactly once"
 
 
+def matching_paren(text, open_idx):
+    """Comment/string-aware matching ')' for the '(' at open_idx
+    (self-contained copy, per this fork's one-file-per-gate convention --
+    see tests/test-sycl-extra-leak-probe-source.py's sibling helper). Needed
+    because an if-condition is not guaranteed to be paren-free, and a naive
+    `text.find(")", ...)` would stop at the first ')' inside a nested
+    expression."""
+    assert text[open_idx] == "("
+    depth = 0
+    state = "code"
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line"
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block"
+                i += 2
+                continue
+            if ch == '"':
+                state = "str"
+            elif ch == "'":
+                prev = text[i - 1] if i > 0 else ""
+                if not (prev.isalnum() or prev == "_"):
+                    state = "chr"
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+                continue
+        elif state == "str":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                state = "code"
+        elif state == "chr":
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
+                state = "code"
+        i += 1
+    raise AssertionError("unbalanced parens")
+
+
+# Word-boundary aware (`(?<![A-Za-z0-9_])`) so this cannot match `if (` as a
+# substring of a longer identifier immediately followed by ` (` (e.g. a
+# hypothetical `motif (...)` call).
+_IF_RE = re.compile(r"(?<![A-Za-z0-9_])if\s*\(")
+
+
+def _find_enclosing_if_condition(body, call_idx):
+    """The whitespace-stripped condition of the SMALLEST `if ( ... )` in
+    `body` whose body (a `{ ... }` block, or a single-statement body up to
+    the next top-level `;`) actually CONTAINS call_idx, or None if no such
+    enclosing if exists (a genuinely unconditional call).
+
+    Deliberately NOT "the nearest preceding `if (`" (quality review c-69sf,
+    nit 1): that textual-proximity approach reports a call as guarded by an
+    UNRELATED `if` earlier in the same function, as long as that if's own
+    body ends before the call -- a genuinely unconditional call preceded by
+    an unrelated `if (something_else) { ... }` would be misreported as
+    guarded by `something_else` and this gate would false-fail. This scans
+    EVERY `if (` in the body and only accepts one whose body span actually
+    contains the call, picking the innermost (latest-starting) match among
+    any that do (nested ifs)."""
+    best = None  # (body_start, condition) for the tightest enclosing if found so far
+    for m in _IF_RE.finditer(body):
+        if_start = m.start()
+        if if_start >= call_idx:
+            continue  # this if starts at or after the call -- cannot enclose it
+        cond_open = m.end() - 1
+        cond_close = matching_paren(body, cond_open)
+        condition = body[cond_open + 1 : cond_close]
+        rest = body[cond_close + 1 :]
+        stripped_rest = rest.lstrip()
+        after_ws = cond_close + 1 + (len(rest) - len(stripped_rest))
+        if body[after_ws : after_ws + 1] == "{":
+            body_start = after_ws
+            body_end = matching_brace(body, body_start)
+        else:
+            # Single-statement body (no braces): up to the next top-level ';'.
+            semi_idx = body.find(";", after_ws)
+            if semi_idx < 0:
+                continue
+            body_start, body_end = after_ws, semi_idx
+        if body_start < call_idx <= body_end and (best is None or body_start > best[0]):
+            best = (body_start, condition)
+    if best is None:
+        return None
+    return re.sub(r"\s+", "", best[1])
+
+
 def _ensure_call_guard_condition(body):
-    """The whitespace-stripped condition of the smallest enclosing
-    `if ( ... )` that guards ENSURE_CALL, or None if there is no enclosing
-    if at all (a genuinely unconditional call). Walks back from the call to
-    the nearest preceding `if (`, then confirms the call actually sits
-    inside that if's body (no other statement between the `{` and the
-    call), so this cannot be fooled by an unrelated, earlier `if (...)`
-    elsewhere in the function. Shared by the GREEN check below and the
-    positive control's complement check on the pre-fix revision."""
+    """The whitespace-stripped condition of the smallest `if ( ... )`
+    actually enclosing ENSURE_CALL in `body`, or None if the call is
+    genuinely unconditional. Thin wrapper over
+    _find_enclosing_if_condition() that locates the call itself. Shared by
+    the GREEN check below and the positive control's complement check on
+    the pre-fix revision."""
     idx = body.find(ENSURE_CALL)
     assert idx >= 0, f"expected {ENSURE_CALL} to be called"
-    if_idx = body.rfind("if (", 0, idx)
-    if if_idx < 0:
-        return None
-    cond_open = if_idx + len("if (") - 1
-    cond_close = body.find(")", cond_open)
-    assert cond_close >= 0, "unterminated if-condition"
-    condition = body[cond_open + 1 : cond_close]
-    brace_open = body.find("{", cond_close)
-    assert brace_open >= 0, f"expected a brace-delimited if body after `if ({condition})`"
-    between = body[cond_close + 1 : brace_open].strip()
-    assert between == "", f"unexpected tokens between if-condition and its body: {between!r}"
-    guarded_body = body[brace_open : matching_brace(body, brace_open) + 1]
-    assert ENSURE_CALL in guarded_body, (
-        f"the nearest enclosing `if ({condition})` does not actually guard the {ENSURE_CALL} call"
+    return _find_enclosing_if_condition(body, idx)
+
+
+def test_guard_condition_extraction_is_structural_not_textual_proximity():
+    # Regression test for the extraction LOGIC itself (quality review
+    # c-69sf, nit 1), independent of whatever unified-cache.cpp currently
+    # contains -- durable the same way the git-show positive control below
+    # is durable, in the "positive control" style: synthetic minimal
+    # function bodies standing in for the three mutants the reviewer
+    # actually tried against a naive nearest-preceding-`if` implementation.
+    unrelated_if_before_unconditional_call = """{
+        if (something_else) {
+            do_other_stuff();
+        }
+        ensure_single_device_context_queue(device_id);
+    }"""
+    assert _ensure_call_guard_condition(unrelated_if_before_unconditional_call) is None, (
+        "an unrelated `if` earlier in the function, whose body does not contain the call, must not be "
+        "reported as guarding it -- the call here is genuinely unconditional"
     )
-    return re.sub(r"\s+", "", condition)
+
+    regated_on_something_else = """{
+        if (!cache_queue && dev_count > 1) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_condition(regated_on_something_else) == "!cache_queue&&dev_count>1", (
+        "expected the full condition to be extracted, not just the absence of a specific substring"
+    )
+
+    correctly_fixed = """{
+        if (!cache_queue) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_condition(correctly_fixed) == "!cache_queue", (
+        "expected the shipped tree's guard pattern to extract exactly `!cache_queue`"
+    )
 
 
 def test_ensure_single_device_context_queue_is_called_unconditionally():
