@@ -32,8 +32,8 @@
 #      passed" for a pair that was never actually measured.
 #   2  usage error: an --only token that names no such pair, no pair ended
 #      up selected at all, bench-guard.sh/--guard override not found, or a
-#      SELECTED pair's model file is missing or unreadable (checked before
-#      any bench-guard invocation).
+#      selected model's file (validated once per model, before any
+#      bench-guard invocation) is missing or unreadable.
 #
 # Every run goes through bench-guard.sh (S5, caf7e73d0) so the same
 # throttle/tenant/Shmem preflight and VALID/SUSPECT postflight stamping
@@ -81,8 +81,8 @@
 # /models (a USB-backed filesystem) was down for two days while being
 # migrated to bcachefs, with byte-identical copies available under
 # /Storage/GenAI/models, so the gate could not run at all in the meantime
-# (llama.cpp-5iba). Each SELECTED pair's model file is validated to exist
-# and be readable at parse time, before any bench-guard.sh invocation --
+# (llama.cpp-5iba). Each selected model's file is validated once, to exist
+# and be readable, at parse time, before any bench-guard.sh invocation --
 # see the model-existence-check block below MODELS/CARDS: a missing model
 # used to surface only as an opaque ERROR:bench-rc=1 row after a full
 # GPU/driver init, not as an immediate, loud usage error naming the path.
@@ -129,12 +129,18 @@ esac; done
 # /foo/mistral-... rather than /foo//mistral-... in both the -m argument
 # and the refusal message. Looped, not a single ${MODELS_DIR%/}, so a value
 # with more than one trailing slash is fully stripped rather than left with
-# one; guarded on length > 1 so the root "/" itself is preserved rather than
-# stripped down to an empty string (--models-dir / must still mean the
-# filesystem root, not "").
+# one; guarded on length > 1 so a bare "/" survives THIS loop unstripped
+# (stripping it down to "" here would make the loop condition's own
+# ${MODELS_DIR: -1} read past an empty string).
 while [ "${#MODELS_DIR}" -gt 1 ] && [ "${MODELS_DIR: -1}" = "/" ]; do
     MODELS_DIR="${MODELS_DIR%/}"
 done
+# A bare "/" (or the loop above reducing --models-dir // down to it) is
+# mapped to the EMPTY string here, once, after the loop: paths below are
+# always built as "$MODELS_DIR/mistral-...", so a literal "/" would still
+# produce "//mistral-..." -- the empty string is what builds the correct
+# single-slash root path "/mistral-...".
+[ "$MODELS_DIR" = "/" ] && MODELS_DIR=""
 
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 

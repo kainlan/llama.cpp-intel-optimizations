@@ -804,12 +804,16 @@ echo "$out" | grep -qF "$MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" || { echo
 # --- Case 16b (llama.cpp-5iba): the model-file check is hoisted out of the
 # card loop -- a model shared across BOTH selected pairs (mistral,b70 AND
 # mistral,b50, same underlying path) must be stat'd and refused ONCE, not
-# once per selected card. Asserts exactly one refusal line (not two) and
-# that it names the MODEL ("model mistral"), not an arbitrary single pair
-# -- a reverted hoist (a per-pair check naming "pair mistral,b70") would
-# still exit 2 and name the missing path, so neither of those alone would
-# catch it; the exact refusal-line COUNT and the "(model ...)" wording are
-# what pin the hoist specifically.
+# once per selected card. The "(model mistral)" WORDING is what actually
+# pins the hoist (a reverted, per-pair check would print "(pair
+# mistral,b70)" instead and this case would still exit 2 and name the
+# missing path either way, so those alone don't catch it). The refusal-
+# line COUNT assertion below cannot itself distinguish the two forms --
+# the script `exit 2`s on the FIRST failing model/pair it finds either
+# way, so a per-pair mutant also produces exactly one line here (it never
+# reaches a second pair to print a second one); it is kept as a belt
+# against a future variant that accumulated multiple refusals instead of
+# exiting on the first, not as this case's primary assertion.
 rm -f "$GUARD_MARKER"
 out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$MISSING_MODELS_DIR" --only mistral,b70 --only mistral,b50 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 2 ] || { echo "FAIL: a missing model file shared by two selected pairs must exit 2, got $rc. Output:
@@ -819,5 +823,23 @@ n_refusal_lines="$(echo "$out" | grep -c "model file not found or not readable" 
 $out"; fail=1; }
 echo "$out" | grep -q "(model mistral)" || { echo "FAIL: expected the refusal to name the MODEL (model mistral), not a single arbitrary pair (got: $out)"; fail=1; }
 [ -f "$GUARD_MARKER" ] && { echo "FAIL: bench-guard must not be invoked at all when a selected model's file is missing (marker exists)"; fail=1; }
+
+# --- Case 16c (llama.cpp-5iba): --models-dir / (the filesystem root) must
+# build a single-slash path ("/mistral-7b-v0.1.Q4_0.gguf"), never
+# "//mistral-...". This is the case the plain trailing-slash strip alone
+# cannot handle: stripping "/" down to "" would leave the loop's own
+# ${MODELS_DIR: -1} indexing an empty string, so MODELS_DIR="/" is mapped
+# to the empty string separately, once, after the loop -- paths are always
+# built as "$MODELS_DIR/mistral-...", so the empty string (not "/") is
+# what produces the correct single slash. The root almost certainly has no
+# such file on any real host, so this doubles as another missing-file
+# refusal case.
+rm -f "$GUARD_MARKER"
+out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "/" --only mistral,b70 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: --models-dir / with a missing file must exit 2, got $rc. Output:
+$out"; fail=1; }
+echo "$out" | grep -qF "/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected /mistral-7b-v0.1.Q4_0.gguf named in the refusal for --models-dir / (got: $out)"; fail=1; }
+echo "$out" | grep -qF "//mistral-7b-v0.1.Q4_0.gguf" && { echo "FAIL: --models-dir / must never produce a doubled slash //mistral-7b-v0.1.Q4_0.gguf (got: $out)"; fail=1; }
+[ -f "$GUARD_MARKER" ] && { echo "FAIL: bench-guard must not be invoked at all when --models-dir / has no mistral file (marker exists)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1
