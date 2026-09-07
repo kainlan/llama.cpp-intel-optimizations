@@ -236,13 +236,13 @@ def parse_log(path, min_free_mib, wanted_tests):
     Raises ParseError on anything that makes the file unusable. There is no
     partial success: a file either yields every wanted test or it fails.
 
-    "n_ctx" is the last `llama_context: n_ctx = N` value seen before the row
-    matching wanted_tests[0] (the "pp" test) -- i.e. the achieved context
-    size for THAT test, not for whatever runs after it (llama-bench builds a
-    separate llama_context per test, so a later test's own n_ctx line, e.g.
-    tg128's, must not leak into this figure). None if no such line appears
-    before that row. Only the long-prompt --table path consults this; every
-    other caller ignores it.
+    "n_ctx" is the MAX `llama_context: n_ctx = N` value found anywhere in the
+    file (owner clarification, llama.cpp-z0wt): llama-bench builds a separate
+    llama_context per test instance, so a -v log carries one such line per
+    test (e.g. 2048 for a pp2048 test, 256 for tg128), and the pp test's own
+    context is always the largest -- the tg test's is bounded by n_gen, so it
+    never wins the max. None if no such line appears at all. Only the
+    long-prompt --table path consults this; every other caller ignores it.
     """
     if not os.path.isfile(path):
         raise ParseError("%s: no such file" % path)
@@ -268,16 +268,21 @@ def parse_log(path, min_free_mib, wanted_tests):
             % (path, free_mib, min_free_mib)
         )
 
-    pp_test = wanted_tests[0]
-    ctx_before_pp = []
-    pp_seen = False
+    # Achieved n_ctx: a -v log carries one "llama_context: n_ctx = N" line per
+    # TEST INSTANCE (llama-bench builds a separate context per test, so the pp
+    # test and the tg test each report their own -- e.g. 2048 and 256 in a
+    # "-p 2048 -n 128" run). The MAX across all of them is the achieved figure
+    # for the arm's pp test (owner clarification, llama.cpp-z0wt, 2026-09-07):
+    # the tg test's own context is always small (bounded by n_gen), so it
+    # never wins the max, and this needs no positional scoping. The
+    # "[SYCL-PLAN] ... n_ctx=... (conservative)" and "[PLACEMENT] ... n_ctx=0"
+    # lines are planner diagnostics, not the achieved context -- N_CTX_RE is
+    # anchored to the "llama_context:" prefix so it never matches them.
+    ctx_matches = [int(m.group(1)) for m in N_CTX_RE.finditer(text)]
+
     header_cols = None
     found = {}
     for line in text.splitlines():
-        if not pp_seen:
-            m_ctx = N_CTX_RE.search(line)
-            if m_ctx:
-                ctx_before_pp.append(int(m_ctx.group(1)))
         if not line.lstrip().startswith("|"):
             continue
         cells = split_row(line)
@@ -299,8 +304,6 @@ def parse_log(path, min_free_mib, wanted_tests):
         if row["fa"] != "1":
             continue
         test = row["test"]
-        if test == pp_test:
-            pp_seen = True  # stop attributing later n_ctx lines to this test
         if test not in wanted_tests:
             continue
         m = TS_RE.match(row["t/s"])
@@ -325,7 +328,7 @@ def parse_log(path, min_free_mib, wanted_tests):
 
     result = {t: found[t] for t in wanted_tests}
     result["free_mib"] = free_mib
-    result["n_ctx"] = ctx_before_pp[-1] if ctx_before_pp else None
+    result["n_ctx"] = max(ctx_matches) if ctx_matches else None
     return result
 
 
