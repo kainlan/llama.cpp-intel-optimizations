@@ -43,7 +43,9 @@ review round 2) so a long-prompt PASS is still a measurement, not the only
 answer available. A `--runs 1 --table` case also proves the sample-stdev
 column renders `n/a` rather than a misleading `0.00`, in both the report and
 the table, when there is no second sample to compute a spread from (review
-rounds 1 and 2).
+rounds 1 and 2) — the case checks for both `"sd    n/a"` (the report line)
+and `"± n/a"` (the table cell) in stdout, not just one of the two rendering
+sites the claim covers (review round 3).
 
 ## Provenance — what is real and what is reconstructed
 

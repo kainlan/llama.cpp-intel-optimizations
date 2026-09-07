@@ -373,6 +373,17 @@ def _stdev_str(values):
     return "n/a" if sd is None else "%.2f" % sd
 
 
+# The "TG" column label is derived from the arms' own tests, not hardcoded --
+# mirroring the round-2 fix to the row builder (which reads arm_tests[1]
+# rather than assuming the literal "tg128"). Every long-prompt arm measures
+# decode with the identical n_gen, so all of them must share one "tg" test
+# name; assert that invariant rather than silently trusting it.
+_tg_test_names = {spec["tests"][1] for spec in LONG_PROMPT_ARMS.values()}
+assert len(_tg_test_names) == 1, (
+    "every long-prompt arm must share one 'tg' test name, got %r" % _tg_test_names
+)
+_TG_COLUMN_LABEL = next(iter(_tg_test_names)).upper()
+
 # Header/separator built from _LONG_PROMPT_PPS rather than hardcoded, so the
 # column list can't drift from the tuple that actually drives the rows below.
 # A comprehension, not a loop-variable leak the module scope would then have
@@ -380,7 +391,7 @@ def _stdev_str(values):
 # were ever empty).
 _TABLE_COLUMNS = (
     ["card", "model"]
-    + [col for pp in _LONG_PROMPT_PPS for col in ("PP%d" % pp, "TG128")]
+    + [col for pp in _LONG_PROMPT_PPS for col in ("PP%d" % pp, _TG_COLUMN_LABEL)]
     + ["ctx achieved", "notes"]
 )
 
@@ -535,10 +546,15 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         spec = arms[arm]
         out.write("%s (%s)\n" % (arm, spec["selector"]))
         free_values = [s["free_mib"] for s in samples]
-        out.write(
-            "  free VRAM: %s MiB (min %d)\n"
-            % (" ".join(str(v) for v in free_values), min(free_values))
-        )
+        if spec["kind"] == REPORT:
+            out.write(
+                "  free VRAM: %s MiB (min %d)\n"
+                % (" ".join(str(v) for v in free_values), min(free_values))
+            )
+        else:
+            # Merge-cert: keep this line byte-identical to 6ae16115c -- the
+            # "(min N)" tail is a long-prompt-only addition (review round 3).
+            out.write("  free VRAM: %s MiB\n" % " ".join(str(v) for v in free_values))
         for test in spec["tests"]:
             values = [s[test] for s in samples]
             mean = sum(values) / len(values)
@@ -718,7 +734,7 @@ def self_test(out):
              arms=_all_good("long-prompt"), want_table=True, expected=0),
         dict(name="long-prompt --runs 1 --table -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
              arms={arm: [_fixture_for_long_prompt_arm(arm)] for arm in LONG_PROMPT_ARMS},
-             runs=1, want_table=True, expected=0, contains=["± n/a"]),
+             runs=1, want_table=True, expected=0, contains=["± n/a", "sd    n/a"]),
     ]
 
     # Expected stream occupancy per exit code. Checking this is the point:

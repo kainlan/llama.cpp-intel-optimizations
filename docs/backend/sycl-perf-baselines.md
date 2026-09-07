@@ -853,7 +853,9 @@ per-arm means table, and a `PASS` verdict), stderr carries every diagnostic
 that accompanies a non-zero exit. **Exit 2 writes nothing at all to stdout** —
 no verdict was computable, so there is no result to report. The `--self-test`
 asserts this per case rather than taking it on trust; a mutation routing one
-diagnostic back to stdout drops it from 10/10 to 4/10.
+diagnostic back to stdout fails every exit-2 case at once (a precise pass
+count is intentionally not repeated here — it drifts every time a case is
+added, which is exactly the trap this note is warning about).
 
 Every one of these is exit 2, not a smaller sample: a missing file, an empty
 file, an arm with fewer than five logs, an arm entirely absent, a results
