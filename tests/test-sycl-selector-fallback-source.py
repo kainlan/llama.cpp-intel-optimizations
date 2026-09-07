@@ -112,6 +112,16 @@ cover):
   character, as in a digit separator), stopping the literal scan at a
   newline, and leaving an unclosed quote in the output verbatim (unmasked)
   instead of masking to EOF/end-of-line.
+  Quality round 7 (rev-5q1r-quality-7, c-td7k) found round 6's "preceded by
+  an alphanumeric or `_`" guard, meant only to exclude digit separators,
+  also excluded ENCODING-PREFIXED CHAR LITERALS -- `L'x'`, `u'x'`, `U'x'`,
+  `u8'x'` -- since the prefix letter is itself alphanumeric, leaving those
+  literals completely unmasked. A balanced pair (`L'{'` inside main, `L'}'`
+  after a later offending call) reached the same false compliant a digit
+  separator once did. Fixed by checking the alphanumeric run back to a
+  token boundary against the exact set of valid C++ encoding prefixes
+  (`L`, `u`, `U`, `u8`) rather than merely "is the preceding character
+  alphanumeric" -- see _is_char_literal_opener's docstring.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -262,6 +272,35 @@ def _has_canonical_inline_block(text):
     return True
 
 
+_CHAR_LITERAL_PREFIXES = {"L", "u", "U", "u8"}
+
+
+def _is_char_literal_opener(text, i):
+    """True if the `'` at position `i` in `text` genuinely opens a char
+    literal: either with no prefix at all, or with exactly one of C++'s
+    encoding prefixes (`L`, `u`, `U`, `u8`) immediately before it, back to
+    a token boundary. False for anything else alphanumeric/`_` immediately
+    preceding it -- most commonly a C++14 digit separator (`1'000`, where
+    the run back to a token boundary is the digit `1`, not a valid prefix),
+    but also any other identifier-suffix use.
+
+    Quality round 7 (rev-5q1r-quality-7, c-td7k) found round 6's "preceded
+    by an alphanumeric or `_`" guard (meant only to exclude digit
+    separators) also excluded ENCODING-PREFIXED CHAR LITERALS -- `L'x'`,
+    `u'x'`, `U'x'`, `u8'x'` -- since the prefix letter is itself
+    alphanumeric, so those literals were left completely unmasked, and a
+    balanced pair of them (e.g. `L'{'` inside main, `L'}'` after a later
+    offending call) could reach the exact false-compliant this scanner
+    exists to prevent. "Preceded by a digit" is NOT a valid shorthand for
+    "is a digit separator, not a prefix": `u8'x'` is preceded by the digit
+    `8`, which is part of the valid `u8` prefix."""
+    j = i
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] == "_"):
+        j -= 1
+    prefix = text[j:i]
+    return prefix == "" or prefix in _CHAR_LITERAL_PREFIXES
+
+
 def _mask_comments_and_literals(text):
     """Returns a copy of `text` the same length, with every `//` line
     comment, `/* */` block comment, string literal ("...") and char literal
@@ -305,9 +344,10 @@ def _mask_comments_and_literals(text):
         `ENTRY(argc, argv) { ... }`) is invisible to MAIN_SIGNATURE_PATTERN
         regardless of masking; this was already true before masking existed
         and is unrelated to it.
-    Digit separators (`1'000'000`) are HANDLED as of quality round 6 (the
-    fix above), not a residual -- listed here only for contrast with the
-    genuinely open items."""
+    Digit separators (`1'000'000`) are HANDLED as of quality round 6, and
+    encoding-prefixed char literals (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) are
+    HANDLED as of quality round 7 -- neither is a residual, listed here
+    only for contrast with the genuinely open items."""
     out = []
     i = 0
     n = len(text)
@@ -323,9 +363,7 @@ def _mask_comments_and_literals(text):
             end = (j + 2) if j != -1 else n
             out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
             i = end
-        elif text[i] in "\"'" and not (
-            text[i] == "'" and i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
-        ):
+        elif text[i] == '"' or (text[i] == "'" and _is_char_literal_opener(text, i)):
             quote = text[i]
             j = i + 1
             closed = False
@@ -963,6 +1001,49 @@ def test_digit_separator_is_not_a_literal_opener():
         '}\n'
     )
     assert _classify(control_digit_separator_in_ordinary_code) == "compliant"
+
+
+def test_encoding_prefixed_char_literal_is_still_masked():
+    """Fixture proving an ENCODING-PREFIXED char literal (`L'x'`, `u'x'`,
+    `U'x'`, `u8'x'`) is still masked, not exempted by the digit-separator
+    guard -- quality round 7 (rev-5q1r-quality-7, c-td7k) found round 6's
+    "preceded by an alphanumeric or `_`" guard also matched the prefix
+    letter of an encoding-prefixed literal, so `L'x'` and friends were left
+    completely unmasked. A balanced pair of such literals (`L'{'` inside
+    main, `L'}'` after a later offending call) then reached the exact
+    false-compliant this scanner exists to prevent, the same way an
+    unguarded digit separator once did.
+
+    Before this fix, 2955b9be8 (quality round 6) classified
+    arm_encoding_prefixed_braces below "compliant" -- the bug. It must
+    classify offender_call_outside_scanned_main again."""
+    arm_encoding_prefixed_braces = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        "    char c = L'{';\n"
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        "    char d = L'}';\n"
+        '}\n'
+    )
+    assert _classify(arm_encoding_prefixed_braces) == "offender_call_outside_scanned_main"
+
+    # Control: a genuine encoding-prefixed char literal AND a digit
+    # separator, both in ordinary code alongside an otherwise correct main
+    # -- proving neither construct makes an otherwise-fine file an
+    # offender.
+    control_prefixed_literal_and_digit_separator = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        "    char c = u8'x';\n"
+        '    const int budget = 1\'000;\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_prefixed_literal_and_digit_separator) == "compliant"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
