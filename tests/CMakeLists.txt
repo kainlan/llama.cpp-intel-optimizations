@@ -508,10 +508,18 @@ endif()
 
 # Regression gate for llama.cpp-yke2: test TUs that include
 # ggml-sycl/common.hpp interpose dpct's inline queue-construction functions
-# without DPCT_PROFILING_ENABLED, silently dropping enable_profiling from the
-# single-GPU unified-cache owner queue (create_cache_for_device,
-# unified-cache.cpp) -- discovered while diagnosing why the G4 numerics test
-# needed a private profiling-enabled queue of its own. Links the real
+# (dpct::device_ext::create_queue_impl(), ggml-sycl/dpct/helper.hpp) without
+# DPCT_PROFILING_ENABLED, silently dropping enable_profiling from every queue
+# built through dpct::device_ext::default_queue() -- including, but not
+# limited to, ggml_backend_sycl_context::stream()'s pre-cache fallback branch
+# (common.hpp) -- discovered while diagnosing why the G4 numerics test needed
+# a private profiling-enabled queue of its own. Fixed by making
+# create_queue_impl() add the property unconditionally (helper.hpp), which is
+# what turns this test's PHASE 1 green; PHASE 2 separately exercises the
+# unified cache's own queue construction (create_cache_for_device(),
+# unified-cache.cpp), an independent fix that removed a `total_gpus > 1` gate
+# on ensure_single_device_context_queue() -- see the test file's header
+# comment for why both phases, and both fixes, are needed. Links the real
 # ggml-sycl library (like test-sycl-mxfp4-woq-repack above) to exercise the
 # actual ggml_backend_sycl_context::stream() path, not a private workaround
 # queue.
@@ -535,6 +543,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     # so a `ctest -R` run does not silently pass for the wrong reason.
     set_tests_properties(test-sycl-profiling-queue-property PROPERTIES
         RUN_SERIAL TRUE
+        TIMEOUT 300
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 

@@ -49,6 +49,7 @@ the defaults are the in-tree files.
 
 import os
 import re
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -286,9 +287,19 @@ def test_ggml_sycl_cmake_no_longer_defines_dpct_profiling_enabled():
     )
 
 
+# _git_show raises unittest.SkipTest (not a bespoke exception) when there is
+# no .git directory, so this test is skipped, not failed, under EITHER
+# runner without importing pytest directly: pytest natively converts a
+# raised unittest.SkipTest into a skip outcome (its documented interop point
+# for non-pytest test code), and the plain-script runner at the bottom of
+# this file catches it explicitly as SKIP.
 def _git_show(path):
     import subprocess
 
+    if not (ROOT / ".git").exists():
+        raise unittest.SkipTest(
+            f"no .git directory at {ROOT} -- cannot fetch {KNOWN_PRE_FIX_REVISION}:{path} for the positive control"
+        )
     proc = subprocess.run(
         ["git", "show", f"{KNOWN_PRE_FIX_REVISION}:{path}"],
         cwd=str(ROOT),
@@ -309,7 +320,8 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
     # <KNOWN_PRE_FIX_REVISION>:<path>` and re-applies the same structural
     # assertions this file uses for GREEN, confirming each is actually
     # capable of catching its own bug -- an assertion that can never fail is
-    # not a check.
+    # not a check. Skipped, not failed, when there is no .git directory to
+    # fetch the pre-fix revision from (nit from spec review c-wbm2).
     pre_unified_cache = _git_show("ggml/src/ggml-sycl/unified-cache.cpp")
     pre_helper = _git_show("ggml/src/ggml-sycl/dpct/helper.hpp")
     pre_sycl_cmake = _git_show("ggml/src/ggml-sycl/CMakeLists.txt")
@@ -357,6 +369,9 @@ if __name__ == "__main__":
             try:
                 fn()
                 print(f"PASS {fn_name}")
+            except unittest.SkipTest as exc:
+                # Not a failure: see _git_show's no-.git-directory case.
+                print(f"SKIP {fn_name}: {exc}")
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {fn_name}: {exc}")
