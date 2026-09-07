@@ -344,24 +344,46 @@ def _mask_comments_and_strings(text):
     return "".join(out)
 
 
-def _skip_ws(body, pos):
-    """The offset of the first non-whitespace character in `body` at or
+def _skip_ws(masked, pos):
+    """The offset of the first non-whitespace character in `masked` at or
     after `pos` (a small shared helper -- every whitespace-skip in this
-    file follows this same lstrip-and-measure pattern)."""
-    rest = body[pos:]
+    file follows this same lstrip-and-measure pattern).
+
+    ALWAYS pass the MASKED text here, never the original `body` (quality
+    review c-7013): a comment or string literal is not whitespace to
+    Python's str.lstrip(), so skipping over the ORIGINAL text stops at the
+    `/` of a `/* ... */` or `//` comment instead of past it, and the
+    caller's subsequent match against `masked` at that position then reads
+    a blanked-out space and fails to find a real, following `if`/`else`
+    that is genuinely there -- reported by the reviewer as a false PASS on
+    the real file for both `} /* comment */ else {` and a `//`-commented
+    line between `}` and `else {`. Masking blanks comments/strings to
+    spaces (same length, same offsets), so lstrip() on the masked text
+    correctly treats a whole comment as whitespace and lands on the next
+    REAL token; body[start_ws]/masked[start_ws] then agree, since masking
+    never alters a real code character, only comment/string interiors and
+    delimiters."""
+    rest = masked[pos:]
     stripped = rest.lstrip()
     return pos + (len(rest) - len(stripped))
 
 
-def _branch_span(body, start_ws):
+def _branch_span(body, masked, start_ws):
     """Given `start_ws` (the position right after an if/else's condition
-    or the `else` keyword, whitespace already skipped via _skip_ws), the
-    (body_start, body_end) span of its body -- a `{ ... }` block, or a
-    single-statement body up to the next top-level `;`. None if a
-    single-statement body has no terminating `;` (malformed input)."""
+    or the `else` keyword, whitespace ALREADY SKIPPED VIA _skip_ws(masked,
+    ...) -- never via body), the (body_start, body_end) span of its body --
+    a `{ ... }` block, or a single-statement body up to the next top-level
+    `;`. None if a single-statement body has no terminating `;` (malformed
+    input). The opening-brace check reads `body` (equivalent to `masked` at
+    a position already known to be real code), but the `;` search reads
+    `masked` (quality review c-7013's audit: a `;` embedded in a comment or
+    string between `start_ws` and the real terminator must not end the
+    search early) -- extraction of the SPAN itself is a set of offsets, not
+    text, so this returns positions usable against either copy; only actual
+    condition-TEXT extraction in the caller reads `body`."""
     if body[start_ws : start_ws + 1] == "{":
         return start_ws, matching_brace(body, start_ws)
-    semi_idx = body.find(";", start_ws)
+    semi_idx = masked.find(";", start_ws)
     if semi_idx < 0:
         return None
     return start_ws, semi_idx
@@ -379,10 +401,10 @@ def _call_is_somewhere_in_else_chain(body, masked, call_idx, pos):
     condition's negation belongs in the result, regardless of how many
     more links separate it from wherever the call actually is)."""
     while True:
-        after_ws = _skip_ws(body, pos)
+        after_ws = _skip_ws(masked, pos)
         if not _IF_KEYWORD_RE.match(masked, after_ws):
             # Plain, final else: no further chain possible after this.
-            span = _branch_span(body, after_ws)
+            span = _branch_span(body, masked, after_ws)
             return span is not None and span[0] < call_idx <= span[1]
         # else-if: this link's own condition + then-body. Its POSITIVE
         # condition, if the call is here, is added separately by
@@ -393,13 +415,13 @@ def _call_is_somewhere_in_else_chain(body, masked, call_idx, pos):
         m = _IF_RE.match(masked, after_ws)
         assert m, "expected `if (` right after an else-if position"
         cond_close = matching_paren(body, m.end() - 1)
-        span = _branch_span(body, _skip_ws(body, cond_close + 1))
+        span = _branch_span(body, masked, _skip_ws(masked, cond_close + 1))
         if span is None:
             return False
         then_start, then_end = span
         if then_start < call_idx <= then_end:
             return True
-        after_then_ws = _skip_ws(body, then_end + 1)
+        after_then_ws = _skip_ws(masked, then_end + 1)
         else_m = _ELSE_RE.match(masked, after_then_ws)
         if not else_m:
             return False  # chain ends here, call not found in it
@@ -459,7 +481,7 @@ def _find_enclosing_if_conditions(body, call_idx):
         cond_open = m.end() - 1
         cond_close = matching_paren(body, cond_open)
         condition = body[cond_open + 1 : cond_close]
-        span = _branch_span(body, _skip_ws(body, cond_close + 1))
+        span = _branch_span(body, masked, _skip_ws(masked, cond_close + 1))
         if span is None:
             continue
         body_start, body_end = span
@@ -469,7 +491,7 @@ def _find_enclosing_if_conditions(body, call_idx):
         # The call is not in the THEN branch -- check for `else` (plain or
         # `else if`): if the call is anywhere later in the chain, THIS
         # if's own condition must be negated and reported.
-        after_then_ws = _skip_ws(body, body_end + 1)
+        after_then_ws = _skip_ws(masked, body_end + 1)
         else_match = _ELSE_RE.match(masked, after_then_ws)
         if not else_match:
             continue
@@ -584,6 +606,38 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
     assert _ensure_call_guard_conditions(else_if_regate) == ["!(total_gpus<=1)", "!cache_queue"], (
         "expected the else-if's guard to ALSO be reported as the NEGATION of the outer if's condition, not "
         "just the inner if's own (positive) condition on its own"
+    )
+
+    # c-7013: a `/* ... */` comment between the THEN branch's closing `}`
+    # and `else` used to make _skip_ws stop on the comment's own `/`
+    # (lstrip on the ORIGINAL text does not skip comment syntax), so the
+    # subsequent `_ELSE_RE.match(masked, ...)` read a blanked space at
+    # that offset and never found the (real) else at all -- a false PASS
+    # that hid the whole chain.
+    block_comment_before_else = """{
+        if (total_gpus <= 1) {
+        } /* single visible GPU */ else if (!cache_queue) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_conditions(block_comment_before_else) == ["!(total_gpus<=1)", "!cache_queue"], (
+        "a `/* ... */` comment between the THEN branch's `}` and `else` must not hide the else-chain"
+    )
+
+    # c-7013: same defect, a `//` line comment on its own line between `}`
+    # and `else` instead of an inline `/* */`.
+    line_comment_before_else = """{
+        if (total_gpus <= 1) {
+        }
+        // comment
+        else {
+            if (!cache_queue) {
+                cache_queue = ensure_single_device_context_queue(device_id);
+            }
+        }
+    }"""
+    assert _ensure_call_guard_conditions(line_comment_before_else) == ["!(total_gpus<=1)", "!cache_queue"], (
+        "a `//` line comment between the THEN branch's `}` and `else` must not hide the else-chain"
     )
 
 
