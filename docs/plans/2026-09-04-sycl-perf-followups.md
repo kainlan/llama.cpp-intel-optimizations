@@ -154,7 +154,7 @@ The early return's premise ("init_tensor is not called again") is true for a REU
 **Acceptance Criteria:**
 
 - [ ] The GPU test passes: extras count bounded across 20 alternating rebuilds; the same test with the fix reverted (scratch) fails (count grows by ~one graph's tensors per iteration) — record both counts in the commit.
-- [ ] Lead: `-p 1024 -n 0 -r 5` RssAnon flat after the first decode (± 50 MB), probe line shows `preserving` = current graph size only; `-p 512` unchanged.
+- [ ] Lead: `-p 1024 -n 0 -r 5` RssAnon flat after the first decode (± 50 MB), probe line shows `preserving` = current graph size only; `-p 512` unchanged. **[This criterion moved twice -- see the amendments below: first to L2b, then to llama.cpp-h9uv (quality review round 1, c-yrh7 #9).]**
 - [ ] Prefill recovery: pp1024 and pp2048 within 10% of pp512 tok/s at default `-ub` on both cards for Mistral Q4_0 (interleaved two-binary A/B vs the L1 binary, 2 pairs each; expected B70 pp1024 ≈ 3000+ vs 1437) — if the number moves less than that, the remaining per-ubatch cost is a different mechanism and L3 records it; this task still lands on the leak evidence alone.
 - [ ] All correctness gates unchanged (Mistral Q4/Q8 both cards, GPT-OSS chat, gemma4 identity).
 - [ ] The `[SOA-DEBUG]` and probe lines updated to report `released=<n> kept=<m>`.
@@ -215,6 +215,57 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > before S3 in the ggml-sycl.cpp hotspot order); the "RssAnon flat after the first decode" acceptance moves from
 > L2 to L2b. Graph replay, oneDNN (GEMM/PP/SDPA), the unified-kernel dispatch and glibc retention were each tested
 > and refuted for the residual (kqy7 c-53px, c-8r4m, c-vufg).
+
+> **Amendment 2026-09-04 (execution, llama.cpp-asdt c-qnq7, commit 50f075464): L2b lands but does NOT close the
+> pp1024 acceptance. [SUPERSEDED BY THE AMENDMENT BELOW -- see llama.cpp-asdt c-871e; the acceptance criterion
+> this paragraph leaves open has since moved.]** The KV-view-extras fix is correct and tested (ctest GREEN on both cards; a design review
+> found and closed a real same-graph collision -- two DIFFERENT, both-live views of the same K tensor at the
+> same offset within one graph, e.g. `get_k`'s attention window vs `cpy_k`'s `ggml_set_rows()` whole-tensor
+> result -- via a process-wide rebuild epoch instead of the unsafe key-only release-and-replace a first draft
+> used). Measured on hardware (level_zero:1, `-p 1024 -n 0 -r 5`, RssAnon sampled on the bench pid): the fix
+> reduces the L2-alone residual from ~310 to ~250 MB/decode, a ~60 MB/decode drop that lines up closely with the
+> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,704 B * 96 views/rebuild *
+> 2 rebuilds/pp1024-decode` =~ 51 MB/decode; `process_ubatch()` calls `ggml_backend_sched_alloc_graph()` once per
+> ubatch, so `n_ubatch=512` gives exactly 2 rebuilds for a pp1024 decode). So the fix is closing the mechanism it
+> was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
+> predecessor attributed to it: ~250 of that ~300 MB/decode remains unaccounted for. The **acceptance criterion
+> stays open** pending a fresh jemalloc profile on the post-L2b binary to attribute the true dominant residual;
+> do not re-close L2b's acceptance line until that lands. Code-only checks (no GPU) ruled out three candidate
+> causes for the gap: layer K/V tensors are roots, not views-of-views (`src/llama-kv-cache.cpp` constructor,
+> `ggml_new_tensor_3d`, `view_src == nullptr`); the per-rebuild epoch counter demonstrably advances twice per
+> pp1024 decode as designed; and the debug accessor reads the same `view_extras` container the release path
+> prunes (single-KV-buffer models only -- an ISWA/SWA model with two live tiered KV buffers would need its own
+> check, not applicable to the Mistral gate this was measured against).
+
+> **Amendment 2026-09-06 (attribution complete, llama.cpp-asdt c-871e / c-s9wr): the ~250 MB/decode residual is
+> NOT a further leak.**
+> A real bug was found and fixed in the same round: the older-epoch release branch called `release_extra_gpu()`
+> exactly once regardless of `kv_view_extra_entry::share_count`, so a shared entry's refcount (1 + share_count)
+> never reached zero and the object leaked, invisible to the entries-only `kv_view_extras` accessor -- fixed by
+> looping the release `1 + share_count` times, with a new live-object counter
+> (`ggml_backend_sycl_debug_live_kv_view_extra_count`, GGML_SYCL_PRIVATE_TESTING) that catches this class of bug
+> where a container-membership count cannot. But in-process jemalloc dumps plus the L1 probe (kept=838/
+> released=838 at every one of 12 resets) show the residual is explained without any further leak: growth tracks
+> RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB) plus the KV views, then
+> decelerates after the ramp (+120/+60/+90/+90 MB) -- i.e. the residual is the SIZE of that bounded window and the
+> allocator churn of 277,704 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
+> `ggml_tensor_extra_gpu`, currently 277,704 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
+> on a 3-device box): the "RssAnon flat after the first decode" acceptance moves there. L2b closes as designed
+> (its own GPU test's flat `kv_view_extras`/`kv_view_extras_live` across 20 rebuilds), with the share_count bug
+> fixed in the same round. Five candidate mechanisms were checked and ruled out or found inapplicable to this
+> benchmark before the attribution above closed the search: the graph-lifetime handle-retention list
+> (`mem-handle.cpp` `graph_unwaitable`, cleared only at a PP<->TG phase boundary or backend teardown -- inapplicable
+> to a pure `-p 1024 -n 0` prefill-only run, which has no such transition); nine tensor-pointer-keyed maps in
+> `ggml-sycl.cpp` (all function-local, freed every call); `UnifiedKernel::plan_cache_valid_` (a single bounded
+> slot, not a growing map); the oneDNN scratch pointer tables in `unified-cache.hpp` (matched insert/erase pairs);
+> and `g_moe_down_sum_shadow_entries` (properly cleared, and MoE-only -- never populated for dense Mistral).
+>
+> **Confirmed on the share_count-fix binary (llama.cpp-asdt c-s9wr, 2026-09-06):** pp1024 `-n 0 -r 5` RssAnon
+> on the bench pid, quiet host, Mistral Q4_0 level_zero:1: 479 MB flat through load, ramps to 1388 MB filling
+> L2's bounded window across the first two rebuilds, then FLAT at 1388 MB for every remaining decode. Against
+> the original "flat after the first decode +/- 50 MB" wording: flat after the second decode, to +/- 0 MB. The
+> per-decode creep this task was opened to fix is gone; what remains is the bounded window's size, which is
+> `llama.cpp-h9uv`'s to shrink.
 
 ### Task L3: Prefill scaling gate and per-ubatch residual (llama.cpp-dfo0, step 3)
 

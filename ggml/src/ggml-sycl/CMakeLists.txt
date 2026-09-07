@@ -2684,6 +2684,55 @@ set_tests_properties(test-sycl-compute-buffer-extra-reuse PROPERTIES
     TIMEOUT 120
 )
 
+# llama.cpp-asdt (plan task L2b): the tiered KV buffer's per-VIEW-tensor
+# extras must stay bounded across repeated graph rebuilds, the same property
+# test-sycl-compute-buffer-extra-reuse checks for the COMPUTE buffer above.
+# Allocates real K/V tensors through ggml_backend_sycl_kv_buffer_type via a
+# synthetic single-device placement plan (GGML_SYCL_PRIVATE_TESTING-only
+# test_set_kv_placement_plan), then alternates two graph shapes through
+# ggml_backend_sched, each building fresh views of those K/V tensors in a
+# fresh ggml_context over the same raw mem_buffer (mirrors
+# llm_graph_result::reset, src/llama-graph.cpp), and reads the tiered KV
+# buffer's view_extras count via the GGML_SYCL_PRIVATE_TESTING-only debug
+# accessor ggml_backend_sycl_debug_last_kv_view_extra_count().
+#
+# Loads no model (synthetic tiny K/V tensors, N_LAYERS=3): not in the
+# model-loading OOM-hazard family this repo tracks (test-llama-archs,
+# test-thread-safety, test-backend-ops). RUN_SERIAL TRUE is still set below,
+# matching every other gpu-serial-labelled GPU test in this repo.
+#
+# Shares the enclosing `if (NOT GGML_BACKEND_DL)` opened above for
+# test-sycl-compute-buffer-extra-reuse rather than opening a redundant nested
+# one -- both tests close together at the single endif below.
+add_executable(test-sycl-kv-view-extra-reuse
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-kv-view-extra-reuse.cpp
+)
+target_include_directories(test-sycl-kv-view-extra-reuse PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-kv-view-extra-reuse PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-kv-view-extra-reuse PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-kv-view-extra-reuse PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+# ggml_backend_sycl_debug_last_kv_view_extra_count() and
+# ggml_sycl::test_set_kv_placement_plan() exist only under
+# GGML_SYCL_PRIVATE_TESTING; the ordinary DSO does not export them.
+target_link_libraries(test-sycl-kv-view-extra-reuse PRIVATE ggml-sycl-private-fixtures)
+add_test(NAME test-sycl-kv-view-extra-reuse COMMAND test-sycl-kv-view-extra-reuse)
+set_tests_properties(test-sycl-kv-view-extra-reuse PROPERTIES
+    LABELS "sycl;memory;kv;tensor-extras;gpu-serial"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
 # Exact-owner weight-usage regression: concurrent LIVE A/B models classify a
 # same-name tensor differently, then A is reactivated. The lookup must follow
 # the exact ModelToken and load boundaries must not clear another live owner.

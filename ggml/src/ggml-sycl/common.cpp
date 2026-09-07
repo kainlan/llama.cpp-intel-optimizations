@@ -1191,6 +1191,10 @@ int64_t downsample_sycl_global_range(int64_t accumulate_block_num, int64_t block
     return sycl_down_blk_size;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+std::atomic<size_t> g_sycl_debug_live_kv_view_extra_count{ 0 };
+#endif
+
 void retain_extra_gpu(ggml_tensor_extra_gpu * extra) {
     if (!extra) {
         return;
@@ -1281,6 +1285,20 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
 
     ggml_sycl_unregister_optimize_feature(&extra->optimized_feature);
     extra->clear_moe_storage_handles();
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // llama.cpp-asdt (plan task L2b, jemalloc-profile bug fix): this is the
+    // one place release_extra_gpu() deletes `extra` (every early return
+    // above means the refcount did not reach zero; a second, unrelated
+    // `delete extra` exists in ggml_backend_sycl_register_host_weight_tensor
+    // (ggml-sycl.cpp) for an extra that failed device-id resolution
+    // immediately after its own allocation, in the same function, which a
+    // KV-view extra can never reach). Attribute the deletion to the
+    // live-KV-view counter regardless of which call site's release brought
+    // it here -- see g_sycl_debug_live_kv_view_extra_count's declaration.
+    if (extra->debug_is_kv_view_extra) {
+        g_sycl_debug_live_kv_view_extra_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+#endif
     delete extra;
 }
 
