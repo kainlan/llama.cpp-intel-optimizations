@@ -1139,3 +1139,27 @@ remains **not wired into dispatch**; production throughput is unaffected either 
 **Steps requiring the user (minimize — ideally none):** none. (If the B70 GPT-OSS slow mode appears during step 4, the lead runs three more pairs before concluding; the `scripts/sycl-decode-mode-capture.sh` output from S4 is attached to llama.cpp-gvu7 either way.)
 
 **Observed success:** the gate strings above verbatim on both cards; RssAnon flat across five pp1024 decodes; all six prefill ratios ≥ 0.9; the named profiler rows present/absent as stated; A/B verdicts with the raw pair lists recorded on the tickets; ctest lines `100% tests passed`. The lead records each command's observed output on the owning ticket before closing it.
+
+**Observed result (executed 2026-09-07 03:53-06:45, lead session, master 6e54ba2eb):**
+merges in order S6 4443e787a, S7 a0c8e1d4f, h9uv 9aef31b0f, vzaj 68676bdc3, kcya d7aeb417e,
+aenv 6e54ba2eb. Full `./scripts/sycl-build.sh` of d7aeb417e: 787/787, rc=0, `GGML_SYCL:BOOL=ON`,
+ldd shows libggml-sycl and libsycl; incremental rebuild of the aenv linkage change on 6e54ba2eb rc=0.
+Models read from `/Storage/GenAI/models` (the `/models` mergerfs was down after the 2026-09-05 reboot).
+- Mistral Q4_0 gate: B50 and B70 both rc=0, continuation ` 6, 7, 8, 9, 10`.
+- GPT-OSS 20B chat gate (`-c 4096`) B50: rc=0, answer line `1, 2, 3, 4, 5`, abort probe 0.
+- gemma4 E4B Q8_0 chat gate (`--jinja -c 4096`) B50: rc=0, `1, 2, 3, 4, 5`; raw `-no-cnv` completion
+  alone rc=0 (` 6, 7, 8, 9.`). Its first attempt in the chain failed with `UR_RESULT_ERROR_OUT_OF_RESOURCES`
+  because it started 21 s after a crashing default-form run was still dumping core (stale GPU tenant,
+  not a regression; that form is removed from the gate chain).
+- ctest on level_zero:1: test-sycl-profiling-queue-property, sycl-extra-gpu-size,
+  test-sycl-mxfp4-stored-gemm-soa-small-m, test-sycl-compute-buffer-extra-reuse,
+  test-sycl-kv-view-extra-reuse, test-sycl-selector-fallback-source,
+  test-sycl-profiling-queue-property-source: all `100% tests passed`.
+- Python gates on the final tree: selector-fallback 17/17, profiling-queue-property 11/11.
+- `GGML_SYCL_EXTRA_LEAK_PROBE=1` pp1024 `-r 5` B50: every reset `kept=838 (~20.0 MB) released=838
+  @ sizeof=25048` (was ~221.9 MB per reset at sizeof=277,704 before h9uv); pp1024 1298.6 t/s (record only).
+- Shmem 0.51-0.53 GB throughout, MemAvailable >= 221 GB, zero GT reset / guc_id / CAT error lines.
+Deferred until `/models` returns: the L4 long-prompt baselines and the L3 real six-pair table (their
+scripts hardcode `/models`). Final integration reviews on llama.cpp-vtfs: c-91qe (fixed by
+llama.cpp-aenv), c-s29e (fixed by llama.cpp-3tqc); the RssAnon-flat criterion is recorded on
+llama.cpp-h9uv as a plateau at 619 MB from decode 2 (two-generation window by L2's design).
