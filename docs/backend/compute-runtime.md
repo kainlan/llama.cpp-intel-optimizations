@@ -7,10 +7,13 @@ and the no-direct-P2P restriction between the two discrete cards) live in
 record.
 
 ⚠️ **Card change:** the B580 that the 2026-05-30 sections below describe was
-replaced by an **Arc Pro B70** on 2026-07-24. `level_zero:0` is now the B70
-(`0000:03:00.0`, Battlemage G31, 256 CU, ~32.6 GB); `level_zero:1` is unchanged
-(Arc Pro B50, `0000:07:00.0`, Battlemage G21). The P2P restriction survived the
-swap intact — see "B70↔B50 P2P topology" below, which is the current record.
+replaced by an **Arc Pro B70** on 2026-07-24. As measured that day,
+`level_zero:0` was the B70 (`0000:03:00.0`, Battlemage G31, 256 CU, ~32.6 GB)
+and `level_zero:1` was the unchanged Arc Pro B50 (`0000:07:00.0`, Battlemage
+G21). The P2P restriction survived the swap intact — see "B70↔B50 P2P
+topology" below, which is the current record for the topology argument; the
+PCI addresses themselves are history as of 2026-09-05, see the note directly
+below.
 
 ⚠️ **PCI addresses moved again, independently of the card swap above:** on the
 2026-09-05 boot the discrete cards re-enumerated at `0000:04:00.0` (B70) and

@@ -172,8 +172,13 @@ head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout
 # PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0), includes an
 # integrated GPU (card1 -> 00:02.0) that must be excluded, and a connector
 # entry (card0-DP-1) that must be ignored by name alone -- it gets a real
-# `device` symlink to the same discrete device as card2, so only the
-# card[0-9]+ filter (not an absent symlink) is what skips it.
+# `device` symlink to the SAME discrete device as card2 (0000:04:00.0), so
+# only the card[0-9]+ filter (not an absent symlink) is what skips it.
+# card0-DP-1 sorts lexically BEFORE card2 in glob order ('-' < '2'), which is
+# exactly what caught review round 1: an earlier, unfiltered second scan for
+# the sysfs card matching a derived PCI address matched card0-DP-1 first and
+# bound SYSFS_CARD to a connector instead of card2. The card= assertions
+# below (not just pci=) are what a regression of that would fail.
 mk_drmroot() {
     local d="$T/drmroot"
     rm -rf "$d" "$T/devices"
@@ -204,13 +209,17 @@ mk_drmroot; mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz0.log" -- true || fail=1
 head -1 "$T/run-lz0.log" | grep -q "pci=0000:04:00.0" \
-    || { echo "FAIL: level_zero:0 must resolve to the LOWER PCI address 0000:04:00.0 (card0->09, card2->04; got: $(head -1 "$T/run-lz0.log")"; fail=1; }
+    || { echo "FAIL: level_zero:0 must resolve to the LOWER PCI address 0000:04:00.0 (card0->09, card2->04; got: $(head -1 "$T/run-lz0.log"))"; fail=1; }
+head -1 "$T/run-lz0.log" | grep -q "card=$T/drmroot/card2" \
+    || { echo "FAIL: level_zero:0 must bind card=$T/drmroot/card2, not the card0-DP-1 connector (got: $(head -1 "$T/run-lz0.log"))"; fail=1; }
 
 mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz1.log" -- true || fail=1
 head -1 "$T/run-lz1.log" | grep -q "pci=0000:09:00.0" \
-    || { echo "FAIL: level_zero:1 must resolve to the HIGHER PCI address 0000:09:00.0 (got: $(head -1 "$T/run-lz1.log")"; fail=1; }
+    || { echo "FAIL: level_zero:1 must resolve to the HIGHER PCI address 0000:09:00.0 (got: $(head -1 "$T/run-lz1.log"))"; fail=1; }
+head -1 "$T/run-lz1.log" | grep -q "card=$T/drmroot/card0" \
+    || { echo "FAIL: level_zero:1 must bind card=$T/drmroot/card0 (got: $(head -1 "$T/run-lz1.log"))"; fail=1; }
 
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?

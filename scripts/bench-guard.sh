@@ -75,14 +75,44 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 
 # derive_pci_for_selector IDX -- enumerate top-level DRM cards under
 # $DRM_ROOT, keep discrete Intel display controllers, sort by PCI address,
-# and print the IDX-th (zero-based) survivor's PCI address on stdout.
-# Calls refuse() (exit 3) directly on any failure. Safe to invoke via a
-# plain command-substitution assignment (PCI="$(derive_pci_for_selector
-# ...)") even though that runs this function in a subshell: under `set -e`
-# a non-zero exit status from a command-substitution assignment still
-# aborts the whole script (unlike a pipeline stage, which pipefail is
-# needed for), so refuse()'s "exit 3" propagates rather than being
-# swallowed -- verified empirically, not folklore.
+# and print "<sysfs card path>|<pci address>" for the IDX-th (zero-based)
+# survivor on stdout. Calls refuse() (exit 3) directly on any failure.
+#
+# Invocation safety: a command substitution ($(...)) runs this function in
+# a SUBSHELL whose `errexit` is OFF by default even though the caller has
+# `set -e` -- bash only inherits errexit into a command substitution when
+# `shopt -s inherit_errexit` is set (bash >= 4.4), which this script does
+# NOT set (verified empirically, not folklore: a `false` inside a function
+# called via `x="$(f)"` is silently swallowed here and the next line in `f`
+# still runs). So a raw filesystem probe failing inside the loop below
+# would, left unguarded, either be silently swallowed (this function
+# called via command substitution, the normal case below) or silently
+# abort the WHOLE script with no message and exit 1 (this function called
+# directly, where the caller's real errexit applies) -- both wrong, and
+# which one happens depends on the CALLER, not on this function. Every
+# probe below that can genuinely fail (as opposed to a file legitimately
+# not existing, which is a normal `continue`) is therefore checked with an
+# explicit `if ! ...; then refuse ...; fi`, which behaves the same either
+# way: refuse() loudly instead of silently dropping a card and shifting
+# the indices of the ones after it. refuse()'s own `exit 3` is separately
+# safe regardless of all the above -- `exit` is unconditional, not gated
+# by errexit -- so it still propagates correctly through the plain
+# command-substitution assignment this function is called with below
+# (RESULT="$(derive_pci_for_selector ...)"), which is why that pattern
+# (not `read` from a herestring, which would swallow the same refuse()
+# silently) is what the caller uses.
+#
+# A card that is merely a different vendor/class is not a probe failure
+# and is excluded the same quiet way as one legitimately missing a
+# `device` link -- only the ordering of the SURVIVING cards is
+# index-significant. This includes a vendor/class file that exists and
+# reads but holds an unexpected value (extra whitespace, an unrelated
+# class like 0x038000): such a card is silently excluded and everything
+# after it shifts down by one index, exactly as if it were a different
+# vendor. A reader relying on this derivation should know a wrong
+# vendor/class file value moves the mapping rather than refusing -- there
+# is no way to tell "this really is a different device" from "the file is
+# subtly wrong" from here.
 derive_pci_for_selector() {
     local idx="$1" c base pci vendor class
     local -a entries=()
@@ -90,28 +120,51 @@ derive_pci_for_selector() {
         [ -e "$c" ] || continue
         base="$(basename "$c")"
         [[ "$base" =~ ^card[0-9]+$ ]] || continue   # skip connectors (card1-DP-1, ...)
-        pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"
+        [ -e "$c/device" ] || [ -L "$c/device" ] || continue   # no device link: legitimate skip
+        if ! pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"; then
+            refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
+        fi
         [ -n "$pci" ] || continue
         [ -r "$c/device/vendor" ] || continue
         [ -r "$c/device/class" ] || continue
-        vendor="$(cat "$c/device/vendor" 2>/dev/null || true)"
+        if ! vendor="$(cat "$c/device/vendor" 2>/dev/null)"; then
+            refuse "failed to read $c/device/vendor (probe error after it was confirmed readable)"
+        fi
         [ "$vendor" = "0x8086" ] || continue
-        class="$(cat "$c/device/class" 2>/dev/null || true)"
+        if ! class="$(cat "$c/device/class" 2>/dev/null)"; then
+            refuse "failed to read $c/device/class (probe error after it was confirmed readable)"
+        fi
         case "$class" in 0x0300*) : ;; *) continue;; esac
         case "$pci" in 0000:00:*) continue;; esac    # exclude the integrated GPU
-        entries+=("$base=$pci")
+        entries+=("$base"$'\t'"$pci"$'\t'"$c")
     done
-    local -a sorted=()
+    local sorted_str=""
     if [ "${#entries[@]}" -gt 0 ]; then
         # Lexical sort on field 2 (the PCI address) is bus/device/function
         # order for the zero-padded dddd:bb:dd.f form; force LC_ALL=C so a
-        # non-C locale cannot reorder it.
-        mapfile -t sorted < <(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t '=' -k2,2)
+        # non-C locale cannot reorder it. The explicit `if !` (not relying
+        # on mapfile's own status, which never sees a failure from inside
+        # a process substitution) is what makes a sort probe failure
+        # refuse() instead of silently yielding zero or partial candidates.
+        if ! sorted_str="$(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t $'\t' -k2,2)"; then
+            refuse "failed to sort discrete GPU candidates under $DRM_ROOT (sort probe error)"
+        fi
     fi
+    local -a sorted=()
+    [ -z "$sorted_str" ] || mapfile -t sorted <<< "$sorted_str"
     local n="${#sorted[@]}"
     [ "$n" -gt 0 ] || refuse "no discrete Intel GPU display controller found under $DRM_ROOT"
-    [ "$idx" -lt "$n" ] || refuse "level_zero:$idx is out of range; found $n discrete Intel GPU(s): ${sorted[*]}"
-    printf '%s\n' "${sorted[$idx]}" | cut -d= -f2
+    if [ "$idx" -ge "$n" ]; then
+        local disp="" e b p
+        for e in "${sorted[@]}"; do
+            IFS=$'\t' read -r b p _ <<< "$e"
+            disp="$disp${disp:+ }$b=$p"
+        done
+        refuse "level_zero:$idx is out of range; found $n discrete Intel GPU(s): $disp"
+    fi
+    local b p path
+    IFS=$'\t' read -r b p path <<< "${sorted[$idx]}"
+    printf '%s|%s\n' "$path" "$p"
 }
 
 if [ -z "$SYSFS_CARD" ]; then
@@ -120,11 +173,24 @@ if [ -z "$SYSFS_CARD" ]; then
             level_zero:[0-9]) : ;;
             *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
         esac
-        PCI="$(derive_pci_for_selector "${SELECTOR#level_zero:}")"
+        # Get BOTH the PCI address and the sysfs card path from the same
+        # derivation pass -- do not re-scan $DRM_ROOT afterward to find the
+        # card for that PCI: an earlier, unfiltered second scan matched a
+        # connector entry sharing the same device symlink ahead of the
+        # real card in glob order (llama.cpp-imns review round 1).
+        RESULT="$(derive_pci_for_selector "${SELECTOR#level_zero:}")"
+        SYSFS_CARD="${RESULT%%|*}"
+        PCI="${RESULT#*|}"
+    else
+        # --pci was given explicitly (no --sysfs-card): still need to find
+        # the matching sysfs card, with the same card[0-9]+ filter as the
+        # derivation above, so a connector entry can't shadow it here either.
+        for c in "$DRM_ROOT"/card*; do
+            base="$(basename "$c")"
+            [[ "$base" =~ ^card[0-9]+$ ]] || continue
+            [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
+        done
     fi
-    for c in "$DRM_ROOT"/card*; do
-        [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
-    done
     [ -n "$SYSFS_CARD" ] || refuse "no DRM card for PCI $PCI"
 fi
 FREQ="$SYSFS_CARD/device/tile0/gt0/freq0"

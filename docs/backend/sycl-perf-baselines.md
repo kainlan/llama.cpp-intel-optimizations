@@ -90,14 +90,22 @@ Each rule below cost a round of discarded measurements.
    sweep for holders:
 
    ```bash
-   # any process with non-zero drm-resident-vram0 on either card. The PCI
-   # addresses below are boot-dependent (moved from 0000:03:00.0/07:00.0 to
-   # 0000:04:00.0/09:00.0 on the 2026-09-05 boot) -- derive them live rather
-   # than trusting either literal form, e.g. with bench-guard.sh's own
-   # derive_pci_for_selector (llama.cpp-imns), or `lspci -d 8086: -nn`.
-   for f in /proc/*/fdinfo/*; do
-       grep -l 'drm-pdev:.*0000:04:00.0' "$f" 2>/dev/null   # B70 (post 2026-09-05; was 03:00.0)
-       grep -l 'drm-pdev:.*0000:09:00.0' "$f" 2>/dev/null   # B50 (post 2026-09-05; was 07:00.0)
+   # any process with non-zero drm-resident-vram0 on either discrete Intel
+   # GPU. Do not hardcode a PCI-address pair here -- both cards' addresses
+   # are boot-dependent (0000:03:00.0/07:00.0 before the 2026-09-05 boot,
+   # 0000:04:00.0/09:00.0 after; llama.cpp-imns), so derive them live from
+   # `lspci` instead, the same way bench-guard.sh's own
+   # derive_pci_for_selector does from sysfs. \[03[0-9a-f]{2}\]: matches
+   # only the PCI class-code bracket (class 0x03 = display controller,
+   # trailing ':' distinguishes it from the device-id bracket further down
+   # the line), and excluding bus 0000:00 drops the integrated GPU:
+   mapfile -t gpu_pci < <(lspci -d 8086: -nn | grep -E '\[03[0-9a-f]{2}\]:' \
+       | awk '{print "0000:"$1}' | grep -v '^0000:00:')
+   for pci in "${gpu_pci[@]}"; do
+       echo "== $pci =="
+       for f in /proc/*/fdinfo/*; do
+           grep -l "drm-pdev:.*${pci}" "$f" 2>/dev/null
+       done
    done
    ```
 

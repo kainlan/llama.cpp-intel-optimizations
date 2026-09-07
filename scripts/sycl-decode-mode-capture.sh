@@ -86,8 +86,9 @@
 # fixed 0000:03:00.0=B70/0000:07:00.0=B50 table, unlike bench-guard.sh's own
 # live derive_pci_for_selector as of llama.cpp-imns) is never exercised by
 # the test suite and is STALE against the current boot's 0000:04:00.0/
-# 0000:09:00.0 addresses -- tracked separately, out of llama.cpp-imns's
-# scope (bench-guard.sh only).
+# 0000:09:00.0 addresses -- tracked as llama.cpp-o4fs (which also covers
+# scripts/sycl-gpu-preflight.sh:38's same-shaped staleness), out of
+# llama.cpp-imns's scope (bench-guard.sh only).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
