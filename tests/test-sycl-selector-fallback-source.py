@@ -258,26 +258,31 @@ closed by masking:
     c-m5ni; tracked as llama.cpp-t81m): B2 fixed only the standard splice
     of a `//` comment's OWN TERMINATOR (backslash immediately before the
     newline). Three related shapes remain open, none fixed here:
-      (a) GCC and clang also splice a backslash followed by TRAILING
+      (EXT) GCC and clang also splice a backslash followed by TRAILING
           WHITESPACE (spaces or tabs) before the newline, as a long-
           standing extension, with a warning (`-Wbackslash-newline-escape`
           on clang; a similar GCC diagnostic). A `//` comment ending in a
           backslash that is itself followed by trailing whitespace before
           the line break still splices on those compilers even though
           `_mask_scan` does not treat it as a continuation.
-      (b) a spliced LINE-COMMENT INTRODUCER: a bare `/` followed by a
-          backslash-newline splice followed by `/` reassembles into `//`
-          only after phase-2 splicing runs, so the raw two-character
+      (LINE-INTRO) a spliced LINE-COMMENT INTRODUCER: a bare `/` followed
+          by a backslash-newline splice followed by `/` reassembles into
+          `//` only after phase-2 splicing runs, so the raw two-character
           lookahead this scanner does (`text[i:i+2] == "//"`) never
           recognizes it as a comment opener at all -- the "comment" (and
           anything after it) is read as ordinary, unmasked code.
-      (c) the same for a BLOCK-COMMENT introducer: `/` + backslash-newline
-          + `*` similarly never reads as `/*`.
-    Each of (a)-(c) can, in principle, be used to hide (a) or expose (b)/(c)
-    the B2 shape -- a hidden or fabricated `execv("/proc/self/exe", argv);`
-    -- past this scanner. Genuine phase-2 splicing (reassembling tokens
-    split across a splice BEFORE any lexical scan, rather than patching
-    each masking branch one shape at a time) is the correct fix and is out
+      (BLOCK-INTRO) the same for a BLOCK-COMMENT introducer: `/` +
+          backslash-newline + `*` similarly never reads as `/*`.
+    (Labelled EXT/LINE-INTRO/BLOCK-INTRO here, deliberately not reusing the
+    (a)/(b) labels from the ACCEPTED FORMS list above, which name the
+    helper-call and inline-block forms and mean something unrelated.)
+    Each of these can, in principle, leave an execv("/proc/self/exe", argv);
+    unmasked when it should really be inert comment text (the same false-
+    PASS direction as B2 itself, for EXT and for text following an
+    unrecognised LINE-INTRO/BLOCK-INTRO introducer) -- past this scanner.
+    Genuine phase-2 splicing (reassembling tokens split across a splice
+    BEFORE any lexical scan, rather than patching each masking branch one
+    shape at a time) is the correct fix and is out
     of scope for this task; filed as llama.cpp-t81m.
 
 This gate reads SOURCE TEXT only -- no compiler, no SYCL device.
@@ -448,9 +453,13 @@ def _mask_scan(text, mask_literals):
     missed in the other.
 
     Returns a copy of `text` the same length, with every `//` line comment
-    and `/* */` block comment replaced character-for-character by spaces
-    (newlines inside a masked span are kept as newlines, everything else
-    becomes a space). String literals ("...") and char literals ('...') are
+    and `/* */` block comment THE SCANNER RECOGNISES replaced character-for-
+    character by spaces (newlines inside a masked span are kept as
+    newlines, everything else becomes a space) -- see KNOWN RESIDUALS below
+    for the phase-2 comment-INTRODUCER shapes (`/` + a splice + `/` or `*`)
+    this raw two-character lookahead does not recognise as a comment start
+    at all, llama.cpp-t81m. String literals ("...") and char literals
+    ('...') are
     always PARSED with the same logic (so a `//`, a brace, or a quote inside
     one still cannot be misread as a comment start or a literal boundary
     elsewhere) -- `mask_literals` controls only whether their CONTENT is
@@ -521,6 +530,13 @@ def _mask_scan(text, mask_literals):
         introduced by the B1/7wal masking fix, spec round 1 rev-aenv-spec-1
         c-ng46); tracked as its own follow-up, llama.cpp-ur8d -- do not fix
         the proof window as part of this task.
+      - PHASE-2 LINE-SPLICING (quality round 1 on B2, rev-3tqc-quality-1
+        c-m5ni; tracked as llama.cpp-t81m): this scanner only implements
+        the standard's splice of a `//` comment's own TERMINATOR (module
+        docstring's B2 entry). See the module docstring's CONTRACT prose,
+        KNOWN RESIDUALS phase-2 bullet, for the three still-open shapes
+        (the GCC/clang trailing-whitespace splice extension, and a spliced
+        line- or block-comment INTRODUCER) this does not cover.
     Digit separators (`1'000'000`) are HANDLED as of quality round 6, and
     encoding-prefixed char literals (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) are
     HANDLED as of quality round 7 -- neither is a residual, listed here
