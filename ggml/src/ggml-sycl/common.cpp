@@ -18,6 +18,7 @@
 #include "unified-cache.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -936,6 +937,115 @@ size_t ggml_sycl_vram_budget_base_mem(bool host_unified, size_t raw_total_mem) {
 
 bool gpu_has_xmx(sycl::device & dev) {
     return dev.has(sycl::aspect::ext_intel_matrix);
+}
+
+namespace {
+
+enum class mxfp4_gateup_ksplit_mode { EXPLICIT, AUTO };
+
+struct mxfp4_gateup_ksplit_config {
+    mxfp4_gateup_ksplit_mode mode           = mxfp4_gateup_ksplit_mode::EXPLICIT;
+    int                      explicit_value = 1;
+};
+
+// Read once per process (llama.cpp-lis9, plan Task G2): every other
+// GGML_SYCL_* accessor in this fork follows this same
+// static-const-immediately-invoked-lambda idiom (e.g.
+// mxfp4_moe_gateup_m2_tg1_index_enabled, mmvq.cpp), and the numerics test
+// for this accessor (tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp)
+// relies on that: it forks a fresh process per S value specifically because
+// a second setenv() within one process would be silently ignored here.
+mxfp4_gateup_ksplit_config mxfp4_gateup_ksplit_parse_env() {
+    mxfp4_gateup_ksplit_config cfg;
+    const char *               env = std::getenv("GGML_SYCL_MXFP4_GATEUP_KSPLIT");
+    if (!env || env[0] == '\0') {
+        return cfg;
+    }
+    if (std::strcmp(env, "auto") == 0) {
+        cfg.mode = mxfp4_gateup_ksplit_mode::AUTO;
+        return cfg;
+    }
+    // llama.cpp-lis9 quality round 1 (nits 5, 6): use the fork's
+    // invalid-env-value convention (GGML_LOG_WARN, e.g.
+    // mmvq_parse_env_mb_value at mmvq.cpp:~22322) instead of a raw fprintf,
+    // and detect strtol overflow via errno -- strtol saturates to
+    // LONG_MIN/LONG_MAX on overflow WITHOUT failing the endptr check below
+    // (it still consumes every digit), so an overflowing value would
+    // otherwise reach `static_cast<int>(parsed)` below with `parsed` outside
+    // int's range: an out-of-range integer conversion, UB pre-C++20 and
+    // implementation-defined after. Reset errno first -- strtol does not
+    // clear a stale value from an earlier call.
+    errno              = 0;
+    char *     end     = nullptr;
+    const long parsed  = std::strtol(env, &end, 10);
+    const bool garbage = (end == env) || (*end != '\0');
+    if (garbage) {
+        GGML_LOG_WARN(
+            "[SYCL] unknown GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s (expected \"auto\" or an integer), falling "
+            "back to 1\n",
+            env);
+        return cfg;
+    }
+    if (errno == ERANGE) {
+        // Clamp on the `long` value's sign, never on a truncated int: casting
+        // an out-of-int-range `long` to `int` first (then clamping that) is
+        // exactly the UB this branch exists to avoid.
+        GGML_LOG_WARN("[SYCL] GGML_SYCL_MXFP4_GATEUP_KSPLIT=%s is out of range; clamping to [1, 4]\n", env);
+        cfg.explicit_value = parsed > 0 ? 4 : 1;
+        return cfg;
+    }
+    cfg.explicit_value = static_cast<int>(parsed);
+    return cfg;
+}
+
+int clamp_ksplit(int value) {
+    if (value < 1) {
+        return 1;
+    }
+    if (value > 4) {
+        return 4;
+    }
+    return value;
+}
+
+// Memoized once, shared by both accessors below (llama.cpp-lis9 spec round 1,
+// nit 7's fix reuses this rather than each accessor keeping its own copy of
+// the env parse).
+const mxfp4_gateup_ksplit_config & mxfp4_gateup_ksplit_cfg() {
+    static const mxfp4_gateup_ksplit_config cfg = mxfp4_gateup_ksplit_parse_env();
+    return cfg;
+}
+
+}  // namespace
+
+bool ggml_sycl_mxfp4_gateup_ksplit_is_auto() {
+    return mxfp4_gateup_ksplit_cfg().mode == mxfp4_gateup_ksplit_mode::AUTO;
+}
+
+int ggml_sycl_mxfp4_gateup_ksplit(int device) {
+    const mxfp4_gateup_ksplit_config & cfg = mxfp4_gateup_ksplit_cfg();
+
+    if (cfg.mode == mxfp4_gateup_ksplit_mode::EXPLICIT) {
+        // `device` is unused on this branch by design -- see
+        // ggml_sycl_mxfp4_gateup_ksplit_is_auto()'s doc comment (common.hpp):
+        // callers on the hot (non-auto) path pass -1 here specifically to
+        // avoid a device-id lookup they do not need.
+        return clamp_ksplit(cfg.explicit_value);
+    }
+
+    // "auto": clamp(compute_units / 128, 1, 4). A 128-CU card (the B50)
+    // resolves to compute_units/128 == 1 exactly, so this formula alone
+    // -- with no separate compute_units <= 128 special case -- already gives
+    // S=1 there; a query failure (device out of range, or the capability
+    // query itself failing at common.cpp's query_xmx_capabilities) defaults
+    // compute_units to 0, which also resolves to S=1, the safe unmodified
+    // path.
+    uint32_t compute_units = 0;
+    if (device >= 0 && device < ggml_sycl_info().device_count) {
+        compute_units = ggml_sycl_info().devices[device].xmx_caps.compute_units;
+    }
+    const int scaled = compute_units > 0 ? static_cast<int>(compute_units / 128) : 1;
+    return clamp_ksplit(scaled);
 }
 
 XMXCapabilities query_xmx_capabilities(sycl::device & dev) {

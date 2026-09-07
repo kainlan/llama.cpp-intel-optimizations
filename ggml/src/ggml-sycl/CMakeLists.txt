@@ -4065,6 +4065,46 @@ if (NOT GGML_BACKEND_DL)
     )
 endif()
 
+# llama.cpp-lis9 (plan Task G2): numerics gate for the opt-in CU-scaled
+# K-split of the MXFP4 gate/up decode DPAS kernel
+# (GGML_SYCL_MXFP4_GATEUP_KSPLIT). Forks+execv's itself per S value (see the
+# source file's own header comment), so it needs its OWN process image, not
+# just a plain in-process call. This needs no special ENVIRONMENT handling
+# for that: execv() (unlike execve() with an explicit envp) leaves the
+# calling process's entire environment untouched, so LD_LIBRARY_PATH and
+# ONEAPI_DEVICE_SELECTOR from ctest's ENVIRONMENT property below reach every
+# re-exec'd child automatically, the same way they reach the top-level
+# process ctest launches.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-mxfp4-gateup-ksplit-numerics
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-mxfp4-gateup-ksplit-numerics.cpp
+    )
+    target_include_directories(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE "-fsycl" "-Wno-narrowing")
+    target_link_options(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE "-fsycl")
+    target_compile_definitions(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-mxfp4-gateup-ksplit-numerics PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    add_test(NAME test-sycl-mxfp4-gateup-ksplit-numerics COMMAND test-sycl-mxfp4-gateup-ksplit-numerics)
+    set_tests_properties(test-sycl-mxfp4-gateup-ksplit-numerics PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;mxfp4;gateup;ksplit;tdd;lis9"
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT 180
+    )
+endif()
+
 if (NOT GGML_BACKEND_DL)
     add_executable(test-q6k-reorder-dispatch
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-q6k-reorder-dispatch.cpp
