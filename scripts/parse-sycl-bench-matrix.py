@@ -375,11 +375,14 @@ def _stdev_str(values):
 
 # Header/separator built from _LONG_PROMPT_PPS rather than hardcoded, so the
 # column list can't drift from the tuple that actually drives the rows below.
-_TABLE_COLUMNS = ["card", "model"]
-for _pp in _LONG_PROMPT_PPS:
-    _TABLE_COLUMNS += ["PP%d" % _pp, "TG128"]
-_TABLE_COLUMNS += ["ctx achieved", "notes"]
-del _pp
+# A comprehension, not a loop-variable leak the module scope would then have
+# to clean up (and which would raise NameError at import if _LONG_PROMPT_PPS
+# were ever empty).
+_TABLE_COLUMNS = (
+    ["card", "model"]
+    + [col for pp in _LONG_PROMPT_PPS for col in ("PP%d" % pp, "TG128")]
+    + ["ctx achieved", "notes"]
+)
 
 _TABLE_HEADER = "| " + " | ".join(_TABLE_COLUMNS) + " |"
 _TABLE_SEPARATOR = "|" + "---|" * len(_TABLE_COLUMNS)
@@ -399,12 +402,17 @@ def _build_table_rows(results):
     for card in _LONG_PROMPT_CARDS:
         for model in _LONG_PROMPT_MODELS:
             cell = {}
+            tests_by_pp = {}
             ctx_achieved = None
             for pp in _LONG_PROMPT_PPS:
                 arm = "%s-%s-pp%d" % (card, model, pp)
                 samples = results[arm]
-                pp_test = "pp%d" % pp
-                for test in (pp_test, "tg128"):
+                # Read the test names from the arm's own spec rather than
+                # hardcoding the second one ("tg128") here: MATRICES is the
+                # single source of truth for what an arm's tests are called.
+                arm_tests = MATRICES["long-prompt"][arm]["tests"]
+                tests_by_pp[pp] = arm_tests
+                for test in arm_tests:
                     values = [s[test] for s in samples]
                     mean = sum(values) / len(values)
                     cell[(pp, test)] = "%.2f \u00b1 %s" % (mean, _stdev_str(values))
@@ -427,10 +435,22 @@ def _build_table_rows(results):
                             % (arm, effective)
                         )
                     ctx_achieved = effective[0]
+                    # Sanity floor (review round 2): the MAX n_ctx line found
+                    # anywhere in a log is only the achieved figure for the pp
+                    # test if it's at least as large as the prompt that test
+                    # actually requested. A max below pp means the max we
+                    # found belongs to some OTHER, smaller test in the file
+                    # (e.g. tg128's own context), not the long-prompt one.
+                    if ctx_achieved < pp:
+                        return None, (
+                            "INPUT ERROR: %s: achieved n_ctx %d is below the arm's "
+                            "prompt length %d\n" % (arm, ctx_achieved, pp)
+                        )
             row_cells = [CARD_LABELS[card], MODEL_LABELS[model]]
             for pp in _LONG_PROMPT_PPS:
-                row_cells.append(cell[(pp, "pp%d" % pp)])
-                row_cells.append(cell[(pp, "tg128")])
+                arm_tests = tests_by_pp[pp]
+                row_cells.append(cell[(pp, arm_tests[0])])
+                row_cells.append(cell[(pp, arm_tests[1])])
             row_cells.append(str(ctx_achieved))
             row_cells.append("-")
             rows.append("| " + " | ".join(row_cells) + " |")
@@ -687,13 +707,18 @@ def self_test(out):
              arms=_with("long-prompt", **{
                  "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("b70-pp8192-no-ctx.txt")],
              }), want_table=True, expected=2),
+        dict(name="long-prompt achieved n_ctx below the arm's own prompt length -> parse error",
+             matrix="long-prompt",
+             arms=_with("long-prompt", **{
+                 "b70-mistral-pp8192": [_fx("b70-pp8192-ctx-too-low.txt")] * DEFAULT_RUNS,
+             }), want_table=True, expected=2),
         dict(name="--table with merge-cert -> parse error", matrix="merge-cert",
              arms=_all_good("merge-cert"), want_table=True, expected=2),
         dict(name="long-prompt --table all good -> PASS with markdown rows", matrix="long-prompt",
              arms=_all_good("long-prompt"), want_table=True, expected=0),
-        dict(name="long-prompt --runs 1 -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
+        dict(name="long-prompt --runs 1 --table -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
              arms={arm: [_fixture_for_long_prompt_arm(arm)] for arm in LONG_PROMPT_ARMS},
-             runs=1, expected=0, contains=["n/a"]),
+             runs=1, want_table=True, expected=0, contains=["± n/a"]),
     ]
 
     # Expected stream occupancy per exit code. Checking this is the point:
@@ -795,7 +820,7 @@ measure the branch" are different facts and must not share an exit code.
 Matrices: merge-cert (four arms, numeric floor/band, gates merges) and
 long-prompt (twelve arms, report-only -- no floor/band exists yet).
 
-Verify the parser before trusting its verdict:  --self-test  (expects 18/18)
+Verify the parser before trusting its verdict:  --self-test  (expects 19/19)
 Gate definition: docs/backend/sycl-perf-baselines.md
 """
 

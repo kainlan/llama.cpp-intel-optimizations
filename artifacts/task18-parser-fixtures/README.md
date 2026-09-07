@@ -11,11 +11,11 @@ These fixtures are that control. Run:
 python3 scripts/parse-sycl-bench-matrix.py --self-test
 ```
 
-It must report **18/18** and exit 0. If it does not, the parser's verdicts are
+It must report **19/19** and exit 0. If it does not, the parser's verdicts are
 not trustworthy and the gate must not be certified from them.
 
 Ten cases cover the original **merge-cert** matrix (numeric floor/band, gates
-merges); eight more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
+merges); nine more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
 matrix (report-only, no gate declared yet) and its `--table` markdown output.
 
 ## What the cases prove
@@ -35,12 +35,15 @@ that hard-codes "everything is fine" would still pass every other case here.
 For long-prompt, exit 1 is impossible by construction (every arm is kind
 REPORT, so `check_gate()` always returns `ok=True`) — the cases instead prove
 exit 2 is still reachable (a missing arm, a missing `pp8192` row, the
-`--table`-only n_ctx-disagreement check, and a sample with no achieved n_ctx
-at all — review round 1 found this last one silently defaulting to 8320
-instead of failing closed) so a long-prompt PASS is still a measurement, not
-the only answer available. A `--runs 1` case also proves the sample-stdev
-column renders `n/a` rather than a misleading `0.00` when there is no second
-sample to compute a spread from (also review round 1).
+`--table`-only n_ctx-disagreement check, a sample with no achieved n_ctx at
+all — review round 1 found this silently defaulting to 8320 instead of
+failing closed — and an achieved n_ctx below the arm's own prompt length,
+i.e. the MAX line found in the file belonged to some other, smaller test —
+review round 2) so a long-prompt PASS is still a measurement, not the only
+answer available. A `--runs 1 --table` case also proves the sample-stdev
+column renders `n/a` rather than a misleading `0.00`, in both the report and
+the table, when there is no second sample to compute a spread from (review
+rounds 1 and 2).
 
 ## Provenance — what is real and what is reconstructed
 
@@ -118,6 +121,13 @@ parse:
   n_ctx = N` lines removed entirely; used as one of five samples so that
   sample's achieved n_ctx is `None`, driving the fail-closed
   no-achieved-n_ctx check (exit 2, never a silent `n_prompt+n_gen` default).
+- `b70-pp8192-ctx-too-low.txt` — `b70-pp8192-good.txt` with only the pp-test's
+  own `n_ctx = 8192` line removed, leaving just the tg-test's `n_ctx = 256`.
+  All five samples in the arm agree on 256, so the disagreement check alone
+  would pass it — this drives the *separate* sanity-floor check (review
+  round 2): an achieved n_ctx (256) below the arm's own prompt length (8192)
+  means the MAX line found in the file belongs to some other, smaller test,
+  not the long-prompt one.
 
 ## Files
 
@@ -135,6 +145,7 @@ parse:
 | `pp8192-missing-pprow.txt` | long-prompt: no `pp8192` row — drives the missing-test parse error |
 | `b70-pp8192-ctx-mismatch.txt` | long-prompt: pp-test `n_ctx` differs from its siblings — drives the `--table` n_ctx-disagreement check |
 | `b70-pp8192-no-ctx.txt` | long-prompt: no `n_ctx` line at all — drives the fail-closed no-achieved-n_ctx check |
+| `b70-pp8192-ctx-too-low.txt` | long-prompt: only n_ctx=256 present (tg-test's, not pp-test's) — drives the achieved-below-prompt-length sanity floor |
 
 `.txt`, not `.log`: `.gitignore` line 17 is `*.log`, so fixtures committed under
 that extension would be silently dropped and the self-test would run against

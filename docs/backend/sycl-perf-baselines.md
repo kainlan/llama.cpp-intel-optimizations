@@ -864,7 +864,7 @@ run whose free VRAM is below the contamination floor.
 
 **Verify the parser before trusting it.** `--self-test` runs it against the
 committed fixtures in `artifacts/task18-parser-fixtures/` and must report
-**18/18** (ten merge-cert cases plus eight covering the long-prompt matrix and
+**19/19** (ten merge-cert cases plus nine covering the long-prompt matrix and
 `--table`). The cases exist to prove the parser returns *all three* exit codes —
 including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
 measurement rather than the only answer it is capable of giving. A checker nobody
