@@ -58,11 +58,18 @@ cover):
   files in subdirectories of either scan root (tests/peg-parser,
   tests/e1-rca, tests/sycl-canary, tests/sycl-alloc-policy-fixtures/*, ...)
   were invisible to it.
-  Quality round 1 (rev-5q1r-quality-1, c-h331) found the (a) fix from round
-  2 itself failed open (any first statement merely starting with "if"
-  passed) and a backslash-continuation gap in the preprocessor-line
-  skipper that a later round's own fix attempt initially missed reproducing
-  correctly.
+  Quality round 1 (rev-5q1r-quality-1, c-h331) found the (a) fix from spec
+  round 2 itself failed open (any first statement merely starting with the
+  two letters "if" passed, e.g. `if (want_debug()) {...}`), fixed with
+  INLINE_GUARD_PATTERN anchored to the actual guard condition; also fixed
+  unrelated formatting drift the port had left in several ported files, and
+  added a first attempt at following backslash-newline continuations in the
+  preprocessor-line skipper.
+  Quality round 2 (rev-5q1r-quality-2, c-dhg6) found round 1's backslash-
+  continuation regex was a no-op for its own stated purpose (the greedy
+  character class consumed the trailing backslash before the continuation
+  alternative was ever tried), fixed it, and tightened a registration-check
+  assertion that a bare substring match could satisfy from prose alone.
   Quality round 3 (rev-5q1r-quality-3, c-autq) found the (a)/found-relevant-
   main check was FILE-scoped rather than per-offending-call: a stray brace
   inside a string literal could mis-bound one main() body early enough to
@@ -81,6 +88,30 @@ cover):
   reporting whether each main()'s scan actually balanced and treating an
   unbalanced one as its own offender rather than trusting a to-EOF span;
   see _find_main_bodies' docstring.
+  Quality round 5 (rev-5q1r-quality-5, c-i7ep) found a third exploit the
+  same raw-text brace/signature scanning enabled: a `main(...) {`-SHAPED
+  SUBSTRING inside a `//`/`/* */` comment or a string literal elsewhere in
+  the file was matched by MAIN_SIGNATURE_PATTERN as a second, spurious
+  "main" that balanced at the enclosing (real) function's own `}` and could
+  cover that function's real offending call, satisfying both round 3's and
+  round 4's checks on a span corresponding to no function at all. Fixed at
+  the root rather than with a fourth fence: `_mask_comments_and_literals()`
+  replaces every comment and string/char literal with spaces of equal
+  length before either the signature search or the brace walk runs, so
+  none of rounds 3/4/5's exploit substrings are visible to either step in
+  the first place. See _mask_comments_and_literals' docstring.
+  Quality round 6 (rev-5q1r-quality-6, c-7pry) found round 5's literal
+  scanner itself introduced a regression: it had no bound on how far a
+  literal could run, and treated ANY apostrophe as a char-literal opener,
+  including a C++14 DIGIT SEPARATOR (`1'000`) -- an unclosed literal (or
+  one "closed" by a much later, unrelated apostrophe, e.g. a second digit
+  separator) could mask away main()'s real closing brace along with
+  everything up to that later apostrophe, corrupting the body span the same
+  way round 4's unmasked stray `{` once did. Fixed by not treating `'` as
+  an opener when preceded by an alphanumeric or `_` (a digit or identifier
+  character, as in a digit separator), stopping the literal scan at a
+  newline, and leaving an unclosed quote in the output verbatim (unmasked)
+  instead of masking to EOF/end-of-line.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -241,11 +272,26 @@ def _mask_comments_and_literals(text):
     used directly to slice or search the ORIGINAL text.
 
     Escapes inside a literal (`\\"`, `\\\\`, `\\'`) are honoured so an
-    escaped quote does not end the literal early.
+    escaped quote does not end the literal early. A literal scan never
+    crosses a newline, and an apostrophe preceded by an alphanumeric or `_`
+    character is NOT treated as a char-literal opener at all -- both are
+    quality round 6 (rev-5q1r-quality-6, c-7pry) fixes for a regression
+    round 5's original literal scanner introduced: it had no bound on how
+    far an unclosed literal could run and treated every `'` as an opener,
+    so a C++14 DIGIT SEPARATOR (`1'000`) started a "char literal" that
+    stayed open until some much later, unrelated apostrophe (a second digit
+    separator, an apostrophe in a comment past the point masking should
+    have already excluded it, etc.) -- masking away everything in between,
+    including main()'s real closing brace, the same corruption round 4's
+    unmasked stray `{` once caused. If no closing quote is found before a
+    newline, the opening quote is emitted VERBATIM (unmasked) rather than
+    masking to end-of-line/EOF, so an apostrophe this scanner cannot safely
+    interpret is left as ordinary text instead of swallowing an unbounded
+    span.
 
-    THREE THINGS THIS DOES NOT HANDLE, LEFT AS KNOWN RESIDUAL GAPS rather
-    than papered over (quality round 5, rev-5q1r-quality-5, c-i7ep
-    should-fix 2: masking must not be sold as closing every direction):
+    KNOWN RESIDUALS INCLUDE (this is not a closed enumeration -- items are
+    added here as they are found, quality round 5's c-i7ep should-fix 2:
+    masking must not be sold as closing every direction):
       - Raw string literals (`R"delim(...)delim"`) are not recognized as a
         distinct construct. `R"` is treated as an ordinary string start, so
         a raw string's own embedded unescaped quotes or parentheses are not
@@ -258,7 +304,10 @@ def _mask_comments_and_literals(text):
       - A `main` spelled through a macro (`#define ENTRY int main` /
         `ENTRY(argc, argv) { ... }`) is invisible to MAIN_SIGNATURE_PATTERN
         regardless of masking; this was already true before masking existed
-        and is unrelated to it."""
+        and is unrelated to it.
+    Digit separators (`1'000'000`) are HANDLED as of quality round 6 (the
+    fix above), not a residual -- listed here only for contrast with the
+    genuinely open items."""
     out = []
     i = 0
     n = len(text)
@@ -274,17 +323,27 @@ def _mask_comments_and_literals(text):
             end = (j + 2) if j != -1 else n
             out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
             i = end
-        elif text[i] in "\"'":
+        elif text[i] in "\"'" and not (
+            text[i] == "'" and i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+        ):
             quote = text[i]
             j = i + 1
+            closed = False
             while j < n:
+                if text[j] == "\n":
+                    break
                 if text[j] == "\\" and j + 1 < n:
                     j += 2
                     continue
                 if text[j] == quote:
                     j += 1
+                    closed = True
                     break
                 j += 1
+            if not closed:
+                out.append(text[i])
+                i += 1
+                continue
             out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
             i = j
         else:
@@ -861,6 +920,49 @@ def test_comment_embedded_main_signature_does_not_mint_a_body():
         '}\n'
     )
     assert _classify(control_no_comment_trick) == "offender_call_outside_scanned_main"
+
+
+def test_digit_separator_is_not_a_literal_opener():
+    """Fixture proving a C++14 digit separator (`1'000`) is not mistaken
+    for a char-literal opener -- quality round 6 (rev-5q1r-quality-6,
+    c-7pry) found round 5's literal scanner treated ANY apostrophe as an
+    opener with no bound on how far the "literal" could run, so two digit
+    separators bracketing main()'s real closing brace (`1'000` inside main,
+    `2'000` inside a later free function) masked away everything between
+    them -- including that closing brace -- corrupting the body span the
+    same way round 4's unmasked stray `{` once did.
+
+    Before this fix, db9f4c804 (quality round 5) classified
+    arm_digit_separators_bracket_main below "compliant" -- a REGRESSION
+    versus c349bd259 (quality round 4, before masking existed at all),
+    which correctly classified it offender_call_outside_scanned_main by
+    accident (an unmasked scanner has no notion of char literals to get
+    wrong). It must classify offender_call_outside_scanned_main again."""
+    arm_digit_separators_bracket_main = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    const int budget = 1\'000;\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    const int other = 2\'000;\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(arm_digit_separators_bracket_main) == "offender_call_outside_scanned_main"
+
+    # Control: a digit separator in ordinary code alongside an otherwise
+    # correct, single main() -- proving the fix does not merely make every
+    # file containing an apostrophe an offender.
+    control_digit_separator_in_ordinary_code = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    const int budget = 1\'000;\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_digit_separator_in_ordinary_code) == "compliant"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
