@@ -3996,8 +3996,12 @@ struct ggml_tensor_extra_gpu {
     // violation that is silently latent today (no member of this struct
     // happens to be touched from any of those directly-compiled TUs) and
     // would become memory corruption the moment one is. A bare `bool` costs
-    // nothing next to this struct's 277,704 B, so there is no reason to
-    // take the risk for it. Only the counter and its accessors stay guarded
+    // nothing next to this struct's ~25 KB (sizeof(ggml_tensor_extra_gpu) =
+    // 25,048 B post-h9uv -- this field lives on the CORE struct, not the
+    // events/XMX/MoE cluster llama.cpp-h9uv moved into
+    // ggml_tensor_extra_gpu_weight_ext; the pre-split struct was 277,712 B),
+    // so there is no reason to take the risk for it. Only the counter and
+    // its accessors stay guarded
     // below -- they are free functions, not part of this struct's layout,
     // so guarding them cannot cause an ODR mismatch.
     bool debug_is_kv_view_extra = false;

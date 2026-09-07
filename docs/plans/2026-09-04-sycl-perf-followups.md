@@ -224,7 +224,7 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > result -- via a process-wide rebuild epoch instead of the unsafe key-only release-and-replace a first draft
 > used). Measured on hardware (level_zero:1, `-p 1024 -n 0 -r 5`, RssAnon sampled on the bench pid): the fix
 > reduces the L2-alone residual from ~310 to ~250 MB/decode, a ~60 MB/decode drop that lines up closely with the
-> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,704 B * 96 views/rebuild *
+> naive prediction for the mechanism it targets (`sizeof(ggml_tensor_extra_gpu)=277,712 B * 96 views/rebuild *
 > 2 rebuilds/pp1024-decode` =~ 51 MB/decode; `process_ubatch()` calls `ggml_backend_sched_alloc_graph()` once per
 > ubatch, so `n_ubatch=512` gives exactly 2 rebuilds for a pp1024 decode). So the fix is closing the mechanism it
 > was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
@@ -248,8 +248,8 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > released=838 at every one of 12 resets) show the residual is explained without any further leak: growth tracks
 > RSS through L2's bounded two-generation COMPUTE-buffer window (1676 x 277 KB =~ 465 MB) plus the KV views, then
 > decelerates after the ramp (+120/+60/+90/+90 MB) -- i.e. the residual is the SIZE of that bounded window and the
-> allocator churn of 277,704 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
-> `ggml_tensor_extra_gpu`, currently 277,704 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
+> allocator churn of 277,712 B objects, not an unbounded leak. The lever is **llama.cpp-h9uv** (right-size
+> `ggml_tensor_extra_gpu`, currently 277,712 B because `GGML_SYCL_MAX_DEVICES=48` sizes 33 device-indexed arrays
 > on a 3-device box): the "RssAnon flat after the first decode" acceptance moves there. L2b closes as designed
 > (its own GPU test's flat `kv_view_extras`/`kv_view_extras_live` across 20 rebuilds), with the share_count bug
 > fixed in the same round. Five candidate mechanisms were checked and ruled out or found inapplicable to this

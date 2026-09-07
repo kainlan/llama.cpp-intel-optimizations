@@ -100,11 +100,17 @@
 //      print a count for (this test's accessor would read 0, not grow) --
 //      what grows instead is the LIVE extra population, exactly the
 //      hardware figure this ticket's own description measured directly:
-//      1152 live 277,704 B extras after 12 rebuilds (~305 MiB total; quality
+//      1152 live 277,712 B extras after 12 rebuilds (~305 MiB total; quality
 //      review round 1, c-yrh7 #5: an earlier draft also quoted a per-rebuild
 //      rate that did not follow from these two numbers -- dropped rather
 //      than restated, since neither of the ticket's own derived rates
-//      closes against its own object count), never released.
+//      closes against its own object count), never released. This is the
+//      pre-h9uv (S1/S2, llama.cpp-aenv) struct size -- the measurement
+//      predates the events/XMX/MoE split, and the 305 MiB total is derived
+//      from it (1152 x 277,712 B); post-split the same 1152-extra leak
+//      would be sizeof(ggml_tensor_extra_gpu) = 25,048 B each, ~28.9 MiB
+//      total, not 305 MiB -- see test-sycl-extra-gpu-size.cpp for the
+//      compile-verified current size.
 // Mutants 2 and 3 predate this test file's tracking accessors and were not
 // built.
 //
@@ -133,7 +139,9 @@
 // `release_extra_gpu(candidate.extra);` call -- kv_view_extras should stay
 // flat (this bug is invisible to it) while kv_view_extras_live should grow
 // by one every iteration (this test's layer-0 K key is shared every
-// iteration, so it would leak one 277 KB extra per rebuild).
+// iteration, so it would leak one ~25 KB extra per rebuild -- 25,048 B
+// post-h9uv; was ~277 KB, 277,712 B, before llama.cpp-h9uv split the
+// events/XMX/MoE cluster off the core struct).
 //
 // ggml_backend_sched_new()'s CPU-last GGML_ASSERT requires its LAST backend
 // entry to be a CPU device; this test still runs everything on SYCL (the CPU
@@ -489,7 +497,8 @@ int main(int, char ** argv) {
         // check that actually catches that bug -- it must equal last_extras
         // (one live object per tracked key) whenever the fix is correct, and
         // grows without bound pre-fix (this test's layer-0 K key is shared
-        // every iteration, so it leaks one 277 KB extra per rebuild).
+        // every iteration, so it leaks one ~25 KB extra per rebuild --
+        // 25,048 B post-h9uv; was ~277 KB, 277,712 B, pre-h9uv).
         if (last_live != N_VIEWS_PER_GRAPH) {
             // llama.cpp-asdt (quality review round 1, c-yrh7 #7): same
             // reasoning as the FAIL above -- print both counts.
@@ -514,8 +523,9 @@ int main(int, char ** argv) {
     // path too. This buffer owns every KV-view extra in the process, so
     // after freeing it the live count must be exactly zero -- a teardown
     // helper that released once per entry instead of 1 + share_count times
-    // would leak 277 KB per shared key here and the loop above would still
-    // have printed PASS on every iteration.
+    // would leak ~25 KB per shared key here (25,048 B post-h9uv; was ~277 KB,
+    // 277,712 B, pre-h9uv) and the loop above would still have printed PASS
+    // on every iteration.
     const size_t live_after_free = ggml_backend_sycl_debug_live_kv_view_extra_count();
     if (ok && live_after_free != 0) {
         fprintf(stderr,
