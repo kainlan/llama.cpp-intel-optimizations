@@ -217,7 +217,8 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > and refuted for the residual (kqy7 c-53px, c-8r4m, c-vufg).
 
 > **Amendment 2026-09-04 (execution, llama.cpp-asdt c-qnq7, commit 50f075464): L2b lands but does NOT close the
-> pp1024 acceptance.** The KV-view-extras fix is correct and tested (ctest GREEN on both cards; a design review
+> pp1024 acceptance. [SUPERSEDED BY THE AMENDMENT BELOW -- see llama.cpp-asdt c-871e; the acceptance criterion
+> this paragraph leaves open has since moved.]** The KV-view-extras fix is correct and tested (ctest GREEN on both cards; a design review
 > found and closed a real same-graph collision -- two DIFFERENT, both-live views of the same K tensor at the
 > same offset within one graph, e.g. `get_k`'s attention window vs `cpy_k`'s `ggml_set_rows()` whole-tensor
 > result -- via a process-wide rebuild epoch instead of the unsafe key-only release-and-replace a first draft
@@ -229,10 +230,7 @@ git commit -m "fix(sycl): release compute-buffer tensor extras orphaned by graph
 > was built for, but that mechanism was never the dominant contributor to the ~300 MB/decode this amendment's own
 > predecessor attributed to it: ~250 of that ~300 MB/decode remains unaccounted for. The **acceptance criterion
 > stays open** pending a fresh jemalloc profile on the post-L2b binary to attribute the true dominant residual;
-> do not re-close L2b's acceptance line until that lands. **Superseded by the amendment below** (attribution
-> complete, llama.cpp-asdt c-871e): a reader who stops at this paragraph gets the wrong instruction -- the
-> profile this paragraph asked for has since landed and the acceptance criterion has moved. Code-only checks
-> (no GPU) ruled out three candidate
+> do not re-close L2b's acceptance line until that lands. Code-only checks (no GPU) ruled out three candidate
 > causes for the gap: layer K/V tensors are roots, not views-of-views (`src/llama-kv-cache.cpp` constructor,
 > `ggml_new_tensor_3d`, `view_src == nullptr`); the per-rebuild epoch counter demonstrably advances twice per
 > pp1024 decode as designed; and the debug accessor reads the same `view_extras` container the release path

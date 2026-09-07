@@ -85,15 +85,25 @@
 // process crashes) instead of all-zero. It does NOT make the count this
 // test prints grow -- release-and-replace on every match still keeps
 // view_extras flat at N_VIEWS_PER_GRAPH, since this mutant removes only
-// SHARING, not release-and-replace itself. (An earlier draft of this
-// comment wrongly claimed this same mutant also grows the count by
-// 2*N_LAYERS per iteration -- spec review round 1, c-hh2r #1, caught that
-// growth is instead the signature of a more drastic mutant that removes the
-// view_extras tracking and release logic entirely, reverting to the pre-
-// L2b baseline this ticket's own description measured directly on
-// hardware: 1152 live 277,704 B extras after 12 rebuilds, ~150 MB/rebuild,
-// never released. That mutant predates this test file's tracking accessors
-// and was not built either.)
+// SHARING, not release-and-replace itself. Three mutants, three different
+// observables -- worth stating precisely (spec review round 2, c-p2eh #1,
+// caught an earlier draft conflating the first two):
+//   1. Drop only the share branch (this mutant): container stays flat
+//      (release-and-replace still runs); the layer-0 same-graph collision
+//      above is its real, distinct effect.
+//   2. Keep tracking but drop release-and-replace entirely (push a new
+//      entry on every match, never release or pop the old one): THIS is
+//      the mutant that would grow the count this test prints, by roughly
+//      one entry per view per iteration.
+//   3. Remove the view_extras tracking and release logic entirely,
+//      reverting to the pre-L2b baseline: there is no container left to
+//      print a count for (this test's accessor would read 0, not grow) --
+//      what grows instead is the LIVE extra population, exactly the
+//      hardware figure this ticket's own description measured directly:
+//      1152 live 277,704 B extras after 12 rebuilds, ~150 MB/rebuild,
+//      never released.
+// Mutants 2 and 3 predate this test file's tracking accessors and were not
+// built.
 //
 // A SECOND, separate bug (found by a hardware jemalloc profile after the
 // epoch fix above landed, still visible on kv_view_extras staying flat):
