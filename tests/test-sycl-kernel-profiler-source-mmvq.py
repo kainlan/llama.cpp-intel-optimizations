@@ -261,35 +261,60 @@ def test_mmv_id_bench_rejects_down_q8_dpas_tile_rows_to_preserve_output_contract
     assert "/*weights=*/nullptr" not in mmv_id_body
 
 
+# Start/end markers bounding each decode arm's function body, shared by both tests
+# below so the boundary specs aren't maintained in two places.
+ARM_BOUNDS: dict[str, tuple[str, str]] = {
+    "mulmat.mmvq.q4_0_soa": (
+        "static void reorder_mul_mat_vec_q4_0_q8_1_sycl",
+        "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
+    ),
+    "mulmat.mmvq.q8_0_soa": (
+        "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
+        "// MXFP4 reorder MMVQ dispatch function",
+    ),
+    "mulmat.mmvq.q4_0_coalesced": (
+        "static void coalesced_mul_mat_vec_q4_0_q8_1_sycl",
+        "// Q8_0 Warp-Coalesced MMVQ Kernel",
+    ),
+    "mulmat.mmvq.q8_0_coalesced": (
+        "static void coalesced_mul_mat_vec_q8_0_q8_1_sycl",
+        "// MXFP4 Warp-Coalesced MMVQ Kernel",
+    ),
+    "mulmat.mmvq.q4_0_aos": (
+        "static void mul_mat_vec_q4_0_q8_1_sycl",
+        "// MoE dispatch: Q4_0 with expert routing via ids tensor (GPU-side, no host sync)",
+    ),
+    "mulmat.mmvq.q8_0_aos": (
+        "static void mul_mat_vec_q8_0_q8_1_sycl",
+        "// MoE dispatch: Q8_0 with expert routing via ids tensor (GPU-side, no host sync)",
+    ),
+    "mulmat.mmvq.q4_k_soa": (
+        "static void reorder_mul_mat_vec_q4_k_q8_1_sycl",
+        "static void mul_mat_vec_q5_K_q8_1_sycl",
+    ),
+    "mulmat.mmvq.q6_k_soa": (
+        "static void reorder_mul_mat_vec_q6_k_q8_1_sycl",
+        "static void mul_mat_vec_q6_K_q8_1_sycl",
+    ),
+}
+
+
+def arm_bodies(mmvq: str, labels) -> dict:
+    return {label: slice_between(mmvq, *ARM_BOUNDS[label]) for label in labels}
+
+
 def test_mmvq_q4_0_and_kquant_decode_arms_have_named_profile_labels() -> None:
     mmvq = MMVQ.read_text(encoding="utf-8")
-    bodies = {
-        "mulmat.mmvq.q4_0_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q4_0_q8_1_sycl",
-            "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
-        ),
-        "mulmat.mmvq.q4_0_coalesced": slice_between(
-            mmvq,
-            "static void coalesced_mul_mat_vec_q4_0_q8_1_sycl",
-            "// Q8_0 Warp-Coalesced MMVQ Kernel",
-        ),
-        "mulmat.mmvq.q4_0_aos": slice_between(
-            mmvq,
-            "static void mul_mat_vec_q4_0_q8_1_sycl",
-            "// MoE dispatch: Q4_0 with expert routing via ids tensor (GPU-side, no host sync)",
-        ),
-        "mulmat.mmvq.q4_k_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q4_k_q8_1_sycl",
-            "static void mul_mat_vec_q5_K_q8_1_sycl",
-        ),
-        "mulmat.mmvq.q6_k_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q6_k_q8_1_sycl",
-            "static void mul_mat_vec_q6_K_q8_1_sycl",
-        ),
-    }
+    bodies = arm_bodies(
+        mmvq,
+        [
+            "mulmat.mmvq.q4_0_soa",
+            "mulmat.mmvq.q4_0_coalesced",
+            "mulmat.mmvq.q4_0_aos",
+            "mulmat.mmvq.q4_k_soa",
+            "mulmat.mmvq.q6_k_soa",
+        ],
+    )
     for label, body in bodies.items():
         assert f'"{label}"' in body, f"{label}: missing profile label"
         assert "ggml_sycl_profile_submit(" in body, f"{label}: launch is not wrapped in ggml_sycl_profile_submit"
@@ -306,48 +331,7 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
     # sums over launch count, sycl-kernel-profiler.cpp) reads the per-launch
     # weight-bytes figure directly instead of requiring hand arithmetic.
     mmvq = MMVQ.read_text(encoding="utf-8")
-    bodies = {
-        "mulmat.mmvq.q4_0_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q4_0_q8_1_sycl",
-            "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
-        ),
-        "mulmat.mmvq.q8_0_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q8_0_q8_1_sycl",
-            "// MXFP4 reorder MMVQ dispatch function",
-        ),
-        "mulmat.mmvq.q4_0_coalesced": slice_between(
-            mmvq,
-            "static void coalesced_mul_mat_vec_q4_0_q8_1_sycl",
-            "// Q8_0 Warp-Coalesced MMVQ Kernel",
-        ),
-        "mulmat.mmvq.q8_0_coalesced": slice_between(
-            mmvq,
-            "static void coalesced_mul_mat_vec_q8_0_q8_1_sycl",
-            "// MXFP4 Warp-Coalesced MMVQ Kernel",
-        ),
-        "mulmat.mmvq.q4_0_aos": slice_between(
-            mmvq,
-            "static void mul_mat_vec_q4_0_q8_1_sycl",
-            "// MoE dispatch: Q4_0 with expert routing via ids tensor (GPU-side, no host sync)",
-        ),
-        "mulmat.mmvq.q8_0_aos": slice_between(
-            mmvq,
-            "static void mul_mat_vec_q8_0_q8_1_sycl",
-            "// MoE dispatch: Q8_0 with expert routing via ids tensor (GPU-side, no host sync)",
-        ),
-        "mulmat.mmvq.q4_k_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q4_k_q8_1_sycl",
-            "static void mul_mat_vec_q5_K_q8_1_sycl",
-        ),
-        "mulmat.mmvq.q6_k_soa": slice_between(
-            mmvq,
-            "static void reorder_mul_mat_vec_q6_k_q8_1_sycl",
-            "static void mul_mat_vec_q6_K_q8_1_sycl",
-        ),
-    }
+    bodies = arm_bodies(mmvq, ARM_BOUNDS)
     # (block_type, QK_constant) the bytes formula must reference for each arm, so a
     # copy-paste that swaps another type's block size into this arm's bytes line is
     # caught rather than merely checking that *some* profile_label.bytes exists.
@@ -369,8 +353,11 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
         assert "profile_label.bytes" in body, f"{label}: does not set profile_label.bytes"
         # Whitespace-proof: match the field assignment regardless of the column
         # alignment clang-format happens to choose, so a hand-assignment reintroduced
-        # with different spacing is still caught.
-        for field in ("category", "queue_kind", "device"):
+        # with different spacing is still caught. Covers all five fields the helper
+        # sets (name, category, queue_kind, metadata, device), not just the three
+        # that used to be set after the helper call in the pre-conversion code, so a
+        # post-call override of e.g. .name or .metadata is caught too.
+        for field in ("name", "category", "queue_kind", "metadata", "device"):
             assert not re.search(rf"profile_label\.{field}\s*=", body), f"{label}: still hand-assigns .{field}"
 
         # Exactly one assignment: re.findall (not re.search, which only reports whether
@@ -388,15 +375,20 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
         assert re.search(rf"\b{qk_const}\b", bytes_expr), (
             f"{label}: bytes formula does not reference {qk_const}: {bytes_expr!r}"
         )
-        # Shape, not just presence: ncols * nrows * sizeof(<block>) / <QK>, in that
-        # order -- so multiplying by QK instead of dividing, or dropping the nrows
-        # factor entirely, is caught even though both still "reference" QK/sizeof().
+        # Shape, not just presence: (size_t) ncols * nrows * sizeof(<block>) / <QK>,
+        # in that order -- so multiplying by QK instead of dividing, dropping the
+        # nrows factor, or dropping the (size_t) cast (silently narrowing the
+        # product on a 32-bit int before the profiler ever sees it) is caught even
+        # though all three still "reference" QK/sizeof().
         shape = re.compile(
-            r"ncols\s*\*\s*nrows\s*\*\s*sizeof\(\s*" + re.escape(block_type) + r"\s*\)\s*/\s*" + re.escape(qk_const)
+            r"\(\s*size_t\s*\)\s*ncols\s*\*\s*nrows\s*\*\s*sizeof\(\s*"
+            + re.escape(block_type)
+            + r"\s*\)\s*/\s*"
+            + re.escape(qk_const)
         )
         assert shape.search(bytes_expr), (
             f"{label}: bytes formula does not match the expected "
-            f"ncols * nrows * sizeof({block_type}) / {qk_const} shape: {bytes_expr!r}"
+            f"(size_t) ncols * nrows * sizeof({block_type}) / {qk_const} shape: {bytes_expr!r}"
         )
 
 
