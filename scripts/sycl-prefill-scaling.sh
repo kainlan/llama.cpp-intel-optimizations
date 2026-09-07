@@ -124,10 +124,17 @@ while [ $# -gt 0 ]; do case "$1" in
     *) echo "sycl-prefill-scaling: unknown arg $1" >&2; exit 2;;
 esac; done
 
-# Strip exactly one trailing slash (--models-dir /foo/ or an env var carrying
-# one) so the paths built from it below read /foo/mistral-... rather than
-# /foo//mistral-... in both the -m argument and the refusal message.
-MODELS_DIR="${MODELS_DIR%/}"
+# Strip ALL trailing slashes (--models-dir /foo/, /foo///, or an env var
+# carrying any of these) so the paths built from it below read
+# /foo/mistral-... rather than /foo//mistral-... in both the -m argument
+# and the refusal message. Looped, not a single ${MODELS_DIR%/}, so a value
+# with more than one trailing slash is fully stripped rather than left with
+# one; guarded on length > 1 so the root "/" itself is preserved rather than
+# stripped down to an empty string (--models-dir / must still mean the
+# filesystem root, not "").
+while [ "${#MODELS_DIR}" -gt 1 ] && [ "${MODELS_DIR: -1}" = "/" ]; do
+    MODELS_DIR="${MODELS_DIR%/}"
+done
 
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 

@@ -713,6 +713,11 @@ echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must r
 # --- Case 14 (llama.cpp-5iba): --models-dir DIR makes the fake bench
 # receive -m pointing at DIR's mistral file, proving the flag actually
 # changes the model path used, not merely that it is accepted as an arg.
+# Passed WITH a trailing slash ("$FLAG_MODELS_DIR/") deliberately -- this
+# is also the only case in the suite that exercises the trailing-slash
+# strip: the assertion below expects the EXACT single-slash path, so a
+# reverted/deleted strip would produce a doubled slash in the fake bench's
+# actual -m argument and this grep would (correctly) fail.
 FLAG_MODELS_DIR="$T/models-flag"
 mkdir -p "$FLAG_MODELS_DIR"
 touch "$FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
@@ -720,7 +725,7 @@ BENCH_ARGV_FLAG="$T/bench-argv-flag.log"
 : > "$BENCH_ARGV_FLAG"
 BENCH14="$T/fake-bench-models-dir-flag.sh"
 mk_fake_bench_audit "$BENCH14" "$BENCH_ARGV_FLAG" "1000.00" "1000.00" "900.00" "850.00"
-out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR/" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --models-dir with a valid fixture file must PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
 grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_FLAG" || { echo "FAIL: expected the fake bench to receive -m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf via --models-dir (audit: $(cat "$BENCH_ARGV_FLAG"))"; fail=1; }
@@ -780,9 +785,39 @@ rm -f "$GUARD_MARKER"
 
 rm -f "$GUARD_MARKER"
 out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$MISSING_MODELS_DIR" --only mistral,b70 2>&1)" && rc=0 || rc=$?
+# rc==2 alone is NOT the evidence this refuses before any bench-guard
+# invocation -- the downstream "could not measure" ERROR path (a
+# preflight refusal, a non-zero bench, a SUSPECT stamp, a parse failure)
+# also exits 2, and every one of those runs only AFTER the header has
+# already printed. The table header (its last field is the bare word
+# "status"; every real data/error row instead ends "PASS", "FAIL(...)",
+# or an "ERROR:..." label) must never appear here, exactly as case 10
+# checks for a rejected --only -- that is what actually proves this
+# refusal fired before the main loop (and hence before any bench-guard
+# invocation), not merely that SOME exit-2 path fired somewhere.
 [ "$rc" -eq 2 ] || { echo "FAIL: a missing model file under --models-dir must exit 2, got $rc. Output:
 $out"; fail=1; }
+echo "$out" | grep -qw "status" && { echo "FAIL: the table header must never print for a missing model file -- this means the existence check did not run before the header printf (got: $out)"; fail=1; }
 echo "$out" | grep -qF "$MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected the missing path $MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf named in the refusal (got: $out)"; fail=1; }
 [ -f "$GUARD_MARKER" ] && { echo "FAIL: bench-guard must not be invoked at all when a selected pair's model file is missing (marker exists)"; fail=1; }
+
+# --- Case 16b (llama.cpp-5iba): the model-file check is hoisted out of the
+# card loop -- a model shared across BOTH selected pairs (mistral,b70 AND
+# mistral,b50, same underlying path) must be stat'd and refused ONCE, not
+# once per selected card. Asserts exactly one refusal line (not two) and
+# that it names the MODEL ("model mistral"), not an arbitrary single pair
+# -- a reverted hoist (a per-pair check naming "pair mistral,b70") would
+# still exit 2 and name the missing path, so neither of those alone would
+# catch it; the exact refusal-line COUNT and the "(model ...)" wording are
+# what pin the hoist specifically.
+rm -f "$GUARD_MARKER"
+out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$MISSING_MODELS_DIR" --only mistral,b70 --only mistral,b50 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || { echo "FAIL: a missing model file shared by two selected pairs must exit 2, got $rc. Output:
+$out"; fail=1; }
+n_refusal_lines="$(echo "$out" | grep -c "model file not found or not readable" || true)"
+[ "$n_refusal_lines" -eq 1 ] || { echo "FAIL: expected exactly ONE refusal line for a model shared by two selected pairs (mistral,b70 and mistral,b50), got $n_refusal_lines. Output:
+$out"; fail=1; }
+echo "$out" | grep -q "(model mistral)" || { echo "FAIL: expected the refusal to name the MODEL (model mistral), not a single arbitrary pair (got: $out)"; fail=1; }
+[ -f "$GUARD_MARKER" ] && { echo "FAIL: bench-guard must not be invoked at all when a selected model's file is missing (marker exists)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1
