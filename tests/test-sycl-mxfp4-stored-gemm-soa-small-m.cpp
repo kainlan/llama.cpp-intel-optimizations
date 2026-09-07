@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -186,6 +187,29 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
                                                                 sycl::property::queue::enable_profiling{} }) :
                                q;
 
+    // Bytes moved per call, for deriving per-launch bandwidth: the whole
+    // expert's SOA buffer (17 bytes per 32-element block: 16 nibble-packed +
+    // 1 E8M0 scale byte) plus the M x n_k int8 activation codes, the
+    // M x (n_k/32) f32 activation scales (llama.cpp-6f73 c-gngd -- omitted
+    // before, closing the 4,521,600 vs 4,524,480 gap against the kernel's
+    // own profile_label.bytes), plus the M x n_out f32 output. Computed here
+    // (function scope, not inside either `if (profiling_requested)` block
+    // below) so BOTH the queue-diag block's own bytes_moved print and the
+    // later per-launch-bandwidth block (llama.cpp-kcya) can see it -- it is
+    // pure arithmetic with no side effects, so computing it unconditionally
+    // costs nothing when profiling is not requested.
+    //
+    // Per-launch bandwidth is THIS figure divided by the mean device time
+    // for one launch (mean_ns), NOT the kernel-profiler CSV's aggregate
+    // `bytes` column divided by mean_ns: sycl-kernel-profiler.cpp's
+    // aggregate accumulates `aggregate.bytes += label.bytes` once per
+    // recorded launch, so that column is the SUM over `count` launches.
+    // Dividing the summed column by mean_ns overstates bandwidth by a
+    // factor of `count` (llama.cpp-6f73 c-irug: a naive read once gave 34%
+    // of peak where the true per-launch figure was 8.5%).
+    const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
+                               (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
+
     if (profiling_requested) {
         // Diagnostic for llama.cpp-6f73 (profiling investigation, round 3):
         // print the properties the queue we are ABOUT TO SUBMIT ON actually
@@ -198,25 +222,6 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
                     (int) has_profiling, (int) is_in_order, (void *) &submit_q);
         GGML_ASSERT(has_profiling);
 
-        // Bytes moved per call, for deriving the mxfp4.stored_gemm.soa
-        // profile row's bandwidth: the whole expert's SOA buffer (17 bytes
-        // per 32-element block: 16 nibble-packed + 1 E8M0 scale byte) plus
-        // the M x n_k int8 activation codes, the M x (n_k/32) f32 activation
-        // scales (llama.cpp-6f73 c-gngd -- omitted before, closing the
-        // 4,521,600 vs 4,524,480 gap against the kernel's own
-        // profile_label.bytes), plus the M x n_out f32 output.
-        //
-        // Per-launch bandwidth is THIS figure divided by the mean device
-        // time for one launch (mean_ns), NOT the kernel-profiler CSV's
-        // aggregate `bytes` column divided by mean_ns: sycl-kernel-
-        // profiler.cpp's aggregate accumulates `aggregate.bytes +=
-        // label.bytes` once per recorded launch, so that column is the SUM
-        // over `count` launches. Dividing the summed column by mean_ns
-        // overstates bandwidth by a factor of `count` (llama.cpp-6f73
-        // c-irug: a naive read once gave 34% of peak where the true
-        // per-launch figure was 8.5%).
-        const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
-                                   (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,
                     (long long) n_k, bytes_moved);
     }
@@ -255,6 +260,56 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         } catch (const std::exception & e) {
             std::printf("  event diag: wait_and_throw/get_profiling_info std::exception: %s\n", e.what());
         }
+
+        // llama.cpp-kcya: per-launch bandwidth, timed independently of the
+        // event-diag block above. That block queries the SAME event the
+        // profiler records -- command_start/command_end on `event` alone --
+        // which is fine for a single-kernel dispatch but NOT for this
+        // kernel any more: ggml_sycl_mxfp4_soa_gemm_dpas is now a
+        // two-kernel (partial+combine) dispatch whenever ksplit > 1
+        // (mxfp4-stored-gemm.cpp), and a SYCL event's own profiling info
+        // covers only the ONE kernel it was returned from -- here, only the
+        // tiny combine kernel, not the much larger partial kernel that ran
+        // before it. Using that timestamp pair for bandwidth would silently
+        // UNDERSTATE elapsed time and OVERSTATE GB/s, exactly the class of
+        // trap this file's own bytes_moved comment above warns about for
+        // the CSV's aggregate `bytes` column. Host wall-clock around the
+        // WHOLE call -- including a wait on the returned event, which
+        // transitively waits for every kernel in the dependency chain, not
+        // just the last one -- does not have that blind spot, so that is
+        // what this print uses. It re-issues the SAME deterministic call
+        // (same inputs, same device buffers) additional times purely for
+        // timing; the output `run_gemm` ultimately returns and scores is
+        // read once, after this loop, so these extra launches cannot change
+        // the correctness verdict, only overwrite t_dst with the identical
+        // result.
+        constexpr int       BW_WARMUP = 3;
+        constexpr int       BW_ITERS  = 20;
+        std::vector<double> call_ns;
+        call_ns.reserve(BW_ITERS);
+        for (int it = 0; it < BW_WARMUP + BW_ITERS; ++it) {
+            const auto  t0       = std::chrono::steady_clock::now();
+            sycl::event bw_event = ggml_sycl_mxfp4_stored_gemm::ggml_sycl_mxfp4_soa_gemm_dpas(
+                submit_q, t_weight->data, static_cast<const int8_t *>(t_act_qs->data),
+                static_cast<const float *>(t_act_sc->data), static_cast<float *>(t_dst->data), (int) M, (int) n_out,
+                (int) n_k, {});
+            bw_event.wait();
+            const auto t1 = std::chrono::steady_clock::now();
+            if (it >= BW_WARMUP) {
+                call_ns.push_back((double) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            }
+        }
+        double mean_ns = 0.0;
+        for (double v : call_ns) {
+            mean_ns += v;
+        }
+        mean_ns /= (double) call_ns.size();
+        const double bw_gbps = bytes_moved / mean_ns;  // (bytes/ns) == GB/s
+        std::printf(
+            "  per_launch_bandwidth M=%lld n_out=%lld n_k=%lld bytes_moved=%.0f mean_ns=%.1f GBps=%.3f (n=%zu, "
+            "host wall-clock incl. every kernel in the dispatch -- NOT the event-diag "
+            "command_start/command_end above)\n",
+            (long long) M, (long long) n_out, (long long) n_k, bytes_moved, mean_ns, bw_gbps, call_ns.size());
     } else {
         event.wait();
     }
