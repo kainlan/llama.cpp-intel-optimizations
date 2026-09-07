@@ -31,7 +31,9 @@
 #      from 0/1 on purpose -- a silent 0 here would misreport "the gate
 #      passed" for a pair that was never actually measured.
 #   2  usage error: an --only token that names no such pair, no pair ended
-#      up selected at all, or bench-guard.sh/--guard override not found.
+#      up selected at all, bench-guard.sh/--guard override not found, or a
+#      SELECTED pair's model file is missing or unreadable (checked before
+#      any bench-guard invocation).
 #
 # Every run goes through bench-guard.sh (S5, caf7e73d0) so the same
 # throttle/tenant/Shmem preflight and VALID/SUSPECT postflight stamping
@@ -122,6 +124,11 @@ while [ $# -gt 0 ]; do case "$1" in
     *) echo "sycl-prefill-scaling: unknown arg $1" >&2; exit 2;;
 esac; done
 
+# Strip exactly one trailing slash (--models-dir /foo/ or an env var carrying
+# one) so the paths built from it below read /foo/mistral-... rather than
+# /foo//mistral-... in both the -m argument and the refusal message.
+MODELS_DIR="${MODELS_DIR%/}"
+
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 
 # --- the six model/card pairs (fixed matrix; see plan task L3) ---
@@ -192,24 +199,31 @@ only_selected() {
 # Model-file existence check (llama.cpp-5iba). Runs AFTER --only validation
 # above and BEFORE the first bench-guard invocation in the main loop below
 # -- and before this, only usage validation has happened, so nothing has
-# touched the GPU or a real sysfs tree yet. Checked only for SELECTED pairs
-# (only_selected), never the full six-pair matrix, so an --only run is never
-# blocked by an unrelated pair's model being absent. A missing or unreadable
-# file is a loud, immediate usage error naming the exact path (exit 2) --
-# without this, the same problem used to surface only as an opaque
-# ERROR:bench-rc=1 row after bench-guard.sh's full preflight and the
-# wrapped bench's own GPU/driver init had already run.
+# touched the GPU or a real sysfs tree yet. Checked once per model whose
+# path is shared across BOTH cards, not once per selected pair -- the -r
+# test is hoisted out of the card loop so a model selected via two --only
+# pairs (e.g. mistral,b70 and mistral,b50) stats its one shared path once,
+# not twice, and the refusal names the MODEL ("model mistral"), since the
+# missing file is a property of the model, not of whichever card happened
+# to be checked first. A model is checked at all only if at least one of
+# its pairs is selected (only_selected), never the full six-pair matrix, so
+# an --only run is never blocked by an unrelated model being absent. A
+# missing or unreadable file is a loud, immediate usage error naming the
+# exact path (exit 2) -- without this, the same problem used to surface
+# only as an opaque ERROR:bench-rc=1 row after bench-guard.sh's full
+# preflight and the wrapped bench's own GPU/driver init had already run.
 for model_entry in "${MODELS[@]}"; do
     IFS='|' read -r m_key _ m_path <<< "$model_entry"
+    model_selected=1
     for card_entry in "${CARDS[@]}"; do
         IFS='|' read -r c_key _ _ <<< "$card_entry"
-        pair_key="$m_key,$c_key"
-        only_selected "$pair_key" || continue
-        [ -r "$m_path" ] || {
-            echo "sycl-prefill-scaling: model file not found or not readable: $m_path (pair $pair_key)" >&2
-            exit 2
-        }
+        only_selected "$m_key,$c_key" && { model_selected=0; break; }
     done
+    [ "$model_selected" -eq 0 ] || continue
+    [ -r "$m_path" ] || {
+        echo "sycl-prefill-scaling: model file not found or not readable: $m_path (model $m_key)" >&2
+        exit 2
+    }
 done
 
 # parse_cell: extracts the numeric t/s value (first token, spread stripped)

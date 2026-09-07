@@ -754,13 +754,18 @@ grep -qF -- "$ENV_MODELS_DIR" "$BENCH_ARGV_WINS" && { echo "FAIL: the env var's 
 # --- Case 16 (llama.cpp-5iba): a --models-dir whose mistral file is absent
 # must refuse with exit 2, name the missing path in stderr, and never
 # invoke bench-guard at all -- BEFORE any GPU init, not after an
-# ERROR:bench-rc=1 row surfaces the problem late. A marker-guard records
-# whether it was ever run at all (a positive control on "zero invocations",
-# not merely "no VALID row printed").
+# ERROR:bench-rc=1 row surfaces the problem late. Two runs against the SAME
+# marker-guard (which just touches GUARD_MARKER and exits 0, regardless of
+# its own args): first a POSITIVE CONTROL with a VALID --models-dir (files
+# present, via the whole-suite FAKE_MODELS_DIR fixture) proves the marker
+# mechanism itself actually detects an invocation -- without this, the
+# "must not exist" assertion below could pass vacuously if the marker-guard
+# were broken, or unreachable for some unrelated reason, and never invoked
+# either way; then the missing-file run proves zero invocations against
+# that same, now-proven-working mechanism.
 MISSING_MODELS_DIR="$T/models-missing"
 mkdir -p "$MISSING_MODELS_DIR"
 GUARD_MARKER="$T/guard-invoked-marker"
-rm -f "$GUARD_MARKER"
 MARKER_GUARD="$T/marker-guard.sh"
 cat > "$MARKER_GUARD" <<EOF
 #!/usr/bin/env bash
@@ -768,6 +773,12 @@ touch "$GUARD_MARKER"
 exit 0
 EOF
 chmod +x "$MARKER_GUARD"
+
+rm -f "$GUARD_MARKER"
+"$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$FAKE_MODELS_DIR" --only mistral,b70 >/dev/null 2>&1 || true
+[ -f "$GUARD_MARKER" ] || { echo "FAIL: positive control -- the marker-guard was never invoked even with a VALID --models-dir, so the 'zero invocations' assertion below would be vacuous"; fail=1; }
+
+rm -f "$GUARD_MARKER"
 out="$("$SCALING" --bench "$BENCH2" --guard "$MARKER_GUARD" --models-dir "$MISSING_MODELS_DIR" --only mistral,b70 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 2 ] || { echo "FAIL: a missing model file under --models-dir must exit 2, got $rc. Output:
 $out"; fail=1; }
