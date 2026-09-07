@@ -4313,8 +4313,9 @@ struct ggml_tensor_extra_gpu {
                                             bool                  require_all    = false,
                                             bool                  require_device = false) const {
         payload.clear();
-        return weight_ext && weight_ext->build_moe_ptr_payload_from_handles(dev, count, payload, require_all,
-                                                                             require_device);
+        return count == 0 || (weight_ext && weight_ext->build_moe_ptr_payload_from_handles(dev, count, payload,
+                                                                                            require_all,
+                                                                                            require_device));
     }
 
     bool build_moe_layout_ptr_payload_from_handles(int                   dev,
@@ -4325,8 +4326,9 @@ struct ggml_tensor_extra_gpu {
                                                    ggml_layout_mode      layout,
                                                    size_t                expected_expert_bytes) const {
         payload.clear();
-        return weight_ext && weight_ext->build_moe_layout_ptr_payload_from_handles(
-                                 dev, count, payload, require_all, require_device, layout, expected_expert_bytes);
+        return count == 0 || (weight_ext && weight_ext->build_moe_layout_ptr_payload_from_handles(
+                                                dev, count, payload, require_all, require_device, layout,
+                                                expected_expert_bytes));
     }
 
     bool remember_moe_storage_handle(int                   expert_id,
