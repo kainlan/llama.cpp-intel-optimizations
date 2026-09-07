@@ -449,8 +449,9 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     // silent misaligned load. `act_scales_device` is deliberately NOT
     // asserted here (llama.cpp-6f73 c-py5n should-fix 2, correcting round
     // 1): it is only ever read by scalar subscript (`act_scales[...]`
-    // below), never block_loaded, so it carries no such alignment
-    // requirement and an assert on it would guard nothing.
+    // above, in mxfp4_soa_gemm_int8_dpas_launch), never block_loaded, so it
+    // carries no such alignment requirement and an assert on it would guard
+    // nothing.
     GGML_ASSERT(reinterpret_cast<uintptr_t>(soa_weight_device) % 32 == 0);
     GGML_ASSERT(reinterpret_cast<uintptr_t>(act_qs_device) % 32 == 0);
 

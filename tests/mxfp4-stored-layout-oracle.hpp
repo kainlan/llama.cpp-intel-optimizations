@@ -319,10 +319,13 @@ Score max_rel_violations(const std::vector<double> & out,
                          double                      rel_tol,
                          double                      abs_floor = DEFAULT_ABS_FLOOR) {
     if (out.size() != ref.size()) {
-        // Flush stdout first: PASS/FAIL lines from `check()` go to stdout,
-        // which is block-buffered when captured/piped while stderr is not --
-        // without this the SIZE MISMATCH line can print before earlier PASS
-        // lines that logically preceded it (this repo has been bitten by
+        // Flush stdout first: PASS/FAIL lines from the CALLER's own test
+        // harness (e.g. check() in the G3 oracle self-test,
+        // score_and_report() in G4+ numerics tests -- neither lives in this
+        // shared header) go to stdout, which is block-buffered when
+        // captured/piped while stderr is not -- without this the SIZE
+        // MISMATCH line can print before earlier PASS lines that logically
+        // preceded it (this repo has been bitten by
         // stdout buffering scrambling test-result attribution before).
         std::fflush(stdout);
         std::fprintf(stderr,
