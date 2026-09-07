@@ -122,6 +122,31 @@ cover):
   token boundary against the exact set of valid C++ encoding prefixes
   (`L`, `u`, `U`, `u8`) rather than merely "is the preceding character
   alphanumeric" -- see _is_char_literal_opener's docstring.
+  Final integration round (rev-final-1, c-91qe finding B1 / llama.cpp-aenv,
+  folding in llama.cpp-7wal) found the masking fix itself had never been
+  applied to four places that needed it, all fixed here: (a)
+  _has_canonical_inline_block's and (b) _first_statement_is_valid's execv()
+  re-exec PROOF searches still ran on raw text, so a bare setenv() with no
+  real re-exec could be waved through by a COMMENT quoting
+  `execv("/proc/self/exe"` right after it -- a FALSE PASS, the opposite
+  direction from every round above and the more serious one (a genuinely
+  broken selector reads as `compliant`); (c) the round-3 outside-span scan
+  and (d) the has_helper/has_setenv half-finished-port check (llama.cpp-
+  7wal) also still ran on raw text, so a COMMENT elsewhere in the file
+  merely quoting the helper call or a setenv() form could false-FAIL an
+  otherwise-compliant file. All four now run against a new
+  _mask_comments_only(text) -- NOT the pre-existing
+  _mask_comments_and_literals(text) used by _find_main_bodies: that
+  function also blanks string literals, and SETENV_PATTERN/EXECV_PATTERN/
+  HELPER_CALL_PATTERN are each anchored on their own quoted argument text
+  (`"ONEAPI_DEVICE_SELECTOR"`, `"/proc/self/exe"`), so routing them through
+  the fully-blanking mask does not fix the bug -- it makes the patterns
+  unable to match ANY real call, comment or not, turning every genuine file
+  into a false offender (caught empirically while building this fix: see
+  _mask_comments_only's docstring for the exact repro). _mask_comments_only
+  parses string/char literals identically (so a `//` or a quote inside one
+  still cannot corrupt the scan) but leaves their content unmasked, closing
+  both directions without breaking any genuine call.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -162,6 +187,33 @@ helper is NOT an offender only if ALL of the following hold):
      where the pattern exists somewhere in the source but not inside any
      main() body at all also fails this: it cannot be main()'s first
      statement if it is not in main() at all.
+
+CONTRACT / LIMITATION: the "followed, within a short window, by
+execv("/proc/self/exe"" proof in (1)(b), and the whole-file
+`sycl_test_selector_fallback(`/`setenv("ONEAPI_DEVICE_SELECTOR"` occurrence
+scans used to detect a half-finished port or a call outside main(), are all
+evaluated against `_mask_comments_only(text)` (final integration round,
+rev-final-1 c-91qe finding B1 / llama.cpp-aenv, folding in llama.cpp-7wal),
+not raw source text: a `//` or `/* */` comment can never satisfy any of
+these checks, closing both a false PASS (a bare setenv() "proven" re-exec-
+safe by a comment quoting the proof text) and a false FAIL (an otherwise-
+compliant file's real call misclassified because a comment elsewhere
+quotes the same pattern). This is deliberately narrower than
+`_mask_comments_and_literals` (used only by _find_main_bodies for
+signature/brace scanning): string and char literals are left UNMASKED here
+because the patterns are themselves anchored on their own quoted argument
+(`"ONEAPI_DEVICE_SELECTOR"`, `"/proc/self/exe"`) -- blanking literals would
+blind every check to genuine calls, not just comment-based false ones. The
+residual gap this leaves is the same one _mask_comments_and_literals
+already documents: a raw string literal (`R"(...)"`) is not specially
+recognized by either masking function, so one could in principle still
+smuggle an unescaped, pattern-matching sequence past this gate. No in-scope
+file uses a raw string literal at the time of writing (see
+_mask_comments_and_literals' and _mask_comments_only's docstrings for the
+census); a normally-escaped string literal cannot reach this gap at all,
+because C++ requires escaping an embedded `"`, which breaks the raw regex
+match (`execv\\(\\s*"` requires an UNESCAPED quote immediately after the
+open paren) independently of any masking.
 
 This gate reads SOURCE TEXT only -- no compiler, no SYCL device.
 """
@@ -261,12 +313,28 @@ def _has_canonical_inline_block(text):
     carry one correct inline block AND a separate stray bare setenv and
     still read as compliant (spec round 2, c-xicg finding 3 -- round 1's
     half-finished-port fail-open, one level over, for the inline form
-    instead of the helper form)."""
-    matches = list(SETENV_PATTERN.finditer(text))
+    instead of the helper form).
+
+    B1 (rev-final-1, c-91qe / llama.cpp-aenv): both the setenv() search and
+    the execv() proof now run against _mask_comments_only(text), not the raw
+    text. Before this fix a bare setenv() with no real re-exec could be
+    waved through by a COMMENT merely quoting `execv("/proc/self/exe"`
+    within the 400-char lookahead window -- `setenv(...); // ...mentions
+    execv("/proc/self/exe" for reference` read as `compliant`, the exact
+    no-op-selector shape this gate exists to catch. Masking removes that
+    comment text before either pattern is searched, so only a genuine
+    re-exec call satisfies the proof. This uses _mask_comments_only, NOT
+    _mask_comments_and_literals -- the latter also blanks string literals,
+    which would blank the pattern's own required quoted argument
+    (`"ONEAPI_DEVICE_SELECTOR"`, `"/proc/self/exe"`) and make it unable to
+    match ANY real call at all; see _mask_comments_only's docstring. See
+    test_execv_proof_ignores_commented_and_quoted_text below."""
+    masked = _mask_comments_only(text)
+    matches = list(SETENV_PATTERN.finditer(masked))
     if not matches:
         return False
     for m in matches:
-        window = text[m.end() : m.end() + 400]
+        window = masked[m.end() : m.end() + 400]
         if not EXECV_PATTERN.search(window):
             return False
     return True
@@ -401,6 +469,85 @@ def _mask_comments_and_literals(text):
     return "".join(out)
 
 
+def _mask_comments_only(text):
+    """Like _mask_comments_and_literals above, but masks ONLY `//` and
+    `/* */` comments to spaces -- string and char literals are PARSED with
+    the exact same logic (so a `//`, a brace, or a quote inside one still
+    cannot be misread as a comment start or a literal boundary elsewhere),
+    but their CONTENT is left unchanged in the output, unlike
+    _mask_comments_and_literals which also blanks it. Length- and
+    position-preserving, same guarantee as _mask_comments_and_literals: a
+    span found in the returned copy can be used directly against `text`.
+
+    B1 (rev-final-1, c-91qe / llama.cpp-aenv): this exists because
+    SETENV_PATTERN, EXECV_PATTERN, and HELPER_CALL_PATTERN all need their
+    own quoted argument text to remain visible to match a REAL call at all
+    -- `setenv("ONEAPI_DEVICE_SELECTOR"` and `execv("/proc/self/exe"` are
+    each anchored on a literal string that lives inside a string literal.
+    Routing these three patterns through _mask_comments_and_literals (which
+    blanks string literals too) does not merely fail to close the
+    vulnerability -- it makes the patterns unable to match ANY real call,
+    comment or not, turning every genuine inline re-exec block and every
+    genuine helper call into a false offender. Verified empirically while
+    building this fix: _mask_comments_and_literals(real_inline_block) blanks
+    both `"ONEAPI_DEVICE_SELECTOR"` and `"/proc/self/exe"`, and
+    EXECV_PATTERN/SETENV_PATTERN then match nothing at all on the result.
+
+    A `//` or `/* */` comment, in contrast, can never legitimately contain a
+    REAL setenv()/execv()/helper call -- masking comments (and only
+    comments) to spaces closes the demonstrated vulnerability (a comment
+    quoting the execv() proof text right after a bare setenv(), or quoting
+    the helper call outside main() -- llama.cpp-7wal) without touching any
+    real code's own string arguments.
+
+    Same known-residuals disclaimer as _mask_comments_and_literals: raw
+    string literals (`R"(...)"`) are not specially recognized, so a raw
+    string could in principle still smuggle unescaped comment-like or
+    call-like text past this masking. No in-scope file uses one at the time
+    of writing (see _mask_comments_and_literals' docstring for the same
+    census)."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        two = text[i : i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            end = j if j != -1 else n
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            end = (j + 2) if j != -1 else n
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+        elif text[i] == '"' or (text[i] == "'" and _is_char_literal_opener(text, i)):
+            quote = text[i]
+            j = i + 1
+            closed = False
+            while j < n:
+                if text[j] == "\n":
+                    break
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                out.append(text[i])
+                i += 1
+                continue
+            out.append(text[i:j])  # literal content preserved, NOT masked
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def _find_main_bodies(text):
     """Yields (body_start, body_end, balanced) for each main(...) function
     found. body_start/body_end are character offsets into `text` (valid in
@@ -476,7 +623,7 @@ def _first_real_offset(text, start, end):
     return pos
 
 
-def _first_statement_is_valid(text, offset):
+def _first_statement_is_valid(masked, offset):
     """True if the real code starting at `offset` is either a direct call
     to the shared helper, or specifically the canonical inline block's
     guarding `if (!getenv("ONEAPI_DEVICE_SELECTOR"` / `if
@@ -491,8 +638,22 @@ def _first_statement_is_valid(text, offset):
     (which does not even start with "if (", just the substring "if") read as
     compliant as long as the canonical block appeared later in the 500-char
     window. INLINE_GUARD_PATTERN anchors the match to the guard's actual
-    condition instead of its first two characters."""
-    remainder = text[offset : offset + 500]
+    condition instead of its first two characters.
+
+    `masked` is `text` already run through _mask_comments_only (the caller,
+    _first_statement_verdict, computes it once and reuses it here and for
+    its own outside-span scan) -- NOT raw source text, and NOT the output of
+    _mask_comments_and_literals (which would also blank the real quoted
+    argument these patterns need to match a genuine call at all; see
+    _mask_comments_only's docstring). B1 (rev-final-1, c-91qe /
+    llama.cpp-aenv): before this fix the execv() proof for the inline
+    guard's setenv() searched the raw window, so a comment merely quoting
+    `execv("/proc/self/exe"` right after a setenv() that never actually
+    re-execs satisfied this check -- the same false-PASS shape closed in
+    _has_canonical_inline_block, one level over (the first-statement path
+    instead of the whole-file path). Masking removes that comment text
+    before the search runs."""
+    remainder = masked[offset : offset + 500]
     if HELPER_CALL_PATTERN.match(remainder):
         return True
     guard_m = INLINE_GUARD_PATTERN.match(remainder)
@@ -524,7 +685,23 @@ def _first_statement_verdict(text):
     "outside_main": every computed body's OWN first-statement check passed
     (or found nothing to check), but some occurrence of the helper call or
     a bespoke setenv("ONEAPI_DEVICE_SELECTOR" in the file falls OUTSIDE
-    every computed body's span -- see _find_main_bodies' TOO-EARLY case."""
+    every computed body's span -- see _find_main_bodies' TOO-EARLY case.
+
+    llama.cpp-7wal (folded in here, rev-final-1 c-91qe / llama.cpp-aenv):
+    this outside-span scan now runs against _mask_comments_only(text)
+    (computed once below and also handed to _first_statement_is_valid), not
+    raw text -- and specifically NOT _mask_comments_and_literals, which
+    would also blank the real quoted arguments SETENV_PATTERN/
+    HELPER_CALL_PATTERN need to find a genuine call at all (see
+    _mask_comments_only's docstring). Before this fix, a COMMENT OUTSIDE
+    main() that merely quoted `sycl_test_selector_fallback(` or
+    `setenv("ONEAPI_DEVICE_SELECTOR"` -- e.g. a note explaining why an
+    earlier port used the helper, or why this file uses the inline block
+    instead -- was matched as if it were a real, second occurrence outside
+    every computed main() body, false-failing an otherwise-compliant file
+    (offender_call_outside_scanned_main). Masking removes that comment text
+    before either pattern is searched here."""
+    masked = _mask_comments_only(text)
     bodies = []
     for start, end, balanced in _find_main_bodies(text):
         if not balanced:
@@ -537,12 +714,12 @@ def _first_statement_verdict(text):
             continue
         found_relevant_main = True
         offset = _first_real_offset(text, start, end)
-        if not _first_statement_is_valid(text, offset):
+        if not _first_statement_is_valid(masked, offset):
             return "not_first"
     if not found_relevant_main:
         return "not_first"
     for pattern in (HELPER_CALL_PATTERN, SETENV_PATTERN):
-        for m in pattern.finditer(text):
+        for m in pattern.finditer(masked):
             if not any(start <= m.start() < end for start, end in bodies):
                 return "outside_main"
     return "ok"
@@ -552,9 +729,23 @@ def _classify(text):
     """Returns one of "not_in_scope", "offender_half_finished",
     "offender_bare_setenv", "offender_not_first_statement",
     "offender_call_outside_scanned_main", "offender_unbalanced_main_body",
-    "compliant" for a single file's text."""
-    has_helper = bool(HELPER_CALL_PATTERN.search(text))
-    has_setenv = bool(SETENV_PATTERN.search(text))
+    "compliant" for a single file's text.
+
+    llama.cpp-7wal (folded in here, rev-final-1 c-91qe / llama.cpp-aenv):
+    has_helper/has_setenv are computed against _mask_comments_only(text),
+    not raw text -- and specifically NOT _mask_comments_and_literals (see
+    that function's and _mask_comments_only's docstrings for why: it would
+    also blank the real quoted argument these patterns need to match a
+    genuine call, misclassifying every real caller as not_in_scope).
+    Before this fix, a COMMENT anywhere in the file merely quoting
+    `sycl_test_selector_fallback(` or `setenv("ONEAPI_DEVICE_SELECTOR"`
+    alongside the file's own real (single) form made both flags true and
+    misclassified the file offender_half_finished even though only one form
+    is actually present in code. Masking removes that comment text before
+    either search runs."""
+    masked = _mask_comments_only(text)
+    has_helper = bool(HELPER_CALL_PATTERN.search(masked))
+    has_setenv = bool(SETENV_PATTERN.search(masked))
     if not has_setenv and not has_helper:
         return "not_in_scope"
     if has_helper and has_setenv:
@@ -1055,6 +1246,129 @@ def test_encoding_prefixed_char_literal_is_still_masked():
         '}\n'
     )
     assert _classify(control_prefixed_literal_and_digit_separator) == "compliant"
+
+
+def test_execv_proof_ignores_commented_text():
+    """Fixture proving B1 (rev-final-1, c-91qe / llama.cpp-aenv) is closed:
+    the execv() re-exec proof for a setenv("ONEAPI_DEVICE_SELECTOR" call --
+    checked both in _has_canonical_inline_block (the whole-file proof) and
+    in _first_statement_is_valid (the inline guard's first-statement proof)
+    -- must not be satisfiable by a COMMENT that merely quotes
+    `execv("/proc/self/exe"` without the setenv() actually being followed
+    by a real re-exec. Before this fix both checks searched the raw
+    400-char lookahead window, so a bare setenv() immediately followed by a
+    comment quoting the proof string classified `compliant` -- the exact
+    no-op-selector shape (llama.cpp-403s) this gate exists to catch. This is
+    the literal repro from rev-final-1's finding.
+
+    Why a STRING LITERAL is not a separate arm here: SETENV_PATTERN and
+    EXECV_PATTERN are anchored on `execv(\\s*"` / `setenv(\\s*"ONEAPI_...` --
+    an unescaped `"` immediately after the call. A normally-written C++
+    string literal quoting that same text must escape its embedded quotes
+    (`"...execv(\\"/proc/self/exe\\"..."`), which puts a backslash between
+    `execv(` and the quote and never matches the pattern in the first place
+    -- masked or not, comment or code. The one construct that COULD smuggle
+    an unescaped `execv("` through a string is a raw string literal
+    (`R"(...)"`), and that is an explicitly documented, pre-existing
+    residual of the masking approach (see _mask_comments_only's and
+    _mask_comments_and_literals' docstrings), not something this fix
+    introduces or claims to close.
+
+    Three arms:
+      1. bare setenv() + a trailing comment quoting the execv() proof text
+         must classify offender_bare_setenv (was: compliant, the bug).
+      2. the same file WITHOUT the comment must classify offender_bare_setenv
+         too (already correct before this fix; proves the fix does not
+         change the honest case).
+      3. a genuine inline re-exec block, PLUS an unrelated string literal
+         that happens to contain the substring "execv(" (but not the full
+         proof pattern), must still classify compliant -- proves masking
+         does not blind the check to a real proof, and that ordinary string
+         content is not touched by _mask_comments_only."""
+    arm_comment_quotes_execv_proof = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '        // never re-execs; comment mentions execv("/proc/self/exe" for reference\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(arm_comment_quotes_execv_proof) == "offender_bare_setenv"
+
+    control_no_comment = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_no_comment) == "offender_bare_setenv"
+
+    control_real_inline_block_with_unrelated_string = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    const char * unrelated = "this file will execv(1) later";\n'
+        '    (void)unrelated;\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_real_inline_block_with_unrelated_string) == "compliant"
+
+
+def test_comment_outside_main_quoting_a_form_does_not_offend():
+    """Fixture proving llama.cpp-7wal is closed: a comment OUTSIDE main()
+    that merely quotes `sycl_test_selector_fallback(` or
+    `setenv("ONEAPI_DEVICE_SELECTOR"` -- e.g. a note explaining why this
+    file uses the inline block instead of the shared helper -- must not
+    make an otherwise-compliant file an offender. Before this fix both the
+    round-3 outside-span scan (_first_statement_verdict) and the
+    has_helper/has_setenv scan (_classify) read raw text, so such a comment
+    was indistinguishable from a real second occurrence and misclassified
+    the file offender_half_finished or offender_call_outside_scanned_main
+    depending on which check tripped first. This is the exact real-world
+    shape rev-vzaj-spec-1 (llama.cpp-vzaj c-zqph) found in
+    tests/test-sycl-kv-view-extra-reuse.cpp at 9aef31b0f."""
+    arm_comment_quotes_helper_call = (
+        '// historical note: an earlier port of this file called\n'
+        '// sycl_test_selector_fallback(argv, "level_zero:0") directly; this\n'
+        '// file now uses the canonical inline block instead.\n'
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(arm_comment_quotes_helper_call) == "compliant"
+
+    arm_comment_quotes_bare_setenv_form = (
+        '// note: do NOT write setenv("ONEAPI_DEVICE_SELECTOR", ...) here\n'
+        '// without a following execv() -- see llama.cpp-403s.\n'
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(arm_comment_quotes_bare_setenv_form) == "compliant"
+
+    # Control: the same shapes without the comment must classify compliant
+    # too -- proves the fix is about the comment, not a side effect.
+    control_no_comment_inline = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_no_comment_inline) == "compliant"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
