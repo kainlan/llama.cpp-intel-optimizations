@@ -312,21 +312,27 @@ def _mask_comments_and_literals(text):
 
     Escapes inside a literal (`\\"`, `\\\\`, `\\'`) are honoured so an
     escaped quote does not end the literal early. A literal scan never
-    crosses a newline, and an apostrophe preceded by an alphanumeric or `_`
-    character is NOT treated as a char-literal opener at all -- both are
-    quality round 6 (rev-5q1r-quality-6, c-7pry) fixes for a regression
-    round 5's original literal scanner introduced: it had no bound on how
-    far an unclosed literal could run and treated every `'` as an opener,
-    so a C++14 DIGIT SEPARATOR (`1'000`) started a "char literal" that
-    stayed open until some much later, unrelated apostrophe (a second digit
-    separator, an apostrophe in a comment past the point masking should
-    have already excluded it, etc.) -- masking away everything in between,
-    including main()'s real closing brace, the same corruption round 4's
-    unmasked stray `{` once caused. If no closing quote is found before a
-    newline, the opening quote is emitted VERBATIM (unmasked) rather than
-    masking to end-of-line/EOF, so an apostrophe this scanner cannot safely
-    interpret is left as ordinary text instead of swallowing an unbounded
-    span.
+    crosses a newline, and a `'` only opens a char literal when
+    _is_char_literal_opener() says so -- the alphanumeric run immediately
+    before it, taken back to a token boundary, must be empty or exactly one
+    of C++'s encoding prefixes (`L`, `u`, `U`, `u8`); see that function's
+    docstring for the exact rule and why "preceded by an alphanumeric or
+    `_`" (a broader, now-wrong shorthand) is not the same check. Both the
+    newline bound and the opener check are quality round 6 (rev-5q1r-
+    quality-6, c-7pry) fixes for a regression round 5's original literal
+    scanner introduced: it had no bound on how far an unclosed literal could
+    run and treated every `'` as an opener, so a C++14 DIGIT SEPARATOR
+    (`1'000`) started a "char literal" that stayed open until some much
+    later, unrelated apostrophe (a second digit separator, an apostrophe in
+    a comment past the point masking should have already excluded it, etc.)
+    -- masking away everything in between, including main()'s real closing
+    brace, the same corruption round 4's unmasked stray `{` once caused
+    (round 6's own first attempt at the opener check was itself too broad;
+    round 7, c-td7k, narrowed it to the exact prefix set above). If no
+    closing quote is found before a newline, the opening quote is emitted
+    VERBATIM (unmasked) rather than masking to end-of-line/EOF, so an
+    apostrophe this scanner cannot safely interpret is left as ordinary
+    text instead of swallowing an unbounded span.
 
     KNOWN RESIDUALS INCLUDE (this is not a closed enumeration -- items are
     added here as they are found, quality round 5's c-i7ep should-fix 2:
@@ -335,8 +341,13 @@ def _mask_comments_and_literals(text):
         distinct construct. `R"` is treated as an ordinary string start, so
         a raw string's own embedded unescaped quotes or parentheses are not
         specially honoured -- masking can end early or run long across one.
-        No file in tests/ or ggml/src/ggml-sycl/tests/ uses a raw string
-        literal at the time of writing.
+        No IN-SCOPE file (see _classify()'s "not_in_scope" verdict) uses a
+        raw string literal at the time of writing; quality round 8
+        (rev-5q1r-quality-8, c-gtm1) found 15 files inside the two scan
+        roots that DO -- test-chat.cpp, test-jinja.cpp, peg-parser/test-
+        json-parser.cpp, test-grammar-integration.cpp, and 11 more -- every
+        one of them classifying not_in_scope (no ONEAPI_DEVICE_SELECTOR
+        mention, no helper call), so none is affected by this gap today.
       - Digraphs (`<%`/`%>` for `{`/`}`, `<:`/`:>` for `[`/`]`, ...) are
         invisible to both the mask and the brace walk -- a digraph brace is
         simply never counted, in either direction. No file here uses them.
