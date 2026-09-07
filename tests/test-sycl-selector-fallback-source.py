@@ -58,6 +58,19 @@ cover):
   files in subdirectories of either scan root (tests/peg-parser,
   tests/e1-rca, tests/sycl-canary, tests/sycl-alloc-policy-fixtures/*, ...)
   were invisible to it.
+  Quality round 1 (rev-5q1r-quality-1, c-h331) found the (a) fix from round
+  2 itself failed open (any first statement merely starting with "if"
+  passed) and a backslash-continuation gap in the preprocessor-line
+  skipper that a later round's own fix attempt initially missed reproducing
+  correctly.
+  Quality round 3 (rev-5q1r-quality-3, c-autq) found the (a)/found-relevant-
+  main check was FILE-scoped rather than per-offending-call: a stray brace
+  inside a string literal could mis-bound one main() body early enough to
+  ORPHAN its real offending call (landing in neither that truncated body
+  nor any other), while an unrelated, even textually-dead (e.g. an `#if
+  0`-guarded) second "int main(...)" elsewhere in the same file happened to
+  satisfy the per-body check -- reading the whole file compliant despite the
+  orphaned offender. See _find_main_bodies' docstring for the enforced fix.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -213,33 +226,37 @@ def _find_main_bodies(text):
     strictly between each main(...) function's opening brace and its
     matching closing brace, found by depth-counted brace scanning.
 
-    LIMITATION (quality round 1, c-h331 nit 3; disposition refined in
-    quality round 2, c-dhg6 nit B): this scanner is NOT string/comment
-    aware -- a `{` or `}` inside a string literal or a comment (e.g.
-    `printf("open brace: {\\n")` or `// note: }`) is counted as a real
-    brace and can mis-bound a main() body's end (too early or too late).
+    LIMITATION (quality round 1, c-h331 nit 3): this scanner is NOT
+    string/comment aware -- a `{` or `}` inside a string literal or a
+    comment (e.g. `printf("open brace: {\\n")` or `// note: }`) is counted
+    as a real brace and can mis-bound a main() body's end, too early or too
+    late.
 
-    No shape has been found where this mis-bounding, BY ITSELF, flips a
-    genuine offender to a false compliant. Reasoning: `_first_statement_ok`
-    always begins its search for the first real statement at `body_start`
-    (the position immediately after main()'s TRUE opening brace, which the
-    signature regex finds correctly regardless of brace counting) and reads
-    the actual file text from there forward or, via
-    `_first_statement_is_valid`, from a fixed offset -- never from a
-    boundary derived by counting past a spurious brace. A too-early
-    `body_end` can only make the scanner give up before reaching a real
-    statement (offender, fail closed) or fail to attribute a match found
-    beyond it to this main() at all (also fail closed, via
-    found_relevant_main). A too-late `body_end` can only pull in match text
-    that belongs to a LATER function, which the first-real-statement walk
-    still reaches only after passing through main()'s own real statements
-    first, so a mismatch there is still reported as an offender. Four
-    constructed shapes probing this (a string-literal `{`, a line-comment
-    `}`, one before the call and one after) were all confirmed fail-closed;
-    none produced a false compliant. Proper string/comment-aware scanning
-    would still be a cleaner implementation, but the motivating risk for a
-    source gate -- a broken file passing silently -- has not been observed
-    to exist at this seam."""
+    Quality round 2 (c-dhg6 nit B) tried to argue this mis-bounding could
+    never by itself flip a genuine offender to a false compliant. Quality
+    round 3 (rev-5q1r-quality-3, c-autq) refuted that with a real
+    reproduction: a too-early `body_end` (from a stray `}` inside a string
+    literal) can ORPHAN a real, offending call -- it ends up in neither the
+    truncated first body nor any other yielded body -- while a textually
+    unrelated SECOND `int main(...)` elsewhere in the same file (even
+    inside dead code, e.g. an `#if 0`-guarded block, since this regex-based
+    scanner does not understand preprocessor conditionals either) happens
+    to call the helper correctly. The per-body loop in
+    `_first_statement_verdict` used to treat "some main body I found passes" as
+    sufficient, so the orphaned offender went unexamined and the file read
+    compliant.
+
+    THE ENFORCED INVARIANT (not merely an empirical claim): after checking
+    every computed body's own first statement, `_first_statement_verdict` also
+    requires every occurrence of the helper call or a bespoke
+    ONEAPI_DEVICE_SELECTOR setenv() anywhere in the file to fall inside the
+    span of SOME computed body. A match outside every computed span --
+    whether orphaned by mis-bounding or genuinely outside any main() --
+    fails the file (offender_call_outside_scanned_main). This closes the
+    mis-bounding gap without requiring string/comment-aware scanning:
+    mis-bounding can still happen, but a match it strands outside every
+    body is now caught structurally rather than relying on no such file
+    existing."""
     for m in MAIN_SIGNATURE_PATTERN.finditer(text):
         start = m.end()
         depth = 1
@@ -301,29 +318,47 @@ def _first_statement_is_valid(text, offset):
     return False
 
 
-def _first_statement_ok(text):
-    """True if every main() body that mentions the helper or a bespoke
-    setenv("ONEAPI_DEVICE_SELECTOR" has that mention as its first real
-    statement, AND at least one main() body actually contains the mention
-    (it cannot be main()'s first statement if it is not in main() at all --
-    spec round 2, c-xicg finding 2: nothing previously checked position,
-    only presence anywhere in the file)."""
+def _first_statement_verdict(text):
+    """Returns "ok", "not_first", or "outside_main" for a single file's
+    handling of main()-body position.
+
+    "not_first": some computed main() body mentions the helper or a
+    bespoke setenv("ONEAPI_DEVICE_SELECTOR" but not as its first real
+    statement, OR no computed body mentions it at all (it cannot be main()'s
+    first statement if it is not in main() at all -- spec round 2, c-xicg
+    finding 2).
+
+    "outside_main": every computed body's OWN first-statement check passed
+    (or found nothing to check), but some occurrence of the helper call or
+    a bespoke setenv("ONEAPI_DEVICE_SELECTOR" in the file falls OUTSIDE
+    every computed body's span -- see _find_main_bodies' docstring for why
+    this is checked explicitly rather than assumed impossible (quality
+    round 3, c-autq: a too-early body_end can orphan a real offending call
+    while an unrelated main elsewhere satisfies the per-body loop)."""
+    bodies = list(_find_main_bodies(text))
     found_relevant_main = False
-    for start, end in _find_main_bodies(text):
+    for start, end in bodies:
         body = text[start:end]
         if not (HELPER_CALL_PATTERN.search(body) or SETENV_PATTERN.search(body)):
             continue
         found_relevant_main = True
         offset = _first_real_offset(text, start, end)
         if not _first_statement_is_valid(text, offset):
-            return False
-    return found_relevant_main
+            return "not_first"
+    if not found_relevant_main:
+        return "not_first"
+    for pattern in (HELPER_CALL_PATTERN, SETENV_PATTERN):
+        for m in pattern.finditer(text):
+            if not any(start <= m.start() < end for start, end in bodies):
+                return "outside_main"
+    return "ok"
 
 
 def _classify(text):
     """Returns one of "not_in_scope", "offender_half_finished",
-    "offender_bare_setenv", "offender_not_first_statement", "compliant"
-    for a single file's text."""
+    "offender_bare_setenv", "offender_not_first_statement",
+    "offender_call_outside_scanned_main", "compliant" for a single file's
+    text."""
     has_helper = bool(HELPER_CALL_PATTERN.search(text))
     has_setenv = bool(SETENV_PATTERN.search(text))
     if not has_setenv and not has_helper:
@@ -332,8 +367,11 @@ def _classify(text):
         return "offender_half_finished"
     if has_setenv and not _has_canonical_inline_block(text):
         return "offender_bare_setenv"
-    if not _first_statement_ok(text):
+    verdict = _first_statement_verdict(text)
+    if verdict == "not_first":
         return "offender_not_first_statement"
+    if verdict == "outside_main":
+        return "offender_call_outside_scanned_main"
     return "compliant"
 
 
@@ -558,6 +596,50 @@ def test_inline_guard_pattern_is_specific():
         '}\n'
     )
     assert _classify(std_getenv_first) == "compliant"
+
+
+def test_orphaned_call_outside_scanned_main_is_caught():
+    """Fixture proving the FILE-scoped found_relevant_main fail-open is
+    closed -- quality round 3 (rev-5q1r-quality-3, c-autq) reproduced a real
+    shape where it was not: a stray `}` inside a string literal mis-bounds
+    the first main()'s computed body early enough to orphan its own real
+    offending call (the call ends up in neither the truncated first body
+    nor any other computed body), while a textually unrelated SECOND
+    `int main(...)` later in the file -- even one guarded by `#if 0`, since
+    this scanner does not understand preprocessor conditionals -- happens
+    to call the helper correctly and satisfies the per-body loop on its
+    own. Before this fix, arm_stray_brace_plus_dead_main below classified
+    "compliant"; it must now classify offender_call_outside_scanned_main."""
+    arm_stray_brace_plus_dead_main = (
+        'int main(int, char ** argv) {\n'
+        '    printf("stray: }\\n");\n'
+        '    do_something_first();\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        '#if 0\n'
+        'int main() {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+        '#endif\n'
+    )
+    assert _classify(arm_stray_brace_plus_dead_main) == "offender_call_outside_scanned_main"
+
+    # Control: the same file WITHOUT the stray brace and WITHOUT the dead
+    # second main -- this must still be a plain offender_not_first_statement
+    # (do_something_first() genuinely runs before the call), proving the fix
+    # did not just make everything with two "main"-shaped regions an
+    # offender for the wrong reason.
+    control_without_stray_brace = (
+        'int main(int, char ** argv) {\n'
+        '    do_something_first();\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_without_stray_brace) == "offender_not_first_statement"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
