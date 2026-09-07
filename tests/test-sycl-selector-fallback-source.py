@@ -1500,17 +1500,72 @@ def test_every_helper_caller_declares_argv_in_main():
     exist, false-flagging a compliant file that uses the inline block
     instead. Searches `_mask_comments_only(text)` instead -- not
     `_mask_comments_and_literals`, which would also blank the pattern's own
-    required argument text (see that function's docstring)."""
+    required argument text (see that function's docstring).
+
+    Quality round 2 (rev-aenv-quality-2, c-ppp8) found the sibling
+    MAIN_WITH_ARGV_PATTERN check still read raw `text` while the line right
+    above it already read the mask: a main() with NO real argv parameter,
+    plus a comment elsewhere merely quoting an argv-taking signature (e.g.
+    `// int main(int argc, char ** argv) {`), satisfied this guard and hid
+    a file that would not actually compile -- the exact fail-open this
+    whole function exists to catch, one level later. Both checks now read
+    the SAME `masked` copy, computed once."""
     missing = []
     for path in _iter_source_files():
         text = path.read_text(encoding="utf-8")
-        if not HELPER_CALL_PATTERN.search(_mask_comments_only(text)):
+        masked = _mask_comments_only(text)
+        if not HELPER_CALL_PATTERN.search(masked):
             continue
-        if not MAIN_WITH_ARGV_PATTERN.search(text):
+        if not MAIN_WITH_ARGV_PATTERN.search(masked):
             missing.append(path.relative_to(REPO_ROOT).as_posix())
     assert not missing, (
         "the following files call sycl_test_selector_fallback(argv, ...) but their main() "
         "does not appear to declare a char ** argv parameter: " + ", ".join(missing)
+    )
+
+
+def test_argv_guard_ignores_commented_main_signature():
+    """Fixture proving quality round 2 (rev-aenv-quality-2, c-ppp8) is
+    closed: MAIN_WITH_ARGV_PATTERN must not be satisfiable by a COMMENT
+    merely quoting an argv-taking main() signature -- the same class of bug
+    B1/quality-round-1 closed for HELPER_CALL_PATTERN/SETENV_PATTERN
+    elsewhere in this file, one site later (the sibling check right above
+    it in test_every_helper_caller_declares_argv_in_main). Before this fix,
+    MAIN_WITH_ARGV_PATTERN.search(text) read raw text while
+    HELPER_CALL_PATTERN.search on the same line already read the mask, so a
+    main() with NO real argv parameter, plus a comment elsewhere quoting
+    one, satisfied the guard and hid a file that would not actually
+    compile.
+
+    Exercises the two regexes directly against _mask_comments_only(text),
+    the same call test_every_helper_caller_declares_argv_in_main now makes
+    per-file, since the fix is one line inside that scan loop over files on
+    disk."""
+    no_argv_main_plus_commented_signature = (
+        '// historical signature, no longer used:\n'
+        '// int main(int argc, char ** argv) {\n'
+        'int main() {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    masked = _mask_comments_only(no_argv_main_plus_commented_signature)
+    assert HELPER_CALL_PATTERN.search(masked)
+    assert not MAIN_WITH_ARGV_PATTERN.search(masked), (
+        "MAIN_WITH_ARGV_PATTERN matched a commented-out signature -- "
+        "the argv guard must read the mask, not raw text"
+    )
+
+    real_argv_main = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    masked_real = _mask_comments_only(real_argv_main)
+    assert HELPER_CALL_PATTERN.search(masked_real)
+    assert MAIN_WITH_ARGV_PATTERN.search(masked_real), (
+        "a genuine argv-taking main() must still satisfy the guard"
     )
 
 
