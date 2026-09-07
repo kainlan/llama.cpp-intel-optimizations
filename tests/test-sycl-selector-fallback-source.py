@@ -231,63 +231,118 @@ def _has_canonical_inline_block(text):
     return True
 
 
+def _mask_comments_and_literals(text):
+    """Returns a copy of `text` the same length, with every `//` line
+    comment, `/* */` block comment, string literal ("...") and char literal
+    ('...') replaced character-for-character by spaces (newlines inside a
+    masked span are kept as newlines, everything else becomes a space).
+    Every offset in the returned copy therefore still lines up 1:1 with
+    `text` -- a position or span found by scanning the MASKED copy can be
+    used directly to slice or search the ORIGINAL text.
+
+    Escapes inside a literal (`\\"`, `\\\\`, `\\'`) are honoured so an
+    escaped quote does not end the literal early.
+
+    THREE THINGS THIS DOES NOT HANDLE, LEFT AS KNOWN RESIDUAL GAPS rather
+    than papered over (quality round 5, rev-5q1r-quality-5, c-i7ep
+    should-fix 2: masking must not be sold as closing every direction):
+      - Raw string literals (`R"delim(...)delim"`) are not recognized as a
+        distinct construct. `R"` is treated as an ordinary string start, so
+        a raw string's own embedded unescaped quotes or parentheses are not
+        specially honoured -- masking can end early or run long across one.
+        No file in tests/ or ggml/src/ggml-sycl/tests/ uses a raw string
+        literal at the time of writing.
+      - Digraphs (`<%`/`%>` for `{`/`}`, `<:`/`:>` for `[`/`]`, ...) are
+        invisible to both the mask and the brace walk -- a digraph brace is
+        simply never counted, in either direction. No file here uses them.
+      - A `main` spelled through a macro (`#define ENTRY int main` /
+        `ENTRY(argc, argv) { ... }`) is invisible to MAIN_SIGNATURE_PATTERN
+        regardless of masking; this was already true before masking existed
+        and is unrelated to it."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        two = text[i : i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            end = j if j != -1 else n
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            end = (j + 2) if j != -1 else n
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
+            i = end
+        elif text[i] in "\"'":
+            quote = text[i]
+            j = i + 1
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    break
+                j += 1
+            out.append("".join(ch if ch == "\n" else " " for ch in text[i:j]))
+            i = j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def _find_main_bodies(text):
     """Yields (body_start, body_end, balanced) for each main(...) function
-    found. body_start/body_end are the character offsets strictly between
-    its opening brace and the position the depth-counted brace scan
-    reached; `balanced` is True only if that scan actually returned to
-    depth 0 (found a real matching closing brace) before EOF.
+    found. body_start/body_end are character offsets into `text` (valid in
+    both `text` and its masked form, since masking preserves length and
+    position), strictly between the function's opening brace and the
+    position the depth-counted brace scan reached; `balanced` is True only
+    if that scan actually returned to depth 0 (found a real matching
+    closing brace) before EOF.
 
-    LIMITATION: this scanner is NOT string/comment aware -- a `{` or `}`
-    inside a string literal or a comment (e.g. `printf("open brace: {\\n")`
-    or `// note: }`) is counted as a real brace and can mis-bound a main()
-    body's end, in EITHER direction. Both directions are now fail-closed by
-    construction, not by an empirical claim that no exploiting shape exists
-    (that claim was made and then refuted twice -- see below):
+    Both the main() signature search and the brace-depth walk run on
+    `_mask_comments_and_literals(text)`, NOT on `text` itself -- see that
+    function's docstring for exactly what it masks and its known residual
+    gaps. This defeats three real, reproduced exploit shapes, all of which
+    previously fooled the raw (unmasked) scanner:
 
-    TOO-EARLY (quality round 3, rev-5q1r-quality-3, c-autq): a stray `}`
-    inside a string/comment can end the scan before main()'s real closing
-    brace, ORPHANING a real offending call in neither the truncated body nor
-    any other yielded body, while a textually unrelated SECOND
-    `int main(...)` elsewhere in the file (even inside dead code, e.g. an
-    `#if 0`-guarded block, since this regex-based scanner does not
-    understand preprocessor conditionals) can satisfy the per-body loop on
-    its own. Closed in `_first_statement_verdict` by requiring every
-    occurrence of the helper call or a bespoke ONEAPI_DEVICE_SELECTOR
-    setenv() anywhere in the file to fall inside the span of SOME yielded
-    body -- a match outside every span fails the file
-    (offender_call_outside_scanned_main), whether orphaned by mis-bounding
-    or genuinely outside any main().
+      - TOO-EARLY (quality round 3, c-autq): a stray `}` inside a string or
+        comment ending a main() body before its real closing brace, ORPHANING
+        a real offending call outside every yielded body.
+      - TOO-LATE (quality round 4, c-q3hv): the mirror -- a stray `{` inside
+        a string or comment pushing the depth count so main()'s real closing
+        brace never returns it to 0, yielding a body that runs to EOF and
+        swallows a later, unrelated function's call.
+      - SPURIOUS SIGNATURE (quality round 5, c-i7ep): a `main(...) {`-shaped
+        SUBSTRING inside a `//` or `/* */` comment (or a string literal)
+        elsewhere in the file being matched by MAIN_SIGNATURE_PATTERN as if
+        it were a second, real main() -- e.g. `// historical: int
+        main(int, char ** argv) {` inside a later free function. That
+        spurious "body" balances at the enclosing function's own real `}`
+        and satisfies BOTH the round-3 and round-4 fixes on a span that
+        corresponds to no function at all, reading the file compliant.
 
-    TOO-LATE (quality round 4, rev-5q1r-quality-4, c-q3hv): the mirror case.
-    A stray `{` inside a string/comment can push the running depth high
-    enough that main()'s own real closing brace only brings it back to 1,
-    never 0 -- the scan then runs all the way to EOF still "inside" main,
-    yielding a body that spans the WHOLE REST OF THE FILE. A helper call in
-    a later, genuinely unrelated free function then falls inside that
-    over-extended span and satisfies the too-early fix's outside-span check
-    on a corrupted span, reading compliant. This function now reports
-    `balanced = depth == 0`, and `_first_statement_verdict` treats ANY
-    unbalanced main() in an in-scope file as its own offender
-    (offender_unbalanced_main_body) rather than trusting a to-EOF span:
-    such a body cannot be used to bound anything, in either direction,
-    because the scanner cannot tell how far past main() the stray brace's
-    influence really extends. A repo-wide census (`_iter_source_files()`
-    plus this scan) found zero in-scope files whose real main() body scans
-    unbalanced, so this bucket exists for defense, not because any current
-    file needs it.
-
-    A full string/comment-aware scanner would remove the underlying
-    ambiguity rather than fencing off its two observed failure directions;
-    it remains deferred as long as each new failure mode keeps closing
-    cleanly without it."""
-    for m in MAIN_SIGNATURE_PATTERN.finditer(text):
+    Masking removes the substring these three exploits depend on before
+    either the signature search or the brace walk ever sees it, rather than
+    fencing off each failure direction with a separate check on raw text --
+    a durable fix at the source of the ambiguity instead of one patch per
+    discovered shape. `#if 0` and `#if !defined(GGML_USE_SYCL)` guarded
+    main() definitions are NOT masked: they are real code with real braces
+    (dead at compile time, not textually fake), and must keep scanning
+    exactly as before -- an unbalanced one still routes to
+    offender_unbalanced_main_body (kept as defence in depth alongside the
+    outside-span check in `_first_statement_verdict`, even though masking
+    closes the specific shapes that used to need them)."""
+    masked = _mask_comments_and_literals(text)
+    for m in MAIN_SIGNATURE_PATTERN.finditer(masked):
         start = m.end()
         depth = 1
         i = start
-        n = len(text)
+        n = len(masked)
         while i < n and depth > 0:
-            c = text[i]
+            c = masked[i]
             if c == "{":
                 depth += 1
             elif c == "}":
@@ -636,13 +691,22 @@ def test_orphaned_call_outside_scanned_main_is_caught():
     closed -- quality round 3 (rev-5q1r-quality-3, c-autq) reproduced a real
     shape where it was not: a stray `}` inside a string literal mis-bounds
     the first main()'s computed body early enough to orphan its own real
-    offending call (the call ends up in neither the truncated first body
-    nor any other computed body), while a textually unrelated SECOND
-    `int main(...)` later in the file -- even one guarded by `#if 0`, since
-    this scanner does not understand preprocessor conditionals -- happens
-    to call the helper correctly and satisfies the per-body loop on its
-    own. Before this fix, arm_stray_brace_plus_dead_main below classified
-    "compliant"; it must now classify offender_call_outside_scanned_main."""
+    offending call, while a textually unrelated SECOND `int main(...)` later
+    in the file (guarded by `#if 0`) happens to call the helper correctly
+    and satisfies the per-body loop on its own.
+
+    HISTORY OF THIS FIXTURE'S EXPECTED VERDICT (each fix made it more
+    precise, never less correct): before round 3's fix (c349bd259's
+    predecessor, 5d2ddf675^) it classified "compliant" -- the bug. Round 3
+    (c349bd259) fixed the outside-span gap and it became
+    offender_call_outside_scanned_main. Quality round 5's masking fix
+    (rev-5q1r-quality-5, c-i7ep) additionally makes the stray `}` inside the
+    string invisible to the brace walk in the first place, so main()'s real
+    closing brace is found directly and the SAME defect (do_something_first()
+    genuinely precedes the call) is now caught earlier and more specifically,
+    as offender_not_first_statement -- correct either way, but this is the
+    verdict a proper string-aware scanner gives without ever needing the
+    outside-span check for THIS particular file."""
     arm_stray_brace_plus_dead_main = (
         'int main(int, char ** argv) {\n'
         '    printf("stray: }\\n");\n'
@@ -658,7 +722,7 @@ def test_orphaned_call_outside_scanned_main_is_caught():
         '}\n'
         '#endif\n'
     )
-    assert _classify(arm_stray_brace_plus_dead_main) == "offender_call_outside_scanned_main"
+    assert _classify(arm_stray_brace_plus_dead_main) == "offender_not_first_statement"
 
     # Control: the same file WITHOUT the stray brace and WITHOUT the dead
     # second main -- this must still be a plain offender_not_first_statement
@@ -680,12 +744,25 @@ def test_unbalanced_main_body_is_its_own_offender():
     quality round 4 (rev-5q1r-quality-4, c-q3hv) reproduced a real shape
     where round 3's own fix was itself corrupted by bad data: a stray `{`
     inside a string literal pushes the brace-scan depth high enough that
-    main()'s real closing brace only returns it to 1, so the scan runs to
-    EOF and yields a body spanning the whole rest of the file. A LATER,
-    genuinely unrelated free function's helper call then falls "inside"
-    that over-extended span and satisfies round 3's outside-span check on
-    corrupted data. Before this fix, arm_too_late_brace below classified
-    "compliant"; it must now classify offender_unbalanced_main_body."""
+    main()'s real closing brace only returns it to 1, so the scan ran to EOF
+    and yielded a body spanning the whole rest of the file, swallowing a
+    LATER, genuinely unrelated free function's helper call and satisfying
+    round 3's outside-span check on corrupted data.
+
+    HISTORY OF THIS FIXTURE'S EXPECTED VERDICT: before round 4's fix
+    (c349bd259) it classified "compliant" -- the bug. Round 4
+    (c349bd259) added the offender_unbalanced_main_body bucket and this arm
+    classified that way, because without masking the stray `{` was a real
+    brace to the walk and main() genuinely never re-balanced. Quality round
+    5's masking fix (rev-5q1r-quality-5, c-i7ep) makes that stray `{`
+    (inside a string literal) invisible to the brace walk in the first
+    place, so main() now balances correctly at its own real closing brace
+    and the late free function's call is directly caught as
+    offender_call_outside_scanned_main -- the SAME underlying defect, now
+    identified without ever needing the unbalanced-body bucket for THIS
+    particular file. That bucket is kept as defence in depth and exercised
+    below by a main() whose imbalance is real code, not a masked-away
+    literal."""
     arm_too_late_brace = (
         'int main(int, char ** argv) {\n'
         '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
@@ -697,13 +774,12 @@ def test_unbalanced_main_body_is_its_own_offender():
         '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
         '}\n'
     )
-    assert _classify(arm_too_late_brace) == "offender_unbalanced_main_body"
+    assert _classify(arm_too_late_brace) == "offender_call_outside_scanned_main"
 
-    # Control: identical WITHOUT the stray `{` -- main()'s body now balances
-    # correctly at its own real closing brace, so late_setup()'s call
-    # genuinely falls outside any computed main body and must be caught by
-    # the round-3 bucket, proving this fix did not just make every file
-    # with a helper call in a non-main function an unbalanced-body offender.
+    # Control: identical WITHOUT the stray `{` -- main()'s body already
+    # balanced correctly at its own real closing brace even before masking,
+    # so late_setup()'s call genuinely falls outside any computed main body
+    # either way, proving the fix did not change this file's verdict.
     control_no_stray_brace = (
         'int main(int, char ** argv) {\n'
         '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
@@ -716,6 +792,75 @@ def test_unbalanced_main_body_is_its_own_offender():
         '}\n'
     )
     assert _classify(control_no_stray_brace) == "offender_call_outside_scanned_main"
+
+    # The bucket itself is kept as defence in depth even though masking
+    # closes the string/comment-hidden-brace shapes that used to need it
+    # (see _find_main_bodies' docstring) -- it must still fire for a main()
+    # whose brace imbalance is REAL CODE, not a brace masking now makes
+    # invisible.
+    arm_real_unclosed_brace = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    if (some_real_condition()) {\n'
+        '        do_stuff();\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(arm_real_unclosed_brace) == "offender_unbalanced_main_body"
+
+
+def test_comment_embedded_main_signature_does_not_mint_a_body():
+    """Fixture proving a `main(...) {`-shaped SUBSTRING inside a comment (or
+    a string literal) does not mint a spurious second main() body -- quality
+    round 5 (rev-5q1r-quality-5, c-i7ep) found a `// historical: int
+    main(int, char ** argv) {` comment inside a later free function created
+    a second, textually-matched "main" that balanced at the enclosing
+    function's own `}` and covered that function's real (offending) call,
+    satisfying both the round-3 outside-span check and the round-4
+    unbalanced-body check on a span that corresponds to no function at all.
+
+    Before this fix, arm_comment_embedded_signature below classified
+    "compliant" -- the bug. The control (identical, without the comment
+    trick) already correctly classified offender_call_outside_scanned_main
+    both before and after this fix; masking makes the two arms agree,
+    neutralizing the exploit without changing the control's verdict."""
+    arm_comment_embedded_signature = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    // historical: int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(arm_comment_embedded_signature) == "offender_call_outside_scanned_main"
+
+    arm_string_embedded_signature = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    log("int main(int, char ** argv) {");\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(arm_string_embedded_signature) == "offender_call_outside_scanned_main"
+
+    control_no_comment_trick = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(control_no_comment_trick) == "offender_call_outside_scanned_main"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
