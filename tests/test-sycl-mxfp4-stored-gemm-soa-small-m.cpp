@@ -246,6 +246,17 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         // read once, after this loop, so these extra launches cannot change
         // the correctness verdict, only overwrite t_dst with the identical
         // result.
+        //
+        // This fix has its own blind spot in the other direction
+        // (llama.cpp-kcya c-amir should-fix 4): the host wall-clock span
+        // ALSO includes host-side kernel-submission and wait overhead that
+        // the profiler's device-timed mean_ns rows do not, so this mean_ns
+        // is strictly LARGER (and the derived GB/s strictly smaller) than
+        // the true device time -- every historical figure in this ticket
+        // (e.g. 237 us, 103.6+5.6 us) is device-timed, so do not compare
+        // this print's numbers against them directly; use it only as a
+        // sanity floor on device bandwidth, and read the profiler CSV's
+        // .partial/.combine mean_ns for the number that matches history.
         constexpr int       BW_WARMUP = 3;
         constexpr int       BW_ITERS  = 20;
         std::vector<double> call_ns;
@@ -271,7 +282,8 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         std::printf(
             "  per_launch_bandwidth M=%lld n_out=%lld n_k=%lld bytes_moved=%.0f mean_ns=%.1f GBps=%.3f (n=%zu, "
             "host wall-clock incl. every kernel in the dispatch -- NOT the event-diag "
-            "command_start/command_end above)\n",
+            "command_start/command_end above -- AND incl. host submit + wait overhead, so this is a LOWER BOUND "
+            "on device bandwidth, NOT comparable to the profiler's device-timed mean_ns rows)\n",
             (long long) M, (long long) n_out, (long long) n_k, bytes_moved, mean_ns, bw_gbps, call_ns.size());
     } else {
         event.wait();

@@ -276,8 +276,9 @@ float * mxfp4_stored_gemm_ksplit_get_or_alloc_scratch(sycl::queue * stream, int 
     req.intent.role                    = ggml_sycl::alloc_role::EXPERT_STAGING;
     req.intent.category                = ggml_sycl::runtime_category::STAGING;
     req.intent.constraints.must_device = true;
-    req.alignment                      = 64;  // covers acc_width*sizeof(float) for every M_TILE this file uses
-    cache.handle                       = ggml_sycl::unified_allocate(req);
+    req.alignment = 64;  // 64 divides acc_width*sizeof(float) (64*M_TILE bytes) for every M_TILE this file
+                         // uses, so every partition's offset into the scratch buffer stays 64-byte aligned
+    cache.handle  = ggml_sycl::unified_allocate(req);
     if (!cache.handle.valid()) {
         cache.handle = {};
         return nullptr;
@@ -383,14 +384,35 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_partial_launch(sycl::queue &        
     // whole M x n_k activation, read once each (same DRAM-traffic reasoning
     // as ggml_sycl_mxfp4_soa_gemm_dpas's own accounting further below --
     // the activation is assumed cache-resident across the launch, not
-    // re-fetched per work-item); plus, when NOT writing directly to the
-    // caller's dst (ksplit > 1), the launch_size x acc_width f32 partial
-    // write this pass makes into scratch.
+    // re-fetched per work-item); plus EXACTLY ONE of the two things this
+    // pass's own epilogue can write (mxfp4_soa_gemm_int8_dpas_launch's
+    // write_direct branch decides which): when write_direct (ksplit <= 1,
+    // or the scratch-alloc-refusal fallback), the M_TILE x n_out f32 write
+    // straight to the caller's dst; otherwise (ksplit > 1) the
+    // launch_size x acc_width f32 partial write into scratch.
+    //
+    // Reconciling this row against ggml_sycl_mxfp4_soa_gemm_dpas's own
+    // test-facing bytes_moved figure (llama.cpp-kcya c-amir should-fix 3):
+    // on the write_direct path they now match exactly (weight + act + dst,
+    // the useful traffic, nothing else). On the ksplit > 1 path they do
+    // NOT match by design -- this row plus
+    // mxfp4_soa_gemm_int8_dpas_combine_launch's own row (below) sum to the
+    // useful weight+act+dst traffic PLUS the scratch round-trip (written
+    // here, read there) that only exists BECAUSE of the K-split. That
+    // round-trip is real DRAM traffic this pass causes, so it belongs in
+    // the profiler's bandwidth accounting; it is NOT "useful" work a
+    // caller cares about, so it is deliberately excluded from
+    // bytes_moved. Do not sum the two profiler rows' bytes and expect
+    // ggml_sycl_mxfp4_soa_gemm_dpas's bytes_moved to fall out -- see this
+    // file's own env-vars doc entry (docs/backend/sycl-env-vars.md,
+    // GGML_SYCL_STORED_GEMM_DEBUG) for the same reconciliation restated
+    // for a reader who has not opened this file.
     const size_t weight_bytes = (size_t) n_out * ((size_t) (n_k / 2) + (size_t) (n_k / 32));
     const size_t act_bytes    = (size_t) M_TILE * ((size_t) n_k + (size_t) (n_k / 32) * sizeof(float));
+    const size_t dst_bytes    = (size_t) M_TILE * (size_t) n_out * sizeof(float);
     const size_t scratch_write_bytes =
         write_direct ? (size_t) 0 : (size_t) launch_size * (size_t) acc_width * sizeof(float);
-    profile_label.bytes = weight_bytes + act_bytes + scratch_write_bytes;
+    profile_label.bytes = weight_bytes + act_bytes + scratch_write_bytes + (write_direct ? dst_bytes : (size_t) 0);
 
     return ggml_sycl_profile_submit(queue, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & h) {
@@ -555,6 +577,12 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_combine_launch(sycl::queue &       q
         "M=" + std::to_string(M_TILE) + ";n_out=" + std::to_string(n_out) + ";ksplit=" + std::to_string(ksplit);
     profile_label.metadata          = metadata.c_str();
     profile_label.device            = ggml_sycl_get_device_id_from_queue(queue);
+    // See mxfp4_soa_gemm_int8_dpas_partial_launch's own bytes comment
+    // (above) for the full reconciliation: this row's scratch_read_bytes
+    // is the other half of that pass's scratch_write_bytes, together the
+    // K-split's real DRAM round-trip -- traffic this dispatch causes but
+    // that ggml_sycl_mxfp4_soa_gemm_dpas's own bytes_moved deliberately
+    // excludes as not "useful" work.
     const size_t scratch_read_bytes = (size_t) n_tiles * (size_t) ksplit * (size_t) acc_width * sizeof(float);
     const size_t dst_bytes          = (size_t) M_TILE * (size_t) n_out * sizeof(float);
     profile_label.bytes             = scratch_read_bytes + dst_bytes;
@@ -622,12 +650,21 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
         if (device >= 0 && device < ggml_sycl_info().device_count) {
             compute_units = ggml_sycl_info().devices[device].xmx_caps.compute_units;
         }
+        // combine_work_items is 0 when ksplit <= 1: the ksplit <= 1 branch
+        // below never submits a combine kernel at all, so printing n_tiles
+        // here would advertise a launch that does not happen (llama.cpp-kcya
+        // c-amir nit 6) -- this print exists specifically to read geometry
+        // without running the binary, so it should not misstate it. A
+        // scratch-allocation refusal on the ksplit > 1 path is a SEPARATE,
+        // not-yet-known-here fallback to the same no-combine shape -- see
+        // the GGML_LOG_WARN a few lines below, which fires only if that
+        // actually happens.
+        const long long combine_work_items = (ksplit <= 1) ? 0 : (long long) n_tiles;
         std::fprintf(stderr,
                      "[mxfp4-stored-gemm] M_TILE=%d n_out=%d n_k=%d compute_units=%u n_tiles=%lld k_tiles=%lld "
                      "ksplit=%d partial_work_items=%lld combine_work_items=%lld k_tiles_per_partition(max)=%lld\n",
                      M_TILE, n_out, n_k, compute_units, (long long) n_tiles, (long long) k_tiles, ksplit,
-                     (long long) (n_tiles * ksplit), (long long) n_tiles,
-                     (long long) ((k_tiles + ksplit - 1) / ksplit));
+                     (long long) (n_tiles * ksplit), combine_work_items, (long long) ((k_tiles + ksplit - 1) / ksplit));
     }
 
     if (ksplit <= 1) {
@@ -644,7 +681,18 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
         // unsplit pass writing straight to dst rather than losing the
         // dispatch outright -- mirrors
         // mxfp4_pair_glu_xmx_tiled_dpas_m2_ksplit_submit's identical
-        // fallback in mmvq.cpp.
+        // fallback in mmvq.cpp. WARN (not INFO -- INFO is dropped at
+        // default verbosity, CLAUDE.md) because this is a MEASUREMENT
+        // instrument, not a production dispatch path: the fallback is
+        // ~2.2x slower than the split path (llama.cpp-kcya c-amir nit 7),
+        // and a silent degrade here would otherwise read as a mystery
+        // regression in whoever's next bandwidth table, discoverable only
+        // by cross-checking the profiler metadata's ksplit=1 against the
+        // GGML_SYCL_STORED_GEMM_DEBUG print's own (higher) resolved ksplit.
+        GGML_LOG_WARN(
+            "[mxfp4-stored-gemm] scratch allocation failed (required_floats=%zu); falling back to the unsplit "
+            "direct-write path (ksplit=1) -- this launch is measurably slower than the requested ksplit=%d\n",
+            required_floats, ksplit);
         return mxfp4_soa_gemm_int8_dpas_partial_launch<M_TILE>(queue, soa_base, act_qs, act_scales, dst, n_out, n_k,
                                                                n_tiles, k_tiles, /*ksplit=*/1, /*write_direct=*/true,
                                                                deps);
@@ -716,6 +764,20 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     // 1, only the ".partial" row exists for that launch (no combine kernel
     // is submitted at all -- see mxfp4_soa_gemm_int8_dpas_launch's
     // ksplit <= 1 branch).
+    //
+    // Sum mean_ns, but do NOT sum the two rows' `bytes` and expect this
+    // function's own test-facing bytes_moved figure to fall out
+    // (llama.cpp-kcya c-amir should-fix 3): on the ksplit <= 1 path they
+    // match (weight + activation + dst, the useful traffic and nothing
+    // else); on the ksplit > 1 path the two rows' bytes ALSO include the
+    // K-split's scratch round-trip (written by .partial, read back by
+    // .combine) -- real DRAM traffic this dispatch causes, so it belongs
+    // in the profiler's own accounting, but not "useful" work a caller of
+    // this function cares about, so bytes_moved deliberately excludes it.
+    // See mxfp4_soa_gemm_int8_dpas_partial_launch's own bytes comment for
+    // the full reconciliation and docs/backend/sycl-env-vars.md
+    // (GGML_SYCL_STORED_GEMM_DEBUG) for the same note restated where a
+    // profiler-CSV reader is more likely to look first.
     switch (M) {
         case 1:
             return mxfp4_soa_gemm_int8_dpas_launch<1>(queue, soa_base, act_qs_device, act_scales_device, dst_device,
