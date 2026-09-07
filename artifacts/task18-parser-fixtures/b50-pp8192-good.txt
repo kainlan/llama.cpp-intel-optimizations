@@ -1,0 +1,9 @@
+llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B50 Graphics) (unknown id) - 14618 MiB free
+llama_context: n_ctx                 = 8192
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  -1 |   1 |          pp8192 |       1526.48 ± 8.96 |
+llama_context: n_ctx                 = 256
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  -1 |   1 |           tg128 |        108.25 ± 0.62 |
+
+build: 6e54ba2eb (14669)

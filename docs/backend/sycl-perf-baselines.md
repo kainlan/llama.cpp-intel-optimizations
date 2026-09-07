@@ -814,6 +814,27 @@ python3 scripts/parse-sycl-bench-matrix.py --arm b50-mistral=a.log,b.log,c.log,d
 `b70-mistral`, `b70-gptoss`, `b50-mistral`, `b50-gptoss` — the layout plan step 6
 already writes.
 
+**Long-prompt matrix (plan task L4, llama.cpp-z0wt).** `--matrix long-prompt`
+switches to a second, independent matrix: twelve arms
+`<card>-<model>-pp<pp>` for card in `{b70,b50}`, model in
+`{mistral,gptoss,gemma4}`, pp in `{2048,8192}`, same five-process-per-arm
+shape (`llama-bench -p <pp> -n 128 -fa 1 -r 5 -v`). It is **report-only**: no
+floor or band has been declared for it (a new guardrail needs an owner
+ruling), so it can only ever exit 0 (input clean) or 2 (input gap) — exit 1
+is structurally unreachable for this matrix, and the report says so
+explicitly. `--table` (long-prompt only; error exit 2 combined with
+`--matrix merge-cert`) additionally prints the markdown rows for the results
+table below, derived from the same parsed samples as the report, never
+re-parsed:
+
+```sh
+python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt \
+  --dir artifacts/perf-<sha>-longprompt --table
+```
+
+This does not add result rows to this document — the parser only produces
+them; the lead adds the measured rows after the matrix has actually run.
+
 **Exit codes, and why there are three rather than two:**
 
 | exit | meaning | what to do |
@@ -843,7 +864,8 @@ run whose free VRAM is below the contamination floor.
 
 **Verify the parser before trusting it.** `--self-test` runs it against the
 committed fixtures in `artifacts/task18-parser-fixtures/` and must report
-**10/10**. The cases exist to prove the parser returns *all three* exit codes —
+**16/16** (ten merge-cert cases plus six covering the long-prompt matrix and
+`--table`). The cases exist to prove the parser returns *all three* exit codes —
 including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
 measurement rather than the only answer it is capable of giving. A checker nobody
 has seen fail is indistinguishable from a checker that cannot fail.
