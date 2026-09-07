@@ -62,7 +62,14 @@ ggml_backend_buffer_t alloc_tensor_buffer(ggml_backend_buffer_type_t buft,
         return nullptr;
     }
     ggml_backend_buffer_set_usage(buffer, usage);
-    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+    // Checked (llama.cpp-6f73 c-nvf1 nit 12): an unchecked failure here used
+    // to surface later as a null tensor->data at the point of use, rather
+    // than as the clean "failed to allocate a device buffer" FAIL the caller
+    // already reports for every OTHER allocation failure in this function.
+    if (ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer)) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(buffer);
+        return nullptr;
+    }
     return buffer;
 }
 
@@ -139,6 +146,20 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
 
     const bool profiling_requested = std::getenv("GGML_SYCL_KERNEL_PROFILE") != nullptr;
 
+    // The three ggml_backend_tensor_set calls above upload through `q`; the
+    // kernel below launches on a SEPARATE queue (`submit_q`, constructed
+    // next) whenever profiling is requested. Neither queue's in-order
+    // property orders work submitted to the OTHER one, so make every upload
+    // provably complete before that second queue is even built, rather than
+    // relying on however ggml_backend_tensor_set happens to synchronize
+    // internally today (llama.cpp-6f73 c-nvf1 should-fix 4). The
+    // non-profiling path is unaffected -- submit_q is a plain copy of `q`
+    // there, so the two calls are already ordered by that queue's own
+    // in-order property.
+    if (profiling_requested) {
+        q.wait();
+    }
+
     // Diagnosed at llama.cpp-6f73 (round 3): `q` (ctx->stream()) reliably
     // lacks sycl::property::queue::enable_profiling in THIS test process,
     // even though it is the identical unified-cache owner queue a sibling
@@ -186,13 +207,14 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         // profile_label.bytes), plus the M x n_out f32 output.
         //
         // Per-launch bandwidth is THIS figure divided by the mean device
-        // time for one launch (mean_ns), NOT this figure divided into the
-        // kernel-profiler CSV's `bytes` column: sycl-kernel-profiler.cpp's
-        // aggregate accumulates `aggregate.bytes += label.bytes` once per
-        // recorded launch, so that column is the SUM over `count` launches.
-        // Dividing the summed column by mean_ns overstates bandwidth by a
-        // factor of `count` (llama.cpp-6f73 c-irug: a naive read once gave
-        // 34% of peak where the true per-launch figure was 8.5%).
+        // time for one launch (mean_ns), NOT the kernel-profiler CSV's
+        // aggregate `bytes` column divided by mean_ns: sycl-kernel-
+        // profiler.cpp's aggregate accumulates `aggregate.bytes +=
+        // label.bytes` once per recorded launch, so that column is the SUM
+        // over `count` launches. Dividing the summed column by mean_ns
+        // overstates bandwidth by a factor of `count` (llama.cpp-6f73
+        // c-irug: a naive read once gave 34% of peak where the true
+        // per-launch figure was 8.5%).
         const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
                                    (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,

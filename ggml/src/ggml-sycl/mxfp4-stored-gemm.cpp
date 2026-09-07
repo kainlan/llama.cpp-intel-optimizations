@@ -9,7 +9,9 @@
 #include "ggml.h"
 #include "unified-kernel.hpp"  // GGML_SYCL_ESIMD_AVAILABLE, esimd/xmx aliases, SYCL_ESIMD_KERNEL
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -39,7 +41,12 @@ q8_1_activation_pack quantize_activations_q8_1(const float * x, int64_t M, int64
             // GGML_COMMON_DECL. Read the leading 2 bytes by LAYOUT instead
             // of by member name: `d` (ggml_half, fp16) is always the first
             // 2 bytes of block_q8_1 regardless of which branch won -- only
-            // the accessor name changes, never the memory layout.
+            // the accessor name changes, never the memory layout. Pinned so
+            // a future layout change to block_q8_1 fails the build instead
+            // of silently producing wrong scales (llama.cpp-6f73 c-nvf1
+            // nit 11).
+            static_assert(sizeof(block_q8_1) == 2 * sizeof(ggml_half) + QK8_1,
+                          "block_q8_1 layout changed; the leading-2-byte read of `d` is no longer valid");
             ggml_fp16_t d_bits;
             std::memcpy(&d_bits, &blk, sizeof(d_bits));
             pack.scales[(size_t) (m * nb + b)] = ggml_fp16_to_fp32(d_bits);
@@ -67,12 +74,20 @@ namespace {
 
 // Private re-derivations of mmvq.cpp's mxfp4_e8m0_to_fp32_half_esimd /
 // mxfp4_code_values_esimd bit-tricks (mmvq.cpp:~7370-7405), renamed and
-// confined to this TU's anonymous namespace: those two symbols are file-local
-// to mmvq.cpp (not declared in any shared header), so this file cannot link
-// against them and must not risk a duplicate-symbol collision with them
-// either. The formulas are reproduced verbatim -- E8M0 "halved" convention to
-// match GGML_E8M0_TO_FP32_HALF, and the same e2m1 magnitude/sign
-// decomposition for the 4-bit code table.
+// confined to this TU's anonymous namespace. Both symbols in mmvq.cpp
+// actually have EXTERNAL linkage (mxfp4_e8m0_to_fp32_half_esimd is a
+// non-static, non-inline, non-template file-scope function at mmvq.cpp:7368,
+// outside that file's own anonymous namespace at :823-957), so this file
+// COULD link against them; that is not the reason for a private copy. The
+// real reason: neither symbol is declared in any shared header, so reaching
+// them from here would mean hand-declaring a prototype for another TU's
+// internal helper -- worse than a small, self-contained re-derivation this
+// TU owns outright. Confining the copy to this TU's own anonymous namespace
+// (llama.cpp-6f73 c-nvf1) rules out any duplicate-symbol collision either
+// way, regardless of which linkage the mmvq.cpp originals carry. The
+// formulas are reproduced verbatim -- E8M0 "halved"
+// convention to match GGML_E8M0_TO_FP32_HALF, and the same e2m1
+// magnitude/sign decomposition for the 4-bit code table.
 //
 // The scalar E8M0 decode CANNOT reuse this backend's own
 // sycl_e8m0_to_fp32_half (common.hpp) here: that helper's `memcpy` is a
@@ -186,11 +201,25 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     // per-tile + deep-prefetch shape mxfp4_pair_glu_xmx_tiled_dpas_m2 uses,
     // are both candidate levers there -- not attempted here).
     constexpr int K_PARTITIONS = 8;  // power of 2, required by the tree reduction below
+    static_assert(K_PARTITIONS > 0 && (K_PARTITIONS & (K_PARTITIONS - 1)) == 0,
+                  "tree reduction requires a power of two");
 
     // SLM budget: K_PARTITIONS partial accumulators, acc_width floats each.
-    // Worst case (M_TILE=8): 8 * 128 * 4 B = 4 KiB, far under the 128 KiB/
-    // work-group budget this hardware provides (CLAUDE.md, SLM budget note).
+    // Worst case (M_TILE=8): 8 * 128 * 4 B = 4 KiB, far under the 128 KiB
+    // total SLM this hardware provides per fattn-esimd-f16.hpp:1315's
+    // `constexpr size_t slm_budget = 128 * 1024; // Intel Arc has 128 KB
+    // SLM`. moe-xmx-fused.hpp:66 defaults the same notion of "SLM budget"
+    // to 65536 (64 KiB) for its own fused-MoE kernel, but that is a
+    // conservative per-kernel default read back from
+    // `FusedMoEConfig::from_device` (queryable via
+    // `sycl::info::device::local_mem_size`, xmx-esimd-common.hpp:98), not
+    // the hardware ceiling -- the 128 KiB figure is the actual device
+    // capacity and is what applies here. Enforced, not just asserted in
+    // prose, below.
     constexpr size_t slm_acc_size = (size_t) K_PARTITIONS * acc_width * sizeof(float);
+    static_assert(slm_acc_size <= 128 * 1024,
+                  "mxfp4_soa_gemm_int8_dpas_launch: SLM accumulator storage exceeds the 128 KiB/work-group "
+                  "budget (fattn-esimd-f16.hpp:1315)");
 
     const int64_t k_tiles          = n_k / k_per;
     const int64_t n_tiles          = (static_cast<int64_t>(n_out) + exec_n - 1) / exec_n;
@@ -313,14 +342,15 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
                         }
                     }
 
+                    // Both weight and activation scales vary per K block
+                    // (MXFP4 sub-block scaling and q8_1 block scaling
+                    // respectively), so the multiply happens INSIDE this
+                    // loop, per k-tile -- not once after the full K
+                    // reduction. Mirrors mxfp4_dpas_down_single_col_sycl's
+                    // epilogue exactly.
                     simd<int, M_TILE * exec_n> part = 0;
                     part = xmx::dpas<8, M_TILE, int, int, int8_t, int8_t>(part, b_vec, a_vec);
 
-                // Both weight and activation scales vary per K block (MXFP4
-                // sub-block scaling and q8_1 block scaling respectively), so
-                // the multiply happens INSIDE this loop, per k-tile -- not
-                // once after the full K reduction. Mirrors
-                // mxfp4_dpas_down_single_col_sycl's epilogue exactly.
 #    pragma unroll
                     for (int r = 0; r < M_TILE; ++r) {
                         simd<int, exec_n>   row_i                  = part.template select<exec_n, 1>(r * exec_n);
@@ -395,6 +425,20 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     GGML_ASSERT(dst_device != nullptr);
     GGML_ASSERT(n_out > 0);
     GGML_ASSERT(n_k > 0 && n_k % (int) GGML_SYCL_MXFP4_MOE_XMX_K == 0);
+    // 32-byte-aligned base pointers: `block_load<int8_t, 32>` (this file's
+    // activation load) and `block_load<uint8_t, 16>` (the weight load) carry
+    // ESIMD vector-alignment requirements, satisfied only because every
+    // offset the kernel computes off these three bases is itself a multiple
+    // of the vector width (`row_qs_stride` and `act_row_stride_q` are both
+    // multiples of 32) -- a caller passing a mid-buffer sub-pointer that is
+    // not itself 32-byte aligned would get a silent misaligned load (the one
+    // site where this could NOT be guaranteed already falls back to a plain
+    // scalar read instead, see the comment at the weight-scale-byte load
+    // below). Asserted here rather than left implicit (llama.cpp-6f73
+    // c-nvf1 should-fix 5).
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(soa_weight_device) % 32 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(act_qs_device) % 32 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(act_scales_device) % 32 == 0);
 
 #if GGML_SYCL_ESIMD_AVAILABLE
     const auto * soa_base = static_cast<const uint8_t *>(soa_weight_device);
@@ -420,8 +464,8 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     // work-item (llama.cpp-6f73 c-ru7x item 4).
     //
     // Per-launch bandwidth is profile_label.bytes / mean_ns for ONE launch,
-    // not profile_label.bytes divided into the kernel-profiler CSV's
-    // aggregate `bytes` column: sycl-kernel-profiler.cpp accumulates
+    // NOT the kernel-profiler CSV's aggregate `bytes` column divided by
+    // mean_ns: sycl-kernel-profiler.cpp accumulates
     // `aggregate.bytes += label.bytes` once per recorded launch, so that
     // column is the SUM over `count` launches, and dividing it by mean_ns
     // overstates bandwidth by a factor of `count` (llama.cpp-6f73 c-irug).

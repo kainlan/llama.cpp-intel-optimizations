@@ -81,6 +81,7 @@
 #include "mxfp4-stored-layout-oracle.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <vector>
@@ -93,6 +94,24 @@
 // comment above summarizes.
 
 namespace {
+
+// This file's own pass/fail machinery -- NOT part of the shared oracle
+// header (llama.cpp-6f73 c-nvf1 should-fix 3): `failures`/`check()` are this
+// test's harness, not something a later kernel's numerics gate (G4 onward)
+// needs or calls -- those use their own `g_failures`/`score_and_report`
+// pattern instead. Keeping this pair out of the header means a future test
+// that forgets to define its own equivalent gets a link error, not a
+// silently-never-read `failures` counter.
+int failures = 0;
+
+void check(bool ok, const std::string & name, const std::string & detail) {
+    if (ok) {
+        std::printf("  PASS  %s%s\n", name.c_str(), detail.empty() ? "" : ("  (" + detail + ")").c_str());
+        return;
+    }
+    std::printf("  FAIL  %s  %s\n", name.c_str(), detail.c_str());
+    ++failures;
+}
 
 // -----------------------------------------------------------------------------
 // Cases

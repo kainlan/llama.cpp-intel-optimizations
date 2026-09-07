@@ -40,17 +40,6 @@
 
 namespace {
 
-int failures = 0;
-
-void check(bool ok, const std::string & name, const std::string & detail) {
-    if (ok) {
-        std::printf("  PASS  %s%s\n", name.c_str(), detail.empty() ? "" : ("  (" + detail + ")").c_str());
-        return;
-    }
-    std::printf("  FAIL  %s  %s\n", name.c_str(), detail.c_str());
-    ++failures;
-}
-
 // -----------------------------------------------------------------------------
 // Constants shared by both stored layouts.
 // -----------------------------------------------------------------------------
@@ -223,8 +212,12 @@ std::vector<double> preprocess_activation(const std::vector<float> & X, int64_t 
             // the leading 2 bytes by LAYOUT instead of by member name: `d`
             // (ggml_half, fp16) is always the first 2 bytes of block_q8_1
             // regardless of which branch won -- only the accessor name
-            // changes, never the memory layout.
-            ggml_fp16_t        d_bits;
+            // changes, never the memory layout. Pinned so a future layout
+            // change to block_q8_1 fails the build instead of silently
+            // producing wrong scales (llama.cpp-6f73 c-nvf1 nit 11).
+            static_assert(sizeof(block_q8_1) == 2 * sizeof(ggml_half) + QK8_1,
+                          "block_q8_1 layout changed; the leading-2-byte read of `d` is no longer valid");
+            ggml_fp16_t d_bits;
             std::memcpy(&d_bits, &blk, sizeof(d_bits));
             const double d = (double) ggml_fp16_to_fp32(d_bits);
             for (int64_t j = 0; j < QK8_1; ++j) {
