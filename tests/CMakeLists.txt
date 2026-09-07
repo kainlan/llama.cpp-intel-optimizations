@@ -506,23 +506,12 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 endif()
 
-# Regression gate for llama.cpp-yke2: test TUs that include
-# ggml-sycl/common.hpp interpose dpct's inline queue-construction functions
-# (dpct::device_ext::create_queue_impl(), ggml-sycl/dpct/helper.hpp) without
-# DPCT_PROFILING_ENABLED, silently dropping enable_profiling from every queue
-# built through dpct::device_ext::default_queue() -- including, but not
-# limited to, ggml_backend_sycl_context::stream()'s pre-cache fallback branch
-# (common.hpp) -- discovered while diagnosing why the G4 numerics test needed
-# a private profiling-enabled queue of its own. Fixed by making
-# create_queue_impl() add the property unconditionally (helper.hpp), which is
-# what turns this test's PHASE 1 green; PHASE 2 separately exercises the
-# unified cache's own queue construction (create_cache_for_device(),
-# unified-cache.cpp), an independent fix that removed a `total_gpus > 1` gate
-# on ensure_single_device_context_queue() -- see the test file's header
-# comment for why both phases, and both fixes, are needed. Links the real
-# ggml-sycl library (like test-sycl-mxfp4-woq-repack above) to exercise the
-# actual ggml_backend_sycl_context::stream() path, not a private workaround
-# queue.
+# Regression gate for llama.cpp-yke2 -- see dpct/helper.hpp's
+# create_queue_impl() comment for the interposition mechanism this fixes,
+# and the test file's own header comment for why it has two phases. Links
+# the real ggml-sycl library (like test-sycl-mxfp4-woq-repack above) to
+# exercise the actual ggml_backend_sycl_context::stream() path, not a
+# private workaround queue.
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-sycl-profiling-queue-property.cpp)
     set_tests_properties(test-sycl-profiling-queue-property PROPERTIES LABELS "sycl;profiler;gpu-serial")

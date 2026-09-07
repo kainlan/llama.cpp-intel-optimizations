@@ -1,59 +1,36 @@
-// GPU regression test for llama.cpp-yke2: test translation units that include
-// ggml-sycl/common.hpp (and transitively ggml-sycl/dpct/helper.hpp) compile
-// their OWN copy of dpct::device_ext's header-only inline queue-construction
-// functions (init_queues()/create_queue_impl()) WITHOUT DPCT_PROFILING_ENABLED
-// -- that macro is a PRIVATE compile definition of the ggml-sycl CMake target
-// (ggml/src/ggml-sycl/CMakeLists.txt) -- and ordinary ELF symbol resolution
-// lets the executable's copy interpose over the library's copy for the whole
-// process. Under exactly one visible GPU (every canonical
-// ONEAPI_DEVICE_SELECTOR=level_zero:N run) that interposition silently
-// dropped sycl::property::queue::enable_profiling from EVERY queue built
-// through dpct::device_ext::default_queue() -- not just the unified cache's
-// owner queue, but also ggml_backend_sycl_context::stream()'s own pre-cache
-// fallback (ggml-sycl/common.hpp:5586-5589), which this test's PHASE 1
-// exercises directly (no tensor is allocated yet, so no cache exists for the
-// device, and stream() falls through to
-// `&(ggml_sycl_get_device(device).default_queue())`).
-//
+// GPU regression test for llama.cpp-yke2. Mechanism: see
+// ggml/src/ggml-sycl/dpct/helper.hpp's create_queue_impl() comment for the
+// canonical explanation of why sycl::property::queue::enable_profiling()
+// must be unconditional source code, not `#ifdef DPCT_PROFILING_ENABLED`
+// (a header-only inline read by a private compile definition is not
+// interposition-safe across translation units, including this test's own).
 // Discovered at llama.cpp-6f73 (comment c-1rsj) while diagnosing why the G4
 // numerics test needed a PRIVATE profiling-enabled queue of its own
 // (tests/test-sycl-mxfp4-stored-gemm-soa-small-m.cpp) even though it shares
-// ctx->stream() with production dispatch. This test is the general
-// regression gate for that root cause: it deliberately compiles its own copy
-// of the same dpct inlines (by including ggml-sycl/common.hpp, exactly like
-// every other affected GPU test TU -- see the census on llama.cpp-yke2) and
-// checks the queue the PUBLIC dispatch path actually hands out --
-// ggml_backend_sycl_context::stream() -- rather than constructing a private
-// workaround queue the way the G4 test had to.
+// ctx->stream() with production dispatch.
 //
-// FIXED in dpct::device_ext::create_queue_impl() (ggml/src/ggml-sycl/dpct/
-// helper.hpp:888, :903, llama.cpp-yke2): sycl::property::queue::
-// enable_profiling() is now added UNCONDITIONALLY, not `#ifdef
-// DPCT_PROFILING_ENABLED` -- every TU (this one included) now compiles an
-// identical copy of these inlines, so it no longer matters which TU's copy
-// the linker resolves. Before that fix, PHASE 1 below FAILS on a
-// single-visible-GPU run (has_property(enable_profiling)=0); after it, it
-// PASSES. This is the fix PHASE 1 actually exercises -- an earlier,
-// narrower attempt at this ticket instead removed a `total_gpus > 1` gate on
-// ensure_single_device_context_queue() in
-// ggml/src/ggml-sycl/unified-cache.cpp's create_cache_for_device(), which is
-// a real, independently-motivated fix (it stops the unified cache's OWN
-// queue construction from ever touching dpct's default_queue() machinery at
-// all, regardless of the helper.hpp fix) but does NOT by itself turn PHASE 1
-// green, since PHASE 1 never reaches the cache -- confirmed on hardware
-// (has_property(enable_profiling)=0 on both cards) before the helper.hpp fix
-// was added. PHASE 2 below is what actually exercises that cache-side change:
-// it forces cache creation and checks the resulting queue is the cache's
-// own, distinct queue object, and that IT ALSO carries the property (which,
-// after the helper.hpp fix, would be true even without the unified-cache.cpp
-// change -- the two fixes are independent, and this test's two phases are
-// what keep either one from silently regressing without detection: reverting
-// PHASE 1's fix alone re-fails PHASE 1, and reverting PHASE 2's fix alone
-// would leave the cache's queue coming from
-// ensure_single_device_context_queue() only when >1 GPU is visible, still
-// passing PHASE 2's property check post-helper.hpp-fix but on the WRONG
-// queue construction path for a single-GPU run -- see PHASE 2's own comment
-// for the identity check that catches that).
+// TWO PHASES exercise two INDEPENDENT fixes, and both are needed to keep
+// either one from silently regressing without detection:
+//
+// PHASE 1 calls ggml_backend_sycl_context::stream() before any tensor is
+// allocated, so no unified cache exists yet and stream() falls through to
+// its pre-cache fallback branch (ggml-sycl/common.hpp:5586-5589) --
+// `&(ggml_sycl_get_device(device).default_queue())`, dpct's raw queue. This
+// is what the helper.hpp fix (create_queue_impl(), helper.hpp:888, :903)
+// actually turns green: before it, PHASE 1 FAILS on a single-visible-GPU
+// run (has_property(enable_profiling)=0, confirmed on hardware on both
+// cards); after it, PASSES. The OTHER, independently-motivated fix --
+// removing unified-cache.cpp's create_cache_for_device() `total_gpus > 1`
+// gate on ensure_single_device_context_queue() -- does NOT by itself turn
+// PHASE 1 green, since PHASE 1 never reaches the cache.
+//
+// PHASE 2 forces cache creation (a single small tensor allocation) and
+// calls stream() again, checking the resulting queue's IDENTITY matches
+// unified_cache::get_queue() -- not just its property, which alone would
+// not catch a regression of the unified-cache.cpp fix (reverting it would
+// put the cache's queue back on dpct's default_queue(), a queue object
+// that, post-helper.hpp-fix, would still correctly carry
+// enable_profiling).
 //
 // See tests/test-sycl-profiling-queue-property-source.py for the
 // accompanying source-level invariants on both fixes.

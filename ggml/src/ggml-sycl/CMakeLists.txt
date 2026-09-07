@@ -655,22 +655,11 @@ else()
 endif()
 
 # SYCL queue profiling (L0 counter-based events) is enabled unconditionally
-# in dpct::device_ext::create_queue_impl() (ggml-sycl/dpct/helper.hpp) --
-# NOT via a compile definition here anymore (llama.cpp-yke2). It used to be:
-# a PRIVATE `DPCT_PROFILING_ENABLED` define read by an `#ifdef` inside those
-# header-only inline functions. Any OTHER translation unit that included the
-# same header (e.g. a GPU test including ggml-sycl/common.hpp) compiled its
-# own copy of those inlines WITHOUT this define, and ordinary ELF symbol
-# resolution let that copy interpose over the library's for the whole
-# process -- silently dropping enable_profiling from
-# dpct::device_ext::default_queue() (and everything built through it) in any
-# process where such a TU was linked in, including entirely legitimate GPU
-# correctness tests that link this library and touch
-# ggml_backend_sycl_context. A macro read inside a header-only inline can
-# never be interposition-safe; the fix makes the property addition
-# unconditional source code instead, so every TU compiles an identical copy
-# regardless of which one links first. See helper.hpp's create_queue_impl()
-# comment for the full mechanism.
+# in dpct::device_ext::create_queue_impl() (ggml-sycl/dpct/helper.hpp), not
+# via a compile definition here -- see that function's comment for why
+# (llama.cpp-yke2: a PRIVATE compile definition here used to be read by an
+# `#ifdef` inside those header-only inline functions, which is not
+# interposition-safe across translation units).
 #
 # The enable_profiling queue property is the SYCL API-correct way to request
 # profiling-capable event pools.  On the L0 backend this triggers counter-based

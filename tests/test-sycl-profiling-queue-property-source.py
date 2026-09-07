@@ -1,44 +1,16 @@
 #!/usr/bin/env python3
-"""Source gate for llama.cpp-yke2 (test TUs that include ggml-sycl/common.hpp
-interpose dpct's inline queue construction without DPCT_PROFILING_ENABLED, so
-the single-GPU unified-cache owner queue silently loses enable_profiling).
-
-Two fixes, checked here:
-
-1. ggml/src/ggml-sycl/dpct/helper.hpp: dpct::device_ext::create_queue_impl()
-   (the header-only inline dpct::device_ext::default_queue() and every other
-   queue it constructs ultimately go through) used to add
-   sycl::property::queue::enable_profiling() only `#ifdef
-   DPCT_PROFILING_ENABLED` -- a macro that was a PRIVATE compile definition of
-   the `ggml-sycl` CMake target (ggml/src/ggml-sycl/CMakeLists.txt). Any OTHER
-   translation unit that includes this header (e.g. any GPU test that
-   includes ggml-sycl/common.hpp, which pulls this header in transitively)
-   compiles its own copy of these inlines WITHOUT the macro, and ordinary ELF
-   symbol resolution lets that copy interpose over the library's for the
-   whole process -- silently dropping enable_profiling from
-   dpct::device_ext::default_queue() (and the roughly five dozen call sites
-   across ggml-sycl.cpp/common.cpp/unified-cache.cpp/etc. that go through it)
-   in any such process, not just the unified cache's owner queue. A macro read
-   inside a header-only inline can never be interposition-safe -- the fix
-   makes the property addition UNCONDITIONAL source code instead (matching
-   this backend's own default_queue_properties(), ggml-sycl/common.hpp, which
-   has always added enable_profiling unconditionally for queues it constructs
-   directly), so every TU compiles an identical copy of these inlines
-   regardless of DPCT_PROFILING_ENABLED, and the now-dead compile definition
-   is removed from CMakeLists.txt.
-
-2. ggml/src/ggml-sycl/unified-cache.cpp's create_cache_for_device(): the
-   cache's owner queue used ensure_single_device_context_queue() (which never
-   touches dpct's default_queue() machinery at all, sidestepping fix 1's
-   mechanism entirely) only when MORE than one GPU was visible (`!cache_queue
-   && total_gpus > 1`), falling back to
-   ggml_sycl_get_device(device_id).default_queue() whenever exactly one GPU
-   was visible -- the configuration every canonical
-   ONEAPI_DEVICE_SELECTOR=level_zero:N run uses. The fix makes that call
-   unconditional, independent of fix 1.
-
-This gate checks the SOURCE TEXT only and does not touch a SYCL device. The
-runtime check is the GPU test tests/test-sycl-profiling-queue-property.cpp.
+"""Source gate for llama.cpp-yke2. Full mechanism: see
+ggml/src/ggml-sycl/dpct/helper.hpp's create_queue_impl() comment (the
+canonical explanation of why sycl::property::queue::enable_profiling() must
+be unconditional, not `#ifdef DPCT_PROFILING_ENABLED`) and
+tests/test-sycl-profiling-queue-property.cpp's header comment (why that
+GPU test has two phases). This gate checks two fixes at the SOURCE TEXT
+level only, without touching a SYCL device: (1) both create_queue_impl()
+overloads in dpct/helper.hpp add the property unconditionally, with the
+macro itself no longer defined for the ggml-sycl target; (2)
+unified-cache.cpp's create_cache_for_device() calls
+ensure_single_device_context_queue() unconditionally, not gated on
+`total_gpus > 1`.
 
 Runs under pytest (llama_test_pytest registration) and as a plain script.
 Point it at alternate copies (to exercise the RED path against a deliberately
@@ -72,9 +44,9 @@ SYCL_CMAKE_SOURCE = Path(
     )
 )
 
-source = SOURCE.read_text()
-helper_source = HELPER_SOURCE.read_text()
-sycl_cmake_source = SYCL_CMAKE_SOURCE.read_text()
+source = SOURCE.read_text(encoding="utf-8")
+helper_source = HELPER_SOURCE.read_text(encoding="utf-8")
+sycl_cmake_source = SYCL_CMAKE_SOURCE.read_text(encoding="utf-8")
 
 FUNC_SIG = "static unified_cache * create_cache_for_device(int"
 ENSURE_CALL = "ensure_single_device_context_queue(device_id)"
@@ -165,17 +137,20 @@ def test_create_cache_for_device_defined_exactly_once():
     assert source.count(FUNC_SIG) == 1, "create_cache_for_device must be defined exactly once"
 
 
-def test_ensure_single_device_context_queue_is_called_unconditionally():
-    body, _ = function_body(source, FUNC_SIG)
+def _ensure_call_guard_condition(body):
+    """The whitespace-stripped condition of the smallest enclosing
+    `if ( ... )` that guards ENSURE_CALL, or None if there is no enclosing
+    if at all (a genuinely unconditional call). Walks back from the call to
+    the nearest preceding `if (`, then confirms the call actually sits
+    inside that if's body (no other statement between the `{` and the
+    call), so this cannot be fooled by an unrelated, earlier `if (...)`
+    elsewhere in the function. Shared by the GREEN check below and the
+    positive control's complement check on the pre-fix revision."""
     idx = body.find(ENSURE_CALL)
-    assert idx >= 0, f"create_cache_for_device must call {ENSURE_CALL}"
-    # Find the smallest enclosing `if ( ... )` immediately guarding this
-    # call: walk back from the call to the nearest preceding `if (`, then
-    # confirm the call sits directly inside that if's body (no other
-    # statement between the `{` and the call), so this cannot be fooled by
-    # an unrelated, earlier `if (total_gpus > 1)` elsewhere in the function.
+    assert idx >= 0, f"expected {ENSURE_CALL} to be called"
     if_idx = body.rfind("if (", 0, idx)
-    assert if_idx >= 0, f"expected an `if (` guarding the {ENSURE_CALL} call"
+    if if_idx < 0:
+        return None
     cond_open = if_idx + len("if (") - 1
     cond_close = body.find(")", cond_open)
     assert cond_close >= 0, "unterminated if-condition"
@@ -188,10 +163,27 @@ def test_ensure_single_device_context_queue_is_called_unconditionally():
     assert ENSURE_CALL in guarded_body, (
         f"the nearest enclosing `if ({condition})` does not actually guard the {ENSURE_CALL} call"
     )
-    assert "total_gpus" not in condition, (
-        f"the {ENSURE_CALL} call must not be gated on total_gpus (found condition `if ({condition})`); "
-        "this queue construction must be unconditional so a single visible GPU also gets a queue built "
-        "via ensure_single_device_context_queue() instead of dpct's interposition-vulnerable default_queue()"
+    return re.sub(r"\s+", "", condition)
+
+
+def test_ensure_single_device_context_queue_is_called_unconditionally():
+    # Exact-equality check, not merely "total_gpus is absent": a re-gate
+    # spelled with a different name (e.g. `dev_count > 1` or
+    # `g_total_gpu_count > 1`) would satisfy an absence-of-"total_gpus"
+    # check while reintroducing exactly the bug this test exists to catch
+    # (spec review c-a1xt, should-fix 1). `!cache_queue` (queue_override not
+    # already supplied) is the one condition allowed to remain, because it
+    # is not a GPU-count gate; no enclosing `if` at all is equally
+    # acceptable (genuinely unconditional).
+    body, _ = function_body(source, FUNC_SIG)
+    condition = _ensure_call_guard_condition(body)
+    if condition is None:
+        return
+    assert condition == "!cache_queue", (
+        f"the {ENSURE_CALL} call must be guarded by exactly `if (!cache_queue)` (queue_override not already "
+        f"supplied) or by no enclosing if at all -- found condition `if ({condition})`, which re-gates the "
+        "call on something else (e.g. a GPU-count check) and would leave a single visible GPU falling back "
+        "to dpct's interposition-vulnerable default_queue() again"
     )
 
 
@@ -257,13 +249,38 @@ def test_create_queue_impl_enables_profiling_unconditionally():
 # Anchored to the START of a (stripped) line, so this cannot match the macro
 # name spelled out inside a `//` explanatory comment (e.g. this very fix's own
 # comment, which legitimately quotes the historical `#ifdef ...` directive it
-# removed) -- only an actual directive, whose `#` is the first non-whitespace
-# character on its line, counts as the live, interposition-vulnerable
-# mechanism this gate must catch.
-DPCT_PROFILING_MACRO_DIRECTIVE_RE = re.compile(
-    r"^\s*#\s*(?:ifdef|ifndef|if\s+defined|elif\s+defined)\s*\(?\s*" + re.escape(DPCT_PROFILING_MACRO),
-    re.MULTILINE,
-)
+# removed) -- only an actual conditional-compilation directive line counts as
+# the live, interposition-vulnerable mechanism this gate must catch. Handled
+# in two steps rather than one regex (spec review c-a1xt, nit 5): first find
+# every #ifdef/#ifndef/#if/#elif line at all, then check WITHIN that line
+# whether it actually reads DPCT_PROFILING_MACRO -- a single anchored regex
+# for `#if defined(MACRO)` alone missed `#if !defined(MACRO)` (no bare
+# `defined MACRO` sequence -- the `!` sits between them) and
+# `#if defined(X) && defined(MACRO)` (MACRO is not the FIRST defined(...) on
+# the line).
+_PREPROC_CONDITIONAL_LINE_RE = re.compile(r"^[ \t]*#[ \t]*(ifdef|ifndef|if|elif)\b(.*)$", re.MULTILINE)
+_DEFINED_MACRO_RE = re.compile(r"defined\s*\(?\s*" + re.escape(DPCT_PROFILING_MACRO) + r"\b")
+
+
+def _directive_reads_macro(directive, rest_of_line):
+    if directive in ("ifdef", "ifndef"):
+        # #ifdef DPCT_PROFILING_ENABLED / #ifndef DPCT_PROFILING_ENABLED --
+        # the macro name follows the directive keyword directly, bare, no
+        # defined(...) wrapper.
+        return re.match(r"^\s*" + re.escape(DPCT_PROFILING_MACRO) + r"\b", rest_of_line) is not None
+    # #if / #elif -- the macro may appear anywhere on the line inside a
+    # defined(...) or `defined NAME` construct: `#if defined(MACRO)`,
+    # `#if !defined(MACRO)`, `#if defined(X) && defined(MACRO)` all match.
+    return _DEFINED_MACRO_RE.search(rest_of_line) is not None
+
+
+def _find_live_macro_directive(text):
+    """The re.Match for the first #ifdef/#ifndef/#if/#elif line that reads
+    DPCT_PROFILING_MACRO, or None if no such live directive exists."""
+    for m in _PREPROC_CONDITIONAL_LINE_RE.finditer(text):
+        if _directive_reads_macro(m.group(1), m.group(2)):
+            return m
+    return None
 
 
 def test_dpct_profiling_enabled_macro_is_gone_from_helper_hpp():
@@ -271,8 +288,8 @@ def test_dpct_profiling_enabled_macro_is_gone_from_helper_hpp():
     # NAME may legitimately still appear in an explanatory comment (e.g.
     # describing the historical bug this fix removes), which is not the
     # live, interposition-vulnerable mechanism this gate must catch --
-    # only an actual #ifdef/#ifndef/#if defined(...) directive reading it is.
-    match = DPCT_PROFILING_MACRO_DIRECTIVE_RE.search(helper_source)
+    # only an actual #ifdef/#ifndef/#if/#elif directive reading it is.
+    match = _find_live_macro_directive(helper_source)
     assert not match, (
         f"found a live preprocessor directive reading {DPCT_PROFILING_MACRO} in dpct/helper.hpp "
         f"({match.group(0)!r}) -- the property must be unconditional source code (llama.cpp-yke2)"
@@ -333,6 +350,17 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
         f"expected the pre-fix gate pattern in {KNOWN_PRE_FIX_REVISION}'s create_cache_for_device -- "
         "if this no longer fails, the positive control itself is void (llama.cpp-yke2)"
     )
+    # Complement of the EXACT-EQUALITY structural check
+    # (_ensure_call_guard_condition / test_ensure_single_device_context_queue_
+    # is_called_unconditionally): on the pre-fix revision the guarding
+    # condition must NOT already be exactly `!cache_queue` -- otherwise that
+    # GREEN check's own positive control would be void too (spec review
+    # c-a1xt, nit 6).
+    pre_condition = _ensure_call_guard_condition(pre_cache_body)
+    assert pre_condition != "!cache_queue", (
+        f"expected {KNOWN_PRE_FIX_REVISION}'s guarding condition to NOT already be exactly `!cache_queue` "
+        f"(found {pre_condition!r}) -- if it is, the exact-equality structural check's positive control is void"
+    )
 
     # 2. helper.hpp: both create_queue_impl overloads must still read the
     #    macro, and a live directive must still be present, at the pre-fix
@@ -348,7 +376,7 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
             "dpct/helper.hpp -- if this no longer fails, the positive control itself is void"
         )
         start = idx + len(CREATE_QUEUE_IMPL_SIG)
-    assert DPCT_PROFILING_MACRO_DIRECTIVE_RE.search(pre_helper), (
+    assert _find_live_macro_directive(pre_helper), (
         f"expected a live #ifdef {DPCT_PROFILING_MACRO} directive in {KNOWN_PRE_FIX_REVISION}'s dpct/helper.hpp"
     )
 

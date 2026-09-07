@@ -11899,26 +11899,12 @@ static unified_cache * create_cache_for_device(int                     device_id
     // isolated per-device execution queue the smart handle resolves into --
     // the Level Zero DEVICE_LOST pattern this backend avoids.
     //
-    // This is now UNCONDITIONAL (llama.cpp-yke2), because dpct's default_queue()
-    // is not a safe cache-owner queue even with exactly one visible GPU.
-    // dpct::device_ext::init_queues()/create_queue_impl()
-    // (dpct/helper.hpp) are header-only inline functions that add
-    // sycl::property::queue::enable_profiling only `#ifdef
-    // DPCT_PROFILING_ENABLED` -- a macro private to the ggml-sycl CMake
-    // target. Any OTHER translation unit that includes
-    // ggml-sycl/common.hpp (transitively pulling in dpct/helper.hpp) --
-    // every GPU test that links ggml-sycl and touches
-    // ggml_backend_sycl_context, not just this file -- compiles its own
-    // copy of those inlines without the macro, and ordinary ELF symbol
-    // resolution lets that copy interpose over the library's for the whole
-    // process, silently dropping enable_profiling from a queue built via
-    // default_queue(). ensure_single_device_context_queue() sidesteps the
-    // hazard entirely: it never calls into dpct's cached default_queue()
-    // machinery, so no header interposition can touch it. Mirrors the
-    // resolution the plan's G4 test carried privately for the queue it
-    // constructed itself (test-sycl-mxfp4-stored-gemm-soa-small-m.cpp);
-    // this makes the same fix reach every consumer of the unified cache's
-    // queue, not just that one test.
+    // Made UNCONDITIONAL (llama.cpp-yke2): ensure_single_device_context_queue()
+    // never touches dpct's cached default_queue() machinery at all, so this
+    // also sidesteps -- independent of, and in addition to, the actual fix
+    // -- the header-only-inline interposition hazard fixed in
+    // dpct::device_ext::create_queue_impl() (dpct/helper.hpp; see that
+    // function's comment for the full mechanism).
     sycl::queue * cache_queue = queue_override;
     if (!cache_queue) {
         cache_queue = ensure_single_device_context_queue(device_id);
