@@ -71,6 +71,16 @@ cover):
   0`-guarded) second "int main(...)" elsewhere in the same file happened to
   satisfy the per-body check -- reading the whole file compliant despite the
   orphaned offender. See _find_main_bodies' docstring for the enforced fix.
+  Quality round 4 (rev-5q1r-quality-4, c-q3hv) found the mirror case round
+  3's own fix introduced: a stray `{` (too-LATE, not too-early) can push
+  the brace-scan depth high enough that main()'s real closing brace only
+  returns it to 1, so the scan runs to EOF and yields a body spanning the
+  WHOLE REST OF THE FILE -- a later, genuinely unrelated free function's
+  helper call then falls "inside" that corrupted span and satisfies round
+  3's own outside-span check on bad data, reading compliant. Closed by
+  reporting whether each main()'s scan actually balanced and treating an
+  unbalanced one as its own offender rather than trusting a to-EOF span;
+  see _find_main_bodies' docstring.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -222,41 +232,55 @@ def _has_canonical_inline_block(text):
 
 
 def _find_main_bodies(text):
-    """Yields (body_start, body_end) character offsets for the region
-    strictly between each main(...) function's opening brace and its
-    matching closing brace, found by depth-counted brace scanning.
+    """Yields (body_start, body_end, balanced) for each main(...) function
+    found. body_start/body_end are the character offsets strictly between
+    its opening brace and the position the depth-counted brace scan
+    reached; `balanced` is True only if that scan actually returned to
+    depth 0 (found a real matching closing brace) before EOF.
 
-    LIMITATION (quality round 1, c-h331 nit 3): this scanner is NOT
-    string/comment aware -- a `{` or `}` inside a string literal or a
-    comment (e.g. `printf("open brace: {\\n")` or `// note: }`) is counted
-    as a real brace and can mis-bound a main() body's end, too early or too
-    late.
+    LIMITATION: this scanner is NOT string/comment aware -- a `{` or `}`
+    inside a string literal or a comment (e.g. `printf("open brace: {\\n")`
+    or `// note: }`) is counted as a real brace and can mis-bound a main()
+    body's end, in EITHER direction. Both directions are now fail-closed by
+    construction, not by an empirical claim that no exploiting shape exists
+    (that claim was made and then refuted twice -- see below):
 
-    Quality round 2 (c-dhg6 nit B) tried to argue this mis-bounding could
-    never by itself flip a genuine offender to a false compliant. Quality
-    round 3 (rev-5q1r-quality-3, c-autq) refuted that with a real
-    reproduction: a too-early `body_end` (from a stray `}` inside a string
-    literal) can ORPHAN a real, offending call -- it ends up in neither the
-    truncated first body nor any other yielded body -- while a textually
-    unrelated SECOND `int main(...)` elsewhere in the same file (even
-    inside dead code, e.g. an `#if 0`-guarded block, since this regex-based
-    scanner does not understand preprocessor conditionals either) happens
-    to call the helper correctly. The per-body loop in
-    `_first_statement_verdict` used to treat "some main body I found passes" as
-    sufficient, so the orphaned offender went unexamined and the file read
-    compliant.
+    TOO-EARLY (quality round 3, rev-5q1r-quality-3, c-autq): a stray `}`
+    inside a string/comment can end the scan before main()'s real closing
+    brace, ORPHANING a real offending call in neither the truncated body nor
+    any other yielded body, while a textually unrelated SECOND
+    `int main(...)` elsewhere in the file (even inside dead code, e.g. an
+    `#if 0`-guarded block, since this regex-based scanner does not
+    understand preprocessor conditionals) can satisfy the per-body loop on
+    its own. Closed in `_first_statement_verdict` by requiring every
+    occurrence of the helper call or a bespoke ONEAPI_DEVICE_SELECTOR
+    setenv() anywhere in the file to fall inside the span of SOME yielded
+    body -- a match outside every span fails the file
+    (offender_call_outside_scanned_main), whether orphaned by mis-bounding
+    or genuinely outside any main().
 
-    THE ENFORCED INVARIANT (not merely an empirical claim): after checking
-    every computed body's own first statement, `_first_statement_verdict` also
-    requires every occurrence of the helper call or a bespoke
-    ONEAPI_DEVICE_SELECTOR setenv() anywhere in the file to fall inside the
-    span of SOME computed body. A match outside every computed span --
-    whether orphaned by mis-bounding or genuinely outside any main() --
-    fails the file (offender_call_outside_scanned_main). This closes the
-    mis-bounding gap without requiring string/comment-aware scanning:
-    mis-bounding can still happen, but a match it strands outside every
-    body is now caught structurally rather than relying on no such file
-    existing."""
+    TOO-LATE (quality round 4, rev-5q1r-quality-4, c-q3hv): the mirror case.
+    A stray `{` inside a string/comment can push the running depth high
+    enough that main()'s own real closing brace only brings it back to 1,
+    never 0 -- the scan then runs all the way to EOF still "inside" main,
+    yielding a body that spans the WHOLE REST OF THE FILE. A helper call in
+    a later, genuinely unrelated free function then falls inside that
+    over-extended span and satisfies the too-early fix's outside-span check
+    on a corrupted span, reading compliant. This function now reports
+    `balanced = depth == 0`, and `_first_statement_verdict` treats ANY
+    unbalanced main() in an in-scope file as its own offender
+    (offender_unbalanced_main_body) rather than trusting a to-EOF span:
+    such a body cannot be used to bound anything, in either direction,
+    because the scanner cannot tell how far past main() the stray brace's
+    influence really extends. A repo-wide census (`_iter_source_files()`
+    plus this scan) found zero in-scope files whose real main() body scans
+    unbalanced, so this bucket exists for defense, not because any current
+    file needs it.
+
+    A full string/comment-aware scanner would remove the underlying
+    ambiguity rather than fencing off its two observed failure directions;
+    it remains deferred as long as each new failure mode keeps closing
+    cleanly without it."""
     for m in MAIN_SIGNATURE_PATTERN.finditer(text):
         start = m.end()
         depth = 1
@@ -269,7 +293,7 @@ def _find_main_bodies(text):
             elif c == "}":
                 depth -= 1
             i += 1
-        yield start, i - 1
+        yield start, i - 1, depth == 0
 
 
 def _first_real_offset(text, start, end):
@@ -319,11 +343,17 @@ def _first_statement_is_valid(text, offset):
 
 
 def _first_statement_verdict(text):
-    """Returns "ok", "not_first", or "outside_main" for a single file's
-    handling of main()-body position.
+    """Returns "ok", "not_first", "outside_main", or "unbalanced" for a
+    single file's handling of main()-body position.
 
-    "not_first": some computed main() body mentions the helper or a
-    bespoke setenv("ONEAPI_DEVICE_SELECTOR" but not as its first real
+    "unbalanced": some main(...) function's brace scan never returned to
+    depth 0 before EOF (see _find_main_bodies' TOO-LATE case). Checked
+    FIRST and unconditionally for any in-scope file: an unbalanced body
+    cannot be trusted to bound anything, so no other verdict is computed
+    from it.
+
+    "not_first": some computed (balanced) main() body mentions the helper
+    or a bespoke setenv("ONEAPI_DEVICE_SELECTOR" but not as its first real
     statement, OR no computed body mentions it at all (it cannot be main()'s
     first statement if it is not in main() at all -- spec round 2, c-xicg
     finding 2).
@@ -331,11 +361,12 @@ def _first_statement_verdict(text):
     "outside_main": every computed body's OWN first-statement check passed
     (or found nothing to check), but some occurrence of the helper call or
     a bespoke setenv("ONEAPI_DEVICE_SELECTOR" in the file falls OUTSIDE
-    every computed body's span -- see _find_main_bodies' docstring for why
-    this is checked explicitly rather than assumed impossible (quality
-    round 3, c-autq: a too-early body_end can orphan a real offending call
-    while an unrelated main elsewhere satisfies the per-body loop)."""
-    bodies = list(_find_main_bodies(text))
+    every computed body's span -- see _find_main_bodies' TOO-EARLY case."""
+    bodies = []
+    for start, end, balanced in _find_main_bodies(text):
+        if not balanced:
+            return "unbalanced"
+        bodies.append((start, end))
     found_relevant_main = False
     for start, end in bodies:
         body = text[start:end]
@@ -357,8 +388,8 @@ def _first_statement_verdict(text):
 def _classify(text):
     """Returns one of "not_in_scope", "offender_half_finished",
     "offender_bare_setenv", "offender_not_first_statement",
-    "offender_call_outside_scanned_main", "compliant" for a single file's
-    text."""
+    "offender_call_outside_scanned_main", "offender_unbalanced_main_body",
+    "compliant" for a single file's text."""
     has_helper = bool(HELPER_CALL_PATTERN.search(text))
     has_setenv = bool(SETENV_PATTERN.search(text))
     if not has_setenv and not has_helper:
@@ -372,6 +403,8 @@ def _classify(text):
         return "offender_not_first_statement"
     if verdict == "outside_main":
         return "offender_call_outside_scanned_main"
+    if verdict == "unbalanced":
+        return "offender_unbalanced_main_body"
     return "compliant"
 
 
@@ -640,6 +673,49 @@ def test_orphaned_call_outside_scanned_main_is_caught():
         '}\n'
     )
     assert _classify(control_without_stray_brace) == "offender_not_first_statement"
+
+
+def test_unbalanced_main_body_is_its_own_offender():
+    """Fixture proving the too-LATE mirror of the round-3 gap is closed --
+    quality round 4 (rev-5q1r-quality-4, c-q3hv) reproduced a real shape
+    where round 3's own fix was itself corrupted by bad data: a stray `{`
+    inside a string literal pushes the brace-scan depth high enough that
+    main()'s real closing brace only returns it to 1, so the scan runs to
+    EOF and yields a body spanning the whole rest of the file. A LATER,
+    genuinely unrelated free function's helper call then falls "inside"
+    that over-extended span and satisfies round 3's outside-span check on
+    corrupted data. Before this fix, arm_too_late_brace below classified
+    "compliant"; it must now classify offender_unbalanced_main_body."""
+    arm_too_late_brace = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    printf("open brace: {\\n");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(arm_too_late_brace) == "offender_unbalanced_main_body"
+
+    # Control: identical WITHOUT the stray `{` -- main()'s body now balances
+    # correctly at its own real closing brace, so late_setup()'s call
+    # genuinely falls outside any computed main body and must be caught by
+    # the round-3 bucket, proving this fix did not just make every file
+    # with a helper call in a non-main function an unbalanced-body offender.
+    control_no_stray_brace = (
+        'int main(int, char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    printf("no brace here\\n");\n'
+        '    return 0;\n'
+        '}\n'
+        '\n'
+        'static void late_setup(char ** argv) {\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:1");\n'
+        '}\n'
+    )
+    assert _classify(control_no_stray_brace) == "offender_call_outside_scanned_main"
 
 
 def test_recursive_scan_reaches_known_subdirectories():
