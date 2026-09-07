@@ -11888,18 +11888,25 @@ static unified_cache * create_cache_for_device(int                     device_id
                                                size_t *                deferred_reserved_out = nullptr,
                                                const device_mem_hint * hint                  = nullptr,
                                                sycl::queue *           queue_override        = nullptr) {
-    // Get queue for this device.  With more than one visible GPU, use the same
-    // single-device context queue that routed execution uses.  Otherwise cache
-    // allocations can land in a default/multi-device context while the smart
-    // handle resolves into an isolated per-device execution queue, which is
-    // exactly the Level Zero DEVICE_LOST pattern this backend avoids.
-    int total_gpus = g_total_gpu_count;
-    if (total_gpus < 0) {
-        total_gpus = dpct::dev_mgr::instance().device_count();
-    }
-
+    // Get queue for this device.  Always prefer the single-device context
+    // queue ensure_single_device_context_queue() builds directly via `new
+    // sycl::queue(ctx, dev, default_queue_properties())` over
+    // ggml_sycl_get_device(device_id).default_queue() (dpct's raw,
+    // header-cached default queue).
+    //
+    // With more than one visible GPU this was already required: a
+    // default/multi-device context could otherwise diverge from the
+    // isolated per-device execution queue the smart handle resolves into --
+    // the Level Zero DEVICE_LOST pattern this backend avoids.
+    //
+    // Made UNCONDITIONAL (llama.cpp-yke2): ensure_single_device_context_queue()
+    // never touches dpct's cached default_queue() machinery at all, so this
+    // also sidesteps -- independent of, and in addition to, the actual fix
+    // -- the header-only-inline interposition hazard fixed in
+    // dpct::device_ext::create_queue_impl() (dpct/helper.hpp; see that
+    // function's comment for the full mechanism).
     sycl::queue * cache_queue = queue_override;
-    if (!cache_queue && total_gpus > 1) {
+    if (!cache_queue) {
         cache_queue = ensure_single_device_context_queue(device_id);
     }
     sycl::queue & queue = cache_queue ? *cache_queue : ggml_sycl_get_device(device_id).default_queue();
