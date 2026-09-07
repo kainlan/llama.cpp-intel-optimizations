@@ -67,6 +67,7 @@ int main() {
 #    include "ggml-sycl/ggml-sycl-bench.hpp"
 #    include "ggml-sycl/sycl-kernel-profiler.hpp"
 #    include "ggml.h"
+#    include "sycl-selector-fallback.hpp"
 
 #    include <sys/wait.h>
 #    include <unistd.h>
@@ -501,9 +502,9 @@ child_result run_one_ksplit(const char * argv0, int ksplit, size_t expected_floa
         setenv("GGML_SYCL_KERNEL_PROFILE", "1", 1);
         setenv("GGML_SYCL_KERNEL_PROFILE_FORMAT", "csv", 1);
         setenv("GGML_SYCL_KERNEL_PROFILE_OUTPUT", (out_prefix + ".csv").c_str(), 1);
-        if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-            setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
-        }
+        // ONEAPI_DEVICE_SELECTOR is already pinned process-wide by the shared
+        // selector-fallback helper main() calls, and inherited across this
+        // fork()+execv() (llama.cpp-2x3m, llama.cpp-5q1r/S6).
 
         std::string         child_flag = "--child";
         std::vector<char *> child_argv = { const_cast<char *>(argv0), const_cast<char *>(child_flag.c_str()),
@@ -532,6 +533,11 @@ child_result run_one_ksplit(const char * argv0, int ksplit, size_t expected_floa
 }  // namespace
 
 int main(int argc, char ** argv) {
+    // See tests/sycl-selector-fallback.hpp for why a plain setenv() here does
+    // not work and why the fix is a re-exec (llama.cpp-2x3m, llama.cpp-5q1r,
+    // consolidated by S6 -- llama.cpp-vzaj).
+    sycl_test_selector_fallback(argv, "level_zero:1");
+
     if (argc >= 4 && std::strcmp(argv[1], "--child") == 0) {
         return run_child(argv[3]);
     }
