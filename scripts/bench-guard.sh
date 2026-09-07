@@ -102,17 +102,24 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # (not `read` from a herestring, which would swallow the same refuse()
 # silently) is what the caller uses.
 #
-# A card that is merely a different vendor/class is not a probe failure
-# and is excluded the same quiet way as one legitimately missing a
-# `device` link -- only the ordering of the SURVIVING cards is
-# index-significant. This includes a vendor/class file that exists and
-# reads but holds an unexpected value (extra whitespace, an unrelated
-# class like 0x038000): such a card is silently excluded and everything
-# after it shifts down by one index, exactly as if it were a different
-# vendor. A reader relying on this derivation should know a wrong
-# vendor/class file value moves the mapping rather than refusing -- there
-# is no way to tell "this really is a different device" from "the file is
-# subtly wrong" from here.
+# A card that legitimately lacks a `device` link at all is excluded quietly
+# -- only the ordering of the SURVIVING cards is index-significant, and the
+# absence says nothing meaningful about whether this was ever a GPU. A card
+# whose device/vendor or device/class file legitimately does not exist, or
+# exists, IS READABLE, and simply holds an unexpected value (extra
+# whitespace, an unrelated class like 0x038000), is ALSO excluded quietly
+# the same way: everything after it shifts down by one index, exactly as
+# if it were a different vendor, and there is no way from here to tell
+# "this really is a different device" from "the file is subtly wrong".
+#
+# In contrast, a DANGLING device symlink (the card had one, but its target
+# no longer resolves -- e.g. a device removed or a hot-unplug race) and an
+# EXISTING-but-UNREADABLE vendor/class file (the file is there, we simply
+# cannot read it, e.g. a permission change) are NOT quiet exclusions: both
+# refuse() loudly instead, because silently dropping either would change
+# level_zero:N's meaning for every card after it with no visible signal --
+# exactly the silent index shift this whole derivation exists to prevent
+# (llama.cpp-imns review round 2).
 derive_pci_for_selector() {
     local idx="$1" c base pci vendor class
     local -a entries=()
@@ -120,12 +127,23 @@ derive_pci_for_selector() {
         [ -e "$c" ] || continue
         base="$(basename "$c")"
         [[ "$base" =~ ^card[0-9]+$ ]] || continue   # skip connectors (card1-DP-1, ...)
-        [ -e "$c/device" ] || [ -L "$c/device" ] || continue   # no device link: legitimate skip
+        if [ ! -e "$c/device" ] && [ ! -L "$c/device" ]; then
+            continue   # no device link at all: legitimate skip
+        fi
+        if [ -L "$c/device" ] && [ ! -e "$c/device" ]; then
+            refuse "$base's device symlink is dangling (its target no longer resolves); refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
         if ! pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"; then
             refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
         fi
         [ -n "$pci" ] || continue
+        if [ -e "$c/device/vendor" ] && [ ! -r "$c/device/vendor" ]; then
+            refuse "$base's device/vendor exists but is not readable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
         [ -r "$c/device/vendor" ] || continue
+        if [ -e "$c/device/class" ] && [ ! -r "$c/device/class" ]; then
+            refuse "$base's device/class exists but is not readable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
         [ -r "$c/device/class" ] || continue
         if ! vendor="$(cat "$c/device/vendor" 2>/dev/null)"; then
             refuse "failed to read $c/device/vendor (probe error after it was confirmed readable)"
@@ -167,6 +185,26 @@ derive_pci_for_selector() {
     printf '%s|%s\n' "$path" "$p"
 }
 
+# find_card_by_pci PCI -- scan top-level DRM cards under $DRM_ROOT (same
+# card[0-9]+ filter as derive_pci_for_selector, so a connector entry can't
+# shadow the real card here either) and print the first matching sysfs
+# card path, or an empty line if none matches. Always exits 0 (the caller
+# decides what an empty result means), so it is safe to assign its output
+# via plain command substitution without an explicit `|| ...` guard.
+find_card_by_pci() {
+    local target_pci="$1" c base found=""
+    for c in "$DRM_ROOT"/card*; do
+        [ -e "$c" ] || continue
+        base="$(basename "$c")"
+        [[ "$base" =~ ^card[0-9]+$ ]] || continue
+        if [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$target_pci" ]; then
+            found="$c"
+            break
+        fi
+    done
+    printf '%s\n' "$found"
+}
+
 if [ -z "$SYSFS_CARD" ]; then
     if [ -z "$PCI" ]; then
         case "$SELECTOR" in
@@ -177,19 +215,19 @@ if [ -z "$SYSFS_CARD" ]; then
         # derivation pass -- do not re-scan $DRM_ROOT afterward to find the
         # card for that PCI: an earlier, unfiltered second scan matched a
         # connector entry sharing the same device symlink ahead of the
-        # real card in glob order (llama.cpp-imns review round 1).
+        # real card in glob order (llama.cpp-imns review round 1). Split
+        # on the LAST '|' (%|*, ##*|), not the first: a PCI address can
+        # never contain '|', but nothing stops a sysfs card path from
+        # containing one, and splitting on the first pipe would then read
+        # part of the path as the PCI address and stamp a nonsense card=
+        # in the refusal/log header (review round 2).
         RESULT="$(derive_pci_for_selector "${SELECTOR#level_zero:}")"
-        SYSFS_CARD="${RESULT%%|*}"
-        PCI="${RESULT#*|}"
+        SYSFS_CARD="${RESULT%|*}"
+        PCI="${RESULT##*|}"
     else
         # --pci was given explicitly (no --sysfs-card): still need to find
-        # the matching sysfs card, with the same card[0-9]+ filter as the
-        # derivation above, so a connector entry can't shadow it here either.
-        for c in "$DRM_ROOT"/card*; do
-            base="$(basename "$c")"
-            [[ "$base" =~ ^card[0-9]+$ ]] || continue
-            [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
-        done
+        # the matching sysfs card.
+        SYSFS_CARD="$(find_card_by_pci "$PCI")"
     fi
     [ -n "$SYSFS_CARD" ] || refuse "no DRM card for PCI $PCI"
 fi

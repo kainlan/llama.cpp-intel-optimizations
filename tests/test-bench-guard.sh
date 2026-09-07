@@ -237,4 +237,46 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true
 
+# A dangling device symlink (target no longer resolves, e.g. a card
+# removed or a hot-unplug race) must refuse loudly rather than silently
+# excluding the card and shifting level_zero indices for the rest (review
+# round 2 finding 1a). TWO cards, not one: card0's symlink is dangling,
+# card1 (reusing the still-valid 0000:09:00.0 device from mk_drmroot) is
+# fine -- this is what actually reproduces the reported bug. With only one
+# (broken) card, "no discrete GPU found" would also refuse with exit 3,
+# masking the real defect: on the pre-fix code this two-card tree instead
+# silently drops card0 and hands level_zero:0 card1's address with rc=0
+# and a VALID stamp (verified against the pre-round-2 guard before this
+# fix landed).
+rm -rf "$T/drmroot-dangling"
+mkdir -p "$T/drmroot-dangling/card0" "$T/drmroot-dangling/card1"
+ln -s "$T/devices/0000:99:00.0-does-not-exist" "$T/drmroot-dangling/card0/device"
+ln -s "$T/devices/0000:09:00.0" "$T/drmroot-dangling/card1/device"
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-dangling" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: a dangling device symlink must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must name the problem (got: $out)"; fail=1; }
+
+# An EXISTING but UNREADABLE device/vendor file must also refuse loudly
+# (review round 2 finding 1b), for the same two-card reason as above --
+# skip under root, which reads any file regardless of permission bits, so
+# chmod 000 would not reproduce this.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "SKIP: unreadable-vendor-file case not reproducible as root (root bypasses permission bits)"
+else
+    rm -rf "$T/drmroot-unreadable-vendor" "$T/devices-unreadable"
+    mkdir -p "$T/devices-unreadable/0000:04:00.0"
+    echo 0x8086 > "$T/devices-unreadable/0000:04:00.0/vendor"
+    chmod 000 "$T/devices-unreadable/0000:04:00.0/vendor"
+    echo 0x030000 > "$T/devices-unreadable/0000:04:00.0/class"
+    mkdir -p "$T/drmroot-unreadable-vendor/card0" "$T/drmroot-unreadable-vendor/card1"
+    ln -s "$T/devices-unreadable/0000:04:00.0" "$T/drmroot-unreadable-vendor/card0/device"
+    ln -s "$T/devices/0000:09:00.0" "$T/drmroot-unreadable-vendor/card1/device"
+    out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-vendor" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    chmod 644 "$T/devices-unreadable/0000:04:00.0/vendor"   # so the EXIT trap's rm -rf can clean it up
+    [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/vendor file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+    echo "$out" | grep -qi "not readable" || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
+fi
+
 [ "$fail" -eq 0 ] && echo "OK: all preflight refusals" || exit 1
