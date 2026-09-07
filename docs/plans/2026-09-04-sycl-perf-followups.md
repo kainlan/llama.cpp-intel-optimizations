@@ -680,6 +680,30 @@ git commit -m "feat(sycl): F32 dmmv arm so batch-1 F32 weights (gemma4 altup pro
 
 ### Task P3: Decode-shaped D=512 attention (spike: measure, then specialise) (llama.cpp-ebxw part 2)
 
+> **Amendment 2026-09-04 (execution, llama.cpp-zwsj c-1ha7 / c-j4k7):** three corrections to the text
+> below, all evidenced on hardware and recorded on llama.cpp-zwsj. (1) The spike found the tile route's
+> decode cost FLAT in `n_kv`, so the shipped fix is the ESIMD instantiation this task's Description already
+> names as the alternative, not the split-KV branch — the toggle actually shipped is
+> `GGML_SYCL_FA_D512_DECODE_ESIMD` (default ON), not `GGML_SYCL_FA_TILE_D512_DECODE_SPLITKV` named below.
+> (2) The acceptance criterion "0 violations with tolerance `1e-3 + 1e-3*|ref|`" is WITHDRAWN: that
+> predicate failed the correct, unmodified tile kernel on hardware (measured f16 accumulation error
+> 2.0e-3 to 5.0e-3 absolute on `|out|` in 0.3-0.9, i.e. 2-5x the tolerance). Replaced by NMSE (normalized
+> mean squared error, the same metric `tests/test-backend-ops.cpp` uses for `GGML_OP_FLASH_ATTN_EXT`)
+> with threshold 5e-5, derived from measured hardware noise: correct tile kernel 8.25e-7 to 2.49e-5
+> across the tested shapes, ESIMD tier ~1e-13; a 1% multiplicative-mutant positive control scores exactly
+> 1e-4, so 5e-5 sits ≥2x above the worst measured correct-kernel value and 2x below the mutant. (3) "the
+> decode tier must only engage at `ne01 <= 8`" is NARROWED to `ne01 == 1` ONLY: hardware testing found the
+> ESIMD tier returns garbage (94% of elements wrong) for a real masked `ne01=4` op while `ne01 == 1`
+> measured correct on both cards; root cause (D=512-specific vs. a latent bug shared with the D≤256 ESIMD
+> family's own multi-query path) is not established and is tracked as follow-up on **llama.cpp-wais**.
+> `ne01` in 2..8 now falls through to the tile route unconditionally regardless of the toggle — this is
+> also gemma4's actual production decode shape (llama always decodes one token at a time outside
+> speculative decoding), so nothing measured is given up. Hardware numbers for the record: gemma4
+> `-p 32 -n 8` profile, `fattn.decode.esimd_partitioned` (`ne01=1`) mean 24.6 µs B70 / 22.0 µs B50 vs
+> `fattn.decode.tile_d512` (`ne01=1`) 138.2 / 134.0 µs — comfortably inside the ≤30 µs acceptance
+> criterion below. Guard `tests/test-sycl-fattn-tile-d512-decode.cpp` PASS on both cards, both toggle
+> states, 7/7 cases each; gemma4 completion gate byte-identical between states.
+
 **Track:** C
 **Depends on:** Task P1
 **File scope:**

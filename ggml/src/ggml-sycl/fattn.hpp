@@ -54,6 +54,37 @@ bool ggml_sycl_fa_onednn_d512_scale_relaxed();
 // accessor above: the tile route has no GGML_SYCL_DNNL dependency.
 bool ggml_sycl_fa_tile_d512_enabled();
 
+// Live (non-cached) parse of GGML_SYCL_FA_D512_DECODE_ESIMD -- the decode-
+// shaped D=512 ESIMD tier (llama.cpp-zwsj / plan Task P3, part 2 of
+// llama.cpp-ebxw). The P3 spike (GGML_SYCL_KERNEL_PROFILE captures of
+// fattn.decode.tile_d512, both cards) found the tile route's decode cost
+// flat in n_kv (115-134 us at n_kv in {32,128,512,2048}) -- a fixed
+// per-launch cost of one work-group doing the whole D=512 reduction
+// serially, not per-key work, so split-KV cannot help it. This variable
+// instead routes ne01==1 D=512 calls to fattn_esimd_f16<512, float>()
+// (fattn-esimd-f16.hpp) -- the SAME partitioned decode kernel already
+// verified for D<=256 (its "optimized" variant has no D<=256-specific
+// branching; the D==128 special-casing in that header belongs to the
+// separate BATCHED prefill kernel, not this one), just newly instantiated
+// at D=512. Default **ON**; `=0` falls back to the tile route
+// unconditionally at any ne01.
+//
+// ⚠️ NARROWED FROM ne01<=8 TO ne01==1 (lead hardware finding, llama.cpp-zwsj/
+// c-1ha7, finding A): hardware testing found launch_fattn_esimd_f16_
+// optimized<512,...> returns garbage for a real masked ne01=4 op (94% of
+// elements wrong) while ne01==1 measured correct on both cards. Root cause
+// (D=512-specific vs a latent bug shared with the D<=256 ESIMD multi-query
+// path, never exercised by any production caller before this ticket) is
+// NOT established -- tracked as follow-up on llama.cpp-wais; see fattn.cpp's
+// D==512 branch for the full note. ne01 in 2..8 and prefill (ne01>8) both
+// fall through to the tile route unconditionally regardless of this
+// switch, which this variable does not touch.
+// Shared by the D==512 dispatch branch (fattn.cpp, caching it in its own
+// function-local static, mirroring ggml_sycl_fa_tile_d512_enabled()'s
+// call-site pattern) and the numerics test, which needs the live value
+// across its own re-exec'd two-state driver.
+bool ggml_sycl_fa_d512_decode_esimd_enabled();
+
 // Pre-allocate V2 partition buffers before SYCL graph recording.
 // This ensures V2 dispatch works during graph recording (malloc/free forbidden during recording).
 // Should be called before graph recording starts.

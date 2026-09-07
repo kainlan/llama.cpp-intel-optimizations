@@ -2327,6 +2327,13 @@ bool ggml_sycl_fa_tile_d512_enabled() {
     return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
 }
 
+// Shared parse for GGML_SYCL_FA_D512_DECODE_ESIMD (llama.cpp-zwsj), declared
+// in fattn.hpp -- mirrors ggml_sycl_fa_tile_d512_enabled()'s shape exactly.
+bool ggml_sycl_fa_d512_decode_esimd_enabled() {
+    const char * env = std::getenv("GGML_SYCL_FA_D512_DECODE_ESIMD");
+    return !(env && (strcmp(env, "0") == 0 || strcmp(env, "false") == 0));
+}
+
 // D=512 tile-path admissibility (llama.cpp-dtpk) -- the gemma-viable route.
 // Unlike oneDNN's compiled-partition-baked sqrt(D) divisor,
 // fattn-tile.hpp's flash_attn_tile<> takes scale as a runtime value, so it
@@ -3802,10 +3809,16 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     const int D = Q->ne[0];
 
     // ==========================================================================
-    // D=512 route: oneDNN-if-admissible, else TILE-if-admissible, else abort
-    // (llama.cpp-jahv + llama.cpp-dtpk). D has no vec/XMX/ESIMD kernel at
-    // 512 in this fork. This branch must come before the paged-V2 and
-    // Standard Dispatch switches below: neither has a `case 512` (paged-V2's
+    // D=512 route: oneDNN-if-admissible, else ESIMD-decode-tier-if-admissible
+    // (ne01==1 only -- see the finding-A note below, llama.cpp-zwsj), else
+    // TILE-if-admissible, else abort
+    // (llama.cpp-jahv + llama.cpp-dtpk). D has no PREFILL vec/XMX kernel at
+    // 512 in this fork -- llama.cpp-zwsj added a decode-shaped ESIMD
+    // instantiation (fattn_esimd_f16<512, float>, below), but it is reached
+    // only through this D==512 branch, never through
+    // ggml_sycl_flash_attn_ext_dispatch_ncols<D,...>'s ESIMD arm, which is
+    // still never instantiated for D=512. This branch must come before the
+    // paged-V2 and Standard Dispatch switches below: neither has a `case 512` (paged-V2's
     // scalar switch GGML_ABORTs on an unhandled D, the Standard Dispatch
     // switches do too), and dispatch_ncols<D,...> is never instantiated for
     // D=512 (no vec kernel body to instantiate it against).
@@ -3843,9 +3856,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // the two admissibility helpers.
     if (D == 512) {
         // llama.cpp-dyi3 ROUND 2 FIX / llama.cpp-86a7: this whole D=512
-        // branch (gemma4's global-attention layers; D=512 has no vec/XMX/
-        // ESIMD kernel in this fork, so it can NEVER reach fattn_esimd_f16)
-        // is a SEPARATE code path from
+        // branch (gemma4's global-attention layers) is a SEPARATE code path from
         // ggml_sycl_flash_attn_ext_dispatch_ncols<D,...> -- ncols<D> is
         // never instantiated for D=512 -- so it previously never went
         // through dispatch_debug_kernel's observation, leaving
@@ -3858,7 +3869,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         // too coarse to ever let D=512 into the allowlist.
         //
         // llama.cpp-86a7 replaces it with a route-AWARE observation,
-        // recorded AFTER dispatch at each of this branch's two successful
+        // recorded AFTER dispatch at each of this branch's successful
         // exit points below, classified by fa_decode_kernel_observation::
         // observe() the same way dispatch_debug_kernel already does for
         // D<=256. tile_d512 is a native kernel using the identical
@@ -3911,6 +3922,109 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
             }
         }
 #endif  // GGML_SYCL_DNNL
+
+        // llama.cpp-zwsj (plan Task P3, part 2 of llama.cpp-ebxw): decode-
+        // shaped (ne01==1 ONLY -- see the note below) D=512 ESIMD tier. The
+        // spike (GGML_SYCL_KERNEL_PROFILE captures of gemma4's
+        // fattn.decode.tile_d512, both cards) found the tile route's decode
+        // cost FLAT in n_kv -- a fixed per-launch cost of one work-group
+        // doing the whole D=512 reduction serially, not per-key work -- so
+        // a split-KV tier inside the tile kernel cannot help a short decode
+        // call; there is nothing to split. This reuses fattn_esimd_f16<D,
+        // Q_type>() (fattn-esimd-f16.hpp), the SAME partitioned decode
+        // kernel already production-verified at D<=256 ("esimd_f16" in the
+        // allowlist below) -- its "optimized" launcher has no D<=256-
+        // specific branching (checked: the D==128 special-casing in that
+        // header belongs to the separate BATCHED prefill kernel, never
+        // called at ne01<=1/decode), so D=512 is a template instantiation,
+        // not a new algorithm.
+        //
+        // ne01 GATE, NARROWED FROM <=8 TO ==1 (lead hardware finding,
+        // llama.cpp-zwsj/c-1ha7, finding A): the plan's own ne01<=8
+        // engagement range was FALSIFIED on hardware -- the lead's guard
+        // run found launch_fattn_esimd_f16_optimized<512,...> returns
+        // garbage (max_diff 1.59, 94% of elements wrong) for a real,
+        // masked ne01=4 op, while the SAME shape through the tile kernel
+        // and the SAME reference agree to ~3.6e-3 (the tile kernel's own
+        // known f16 precision floor, not a defect). ne01==1 (this file's
+        // own guard's now-added mask=1 cases) measured correct on
+        // hardware. Root cause is NOT established -- it is unknown
+        // whether the multi-query mask path is broken specifically at
+        // D=512 or is a latent bug shared with the D<=256 ESIMD family
+        // that nothing has exercised before (no production caller reaches
+        // this kernel with ne01>1 either; launch_fattn_esimd_f16_batched
+        // is the D<=256 family's OWN multi-query answer, and this ticket
+        // did not touch it). Rather than ship a blind kernel patch with no
+        // hardware to verify it, this narrows engagement to the ONE shape
+        // measured correct -- ne01==1, which is also gemma4's actual
+        // production decode shape (llama always decodes one token at a
+        // time outside speculative decoding). ne01 in 2..8 now falls
+        // through to the tile route unconditionally, regardless of the
+        // toggle -- see the guard's ne01=4 case, which now asserts the
+        // REFUSAL, not the tier's multi-query correctness. Root-cause
+        // follow-up (a D=256 ne01=4 mask=1 control to decide shared-kernel
+        // vs D=512-specific, to decide whether this gate can re-widen)
+        // tracked as llama.cpp-wais.
+        //
+        // Reuses ggml_sycl_fattn_d512_tile_admissible()'s screen rather
+        // than a second copy: it already requires exactly what this route
+        // also needs (F16 K/V, F32 Q, DV=512, integer GQA ratio, no paged/
+        // multi-seq sources, no softcap), and ADMITTING is unchanged either
+        // way -- supports_op() never asks which of the two decode kernels
+        // will run, only whether the op is servable at all.
+        // Toggle checked FIRST (a cached bool, no function call) so that
+        // GGML_SYCL_FA_D512_DECODE_ESIMD=0 short-circuits before the
+        // ggml_sycl_fattn_d512_tile_admissible(dst) call below -- that
+        // predicate is evaluated again, unconditionally, by the tile branch
+        // a few lines down, so ordering it after the toggle avoids running
+        // it twice per dispatch in the (default-off-of-tile, i.e. toggle=0)
+        // state, a genuine hot path (every D=512 layer of every token).
+        static const bool d512_decode_esimd_enabled = ggml_sycl_fa_d512_decode_esimd_enabled();
+        if (d512_decode_esimd_enabled && params.ne01 == 1 && ggml_sycl_fattn_d512_tile_admissible(dst)) {
+            // g_sycl_fa_esimd_enabled/fattn_esimd_f16_available(): the same
+            // ESIMD-availability guard the D<=256 decode path checks before
+            // calling this exact function (fattn.cpp:2525/2630/3038) --
+            // fattn_esimd_f16<D,...>'s non-ESIMD stub GGML_ASSERTs rather
+            // than declining, so skipping this guard would abort instead of
+            // falling back to tile on a build/device without ESIMD.
+            if (g_sycl_fa_esimd_enabled && fattn_esimd_f16_available()) {
+                // ggml_sycl_fattn_d512_tile_admissible() already guarantees
+                // Q->type == GGML_TYPE_F32 (fattn.cpp, same reasoning as the
+                // tile route's own defensive backstop: build_attn_mha()
+                // skips the F16 Q cast specifically for D==512).
+                fattn_esimd_f16<512, float>(params, *stream);
+                // d512_observe (== params.ne01 <= 1) is a tautology here --
+                // this arm is already gated on params.ne01 == 1 above -- but
+                // the check is kept for symmetry with this branch's other
+                // two observe() exits (onednn_d512, d512_tile), which are
+                // not similarly narrowed and do need the runtime test.
+                if (d512_observe) {
+                    // Same allowlist bucket as the D<=256 decode path -- see
+                    // fa_decode_kernel_observation::classify() (common.hpp):
+                    // it matches on kernel NAME, not D, and this genuinely
+                    // is the identical verified graph-safe launch idiom
+                    // (no wait()/malloc at submission, pointer resolution
+                    // via the shared graph-input-staging mechanism), just a
+                    // new template instantiation of the same function.
+                    ctx.fa_decode_kernel_obs.observe("esimd_f16");
+                }
+                if (d512_dispatch_debug_enabled) {
+                    fprintf(stderr,
+                            "[SYCL] fattn selected [d512] esimd_partitioned D=%d ne01=%d ne11=%d H_q=%d H_kv=%d\n", D,
+                            params.ne01, params.ne11, params.ne02, params.ne12);
+                }
+                return;
+            }
+            // Toggle is on but this build/device has no ESIMD (rare): fall
+            // through to the tile route below at any ne01, including this
+            // decode-shaped one.
+        }
+        // GGML_SYCL_FA_D512_DECODE_ESIMD=0 (the toggle above is false), or
+        // ne01!=1 (prefill, OR the ne01 in 2..8 multi-query shapes finding A
+        // above refuses -- see that note), or the shape fails
+        // ggml_sycl_fattn_d512_tile_admissible(): the tile route below is
+        // reached at any ne01 -- =0 is a full opt-out, not just a "prefer
+        // tile when both fit" hint.
 
         if (ggml_sycl_fattn_d512_tile_admissible(dst)) {
             // Correction of record (spec review rev-dtpk-qual, F1): the
