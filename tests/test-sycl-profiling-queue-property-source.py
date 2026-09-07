@@ -344,6 +344,68 @@ def _mask_comments_and_strings(text):
     return "".join(out)
 
 
+def _skip_ws(body, pos):
+    """The offset of the first non-whitespace character in `body` at or
+    after `pos` (a small shared helper -- every whitespace-skip in this
+    file follows this same lstrip-and-measure pattern)."""
+    rest = body[pos:]
+    stripped = rest.lstrip()
+    return pos + (len(rest) - len(stripped))
+
+
+def _branch_span(body, start_ws):
+    """Given `start_ws` (the position right after an if/else's condition
+    or the `else` keyword, whitespace already skipped via _skip_ws), the
+    (body_start, body_end) span of its body -- a `{ ... }` block, or a
+    single-statement body up to the next top-level `;`. None if a
+    single-statement body has no terminating `;` (malformed input)."""
+    if body[start_ws : start_ws + 1] == "{":
+        return start_ws, matching_brace(body, start_ws)
+    semi_idx = body.find(";", start_ws)
+    if semi_idx < 0:
+        return None
+    return start_ws, semi_idx
+
+
+def _call_is_somewhere_in_else_chain(body, masked, call_idx, pos):
+    """Starting at `pos` (immediately after an `else` keyword, NOT yet
+    whitespace-skipped), walks the rest of an if/else-if/.../else chain --
+    `else if (c2) { ... } else if (c3) { ... } else { ... }`, however many
+    links -- and returns True if call_idx falls inside ANY later branch's
+    body (an else-if's then-branch, deeper still in the chain, or a final
+    plain else). False if the call is not found anywhere in the remainder
+    of the chain (quality review c-dl9x: this is what
+    _find_enclosing_if_conditions calls to decide whether ITS OWN
+    condition's negation belongs in the result, regardless of how many
+    more links separate it from wherever the call actually is)."""
+    while True:
+        after_ws = _skip_ws(body, pos)
+        if not _IF_KEYWORD_RE.match(masked, after_ws):
+            # Plain, final else: no further chain possible after this.
+            span = _branch_span(body, after_ws)
+            return span is not None and span[0] < call_idx <= span[1]
+        # else-if: this link's own condition + then-body. Its POSITIVE
+        # condition, if the call is here, is added separately by
+        # _find_enclosing_if_conditions's own top-level scan discovering
+        # this same `if (` as an independent match -- this walk only needs
+        # to know WHETHER the call is here, to decide whether the ORIGINAL
+        # (calling) if's condition should be negated.
+        m = _IF_RE.match(masked, after_ws)
+        assert m, "expected `if (` right after an else-if position"
+        cond_close = matching_paren(body, m.end() - 1)
+        span = _branch_span(body, _skip_ws(body, cond_close + 1))
+        if span is None:
+            return False
+        then_start, then_end = span
+        if then_start < call_idx <= then_end:
+            return True
+        after_then_ws = _skip_ws(body, then_end + 1)
+        else_m = _ELSE_RE.match(masked, after_then_ws)
+        if not else_m:
+            return False  # chain ends here, call not found in it
+        pos = else_m.end()
+
+
 def _find_enclosing_if_conditions(body, call_idx):
     """The whitespace-stripped conditions of EVERY `if ( ... )` in `body`
     whose body (a `{ ... }` block, or a single-statement body up to the
@@ -372,17 +434,24 @@ def _find_enclosing_if_conditions(body, call_idx):
     extracts conditions and body spans from the ORIGINAL `body` text using
     the masked copy's offsets, which are identical by construction.
 
-    Also checks a plain `else` branch when the call is not in the THEN
-    branch (quality review c-efy0): `if (total_gpus <= 1) { keep dpct
-    default } else { if (!cache_queue) { call } }` is the pre-fix bug
-    verbatim, and a scan that only ever looked inside THEN branches missed
-    it entirely -- the call there is guarded by the NEGATION of the if's
-    condition, reported as `!(<condition>)`. `else if` is deliberately NOT
-    handled here: it is its own separate `if (`, already discovered on its
-    own by this same scan. See _mask_comments_and_strings()'s docstring for
+    Also walks the rest of an if/else-if/.../else CHAIN when the call is
+    not in a given link's own THEN branch (quality review c-efy0, then
+    c-dl9x): `if (total_gpus <= 1) { default } else { if (!cache_queue)
+    { call } }` (plain else) and `if (total_gpus <= 1) { } else if
+    (!cache_queue) { call }` (else-if) are BOTH the pre-fix bug verbatim,
+    one token apart -- the call ends up somewhere LATER in the chain,
+    guarded by the NEGATION of every condition it stepped over on the way,
+    reported as `!(<condition>)`. `else if` is NOT skipped as "someone
+    else's problem": its own then-branch, if that is where the call is, IS
+    independently discovered and added (positively) by this same scan on a
+    later iteration -- but if the call is even FURTHER down the chain (a
+    second else-if, or the final else), THIS if's own condition must still
+    be negated and reported, which is why _call_is_somewhere_in_else_chain()
+    walks the WHOLE remainder of the chain rather than checking only the
+    immediately-next link. See _mask_comments_and_strings()'s docstring for
     named residual spellings this scan still does not detect, and why."""
     masked = _mask_comments_and_strings(body)
-    found = []  # (body_start, condition), any order; sorted by body_start below
+    found = []  # (position, condition), any order; sorted by position below
     for m in _IF_RE.finditer(masked):
         if_start = m.start()
         if if_start >= call_idx:
@@ -390,54 +459,23 @@ def _find_enclosing_if_conditions(body, call_idx):
         cond_open = m.end() - 1
         cond_close = matching_paren(body, cond_open)
         condition = body[cond_open + 1 : cond_close]
-        rest = body[cond_close + 1 :]
-        stripped_rest = rest.lstrip()
-        after_ws = cond_close + 1 + (len(rest) - len(stripped_rest))
-        if body[after_ws : after_ws + 1] == "{":
-            body_start = after_ws
-            body_end = matching_brace(body, body_start)
-        else:
-            # Single-statement body (no braces): up to the next top-level ';'.
-            semi_idx = body.find(";", after_ws)
-            if semi_idx < 0:
-                continue
-            body_start, body_end = after_ws, semi_idx
+        span = _branch_span(body, _skip_ws(body, cond_close + 1))
+        if span is None:
+            continue
+        body_start, body_end = span
         if body_start < call_idx <= body_end:
             found.append((body_start, condition))
             continue
-        # The call is not in the THEN branch -- check for a plain `else`
-        # (quality review c-efy0): `if (total_gpus <= 1) { keep dpct
-        # default } else { if (!cache_queue) { call } }` is the pre-fix bug
-        # verbatim, and a check that only ever looked at THEN branches
-        # missed it entirely (false PASS -- extracted only ["!cache_queue"]
-        # from the inner if, never seeing the outer condition at all). If
-        # the call falls inside a plain `else` body (not `else if`, which
-        # is its own separate `if (` already discovered by this same loop
-        # on its next iteration), the call is guarded by the NEGATION of
-        # this if's condition.
-        rest_at = body[body_end + 1 :]
-        stripped_at = rest_at.lstrip()
-        after_then_ws = body_end + 1 + (len(rest_at) - len(stripped_at))
+        # The call is not in the THEN branch -- check for `else` (plain or
+        # `else if`): if the call is anywhere later in the chain, THIS
+        # if's own condition must be negated and reported.
+        after_then_ws = _skip_ws(body, body_end + 1)
         else_match = _ELSE_RE.match(masked, after_then_ws)
         if not else_match:
             continue
-        after_else = else_match.end()
-        rest_ae = body[after_else:]
-        stripped_ae = rest_ae.lstrip()
-        after_else_ws = after_else + (len(rest_ae) - len(stripped_ae))
-        if _IF_KEYWORD_RE.match(masked, after_else_ws):
-            continue  # `else if` -- handled as its own separate `if (` match
-        if body[after_else_ws : after_else_ws + 1] == "{":
-            else_body_start = after_else_ws
-            else_body_end = matching_brace(body, else_body_start)
-        else:
-            else_semi = body.find(";", after_else_ws)
-            if else_semi < 0:
-                continue
-            else_body_start, else_body_end = after_else_ws, else_semi
-        if else_body_start < call_idx <= else_body_end:
-            found.append((else_body_start, "!(" + condition + ")"))
-    found.sort(key=lambda pair: pair[0])  # outermost (earliest body_start) first
+        if _call_is_somewhere_in_else_chain(body, masked, call_idx, else_match.end()):
+            found.append((if_start, "!(" + condition + ")"))
+    found.sort(key=lambda pair: pair[0])  # outermost (earliest position) first
     return [re.sub(r"\s+", "", c) for _, c in found]
 
 
@@ -531,6 +569,21 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
     assert _ensure_call_guard_conditions(else_branch_regate) == ["!(total_gpus<=1)", "!cache_queue"], (
         "expected the else-branch's guard to be reported as the NEGATION of the if's condition, outermost "
         "first, alongside the inner !cache_queue condition"
+    )
+
+    # c-dl9x: the same pre-fix bug, one token apart -- `else if` instead of
+    # a plain `else`. Round 4's fix explicitly skipped `else if` on the
+    # (true but incomplete) premise that the inner if is discovered on its
+    # own; the outer condition's negation still needs to be reported.
+    else_if_regate = """{
+        if (total_gpus <= 1) {
+        } else if (!cache_queue) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_conditions(else_if_regate) == ["!(total_gpus<=1)", "!cache_queue"], (
+        "expected the else-if's guard to ALSO be reported as the NEGATION of the outer if's condition, not "
+        "just the inner if's own (positive) condition on its own"
     )
 
 
