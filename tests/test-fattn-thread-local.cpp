@@ -5,6 +5,7 @@
 
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,10 +28,8 @@ void ggml_sycl_test_seq_id_buffers_free_all();
 bool ggml_sycl_test_seq_id_buffers_touch(sycl::queue * stream);
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     sycl::queue q;
     try {

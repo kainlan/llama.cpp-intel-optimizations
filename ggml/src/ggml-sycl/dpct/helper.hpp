@@ -851,6 +851,31 @@ namespace dpct
 
       /// Caller should acquire resource \p m_mutex before calling this
       /// function.
+      // enable_profiling is added UNCONDITIONALLY here, not gated on
+      // `#ifdef DPCT_PROFILING_ENABLED` (llama.cpp-yke2). These
+      // create_queue_impl() overloads, like the rest of device_ext, are
+      // header-only inlines: any translation unit that includes this header
+      // compiles its own copy, and ordinary ELF symbol resolution lets
+      // whichever TU's copy the linker happens to pick interpose over every
+      // other TU's for the whole process -- including the ggml-sycl shared
+      // library's own copy, which used to be the only one built with the
+      // macro defined (it was a PRIVATE compile definition of the
+      // `ggml-sycl` CMake target). A test executable that includes
+      // ggml-sycl/common.hpp (and so this header) compiled its copy WITHOUT
+      // the macro, and that copy silently won process-wide, dropping
+      // enable_profiling from dpct::device_ext::default_queue() (and
+      // everything built through it -- roughly five dozen call sites across
+      // ggml-sycl.cpp/common.cpp/unified-cache.cpp/etc. that call
+      // ggml_sycl_get_device(...).default_queue() directly, not just the
+      // unified cache's owner queue). A macro read inside a header-only
+      // inline can never be interposition-safe, because "which TU's copy
+      // wins" is exactly what interposition means; the fix is to stop the
+      // property from depending on a macro at all, matching this backend's
+      // own default_queue_properties() (ggml-sycl/common.hpp), which has
+      // always added enable_profiling unconditionally for every queue IT
+      // constructs directly. Every TU now compiles an IDENTICAL copy of
+      // these inlines regardless of DPCT_PROFILING_ENABLED, so which one the
+      // linker resolves no longer matters for this property.
       template <class... Properties>
       sycl::queue create_queue_impl(bool enable_exception_handler,
                                     Properties... properties) {
@@ -859,13 +884,8 @@ namespace dpct
           eh = exception_handler;
         }
         sycl::context ctx(*this, eh);
-        _queues.push_back(sycl::queue(
-            ctx, *this, eh,
-            sycl::property_list(
-#ifdef DPCT_PROFILING_ENABLED
-                sycl::property::queue::enable_profiling(),
-#endif
-                properties...)));
+        _queues.push_back(
+            sycl::queue(ctx, *this, eh, sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
 
         return _queues.back();
       }
@@ -879,13 +899,8 @@ namespace dpct
           eh = exception_handler;
         }
         sycl::context ctx(device, eh);
-        _queues.push_back(sycl::queue(
-            ctx, device, eh,
-                        sycl::property_list(
-#ifdef DPCT_PROFILING_ENABLED
-                            sycl::property::queue::enable_profiling(),
-#endif
-                            properties...)));
+        _queues.push_back(sycl::queue(ctx, device, eh,
+                                      sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
 
         return _queues.back();
       }

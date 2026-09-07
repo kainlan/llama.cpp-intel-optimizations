@@ -506,6 +506,36 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 endif()
 
+# Regression gate for llama.cpp-yke2 -- see dpct/helper.hpp's
+# create_queue_impl() comment for the interposition mechanism this fixes,
+# and the test file's own header comment for why it has two phases. Links
+# the real ggml-sycl library (like test-sycl-mxfp4-woq-repack above) to
+# exercise the actual ggml_backend_sycl_context::stream() path, not a
+# private workaround queue.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-profiling-queue-property.cpp)
+    set_tests_properties(test-sycl-profiling-queue-property PROPERTIES LABELS "sycl;profiler;gpu-serial")
+    target_include_directories(test-sycl-profiling-queue-property PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-profiling-queue-property PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-profiling-queue-property PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-profiling-queue-property PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-profiling-queue-property PRIVATE "-fsycl")
+        target_link_options(test-sycl-profiling-queue-property PRIVATE "-fsycl")
+    endif()
+    # RUN_SERIAL and the LD_LIBRARY_PATH addition mirror
+    # test-sycl-two-context-ownership above: a direct (non-ctest) invocation
+    # of a SYCL test binary without oneAPI's redist lib on LD_LIBRARY_PATH
+    # prints SKIP with exit 0 (CLAUDE.md: "a SYCL test binary run WITHOUT
+    # sourcing setvars.sh prints SKIP and exits 0") -- ctest supplies it here
+    # so a `ctest -R` run does not silently pass for the wrong reason.
+    set_tests_properties(test-sycl-profiling-queue-property PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 300
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # WOQ repack kernel microbench (perf-recovery epic, track D, llama.cpp-0vqt):
 # NOT a ctest -- it is a device-event throughput measurement, not a
 # correctness gate (that's test-sycl-mxfp4-woq-{,tiled-}repack above), so it
@@ -2802,6 +2832,39 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-extra-leak-probe-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-extra-leak-probe-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# llama.cpp-5q1r (plan task S6): source gate asserting every tests/*.cpp that
+# setenv()s ONEAPI_DEVICE_SELECTOR in its own main() does so through the
+# shared tests/sycl-selector-fallback.hpp re-exec helper, not a no-op bare
+# setenv() or an independent execv() copy -- see that file and the gate
+# script's own docstring for why a plain setenv() cannot work here. Host-only,
+# reads the sources as text. Same registration shape as
+# test-sycl-extra-leak-probe-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-selector-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-selector-fallback-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 30)
+endif()
+
+# Pure-Python source-level companion to the GPU test
+# test-sycl-profiling-queue-property.cpp (llama.cpp-yke2): checks that
+# create_cache_for_device()'s call to ensure_single_device_context_queue() is
+# unconditional (not gated on total_gpus > 1). Host-only, reads the sources
+# as text -- same registration shape as test-sycl-extra-leak-probe-source
+# above. Registered here, well after find_package(Python3) above, rather than
+# next to the GPU test itself (much earlier in this file, before that
+# find_package call) -- Python3_Interpreter_FOUND is unset that early, so a
+# registration placed there is silently never added at all (ctest -N reports
+# it as if it never existed, not merely skipped).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-profiling-queue-property-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-profiling-queue-property-source.py
         LABEL "sycl;source;host"
         TIMEOUT 30)
 endif()

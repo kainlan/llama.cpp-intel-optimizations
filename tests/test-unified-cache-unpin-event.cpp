@@ -34,6 +34,7 @@
 // `unpin_on_event` clears, instead of inferring the path ran from a passing
 // result.
 #include "ggml-sycl/unified-cache.hpp"
+#include "sycl-selector-fallback.hpp"
 
 #include <unistd.h>
 
@@ -992,9 +993,7 @@ static bool run_binbcast_stress(event_mode mode, int iters) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     // Graph replay makes the per-op pin/unpin path unreachable: while recording,
     // `maybe_pin_cached` returns early because pin ops are not graph-recordable,
