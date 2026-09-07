@@ -5,10 +5,14 @@ ONEAPI_DEVICE_SELECTOR via setenv() must do so either through the shared
 re-exec fallback (tests/sycl-selector-fallback.hpp,
 sycl_test_selector_fallback()) or through the canonical inline re-exec block
 S2 landed first (759b5647d) -- `if (!getenv("ONEAPI_DEVICE_SELECTOR")) {
-setenv(...); execv("/proc/self/exe", argv); ...}` -- never a bespoke
-`setenv()`-only copy with no execv, and never BOTH the helper call and a
-leftover bespoke setenv (a half-finished port reads as a real fix, so that
-combination is an offender too).
+setenv(...); execv("/proc/self/exe", argv); ...}` -- and that call (or block)
+must be the FIRST real statement inside main(), per the helper's own
+contract ("Call this as the FIRST statement of main ... anything run before
+this call runs twice"). Never a bespoke `setenv()`-only copy with no execv;
+never BOTH the helper call and a leftover bespoke setenv (a half-finished
+port reads as a real fix); never an inline block sitting beside a SEPARATE,
+stray bare setenv elsewhere in the same file (the same half-finished shape,
+one level over); never buried after other code.
 
 WHY THIS GATE EXISTS: a plain `setenv("ONEAPI_DEVICE_SELECTOR", ...)` inside
 main() is a NO-OP in this fork. Every SYCL test here links ggml-sycl, which
@@ -22,56 +26,78 @@ every device, including the integrated GPU whose global_mem_size reports
 231.7 GB of system RAM as phantom "VRAM" (llama.cpp-403s), with nothing in
 the test's own output to say so. The fix is to re-exec the process
 (setenv() then execv("/proc/self/exe", argv)) so the child's libccl
-initializer observes the variable already set; see
+initializer observes the variable already set -- which only works if
+nothing runs (and re-runs, on the second pass) before it; see
 tests/sycl-selector-fallback.hpp for the full rationale and the guards
 (re-exec only when setenv() itself succeeded, warn-and-continue rather than
 exit(77) on failure).
 
-RED (before the llama.cpp-5q1r port): ~20 sibling tests called the no-op
-`setenv()`-only form directly in main(), and two more
-(test-sycl-mmvq-q8-0-soa-numerics.cpp, test-sycl-fattn-tile-d512-decode.cpp)
-had already grown their OWN correct-but-independent execv() copy (landed by
-plan task S2) -- both counted as offenders in the first version of this
-gate, since the point was exactly one implementation, not several correct
-ones. Spec round 1 (rev-5q1r-spec-1, c-k45u) found two more offenders this
-gate could not even see (ggml/src/ggml-sycl/tests/test-cross-model-weight-
-usage.cpp, ggml/src/ggml-sycl/tests/test-canonical-checksum-owner-scope.cpp
--- live, ctest-registered targets in ggml/src/ggml-sycl/CMakeLists.txt) and
-one exclusion that was wrong (tests/test-sycl-compute-buffer-extra-reuse.cpp
-IS registered on master, in ggml/src/ggml-sycl/CMakeLists.txt, not
-tests/CMakeLists.txt -- the earlier "not registered here" rationale checked
-only tests/CMakeLists.txt).
-GREEN (after both the original port and the spec round 1 fixes): every one
-of those calls the shared helper (or, for a sibling mid-review on another
-branch, may legitimately still carry the canonical inline block -- see
-SCOPE below).
+HISTORY (each round found a gap the previous round's evidence did not
+cover):
+  RED (before the llama.cpp-5q1r port): ~20 sibling tests called the no-op
+  `setenv()`-only form directly in main(), and two more
+  (test-sycl-mmvq-q8-0-soa-numerics.cpp, test-sycl-fattn-tile-d512-decode.cpp)
+  had already grown their OWN correct-but-independent execv() copy (landed by
+  plan task S2) -- both counted as offenders in the first version of this
+  gate, since the point was exactly one implementation, not several correct
+  ones.
+  Spec round 1 (rev-5q1r-spec-1, c-k45u) found two more offenders this gate
+  could not even see (ggml/src/ggml-sycl/tests/test-cross-model-weight-
+  usage.cpp, ggml/src/ggml-sycl/tests/test-canonical-checksum-owner-scope.cpp
+  -- live, ctest-registered targets in ggml/src/ggml-sycl/CMakeLists.txt),
+  one exclusion that was wrong (tests/test-sycl-compute-buffer-extra-reuse.cpp
+  IS registered on master, in ggml/src/ggml-sycl/CMakeLists.txt, not
+  tests/CMakeLists.txt), and a fail-open on a half-finished helper port
+  (helper call plus a leftover bespoke setenv passed as clean).
+  Spec round 2 (rev-5q1r-spec-2, c-xicg) found three more gaps, all fixed
+  here: (a) nothing checked the helper/inline call was actually the FIRST
+  statement of main, only that it existed somewhere in the file; (b) the
+  inline-block acceptance check accepted a file with one correct block AND
+  a separate stray bare setenv, the same half-finished shape as (a) in
+  round 1 but for the inline form; (c) the scan was non-recursive, so *.cpp
+  files in subdirectories of either scan root (tests/peg-parser,
+  tests/e1-rca, tests/sycl-canary, tests/sycl-alloc-policy-fixtures/*, ...)
+  were invisible to it.
+GREEN (after every round above): every in-scope file calls the shared
+helper as the first statement of main, or -- for a sibling mid-review on
+another branch -- may still legitimately carry the canonical inline block
+as its ENTIRE handling of the variable, also as the first statement.
 
-SCOPE: this gate scans TWO directories -- tests/ and
-ggml/src/ggml-sycl/tests/ -- for every *.cpp file containing a literal
-`setenv("ONEAPI_DEVICE_SELECTOR"` call in its own source, minus the files in
-EXCLUDED_FILES below (keyed by path relative to the repo root, since the two
-directories could in principle share a basename). This is deliberately a
-superset of the `test-sycl-*.cpp` glob and of a single directory: the
-census this gate encodes (see llama.cpp-5q1r) was done with a plain
-`grep -l` across all of tests/*.cpp, several offenders there do not carry
-the `test-sycl-` prefix (e.g. tests/test-layout-bytes.cpp), and spec round 1
-found live offenders outside tests/ entirely.
+SCOPE: this gate scans TWO directories, RECURSIVELY -- tests/ and
+ggml/src/ggml-sycl/tests/, including every subdirectory of each -- for
+every *.cpp file containing a literal `setenv("ONEAPI_DEVICE_SELECTOR"`
+call or a call to the shared helper in its own source, minus the files in
+EXCLUDED_FILES below (keyed by path relative to the repo root, since the
+two directories could in principle share a basename). This is deliberately
+a superset of the `test-sycl-*.cpp` glob, of a single directory, and of a
+top-level-only listing: the census this gate encodes (see llama.cpp-5q1r)
+was done with a plain `grep -l` across all of tests/*.cpp, several
+offenders there do not carry the `test-sycl-` prefix (e.g.
+tests/test-layout-bytes.cpp), spec round 1 found live offenders outside
+tests/ entirely, and spec round 2 found the scan missed nested
+subdirectories (none of which currently carry the pattern, but a future
+file there should not be invisible by construction).
 
-ACCEPTED FORMS (a file that setenv()s ONEAPI_DEVICE_SELECTOR is NOT an
-offender if it uses either):
-  1. The shared helper: a call to sycl_test_selector_fallback(...).
-  2. The canonical inline block: a setenv("ONEAPI_DEVICE_SELECTOR" call
-     followed, within a short window, by execv("/proc/self/exe" -- this is
-     what plan task S2 landed first, and what a sibling test on another,
-     not-yet-merged branch (e.g. plan task L2b's
-     tests/test-sycl-kv-view-extra-reuse.cpp) may still legitimately carry;
-     consolidating it onto the shared helper is a fine follow-up, but must
-     not be a hard gate condition that breaks a merge in flight.
-A file combining BOTH forms (calls the helper AND still has a bespoke
-setenv("ONEAPI_DEVICE_SELECTOR" left in) is an offender: there is no
-legitimate reason a helper-calling file needs its own literal setenv() for
-this variable, and the combination is exactly what a half-finished
-consolidation would leave behind.
+ACCEPTED FORMS (a file that setenv()s ONEAPI_DEVICE_SELECTOR or calls the
+helper is NOT an offender only if ALL of the following hold):
+  1. Its ENTIRE handling of the variable is exactly one of:
+       (a) a call to the shared helper, sycl_test_selector_fallback(...), or
+       (b) the canonical inline block -- EVERY setenv("ONEAPI_DEVICE_SELECTOR"
+           call in the file must be followed, within a short window, by
+           execv("/proc/self/exe" (this is what plan task S2 landed first,
+           and what a sibling test on another, not-yet-merged branch may
+           still legitimately carry; consolidating it onto the shared
+           helper is a fine follow-up, not a hard gate condition).
+     Combining (a) and (b) in the same file, or having a stray bare setenv
+     alongside a correct instance of either, is a half-finished port and an
+     offender either way.
+  2. That call (or the inline block's guarding `if`) is the FIRST real
+     statement inside main() -- the first thing found after main()'s
+     opening brace once blank lines, `//` comments, `/* */` blocks, and
+     preprocessor lines (`#if`, `#endif`, `#else`, ...) are skipped. A file
+     where the pattern exists somewhere in the source but not inside any
+     main() body at all also fails this: it cannot be main()'s first
+     statement if it is not in main() at all.
 
 This gate reads SOURCE TEXT only -- no compiler, no SYCL device.
 """
@@ -92,6 +118,12 @@ SETENV_PATTERN = re.compile(r'setenv\(\s*"ONEAPI_DEVICE_SELECTOR"')
 EXECV_PATTERN = re.compile(r'execv\(\s*"/proc/self/exe"')
 HELPER_CALL_PATTERN = re.compile(r"sycl_test_selector_fallback\s*\(")
 MAIN_WITH_ARGV_PATTERN = re.compile(r"int\s+main\s*\([^)]*char\s*\*\*\s*argv[^)]*\)")
+MAIN_SIGNATURE_PATTERN = re.compile(r"int\s+main\s*\([^)]*\)\s*\{")
+
+_WHITESPACE = re.compile(r"\s+")
+_LINE_COMMENT = re.compile(r"//[^\n]*")
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_PP_LINE = re.compile(r"#[^\n]*")
 
 # Files that setenv("ONEAPI_DEVICE_SELECTOR" in their own main() but are
 # deliberately NOT part of this port (llama.cpp-5q1r, lead guidance c-kjzk),
@@ -120,7 +152,7 @@ def _iter_source_files():
     for d in SCAN_DIRS:
         if not d.is_dir():
             continue
-        for path in sorted(d.glob("*.cpp")):
+        for path in sorted(d.rglob("*.cpp")):
             rel = path.relative_to(REPO_ROOT).as_posix()
             if rel in EXCLUDED_FILES:
                 continue
@@ -129,20 +161,103 @@ def _iter_source_files():
 
 
 def _has_canonical_inline_block(text):
-    """True if a setenv("ONEAPI_DEVICE_SELECTOR" call is followed, within a
-    short window, by execv("/proc/self/exe" -- the canonical inline re-exec
-    block plan task S2 landed first, still valid for a file that has not yet
-    been consolidated onto the shared helper."""
-    for m in SETENV_PATTERN.finditer(text):
+    """True if EVERY setenv("ONEAPI_DEVICE_SELECTOR" call in the text is
+    followed, within a short window, by execv("/proc/self/exe" -- i.e. the
+    file's entire bespoke handling of this variable is the canonical inline
+    re-exec block, with no stray bare setenv left anywhere. A single
+    correctly-followed match used to be enough, which meant a file could
+    carry one correct inline block AND a separate stray bare setenv and
+    still read as compliant (spec round 2, c-xicg finding 3 -- round 1's
+    half-finished-port fail-open, one level over, for the inline form
+    instead of the helper form)."""
+    matches = list(SETENV_PATTERN.finditer(text))
+    if not matches:
+        return False
+    for m in matches:
         window = text[m.end() : m.end() + 400]
-        if EXECV_PATTERN.search(window):
-            return True
+        if not EXECV_PATTERN.search(window):
+            return False
+    return True
+
+
+def _find_main_bodies(text):
+    """Yields (body_start, body_end) character offsets for the region
+    strictly between each main(...) function's opening brace and its
+    matching closing brace (found by depth-counted brace scanning, so
+    nested braces inside the body do not end it early)."""
+    for m in MAIN_SIGNATURE_PATTERN.finditer(text):
+        start = m.end()
+        depth = 1
+        i = start
+        n = len(text)
+        while i < n and depth > 0:
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            i += 1
+        yield start, i - 1
+
+
+def _first_real_offset(text, start, end):
+    """Advances past whitespace, `//` line comments, `/* */` block
+    comments, and preprocessor directive lines (#if, #endif, #else, ...) to
+    find where the first real (non-comment, non-preprocessor) statement
+    begins inside a main() body."""
+    pos = start
+    while pos < end:
+        for pattern in (_WHITESPACE, _LINE_COMMENT, _BLOCK_COMMENT, _PP_LINE):
+            m = pattern.match(text, pos)
+            if m:
+                pos = m.end()
+                break
+        else:
+            break
+    return pos
+
+
+def _first_statement_is_valid(text, offset):
+    """True if the real code starting at `offset` is either a direct call
+    to the shared helper, or the `if` guard opening the canonical inline
+    re-exec block (identified structurally: the setenv() call inside it is
+    close to `offset`, and is itself followed by execv() within a short
+    window)."""
+    remainder = text[offset : offset + 500]
+    if HELPER_CALL_PATTERN.match(remainder):
+        return True
+    if remainder.lstrip(" \t").startswith("if"):
+        setenv_m = SETENV_PATTERN.search(remainder)
+        if setenv_m and setenv_m.start() < 200:
+            window = remainder[setenv_m.end() : setenv_m.end() + 400]
+            if EXECV_PATTERN.search(window):
+                return True
     return False
+
+
+def _first_statement_ok(text):
+    """True if every main() body that mentions the helper or a bespoke
+    setenv("ONEAPI_DEVICE_SELECTOR" has that mention as its first real
+    statement, AND at least one main() body actually contains the mention
+    (it cannot be main()'s first statement if it is not in main() at all --
+    spec round 2, c-xicg finding 2: nothing previously checked position,
+    only presence anywhere in the file)."""
+    found_relevant_main = False
+    for start, end in _find_main_bodies(text):
+        body = text[start:end]
+        if not (HELPER_CALL_PATTERN.search(body) or SETENV_PATTERN.search(body)):
+            continue
+        found_relevant_main = True
+        offset = _first_real_offset(text, start, end)
+        if not _first_statement_is_valid(text, offset):
+            return False
+    return found_relevant_main
 
 
 def _classify(text):
     """Returns one of "not_in_scope", "offender_half_finished",
-    "offender_bare_setenv", "compliant" for a single file's text."""
+    "offender_bare_setenv", "offender_not_first_statement", "compliant"
+    for a single file's text."""
     has_helper = bool(HELPER_CALL_PATTERN.search(text))
     has_setenv = bool(SETENV_PATTERN.search(text))
     if not has_setenv and not has_helper:
@@ -151,6 +266,8 @@ def _classify(text):
         return "offender_half_finished"
     if has_setenv and not _has_canonical_inline_block(text):
         return "offender_bare_setenv"
+    if not _first_statement_ok(text):
+        return "offender_not_first_statement"
     return "compliant"
 
 
@@ -167,11 +284,10 @@ def _offenders():
 def test_no_offenders_outside_excluded_files():
     offenders = _offenders()
     assert not offenders, (
-        "the following files call setenv(\"ONEAPI_DEVICE_SELECTOR\") without the shared "
-        "sycl_test_selector_fallback() helper or the canonical inline execv() block, or call the "
-        "helper while still retaining a bespoke setenv() (a half-finished port) -- a plain "
-        "setenv() in main() is a no-op in this fork, see llama.cpp-2x3m / llama.cpp-5q1r: "
-        + ", ".join(offenders)
+        "the following files mishandle ONEAPI_DEVICE_SELECTOR -- a bare setenv() with no execv(), "
+        "a helper call or inline block that is not main()'s first real statement, or a half-finished "
+        "combination of forms -- a plain setenv() in main() is a no-op in this fork, see "
+        "llama.cpp-2x3m / llama.cpp-5q1r: " + ", ".join(offenders)
     )
 
 
@@ -220,6 +336,107 @@ def test_half_finished_port_is_caught():
 
     unrelated = 'int main() { return 0; }\n'
     assert _classify(unrelated) == "not_in_scope"
+
+
+def test_stray_setenv_beside_inline_block_is_caught():
+    """Fixture proving a file with one CORRECT canonical inline block AND a
+    SEPARATE stray bare setenv is caught -- spec round 2 (c-xicg finding 3)
+    found the single-match version of _has_canonical_inline_block() missed
+    exactly this: it stopped looking the moment it found one setenv()
+    followed by an execv(), so a second, bare setenv() elsewhere in the same
+    file went unnoticed."""
+    inline_block_plus_stray = (
+        'int main(int, char ** argv) {\n'
+        '    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    some_other_setup();\n'
+        '    // a leftover from a half-finished edit -- never followed by execv\n'
+        '    setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert not _has_canonical_inline_block(inline_block_plus_stray)
+    assert _classify(inline_block_plus_stray) == "offender_bare_setenv"
+
+
+def test_first_statement_position_is_checked():
+    """Fixture proving the position check actually runs, not just exists --
+    spec round 2 (c-xicg finding 2) found the gate never verified the
+    helper/inline call was main()'s FIRST statement, only that it appeared
+    somewhere in the file."""
+    helper_after_other_code = (
+        'int main(int, char ** argv) {\n'
+        '    do_some_setup_first();\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(helper_after_other_code) == "offender_not_first_statement"
+
+    inline_after_other_code = (
+        'int main(int, char ** argv) {\n'
+        '    do_some_setup_first();\n'
+        '    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(inline_after_other_code) == "offender_not_first_statement"
+
+    # Blank lines, a line comment, a block comment, and a preprocessor guard
+    # line between the opening brace and the call must all be tolerated --
+    # none of them is a real statement.
+    helper_after_only_noise = (
+        'int main(int, char ** argv) {\n'
+        '\n'
+        '    // a comment explaining why this matters\n'
+        '    /* a block comment\n'
+        '       spanning two lines */\n'
+        '#if defined(SOME_GUARD)\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '#endif\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(helper_after_only_noise) == "compliant"
+
+    # The pattern exists in the file but not inside ANY main() body at all
+    # -- it cannot be main()'s first statement if it is not in main().
+    setenv_outside_main = (
+        'static void setup() {\n'
+        '    setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);\n'
+        '    execv("/proc/self/exe", nullptr);\n'
+        '}\n'
+        '\n'
+        'int main() {\n'
+        '    setup();\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(setenv_outside_main) == "offender_not_first_statement"
+
+
+def test_recursive_scan_reaches_known_subdirectories():
+    """Confirms rglob (not glob) is actually used and actually descends --
+    spec round 2 (c-xicg finding 4) found *.cpp files in subdirectories of
+    both scan roots (tests/peg-parser, tests/e1-rca, tests/sycl-canary,
+    tests/sycl-alloc-policy-fixtures/*, ...) were invisible to a
+    non-recursive glob. None of those currently carry the
+    ONEAPI_DEVICE_SELECTOR pattern, so this asserts reach, not verdicts."""
+    anchor = TESTS_DIR / "peg-parser" / "test-basic.cpp"
+    assert anchor.is_file(), (
+        "fixture assumption broken: tests/peg-parser/test-basic.cpp no longer exists -- "
+        "pick another known nested .cpp file to anchor this test"
+    )
+    scanned = {p.relative_to(REPO_ROOT).as_posix() for p in _iter_source_files()}
+    assert "tests/peg-parser/test-basic.cpp" in scanned, (
+        "the scan does not reach tests/peg-parser/test-basic.cpp -- recursion into "
+        "subdirectories of the scan roots is broken"
+    )
 
 
 def test_excluded_files_are_still_accounted_for():
