@@ -214,12 +214,17 @@ rev-final-1 c-91qe finding B1 / llama.cpp-aenv, folding in llama.cpp-7wal;
 its own `//`-branch line-splicing gap closed by final integration round 2,
 rev-final-2 c-s29e finding B2 / llama.cpp-3tqc), not raw source text. What
 this GUARANTEES: an ordinarily-written `//` or `/* */` comment -- including
-one whose `//` form continues onto a following physical line via a
-backslash-newline splice -- cannot satisfy any of these checks merely by
-containing matching text, closing both a false PASS (a bare setenv()
-"proven" re-exec-safe by a comment quoting the proof text) and a false FAIL
-(an otherwise-compliant file's real call misclassified because a comment
-elsewhere quotes the same pattern). This is deliberately narrower than
+a `//` comment whose OWN TERMINATOR is spliced away onto a following
+physical line by a standard backslash-immediately-before-newline
+continuation -- cannot satisfy any of these checks merely by containing
+matching text, closing both a false PASS (a bare setenv() "proven" re-exec-
+safe by a comment quoting the proof text) and a false FAIL (an otherwise-
+compliant file's real call misclassified because a comment elsewhere
+quotes the same pattern). This guarantee does NOT extend to phase-2
+splicing of a comment's OWN INTRODUCER (`//` or `/*` itself split across a
+splice), nor to the GCC/clang non-standard trailing-whitespace splice
+extension -- see the KNOWN RESIDUALS bullet below (llama.cpp-t81m) for
+those still-open shapes. This is deliberately narrower than
 `_mask_comments_and_literals` (used only by _find_main_bodies for
 signature/brace scanning): string and char literals are left UNMASKED here
 because the patterns are themselves anchored on their own quoted argument
@@ -249,6 +254,31 @@ closed by masking:
     is NOT a masking gap: `#if 0 ... #endif` is real, unmasked code by
     design, and the proof-window search has no preprocessor-awareness at
     all (see _find_main_bodies' docstring for the full contrast with B2).
+  - PHASE-2 SPLICING RESIDUAL (quality round 1 on B2, rev-3tqc-quality-1
+    c-m5ni; tracked as llama.cpp-t81m): B2 fixed only the standard splice
+    of a `//` comment's OWN TERMINATOR (backslash immediately before the
+    newline). Three related shapes remain open, none fixed here:
+      (a) GCC and clang also splice a backslash followed by TRAILING
+          WHITESPACE (spaces or tabs) before the newline, as a long-
+          standing extension, with a warning (`-Wbackslash-newline-escape`
+          on clang; a similar GCC diagnostic). A `//` comment ending in a
+          backslash that is itself followed by trailing whitespace before
+          the line break still splices on those compilers even though
+          `_mask_scan` does not treat it as a continuation.
+      (b) a spliced LINE-COMMENT INTRODUCER: a bare `/` followed by a
+          backslash-newline splice followed by `/` reassembles into `//`
+          only after phase-2 splicing runs, so the raw two-character
+          lookahead this scanner does (`text[i:i+2] == "//"`) never
+          recognizes it as a comment opener at all -- the "comment" (and
+          anything after it) is read as ordinary, unmasked code.
+      (c) the same for a BLOCK-COMMENT introducer: `/` + backslash-newline
+          + `*` similarly never reads as `/*`.
+    Each of (a)-(c) can, in principle, be used to hide (a) or expose (b)/(c)
+    the B2 shape -- a hidden or fabricated `execv("/proc/self/exe", argv);`
+    -- past this scanner. Genuine phase-2 splicing (reassembling tokens
+    split across a splice BEFORE any lexical scan, rather than patching
+    each masking branch one shape at a time) is the correct fix and is out
+    of scope for this task; filed as llama.cpp-t81m.
 
 This gate reads SOURCE TEXT only -- no compiler, no SYCL device.
 """
@@ -515,9 +545,14 @@ def _mask_scan(text, mask_literals):
             # line too. Advance past every such continuation before
             # settling on the comment's end so that continued line does not
             # survive masking. This mirrors only backslash-immediately-
-            # before-newline; a trailing space after the backslash (`\\ \n`)
-            # is NOT a valid splice per the standard and is deliberately
-            # NOT treated as one here.
+            # before-newline, which is the C++ standard's actual splice
+            # rule and is what this check is scoped to. GCC and clang also
+            # splice a backslash followed by trailing whitespace (spaces
+            # or tabs) before the newline, as a long-standing extension
+            # (warned on, e.g. clang's -Wbackslash-newline-escape) -- that
+            # broader, non-standard form is deliberately NOT matched here;
+            # see the CONTRACT docstring's KNOWN RESIDUALS list
+            # (llama.cpp-t81m) for the still-open shapes this leaves.
             j = i + 2
             while True:
                 j = text.find("\n", j)
