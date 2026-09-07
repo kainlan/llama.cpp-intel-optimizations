@@ -4,6 +4,7 @@
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -71,10 +72,9 @@ static bool test_unsupported_dense_dtype_has_zero_demand() {
 
 #if defined(GGML_USE_SYCL)
 static bool test_graph_scratch_owner_survives_pool_reset_and_growth() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
-
+    // The selector fallback runs at the top of main(), not here: it must be
+    // the first statement of the whole process (see sycl-selector-fallback.hpp),
+    // and this function runs after two earlier CPU-only tests.
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {
         std::puts("SKIP: SYCL backend unavailable");
@@ -140,7 +140,8 @@ static bool test_graph_scratch_owner_survives_pool_reset_and_growth() {
 }
 #endif
 
-int main() {
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
     int failed = 0;
     failed += !test_mxfp4_coalesced_decode_scratch_uses_graph_shape();
     failed += !test_unsupported_dense_dtype_has_zero_demand();

@@ -26,6 +26,7 @@
 
 #include "ggml-sycl/fattn-onednn.hpp"
 #include "ggml-sycl/unified-cache.hpp"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdint>
 #include <cmath>
@@ -141,10 +142,9 @@ static bool test_non_monotonic_source_stride_descriptor() {
 }
 
 static bool test_materialize_f16_device_mapping_and_handle() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
-
+    // The selector fallback runs at the top of main(), not here: it must be
+    // the first statement of the whole process (see sycl-selector-fallback.hpp),
+    // and this function runs after three earlier tests.
     constexpr int H_kv = 2;
     constexpr int D = 4;
     constexpr int n_kv = 3;
@@ -216,7 +216,8 @@ static bool test_materialize_f16_device_mapping_and_handle() {
     return true;
 }
 
-int main() {
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
     bool ok = true;
     ok &= test_gqa_byte_index_mapping();
     ok &= test_mqa_byte_index_mapping();

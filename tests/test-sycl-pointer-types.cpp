@@ -2,6 +2,7 @@
 // Validates sycl::get_pointer_type for device/host/shared/unknown pointers.
 
 #include "ggml-sycl.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdlib>
 #include <cstdio>
@@ -22,10 +23,8 @@ static bool expect_type(sycl::usm::alloc got, sycl::usm::alloc expected, const c
     return true;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     sycl::queue q;
     const auto & ctx = q.get_context();

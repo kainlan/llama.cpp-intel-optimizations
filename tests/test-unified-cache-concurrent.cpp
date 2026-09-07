@@ -7,6 +7,7 @@
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml-sycl/ggml-sycl-test.hpp"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -214,10 +215,8 @@ static bool test_mixed_ops(sycl::queue & q) {
     return true;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     sycl::queue q;
     try {

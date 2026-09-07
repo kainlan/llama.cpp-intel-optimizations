@@ -9,10 +9,11 @@
 // the remaining blockers.  It loads models, so it belongs to the OOM-hazard
 // family: run once, never in a loop.
 //
-// ⚠️ ONE HAZARD LIVES IN THIS FILE: main() setenv()s ONEAPI_DEVICE_SELECTOR to
-// level_zero:0 -- the B70 BENCHMARK card -- when nothing is set.  The setenv
-// only fires when the variable is unset, so the registration's pinned
-// level_zero:1 defeats it; a direct run must pin it by hand.
+// main() pins ONEAPI_DEVICE_SELECTOR to level_zero:0 -- the B70 BENCHMARK
+// card -- only when nothing is already set, via the shared re-exec fallback
+// (tests/sycl-selector-fallback.hpp, llama.cpp-5q1r); the registration's
+// pinned level_zero:1 still wins because it is already set when main() runs.
+// A direct (non-ctest) invocation gets level_zero:0 unless it pins by hand.
 //
 // ---------------------------------------------------------------------------
 // llama.cpp-0tkh ADJUDICATION: STALE ORACLE, not a dropped override.
@@ -54,6 +55,7 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/ggml-sycl-test.hpp"
+#include "sycl-selector-fallback.hpp"
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -1020,17 +1022,15 @@ static bool test_model_load_preload_caches_weight(int device_id) {
     return true;
 }
 
-int main() {
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
+
     // The first restored run's evidence (artifacts/b8uv/first-run.txt) had its
     // stdout FAIL lines flushed at exit, landing them tens of lines away from
     // the stderr context that explains them.  Unbuffered keeps the two streams
     // in causal order so one run can be read as a transcript.
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
-
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
 
     ggml_sycl::test_clear_layout_override();
     setenv("GGML_SYCL_WEIGHTS_EVICTABLE", "1", 1);

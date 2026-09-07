@@ -97,6 +97,7 @@
 #include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
 
 #include <cstdio>
@@ -885,17 +886,15 @@ static sycl::queue make_queue_or_fail(const sycl::device & dev) {
     }
 }
 
-int main() {
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:1");
+
     // Enumerate BEFORE constructing any queue. `sycl::queue q;` default-
     // constructs through the default selector, which THROWS when the runtime
     // exposes no device -- and it used to sit outside the try below, so on a
     // device-less host this test died with an uncaught exception (exit 134)
     // without ever reaching its own error handling. Same defect and same fix
     // as test-mmq-xmx-dispatch (0f48c5352, llama.cpp-k208).
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
-    }
-
     std::vector<sycl::device> devices;
     try {
         devices = sycl::device::get_devices(sycl::info::device_type::gpu);

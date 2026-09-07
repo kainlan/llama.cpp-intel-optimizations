@@ -125,6 +125,7 @@
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/model-lifecycle.hpp"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -155,13 +156,11 @@ static void print_cache_id(const char * label, const ggml_sycl_cache_id & id) {
             id.has_gguf, (unsigned long long) id.file_id, id.file_offs, (unsigned long long) id.model_id);
 }
 
-int main() {
+int main(int, char ** argv) {
     // Never enumerate the iGPU by accident (CLAUDE.md, llama.cpp-403s) -- this
     // test is device-free by construction (see the header), but stay
     // consistent with the common pattern among tests here that link ggml-sycl.
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0,1", 1);
-    }
+    sycl_test_selector_fallback(argv, "level_zero:0,1");
 
     using ggml_sycl::lifecycle::error;
     using ggml_sycl::lifecycle::ModelToken;
