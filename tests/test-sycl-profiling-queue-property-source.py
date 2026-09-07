@@ -17,6 +17,23 @@ Point it at alternate copies (to exercise the RED path against a deliberately
 unmodified tree) via GGML_SYCL_YKE2_UNIFIED_CACHE_SOURCE,
 GGML_SYCL_YKE2_DPCT_HELPER_SOURCE and GGML_SYCL_YKE2_GGML_SYCL_CMAKE_SOURCE;
 the defaults are the in-tree files.
+
+CONTRACT (quality review c-4rrx): every check in this file that looks for a
+TOKEN -- a signature, a brace, a call, an `if`/`else` keyword, a macro
+directive, a known-buggy pattern -- reads a MASKED copy of the relevant
+text (via _mask_comments_and_strings()), never the original; a token
+search against unmasked text is foolable in both directions by an
+explanatory comment quoting it. Only the REPORTING/EXTRACTION of already-
+located condition TEXT (for an error message, or a returned list of
+conditions) reads the original. The two exceptions are matching_brace()/
+matching_paren(), which are themselves already comment/string-aware
+internally for finding a closing delimiter (that is the whole reason
+_mask_comments_and_strings() is needed only for the *initial* token scan),
+and the two `sycl_cmake_source`/`pre_sycl_cmake` substring checks, which
+stay on the raw CMakeLists.txt text by design -- _mask_comments_and_strings()
+only understands C++ comment syntax (`//`, `/* */`), not CMake's `#`, so
+"masking" a CMake file with it would not actually mask anything and would
+misleadingly imply protection that is not there.
 """
 
 import os
@@ -126,15 +143,25 @@ def matching_brace(text, open_idx):
 
 
 def function_body(text, signature, start=0):
-    idx = text.find(signature, start)
+    # Locates the signature and its opening brace in the MASKED text
+    # (quality review c-4rrx audit), not the original -- a signature or a
+    # stray `{` spelled out in an explanatory comment must not be found in
+    # their place. The returned body text still slices the ORIGINAL `text`
+    # (matching_brace() is itself already comment/string-aware for finding
+    # the closing brace, the same reason it reads `body`/original
+    # elsewhere in this file), and offsets are identical either way.
+    masked = _mask_comments_and_strings(text)
+    idx = masked.find(signature, start)
     assert idx >= 0, f"missing definition: {signature}"
-    open_idx = text.find("{", idx)
+    open_idx = masked.find("{", idx)
     assert open_idx >= 0, f"no opening brace found after {signature}"
     return text[open_idx : matching_brace(text, open_idx) + 1], idx
 
 
 def test_create_cache_for_device_defined_exactly_once():
-    assert source.count(FUNC_SIG) == 1, "create_cache_for_device must be defined exactly once"
+    assert _mask_comments_and_strings(source).count(FUNC_SIG) == 1, (
+        "create_cache_for_device must be defined exactly once"
+    )
 
 
 def matching_paren(text, open_idx):
@@ -507,8 +534,17 @@ def _ensure_call_guard_conditions(body):
     call is genuinely unconditional. Thin wrapper over
     _find_enclosing_if_conditions() that locates the call itself. Shared by
     the GREEN check below and the positive control's complement check on
-    the pre-fix revision."""
-    idx = body.find(ENSURE_CALL)
+    the pre-fix revision.
+
+    Locates the call in the MASKED body, not the original (quality review
+    c-4rrx should-fix 2): a decoy comment spelling out the call ABOVE the
+    real one put call_idx at that (unguarded, top-level) position, so a
+    genuinely re-gated real call underneath it read as unconditional and
+    the gate passed on any re-gate at all. Verified: `if (!cache_queue &&
+    total_gpus > 1) { call }` correctly FAILs; adding one decoy comment
+    line spelling the call above it made the same tree PASS, before this
+    fix."""
+    idx = _mask_comments_and_strings(body).find(ENSURE_CALL)
     assert idx >= 0, f"expected {ENSURE_CALL} to be called"
     return _find_enclosing_if_conditions(body, idx)
 
@@ -640,6 +676,24 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
         "a `//` line comment between the THEN branch's `}` and `else` must not hide the else-chain"
     )
 
+    # c-4rrx should-fix 2, case (11): a decoy comment spelling out
+    # ENSURE_CALL ABOVE the real, re-gated call used to set call_idx at
+    # that (unguarded, top-level) decoy position, so the extraction
+    # reported [] (unconditional) instead of the real call's actual guard
+    # -- the gate would then pass on ANY re-gate of the real call
+    # underneath the decoy.
+    decoy_comment_above_regated_call = """{
+        // ensure_single_device_context_queue(device_id) is called below.
+        sycl::queue * cache_queue = queue_override;
+        if (!cache_queue && total_gpus > 1) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_conditions(decoy_comment_above_regated_call) == ["!cache_queue&&total_gpus>1"], (
+        "expected the guard extracted for the REAL, re-gated call underneath the decoy, not [] from locating "
+        "the unguarded decoy comment's mention of the call name instead"
+    )
+
 
 def test_ensure_single_device_context_queue_is_called_unconditionally():
     # Exact-equality check on the FULL LIST of enclosing conditions
@@ -666,9 +720,13 @@ def test_buggy_multi_gpu_gate_pattern_is_absent():
     # Regression guard for the exact pre-fix pattern, independent of the
     # structural check above: `!cache_queue && total_gpus > 1` must not
     # reappear anywhere in this function (e.g. reintroduced via a rebase or
-    # a copy-paste from the historical multi-GPU-only code path).
+    # a copy-paste from the historical multi-GPU-only code path). Searches
+    # the MASKED body (quality review c-4rrx audit), not the original --
+    # per the contract at the top of this file, a token search must not be
+    # fooled by (or false-fail on) an explanatory comment quoting the
+    # pattern by name.
     body, _ = function_body(source, FUNC_SIG)
-    assert not BUGGY_GATE_RE.search(body), (
+    assert not BUGGY_GATE_RE.search(_mask_comments_and_strings(body)), (
         "found the pre-fix gate pattern `!cache_queue && total_gpus > 1` -- "
         "ensure_single_device_context_queue() must be called unconditionally (llama.cpp-yke2)"
     )
@@ -680,10 +738,44 @@ def test_fallback_to_raw_default_queue_still_exists_for_construction_failure():
     # nullptr if queue construction throws, and create_cache_for_device must
     # still degrade to the raw default_queue() in that case rather than
     # crashing on a null dereference.
+    #
+    # Checked against the MASKED body, never the original (quality review
+    # c-4rrx should-fix 1): this function's own leading comment ALREADY
+    # spells the literal fallback expression twice, as documentation, so a
+    # raw `in body` check here is VOID -- it stays true even if the real
+    # fallback line is deleted. Verified: deleting the real line while
+    # leaving the comment untouched still passes an unmasked check.
     body, _ = function_body(source, FUNC_SIG)
-    assert "ggml_sycl_get_device(device_id).default_queue()" in body, (
+    assert "ggml_sycl_get_device(device_id).default_queue()" in _mask_comments_and_strings(body), (
         "create_cache_for_device must keep the default_queue() fallback for when "
         "ensure_single_device_context_queue() fails to construct a queue"
+    )
+
+
+def test_fallback_check_would_still_fail_if_the_real_line_were_deleted():
+    # Positive-control-style regression test for quality review c-4rrx
+    # should-fix 1, case (10): reproduces the exact shape that made the
+    # PRE-FIX (unmasked) check void -- a comment mentioning the fallback
+    # literal, with the real code NOT containing it -- and proves the
+    # MASKED check correctly does not see it there, so a rebase that
+    # deletes the real fallback line (leaving only the comment behind)
+    # would still be caught.
+    decoy_comment_only = """{
+        // NOTE: used to fall back to
+        // ggml_sycl_get_device(device_id).default_queue() here.
+        sycl::queue * cache_queue = queue_override;
+        if (!cache_queue) {
+            cache_queue = ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert "ggml_sycl_get_device(device_id).default_queue()" in decoy_comment_only, (
+        "test setup error: the decoy comment must actually contain the literal text"
+    )
+    assert "ggml_sycl_get_device(device_id).default_queue()" not in _mask_comments_and_strings(
+        decoy_comment_only
+    ), (
+        "the fallback literal must not be found once masking removes the comment it lives in -- if it still "
+        "is, this check is void again, exactly as the pre-fix unmasked check was"
     )
 
 
@@ -701,20 +793,29 @@ def test_create_queue_impl_defined_exactly_twice():
     # The two dpct::device_ext::create_queue_impl() overloads (with and
     # without an explicit sycl::device parameter) -- both must be fixed, not
     # just one, since dpct::device_ext::default_queue() and other call sites
-    # can reach either.
-    assert helper_source.count(CREATE_QUEUE_IMPL_SIG) == 2, (
+    # can reach either. Counted in the MASKED text (quality review c-4rrx
+    # audit), not the original, so a signature spelled out in an
+    # explanatory comment cannot inflate the count.
+    assert _mask_comments_and_strings(helper_source).count(CREATE_QUEUE_IMPL_SIG) == 2, (
         "expected exactly two create_queue_impl(...) overloads in dpct/helper.hpp"
     )
 
 
 def test_create_queue_impl_enables_profiling_unconditionally():
+    # Checked against the MASKED body, never the original (quality review
+    # c-4rrx audit): either check on raw text is foolable by an
+    # explanatory comment -- ENABLE_PROFILING_CALL spelled out nearby would
+    # let the `in body` check pass even if the real call were deleted, and
+    # DPCT_PROFILING_MACRO spelled out in a comment (as this very function's
+    # own history now is) would false-fail the `not in body` check.
     for body in _create_queue_impl_bodies():
-        assert ENABLE_PROFILING_CALL in body, (
+        masked_body = _mask_comments_and_strings(body)
+        assert ENABLE_PROFILING_CALL in masked_body, (
             f"create_queue_impl must unconditionally add {ENABLE_PROFILING_CALL} to its property_list "
             "(llama.cpp-yke2) -- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
             "in a header-only inline"
         )
-        assert DPCT_PROFILING_MACRO not in body, (
+        assert DPCT_PROFILING_MACRO not in masked_body, (
             f"create_queue_impl must not read {DPCT_PROFILING_MACRO} at all -- the property must be "
             "unconditional source code, not gated on a macro that depends on which TU's copy of this "
             "header-only inline the linker resolves"
@@ -819,9 +920,11 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
     pre_sycl_cmake = _git_show("ggml/src/ggml-sycl/CMakeLists.txt")
 
     # 1. unified-cache.cpp: create_cache_for_device must still carry the
-    #    total_gpus > 1 gate at the pre-fix revision.
+    #    total_gpus > 1 gate at the pre-fix revision. Searched in the
+    #    MASKED body (quality review c-4rrx audit consistency), matching
+    #    the GREEN check's own counterpart.
     pre_cache_body, _ = function_body(pre_unified_cache, FUNC_SIG)
-    assert BUGGY_GATE_RE.search(pre_cache_body), (
+    assert BUGGY_GATE_RE.search(_mask_comments_and_strings(pre_cache_body)), (
         f"expected the pre-fix gate pattern in {KNOWN_PRE_FIX_REVISION}'s create_cache_for_device -- "
         "if this no longer fails, the positive control itself is void (llama.cpp-yke2)"
     )
@@ -840,14 +943,16 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
 
     # 2. helper.hpp: both create_queue_impl overloads must still read the
     #    macro, and a live directive must still be present, at the pre-fix
-    #    revision.
-    assert pre_helper.count(CREATE_QUEUE_IMPL_SIG) == 2, (
+    #    revision. Counted/searched in MASKED text throughout (quality
+    #    review c-4rrx audit consistency), matching the GREEN checks'
+    #    counterparts.
+    assert _mask_comments_and_strings(pre_helper).count(CREATE_QUEUE_IMPL_SIG) == 2, (
         f"expected exactly two create_queue_impl(...) overloads in {KNOWN_PRE_FIX_REVISION}'s dpct/helper.hpp"
     )
     start = 0
     for _ in range(2):
         pre_impl_body, idx = function_body(pre_helper, CREATE_QUEUE_IMPL_SIG, start)
-        assert DPCT_PROFILING_MACRO in pre_impl_body, (
+        assert DPCT_PROFILING_MACRO in _mask_comments_and_strings(pre_impl_body), (
             f"expected {DPCT_PROFILING_MACRO} still gating create_queue_impl in {KNOWN_PRE_FIX_REVISION}'s "
             "dpct/helper.hpp -- if this no longer fails, the positive control itself is void"
         )
