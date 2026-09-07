@@ -373,15 +373,30 @@ def test_mmvq_eight_decode_arms_use_shared_helper_with_bytes_set() -> None:
         for field in ("category", "queue_kind", "device"):
             assert not re.search(rf"profile_label\.{field}\s*=", body), f"{label}: still hand-assigns .{field}"
 
-        bytes_assignment = re.search(r"profile_label\.bytes\s*=\s*([^;]+);", body)
-        assert bytes_assignment, f"{label}: no profile_label.bytes = ...; assignment found"
-        bytes_expr = bytes_assignment.group(1)
+        # Exactly one assignment: re.findall (not re.search, which only reports whether
+        # a first match exists) so a stray duplicate assignment left behind by a bad
+        # merge or copy-paste is caught rather than silently ignored.
+        bytes_assignments = re.findall(r"profile_label\.bytes\s*=\s*[^;]+;", body)
+        assert len(bytes_assignments) == 1, (
+            f"{label}: expected exactly one profile_label.bytes assignment, found {len(bytes_assignments)}"
+        )
+        bytes_expr = re.search(r"profile_label\.bytes\s*=\s*([^;]+);", bytes_assignments[0]).group(1)
         block_type, qk_const = bytes_formula[label]
         assert f"sizeof({block_type})" in bytes_expr, (
             f"{label}: bytes formula does not reference sizeof({block_type}): {bytes_expr!r}"
         )
         assert re.search(rf"\b{qk_const}\b", bytes_expr), (
             f"{label}: bytes formula does not reference {qk_const}: {bytes_expr!r}"
+        )
+        # Shape, not just presence: ncols * nrows * sizeof(<block>) / <QK>, in that
+        # order -- so multiplying by QK instead of dividing, or dropping the nrows
+        # factor entirely, is caught even though both still "reference" QK/sizeof().
+        shape = re.compile(
+            r"ncols\s*\*\s*nrows\s*\*\s*sizeof\(\s*" + re.escape(block_type) + r"\s*\)\s*/\s*" + re.escape(qk_const)
+        )
+        assert shape.search(bytes_expr), (
+            f"{label}: bytes formula does not match the expected "
+            f"ncols * nrows * sizeof({block_type}) / {qk_const} shape: {bytes_expr!r}"
         )
 
 
