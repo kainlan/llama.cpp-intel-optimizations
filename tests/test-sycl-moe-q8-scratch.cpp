@@ -1,9 +1,9 @@
 // Regression coverage for MoE graph Q8_1 scratch sizing.
 
-#include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "sycl-selector-fallback.hpp"
 
 #include <cstdio>

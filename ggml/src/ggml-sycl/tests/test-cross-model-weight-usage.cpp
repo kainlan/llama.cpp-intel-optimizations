@@ -14,6 +14,7 @@
 // Mutation control: key g_sycl_weight_usages by bare name, or clear it at B's
 // load boundary. The B or reactivated-A exact-owner checks then fail.
 
+#include "../../../../tests/sycl-selector-fallback.hpp"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
@@ -46,10 +47,8 @@ static tensor_usage usage_of(ggml_context * ctx, const char * name) {
     return ggml_sycl_get_tensor_usage(t);
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:0");
 
     ggml_init_params params{};
     params.mem_size    = 16 * 1024 * 1024;

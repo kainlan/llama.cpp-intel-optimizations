@@ -56,14 +56,11 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
+#include "sycl-selector-fallback.hpp"
 #include "test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 
-#include <unistd.h>
-
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <vector>
 
 #if !defined(GGML_SYCL_PRIVATE_TESTING)
@@ -103,15 +100,10 @@ ggml_tensor * build_graph(ggml_context * ctx, ggml_cgraph * gf, ggml_tensor * we
 }  // namespace
 
 int main(int, char ** argv) {
-    // libccl's static initializer makes libsycl memoize ONEAPI_DEVICE_SELECTOR
-    // before main() runs, so a plain setenv() here is too late to steer device
-    // selection (llama.cpp-2x3m c-oftt, gdb-traced): re-exec once with the
-    // selector already in the environment.
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
-        execv("/proc/self/exe", argv);
-        fprintf(stderr, "warning: re-exec failed (%s)\n", strerror(errno));
-    }
+    // See tests/sycl-selector-fallback.hpp for why a plain setenv() here does
+    // not work (libccl's static initializer memoizes the selector before
+    // main() runs, llama.cpp-2x3m) and why the fix is a re-exec.
+    sycl_test_selector_fallback(argv, "level_zero:1");
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);
     if (!backend) {

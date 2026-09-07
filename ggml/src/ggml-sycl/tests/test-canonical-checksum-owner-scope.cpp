@@ -37,6 +37,7 @@
 // All names are synthetic ("zzz_ckchk_*") and cannot collide with a real GGUF
 // tensor name, so nothing below can be satisfied by a real model's capture.
 
+#include "../../../../tests/sycl-selector-fallback.hpp"
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
@@ -100,10 +101,8 @@ static row row_of(const ggml_tensor * t) {
     return r;
 }
 
-int main() {
-    if (!std::getenv("ONEAPI_DEVICE_SELECTOR")) {
-        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:1", 1);
-    }
+int main(int, char ** argv) {
+    sycl_test_selector_fallback(argv, "level_zero:1");
     // Drive the real env gate rather than bypassing it: the substring filter
     // must admit every zzz_ckchk_* name below, and the capture caches its
     // enabled/-filter decision in a function-local static on first call.
