@@ -202,23 +202,154 @@ def matching_paren(text, open_idx):
 _IF_RE = re.compile(r"(?<![A-Za-z0-9_])if\s*\(")
 
 
-def _find_enclosing_if_condition(body, call_idx):
-    """The whitespace-stripped condition of the SMALLEST `if ( ... )` in
-    `body` whose body (a `{ ... }` block, or a single-statement body up to
-    the next top-level `;`) actually CONTAINS call_idx, or None if no such
-    enclosing if exists (a genuinely unconditional call).
+def _mask_comments_and_strings(text):
+    """A same-length, same-offset copy of `text` with every `//` comment,
+    `/* */` comment, and string/char literal (delimiters included)
+    replaced by spaces (newlines preserved). Used ONLY to decide where a
+    live `if (` may be matched (quality review c-12xi): `_IF_RE.finditer`
+    scanning the raw body would count an `if (` spelled inside a comment or
+    a string literal, which is not real code. Every surviving character's
+    OFFSET is identical to the original, so callers match against this
+    masked copy but slice/parse the ORIGINAL `text` using those offsets
+    (matching_paren()/matching_brace() are themselves already
+    comment/string-aware for finding the closing delimiter, so only the
+    initial `if (` scan needed this).
+
+    LIMITATION, named rather than claimed away: like matching_brace()/
+    matching_paren() above (whose char-literal guard this copies), a `'`
+    immediately after an alnum/`_` character is treated as a C++14 digit
+    separator (`1'000`), not a char-literal opener -- correct for digit
+    separators, but it also means an encoding-prefixed char literal
+    (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) is not masked as a literal (its `'`s
+    are left as ordinary characters, which cannot themselves misdirect the
+    `if (` scan below, but a stray `if (` INSIDE such a literal, if one
+    ever existed here, would not be masked out). This helper is scoped to
+    one known, small, in-repo function body, not arbitrary/adversarial
+    C++, and neither residual is expected to matter for it; not a
+    completeness claim for a general-purpose C++ tokenizer."""
+    # Same four-state machine as matching_brace()/matching_paren() above,
+    # but building a masked copy instead of tracking depth. Every branch
+    # explicitly sets `i` and `continue`s, so each character is visited
+    # (and, in a masking branch, replaced) exactly once -- deliberately
+    # verbose over cleverness here, since a subtle off-by-one in a
+    # comment-masking helper is exactly the kind of bug this whole file
+    # exists to not have.
+    out = list(text)
+    state = "code"
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                state = "line"
+                out[i] = " "
+                i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block"
+                out[i] = " "
+                i += 1
+                continue
+            if ch == '"':
+                state = "str"
+                out[i] = " "
+                i += 1
+                continue
+            if ch == "'":
+                prev = text[i - 1] if i > 0 else ""
+                if not (prev.isalnum() or prev == "_"):
+                    state = "chr"
+                    out[i] = " "
+                    i += 1
+                    continue
+            i += 1
+            continue
+        elif state == "line":
+            if ch == "\n":
+                state = "code"
+                i += 1
+                continue
+            out[i] = " "
+            i += 1
+            continue
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                out[i] = " "
+                out[i + 1] = " "
+                state = "code"
+                i += 2
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        elif state == "str":
+            if ch == "\\":
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if ch == '"':
+                out[i] = " "
+                state = "code"
+                i += 1
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        elif state == "chr":
+            if ch == "\\":
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if ch == "'":
+                out[i] = " "
+                state = "code"
+                i += 1
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+    return "".join(out)
+
+
+def _find_enclosing_if_conditions(body, call_idx):
+    """The whitespace-stripped conditions of EVERY `if ( ... )` in `body`
+    whose body (a `{ ... }` block, or a single-statement body up to the
+    next top-level `;`) actually CONTAINS call_idx, ordered OUTERMOST to
+    INNERMOST -- empty list if no enclosing if exists (a genuinely
+    unconditional call).
 
     Deliberately NOT "the nearest preceding `if (`" (quality review c-69sf,
     nit 1): that textual-proximity approach reports a call as guarded by an
     UNRELATED `if` earlier in the same function, as long as that if's own
     body ends before the call -- a genuinely unconditional call preceded by
     an unrelated `if (something_else) { ... }` would be misreported as
-    guarded by `something_else` and this gate would false-fail. This scans
-    EVERY `if (` in the body and only accepts one whose body span actually
-    contains the call, picking the innermost (latest-starting) match among
-    any that do (nested ifs)."""
-    best = None  # (body_start, condition) for the tightest enclosing if found so far
-    for m in _IF_RE.finditer(body):
+    guarded by `something_else` and this gate would false-fail.
+
+    And deliberately NOT "only the innermost enclosing if" either (quality
+    review c-12xi): keeping only the tightest match is a false PASS on a
+    re-gate wrapped AROUND an already-correct inner if -- e.g.
+    `if (dev_count > 1) { if (!cache_queue) { call } } }` reads as
+    correctly guarded if only `!cache_queue` is checked, while the OUTER
+    `dev_count > 1` silently reinstates the pre-fix, GPU-count-gated
+    semantics. Every enclosing if must be reported so the caller can reject
+    any list other than [] or exactly ["!cache_queue"].
+
+    Matches `if (` against a comment/string-MASKED copy of `body` (c-12xi's
+    other nit: a commented-out or quoted `if (...)` must not count), but
+    extracts conditions and body spans from the ORIGINAL `body` text using
+    the masked copy's offsets, which are identical by construction."""
+    masked = _mask_comments_and_strings(body)
+    found = []  # (body_start, condition), any order; sorted by body_start below
+    for m in _IF_RE.finditer(masked):
         if_start = m.start()
         if if_start >= call_idx:
             continue  # this if starts at or after the call -- cannot enclose it
@@ -237,39 +368,38 @@ def _find_enclosing_if_condition(body, call_idx):
             if semi_idx < 0:
                 continue
             body_start, body_end = after_ws, semi_idx
-        if body_start < call_idx <= body_end and (best is None or body_start > best[0]):
-            best = (body_start, condition)
-    if best is None:
-        return None
-    return re.sub(r"\s+", "", best[1])
+        if body_start < call_idx <= body_end:
+            found.append((body_start, condition))
+    found.sort(key=lambda pair: pair[0])  # outermost (earliest body_start) first
+    return [re.sub(r"\s+", "", c) for _, c in found]
 
 
-def _ensure_call_guard_condition(body):
-    """The whitespace-stripped condition of the smallest `if ( ... )`
-    actually enclosing ENSURE_CALL in `body`, or None if the call is
-    genuinely unconditional. Thin wrapper over
-    _find_enclosing_if_condition() that locates the call itself. Shared by
+def _ensure_call_guard_conditions(body):
+    """The whitespace-stripped conditions of every `if ( ... )` actually
+    enclosing ENSURE_CALL in `body`, outermost to innermost -- [] if the
+    call is genuinely unconditional. Thin wrapper over
+    _find_enclosing_if_conditions() that locates the call itself. Shared by
     the GREEN check below and the positive control's complement check on
     the pre-fix revision."""
     idx = body.find(ENSURE_CALL)
     assert idx >= 0, f"expected {ENSURE_CALL} to be called"
-    return _find_enclosing_if_condition(body, idx)
+    return _find_enclosing_if_conditions(body, idx)
 
 
 def test_guard_condition_extraction_is_structural_not_textual_proximity():
     # Regression test for the extraction LOGIC itself (quality review
-    # c-69sf, nit 1), independent of whatever unified-cache.cpp currently
-    # contains -- durable the same way the git-show positive control below
-    # is durable, in the "positive control" style: synthetic minimal
-    # function bodies standing in for the three mutants the reviewer
-    # actually tried against a naive nearest-preceding-`if` implementation.
+    # c-69sf nit 1, c-12xi), independent of whatever unified-cache.cpp
+    # currently contains -- durable the same way the git-show positive
+    # control below is durable, in the "positive control" style: synthetic
+    # minimal function bodies standing in for the mutants both reviewers
+    # actually tried.
     unrelated_if_before_unconditional_call = """{
         if (something_else) {
             do_other_stuff();
         }
         ensure_single_device_context_queue(device_id);
     }"""
-    assert _ensure_call_guard_condition(unrelated_if_before_unconditional_call) is None, (
+    assert _ensure_call_guard_conditions(unrelated_if_before_unconditional_call) == [], (
         "an unrelated `if` earlier in the function, whose body does not contain the call, must not be "
         "reported as guarding it -- the call here is genuinely unconditional"
     )
@@ -279,7 +409,7 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
             cache_queue = ensure_single_device_context_queue(device_id);
         }
     }"""
-    assert _ensure_call_guard_condition(regated_on_something_else) == "!cache_queue&&dev_count>1", (
+    assert _ensure_call_guard_conditions(regated_on_something_else) == ["!cache_queue&&dev_count>1"], (
         "expected the full condition to be extracted, not just the absence of a specific substring"
     )
 
@@ -288,29 +418,55 @@ def test_guard_condition_extraction_is_structural_not_textual_proximity():
             cache_queue = ensure_single_device_context_queue(device_id);
         }
     }"""
-    assert _ensure_call_guard_condition(correctly_fixed) == "!cache_queue", (
+    assert _ensure_call_guard_conditions(correctly_fixed) == ["!cache_queue"], (
         "expected the shipped tree's guard pattern to extract exactly `!cache_queue`"
+    )
+
+    # c-12xi: an outer re-gate wrapped AROUND an already-correct inner if
+    # must not be masked by keeping only the innermost condition.
+    nested_outer_regate = """{
+        if (dev_count > 1) {
+            if (!cache_queue) {
+                cache_queue = ensure_single_device_context_queue(device_id);
+            }
+        }
+    }"""
+    assert _ensure_call_guard_conditions(nested_outer_regate) == ["dev_count>1", "!cache_queue"], (
+        "expected BOTH the outer re-gate and the inner condition, outermost first -- keeping only the "
+        "innermost would hide the outer re-gate entirely"
+    )
+
+    # c-12xi: an `if (` spelled inside a `//` comment must not count as a
+    # real enclosing if.
+    comment_spelled_if = """{
+        // A stale note: if (!cache_queue) used to be the whole condition.
+        if (dev_count > 1) {
+            ensure_single_device_context_queue(device_id);
+        }
+    }"""
+    assert _ensure_call_guard_conditions(comment_spelled_if) == ["dev_count>1"], (
+        "an `if (` spelled out inside a `//` comment must not be picked up as a real enclosing if"
     )
 
 
 def test_ensure_single_device_context_queue_is_called_unconditionally():
-    # Exact-equality check, not merely "total_gpus is absent": a re-gate
-    # spelled with a different name (e.g. `dev_count > 1` or
-    # `g_total_gpu_count > 1`) would satisfy an absence-of-"total_gpus"
-    # check while reintroducing exactly the bug this test exists to catch
-    # (spec review c-a1xt, should-fix 1). `!cache_queue` (queue_override not
-    # already supplied) is the one condition allowed to remain, because it
-    # is not a GPU-count gate; no enclosing `if` at all is equally
-    # acceptable (genuinely unconditional).
+    # Exact-equality check on the FULL LIST of enclosing conditions
+    # (outermost to innermost), not merely "total_gpus is absent" from the
+    # innermost one: a re-gate spelled with a different name (e.g.
+    # `dev_count > 1` or `g_total_gpu_count > 1`), OR wrapped as an OUTER
+    # if around an already-correct inner one, would both reintroduce
+    # exactly the bug this test exists to catch (spec review c-a1xt
+    # should-fix 1; quality review c-12xi). The call may be unconditional
+    # ([]) or guarded by exactly one `if (!cache_queue)` (["!cache_queue"]
+    # -- queue_override not already supplied, which is not a GPU-count
+    # gate); nothing else is acceptable.
     body, _ = function_body(source, FUNC_SIG)
-    condition = _ensure_call_guard_condition(body)
-    if condition is None:
-        return
-    assert condition == "!cache_queue", (
+    conditions = _ensure_call_guard_conditions(body)
+    assert conditions in ([], ["!cache_queue"]), (
         f"the {ENSURE_CALL} call must be guarded by exactly `if (!cache_queue)` (queue_override not already "
-        f"supplied) or by no enclosing if at all -- found condition `if ({condition})`, which re-gates the "
-        "call on something else (e.g. a GPU-count check) and would leave a single visible GPU falling back "
-        "to dpct's interposition-vulnerable default_queue() again"
+        f"supplied) or by no enclosing if at all -- found enclosing condition(s) {conditions!r} (outermost to "
+        "innermost), which re-gate(s) the call on something else (e.g. a GPU-count check) and would leave a "
+        "single visible GPU falling back to dpct's interposition-vulnerable default_queue() again"
     )
 
 
@@ -478,15 +634,16 @@ def test_positive_control_gate_can_fail_on_the_known_pre_fix_revision():
         "if this no longer fails, the positive control itself is void (llama.cpp-yke2)"
     )
     # Complement of the EXACT-EQUALITY structural check
-    # (_ensure_call_guard_condition / test_ensure_single_device_context_queue_
+    # (_ensure_call_guard_conditions / test_ensure_single_device_context_queue_
     # is_called_unconditionally): on the pre-fix revision the guarding
-    # condition must NOT already be exactly `!cache_queue` -- otherwise that
-    # GREEN check's own positive control would be void too (spec review
-    # c-a1xt, nit 6).
-    pre_condition = _ensure_call_guard_condition(pre_cache_body)
-    assert pre_condition != "!cache_queue", (
-        f"expected {KNOWN_PRE_FIX_REVISION}'s guarding condition to NOT already be exactly `!cache_queue` "
-        f"(found {pre_condition!r}) -- if it is, the exact-equality structural check's positive control is void"
+    # condition(s) must NOT already be exactly [] or ["!cache_queue"] --
+    # otherwise that GREEN check's own positive control would be void too
+    # (spec review c-a1xt, nit 6).
+    pre_conditions = _ensure_call_guard_conditions(pre_cache_body)
+    assert pre_conditions not in ([], ["!cache_queue"]), (
+        f"expected {KNOWN_PRE_FIX_REVISION}'s guarding condition(s) to NOT already be [] or exactly "
+        f"['!cache_queue'] (found {pre_conditions!r}) -- if they are, the exact-equality structural check's "
+        "positive control is void"
     )
 
     # 2. helper.hpp: both create_queue_impl overloads must still read the
