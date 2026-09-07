@@ -11,11 +11,11 @@ These fixtures are that control. Run:
 python3 scripts/parse-sycl-bench-matrix.py --self-test
 ```
 
-It must report **16/16** and exit 0. If it does not, the parser's verdicts are
+It must report **18/18** and exit 0. If it does not, the parser's verdicts are
 not trustworthy and the gate must not be certified from them.
 
 Ten cases cover the original **merge-cert** matrix (numeric floor/band, gates
-merges); six more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
+merges); eight more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
 matrix (report-only, no gate declared yet) and its `--table` markdown output.
 
 ## What the cases prove
@@ -34,9 +34,13 @@ The exit-1 case matters most and is the easiest to omit. Without it, a parser
 that hard-codes "everything is fine" would still pass every other case here.
 For long-prompt, exit 1 is impossible by construction (every arm is kind
 REPORT, so `check_gate()` always returns `ok=True`) — the cases instead prove
-exit 2 is still reachable (a missing arm, a missing `pp8192` row, and the
-`--table`-only n_ctx-disagreement check) so a long-prompt PASS is still a
-measurement, not the only answer available.
+exit 2 is still reachable (a missing arm, a missing `pp8192` row, the
+`--table`-only n_ctx-disagreement check, and a sample with no achieved n_ctx
+at all — review round 1 found this last one silently defaulting to 8320
+instead of failing closed) so a long-prompt PASS is still a measurement, not
+the only answer available. A `--runs 1` case also proves the sample-stdev
+column renders `n/a` rather than a misleading `0.00` when there is no second
+sample to compute a spread from (also review round 1).
 
 ## Provenance — what is real and what is reconstructed
 
@@ -95,14 +99,14 @@ parse:
   same capture run). Notably its pp-test `n_ctx` line reads **8192**, not the
   naive `n_prompt+n_gen=8320` — real evidence that the parser's "unless a log
   shows a different n_ctx" fallback is not a hypothetical.
-- `b50-pp2048-good.txt`, `b50-pp8192-good.txt` — **derived, not real**: no
-  `b50-*-longprompt` log existed yet when this task's implementation and
-  self-test were otherwise done (the archive fills b70 first, then b50, per
-  the task brief). Each is the matching `b70-pp*-good.txt` with only the
-  device line replaced by the real B50 form seen on this boot,
-  `Intel(R) Arc(TM) Pro B50 Graphics) (unknown id) - 14618 MiB free`
-  (above the 14000 MiB contamination floor). **Swap these for real
-  `b50-*-pp*-1.log` trims once the archive's B50 half lands.**
+- `b50-pp2048-good.txt`, `b50-pp8192-good.txt` — **real**, trimmed from
+  `b50-gemma4-pp2048-1.log` / `b50-gemma4-pp8192-1.log` (VALID, captured
+  2026-09-07, 18:10:05 / 18:11:22): free VRAM 14618 MiB (above the 14000 MiB
+  contamination floor), pp-test `n_ctx` 2048 / 8192. These replace an earlier
+  revision that derived them from the B70 fixtures with only the device line
+  swapped, because no `b50-*-longprompt` log existed yet at the time; real
+  B50 logs landed before review round 1 finished, so the derived versions
+  were replaced rather than kept as a caveat.
 - `pp8192-missing-pprow.txt` — synthetic: the free-VRAM line, one `n_ctx`
   line, and only the `tg128` row (no `pp8192` row) — drives the "missing
   wanted test" parse error for a long-prompt arm.
@@ -110,6 +114,10 @@ parse:
   `n_ctx` line changed from `8192` to `4096`; used as one of five samples
   for an arm so the five processes disagree on achieved `n_ctx`, driving the
   `--table`-only disagreement check (exit 2).
+- `b70-pp8192-no-ctx.txt` — `b70-pp8192-good.txt` with both `llama_context:
+  n_ctx = N` lines removed entirely; used as one of five samples so that
+  sample's achieved n_ctx is `None`, driving the fail-closed
+  no-achieved-n_ctx check (exit 2, never a silent `n_prompt+n_gen` default).
 
 ## Files
 
@@ -122,10 +130,11 @@ parse:
 | `unparseable-ts.txt` | `t/s` cell reads `N/A` |
 | `no-fa-column.txt` | no `fa` column, i.e. not the `-fa 1` matrix |
 | `low-free-vram.txt` | 13800 MiB free — the ~13.8 GB contamination case the perf doc names |
-| `b70-pp2048-good.txt`, `b70-pp8192-good.txt` | long-prompt: real one-process trims, reused across all 3 models on B70 |
-| `b50-pp2048-good.txt`, `b50-pp8192-good.txt` | long-prompt: **derived** from the B70 fixtures (see provenance above) — swap for real trims once available |
+| `b70-pp2048-good.txt`, `b70-pp8192-good.txt` | long-prompt: real one-process trims (b70-mistral), reused across all 3 models on B70 |
+| `b50-pp2048-good.txt`, `b50-pp8192-good.txt` | long-prompt: real one-process trims (b50-gemma4), reused across all 3 models on B50 |
 | `pp8192-missing-pprow.txt` | long-prompt: no `pp8192` row — drives the missing-test parse error |
 | `b70-pp8192-ctx-mismatch.txt` | long-prompt: pp-test `n_ctx` differs from its siblings — drives the `--table` n_ctx-disagreement check |
+| `b70-pp8192-no-ctx.txt` | long-prompt: no `n_ctx` line at all — drives the fail-closed no-achieved-n_ctx check |
 
 `.txt`, not `.log`: `.gitignore` line 17 is `*.log`, so fixtures committed under
 that extension would be silently dropped and the self-test would run against

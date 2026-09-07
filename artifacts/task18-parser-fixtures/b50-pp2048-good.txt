@@ -2,8 +2,8 @@ llama_prepare_model_devices: using device SYCL0 (Intel(R) Arc(TM) Pro B50 Graphi
 llama_context: n_ctx                 = 2048
 | model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  -1 |   1 |          pp2048 |      2847.87 ± 33.90 |
+| gemma4 E4B Q8_0                |   7.62 GiB |     7.52 B | SYCL       |  -1 |   1 |          pp2048 |     1210.00 ± 453.49 |
 llama_context: n_ctx                 = 256
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  -1 |   1 |           tg128 |        108.29 ± 0.72 |
+| gemma4 E4B Q8_0                |   7.62 GiB |     7.52 B | SYCL       |  -1 |   1 |           tg128 |         35.29 ± 0.19 |
 
 build: 6e54ba2eb (14669)

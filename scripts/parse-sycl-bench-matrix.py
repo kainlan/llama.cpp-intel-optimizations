@@ -123,7 +123,12 @@ MERGE_CERT_ARMS = {
 # clean" (exit 0) or "input had a gap" (exit 2). check_gate() always returns
 # ok=True for REPORT arms, so VERDICT FAIL (exit 1) is structurally
 # unreachable for this matrix.
-_LONG_PROMPT_SELECTORS = {"b70": "level_zero:0", "b50": "level_zero:1"}
+# Ordered once, here, and shared by every consumer that needs to iterate
+# cards or pp values (the arm builder and the --table row builder) -- so
+# "b70 before b50" and "pp2048 before pp8192" are each a fact stated in one
+# place rather than two separately-hardcoded tuples that could drift apart.
+_LONG_PROMPT_CARDS = ("b70", "b50")
+_LONG_PROMPT_CARD_SELECTORS = {"b70": "level_zero:0", "b50": "level_zero:1"}
 _LONG_PROMPT_MODELS = ("mistral", "gptoss", "gemma4")
 _LONG_PROMPT_PPS = (2048, 8192)
 
@@ -137,7 +142,8 @@ CARD_LABELS = {"b70": "B70", "b50": "B50"}
 
 def _build_long_prompt_arms():
     arms = {}
-    for card, selector in _LONG_PROMPT_SELECTORS.items():
+    for card in _LONG_PROMPT_CARDS:
+        selector = _LONG_PROMPT_CARD_SELECTORS[card]
         for model in _LONG_PROMPT_MODELS:
             for pp in _LONG_PROMPT_PPS:
                 arms["%s-%s-pp%d" % (card, model, pp)] = {
@@ -230,8 +236,8 @@ def split_row(line):
 
 
 def parse_log(path, min_free_mib, wanted_tests):
-    """Return {test: float for test in wanted_tests} plus "free_mib" and
-    "n_ctx" for one process.
+    """Return {test: float for test in wanted_tests} plus "free_mib", "n_ctx"
+    and "path" for one process.
 
     Raises ParseError on anything that makes the file unusable. There is no
     partial success: a file either yields every wanted test or it fails.
@@ -241,8 +247,10 @@ def parse_log(path, min_free_mib, wanted_tests):
     llama_context per test instance, so a -v log carries one such line per
     test (e.g. 2048 for a pp2048 test, 256 for tg128), and the pp test's own
     context is always the largest -- the tg test's is bounded by n_gen, so it
-    never wins the max. None if no such line appears at all. Only the
-    long-prompt --table path consults this; every other caller ignores it.
+    never wins the max. None if no such line appears at all -- the caller
+    (long-prompt --table) must fail closed on that, never assume a default
+    ctx was achieved. Only --table consults "n_ctx"/"path"; every other
+    caller ignores them.
     """
     if not os.path.isfile(path):
         raise ParseError("%s: no such file" % path)
@@ -256,9 +264,11 @@ def parse_log(path, min_free_mib, wanted_tests):
     free_matches = FREE_VRAM_RE.findall(text)
     if not free_matches:
         raise ParseError(
-            "%s: no '- NNNNN MiB free' line. Was llama-bench run WITHOUT -v? "
-            "Without it the log callback is nulled and free VRAM is never printed, "
-            "so the run cannot be shown to be uncontaminated." % path
+            "%s: no '- NNNNN MiB free' line. Was llama-bench run WITHOUT -v "
+            "(the log callback is nulled and free VRAM is never printed), or did "
+            "the run fail before reaching the device -- e.g. a model-load error "
+            "(look for a 'llama_bench: error:' line)? Either way the run cannot "
+            "be shown to be uncontaminated." % path
         )
     free_mib = min(int(m) for m in free_matches)
     if free_mib < min_free_mib:
@@ -329,6 +339,7 @@ def parse_log(path, min_free_mib, wanted_tests):
     result = {t: found[t] for t in wanted_tests}
     result["free_mib"] = free_mib
     result["n_ctx"] = max(ctx_matches) if ctx_matches else None
+    result["path"] = path
     return result
 
 
@@ -345,25 +356,47 @@ def check_gate(spec, test, mean):
 
 
 def _stdev(values):
-    """Sample standard deviation (n-1). 0.0 for a single sample -- stdev needs
-    at least two points and a lone sample has no spread to report."""
+    """Sample standard deviation (n-1), or None for a single sample.
+
+    A lone sample has no spread to report -- returning 0.0 for it would be a
+    CLAIM of no spread (indistinguishable from "measured, and stable"), not
+    an honest "not computable". Render None as "n/a", never as a number.
+    """
     if len(values) < 2:
-        return 0.0
+        return None
     return statistics.stdev(values)
 
 
-_TABLE_HEADER = "| card | model | PP2048 | TG128 | PP8192 | TG128 | ctx achieved | notes |"
-_TABLE_SEPARATOR = "|---|---|---|---|---|---|---|---|"
+def _stdev_str(values):
+    """"%.2f" formatted, or "n/a" when _stdev() can't compute one."""
+    sd = _stdev(values)
+    return "n/a" if sd is None else "%.2f" % sd
 
 
-def _build_table_rows(arms, results):
+# Header/separator built from _LONG_PROMPT_PPS rather than hardcoded, so the
+# column list can't drift from the tuple that actually drives the rows below.
+_TABLE_COLUMNS = ["card", "model"]
+for _pp in _LONG_PROMPT_PPS:
+    _TABLE_COLUMNS += ["PP%d" % _pp, "TG128"]
+_TABLE_COLUMNS += ["ctx achieved", "notes"]
+del _pp
+
+_TABLE_HEADER = "| " + " | ".join(_TABLE_COLUMNS) + " |"
+_TABLE_SEPARATOR = "|" + "---|" * len(_TABLE_COLUMNS)
+
+# The "ctx achieved" column is reported against the LONGEST configured pp --
+# i.e. the actual long-prompt test, not an arbitrary one.
+_CTX_ACHIEVED_PP = _LONG_PROMPT_PPS[-1]
+
+
+def _build_table_rows(results):
     """Return (rows, None) or (None, error_message).
 
     Reuses the samples already parsed into `results` -- never re-parses a
     log -- so the table and the report above it are the same numbers.
     """
     rows = [_TABLE_HEADER, _TABLE_SEPARATOR]
-    for card in ("b70", "b50"):
+    for card in _LONG_PROMPT_CARDS:
         for model in _LONG_PROMPT_MODELS:
             cell = {}
             ctx_achieved = None
@@ -374,32 +407,33 @@ def _build_table_rows(arms, results):
                 for test in (pp_test, "tg128"):
                     values = [s[test] for s in samples]
                     mean = sum(values) / len(values)
-                    sd = _stdev(values)
-                    cell[(pp, test)] = "%.2f \u00b1 %.2f" % (mean, sd)
-                if pp == 8192:
-                    default_ctx = pp + 128  # n_prompt + n_gen, the naive expectation
-                    effective = [
-                        s["n_ctx"] if s["n_ctx"] is not None else default_ctx
-                        for s in samples
-                    ]
+                    cell[(pp, test)] = "%.2f \u00b1 %s" % (mean, _stdev_str(values))
+                if pp == _CTX_ACHIEVED_PP:
+                    # Fail closed: a sample with no achieved n_ctx at all must
+                    # never fall back to a naive default (n_prompt+n_gen) --
+                    # that would silently report an UNMEASURED figure as if it
+                    # were the achieved one (llama.cpp-z0wt review round 1).
+                    no_ctx = [s["path"] for s in samples if s["n_ctx"] is None]
+                    if no_ctx:
+                        return None, (
+                            "INPUT ERROR: %s: no achieved n_ctx (no "
+                            "'llama_context: n_ctx = N' line) in: %s\n"
+                            % (arm, ", ".join(no_ctx))
+                        )
+                    effective = [s["n_ctx"] for s in samples]
                     if len(set(effective)) != 1:
                         return None, (
                             "INPUT ERROR: %s: processes disagree on achieved n_ctx: %s\n"
                             % (arm, effective)
                         )
                     ctx_achieved = effective[0]
-            rows.append(
-                "| %s | %s | %s | %s | %s | %s | %d | - |"
-                % (
-                    CARD_LABELS[card],
-                    MODEL_LABELS[model],
-                    cell[(2048, "pp2048")],
-                    cell[(2048, "tg128")],
-                    cell[(8192, "pp8192")],
-                    cell[(8192, "tg128")],
-                    ctx_achieved,
-                )
-            )
+            row_cells = [CARD_LABELS[card], MODEL_LABELS[model]]
+            for pp in _LONG_PROMPT_PPS:
+                row_cells.append(cell[(pp, "pp%d" % pp)])
+                row_cells.append(cell[(pp, "tg128")])
+            row_cells.append(str(ctx_achieved))
+            row_cells.append("-")
+            rows.append("| " + " | ".join(row_cells) + " |")
     return rows, None
 
 
@@ -462,7 +496,7 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
 
     table_rows = None
     if want_table:
-        table_rows, table_err = _build_table_rows(arms, results)
+        table_rows, table_err = _build_table_rows(results)
         if table_err:
             err.write(table_err)
             return 2
@@ -480,16 +514,19 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         samples = results[arm]
         spec = arms[arm]
         out.write("%s (%s)\n" % (arm, spec["selector"]))
-        out.write("  free VRAM: %s MiB\n" % " ".join(str(s["free_mib"]) for s in samples))
+        free_values = [s["free_mib"] for s in samples]
+        out.write(
+            "  free VRAM: %s MiB (min %d)\n"
+            % (" ".join(str(v) for v in free_values), min(free_values))
+        )
         for test in spec["tests"]:
             values = [s[test] for s in samples]
             mean = sum(values) / len(values)
             ok, desc = check_gate(spec, test, mean)
             if spec["kind"] == REPORT:
-                sd = _stdev(values)
                 out.write(
-                    "  %-6s mean %9.2f  sd %6.2f  [%s]  %s\n"
-                    % (test, mean, sd, " ".join("%.2f" % v for v in values), desc)
+                    "  %-6s mean %9.2f  sd %6s  [%s]  %s\n"
+                    % (test, mean, _stdev_str(values), " ".join("%.2f" % v for v in values), desc)
                 )
             else:
                 out.write(
@@ -600,44 +637,63 @@ def self_test(out):
     good = _fx("b50-mistral-good.txt")
     lp_pp8192_good = _fx("b70-pp8192-good.txt")
 
-    # (name, matrix, arm_files, want_table, expected exit code)
+    # Each case is a dict so optional knobs (runs, want_table, contains) don't
+    # force every row to spell out every field.
+    #   name         label printed in the report
+    #   matrix       "merge-cert" or "long-prompt"
+    #   arms         {arm: [path, ...]}
+    #   expected     exit code this case must produce
+    #   want_table   pass --table (default False)
+    #   runs         required-samples-per-arm override (default DEFAULT_RUNS)
+    #   contains     substrings that must appear in stdout (default: none checked)
     cases = [
-        ("all arms good -> PASS", "merge-cert", _all_good("merge-cert"), False, 0),
-        ("one arm has 4 samples -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4}), False, 2),
-        ("one sample empty -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("empty.txt")]}), False, 2),
-        ("one sample missing the free-VRAM line -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("no-vram-line.txt")]}), False, 2),
-        ("one sample has an unparseable t/s cell -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("unparseable-ts.txt")]}), False, 2),
-        ("one sample has no fa column -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("no-fa-column.txt")]}), False, 2),
-        ("one sample contaminated (low free VRAM) -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("low-free-vram.txt")]}), False, 2),
-        ("a missing file -> parse error", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("does-not-exist.txt")]}), False, 2),
-        ("an arm entirely absent -> parse error", "merge-cert",
-         {a: v for a, v in _all_good("merge-cert").items() if a != "b70-gptoss"}, False, 2),
-        ("below-floor throughput -> VERDICT FAIL (not a parse error)", "merge-cert",
-         _with("merge-cert", **{"b50-mistral": [_fx("b50-mistral-below-floor.txt")] * DEFAULT_RUNS}), False, 1),
+        dict(name="all arms good -> PASS", matrix="merge-cert",
+             arms=_all_good("merge-cert"), expected=0),
+        dict(name="one arm has 4 samples -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4}), expected=2),
+        dict(name="one sample empty -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("empty.txt")]}), expected=2),
+        dict(name="one sample missing the free-VRAM line -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("no-vram-line.txt")]}), expected=2),
+        dict(name="one sample has an unparseable t/s cell -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("unparseable-ts.txt")]}), expected=2),
+        dict(name="one sample has no fa column -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("no-fa-column.txt")]}), expected=2),
+        dict(name="one sample contaminated (low free VRAM) -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("low-free-vram.txt")]}), expected=2),
+        dict(name="a missing file -> parse error", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 4 + [_fx("does-not-exist.txt")]}), expected=2),
+        dict(name="an arm entirely absent -> parse error", matrix="merge-cert",
+             arms={a: v for a, v in _all_good("merge-cert").items() if a != "b70-gptoss"}, expected=2),
+        dict(name="below-floor throughput -> VERDICT FAIL (not a parse error)", matrix="merge-cert",
+             arms=_with("merge-cert", **{"b50-mistral": [_fx("b50-mistral-below-floor.txt")] * DEFAULT_RUNS}),
+             expected=1),
 
-        ("long-prompt all arms good -> PASS (report-only)", "long-prompt",
-         _all_good("long-prompt"), False, 0),
-        ("long-prompt one arm entirely absent -> parse error", "long-prompt",
-         {a: v for a, v in _all_good("long-prompt").items() if a != "b70-gemma4-pp8192"}, False, 2),
-        ("long-prompt one sample missing its pp8192 row -> parse error", "long-prompt",
-         _with("long-prompt", **{
-             "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("pp8192-missing-pprow.txt")],
-         }), False, 2),
-        ("long-prompt n_ctx disagreement across a cell's processes -> parse error", "long-prompt",
-         _with("long-prompt", **{
-             "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("b70-pp8192-ctx-mismatch.txt")],
-         }), True, 2),
-        ("--table with merge-cert -> parse error", "merge-cert",
-         _all_good("merge-cert"), True, 2),
-        ("long-prompt --table all good -> PASS with markdown rows", "long-prompt",
-         _all_good("long-prompt"), True, 0),
+        dict(name="long-prompt all arms good -> PASS (report-only)", matrix="long-prompt",
+             arms=_all_good("long-prompt"), expected=0),
+        dict(name="long-prompt one arm entirely absent -> parse error", matrix="long-prompt",
+             arms={a: v for a, v in _all_good("long-prompt").items() if a != "b70-gemma4-pp8192"}, expected=2),
+        dict(name="long-prompt one sample missing its pp8192 row -> parse error", matrix="long-prompt",
+             arms=_with("long-prompt", **{
+                 "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("pp8192-missing-pprow.txt")],
+             }), expected=2),
+        dict(name="long-prompt n_ctx disagreement across a cell's processes -> parse error",
+             matrix="long-prompt",
+             arms=_with("long-prompt", **{
+                 "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("b70-pp8192-ctx-mismatch.txt")],
+             }), want_table=True, expected=2),
+        dict(name="long-prompt one sample with NO achieved n_ctx -> parse error (never a default)",
+             matrix="long-prompt",
+             arms=_with("long-prompt", **{
+                 "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("b70-pp8192-no-ctx.txt")],
+             }), want_table=True, expected=2),
+        dict(name="--table with merge-cert -> parse error", matrix="merge-cert",
+             arms=_all_good("merge-cert"), want_table=True, expected=2),
+        dict(name="long-prompt --table all good -> PASS with markdown rows", matrix="long-prompt",
+             arms=_all_good("long-prompt"), want_table=True, expected=0),
+        dict(name="long-prompt --runs 1 -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
+             arms={arm: [_fixture_for_long_prompt_arm(arm)] for arm in LONG_PROMPT_ARMS},
+             runs=1, expected=0, contains=["n/a"]),
     ]
 
     # Expected stream occupancy per exit code. Checking this is the point:
@@ -647,19 +703,27 @@ def self_test(out):
     stream_contract = {0: (True, False), 1: (True, True), 2: (False, True)}
 
     failures = 0
-    for name, matrix, arms, want_table, expected in cases:
+    for case in cases:
+        name = case["name"]
+        expected = case["expected"]
         cap_out, cap_err = io.StringIO(), io.StringIO()
-        got = evaluate(matrix, arms, DEFAULT_RUNS, {}, cap_out, cap_err, want_table)
+        got = evaluate(
+            case["matrix"], case["arms"], case.get("runs", DEFAULT_RUNS), {},
+            cap_out, cap_err, case.get("want_table", False),
+        )
         want_out, want_err = stream_contract[expected]
         streams_ok = (bool(cap_out.getvalue()) == want_out
                       and bool(cap_err.getvalue()) == want_err)
-        ok = got == expected and streams_ok
+        missing = [t for t in case.get("contains", []) if t not in cap_out.getvalue()]
+        ok = got == expected and streams_ok and not missing
         note = ""
         if got != expected:
             note = "  <- wrong exit code"
         elif not streams_ok:
             note = "  <- wrong stream: stdout=%d bytes stderr=%d bytes" % (
                 len(cap_out.getvalue()), len(cap_err.getvalue()))
+        elif missing:
+            note = "  <- stdout missing %r" % missing
         out.write("  %-62s expected %d got %d  %s%s\n"
                   % (name, expected, got, "OK" if ok else "FAIL", note))
         if not ok:
@@ -719,9 +783,11 @@ Exit 2 covers: missing file, empty file, an arm with fewer than the required
 samples, an arm entirely absent, a results directory that does not exist, a
 directory that exists but is empty, an unparseable t/s cell, a table with no
 'fa' column (not the -fa 1 matrix), a log with no '- NNNNN MiB free' line
-(llama-bench run without -v), free VRAM below the contamination floor,
---table combined with --matrix merge-cert, and (long-prompt --table only) the
-five processes of one arm disagreeing on the achieved n_ctx.
+(llama-bench run without -v, or the run failed before reaching the device),
+free VRAM below the contamination floor, --table combined with --matrix
+merge-cert, and (long-prompt --table only) a sample with no achieved n_ctx at
+all, or the five processes of one arm disagreeing on the achieved n_ctx --
+never a silent default for either.
 
 1 and 2 are deliberately distinct: "the branch is slow" and "I could not
 measure the branch" are different facts and must not share an exit code.
@@ -729,7 +795,7 @@ measure the branch" are different facts and must not share an exit code.
 Matrices: merge-cert (four arms, numeric floor/band, gates merges) and
 long-prompt (twelve arms, report-only -- no floor/band exists yet).
 
-Verify the parser before trusting its verdict:  --self-test  (expects 16/16)
+Verify the parser before trusting its verdict:  --self-test  (expects 18/18)
 Gate definition: docs/backend/sycl-perf-baselines.md
 """
 
