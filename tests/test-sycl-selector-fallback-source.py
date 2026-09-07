@@ -134,7 +134,18 @@ _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 # A preprocessor directive line, following backslash-newline continuations
 # (a multi-line `#define X(a) \` in main()'s preamble must be skipped whole,
 # not just its first physical line -- quality round 1, c-h331 nit 4).
-_PP_LINE = re.compile(r"#[^\n]*(?:\\\n[^\n]*)*")
+#
+# Quality round 2 (rev-5q1r-quality-2, c-dhg6) found the first attempt at
+# this, `#[^\n]*(?:\\\n[^\n]*)*`, was a no-op for its own stated purpose: the
+# greedy `[^\n]*` consumes the trailing backslash on the first line (a
+# backslash is not `\n`), so the match already succeeds before the
+# continuation alternative is ever tried, and nothing forces a backtrack.
+# `_PP_LINE.match("#define X(a) \\\n    do_stuff(a)\n")` returned only
+# `"#define X(a) \\"`.  The fix processes character-by-character with the
+# continuation as its own alternative, tried FIRST, so a literal `\` right
+# before a newline is consumed together with that newline instead of ending
+# the match:
+_PP_LINE = re.compile(r"#(?:\\\n|[^\n])*")
 
 # Files that setenv("ONEAPI_DEVICE_SELECTOR" in their own main() but are
 # deliberately NOT part of this port (llama.cpp-5q1r, lead guidance c-kjzk),
@@ -202,18 +213,33 @@ def _find_main_bodies(text):
     strictly between each main(...) function's opening brace and its
     matching closing brace, found by depth-counted brace scanning.
 
-    LIMITATION (quality round 1, c-h331 nit 3): this scanner is NOT
-    string/comment aware -- a `{` or `}` inside a string literal or a
-    comment (e.g. `printf("open brace: {\\n")` or `// note: }`) is counted
-    as a real brace and can mis-bound a main() body. This fails CLOSED, not
-    open: a stray brace can only make the counted body end too early or too
-    late, which in practice makes an otherwise-compliant file read as
-    offender_not_first_statement (verified: both a string-literal `{` and a
-    line-comment `}` placed before a correct call still classify as an
-    offender, never as a false compliant). Proper string/comment-aware
-    scanning would remove this blind spot; it has not been implemented
-    because every real hit today is fail-closed and a human reads the
-    failure message rather than trusting a silent false pass."""
+    LIMITATION (quality round 1, c-h331 nit 3; disposition refined in
+    quality round 2, c-dhg6 nit B): this scanner is NOT string/comment
+    aware -- a `{` or `}` inside a string literal or a comment (e.g.
+    `printf("open brace: {\\n")` or `// note: }`) is counted as a real
+    brace and can mis-bound a main() body's end (too early or too late).
+
+    No shape has been found where this mis-bounding, BY ITSELF, flips a
+    genuine offender to a false compliant. Reasoning: `_first_statement_ok`
+    always begins its search for the first real statement at `body_start`
+    (the position immediately after main()'s TRUE opening brace, which the
+    signature regex finds correctly regardless of brace counting) and reads
+    the actual file text from there forward or, via
+    `_first_statement_is_valid`, from a fixed offset -- never from a
+    boundary derived by counting past a spurious brace. A too-early
+    `body_end` can only make the scanner give up before reaching a real
+    statement (offender, fail closed) or fail to attribute a match found
+    beyond it to this main() at all (also fail closed, via
+    found_relevant_main). A too-late `body_end` can only pull in match text
+    that belongs to a LATER function, which the first-real-statement walk
+    still reaches only after passing through main()'s own real statements
+    first, so a mismatch there is still reported as an offender. Four
+    constructed shapes probing this (a string-literal `{`, a line-comment
+    `}`, one before the call and one after) were all confirmed fail-closed;
+    none produced a false compliant. Proper string/comment-aware scanning
+    would still be a cleaner implementation, but the motivating risk for a
+    source gate -- a broken file passing silently -- has not been observed
+    to exist at this seam."""
     for m in MAIN_SIGNATURE_PATTERN.finditer(text):
         start = m.end()
         depth = 1
@@ -444,6 +470,22 @@ def test_first_statement_position_is_checked():
     )
     assert _classify(helper_after_only_noise) == "compliant"
 
+    # A multi-line preprocessor directive (backslash-newline continuation)
+    # before the call must be skipped WHOLE, not just its first physical
+    # line -- quality round 2 (c-dhg6) found the predecessor _PP_LINE regex
+    # was a no-op for exactly this shape: it silently stopped at the
+    # trailing backslash and treated the continuation line as the first
+    # real statement, misclassifying this fixture as an offender.
+    helper_after_multiline_define = (
+        'int main(int, char ** argv) {\n'
+        '#define LOCAL_HELPER(a) \\\n'
+        '    do_stuff(a)\n'
+        '    sycl_test_selector_fallback(argv, "level_zero:0");\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(helper_after_multiline_define) == "compliant"
+
     # The pattern exists in the file but not inside ANY main() body at all
     # -- it cannot be main()'s first statement if it is not in main().
     setenv_outside_main = (
@@ -537,16 +579,50 @@ def test_recursive_scan_reaches_known_subdirectories():
     )
 
 
+def _registration_form(stem, cmake_text):
+    """Returns the matched CMake registration call for `stem` (a .cpp
+    file's basename without extension) in `cmake_text`, or None -- an
+    add_executable(...), llama_build(...)/llama_build_and_test(...) (which
+    take the .cpp filename), or add_test(NAME ...) call, never a bare
+    substring match.
+
+    Quality round 2 (rev-5q1r-quality-2, c-dhg6 nit A) found the
+    predecessor of this check, `stem not in cmake_text`, is satisfiable by
+    PROSE ALONE: tests/CMakeLists.txt:2680 mentions "test-sycl-model-
+    repro.cpp" inside a comment (a catalogued "restorable source" note),
+    with no registration anywhere nearby -- a bare substring check would
+    have reported that file as registered the moment its name was merely
+    discussed, false-alarming a human into believing an exclusion needs
+    dropping when nothing was actually registered."""
+    escaped = re.escape(stem)
+    for pattern in (
+        rf"add_executable\s*\(\s*{escaped}\b",
+        rf"llama_build\s*\(\s*{escaped}\.cpp\b",
+        rf"llama_build_and_test\s*\(\s*{escaped}\.cpp\b",
+        rf"add_test\s*\(\s*NAME\s+{escaped}\b",
+    ):
+        m = re.search(pattern, cmake_text)
+        if m:
+            return m.group(0)
+    return None
+
+
 def test_excluded_files_are_still_accounted_for():
     """Guards the exclusion list itself against silent rot: each excluded
     file must still exist, still contain a bespoke ONEAPI_DEVICE_SELECTOR
-    setenv() (the pattern that justified excluding it), and -- since every
-    current exclusion's stated reason is "not registered anywhere" -- its
-    bare name must still be ABSENT from both CMakeLists.txt files. The
-    moment a file is registered, this assertion fails and forces a human to
-    either port it or write a new, still-true reason instead of the
-    exclusion silently protecting a now-built, now-ctest-registered test
-    (spec round 1, c-k45u finding 3)."""
+    setenv() (the pattern that justified excluding it), and must still lack
+    an actual CMake registration (add_executable / llama_build* / add_test)
+    in either CMakeLists.txt -- checked via _registration_form(), not a
+    bare substring, precisely because a bare substring is satisfiable by
+    prose alone (see that function's docstring). "Not registered" is a
+    secondary, non-load-bearing fact for the current exclusion (its
+    PRIMARY reason -- the subprocess-command-string mechanism, see
+    EXCLUDED_FILES -- is what actually discriminates it from ported, gated
+    files that are equally unregistered), but it is still checked here: the
+    moment a currently-excluded file gains a real registration, a human
+    should re-examine whether the exclusion (for whichever reason) still
+    holds, rather than the exclusion silently continuing to skip a newly
+    built, ctest-registered test (spec round 1, c-k45u finding 3)."""
     for rel in EXCLUDED_FILES:
         path = REPO_ROOT / rel
         assert path.is_file(), f"excluded file {rel} no longer exists -- update this gate's EXCLUDED_FILES"
@@ -558,11 +634,12 @@ def test_excluded_files_are_still_accounted_for():
         stem = path.stem  # basename without .cpp -- the CMake target/source name
         for cmake_path in CMAKE_FILES:
             cmake_text = cmake_path.read_text(encoding="utf-8")
-            assert stem not in cmake_text, (
-                f"excluded file {rel} (target name '{stem}') now appears in "
-                f"{cmake_path.relative_to(REPO_ROOT)} -- it has been registered, so the "
-                "\"not registered anywhere\" exclusion reason no longer holds. Port it to the "
-                "shared helper and drop it from EXCLUDED_FILES instead of leaving the exclusion in place."
+            found = _registration_form(stem, cmake_text)
+            assert found is None, (
+                f"excluded file {rel} (target name '{stem}') now has a real registration "
+                f"({found!r}) in {cmake_path.relative_to(REPO_ROOT)} -- re-examine whether the "
+                "exclusion still holds for its stated (primary) reason; if not, port it to the "
+                "shared helper and drop it from EXCLUDED_FILES."
             )
 
 
