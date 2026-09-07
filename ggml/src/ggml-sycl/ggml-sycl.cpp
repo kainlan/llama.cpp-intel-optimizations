@@ -90875,21 +90875,33 @@ static uint64_t moe_graph_dispatch_identity_signature(ggml_backend_sycl_context 
         }
         // Diagnostic-only reads before the table is confirmed present: an
         // extra with no weight_ext yet is exactly the "table not valid"
-        // state, so null-check rather than allocate via weight() here.
-        // capture_table_reject() only needs SOME handle value for logging on
-        // the early-reject path -- a default-constructed one reports the
-        // same "invalid" fields a never-populated array slot would.
+        // state, so both checks below null-check weight_ext rather than
+        // allocate via weight().
+        //
+        // capture_table_reject() below needs a handle to log. weight_ext may
+        // already be allocated with a populated (but no longer valid) table
+        // handle at that point -- invalidate_backend_weight_mutation()
+        // clears moe_device_table_valid without clearing the handle itself
+        // -- so it reads the real handle when weight_ext exists (still
+        // without allocating: weight_ext is only null-checked, never
+        // lazily created) and falls back to a default-constructed one only
+        // when weight_ext genuinely does not exist yet, the same "invalid"
+        // fields a never-populated array slot would have reported before
+        // the weight_ext split.
+        //
+        // The ternary deliberately COPIES the handle rather than binding a
+        // reference to it (a reference cannot bind across the ternary's own
+        // temporary on the default-handle branch anyway). The copy is safe
+        // here because this is a diagnostic read, not a lease: mem_handle's
+        // copy constructor cannot drive its refcount to zero, and every
+        // caller reaching this point runs inside graph-compute dispatch
+        // with no cache lock held, so there is no concurrent eviction for a
+        // momentarily-stale copy to race against.
         if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[sycl_ctx->device]) {
             const int role_layer_hash = moe_cache_layer_id(role.weight->name ? role.weight->name : "");
             (void) moe_fusion_ensure_full_local_ptr_table_from_descriptor(*sycl_ctx, role, role_layer_hash);
         }
         if (!extra->weight_ext || !extra->weight_ext->moe_device_table_valid[sycl_ctx->device]) {
-            // weight_ext may already be allocated with a populated (but no
-            // longer valid) table handle here -- invalidate_backend_weight_
-            // mutation() clears moe_device_table_valid without clearing the
-            // handle itself -- so report the real handle when one exists
-            // rather than always synthesizing a default one for the reject
-            // diagnostics.
             capture_table_reject(extra, extra->weight_ext ?
                                             extra->weight_ext->moe_expert_ptrs_handle[sycl_ctx->device] :
                                             ggml_sycl::mem_handle{});
