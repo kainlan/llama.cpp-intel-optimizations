@@ -147,6 +147,23 @@ cover):
   parses string/char literals identically (so a `//` or a quote inside one
   still cannot corrupt the scan) but leaves their content unmasked, closing
   both directions without breaking any genuine call.
+  Final integration round 2 (rev-final-2, c-s29e finding B2 / llama.cpp-3tqc)
+  found round 1's masking fix itself had a gap in the `//` branch of
+  _mask_scan: it ended a line comment at the first `\n` regardless of a
+  trailing backslash, so it did not implement C++ translation phase 2 (line
+  splicing) -- a `//` comment whose line ends in a backslash really continues onto
+  the next physical line, and that continuation is not seen by a compiler
+  as code at all. A bare setenv() followed by such a comment, with a live-
+  looking `execv("/proc/self/exe", argv);` written on the spliced-away
+  line, was left unmasked and satisfied the re-exec proof: a FALSE PASS,
+  the same direction and the same "disabled execv still satisfies the
+  proof" family as B1, but a genuine masking gap rather than B1's raw-text
+  gap (contrast with llama.cpp-ur8d's `#if 0` residual below, which is NOT
+  a masking gap -- that execv() is real, unmasked, textually-dead code by
+  design). Fixed by advancing the `//` branch's end-of-comment search past
+  every backslash-newline continuation (allowing an intervening `\r`)
+  before blanking, keeping the mask length- and offset-preserving. See
+  test_line_spliced_comment_does_not_expose_execv_proof.
 GREEN (after every round above): every in-scope file calls the shared
 helper as the first statement of main, or -- for a sibling mid-review on
 another branch -- may still legitimately carry the canonical inline block
@@ -193,27 +210,80 @@ execv("/proc/self/exe"" proof in (1)(b), and the whole-file
 `sycl_test_selector_fallback(`/`setenv("ONEAPI_DEVICE_SELECTOR"` occurrence
 scans used to detect a half-finished port or a call outside main(), are all
 evaluated against `_mask_comments_only(text)` (final integration round,
-rev-final-1 c-91qe finding B1 / llama.cpp-aenv, folding in llama.cpp-7wal),
-not raw source text: a `//` or `/* */` comment can never satisfy any of
-these checks, closing both a false PASS (a bare setenv() "proven" re-exec-
+rev-final-1 c-91qe finding B1 / llama.cpp-aenv, folding in llama.cpp-7wal;
+its own `//`-branch line-splicing gap closed by final integration round 2,
+rev-final-2 c-s29e finding B2 / llama.cpp-3tqc), not raw source text. What
+this GUARANTEES: an ordinarily-written `//` or `/* */` comment -- including
+a `//` comment whose OWN TERMINATOR is spliced away onto a following
+physical line by a standard backslash-immediately-before-newline
+continuation -- cannot satisfy any of these checks merely by containing
+matching text, closing both a false PASS (a bare setenv() "proven" re-exec-
 safe by a comment quoting the proof text) and a false FAIL (an otherwise-
 compliant file's real call misclassified because a comment elsewhere
-quotes the same pattern). This is deliberately narrower than
+quotes the same pattern). This guarantee does NOT extend to phase-2
+splicing of a comment's OWN INTRODUCER (`//` or `/*` itself split across a
+splice), nor to the GCC/clang non-standard trailing-whitespace splice
+extension -- see the KNOWN RESIDUALS bullet below (llama.cpp-t81m) for
+those still-open shapes. This is deliberately narrower than
 `_mask_comments_and_literals` (used only by _find_main_bodies for
 signature/brace scanning): string and char literals are left UNMASKED here
 because the patterns are themselves anchored on their own quoted argument
 (`"ONEAPI_DEVICE_SELECTOR"`, `"/proc/self/exe"`) -- blanking literals would
-blind every check to genuine calls, not just comment-based false ones. The
-residual gap this leaves is the same one _mask_comments_and_literals
-already documents: a raw string literal (`R"(...)"`) is not specially
-recognized by either masking function, so one could in principle still
-smuggle an unescaped, pattern-matching sequence past this gate. No in-scope
-file uses a raw string literal at the time of writing (see
-_mask_comments_and_literals' and _mask_comments_only's docstrings for the
-census); a normally-escaped string literal cannot reach this gap at all,
-because C++ requires escaping an embedded `"`, which breaks the raw regex
-match (`execv\\(\\s*"` requires an UNESCAPED quote immediately after the
-open paren) independently of any masking.
+blind every check to genuine calls, not just comment-based false ones.
+
+This is NOT a completeness claim -- named residuals remain, none of them
+closed by masking:
+  - A raw string literal (`R"(...)"`) is not specially recognized by
+    either masking function, so one could in principle still smuggle an
+    unescaped, pattern-matching sequence past this gate. No in-scope file
+    uses one at the time of writing (see _mask_comments_and_literals' and
+    _mask_comments_only's docstrings for the census); a normally-escaped
+    string literal cannot reach this gap at all, because C++ requires
+    escaping an embedded `"`, which breaks the raw regex match
+    (`execv\\(\\s*"` requires an UNESCAPED quote immediately after the open
+    paren) independently of any masking.
+  - Digraphs (`<%`/`%>` for `{`/`}`, `<:`/`:>` for `[`/`]`, ...) are
+    invisible to both the mask and the brace walk (see
+    _find_main_bodies' docstring).
+  - A macro-spelled `main` (e.g. `#define ENTRY int main` /
+    `ENTRY(argc, argv) { ... }`) is invisible to MAIN_SIGNATURE_PATTERN
+    regardless of masking (see _find_main_bodies' docstring).
+  - A `#if 0` (or any always-false preprocessor guard) wrapping a real
+    `execv("/proc/self/exe", argv);` call satisfies the execv() proof even
+    though it never compiles or runs -- tracked as llama.cpp-ur8d. This one
+    is NOT a masking gap: `#if 0 ... #endif` is real, unmasked code by
+    design, and the proof-window search has no preprocessor-awareness at
+    all (see _find_main_bodies' docstring for the full contrast with B2).
+  - PHASE-2 SPLICING RESIDUAL (quality round 1 on B2, rev-3tqc-quality-1
+    c-m5ni; tracked as llama.cpp-t81m): B2 fixed only the standard splice
+    of a `//` comment's OWN TERMINATOR (backslash immediately before the
+    newline). Three related shapes remain open, none fixed here:
+      (EXT) GCC and clang also splice a backslash followed by TRAILING
+          WHITESPACE (spaces or tabs) before the newline, as a long-
+          standing extension, with a warning (`-Wbackslash-newline-escape`
+          on clang; a similar GCC diagnostic). A `//` comment ending in a
+          backslash that is itself followed by trailing whitespace before
+          the line break still splices on those compilers even though
+          `_mask_scan` does not treat it as a continuation.
+      (LINE-INTRO) a spliced LINE-COMMENT INTRODUCER: a bare `/` followed
+          by a backslash-newline splice followed by `/` reassembles into
+          `//` only after phase-2 splicing runs, so the raw two-character
+          lookahead this scanner does (`text[i:i+2] == "//"`) never
+          recognizes it as a comment opener at all -- the "comment" (and
+          anything after it) is read as ordinary, unmasked code.
+      (BLOCK-INTRO) the same for a BLOCK-COMMENT introducer: `/` +
+          backslash-newline + `*` similarly never reads as `/*`.
+    (Labelled EXT/LINE-INTRO/BLOCK-INTRO here, deliberately not reusing the
+    (a)/(b) labels from the ACCEPTED FORMS list above, which name the
+    helper-call and inline-block forms and mean something unrelated.)
+    Each of these can, in principle, leave an execv("/proc/self/exe", argv);
+    unmasked when it should really be inert comment text (the same false-
+    PASS direction as B2 itself, for EXT and for text following an
+    unrecognised LINE-INTRO/BLOCK-INTRO introducer) -- past this scanner.
+    Genuine phase-2 splicing (reassembling tokens split across a splice
+    BEFORE any lexical scan, rather than patching each masking branch one
+    shape at a time) is the correct fix and is out
+    of scope for this task; filed as llama.cpp-t81m.
 
 This gate reads SOURCE TEXT only -- no compiler, no SYCL device.
 """
@@ -383,9 +453,13 @@ def _mask_scan(text, mask_literals):
     missed in the other.
 
     Returns a copy of `text` the same length, with every `//` line comment
-    and `/* */` block comment replaced character-for-character by spaces
-    (newlines inside a masked span are kept as newlines, everything else
-    becomes a space). String literals ("...") and char literals ('...') are
+    and `/* */` block comment THE SCANNER RECOGNISES replaced character-for-
+    character by spaces (newlines inside a masked span are kept as
+    newlines, everything else becomes a space) -- see KNOWN RESIDUALS below
+    for the phase-2 comment-INTRODUCER shapes (`/` + a splice + `/` or `*`)
+    this raw two-character lookahead does not recognise as a comment start
+    at all, llama.cpp-t81m. String literals ("...") and char literals
+    ('...') are
     always PARSED with the same logic (so a `//`, a brace, or a quote inside
     one still cannot be misread as a comment start or a literal boundary
     elsewhere) -- `mask_literals` controls only whether their CONTENT is
@@ -456,6 +530,13 @@ def _mask_scan(text, mask_literals):
         introduced by the B1/7wal masking fix, spec round 1 rev-aenv-spec-1
         c-ng46); tracked as its own follow-up, llama.cpp-ur8d -- do not fix
         the proof window as part of this task.
+      - PHASE-2 LINE-SPLICING (quality round 1 on B2, rev-3tqc-quality-1
+        c-m5ni; tracked as llama.cpp-t81m): this scanner only implements
+        the standard's splice of a `//` comment's own TERMINATOR (module
+        docstring's B2 entry). See the module docstring's CONTRACT prose,
+        KNOWN RESIDUALS phase-2 bullet, for the three still-open shapes
+        (the GCC/clang trailing-whitespace splice extension, and a spliced
+        line- or block-comment INTRODUCER) this does not cover.
     Digit separators (`1'000'000`) are HANDLED as of quality round 6, and
     encoding-prefixed char literals (`L'x'`, `u'x'`, `U'x'`, `u8'x'`) are
     HANDLED as of quality round 7 -- neither is a residual, listed here
@@ -472,8 +553,36 @@ def _mask_scan(text, mask_literals):
     while i < n:
         two = text[i : i + 2]
         if two == "//":
-            j = text.find("\n", i)
-            end = j if j != -1 else n
+            # C++ translation phase 2 (line splicing): a physical line whose
+            # newline is immediately preceded by a backslash (optionally
+            # with a "\r" in between, for CRLF sources) is spliced onto the
+            # next physical line before comments are even recognised, so a
+            # `//` comment ending in `\` continues onto the next physical
+            # line too. Advance past every such continuation before
+            # settling on the comment's end so that continued line does not
+            # survive masking. This mirrors only backslash-immediately-
+            # before-newline, which is the C++ standard's actual splice
+            # rule and is what this check is scoped to. GCC and clang also
+            # splice a backslash followed by trailing whitespace (spaces
+            # or tabs) before the newline, as a long-standing extension
+            # (warned on, e.g. clang's -Wbackslash-newline-escape) -- that
+            # broader, non-standard form is deliberately NOT matched here;
+            # see the CONTRACT docstring's KNOWN RESIDUALS list
+            # (llama.cpp-t81m) for the still-open shapes this leaves.
+            j = i + 2
+            while True:
+                j = text.find("\n", j)
+                if j == -1:
+                    j = n
+                    break
+                k = j - 1
+                if k >= i and text[k] == "\r":
+                    k -= 1
+                if k >= i and text[k] == "\\":
+                    j += 1
+                    continue
+                break
+            end = j
             out.append("".join(ch if ch == "\n" else " " for ch in text[i:end]))
             i = end
         elif two == "/*":
@@ -1332,6 +1441,53 @@ def test_execv_proof_ignores_commented_text():
         '}\n'
     )
     assert _classify(control_real_inline_block_with_unrelated_string) == "compliant"
+
+
+def test_line_spliced_comment_does_not_expose_execv_proof():
+    """Fixture proving B2 (rev-final-2, c-s29e / llama.cpp-3tqc) is closed:
+    a `//` comment whose line ends in a backslash continues, under real
+    C++ translation-phase-2 line splicing, onto the next physical line --
+    so `execv("/proc/self/exe", argv);` placed there never actually
+    compiles; it is still comment text. Before this fix `_mask_scan`'s
+    `//` branch ended the comment at the first `\n` regardless of a
+    trailing backslash, so that continuation line was left unmasked and
+    satisfied the execv() re-exec proof for a setenv() that never really
+    re-execs -- classifying `compliant` for what is, in the real
+    compiler's eyes, a bare no-op setenv(). Confirmed pre-existing on
+    master 6e54ba2eb (both arms below returned `compliant` there); this is
+    the same "disabled execv still satisfies the proof" family as
+    llama.cpp-ur8d's `#if 0` residual, but this one IS a masking gap
+    (ur8d's is not -- `#if 0 ... #endif` is real unmasked code by design).
+
+    Two arms:
+      1. the comment ends in a backslash -- the execv() call is (really) still
+         inside the comment and must NOT satisfy the proof:
+         offender_bare_setenv (was: compliant, the bug).
+      2. the same file with the backslash removed -- the comment ends on
+         its own line and the execv() on the next line is genuine live
+         code: compliant, both before and after this fix (proves the fix
+         does not touch the honest case)."""
+    arm_spliced_comment_hides_execv = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);  // FIXME re-enable: \\\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(arm_spliced_comment_hides_execv) == "offender_bare_setenv"
+
+    control_backslash_removed_execv_is_live = (
+        'int main(int, char ** argv) {\n'
+        '    if (!getenv("ONEAPI_DEVICE_SELECTOR")) {\n'
+        '        setenv("ONEAPI_DEVICE_SELECTOR", "level_zero:0", 1);  // FIXME re-enable:\n'
+        '        execv("/proc/self/exe", argv);\n'
+        '    }\n'
+        '    return 0;\n'
+        '}\n'
+    )
+    assert _classify(control_backslash_removed_execv_is_live) == "compliant"
 
 
 def test_comment_outside_main_quoting_a_form_does_not_offend():
