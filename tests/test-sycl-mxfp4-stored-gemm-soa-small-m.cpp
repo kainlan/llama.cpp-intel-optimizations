@@ -184,6 +184,15 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
         // scales (llama.cpp-6f73 c-gngd -- omitted before, closing the
         // 4,521,600 vs 4,524,480 gap against the kernel's own
         // profile_label.bytes), plus the M x n_out f32 output.
+        //
+        // Per-launch bandwidth is THIS figure divided by the mean device
+        // time for one launch (mean_ns), NOT this figure divided into the
+        // kernel-profiler CSV's `bytes` column: sycl-kernel-profiler.cpp's
+        // aggregate accumulates `aggregate.bytes += label.bytes` once per
+        // recorded launch, so that column is the SUM over `count` launches.
+        // Dividing the summed column by mean_ns overstates bandwidth by a
+        // factor of `count` (llama.cpp-6f73 c-irug: a naive read once gave
+        // 34% of peak where the true per-launch figure was 8.5%).
         const double bytes_moved = (double) n_out * (double) n_k * 17.0 / 32.0 + (double) M * (double) n_k +
                                    (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
         std::printf("  bytes_moved M=%lld n_out=%lld n_k=%lld: %.0f\n", (long long) M, (long long) n_out,

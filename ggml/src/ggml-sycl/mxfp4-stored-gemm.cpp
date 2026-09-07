@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "unified-kernel.hpp"  // GGML_SYCL_ESIMD_AVAILABLE, esimd/xmx aliases, SYCL_ESIMD_KERNEL
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -204,13 +205,25 @@ static sycl::event mxfp4_soa_gemm_int8_dpas_launch(sycl::queue &                
     // mxfp4_pair_glu_xmx_tiled_dpas_m2's own geometry at the GPT-OSS shape
     // (see this file's commit body for that comparison) without needing a
     // GPU-side profiler.
+    //
+    // kt_per_partition (below) is the CEILING, i.e. what every partition
+    // except the last one actually does; the last partition's own
+    // k-tile count is clamped by the same `kt_end = min(kt_start +
+    // kt_per_partition, k_tiles)` the kernel body uses (llama.cpp-6f73
+    // spec round 3, c-p2gm nit 6) -- e.g. at K=2880 (k_tiles=90,
+    // K_PARTITIONS=8) partitions 0-6 each process 12 k-tiles and
+    // partition 7 processes only 6. Print both so the geometry is
+    // complete without running the binary.
     if (std::getenv("GGML_SYCL_STORED_GEMM_DEBUG")) {
+        const int64_t kt_start_last = (K_PARTITIONS - 1) * kt_per_partition;
+        const int64_t kt_end_last   = std::min(kt_start_last + kt_per_partition, k_tiles);
+        const int64_t kt_last       = std::max<int64_t>(0, kt_end_last - kt_start_last);
         std::fprintf(stderr,
                      "[mxfp4-stored-gemm] M_TILE=%d n_out=%d n_k=%d global_range=%lld local_range=%d "
                      "work_groups(n_tiles)=%lld rows_per_work_item(exec_n)=%d k_tiles_total=%lld "
-                     "k_tiles_per_work_item=%lld\n",
+                     "k_tiles_per_work_item(max)=%lld k_tiles_per_work_item(last_partition)=%lld\n",
                      M_TILE, n_out, n_k, (long long) (n_tiles * K_PARTITIONS), K_PARTITIONS, (long long) n_tiles,
-                     exec_n, (long long) k_tiles, (long long) kt_per_partition);
+                     exec_n, (long long) k_tiles, (long long) kt_per_partition, (long long) kt_last);
     }
 
     return queue.submit([&](sycl::handler & h) {
@@ -405,6 +418,13 @@ sycl::event ggml_sycl_mxfp4_soa_gemm_dpas(sycl::queue &                    queue
     // most 8 x 2880 = 23 KB for M=8, K=2880) stays cache-resident across the
     // launch rather than being evicted and re-fetched from DRAM per
     // work-item (llama.cpp-6f73 c-ru7x item 4).
+    //
+    // Per-launch bandwidth is profile_label.bytes / mean_ns for ONE launch,
+    // not profile_label.bytes divided into the kernel-profiler CSV's
+    // aggregate `bytes` column: sycl-kernel-profiler.cpp accumulates
+    // `aggregate.bytes += label.bytes` once per recorded launch, so that
+    // column is the SUM over `count` launches, and dividing it by mean_ns
+    // overstates bandwidth by a factor of `count` (llama.cpp-6f73 c-irug).
     const size_t weight_bytes = (size_t) n_out * ((size_t) (n_k / 2) + (size_t) (n_k / 32));
     const size_t act_bytes    = (size_t) M * ((size_t) n_k + (size_t) (n_k / 32) * sizeof(float));
     const size_t dst_bytes    = (size_t) M * (size_t) n_out * sizeof(float);
