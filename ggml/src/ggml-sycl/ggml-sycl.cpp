@@ -43326,8 +43326,9 @@ inline void ggml_sycl_op_mul_mat_sycl(ggml_backend_sycl_context & ctx,
             // and falls to the generic to_fp32_sycl() path below, same as
             // any other decline reason; that path's own correctness for a
             // genuinely SOA-materialized weight, and the src0_full_tensor
-            // gap noted above, are separate pre-existing questions the lead
-            // is tracking, not fixed here.
+            // gap noted above, are separate pre-existing questions tracked
+            // as llama.cpp-zq23 (dkw0 full_tensor gap) and llama.cpp-kpvf
+            // (planned-SOA fp32 path), not fixed here.
             void * dkw0_q8_0_coalesced_ptr = nullptr;
             if (q8_0_dense_planned_layout == GGML_LAYOUT_COALESCED && src0->type == GGML_TYPE_Q8_0) {
                 void * dkw0_candidate = ggml_sycl_get_weight_layout_ptr(src0, ctx.device, GGML_LAYOUT_COALESCED);

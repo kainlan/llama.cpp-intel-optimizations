@@ -391,7 +391,10 @@ def test_planned_layout_decided_once_and_gates_both_lookups():
     helper_body = function_body(backend, HELPER_SIG)
     assert (
         "get_effective_layout_mode(" not in helper_body
-    ), "the planned layout must NOT be read from get_effective_layout_mode (llama.cpp-pktr spec review round 2 regression source)"
+    ), (
+        "the planned layout must NOT be read from get_effective_layout_mode "
+        "(llama.cpp-pktr spec review round 2 regression source)"
+    )
     assert (
         helper_body.count("ggml_sycl_resolve(") == 1
     ), "the helper must call ggml_sycl_resolve() exactly once"
