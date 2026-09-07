@@ -539,12 +539,14 @@ int main(int argc, char ** argv) {
     const shape_layout shape  = compute_shape();
     const pid_t        my_pid = getpid();
 
-    // llama.cpp-lis9 spec round 1 (nit 8): S=3 exercises the non-divisible
-    // K-tile partition (GPT-OSS: k_tiles=90, 90/3=30 exactly -- so S=4
-    // remains the only point covering a REMAINDER partition, 90/4=22 r2;
-    // S=3 is covered here for a clean-division split ratio between the
-    // already-covered S=2 (90/2=45) and S=4 cases). kNumKsplitPoints must
-    // match the length of `ksplits` below.
+    // llama.cpp-lis9 spec round 1 (nit 8), corrected quality round 3 (N1):
+    // S=4 is the only point covering a REMAINDER K-tile partition (GPT-OSS:
+    // k_tiles=90, 90/4=22 r2 -- two K-parts of 23 tiles and two of 22,
+    // exercising k_tiles_rem). S=3 divides evenly (90/3=30 exactly, like
+    // S=2's 90/2=45) and is covered here as a clean-division split ratio
+    // between the already-covered S=2 and S=4 cases, not to exercise the
+    // remainder itself. kNumKsplitPoints must match the length of
+    // `ksplits` below.
     constexpr int kNumKsplitPoints          = 4;
     const int     ksplits[kNumKsplitPoints] = { 1, 2, 3, 4 };
     child_result  results[kNumKsplitPoints];
