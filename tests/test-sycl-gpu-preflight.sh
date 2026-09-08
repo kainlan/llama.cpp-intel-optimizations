@@ -33,6 +33,7 @@ fail=0
 cases=0
 
 # shellcheck source=sycl-fake-drm-fixture.sh
+# shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 # mk_drmroot_single: only ONE discrete card -- a single-GPU host, so

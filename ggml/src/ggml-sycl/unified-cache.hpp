@@ -3023,8 +3023,12 @@ class unified_cache {
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
 
     // Current outstanding DIRECT (not-yet-confirmed-released) Graph-scratch
-    // bytes. Exposed for tests that need to drive the allocator up to its cap
-    // without allocating through the same private path being tested.
+    // bytes. Exposed for tests: test-sycl-onednn-graph-scratch-direct.cpp's
+    // parked-allocation setup reads this before and after one DIRECT
+    // allocation and asserts the delta equals exactly the requested size --
+    // proof the accessor tracks a real charge rather than staying inert,
+    // without needing to allocate through the same private path being
+    // tested to observe it.
     size_t onednn_graph_scratch_direct_outstanding_bytes() const {
         return onednn_graph_scratch_direct_outstanding_bytes_;
     }

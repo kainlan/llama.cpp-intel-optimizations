@@ -140,9 +140,11 @@ DIRECT_BODY_CODE = extract_function_body(
 # through onednn_graph_scratch_entry_usable_locked()) or the peek can
 # silently diverge again the way it did before this round -- see that
 # function's own comment in unified-cache.hpp. Extracted separately from
-# WAIT_HEADROOM_BODY_CODE below (the wait loop's own extracted body) so the
-# "both call the shared predicate" checks read against exactly the two
-# functions the invariant is actually about.
+# POOL_SIZE_READY_BODY_CODE below -- the sibling this file's "both call the
+# shared predicate" checks pair it with -- so those checks read against
+# exactly the two functions the invariant is actually about. (A third
+# extracted body, WAIT_HEADROOM_BODY_CODE, is used separately below only for
+# the pqgl eviction-sweep-ordering check, not this pair.)
 TRY_REUSE_POOL_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked("
 )

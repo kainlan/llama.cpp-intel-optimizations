@@ -255,6 +255,7 @@ run_capture() { # $1=out-dir, remaining = extra CAPTURE args, then -- command
 # definitions in sycl-fake-drm-fixture.sh for exact signatures and
 # defaults.
 # shellcheck source=sycl-fake-drm-fixture.sh
+# shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 cases=$((cases+1))

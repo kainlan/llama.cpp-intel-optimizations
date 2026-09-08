@@ -28,6 +28,7 @@ cases=0
 # definitions in sycl-fake-drm-fixture.sh for exact signatures and
 # defaults.
 # shellcheck source=sycl-fake-drm-fixture.sh
+# shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 mk_tree() { # $1=throttle $2=act_freq
