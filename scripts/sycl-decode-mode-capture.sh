@@ -84,11 +84,12 @@
 # makes both this script and the bench-guard.sh child agree on the same fake
 # tree, which is why this script's own selector->PCI case below (still a
 # fixed 0000:03:00.0=B70/0000:07:00.0=B50 table, unlike bench-guard.sh's own
-# live derive_pci_for_selector as of llama.cpp-imns) is never exercised by
-# the test suite and is STALE against the current boot's 0000:04:00.0/
-# 0000:09:00.0 addresses -- tracked as llama.cpp-o4fs (which also covers
-# scripts/sycl-gpu-preflight.sh:38's same-shaped staleness), out of
-# llama.cpp-imns's scope (bench-guard.sh only).
+# live derive_pci_for_selector as of llama.cpp-imns) has level_zero:0/1 arms
+# that are never taken by the test suite (it passes --sysfs-card, or unsets
+# the selector to hit the refusal arm) and is STALE against the current
+# boot's 0000:04:00.0/0000:09:00.0 addresses -- tracked as llama.cpp-o4fs
+# (which also covers scripts/sycl-gpu-preflight.sh:38's same-shaped
+# staleness), out of llama.cpp-imns's scope (bench-guard.sh only).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

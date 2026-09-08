@@ -8,6 +8,7 @@ GUARD="$ROOT_DIR/scripts/bench-guard.sh"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
+skipped=0
 
 mk_tree() { # $1=throttle $2=act_freq
     local d="$T/sys/class/drm/card9/device/tile0/gt0/freq0"
@@ -233,6 +234,51 @@ expect_status 3 "a DRM root with only an integrated GPU must refuse" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-igpu-only" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true
 
+# The iGPU exclusion must be DOMAIN-agnostic (bus 00 on any domain), not
+# hardcoded to domain 0000 -- an iGPU can enumerate under a non-zero PCI
+# domain (0001:00:02.0 here) and must still be excluded exactly like
+# 0000:00:02.0 above. RED against the pre-fix `0000:00:*` pattern: that
+# pattern does not match 0001:00:02.0, so the pre-fix guard counts it as a
+# second discrete GPU, and level_zero:1 wrongly resolves with rc=0 instead
+# of refusing out-of-range (llama.cpp-imns review round 3, finding M1).
+mk_drmroot_domain_igpu() {
+    local d="$T/drmroot-domain-igpu"
+    rm -rf "$d" "$T/devices-domain-igpu"
+    mkdir -p "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/throttle"
+    echo 0 > "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/throttle/status"
+    echo 0 > "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/act_freq"
+    echo 0x8086 > "$T/devices-domain-igpu/0000:04:00.0/vendor"
+    echo 0x030000 > "$T/devices-domain-igpu/0000:04:00.0/class"
+
+    # Full throttle/act_freq sysfs on the fake iGPU too (unlike the plain
+    # domain-0000 iGPU fixture above, which needs none since it's excluded
+    # identically pre- and post-fix): a pre-fix guard that wrongly accepts
+    # this device as a second discrete GPU must be able to run it all the
+    # way to a VALID exit, not incidentally refuse for the unrelated reason
+    # of missing sysfs files -- otherwise the assertions below could not
+    # tell "correctly excluded" from "wrongly included but happens to fail
+    # differently" apart, and the RED/GREEN distinction would be void.
+    mkdir -p "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/throttle"
+    echo 0 > "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/throttle/status"
+    echo 0 > "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/act_freq"
+    echo 0x8086 > "$T/devices-domain-igpu/0001:00:02.0/vendor"
+    echo 0x030000 > "$T/devices-domain-igpu/0001:00:02.0/class"
+
+    mkdir -p "$d/card0" "$d/card1"
+    ln -s "$T/devices-domain-igpu/0000:04:00.0" "$d/card0/device"
+    ln -s "$T/devices-domain-igpu/0001:00:02.0" "$d/card1/device"
+}
+mk_drmroot_domain_igpu; mk_meminfo 3000000
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-domain-igpu.log" -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: level_zero:0 with a non-0000-domain iGPU present must still resolve the discrete card (got rc=$rc, out: $out)"; fail=1; }
+head -1 "$T/run-domain-igpu.log" | grep -q "pci=0000:04:00.0" \
+    || { echo "FAIL: level_zero:0 must resolve to the discrete card, not be confused by the 0001:00:02.0 iGPU (got: $(head -1 "$T/run-domain-igpu.log"))"; fail=1; }
+out2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc2=0 || rc2=$?
+[ "$rc2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the domain-0001 iGPU is excluded (only one discrete GPU), got rc=$rc2 (out: $out2)"; fail=1; }
+echo "$out2" | grep -q "0001:00:02.0" && { echo "FAIL: out-of-range refusal must not list the domain-0001 iGPU as a discrete GPU (got: $out2)"; fail=1; }
+
 expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true
@@ -263,6 +309,7 @@ echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must
 # chmod 000 would not reproduce this.
 if [ "$(id -u)" -eq 0 ]; then
     echo "SKIP: unreadable-vendor-file case not reproducible as root (root bypasses permission bits)"
+    skipped=$((skipped+1))
 else
     rm -rf "$T/drmroot-unreadable-vendor" "$T/devices-unreadable"
     mkdir -p "$T/devices-unreadable/0000:04:00.0"
@@ -279,4 +326,41 @@ else
     echo "$out" | grep -qi "not readable" || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
 fi
 
-[ "$fail" -eq 0 ] && echo "OK: all preflight refusals" || exit 1
+# An unreadable/unsearchable device DIRECTORY (chmod 000 on the resolved
+# device dir itself, not just the vendor file inside it) must also refuse
+# loudly (review round 3, finding M2): `[ -e "$c/device/vendor" ]` alone
+# cannot see this case, because a search-denied parent directory makes stat
+# on anything inside it fail the same way a legitimately absent file would,
+# so the vendor/class readability checks above never fire. Two cards, same
+# reason as the dangling-symlink and unreadable-vendor cases above: with
+# only the broken card, "no discrete GPU found" would also refuse with
+# exit 3 and mask the real defect. Skip under root, which bypasses
+# permission bits, so chmod 000 would not reproduce this.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "SKIP: unreadable-device-dir case not reproducible as root (root bypasses permission bits)"
+    skipped=$((skipped+1))
+else
+    rm -rf "$T/drmroot-unreadable-devdir" "$T/devices-unreadable-devdir"
+    mkdir -p "$T/devices-unreadable-devdir/0000:04:00.0"
+    echo 0x8086 > "$T/devices-unreadable-devdir/0000:04:00.0/vendor"
+    echo 0x030000 > "$T/devices-unreadable-devdir/0000:04:00.0/class"
+    chmod 000 "$T/devices-unreadable-devdir/0000:04:00.0"
+    mkdir -p "$T/drmroot-unreadable-devdir/card0" "$T/drmroot-unreadable-devdir/card1"
+    ln -s "$T/devices-unreadable-devdir/0000:04:00.0" "$T/drmroot-unreadable-devdir/card0/device"
+    ln -s "$T/devices/0000:09:00.0" "$T/drmroot-unreadable-devdir/card1/device"
+    out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-devdir" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    chmod 755 "$T/devices-unreadable-devdir/0000:04:00.0"   # so the EXIT trap's rm -rf can clean it up
+    [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device directory must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+    echo "$out" | grep -qi "not readable/searchable" || { echo "FAIL: unreadable-device-dir refusal must name the problem (got: $out)"; fail=1; }
+fi
+
+if [ "$fail" -eq 0 ]; then
+    if [ "$skipped" -gt 0 ]; then
+        echo "OK: all preflight refusals ($skipped case(s) skipped as root)"
+    else
+        echo "OK: all preflight refusals"
+    fi
+else
+    exit 1
+fi

@@ -38,7 +38,7 @@
 # derive_pci_for_selector() below enumerates top-level cards (card[0-9]+
 # only -- connector entries like card1-DP-1 are excluded by name), keeps
 # discrete Intel display controllers (device/vendor 0x8086, device/class
-# 0x0300*, PCI bus != 0000:00 so the integrated GPU is excluded), sorts the
+# 0x0300*, PCI bus 00 on any domain so the integrated GPU is excluded), sorts the
 # survivors by PCI address (lexical order on the zero-padded dddd:bb:dd.f
 # string is bus/device/function order), and maps level_zero:N to the N-th
 # survivor, zero-based. This assumes Level Zero orders the two discrete
@@ -113,13 +113,18 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # "this really is a different device" from "the file is subtly wrong".
 #
 # In contrast, a DANGLING device symlink (the card had one, but its target
-# no longer resolves -- e.g. a device removed or a hot-unplug race) and an
-# EXISTING-but-UNREADABLE vendor/class file (the file is there, we simply
-# cannot read it, e.g. a permission change) are NOT quiet exclusions: both
-# refuse() loudly instead, because silently dropping either would change
-# level_zero:N's meaning for every card after it with no visible signal --
-# exactly the silent index shift this whole derivation exists to prevent
-# (llama.cpp-imns review round 2).
+# no longer resolves -- e.g. a device removed or a hot-unplug race), an
+# UNREADABLE-OR-UNSEARCHABLE device DIRECTORY (the resolved target exists
+# but cannot be read or entered, e.g. `chmod 000` on it -- this must be
+# caught separately from the vendor/class file checks below, because an
+# unsearchable directory makes `[ -e "$c/device/vendor" ]` itself return
+# false, the same as a legitimately absent file, so those checks alone
+# cannot see it), and an EXISTING-but-UNREADABLE vendor/class file (the
+# file is there, we simply cannot read it, e.g. a permission change) are
+# NOT quiet exclusions: all three refuse() loudly instead, because silently
+# dropping any of them would change level_zero:N's meaning for every card
+# after it with no visible signal -- exactly the silent index shift this
+# whole derivation exists to prevent (llama.cpp-imns review round 2/3).
 derive_pci_for_selector() {
     local idx="$1" c base pci vendor class
     local -a entries=()
@@ -137,6 +142,9 @@ derive_pci_for_selector() {
             refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
         fi
         [ -n "$pci" ] || continue
+        if [ -d "$c/device" ] && { [ ! -r "$c/device" ] || [ ! -x "$c/device" ]; }; then
+            refuse "$base's device directory ($pci) exists but is not readable/searchable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
         if [ -e "$c/device/vendor" ] && [ ! -r "$c/device/vendor" ]; then
             refuse "$base's device/vendor exists but is not readable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
         fi
@@ -153,7 +161,7 @@ derive_pci_for_selector() {
             refuse "failed to read $c/device/class (probe error after it was confirmed readable)"
         fi
         case "$class" in 0x0300*) : ;; *) continue;; esac
-        case "$pci" in 0000:00:*) continue;; esac    # exclude the integrated GPU
+        case "$pci" in ????:00:*) continue;; esac    # exclude the integrated GPU (bus 00, any domain)
         entries+=("$base"$'\t'"$pci"$'\t'"$c")
     done
     local sorted_str=""
