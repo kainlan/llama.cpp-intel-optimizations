@@ -874,16 +874,20 @@ matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), a run
 whose free VRAM is below the contamination floor, `--table` combined with
 `--matrix merge-cert`, (long-prompt `--table` only) a sample with no achieved
 `n_ctx` at all, the five processes of one arm disagreeing on the achieved
-`n_ctx`, or an achieved `n_ctx` below the arm's own prompt length, and
+`n_ctx`, or an achieved `n_ctx` below the arm's own prompt length,
 `--partial-arm` combined with `--matrix merge-cert`, naming an arm that isn't
 declared, naming an arm with zero samples, or naming an arm that already has
-the full sample count (the flag would then be stale) — never a silent
+the full sample count (the flag would then be stale), and a `--partial-arm`
+reason that is empty, contains `|` (it sits verbatim in a markdown table
+cell, where an unescaped `|` would split the row), or repeats an arm already
+given (the later reason would otherwise silently win) — never a silent
 default or a lingering flag for any of these.
 
 **Verify the parser before trusting it.** `--self-test` runs it against the
 committed fixtures in `artifacts/task18-parser-fixtures/` and must report
-**24/24** (ten cases for the merge-cert matrix, nine for long-prompt and
-`--table`, five more for `--partial-arm` — the self-test prints its own
+**30/30** (ten cases for the merge-cert matrix, nine for long-prompt and
+`--table`, five for `--partial-arm` through `evaluate()`, and six exercising
+`parse_partial_arms()`'s own parsing directly — the self-test prints its own
 total, so this figure is not hand-maintained). The cases exist to prove the
 parser returns *all three* exit codes — including a below-floor fixture that
 must produce exit 1 — so that a `PASS` is a measurement rather than the only

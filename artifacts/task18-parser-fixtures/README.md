@@ -11,15 +11,18 @@ These fixtures are that control. Run:
 python3 scripts/parse-sycl-bench-matrix.py --self-test
 ```
 
-It must report **24/24** and exit 0. If it does not, the parser's verdicts are
+It must report **30/30** and exit 0. If it does not, the parser's verdicts are
 not trustworthy and the gate must not be certified from them.
 
 Ten cases cover the original **merge-cert** matrix (numeric floor/band, gates
 merges); nine more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
 matrix (report-only, no gate declared yet) and its `--table` markdown output;
-five more (llama.cpp-z0wt, scope addition) cover `--partial-arm`, the
-accept-fewer-than-`runs`-samples exception for a declared arm that could not
-be fully measured.
+five more (llama.cpp-z0wt, scope addition) cover `--partial-arm` as
+`evaluate()` sees it -- the accept-fewer-than-`runs`-samples exception for a
+declared arm that could not be fully measured; six more (llama.cpp-z0wt,
+review round 6) call `parse_partial_arms()` directly, since none of the other
+cases ever exercise its own `ARM=REASON` splitting and validation -- they all
+hand `evaluate()` an already-parsed `{arm: reason}` dict.
 
 ## What the cases prove
 

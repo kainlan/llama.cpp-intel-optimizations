@@ -136,6 +136,11 @@ MERGE_CERT_ARMS = {
 # place rather than two separately-hardcoded tuples that could drift apart.
 _LONG_PROMPT_CARDS = ("b70", "b50")
 _LONG_PROMPT_CARD_SELECTORS = {"b70": "level_zero:0", "b50": "level_zero:1"}
+if set(_LONG_PROMPT_CARD_SELECTORS) != set(_LONG_PROMPT_CARDS):
+    raise RuntimeError(
+        "_LONG_PROMPT_CARD_SELECTORS keys %r must match _LONG_PROMPT_CARDS %r"
+        % (sorted(_LONG_PROMPT_CARD_SELECTORS), sorted(_LONG_PROMPT_CARDS))
+    )
 _LONG_PROMPT_MODELS = ("mistral", "gptoss", "gemma4")
 _LONG_PROMPT_PPS = (2048, 8192)
 
@@ -191,9 +196,20 @@ LONG_PROMPT_ARMS = _build_long_prompt_arms()
 # long-prompt-only so far, and a shared name would misdescribe whichever one
 # it wasn't originally written for.
 MatrixDescriptor = collections.namedtuple(
-    "MatrixDescriptor", ["arms", "title", "verdict", "supports_table", "supports_partial_arm"]
+    "MatrixDescriptor",
+    ["arms", "title", "verdict", "supports_table", "supports_partial_arm", "fixture_for_arm"],
 )
 
+# `fixture_for_arm` is a callable (arm name -> committed fixture path) rather
+# than a shared function with a `matrix == "merge-cert"` branch inside it
+# (review round 6, N8): `_all_good()` used to be the last place in the file
+# switching on the matrix name string, mirroring the three call sites the
+# round-4 MatrixDescriptor refactor already replaced for title/verdict/table
+# support. Both callables are defined further down the file (`_fx`,
+# `_fixture_for_long_prompt_arm`); referencing them from a lambda here is
+# safe because Python looks up a lambda body's globals when it is CALLED, not
+# when it is created, and nothing calls `fixture_for_arm` before the whole
+# module has finished loading.
 MATRICES = {
     "merge-cert": MatrixDescriptor(
         arms=MERGE_CERT_ARMS,
@@ -201,6 +217,7 @@ MATRICES = {
         verdict="VERDICT: PASS -- all %d arms present, parseable, and within gate\n",
         supports_table=False,
         supports_partial_arm=False,
+        fixture_for_arm=lambda arm: _fx("%s-good.txt" % arm),
     ),
     "long-prompt": MatrixDescriptor(
         arms=LONG_PROMPT_ARMS,
@@ -214,6 +231,7 @@ MATRICES = {
         ),
         supports_table=True,
         supports_partial_arm=True,
+        fixture_for_arm=lambda arm: _fixture_for_long_prompt_arm(arm),
     ),
 }
 DEFAULT_MATRIX = "merge-cert"
@@ -490,6 +508,18 @@ def _build_table_rows(results, arms, partial_arms=None):
     spread to claim, same reasoning as _stdev_str() elsewhere in this file.
     The ctx-achieved column is unaffected: it is derived from whatever
     samples are present, exactly as for a full arm.
+
+    Unlike `arms`/`results`/`partial_arms` above, this function still reads
+    the long-prompt ORDERING and LABEL globals directly --
+    `_LONG_PROMPT_CARDS`, `_LONG_PROMPT_MODELS`, `_LONG_PROMPT_PPS`,
+    `_CARD_LABELS`, `_MODEL_LABELS`, `_CTX_ACHIEVED_PP`, `_TABLE_HEADER`,
+    `_TABLE_SEPARATOR` -- and that is BY DESIGN, not an oversight the round-4
+    parameter-passing cleanup missed (review round 6, N7). Those are the
+    module's structural constants for what a long-prompt table even IS (which
+    cards, which models, which column order); this function only ever renders
+    the one long-prompt table there is, so threading eight more constants
+    through its signature would relocate that coupling, not remove it, for no
+    corresponding gain in testability.
     """
     partial_arms = partial_arms or {}
     rows = [_TABLE_HEADER, _TABLE_SEPARATOR]
@@ -511,6 +541,17 @@ def _build_table_rows(results, arms, partial_arms=None):
                     mean = sum(values) / len(values)
                     if arm in partial_arms:
                         k = len(values)
+                        # Deliberately NOT "mean +/- n/a" at k<2, unlike the
+                        # non-partial branch below (review round 6, N5): a
+                        # non-partial single sample (--runs 1) has nothing
+                        # else marking it as off-nominal, so "+/- n/a" is the
+                        # only signal that no spread was computed. A partial
+                        # cell already carries "(n=k, REASON)", which says
+                        # the same "off-nominal sample count" thing on its
+                        # own -- appending "+/- n/a" too would repeat that
+                        # and crowd out the more useful REASON text. The two
+                        # branches read differently on purpose; this is not
+                        # drift to reconcile.
                         if k >= 2:
                             cell[(pp, test)] = "%.2f \u00b1 %s (n=%d, %s)" % (
                                 mean, _stdev_str(values), k, partial_arms[arm]
@@ -673,9 +714,13 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         samples = results[arm]
         spec = arms[arm]
         if arm in partial_arms:
+            # Append the selector rather than dropping it (review round 6,
+            # N3): the non-partial line below prints it too, and losing it
+            # here for no reason would make a partial arm's report line the
+            # only one that doesn't say which device it ran on.
             out.write(
-                "%s  PARTIAL (n=%d of %d) -- %s\n"
-                % (arm, len(samples), runs, partial_arms[arm])
+                "%s  PARTIAL (n=%d of %d) -- %s (%s)\n"
+                % (arm, len(samples), runs, partial_arms[arm], spec["selector"])
             )
         else:
             out.write("%s (%s)\n" % (arm, spec["selector"]))
@@ -804,10 +849,8 @@ def _fixture_for_long_prompt_arm(arm):
 def _all_good(matrix):
     """Every arm of `matrix` at DEFAULT_RUNS in-gate (or, for long-prompt,
     simply parseable) samples. The baseline every case perturbs."""
-    arms = MATRICES[matrix].arms
-    if matrix == "merge-cert":
-        return {arm: [_fx("%s-good.txt" % arm)] * DEFAULT_RUNS for arm in arms}
-    return {arm: [_fixture_for_long_prompt_arm(arm)] * DEFAULT_RUNS for arm in arms}
+    descriptor = MATRICES[matrix]
+    return {arm: [descriptor.fixture_for_arm(arm)] * DEFAULT_RUNS for arm in descriptor.arms}
 
 
 def _with(matrix, **overrides):
@@ -899,7 +942,7 @@ def self_test(out):
              partial_arm={"b70-mistral-pp8192": "GPU CAT error"},
              want_table=True, expected=0,
              contains=[
-                 "b70-mistral-pp8192  PARTIAL (n=1 of 5) -- GPU CAT error",
+                 "b70-mistral-pp8192  PARTIAL (n=1 of 5) -- GPU CAT error (level_zero:0)",
                  "1 arm partial: b70-mistral-pp8192 (n=1 of 5)",
                  "1526.48 (n=1, GPU CAT error)",
              ]),
@@ -926,21 +969,65 @@ def self_test(out):
              partial_arm={"b50-mistral": "reason"}, expected=2),
     ]
 
+    # Cases exercising parse_partial_arms() ITSELF (review round 6, S1-S3):
+    # every case above passes an already-parsed {arm: reason} dict straight
+    # to evaluate(), so none of them ever runs parse_partial_arms()'s own
+    # "=" splitting or validation -- these six do, calling it directly rather
+    # than through the CLI/evaluate() path.
+    #   values          the raw --partial-arm strings, as argparse would collect them
+    #   expect_result   the exact dict parse_partial_arms() must return (success case)
+    #   expect_error    True if it must raise ParseError instead
+    parse_cases = [
+        dict(name="parse_partial_arms('a=b=c') -> {'a': 'b=c'} (splits on FIRST = only)",
+             values=["a=b=c"], expect_result={"a": "b=c"}),
+        dict(name="parse_partial_arms('a=') -> ParseError (empty reason)",
+             values=["a="], expect_error=True),
+        dict(name="parse_partial_arms('=b') -> ParseError (empty arm name)",
+             values=["=b"], expect_error=True),
+        dict(name="parse_partial_arms('ab') -> ParseError (no '=' at all)",
+             values=["ab"], expect_error=True),
+        dict(name="parse_partial_arms reason containing '|' -> ParseError (would split a table row)",
+             values=["a=reason with | a pipe in it"], expect_error=True),
+        dict(name="parse_partial_arms same arm given twice -> ParseError (later reason would silently win)",
+             values=["a=first reason", "a=second reason"], expect_error=True),
+    ]
+
     # Expected stream occupancy per exit code. Checking this is the point:
     # without it, "diagnostics go to stderr" is a claim about the source rather
     # than a property of the program.
     #                 exit: (stdout non-empty?, stderr non-empty?)
     stream_contract = {0: (True, False), 1: (True, True), 2: (False, True)}
 
+    # Derived from the actual names rather than a hardcoded field width
+    # (review round 6, N4): a hardcoded width goes ragged the moment a case
+    # name grows past it, which is exactly what happened to the previous
+    # "%-78s" against an 80-character name.
+    name_width = max(len(c["name"]) for c in cases + parse_cases)
+
     failures = 0
     for case in cases:
         name = case["name"]
         expected = case["expected"]
         cap_out, cap_err = io.StringIO(), io.StringIO()
-        got = evaluate(
-            case["matrix"], case["arms"], case.get("runs", DEFAULT_RUNS), {},
-            cap_out, cap_err, case.get("want_table", False), case.get("partial_arm", {}),
-        )
+        try:
+            got = evaluate(
+                case["matrix"], case["arms"], case.get("runs", DEFAULT_RUNS), {},
+                cap_out, cap_err, case.get("want_table", False), case.get("partial_arm", {}),
+            )
+        except Exception as exc:
+            # A mutant that removes a guard doesn't always degrade cleanly to
+            # a wrong exit code -- several instead crash evaluate() outright
+            # (a ZeroDivisionError from an empty sample list, a KeyError from
+            # an undeclared arm). Before this, that crash aborted the WHOLE
+            # self-test run and hid every case after it, rather than
+            # reporting the one case that actually caught the regression
+            # (review round 6, N6; three round-5 mutants did exactly this).
+            out.write(
+                "  %-*s expected %d, raised %s: %s  FAIL\n"
+                % (name_width, name, expected, type(exc).__name__, exc)
+            )
+            failures += 1
+            continue
         want_out, want_err = stream_contract[expected]
         streams_ok = (bool(cap_out.getvalue()) == want_out
                       and bool(cap_err.getvalue()) == want_err)
@@ -954,12 +1041,30 @@ def self_test(out):
                 len(cap_out.getvalue()), len(cap_err.getvalue()))
         elif missing:
             note = "  <- stdout missing %r" % missing
-        out.write("  %-78s expected %d got %d  %s%s\n"
-                  % (name, expected, got, "OK" if ok else "FAIL", note))
+        out.write("  %-*s expected %d got %d  %s%s\n"
+                  % (name_width, name, expected, got, "OK" if ok else "FAIL", note))
         if not ok:
             failures += 1
 
-    out.write("\n%d/%d self-test cases passed\n" % (len(cases) - failures, len(cases)))
+    for case in parse_cases:
+        name = case["name"]
+        try:
+            got = parse_partial_arms(case["values"])
+            if case.get("expect_error"):
+                ok = False
+                note = "  <- expected ParseError, got %r" % (got,)
+            else:
+                ok = got == case["expect_result"]
+                note = "" if ok else "  <- got %r, expected %r" % (got, case["expect_result"])
+        except ParseError as exc:
+            ok = bool(case.get("expect_error"))
+            note = "" if ok else "  <- unexpected ParseError: %s" % exc
+        out.write("  %-*s %s%s\n" % (name_width, name, "OK" if ok else "FAIL", note))
+        if not ok:
+            failures += 1
+
+    total_cases = len(cases) + len(parse_cases)
+    out.write("\n%d/%d self-test cases passed\n" % (total_cases - failures, total_cases))
     if failures:
         out.write("SELF-TEST FAILED -- do not trust this parser's verdicts.\n")
         return 2
@@ -974,7 +1079,11 @@ def self_test(out):
 
 def parse_min_free(values):
     """--min-free-mib b70=31000 -> {"level_zero:0": 31000}"""
-    alias = {"b70": "level_zero:0", "b50": "level_zero:1"}
+    # Reads the module's own card->selector map rather than a second,
+    # separately-hardcoded {"b70": ..., "b50": ...} literal (review round 6):
+    # a third card added to _LONG_PROMPT_CARD_SELECTORS would otherwise need
+    # updating here too, silently, for --min-free-mib to learn about it.
+    alias = _LONG_PROMPT_CARD_SELECTORS
     out = {}
     for item in values or []:
         if "=" not in item:
@@ -998,6 +1107,14 @@ def parse_partial_arms(values):
     non-empty here -- whether it names a REAL long-prompt arm is checked by
     the caller (evaluate()), which is the only place that knows which matrix
     is in play and can therefore also refuse it for merge-cert.
+
+    A reason may not contain "|": it is embedded verbatim into a markdown
+    table cell (`mean (n=k, REASON)`), and an unescaped "|" there would split
+    the row into extra cells instead of staying inside one (review round 6,
+    S1). A given arm may be named at most once: silently keeping only the
+    last of several reasons would make `--partial-arm ARM=x --partial-arm
+    ARM=y` an ambiguous command whose effect depends on argument order
+    (review round 6, S2).
     """
     out = {}
     for item in values or []:
@@ -1010,6 +1127,17 @@ def parse_partial_arms(values):
             raise ParseError("--partial-arm arm name must not be empty, got %r" % item)
         if not reason:
             raise ParseError("--partial-arm reason must not be empty, got %r" % item)
+        if "|" in reason:
+            raise ParseError(
+                "--partial-arm reason must not contain '|', got %r -- it is embedded "
+                "verbatim in a markdown table cell, and an unescaped '|' would split "
+                "the row into extra columns instead of staying inside one" % reason
+            )
+        if arm in out:
+            raise ParseError(
+                "--partial-arm %s given more than once (%r, then %r) -- the later "
+                "reason would silently win; pass it only once" % (arm, out[arm], reason)
+            )
         out[arm] = reason
     return out
 
@@ -1041,11 +1169,14 @@ directory that exists but is empty, an unparseable t/s cell, a table with no
 free VRAM below the contamination floor, --table combined with --matrix
 merge-cert, (long-prompt --table only) a sample with no achieved n_ctx at
 all, the five processes of one arm disagreeing on the achieved n_ctx, or an
-achieved n_ctx below the arm's own prompt length, and --partial-arm combined
+achieved n_ctx below the arm's own prompt length, --partial-arm combined
 with --matrix merge-cert, naming an arm that isn't declared, naming an arm
 with zero samples, or naming an arm that already has the full sample count
-(the flag would then be stale) -- never a silent default or a lingering flag
-for any of these.
+(the flag would then be stale), and --partial-arm=REASON where REASON is
+empty, contains '|' (it is embedded verbatim in a markdown table cell, and
+an unescaped '|' would split the row), or repeats an arm already given
+(the later reason would otherwise silently win) -- never a silent default
+or a lingering flag for any of these.
 
 1 and 2 are deliberately distinct: "the branch is slow" and "I could not
 measure the branch" are different facts and must not share an exit code.
@@ -1055,7 +1186,7 @@ long-prompt (twelve arms, report-only -- no floor/band exists yet).
 --partial-arm accepts 1..runs-1 samples for one declared long-prompt arm that
 could not be fully measured, instead of requiring exactly --runs.
 
-Verify the parser before trusting its verdict:  --self-test  (expects 24/24)
+Verify the parser before trusting its verdict:  --self-test  (expects 30/30)
 Gate definition: docs/backend/sycl-perf-baselines.md
 """
 
