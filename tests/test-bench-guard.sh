@@ -240,6 +240,18 @@ out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-memi
 [ "$rc" -eq 3 ] || { echo "FAIL: missing --meminfo must refuse cleanly with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -q "no meminfo at" || { echo "FAIL: missing --meminfo refusal must name the problem (got: $out)"; fail=1; }
 
+# Not fixture-testable here (llama.cpp-pqgl): bench-guard.sh's postflight
+# kernel-log window now anchors --since to run_start_epoch, captured just
+# before the wrapped command starts, instead of a fixed "10 minutes ago".
+# --journalctl-cmd (the fixture mechanism every case below uses) REPLACES
+# the whole kernel_log() body, including the --since argument -- so a
+# fixture never sees, and cannot assert on, what --since was actually set
+# to. And unlike sycl-gpu-preflight.sh (sourced directly into its test, so
+# `journalctl` can be overridden as a shell function), bench-guard.sh runs
+# as its own separate process under ctest/this file's `"$GUARD" ...`
+# invocations -- a `date`-shimming wrapper in THIS shell cannot reach
+# a `journalctl` call made inside that other process.
+
 cases=$((cases+1))
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
