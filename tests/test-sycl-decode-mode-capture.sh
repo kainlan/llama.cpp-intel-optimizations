@@ -226,6 +226,84 @@ run_capture() { # $1=out-dir, remaining = extra CAPTURE args, then -- command
         --out "$1" "${@:2}"
 }
 
+# --- live --drm-root derivation (llama.cpp-o4fs) -------------------------
+#
+# Before this fix, $CAPTURE carried its own PRIVATE selector->PCI table
+# (level_zero:0 -> 0000:03:00.0, level_zero:1 -> 0000:07:00.0) instead of
+# sharing bench-guard.sh's derive_card_for_selector, and had no --drm-root
+# flag at all -- every case below would have failed against that code:
+# --drm-root would hit the "unknown arg" branch (exit 2), and even a
+# variant using the real /sys/class/drm path could never exercise a
+# card-order-!=-PCI-order fixture the way bench-guard.sh's own suite does,
+# since the private table only ever produced the two hardcoded, now-stale
+# addresses. The derivation arm was therefore dead code as far as this
+# suite could tell: every case above passes --sysfs-card explicitly, which
+# always bypasses derivation entirely.
+#
+# mk_pci_dev/mk_drmroot mirror tests/test-bench-guard.sh's own fixture
+# builders of the same name exactly (including the deliberate
+# card-order-!=-PCI-order + connector-entry shape) -- kept as a local copy
+# rather than shared, the same way this file already duplicates
+# mk_tree/mk_meminfo/expect_status from that suite, per this file's own
+# header comment.
+mk_pci_dev() {
+    local devroot="$1" addr="$2" with_freq="${3:-}"
+    mkdir -p "$devroot/$addr"
+    echo 0x8086 > "$devroot/$addr/vendor"
+    echo 0x030000 > "$devroot/$addr/class"
+    if [ -n "$with_freq" ]; then
+        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
+        echo 0 > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
+        echo 0 > "$devroot/$addr/tile0/gt0/freq0/act_freq"
+    fi
+}
+
+mk_drmroot() {
+    local d="$T/drmroot" devroot="$T/devices-lz01"
+    rm -rf "$d" "$devroot"
+    mk_pci_dev "$devroot" 0000:09:00.0 with_freq
+    mk_pci_dev "$devroot" 0000:00:02.0
+    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
+    mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
+    ln -s "$devroot/0000:09:00.0" "$d/card0/device"
+    ln -s "$devroot/0000:00:02.0" "$d/card1/device"
+    ln -s "$devroot/0000:04:00.0" "$d/card2/device"
+    ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
+}
+
+mk_drmroot; mk_meminfo 3000000
+out_lz0="$T/out-lz0"
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$CAPTURE" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 \
+    --out "$out_lz0" -- "$bench" || { echo "FAIL: level_zero:0 --drm-root run failed"; fail=1; }
+head -1 "$out_lz0/bench.log" | grep -q "card=$T/drmroot/card2" \
+    || { echo "FAIL: level_zero:0 must derive card=$T/drmroot/card2 (lower PCI 0000:04:00.0; card0->09, card2->04), not the card0-DP-1 connector (got: $(head -1 "$out_lz0/bench.log" 2>/dev/null))"; fail=1; }
+
+mk_meminfo 3000000
+out_lz1="$T/out-lz1"
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$CAPTURE" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 \
+    --out "$out_lz1" -- "$bench" || { echo "FAIL: level_zero:1 --drm-root run failed"; fail=1; }
+head -1 "$out_lz1/bench.log" | grep -q "card=$T/drmroot/card0" \
+    || { echo "FAIL: level_zero:1 must derive card=$T/drmroot/card0 (higher PCI 0000:09:00.0) (got: $(head -1 "$out_lz1/bench.log" 2>/dev/null))"; fail=1; }
+
+# Out-of-range: only two discrete cards in mk_drmroot's fixture, so
+# level_zero:2 must refuse with exit 3 -- and must not even reach $OUT
+# (setup-only failure, same rule the pre-existing setup-fail-regression
+# case below enforces for the no-selector case).
+out_lz2="$T/out-lz2"
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+lz2_rc=0
+out_lz2_text="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$CAPTURE" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 \
+    --out "$out_lz2" -- "$bench" 2>&1)" || lz2_rc=$?
+[ "$lz2_rc" -eq 3 ] || { echo "FAIL: level_zero:2 (out of range) must refuse with exit 3, got $lz2_rc (out: $out_lz2_text)"; fail=1; }
+echo "$out_lz2_text" | grep -qi "out of range" \
+    || { echo "FAIL: out-of-range refusal must say so (got: $out_lz2_text)"; fail=1; }
+[ ! -e "$out_lz2" ] || { echo "FAIL: an out-of-range setup failure must not create --out at all"; fail=1; }
+
 # --- mode computation across the two thresholds and the middle band ---
 
 mk_tree 0 0; mk_meminfo 3000000

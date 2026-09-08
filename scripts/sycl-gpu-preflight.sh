@@ -7,6 +7,48 @@ sycl_preflight_repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
 }
 
+# Share derive_card_for_selector/is_top_level_card/find_card_by_pci with
+# bench-guard.sh and sycl-decode-mode-capture.sh (llama.cpp-o4fs) instead of
+# this file's own former hardcoded B50 PCI address (0000:07:00.0), which
+# went stale at the 2026-09-05 boot when the discrete cards moved to
+# 0000:04:00.0/0000:09:00.0 -- see CLAUDE.md. Sourcing has no side effects
+# beyond defining those functions and defaulting $DRM_ROOT; see its own
+# header comment for the full contract.
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
+
+# sycl_preflight_b50_pci_address -- derive the PCI address of the SECOND
+# (index 1) discrete Intel GPU under $SYCL_PREFLIGHT_DRM_ROOT (default
+# /sys/class/drm, overridable for tests the same way bench-guard.sh's
+# --drm-root is), i.e. the B50 by the same ascending-PCI-address convention
+# bench-guard.sh documents (CLAUDE.md: "this assumes Level Zero orders the
+# discrete cards by ascending PCI address -- true on every boot observed so
+# far"). Prints nothing (and exits nonzero, though the caller below only
+# checks for empty output) if a second discrete card cannot be derived --
+# a single-GPU host, a topology error, or any of derive_card_for_selector's
+# own loud-refusal cases.
+#
+# Runs derive_card_for_selector in a SUBSHELL with a local refuse() that
+# merely exits that subshell, never the calling script -- this file is
+# `source`d into arbitrary callers as a passive library, not something that
+# owns the process, so a derivation failure here must never terminate
+# whatever script sourced this file. This is exactly the kind of
+# differently-shaped `refuse` sycl-gpu-sysfs.sh's own header contract
+# anticipates: derive_card_for_selector does not care whether `refuse`
+# exits the whole process or only a subshell, as long as it does not
+# return normally back into it.
+sycl_preflight_b50_pci_address() {
+    local root="${SYCL_PREFLIGHT_DRM_ROOT:-/sys/class/drm}"
+    (
+        # shellcheck disable=SC2034  # read by derive_card_for_selector (sourced above)
+        DRM_ROOT="$root"
+        # shellcheck disable=SC2329  # invoked indirectly, from inside derive_card_for_selector
+        refuse() { exit 1; }
+        derive_card_for_selector 1 >/dev/null 2>&1
+        printf '%s\n' "$DERIVED_PCI"
+    )
+}
+
 sycl_preflight_selector_uses_level_zero() {
     local selector="${1:-}"
     [[ -z "$selector" || "$selector" == *level_zero* ]]
@@ -35,7 +77,17 @@ sycl_preflight_journal_has_previous_boot_gpu_faults() {
 }
 
 sycl_preflight_b50_sysfs_bad() {
-    local b50="/sys/bus/pci/devices/0000:07:00.0"
+    local pci_root="${SYCL_PREFLIGHT_PCI_ROOT:-/sys/bus/pci/devices}"
+    local pci b50
+    pci="$(sycl_preflight_b50_pci_address)"
+    # Cannot derive a second discrete card's PCI address at all (single-GPU
+    # host, topology error, ...): treat this the same conservative way the
+    # old fixed-address form treated a genuinely-missing sysfs entry -- as
+    # bad, not as "no B50 present, so nothing to check". Whether this
+    # function's verdict is even consulted still depends on the caller's
+    # own sycl_preflight_selector_may_use_b50 gate.
+    [[ -n "$pci" ]] || return 0
+    b50="$pci_root/$pci"
     [[ -e "$b50" ]] || return 0
 
     local enable power_state runtime_status

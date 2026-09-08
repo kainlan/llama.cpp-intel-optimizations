@@ -820,6 +820,22 @@ if (NOT WIN32)
     )
     set_tests_properties(test-bench-guard PROPERTIES SKIP_RETURN_CODE 77)
 
+    # sycl-gpu-preflight unit tests (llama.cpp-o4fs): the live B50 PCI-
+    # address derivation sycl_preflight_b50_pci_address/
+    # sycl_preflight_b50_sysfs_bad now share with bench-guard.sh via
+    # scripts/sycl-gpu-sysfs.sh (above), instead of the fixed
+    # /sys/bus/pci/devices/0000:07:00.0 address this file hardcoded before.
+    # Pure bash against a fake DRM/PCI sysfs tree via
+    # SYCL_PREFLIGHT_DRM_ROOT/SYCL_PREFLIGHT_PCI_ROOT env overrides -- no
+    # GPU, safe at any parallelism.
+    llama_test_cmd(
+        bash
+        NAME test-sycl-gpu-preflight
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gpu-preflight.sh
+    )
+    set_tests_properties(test-sycl-gpu-preflight PROPERTIES SKIP_RETURN_CODE 77)
+
     # sycl-decode-mode-capture unit tests (plan task S4, llama.cpp-gvu7): the
     # one-run freq/throttle/RssAnon timeline + kprof capture for the B70
     # GPT-OSS decode slow mode. Invokes bench-guard.sh (above) as a child for

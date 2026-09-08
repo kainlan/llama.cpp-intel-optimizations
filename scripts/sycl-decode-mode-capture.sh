@@ -84,22 +84,24 @@
 # the caller, not one filtered to llama tenants (llama.cpp-gvu7 quality
 # review).
 #
-# Card derivation for the sampler is a live PCI-symlink lookup, copied here
-# rather than shared because bench-guard.sh does not expose its derived card
-# to a caller. Passing --sysfs-card explicitly (as the test suite does)
-# makes both this script and the bench-guard.sh child agree on the same fake
-# tree, which is why this script's own selector->PCI case below (still a
-# fixed 0000:03:00.0=B70/0000:07:00.0=B50 table, unlike bench-guard.sh's own
-# live derive_card_for_selector as of llama.cpp-imns) has level_zero:0/1 arms
-# that are never taken by the test suite (it passes --sysfs-card, or unsets
-# the selector to hit the refusal arm) and is STALE against the current
-# boot's 0000:04:00.0/0000:09:00.0 addresses -- tracked as llama.cpp-o4fs
-# (which also covers scripts/sycl-gpu-preflight.sh:38's same-shaped
-# staleness), out of llama.cpp-imns's scope (bench-guard.sh only).
+# Card derivation for the sampler now shares scripts/sycl-gpu-sysfs.sh's
+# derive_card_for_selector with bench-guard.sh (llama.cpp-o4fs), rather than
+# carrying its own private selector->PCI table -- an earlier version of this
+# script had exactly that private copy (a fixed 0000:03:00.0=B70/
+# 0000:07:00.0=B50 table) and it went stale against the current boot's
+# 0000:04:00.0/0000:09:00.0 addresses, since the test suite always passes
+# --sysfs-card (or unsets the selector to hit the refusal arm), so its
+# level_zero:0/1 derivation branch was never exercised. Passing
+# --sysfs-card explicitly (as the test suite does, and as a real caller may
+# too) still makes both this script and the bench-guard.sh child agree on
+# the same card, exactly as before -- see the --drm-root flag below for how
+# a caller drives the SAME derivation this script uses internally.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_GUARD="$SCRIPT_DIR/bench-guard.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
 
 # --- tunables (named, not inline literals, the way bench-guard.sh names its
 # own: SHMEM_CEIL_KB, SHMEM_GROWTH_SUSPECT_KB, POLL_INTERVAL). Several
@@ -126,7 +128,12 @@ CMDLINE_MAX_CHARS=120   # audit-line cmdline truncation
 export LC_NUMERIC=C
 
 OUT="" SYSFS_CARD="" MEMINFO="/proc/meminfo" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT=""
+# DRM_ROOT is NOT (re)declared here: sycl-gpu-sysfs.sh, sourced above, already
+# applied its default (`: "${DRM_ROOT:=/sys/class/drm}"`) at source time --
+# redeclaring it to "" here would stomp that default right back out before
+# --drm-root ever gets a chance to override it.
 
+# shellcheck disable=SC2034  # --drm-root below sets DRM_ROOT, read by derive_card_for_selector (sourced above, sycl-gpu-sysfs.sh) -- shellcheck can't see across a `source`
 while [ $# -gt 0 ]; do case "$1" in
     --out)             OUT="$2";            shift 2;;
     --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
@@ -135,6 +142,7 @@ while [ $# -gt 0 ]; do case "$1" in
     --df-cmd)          DF_CMD="$2";         shift 2;;
     --journalctl-cmd)  JOURNALCTL_CMD="$2"; shift 2;;
     --max-wait)        MAX_WAIT="$2";       shift 2;;
+    --drm-root)        DRM_ROOT="$2";       shift 2;;
     --) shift; break;;
     *) echo "sycl-decode-mode-capture: unknown arg $1" >&2; exit 2;;
 esac; done
@@ -142,7 +150,9 @@ esac; done
 [ $# -gt 0 ] || { echo "sycl-decode-mode-capture: no bench command (pass it after --)" >&2; exit 2; }
 [ -x "$BENCH_GUARD" ] || { echo "sycl-decode-mode-capture: $BENCH_GUARD not found or not executable" >&2; exit 2; }
 
-# --- card derivation (mirrors bench-guard.sh; skipped when --sysfs-card is given) ---
+# --- card derivation (shares derive_card_for_selector with bench-guard.sh
+# via sycl-gpu-sysfs.sh, sourced above; skipped when --sysfs-card is given)
+# ---
 # Deliberately BEFORE the reset block below: this can exit 3 without ever
 # having launched anything, and it must not touch $OUT at all if it does --
 # a setup-only failure (e.g. no selector and no --sysfs-card) must never
@@ -154,14 +164,19 @@ esac; done
 if [ -z "$SYSFS_CARD" ]; then
     SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
     case "$SELECTOR" in
-        level_zero:0) PCI="0000:03:00.0";;
-        level_zero:1) PCI="0000:07:00.0";;
-        *) echo "sycl-decode-mode-capture: cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:0 or level_zero:1 (got '$SELECTOR'); otherwise pass --sysfs-card" >&2; exit 3;;
+        level_zero:[0-9]) : ;;
+        *) echo "sycl-decode-mode-capture: cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --sysfs-card" >&2; exit 3;;
     esac
-    for c in /sys/class/drm/card*; do
-        [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
-    done
-    [ -n "$SYSFS_CARD" ] || { echo "sycl-decode-mode-capture: no DRM card for PCI $PCI" >&2; exit 3; }
+    # refuse(): derive_card_for_selector's own contract (see
+    # scripts/sycl-gpu-sysfs.sh's header comment) -- this mirrors this
+    # script's own prior inline refusal shape (message on stderr, exit 3),
+    # so a caller sees the same class of failure it always did.
+    # shellcheck disable=SC2329  # invoked indirectly, from inside derive_card_for_selector (sourced)
+    refuse() { echo "sycl-decode-mode-capture: REFUSED: $*" >&2; exit 3; }
+    # shellcheck disable=SC2034  # DERIVED_PCI is set for symmetry with bench-guard.sh's own reset; this script only consumes DERIVED_CARD
+    DERIVED_CARD="" DERIVED_PCI=""
+    derive_card_for_selector "${SELECTOR#level_zero:}"
+    SYSFS_CARD="$DERIVED_CARD"
 fi
 FREQ="$SYSFS_CARD/device/tile0/gt0/freq0"
 
