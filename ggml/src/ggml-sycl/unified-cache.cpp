@@ -9841,26 +9841,29 @@ bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked(size_t siz
 // attempt) and onednn_graph_scratch_pool_size_ready_locked() (the wait
 // loop's peek) both apply -- see their declarations in unified-cache.hpp for
 // why the two disagreeing used to be a silent fail-open of the DIRECT cap.
-bool unified_cache::onednn_graph_scratch_entry_usable_locked(const onednn_graph_scratch_pool_entry & entry,
-                                                             size_t                                  alignment,
-                                                             int                                     device_id,
-                                                             resolved_ptr * out_resolved) const {
-    // event_complete()'s pre-existing blocking behaviour on profiling
-    // queues is tracked separately, unrelated to this pool: llama.cpp-c6ah.
+// Performs the ONE event_complete() query and, if that passes, the ONE
+// resolve() query this entry needs for this request -- callers must not
+// query event_complete() on the same entry themselves first (see the
+// declaration's comment).
+unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratch_entry_usable_locked(
+    const onednn_graph_scratch_pool_entry & entry,
+    size_t                                  alignment,
+    int                                     device_id,
+    resolved_ptr *                          out_resolved) const {
     if (!event_complete(entry.release_event)) {
-        return false;
+        return onednn_graph_scratch_entry_fit::EVENT_PENDING;
     }
     const auto resolved = entry.owner.resolve(device_id);
     if (out_resolved) {
         *out_resolved = resolved;
     }
     if (!resolved.ptr || !resolved.on_device) {
-        return false;
+        return onednn_graph_scratch_entry_fit::RESOLVE_FAILED;
     }
     if (alignment != 0 && reinterpret_cast<uintptr_t>(resolved.ptr) % alignment != 0) {
-        return false;
+        return onednn_graph_scratch_entry_fit::ALIGNMENT_MISMATCH;
     }
-    return true;
+    return onednn_graph_scratch_entry_fit::USABLE;
 }
 
 bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
@@ -9874,24 +9877,24 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
     }
     std::vector<onednn_graph_scratch_pool_entry> & bucket = pool_it->second;
     for (size_t i = 0; i < bucket.size(); ++i) {
-        // event_complete()'s pre-existing blocking behaviour on profiling
-        // queues is tracked separately, unrelated to this pool: llama.cpp-c6ah.
-        // Checked here (not only inside entry_usable_locked() below) because
-        // "not yet complete" must `continue` to the next bucket entry, while
-        // "complete but the resolve itself failed" (below) must NOT --
-        // those two both leave `resolved` empty, so they are otherwise
-        // indistinguishable from the out-param alone.
-        if (!event_complete(bucket[i].release_event)) {
+        // Single call does the event_complete() + resolve() work for this
+        // entry -- no separate event_complete() query here (llama.cpp-c6ah
+        // tracks its own potentially-blocking behaviour on profiling queues
+        // separately; a second query per candidate entry would double that
+        // cost for no benefit, since EVENT_PENDING already reports "not
+        // ready" on its own).
+        resolved_ptr                         resolved{};
+        const onednn_graph_scratch_entry_fit fit =
+            onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
+        if (fit == onednn_graph_scratch_entry_fit::EVENT_PENDING) {
             continue;
         }
-        // Peek without popping: an alignment mismatch -- the pool is keyed
-        // on size alone, so a size match does not guarantee this entry
-        // satisfies THIS request's alignment -- must leave the entry
-        // pooled for a future request whose alignment it does satisfy, not
-        // consume it.
-        resolved_ptr resolved{};
-        const bool   usable = onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
-        if (!usable && resolved.ptr && resolved.on_device) {
+        if (fit == onednn_graph_scratch_entry_fit::ALIGNMENT_MISMATCH) {
+            // Peek without popping: the pool is keyed on size alone, so a
+            // size match does not guarantee this entry satisfies THIS
+            // request's alignment -- must leave the entry pooled for a
+            // future request whose alignment it does satisfy, not consume
+            // it.
             continue;
         }
         mem_handle owner = std::move(bucket[i].owner);
@@ -9903,14 +9906,12 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         // removed from that one while pooled, and stays charged now that
         // it is checked out again).
         onednn_graph_scratch_pool_bytes_ -= std::min(size, onednn_graph_scratch_pool_bytes_);
-        if (!usable) {
-            // Only remaining way to reach here with !usable: the resolve
-            // itself failed (ptr/on_device false), since the alignment-only
-            // mismatch above already `continue`d. Should not happen for a
-            // still-owned handle -- fall through and let `owner` destruct
-            // here (a real, immediate release), same as any other unusable
-            // resolution. Do not retry another bucket entry: something is
-            // wrong with this specific handle, not with pooling in general.
+        if (fit == onednn_graph_scratch_entry_fit::RESOLVE_FAILED) {
+            // Should not happen for a still-owned handle -- fall through and
+            // let `owner` destruct here (a real, immediate release), same as
+            // any other unusable resolution. Do not retry another bucket
+            // entry: something is wrong with this specific handle, not with
+            // pooling in general.
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
             // Erase the map entry once its bucket empties out rather than
@@ -9936,7 +9937,8 @@ bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, siz
         return false;
     }
     for (const auto & entry : it->second) {
-        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id)) {
+        if (onednn_graph_scratch_entry_usable_locked(entry, alignment, device_id) ==
+            onednn_graph_scratch_entry_fit::USABLE) {
             return true;
         }
     }
@@ -9984,8 +9986,10 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         std::this_thread::sleep_for(std::chrono::milliseconds(kOnednnGraphDirectWaitPollTimeoutMs));
         lock.lock();
 
-        // Check the requested size's OWN bucket first: an event-complete
-        // entry of the exact size this request needs can satisfy it with no
+        // Check the requested size's OWN bucket first: an entry of the
+        // exact size this request needs that onednn_graph_scratch_entry_usable_locked()
+        // reports usable (event complete, device-resident, and correctly
+        // aligned -- not merely event-complete) can satisfy it with no
         // eviction at all (reuse never needed headroom in the first place --
         // see onednn_graph_scratch_try_reuse_pool_locked()'s own comment).
         // Skipping the general eviction sweep in that case avoids evicting
@@ -10074,10 +10078,10 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
 // onednn_graph_scratch_alloc_direct_locked()'s own miss-counting site for
 // where the miss half of that invariant is kept. Callers must hold
 // onednn_graph_scratch_mutex_.
-void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size, size_t align, int device) {
+void * unified_cache::onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id) {
     mem_handle pooled_owner;
     void *     pooled_ptr = nullptr;
-    if (!onednn_graph_scratch_try_reuse_pool_locked(size, align, device, &pooled_owner, &pooled_ptr)) {
+    if (!onednn_graph_scratch_try_reuse_pool_locked(size, alignment, device_id, &pooled_owner, &pooled_ptr)) {
         return nullptr;
     }
     onednn_graph_scratch_direct_owners_[pooled_ptr] = { std::move(pooled_owner), size };

@@ -3874,8 +3874,10 @@ class unified_cache {
     // either served from the pool (a hit) or freshly allocated (a miss).
     // See the public onednn_graph_scratch_pool_hit_count() accessor above.
     size_t onednn_graph_scratch_pool_hit_count_      = 0;
-    // How many times a DIRECT request found no ready (event-complete) entry
-    // of its exact size in the pool -- the request then went through the
+    // How many times a DIRECT request found no entry of its exact size in
+    // the pool that onednn_graph_scratch_entry_usable_locked() reported
+    // USABLE (event complete, device-resident, and correctly aligned -- not
+    // merely event-complete) -- the request then went through the
     // cap/eviction path and, ultimately, a real allocation. Logged at
     // teardown alongside the hit count so a run's log answers "how well is
     // the pool actually working" without extra instrumentation.
@@ -3893,44 +3895,65 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_bytes_          = 0;
     size_t onednn_graph_scratch_pool_peak_bytes_     = 0;
 
-    // Whether pool entry `entry` can satisfy a request of `alignment` bytes
-    // on `device_id` right now: its release event has completed, its owner
-    // resolves to a real device-resident pointer, and that pointer satisfies
-    // `alignment`. Shared by onednn_graph_scratch_try_reuse_pool_locked()
-    // (which pops and reuses a usable entry) and
-    // onednn_graph_scratch_pool_size_ready_locked() (which only peeks) --
-    // both MUST agree on this definition, because a laxer peek than the real
-    // reuse attempt would let onednn_graph_scratch_wait_for_direct_headroom_locked()'s
+    // Outcome of testing one pool entry against a request's `alignment` and
+    // `device_id` -- see onednn_graph_scratch_entry_usable_locked() below.
+    // Kept as a 4-way enum (not a bool) specifically so a caller can
+    // distinguish EVENT_PENDING ("not ready yet, try the next entry, no
+    // resolve() was even attempted") from RESOLVE_FAILED ("ready, but its
+    // owner would not resolve -- an anomaly worth a hard stop") without a
+    // second, redundant event_complete() query -- see the function's own
+    // comment.
+    enum class onednn_graph_scratch_entry_fit {
+        USABLE,              // event complete, resolves on device, and aligned -- ready to reuse
+        EVENT_PENDING,       // release_event has not completed yet (resolve() was not attempted)
+        RESOLVE_FAILED,      // event complete, but owner.resolve() did not return a device-resident pointer
+        ALIGNMENT_MISMATCH,  // event complete and resolved fine, but not at the requested alignment
+    };
+
+    // Tests pool entry `entry` against a request of `alignment` bytes on
+    // `device_id` right now. Shared by onednn_graph_scratch_try_reuse_pool_locked()
+    // (which pops and reuses a USABLE entry) and
+    // onednn_graph_scratch_pool_size_ready_locked() (which only peeks for
+    // USABLE) -- both MUST agree on this definition, because a laxer peek
+    // than the real reuse attempt would let onednn_graph_scratch_wait_for_direct_headroom_locked()'s
     // wait loop believe a same-size entry is ready when the post-wait
     // re-check still misses it (event-complete but misaligned), skipping
     // the eviction sweep that was supposed to make the request actually fit
     // under the cap -- a silent fail-open of the DIRECT cap. `out_resolved`,
-    // if non-null, receives the resolve() result even on a false return, so
-    // a caller that must distinguish "resolve itself failed" (an anomaly
-    // worth a hard stop -- see onednn_graph_scratch_try_reuse_pool_locked()'s
-    // own comment) from "resolved fine but misaligned" (worth trying the
-    // next entry) does not have to resolve() a second time. Callers must
-    // hold onednn_graph_scratch_mutex_.
-    bool onednn_graph_scratch_entry_usable_locked(const onednn_graph_scratch_pool_entry & entry,
-                                                  size_t                                  alignment,
-                                                  int                                     device_id,
-                                                  resolved_ptr *                          out_resolved = nullptr) const;
+    // if non-null, receives the resolve() result whenever a resolve is
+    // actually attempted (every outcome except EVENT_PENDING), so a caller
+    // that needs the resolved pointer on a USABLE result, or needs to tell
+    // RESOLVE_FAILED apart from ALIGNMENT_MISMATCH for its own branching,
+    // does not have to resolve() a second time. This single call already
+    // performs the one event_complete() query and (if that passes) the one
+    // resolve() query this entry needs for this request -- a caller must
+    // NOT call event_complete() on the same entry itself first (llama.cpp-c6ah
+    // tracks event_complete()'s own potentially-blocking behaviour on
+    // profiling queues separately; doubling the query here would double
+    // that cost per candidate entry for no benefit, since EVENT_PENDING
+    // already reports exactly that outcome). Callers must hold
+    // onednn_graph_scratch_mutex_.
+    onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
+        const onednn_graph_scratch_pool_entry & entry,
+        size_t                                  alignment,
+        int                                     device_id,
+        resolved_ptr *                          out_resolved = nullptr) const;
 
     // Try to serve `size` bytes from onednn_graph_scratch_reuse_pool_: if a
     // bucket for that exact size holds an entry onednn_graph_scratch_entry_usable_locked()
-    // reports usable for `alignment`/`device_id`, pops it and returns true
+    // reports USABLE for `alignment`/`device_id`, pops it and returns true
     // with *out_owner/*out_ptr set. Does NOT touch
     // onednn_graph_scratch_direct_outstanding_bytes_ (a pooled entry's bytes
     // were never removed from it) or note_onednn_graph_scratch_alloc_locked()
     // (the caller does that, same as for a fresh allocation) -- this helper
     // only does the pool lookup/resolve. The pool is keyed on size alone, so
-    // a size match does not guarantee an alignment match -- an entry that
-    // resolves fine but does not satisfy `alignment` is skipped (left pooled
-    // for a future request it does satisfy) rather than handed back
-    // misaligned; an entry that fails to resolve at all is treated as a hard
-    // failure for this call (see the function body) rather than skipped,
-    // since a resolve failure on a still-owned handle indicates a bug, not
-    // an ordinary cache miss. Callers must hold onednn_graph_scratch_mutex_.
+    // a size match does not guarantee an alignment match -- an
+    // ALIGNMENT_MISMATCH entry is skipped (left pooled for a future request
+    // it does satisfy) rather than handed back misaligned; a RESOLVE_FAILED
+    // entry is treated as a hard failure for this call (see the function
+    // body) rather than skipped, since a resolve failure on a still-owned
+    // handle indicates a bug, not an ordinary cache miss. Callers must hold
+    // onednn_graph_scratch_mutex_.
     bool onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
                                                     size_t       alignment,
                                                     int          device_id,
@@ -3939,7 +3962,7 @@ class unified_cache {
 
     // True if onednn_graph_scratch_reuse_pool_ already holds an entry of
     // exactly `size` that onednn_graph_scratch_entry_usable_locked() reports
-    // usable for `alignment`/`device_id` -- a peek, not a pop (does not
+    // USABLE for `alignment`/`device_id` -- a peek, not a pop (does not
     // touch ownership or any counter). Used by
     // onednn_graph_scratch_wait_for_direct_headroom_locked()'s wait loop to
     // recognise "the exact size (and alignment, and device) this request
@@ -3954,7 +3977,7 @@ class unified_cache {
     bool onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;
 
     // Single entry point for a DIRECT request's pool lookup: looks up
-    // `size`/`align` for `device` via onednn_graph_scratch_try_reuse_pool_locked()
+    // `size`/`alignment` for `device_id` via onednn_graph_scratch_try_reuse_pool_locked()
     // and, on a hit, records ownership, the hit counter, and the
     // once-per-size debug print -- returning the resolved pointer directly,
     // so every call site reads as `if (void * p =
@@ -3972,7 +3995,7 @@ class unified_cache {
     // miss. Miss accounting lives at
     // onednn_graph_scratch_alloc_direct_locked()'s own tail, past every
     // re-check, not here. Callers must hold onednn_graph_scratch_mutex_.
-    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t align, int device);
+    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t alignment, int device_id);
 
     // The DIRECT (non-arena) allocation tail of onednn_graph_scratch_alloc()
     // -- request setup, the forced-fail test hook, the unlock/drain/relock/

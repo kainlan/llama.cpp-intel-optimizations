@@ -418,7 +418,7 @@ ticket reproduced on:
   the cap does not shrink out from under the allocator as the arena's own
   zones consume the budget it was planned against). A request that cannot be
   served from the pool and would exceed the cap evicts (a REAL release,
-  destructing the owned `mem_handle`) completed pool entries of OTHER sizes,
+  destructing the owned `mem_handle`) completed pool entries -- of ANY size, including the requested size's own bucket (a same-size entry that is complete but fails this request's alignment is exactly the kind of entry this evicts),
   stopping as soon as it fits — preserving as much of the pool as possible —
   and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
   — potentially called from a different thread — can keep parking newly-freed

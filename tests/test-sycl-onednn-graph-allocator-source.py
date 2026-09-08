@@ -135,6 +135,20 @@ ALLOC_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::o
 DIRECT_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_alloc_direct_locked("
 )
+# llama.cpp-0oxf round-5 finding G2: the real pop-and-reuse attempt and the
+# wait loop's peek must apply the IDENTICAL usability test (both routed
+# through onednn_graph_scratch_entry_usable_locked()) or the peek can
+# silently diverge again the way it did before this round -- see that
+# function's own comment in unified-cache.hpp. Extracted separately from
+# TRY_POOL_BODY_CODE below (this file's other reuse-pool checks) so the
+# "both call the shared predicate" checks read against exactly the two
+# functions the invariant is actually about.
+TRY_REUSE_POOL_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked("
+)
+POOL_SIZE_READY_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_size_ready_locked("
+)
 # Anchor on the open paren only, not the full parameter list: llama.cpp-0oxf
 # changed this function's signature twice (first to a single planner_n_ctx
 # argument, then to (n_head, n_ubatch, n_ctx) after the lead's measurement
@@ -279,6 +293,24 @@ def test_onednn_graph_allocator_source_contract() -> None:
     direct_alloc_pos = direct_code_no_literals.find("unified_alloc(")
     checks["DIRECT body's own re-check precedes its own fresh allocation"] = (
         direct_probe_pos != -1 and direct_alloc_pos != -1 and direct_probe_pos < direct_alloc_pos
+    )
+    # llama.cpp-0oxf round-5 finding G2: the pop-and-reuse attempt and the
+    # wait loop's peek must not be free to diverge again on what counts as
+    # "usable" -- assert both actually route through the one shared
+    # predicate, and that the peek's own declaration still accepts the
+    # alignment/device_id it needs to apply that predicate (a peek that lost
+    # those parameters back to a size-only signature would silently regress
+    # to the old, laxer test even with the predicate call still present
+    # elsewhere).
+    checks["try_reuse_pool_locked() body calls the shared usability predicate"] = (
+        "onednn_graph_scratch_entry_usable_locked(" in TRY_REUSE_POOL_BODY_CODE
+    )
+    checks["pool_size_ready_locked() body calls the shared usability predicate"] = (
+        "onednn_graph_scratch_entry_usable_locked(" in POOL_SIZE_READY_BODY_CODE
+    )
+    checks["pool_size_ready_locked() declaration still takes alignment and device_id"] = (
+        "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;"
+        in normalize_ws(CACHE_HPP_CODE)
     )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
