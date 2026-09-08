@@ -119,7 +119,8 @@ arms' real gates rather than at invented numbers.
 
 The long-prompt matrix's own fixtures are trimmed from **real, guarded
 captures**, not reconstructed from source like the merge-cert set above. The
-lead archives 60 guarded logs under
+lead archived 56 guarded logs (11 full cells plus a partial B50 Mistral pp8192
+cell) and one `.FAULT` under
 `/Apps/llama.cpp/artifacts/perf-6ae16115c-longprompt/` (each an
 n=1..5 `llama-bench -p <pp> -n 128 -fa 1 -r 5 -v` process, one per
 card/model/pp/n); this task's committed fixtures are one `n=1` sample per

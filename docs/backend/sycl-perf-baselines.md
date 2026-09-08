@@ -160,23 +160,27 @@ Binaries built at `6e54ba2eb` (the SYCL backend is unchanged through `0d8b160c5`
 models read from the byte-identical NFS copies under `/Storage/GenAI/models`
 (`/models` was mid-migration); ambient load ~17; B70 free VRAM 30553 MiB and B50
 14618 MiB on every run. `ctx achieved` is the `llama_context: n_ctx` the pp8192 test
-actually ran with (llama-bench sizes it per test). Table produced by
-`python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-6ae16115c-longprompt --table --partial-arm "b50-mistral-pp8192=GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf"`
-from the archived logs, never by hand.
+actually ran with (llama-bench sizes it per test). Table rows produced by
+`python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-6ae16115c-longprompt --table --partial-arm "b50-mistral-pp8192=GPU CAT error on 2 of 2 attempts after the 2026-09-07 reboot, llama.cpp-0oxf"`
+from the archived logs; only the `notes` column was added by hand. The logs were
+captured with `scripts/bench-guard.sh` at `42184389d` under its `--pci` override,
+which predates the llama.cpp-imns `pci=`/`card=` header stamp, so the archived
+headers do not name the card (the driver log and `l3-prefill-gate.txt` do).
 
 | card | model | PP2048 | TG128 | PP8192 | TG128 | ctx achieved | notes |
 |---|---|---|---|---|---|---|---|
 | B70 | Mistral 7B Q4_0 | 2859.24 ± 54.97 | 109.70 ± 2.11 | 1555.38 ± 48.27 | 110.36 ± 2.63 | 8192 | - |
 | B70 | GPT-OSS 20B MXFP4 | 1544.44 ± 43.28 | 48.40 ± 9.68 | 1262.05 ± 25.68 | 49.60 ± 7.52 | 8192 | tg bimodal, see note 2 |
 | B70 | gemma4 E4B Q8_0 | 2533.00 ± 106.25 | 75.26 ± 1.27 | 1948.32 ± 69.98 | 75.63 ± 1.57 | 8192 | first process fastest, note 3 |
-| B50 | Mistral 7B Q4_0 | 1229.01 ± 8.17 | 47.01 ± 0.43 | 804.16 (n=1, GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf) | 46.56 (n=1, GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf) | 8192 | note 1 |
+| B50 | Mistral 7B Q4_0 | 1229.01 ± 8.17 | 47.01 ± 0.43 | 804.16 (n=1, GPU CAT error on 2 of 2 attempts after the 2026-09-07 reboot, llama.cpp-0oxf) | 46.56 (n=1, GPU CAT error on 2 of 2 attempts after the 2026-09-07 reboot, llama.cpp-0oxf) | 8192 | note 1 |
 | B50 | GPT-OSS 20B MXFP4 | 799.69 ± 9.45 | 36.16 ± 2.21 | 653.61 ± 6.74 | 37.08 ± 1.44 | 8192 | - |
 | B50 | gemma4 E4B Q8_0 | 1372.74 ± 91.87 | 35.37 ± 0.28 | 1047.87 ± 8.97 | 35.46 ± 0.32 | 8192 | pp2048 sample 1 = 1210 (in-process ± 453), note 3 |
 
 These are **report-only rows, not gates**: no floor or band is declared for the
 long-prompt matrix until the owner rules on one (CLAUDE.md: a new guardrail is an
 owner decision). The parser refuses (exit 2, nothing on stdout) on any missing or
-short arm, so a future run cannot silently drop a cell.
+short arm unless the arm is explicitly named by `--partial-arm`, so a future run
+cannot silently drop a cell.
 
 Notes:
 
@@ -184,8 +188,10 @@ Notes:
    2026-09-07 20:02 reboot; after it the same command faulted on 2 of 2 attempts with
    `xe 0000:09:00.0: Engine memory CAT error class=ccs` + engine reset, then
    `UR_RESULT_ERROR_OUT_OF_RESOURCES` and (once) a segfault. Tracked as
-   **llama.cpp-0oxf (P1)**; the faulted log is kept as
-   `artifacts/perf-6ae16115c-longprompt/b50-mistral-pp8192-2.log.FAULT`. The card
+   **llama.cpp-0oxf (P1)**; both faulted logs are kept as
+   `artifacts/perf-6ae16115c-longprompt/b50-mistral-pp8192-2-first-attempt.log.FAULT`
+   (the segfaulting first attempt, with its RssAnon sidecar) and
+   `b50-mistral-pp8192-2.log.FAULT` (the retry). The card
    recovered without a reboot (Mistral gate correct afterwards) and every other B50
    run's own kernel-log window was fault-free.
 2. **B70 GPT-OSS tg128 is bimodal** (39-42 vs 57-59 across the five processes, sd 9.7):
@@ -216,7 +222,7 @@ pair, guard-VALID, no kernel faults; full output in
 
 The collapse in the snapshot below (pp1024/pp512 of 0.30-0.69) is gone after L2/L2b
 (llama.cpp-dfo0 steps 1-2, llama.cpp-h9uv): five of six pairs are at or above the 0.9
-floor. gemma4 on the B70 is reproducibly 0.875-0.896 (three runs), 1-3 points under it,
+floor. gemma4 on the B70 is reproducibly 0.875-0.896 (three runs), 0.4-2.5 points under it,
 and the per-decode fixed cost (the `intercept_ms` column: ~75-90 ms B70 dense, ~190 ms
 B70 MoE, 150-380 ms B50) is the residual the gate records; both stay open on
 **llama.cpp-dfo0**. Repeated single runs of the B70 ratio move by ±3 points
@@ -933,17 +939,17 @@ floor or band has been declared for it (a new guardrail needs an owner
 ruling), so it can only ever exit 0 (input clean) or 2 (input gap) — exit 1
 is structurally unreachable for this matrix, and the report says so
 explicitly. `--table` (long-prompt only; error exit 2 combined with
-`--matrix merge-cert`) additionally prints the markdown rows for the results
-table below, derived from the same parsed samples as the report, never
-re-parsed:
+`--matrix merge-cert`) additionally prints the markdown rows for the Long-Prompt
+Baselines section above (whose rows this command produced), derived from the
+same parsed samples as the report, never re-parsed:
 
 ```sh
 python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt \
   --dir artifacts/perf-<sha>-longprompt --table
 ```
 
-This does not add result rows to this document — the parser only produces
-them; the lead adds the measured rows after the matrix has actually run.
+The parser only produces the rows; the measured rows live in the Long-Prompt
+Baselines section above and were pasted from this command's output.
 
 **`--partial-arm ARM=REASON`** (repeatable, long-prompt only; error exit 2
 combined with `--matrix merge-cert`) accepts 1..runs-1 samples for one
