@@ -264,15 +264,16 @@ if ! sycl_preflight_journal_has_previous_boot_gpu_faults; then
 fi
 unset -f journalctl
 
-# --- companion checks so the llama.cpp-pqgl fix's capture-then-grep-c rewrite didn't
-# flip either function's polarity: a genuinely clean journal must still
-# read as "no fault", and a journalctl that cannot be found must still
-# reach the pre-existing documented "no fault" fail-open (see
-# scripts/sycl-gpu-preflight.sh's own comment directly above the two
-# journal-check functions' definitions, not this file), not a new
-# behaviour ---
+# --- companion checks so the llama.cpp-pqgl fix's capture-then-grep-c
+# rewrite didn't flip either function's polarity: a genuinely clean
+# journal must still read as "no fault", and a journalctl that cannot
+# be found must still reach the pre-existing documented "no fault"
+# fail-open (see scripts/sycl-gpu-preflight.sh's own comment directly
+# above the two journal-check functions' definitions, not this file),
+# not a new behaviour ---
 
 cases=$((cases+1))
+# shellcheck disable=SC2329  # invoked indirectly, as the `journalctl` override
 journalctl() { seq 1 5000 | sed 's/^/kernel: quiet boot line /'; }
 if sycl_preflight_journal_has_current_boot_gpu_faults; then
     echo "FAIL: sycl_preflight_journal_has_current_boot_gpu_faults must NOT report a fault on a clean journal"
