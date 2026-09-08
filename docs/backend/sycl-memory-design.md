@@ -442,7 +442,7 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
-- **The pool is bounded per size, and reclaimed at every point that could
+  - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
   also caps each size bucket at `onednn_graph_scratch_pool_depth_per_size()`
@@ -459,32 +459,32 @@ ticket reproduced on:
   KV/RUNTIME zones for a new context, and — the one point that does NOT go
   through `arena_reserve()` at all —
   `ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`) on every
-  successful runtime `n_ctx`/`n_ubatch` update, via the free-function wrapper
-  `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that third
-  site a pooled buffer sized for one context's shapes could sit on a 16 GB
-  card holding up to the cap's worth of idle VRAM while the next model loads
-  (`llama-bench` with several `-m`, a server switching models) or while the
-  SAME model's context is resized to a different `n_ctx`. The three sites do
-  NOT log in the same order relative to the clear (the context-reclaim and
-  runtime-update sites share `reclaim_pool()`, which clears the pool and only
-  then logs the summary; teardown instead logs the summary early, well before
-  it actually clears the pool) — see `docs/backend/sycl-env-vars.md`'s
-  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site ordering.
-  Either way the line logged is `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT
-  pool summary (%s): hits=%zu misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB
-  (cumulative for this process, not just this reclaim)` (silent if the pool
-  was never used), where `%s` is `"teardown"`, `"context reclaim"`, or
-  `"runtime context update"`. Only the teardown call logs at
-  `GGML_LOG_LEVEL_WARN`; the context-reclaim and runtime-context-update
-  calls log at `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity
-  in every tool (see CLAUDE.md's "llama-bench traps" section) — so those two
-  summaries are invisible in a normal run unless verbosity is raised. The
-  summary call passes the enum `GGML_LOG_LEVEL_WARN` directly to
-  `ggml_log_internal()` because its level is a runtime choice — WARN at
-  teardown, INFO otherwise — which the level-baking
-  `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot express. The high-water line
-  above it has a single fixed level and uses the `GGML_LOG_WARN` macro
-  instead.
+  successful runtime `n_ctx`/`n_ubatch` update, via the free-function
+  wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that
+  third site a pooled buffer sized for one context's shapes could sit on a
+  16 GB card holding up to the cap's worth of idle VRAM while the next model
+  loads (`llama-bench` with several `-m`, a server switching models) or
+  while the SAME model's context is resized to a different `n_ctx`. The
+  three sites do NOT log in the same order relative to the clear (the
+  context-reclaim and runtime-update sites share `reclaim_pool()`, which
+  clears the pool and only then logs the summary; teardown instead logs the
+  summary early, well before it actually clears the pool) — see
+  `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
+  row for the exact per-site ordering. Either way the line logged is
+  `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
+  misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB (cumulative for
+  this process, not just this reclaim)` (silent if the pool was never used),
+  where `%s` is `"teardown"`, `"context reclaim"`, or `"runtime context
+  update"`. Only the teardown call logs at `GGML_LOG_LEVEL_WARN`; the
+  context-reclaim and runtime-context-update calls log at
+  `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity in every tool
+  (see CLAUDE.md's "llama-bench traps" section) — so those two summaries are
+  invisible in a normal run unless verbosity is raised. The summary call
+  passes the enum `GGML_LOG_LEVEL_WARN` directly to `ggml_log_internal()`
+  because its level is a runtime choice — WARN at teardown, INFO otherwise —
+  which the level-baking `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot
+  express. The high-water line above it has a single fixed level and uses
+  the `GGML_LOG_WARN` macro instead.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/

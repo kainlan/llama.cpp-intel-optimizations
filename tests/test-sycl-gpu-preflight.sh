@@ -269,16 +269,16 @@ cases=$((cases+1))
 # This file's own top-of-file `source "$PREFLIGHT"` above already sourced it
 # once under `set -euo pipefail`; every one of this file's six sibling
 # sourcing scripts does the same under set -e (most with -uo pipefail; only
-# scripts/benchmark-sycl.sh uses bare `set -e`). A second `source` of the SAME copy is
-# what a caller that sources this library more than once (or a caller that
-# is itself sourced more than once) would trigger, and SYCL_PREFLIGHT_FAULT_RE
-# was a bare top-level `readonly` before the fix -- a second assignment to
-# an already-readonly variable aborts the whole subshell under `set -e`,
-# not just that one line. Also assert the variable actually ENDS UP
-# readonly (`readonly -p`, matched with a `case` statement rather than a
-# `| grep -q` pipeline, which this project's gates avoid for the SIGPIPE
-# hazard documented in CLAUDE.md): the guard must not merely survive a
-# double source, it must still leave the real invariant in place
+# scripts/benchmark-sycl.sh uses bare `set -e`). A second `source` of the
+# SAME copy is what a caller that sources this library more than once (or a
+# caller that is itself sourced more than once) would trigger, and
+# SYCL_PREFLIGHT_FAULT_RE was a bare top-level `readonly` before the fix --
+# a second assignment to an already-readonly variable aborts the whole
+# subshell under `set -e`, not just that one line. Also assert the variable
+# actually ENDS UP readonly (`readonly -p`, matched with a `case` statement
+# rather than a `| grep -q` pipeline, which this project's gates avoid for
+# the SIGPIPE hazard documented in CLAUDE.md): the guard must not merely
+# survive a double source, it must still leave the real invariant in place
 # afterwards. Run in a fresh `bash -c` subshell (not this file's own
 # process) so a genuine abort here fails only this case, not the whole
 # suite.

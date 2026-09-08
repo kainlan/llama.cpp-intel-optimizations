@@ -3013,11 +3013,13 @@ class unified_cache {
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 
     // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to wait
-    // for headroom to free up under the cap -- polling the size-bucketed
-    // reuse pool for a completed in-flight entry it could evict -- before it
-    // was allowed to allocate. Exposed for tests and for the teardown log
-    // line; see the private ledger this counts against in the member
-    // declarations further below.
+    // for headroom to free up under the cap before it was allowed to
+    // allocate -- polling until either exit condition is met: a same-size
+    // entry in the request's own bucket becomes USABLE and can be reused
+    // with nothing evicted, or the general eviction sweep frees enough
+    // headroom by releasing other in-flight entries. Exposed for tests and
+    // for the teardown log line; see the private ledger this counts against
+    // in the member declarations further below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
@@ -3029,6 +3031,8 @@ class unified_cache {
     // proof the accessor tracks a real charge rather than staying inert,
     // without needing to allocate through the same private path being
     // tested to observe it.
+    // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
+    // above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_outstanding_bytes() const {
         return onednn_graph_scratch_direct_outstanding_bytes_;
     }
@@ -3050,9 +3054,12 @@ class unified_cache {
 
     size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
 
-    // Public, self-locking entry point: logs the pool summary then releases
-    // (for real) every pooled DIRECT Graph-scratch buffer. `context` names
-    // the call site for the log line (e.g. "context reclaim", "runtime
+    // Public, self-locking entry point: releases (for real) every pooled
+    // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
+    // before log, same order as the body below and for the same reason
+    // (logging first would under-report the summary by the pool's own live
+    // contents at that moment). `context` names the call site for the log
+    // line (e.g. "context reclaim", "runtime
     // context update"). Called internally at arena_reserve()'s context-
     // reclaim branch; also called externally (via
     // unified_cache_reclaim_onednn_graph_scratch_pool() below) from
@@ -4088,9 +4095,12 @@ class unified_cache {
     // successful runtime n_ctx/n_ubatch update via the free-function wrapper
     // unified_cache_reclaim_onednn_graph_scratch_pool() -- a pooled DIRECT
     // buffer must not outlive the context it was allocated for. Callers must
-    // hold onednn_graph_scratch_mutex_ (teardown/context-reclaim/runtime-
-    // update call sites take it explicitly since they are not already
-    // inside an onednn_graph_scratch_* entry point).
+    // hold onednn_graph_scratch_mutex_. Only the teardown call site
+    // (shutdown_resources()) takes it explicitly, since it is not already
+    // inside an onednn_graph_scratch_* entry point; the context-reclaim and
+    // runtime-update call sites both go through
+    // onednn_graph_scratch_reclaim_pool() above, which acquires the lock
+    // itself before calling this.
     void onednn_graph_scratch_clear_pool_locked();
 
     // Logs the pool hit/miss/eviction counts and peak pooled bytes -- silent
