@@ -3883,10 +3883,15 @@ class unified_cache {
     // the pool actually working" without extra instrumentation.
     size_t onednn_graph_scratch_pool_miss_count_     = 0;
     // How many pool entries were released for real rather than reused --
-    // either evicted under cap pressure (onednn_graph_scratch_evict_pool_until_fits_locked())
-    // or released immediately because their size bucket was already at
-    // onednn_graph_scratch_pool_depth_per_size()'s per-size depth
-    // limit when onednn_graph_scratch_free() tried to park them.
+    // evicted under cap pressure (onednn_graph_scratch_evict_pool_until_fits_locked()),
+    // released immediately because their size bucket was already at
+    // onednn_graph_scratch_pool_depth_per_size()'s per-size depth limit
+    // when onednn_graph_scratch_free() tried to park them, or released in
+    // bulk by onednn_graph_scratch_clear_pool_locked() at one of its three
+    // reclaim points (cache teardown, arena_reserve()'s context-reclaim
+    // branch, and ggml_backend_sycl_set_runtime_context()'s runtime-update
+    // reclaim), which counts every entry it clears as an eviction
+    // regardless of the reason the pool is being reclaimed.
     size_t onednn_graph_scratch_pool_eviction_count_ = 0;
     // Running total of bytes currently sitting in the pool (across every
     // size bucket, reused or not yet), and its high-water mark. Distinct
