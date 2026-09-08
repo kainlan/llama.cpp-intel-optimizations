@@ -46,9 +46,9 @@ sycl_preflight_b50_pci_address() {
         # shellcheck disable=SC2329  # invoked indirectly, from inside derive_card_for_selector
         refuse() { exit 1; }
         # NOT reset before the call, unlike bench-guard.sh/sycl-decode-mode-
-        # capture.sh's own DERIVED_CARD="" DERIVED_PCI="" before their calls
-        # (quality review round 3, F12): a stale DERIVED_PCI can never leak
-        # into this function's output regardless, because a FAILED
+        # capture.sh's own DERIVED_CARD="" DERIVED_PCI="" before their calls:
+        # a stale DERIVED_PCI can never leak into this function's output
+        # regardless, because a FAILED
         # derivation always reaches refuse()'s own `exit 1` -- which
         # terminates this SUBSHELL immediately -- before the `printf` line
         # below ever runs. Only a SUCCESSFUL derive_card_for_selector call
@@ -77,16 +77,55 @@ sycl_preflight_selector_may_use_b50() {
        "$selector" == *level_zero:*gpu* ]]
 }
 
+# Both journal-check functions below capture the full producer output into a
+# variable FIRST and grep -c a herestring second, rather than piping straight
+# into `grep -Eiq`. Piping directly is a fail-open SIGPIPE hazard: `grep -q`
+# exits at the FIRST match without draining the rest of its input, so on a
+# real fault (a match near the start of a long journal) the still-writing
+# `journalctl` process gets SIGPIPE on its next write and exits 141. Under
+# `set -o pipefail` (five of six sourcing callers run under it) bash reports
+# a pipeline's status as the last command to exit non-zero -- `grep -q`
+# itself exited 0 (it matched), so that 141 from `journalctl` becomes the
+# pipeline's status, this function returns non-zero ("no fault"), and the
+# gate does NOT refuse on a host with a current-boot CAT error or engine
+# reset (llama.cpp-pqgl; reproduced with a fault line followed by 400k
+# filler lines under `set -euo pipefail`). Capturing first sidesteps this
+# entirely: the herestring grep never shares a pipe with a live writer.
+#
+# `|| return 1` on the capture preserves this file's existing behaviour for
+# a MISSING or failing journalctl (same fail-open verdict the prior
+# `command -v journalctl || return 1` guard gave): this preflight check is a
+# passive advisory gate that already refuses independently on B50 sysfs
+# state and uninterruptible GPU work, so "journal unreadable" here does not
+# escalate to a refusal the way bench-guard.sh's postflight SUSPECT does --
+# a deliberate difference, not an oversight, because this function's boolean
+# result has no room to express a third "unreadable" state without changing
+# every caller.
+#
+# Both captures below (this function's and its previous-boot sibling's) are
+# deliberately UNBOUNDED (no `-n`, no `--since`): this is a
+# current/previous-BOOT-wide fault check by design (`-b`/`-b -1`), not a
+# windowed one like bench-guard.sh's postflight check (which has an actual
+# window to bound -- the run it just guarded). There is no meaningful
+# "recent enough" cutoff for "has this boot ever seen a GPU fault" short of
+# re-deriving boot time from journalctl itself, which buys nothing over just
+# reading the whole boot's journal. Measured size is modest in practice
+# (~7.6 MB for a boot's kernel ring on this host) and this path already
+# avoids the SIGPIPE hazard the capture-first rewrite above exists to fix.
 sycl_preflight_journal_has_current_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
-    journalctl -k -b --no-pager 2>/dev/null |
-        grep -Eiq 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+    local jl_out n
+    jl_out="$(journalctl -k -b --no-pager 2>/dev/null)" || return 1
+    n="$(grep -ciE 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes' <<<"$jl_out" || true)"
+    [ "${n:-0}" -gt 0 ]
 }
 
 sycl_preflight_journal_has_previous_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
-    journalctl -k -b -1 --no-pager 2>/dev/null |
-        grep -Eiq 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+    local jl_out n
+    jl_out="$(journalctl -k -b -1 --no-pager 2>/dev/null)" || return 1
+    n="$(grep -ciE 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes' <<<"$jl_out" || true)"
+    [ "${n:-0}" -gt 0 ]
 }
 
 # sycl_preflight_b50_sysfs_bad -- true (return 0) iff the B50's sysfs
@@ -114,9 +153,9 @@ sycl_preflight_b50_sysfs_bad() {
     # in a non-conditional context (not inside `if`/`&&`/`||`) would have the
     # whole calling script/shell terminated by THIS assignment the moment
     # derivation fails, before it ever reached the documented
-    # "cannot derive -> bad" verdict below (quality review finding F3; the
-    # same class of bug this file's own test suite hit and fixed with an
-    # identical `|| true` on its own test-side calls).
+    # "cannot derive -> bad" verdict below (the same class of bug this
+    # file's own test suite hit and fixed with an identical `|| true` on its
+    # own test-side calls).
     pci="$(sycl_preflight_b50_pci_address)" || true
     # Cannot derive a second discrete card's PCI address at all (single-GPU
     # host, topology error, ...): treat this the same conservative way the

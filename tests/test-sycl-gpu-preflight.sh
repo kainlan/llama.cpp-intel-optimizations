@@ -27,10 +27,10 @@ source "$PREFLIGHT"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
 # cases: total test-case count, printed in the final "OK" line and checked
-# against a literal total below -- the llama.cpp-3e0f finding 10 / Q6
-# convention tests/test-bench-guard.sh and tests/test-sycl-prefill-scaling.sh
-# already use (spec review round 2, M5). Every case below bumps this exactly
-# once, directly above its own case.
+# against a literal total below -- the llama.cpp-3e0f convention
+# tests/test-bench-guard.sh and tests/test-sycl-prefill-scaling.sh already
+# use. Every case below bumps this exactly once, directly above its own
+# case.
 cases=0
 
 mk_pci_dev() { # $1=devroot $2=addr
@@ -114,14 +114,13 @@ else
     fail=1
 fi
 
-# --- F8 (spec review round 3): the address DOES enumerate in DRM (a
-# healthy derivation, unlike the cannot-derive case just above) but has no
-# matching entry under the PCI root -- distinct from every other
-# sysfs_bad case, which all use $T/drmroot (a real DERIVED address) paired
-# with a pciroot fixture that DOES contain that address. An empty PCI root
-# directory (mkdir with nothing inside it) must still reach the
-# conservative CANNOT-CONFIRM-GOOD verdict (final check, quality review
-# round 4): via the `[[ -e "$b50" ]] || return 0` guard, or equivalently
+# --- the address DOES enumerate in DRM (a healthy derivation, unlike the
+# cannot-derive case just above) but has no matching entry under the PCI
+# root -- distinct from every other sysfs_bad case, which all use
+# $T/drmroot (a real DERIVED address) paired with a pciroot fixture that
+# DOES contain that address. An empty PCI root directory (mkdir with
+# nothing inside it) must still reach the conservative CANNOT-CONFIRM-GOOD
+# verdict: via the `[[ -e "$b50" ]] || return 0` guard, or equivalently
 # the terminal enable/power_state fall-through if that guard were ever
 # removed -- the two are indistinguishable from outside this function
 # (deleting the guard leaves this suite green, since a missing directory
@@ -139,8 +138,8 @@ else
     fail=1
 fi
 
-# --- F3 regression (quality review): the call above sits inside an `if`,
-# which is ALREADY exempt from `set -e` regardless of any internal bug --
+# --- the call above sits inside an `if`, which is ALREADY exempt from
+# `set -e` regardless of any internal bug --
 # it cannot catch a caller-under-set-e problem. sycl_preflight_b50_sysfs_bad's
 # own internal `pci="$(sycl_preflight_b50_pci_address)"` needs its own
 # `|| true`, because sycl_preflight_b50_pci_address legitimately returns
@@ -221,10 +220,78 @@ if ! sycl_preflight_selector_may_use_b50 "level_zero:1"; then
     fail=1
 fi
 
+# --- llama.cpp-pqgl positive control: SIGPIPE fail-open under this
+# file's own `set -o pipefail` (see the top of this file). The old form was
+# `journalctl -k -b [-1] --no-pager 2>/dev/null | grep -Eiq '<patterns>'`.
+# `grep -q` exits at the FIRST match without draining the rest of its
+# input; a still-writing producer then gets SIGPIPE on its next write, and
+# under pipefail bash reports the pipeline's status as the last command to
+# exit non-zero -- `grep -q` itself exited 0 (it matched), so the
+# producer's SIGPIPE exit becomes the pipeline's status, the function
+# returns non-zero ("no fault"), and a real current-boot/previous-boot
+# fault goes undetected. A fault line followed by a SHORT journal (as in
+# the bench-guard.sh sibling test's 20000-line fixture) is not reliably
+# enough to trigger the race on every host/pipe-buffer size, so this uses
+# 400000 filler lines, comfortably larger than any pipe buffer, streamed
+# one at a time via `seq | sed` so the fault line is matched and the pipe
+# closed while the producer is still writing behind it. `journalctl` is
+# overridden as a shell FUNCTION (not an external script): a function
+# called on the left of a pipe still runs in its own forked subshell, so
+# the SIGPIPE mechanics are the same as a real external producer.
+mk_journal_fault_then_filler() {  # uses the global $FAULT_LINE, set by the caller before invoking this
+    # shellcheck disable=SC2329  # invoked indirectly, as the `journalctl` override
+    journalctl() {
+        printf '%s\n' "$FAULT_LINE"
+        seq 1 400000 | sed 's/^/kernel: filler line /'
+    }
+}
+
+cases=$((cases+1))
+FAULT_LINE='kernel: xe 0000:04:00.0: Engine reset triggered'
+mk_journal_fault_then_filler
+if ! sycl_preflight_journal_has_current_boot_gpu_faults; then
+    echo "FAIL: sycl_preflight_journal_has_current_boot_gpu_faults must detect a fault line followed by 400000 filler lines, not fail open under SIGPIPE/pipefail"
+    fail=1
+fi
+unset -f journalctl
+
+cases=$((cases+1))
+FAULT_LINE='kernel: xe 0000:04:00.0: guc_id=2 engine reset'
+mk_journal_fault_then_filler
+if ! sycl_preflight_journal_has_previous_boot_gpu_faults; then
+    echo "FAIL: sycl_preflight_journal_has_previous_boot_gpu_faults must detect a fault line followed by 400000 filler lines, not fail open under SIGPIPE/pipefail"
+    fail=1
+fi
+unset -f journalctl
+
+# --- companion checks so the llama.cpp-pqgl fix's capture-then-grep-c
+# rewrite didn't flip either function's polarity: a genuinely clean
+# journal must still read as "no fault", and a journalctl that cannot
+# be found must still reach the pre-existing documented "no fault"
+# fail-open (see scripts/sycl-gpu-preflight.sh's own comment directly
+# above the two journal-check functions' definitions, not this file),
+# not a new behaviour ---
+
+cases=$((cases+1))
+# shellcheck disable=SC2329  # invoked indirectly, as the `journalctl` override
+journalctl() { seq 1 5000 | sed 's/^/kernel: quiet boot line /'; }
+if sycl_preflight_journal_has_current_boot_gpu_faults; then
+    echo "FAIL: sycl_preflight_journal_has_current_boot_gpu_faults must NOT report a fault on a clean journal"
+    fail=1
+fi
+unset -f journalctl
+
+cases=$((cases+1))
+mkdir -p "$T/empty-path-bin"
+if PATH="$T/empty-path-bin" sycl_preflight_journal_has_current_boot_gpu_faults; then
+    echo "FAIL: sycl_preflight_journal_has_current_boot_gpu_faults must NOT report a fault when journalctl cannot be found (documented fail-open decision)"
+    fail=1
+fi
+
 # Expected total is a LITERAL, not derived from anything else in this file --
-# bump it whenever a case is added or removed above (llama.cpp-3e0f finding
-# 10 / Q6 convention, adopted here per spec review round 2, M5).
-[ "$cases" -eq 10 ] || { echo "FAIL: expected 10 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+# bump it whenever a case is added or removed above (llama.cpp-3e0f
+# convention).
+[ "$cases" -eq 14 ] || { echo "FAIL: expected 14 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: sycl-gpu-preflight B50 live derivation ($cases cases)"

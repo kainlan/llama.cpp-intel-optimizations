@@ -1283,9 +1283,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                                          const ggml_sycl_placement_envelope *       envelope,
                                          int                                        n_experts = 0);
 
-void     unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
-size_t   unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
-void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
+void   unified_cache_set_planned_pp_pipeline_scratch_bytes(int device_id, size_t bytes);
+size_t unified_cache_get_planned_pp_pipeline_scratch_bytes(int device_id);
+void   unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t bytes);
 // The primitive-API weights+activations pair's own planned requirement,
 // WITHOUT the Graph-scratch allocator's additive floor (llama.cpp-gwno
 // round 3, spec-review finding 3). Two getters exist because they answer
@@ -1307,8 +1307,8 @@ void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t
 //     absorbs the pair's growth signal instead of the guard ever recording
 //     it. Every future caller of either getter must say, in a comment,
 //     which question it is asking.
-size_t   unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
-size_t   unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
+size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
+size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 
 // llama.cpp-0oxf: the SDPA shape (max query-head count, ubatch size, context
 // length) recorded alongside the scratchpad bytes above, feeding
@@ -3758,7 +3758,7 @@ class unified_cache {
     // -- it is tracked purely so free() can maintain the outstanding-bytes
     // counter below without oneDNN having to pass it back (its free callback
     // doesn't carry one).
-    std::unordered_map<void *, size_t>     onednn_graph_scratch_zone_sizes_;
+    std::unordered_map<void *, size_t>                            onednn_graph_scratch_zone_sizes_;
 
     // Concurrently-outstanding bytes (zone-backed + DIRECT-fallback
     // combined) and its running peak, both updated under
@@ -3826,8 +3826,18 @@ class unified_cache {
     // the latter is read/written from onednn_graph_scratch_alloc() BEFORE the
     // mutex is taken (the size==0/q==nullptr check happens ahead of the lock,
     // since there is nothing to lock for on an invalid request).
+    // onednn_graph_scratch_oversized_request_logged_ and
+    // onednn_graph_scratch_gave_up_waiting_logged_ (llama.cpp-pqgl) are the
+    // same per-instance "log once" shape as
+    // onednn_graph_scratch_first_wait_logged_ above, for
+    // onednn_graph_scratch_wait_for_direct_headroom_locked()'s size>cap
+    // early-out and onednn_graph_scratch_alloc_direct_locked()'s
+    // gave-up-waiting ERROR respectively -- both only ever touched under
+    // onednn_graph_scratch_mutex_, same as the other two.
     size_t            onednn_graph_scratch_last_printed_request_size_ = SIZE_MAX;
     bool              onednn_graph_scratch_first_wait_logged_         = false;
+    bool              onednn_graph_scratch_oversized_request_logged_  = false;
+    bool              onednn_graph_scratch_gave_up_waiting_logged_    = false;
     std::atomic<bool> onednn_graph_scratch_zone_miss_warned_{ false };
     std::atomic<bool> onednn_graph_scratch_invalid_request_warned_{ false };
     std::atomic<bool> onednn_zone_clamp_warned_{ false };
@@ -3886,7 +3896,11 @@ class unified_cache {
     // evicted under cap pressure (onednn_graph_scratch_evict_pool_until_fits_locked()),
     // released immediately because their size bucket was already at
     // onednn_graph_scratch_pool_depth_per_size()'s per-size depth limit
-    // when onednn_graph_scratch_free() tried to park them, or released in
+    // when onednn_graph_scratch_free() tried to park them, popped and
+    // released immediately by onednn_graph_scratch_try_reuse_pool_locked()'s
+    // own RESOLVE_FAILED branch (an entry whose event completed but whose
+    // pointer could not be re-resolved -- should not happen for a still-
+    // owned handle, but is a real release when it does), or released in
     // bulk by onednn_graph_scratch_clear_pool_locked() at one of its three
     // reclaim points (cache teardown, arena_reserve()'s context-reclaim
     // branch, and ggml_backend_sycl_set_runtime_context()'s runtime-update
@@ -4041,10 +4055,17 @@ class unified_cache {
     // onednn_graph_scratch_pool_size_ready_locked()'s per-iteration peek --
     // see that function's comment for why a peek that ignored them could
     // report "ready" for an entry the post-wait re-check would still miss.
+    // `out_was_oversized` is set true only when the returned false came from
+    // the size>cap early-out (no wait was attempted -- that branch already
+    // logs its own latched WARN), false in every other case including a
+    // genuine timed-out wait; lets the caller avoid logging its own
+    // "gave up waiting" ERROR for a call that never actually waited
+    // (llama.cpp-pqgl).
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                               size_t                         alignment,
                                                               int                            device_id,
-                                                              std::unique_lock<std::mutex> & lock);
+                                                              std::unique_lock<std::mutex> & lock,
+                                                              bool &                         out_was_oversized);
 
     // Releases every entry in onednn_graph_scratch_reuse_pool_ (real release
     // for an entry whose release_event has already completed; handed to

@@ -212,6 +212,14 @@ pre_thr="$st"
 # command exits non-zero (its own exit status IS the simple command's
 # status). `|| rc=$?` keeps the non-zero status without letting -e fire, and
 # mirrors it in the guard's own exit below rather than the verdict.
+#
+# Captured immediately before the wrapped command starts, not derived from
+# $BUDGET, so the postflight kernel-log window below covers exactly the run
+# regardless of how long it actually took (BUDGET is a ceiling, --budget is
+# user-settable, and a fixed "10 minutes ago" would both miss a fault early
+# in a run longer than 10 minutes and mis-attribute a fault from a prior run
+# still inside that fixed window).
+run_start_epoch="$(date +%s)"
 rc=0
 if [ -n "$LOG" ]; then
     tmp_out="$(mktemp)"
@@ -244,7 +252,7 @@ elif [ "$rc" -ge 128 ]; then
     reasons="$reasons signal:rc=$rc"
 fi
 kernel_log() {
-    if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null; fi
+    if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "@$run_start_epoch" --no-pager 2>/dev/null; fi
 }
 # The producer's own exit status is captured SEPARATELY from the match
 # count, via a plain command substitution rather than piping straight into

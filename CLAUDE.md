@@ -1076,6 +1076,11 @@ script that hardcodes a PCI address is stale on this boot: `scripts/bench-guard.
 and refused every run with `no DRM card for PCI 0000:03:00.0` (llama.cpp-imns; fixed to
 derive the card live from the DRM/PCI enumeration). Pre-2026-09-05 notes quoting
 `03:00.0`/`07:00.0` (the P2P section above included) are history, not the current map.
+The live derivation itself lives in one shared file, `scripts/sycl-gpu-sysfs.sh`
+(`derive_card_for_selector`/`is_top_level_card`/`find_card_by_pci`), sourced by all
+three of its consumers -- `bench-guard.sh`, `sycl-decode-mode-capture.sh`, and
+`sycl-gpu-preflight.sh` (llama.cpp-o4fs) -- so none of them can drift out of sync
+with each other again.
 
 ⚠️ **This table had `renderD128` and `renderD129` SWAPPED until 2026-07-30** — it
 listed the B70 as `renderD128`, which is actually the iGPU. Verified against the

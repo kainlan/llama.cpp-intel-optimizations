@@ -425,7 +425,12 @@ ticket reproduced on:
   and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
   — potentially called from a different thread — can keep parking newly-freed
   entries this wait might evict on its very next poll) for an in-flight entry
-  to complete if none are immediately evictable. If the wait times out, the
+  to complete if none are immediately evictable. A single request larger
+  than the whole cap by itself is a separate early-out: the eviction sweep
+  above still runs (a real release of anything it can evict), but the
+  bounded wait is skipped entirely — logged once — since no amount of
+  waiting could ever make it fit, and the allocation is then attempted
+  directly, same as after a timed-out wait. If the wait times out, the
   allocator proceeds anyway rather than refusing a possibly one-off spike
   pre-emptively; `unified_alloc()` below is still checked. If that allocation
   genuinely fails even after one drain-and-retry, the allocator now logs the
@@ -456,11 +461,16 @@ ticket reproduced on:
   site a pooled buffer sized for one context's shapes could sit on a 16 GB
   card holding up to the cap's worth of idle VRAM while the next model loads
   (`llama-bench` with several `-m`, a server switching models) or while the
-  SAME model's context is resized to a different `n_ctx`. Each reclaim point
-  logs a summary line first (silent if the pool was never used):
-  `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
-  misses=%zu evictions=%zu peak_pooled=%.1f MB`, where `%s` is `"teardown"`,
-  `"context reclaim"`, or `"runtime context update"`.
+  SAME model's context is resized to a different `n_ctx`. The three sites do
+  NOT log in the same order relative to the clear (the context-reclaim and
+  runtime-update sites share `reclaim_pool()`, which clears the pool and only
+  then logs the summary; teardown instead logs the summary early, well before
+  it actually clears the pool) — see `docs/backend/sycl-env-vars.md`'s
+  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site ordering.
+  Either way the line logged is `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT
+  pool summary (%s): hits=%zu misses=%zu evictions=%zu peak_pooled=%.1f MB`
+  (silent if the pool was never used), where `%s` is `"teardown"`, `"context
+  reclaim"`, or `"runtime context update"`.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/

@@ -44,7 +44,7 @@
 // same point arena_reserve() reclaims the KV/RUNTIME zones for a new
 // context, so a pooled buffer cannot outlive the context it belongs to.
 //
-// This test asserts four properties:
+// This test asserts five properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -77,13 +77,6 @@
 //       GGML_ABORT() into a latched flag plus a nullptr return. This test
 //       asserts the ERROR log line, the latch, and the nullptr return.
 //
-// RED-FIRST NOTE. All three properties are RED against the pre-0oxf code:
-// (a) and (b) have no pool, cap, or wait at all (every DIRECT allocation is
-// a fresh unified_alloc() with no bound), and (c) had no abort hook to
-// suppress -- the pre-fix function simply returned nullptr with
-// `req.suppress_failure_log = true`, so the log capture in this test would
-// find nothing and the "abort triggered" latch would not exist.
-//
 //   (d) RECLAIM SAFETY (BLOCKING): reclaiming the
 //       pool (onednn_graph_scratch_reclaim_pool(), reached from cache
 //       teardown, arena_reserve()'s context-reclaim branch, and
@@ -100,6 +93,27 @@
 //       same size misses the pool -- see the test's own comment for why
 //       this behavioral proxy is the strongest property observable without
 //       adding test-only introspection into mem-handle.cpp's drain worker.
+//
+//   (e) OVERSIZED REQUEST EARLY-OUT: a single request larger than the whole
+//       DIRECT cap must skip the bounded poll-loop wait entirely --
+//       observable as onednn_graph_scratch_direct_wait_count() staying
+//       unchanged, the primary proof the early-out fired rather than the
+//       wait loop -- while the eviction sweep that always runs first still
+//       does, observable as onednn_graph_scratch_pool_eviction_count()
+//       increasing for a genuinely parked entry, and the allocation still
+//       succeeds as a real (uncapped-by-this-check) allocation. Added by
+//       llama.cpp-pqgl's review, not part of the original 0oxf RED-FIRST
+//       set below.
+//
+// RED-FIRST NOTE. Three of these five properties, (a)-(c), are RED against
+// the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
+// DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
+// no abort hook to suppress -- the pre-fix function simply returned nullptr
+// with `req.suppress_failure_log = true`, so the log capture in this test
+// would find nothing and the "abort triggered" latch would not exist. (d)
+// and (e) above were added by later tickets (llama.cpp-0oxf's own
+// reclaim-safety finding and llama.cpp-pqgl's review, respectively) and are
+// not part of this original RED-FIRST set.
 //
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
 // compiled in (the whole onednn_graph_scratch_* subsystem is `#if
@@ -147,10 +161,25 @@ void check(bool ok, const char * what) {
 
 std::string g_captured_log;
 
+// A level TAG ("[ERROR] " / "[WARN] ") is prefixed onto each new
+// (non-continuation) ERROR or WARN line so a check can assert not just that
+// some text was logged, but that it was logged AT that specific level --
+// e.g. distinguishing the oversized-request WARN from what would otherwise
+// be an indistinguishable-by-text ERROR (llama.cpp-pqgl: capturing text
+// alone made a WARN-vs-ERROR downgrade unverifiable). INFO and DEBUG lines
+// are captured with no tag at all -- no check in this file needs to tell
+// them apart from each other. GGML_LOG_LEVEL_CONT (a continuation of the
+// previous log call) also gets no fresh tag, so a message split across
+// multiple callback invocations still reads as one tagged line rather than
+// being interrupted mid-sentence.
 void capture_log(enum ggml_log_level level, const char * text, void * user_data) {
-    GGML_UNUSED(level);
     GGML_UNUSED(user_data);
     if (text != nullptr) {
+        if (level == GGML_LOG_LEVEL_ERROR) {
+            g_captured_log += "[ERROR] ";
+        } else if (level == GGML_LOG_LEVEL_WARN) {
+            g_captured_log += "[WARN] ";
+        }
         g_captured_log += text;
     }
 }
@@ -325,12 +354,13 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     sycl::queue & q = cache->get_queue();
 
     // 310 MiB, not 360: this must stay UNDER the 350 MB cap main() sets via
-    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB -- a size over
-    // the cap makes both allocations below run the full
-    // kOnednnGraphDirectWaitTotalTimeoutMs give-up wait (measured: this test
-    // took 14.2 s instead of ~3.7 s) and log misleading "gave up waiting for
-    // headroom" ERRORs for a property this test isn't even exercising.
-    // Still distinct from kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, so both allocations below take
+    // the NORMAL pool path this test actually exercises (reclaim/pending-
+    // event handling) rather than the size>cap early-out
+    // (onednn_graph_scratch_wait_for_direct_headroom_locked(), llama.cpp-pqgl)
+    // -- that early-out has its own dedicated test below,
+    // test_oversized_request_skips_wait_loop(). Still distinct from
+    // kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
     constexpr size_t kSizeD = 310ull * 1024 * 1024;
 
     void * ptr = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
@@ -400,6 +430,133 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     }
 }
 
+// --- (e) a request larger than the cap takes the size>cap early-out, not
+//         the full poll-loop wait, AND the eviction sweep still runs first
+//         (llama.cpp-pqgl) --------------------------------------------------
+//
+// This must remain the ONLY oversized (size>cap) request issued anywhere in
+// this process, and the FIRST one if any other test is ever added after it:
+// onednn_graph_scratch_oversized_request_logged_ is a per-instance "log
+// once" latch, so a second oversized request anywhere else in this binary
+// -- before or after this test -- would silently not log the WARN this test
+// asserts on.
+void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
+    printf("DIRECT path request larger than the cap skips the poll-loop wait:\n");
+
+    // Start from a clean pool.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup");
+
+    sycl::queue & q = cache->get_queue();
+
+    // Park ONE genuinely event-complete pooled entry, well under the cap,
+    // BEFORE issuing the oversized request below -- so the eviction sweep
+    // inside onednn_graph_scratch_wait_for_direct_headroom_locked() (which a
+    // prior fix moved to run BEFORE its size>cap early-out) has something
+    // REAL to evict. Without this setup the pool would already be empty and
+    // this test could not tell "the sweep ran before the early-out" apart
+    // from "the sweep never ran at all" -- both pass identically on an
+    // empty pool.
+    //
+    // 280 MiB, not 200: this process reserves a 256 MB ONEDNN zone even with
+    // no model loaded -- measured on hardware, `[VRAM-ARENA] Reserved single
+    // chunk: ... oneDNN=256.0 ...` -- and a request at or under that zone
+    // size is served FROM THE ZONE, never takes the DIRECT path, and so
+    // never enters the pool this setup needs it to. 200 MiB silently did
+    // exactly that: measured FAIL on hardware, the eviction-count assertion
+    // below never saw an increase, because the "parked" allocation was
+    // never pooled to begin with. 280 MiB is above that zone -- matching
+    // every other size in this file (kSizeA/kSizeB/kSizeC/kSizeD at
+    // 300/320/340/310 MiB are all above it for the identical reason, and a
+    // 300 MiB request logs "did not fit the ONEDNN zone" confirming it),
+    // distinct from all four of them, and comfortably under the 350 MB cap
+    // main() sets -- so it can be parked and later evicted without itself
+    // ever engaging the cap machinery this test isn't exercising. The
+    // miss-count assertion right after the allocation below is this setup's
+    // own self-check against silently regressing back to a zone-served size.
+    constexpr size_t kSizeParked        = 280ull * 1024 * 1024;
+    const size_t     misses_before_park = cache->onednn_graph_scratch_pool_miss_count();
+    void *           parked             = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
+    check(parked != nullptr, "the parked-entry setup allocation succeeds");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_park + 1,
+          "the parked allocation was a DIRECT-path pool miss, not served from the ONEDNN zone -- proves this "
+          "setup actually parks a poolable entry rather than silently zone-serving it");
+    if (parked) {
+        sycl::event release = submit_slow_release(q);
+        cache->onednn_graph_scratch_free(parked, &release);
+        release.wait();  // ensure event-complete before the oversized request below
+    }
+
+    const size_t evictions_before  = cache->onednn_graph_scratch_pool_eviction_count();
+    const size_t wait_count_before = cache->onednn_graph_scratch_direct_wait_count();
+
+    // main() sets the cap to 350 MB via GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB.
+    // 366 MiB is comfortably over that ON ITS OWN -- no amount of eviction
+    // or waiting could ever bring outstanding+size under the cap for this
+    // request.
+    constexpr size_t kSizeOversized = 366ull * 1024 * 1024;
+
+    g_captured_log.clear();
+    ggml_log_set(capture_log, nullptr);
+
+    const auto start = std::chrono::steady_clock::now();
+    void *     ptr   = cache->onednn_graph_scratch_alloc(kSizeOversized, 256, &q);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+    ggml_log_set(nullptr, nullptr);
+
+    check(ptr != nullptr,
+          "the oversized allocation still succeeds -- the cap bounds pooling/waiting, it is not a hard refusal");
+    check(cache->onednn_graph_scratch_pool_eviction_count() > evictions_before,
+          "the eviction sweep still ran and released the parked entry before the size>cap early-out fired");
+    // Primary proof the early-out fired rather than the poll loop:
+    // onednn_graph_scratch_direct_wait_count() is only incremented once the
+    // poll loop past the early-out actually starts, which the early-out
+    // returns before reaching -- this is a stronger, non-timing-based
+    // signal than the elapsed-time check below, and not vulnerable to a
+    // slow but otherwise-correct allocation false-failing it.
+    check(cache->onednn_graph_scratch_direct_wait_count() == wait_count_before,
+          "onednn_graph_scratch_direct_wait_count() did NOT increase -- the early-out returned before any wait "
+          "was attempted, not after a completed-but-unsuccessful one");
+    // Secondary timing check only -- 4000 ms, not 2000: 2000 ms equals
+    // kOnednnGraphDirectFailureDrainTimeoutMs, so a single drain-and-retry
+    // on this call's underlying unified_alloc() would false-fail a 2000 ms
+    // bound even though the early-out itself worked correctly. What this
+    // bounds is "did not run the full 5000 ms poll loop", not
+    // "was instantaneous".
+    check(elapsed.count() < 4000, "the allocation returned well under the 5 s poll-loop timeout");
+    printf("    (elapsed=%lld ms)\n", static_cast<long long>(elapsed.count()));
+    // Adjacency, not three independent substring searches: the "[WARN] " tag
+    // is prepended immediately before the message text (capture_log above),
+    // and GGML_LOG_WARN emits the whole line in one callback, so the tag and
+    // the message start are always contiguous when this really was logged
+    // at WARN -- a check that only searched for "[WARN] " and the message
+    // text independently could pass on an unrelated WARN elsewhere plus an
+    // ERROR carrying this text, which is exactly the confusion this check
+    // exists to rule out.
+    check(contains(g_captured_log, "[WARN] [UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: requested") &&
+              contains(g_captured_log, "cap by itself"),
+          "the latched oversized-request WARN was logged, and at WARN level (not ERROR)");
+    // llama.cpp-pqgl: the caller (onednn_graph_scratch_alloc_direct_locked)
+    // must NOT also log its own "gave up waiting for headroom" ERROR for
+    // this call -- that message describes a genuine timed-out wait, and
+    // this call never waited at all, having returned via the early-out
+    // instead. This binds only while
+    // onednn_graph_scratch_gave_up_waiting_logged_ has not already latched
+    // from an earlier genuine timeout elsewhere in this process (no test in
+    // this file triggers one) -- otherwise the message would stay silent
+    // regardless of whether this call's own early-out guard still exists,
+    // and this check would pass vacuously.
+    check(!contains(g_captured_log, "gave up waiting for headroom"),
+          "the caller did not log its timed-out-wait ERROR for a call that never waited");
+
+    if (ptr) {
+        cache->onednn_graph_scratch_free(ptr, nullptr);
+    }
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -448,6 +605,7 @@ int main(int, char ** argv) {
     test_bounded_eviction(cache);
     test_loud_failure(cache);
     test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
+    test_oversized_request_skips_wait_loop(cache, device);
 
     ggml_backend_free(backend);
 

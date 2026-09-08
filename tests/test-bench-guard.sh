@@ -240,6 +240,40 @@ out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-memi
 [ "$rc" -eq 3 ] || { echo "FAIL: missing --meminfo must refuse cleanly with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -q "no meminfo at" || { echo "FAIL: missing --meminfo refusal must name the problem (got: $out)"; fail=1; }
 
+# bench-guard.sh's postflight kernel-log window now anchors --since to
+# run_start_epoch, captured just before the wrapped command starts, instead
+# of a fixed "10 minutes ago". This IS fixture-testable, just not through
+# --journalctl-cmd (which REPLACES the whole kernel_log() body, including
+# the --since argument, so a --journalctl-cmd fixture never sees what
+# --since was actually set to). bench-guard.sh calls `journalctl` by bare
+# name and does not sanitize PATH, so a fake executable placed on PATH for
+# the child process can observe the real argv it was invoked with -- this
+# is the ONLY case in this file that omits --journalctl-cmd; every other
+# case above and below fakes the whole kernel_log() body via that flag,
+# which bypasses this exact code path.
+cases=$((cases+1))
+mk_tree 0 0; mk_meminfo 3000000
+mkdir -p "$T/bin"
+since_sink="$T/journalctl-argv-sink.txt"
+: > "$since_sink"
+cat > "$T/bin/journalctl" <<SHIM
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$since_sink"
+SHIM
+chmod +x "$T/bin/journalctl"
+t0="$(date +%s)"
+PATH="$T/bin:$PATH" "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-since-shim.log" -- true || fail=1
+t1="$(date +%s)"
+recorded="$(cat "$since_sink")"
+echo "$recorded" | grep -qE -- '--since @[0-9]+' \
+    || { echo "FAIL: without --journalctl-cmd the guard must call journalctl with --since @<epoch> (got: $recorded)"; fail=1; }
+since_epoch="$(echo "$recorded" | grep -oE '@[0-9]+' | tr -d '@' | head -1)"
+if [ -z "$since_epoch" ] || [ "$since_epoch" -lt "$t0" ] || [ "$since_epoch" -gt "$t1" ]; then
+    echo "FAIL: the --since epoch ($since_epoch) must fall within [t0=$t0, t1=$t1] -- captured right before the wrapped command starts, not a fixed window (got argv: $recorded)"
+    fail=1
+fi
+
 cases=$((cases+1))
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
@@ -797,7 +831,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 45 ] || { echo "FAIL: expected 45 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 46 ] || { echo "FAIL: expected 46 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
