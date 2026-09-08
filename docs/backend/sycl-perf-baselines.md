@@ -835,6 +835,15 @@ python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt \
 This does not add result rows to this document — the parser only produces
 them; the lead adds the measured rows after the matrix has actually run.
 
+**`--partial-arm ARM=REASON`** (repeatable, long-prompt only; error exit 2
+combined with `--matrix merge-cert`) accepts 1..runs-1 samples for one
+declared arm that could not be fully measured — e.g. a GPU fault mid-sweep —
+so the real data it does have is reported rather than discarded, with its
+report line reading `PARTIAL (n=k of runs)` and its `--table` cells reading
+`mean (n=k, REASON)`; a zero-sample arm (nothing to report) or an
+already-complete arm (the flag would be stale) under that name is still
+exit 2.
+
 **Exit codes, and why there are three rather than two:**
 
 | exit | meaning | what to do |
@@ -863,19 +872,23 @@ directory that does not exist, a directory that exists but is empty, an
 unparseable `t/s` cell, a table with no `fa` column (i.e. not the `-fa 1`
 matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), a run
 whose free VRAM is below the contamination floor, `--table` combined with
-`--matrix merge-cert`, and (long-prompt `--table` only) a sample with no
-achieved `n_ctx` at all, the five processes of one arm disagreeing on the
-achieved `n_ctx`, or an achieved `n_ctx` below the arm's own prompt length —
-never a silent default for any of these.
+`--matrix merge-cert`, (long-prompt `--table` only) a sample with no achieved
+`n_ctx` at all, the five processes of one arm disagreeing on the achieved
+`n_ctx`, or an achieved `n_ctx` below the arm's own prompt length, and
+`--partial-arm` combined with `--matrix merge-cert`, naming an arm that isn't
+declared, naming an arm with zero samples, or naming an arm that already has
+the full sample count (the flag would then be stale) — never a silent
+default or a lingering flag for any of these.
 
 **Verify the parser before trusting it.** `--self-test` runs it against the
 committed fixtures in `artifacts/task18-parser-fixtures/` and must report
-**19/19** (ten cases for the merge-cert matrix, nine added for long-prompt and
-`--table` — the self-test prints its own total, so this figure is not
-hand-maintained). The cases exist to prove the parser returns *all three* exit
-codes — including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
-measurement rather than the only answer it is capable of giving. A checker nobody
-has seen fail is indistinguishable from a checker that cannot fail.
+**24/24** (ten cases for the merge-cert matrix, nine for long-prompt and
+`--table`, five more for `--partial-arm` — the self-test prints its own
+total, so this figure is not hand-maintained). The cases exist to prove the
+parser returns *all three* exit codes — including a below-floor fixture that
+must produce exit 1 — so that a `PASS` is a measurement rather than the only
+answer it is capable of giving. A checker nobody has seen fail is
+indistinguishable from a checker that cannot fail.
 
 > ⚠️ **The free-VRAM floors are contamination detectors, not precision checks,
 > and the documented B50 figure does not match reality.** This document states

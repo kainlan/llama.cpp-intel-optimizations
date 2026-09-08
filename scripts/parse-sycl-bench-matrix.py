@@ -19,7 +19,11 @@ Two independent matrices, selected with --matrix (default merge-cert):
                clean) or 2 (input gap) -- exit 1 is unreachable for this
                matrix. `--table` additionally prints the markdown rows for
                docs/backend/sycl-perf-baselines.md, derived from the same
-               parsed samples as the report -- never re-parsed.
+               parsed samples as the report -- never re-parsed. `--partial-arm
+               ARM=REASON` accepts 1..runs-1 samples for one declared arm that
+               could not be fully measured (e.g. a GPU fault mid-sweep), so a
+               real partial result is reported rather than discarded; a zero-
+               sample or fully-complete arm under that flag is still exit 2.
 
 The `+/-` llama-bench prints is the spread WITHIN one process and is
 deliberately ignored; every verdict here is the mean ACROSS the five
@@ -44,6 +48,8 @@ Usage:
     parse-sycl-bench-matrix.py --dir artifacts/perf-final
     parse-sycl-bench-matrix.py --arm b50-mistral=log1,log2,log3,log4,log5
     parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-<sha>-longprompt --table
+    parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-<sha>-longprompt --table \
+        --partial-arm b50-mistral-pp8192="GPU CAT error, only 1 of 5 attempts completed"
     parse-sycl-bench-matrix.py --self-test
 
 `--dir` expects `<arm>-<n>.log` (or `.txt`) for n in 1..runs, e.g.
@@ -174,13 +180,18 @@ def _build_long_prompt_arms():
 LONG_PROMPT_ARMS = _build_long_prompt_arms()
 
 # A matrix is more than its arm dict: evaluate() also needs to know its report
-# header, its PASS-verdict line, and whether --table is meaningful for it.
-# Bundling those into one descriptor (rather than three separate
+# header, its PASS-verdict line, and whether --table/--partial-arm are
+# meaningful for it. Bundling those into one descriptor (rather than
 # `if matrix == "merge-cert": ... else: ...` switches scattered through
-# evaluate()) means adding a third matrix later touches this table, not three
-# call sites (llama.cpp-z0wt review round 4).
+# evaluate()) means adding a third matrix later touches this table, not
+# several call sites (llama.cpp-z0wt review round 4). --table and
+# --partial-arm are separate fields, not one shared flag, even though today
+# only long-prompt supports either: they are unrelated CLI features (a
+# report format vs. an input-completeness exception) that happen to both be
+# long-prompt-only so far, and a shared name would misdescribe whichever one
+# it wasn't originally written for.
 MatrixDescriptor = collections.namedtuple(
-    "MatrixDescriptor", ["arms", "title", "verdict", "supports_table"]
+    "MatrixDescriptor", ["arms", "title", "verdict", "supports_table", "supports_partial_arm"]
 )
 
 MATRICES = {
@@ -189,6 +200,7 @@ MATRICES = {
         title="Merge-certification performance matrix -- %d processes per arm\n\n",
         verdict="VERDICT: PASS -- all %d arms present, parseable, and within gate\n",
         supports_table=False,
+        supports_partial_arm=False,
     ),
     "long-prompt": MatrixDescriptor(
         arms=LONG_PROMPT_ARMS,
@@ -201,6 +213,7 @@ MATRICES = {
             "all %d arms present and parseable\n"
         ),
         supports_table=True,
+        supports_partial_arm=True,
     ),
 }
 DEFAULT_MATRIX = "merge-cert"
@@ -455,7 +468,7 @@ _TABLE_SEPARATOR = "|" + "---|" * len(_TABLE_COLUMNS)
 _CTX_ACHIEVED_PP = _LONG_PROMPT_PPS[-1]
 
 
-def _build_table_rows(results, arms):
+def _build_table_rows(results, arms, partial_arms=None):
     """Return the markdown table rows for the long-prompt matrix.
 
     Raises ParseError on any input gap -- there is no partial-success return
@@ -470,7 +483,15 @@ def _build_table_rows(results, arms):
     (`MATRICES["long-prompt"].arms`), passed in by the caller rather than read
     from the module global here, so this function has no hidden dependency on
     which matrix is being evaluated (review round 4).
+
+    `partial_arms` is {arm: reason} for any arm evaluate() accepted with
+    fewer than `runs` samples (review round 5). Its cells render
+    "mean (n=k, REASON)", with "+/- sd" only when k>=2 -- a lone sample has no
+    spread to claim, same reasoning as _stdev_str() elsewhere in this file.
+    The ctx-achieved column is unaffected: it is derived from whatever
+    samples are present, exactly as for a full arm.
     """
+    partial_arms = partial_arms or {}
     rows = [_TABLE_HEADER, _TABLE_SEPARATOR]
     for card in _LONG_PROMPT_CARDS:
         for model in _LONG_PROMPT_MODELS:
@@ -488,7 +509,16 @@ def _build_table_rows(results, arms):
                 for test in arm_tests:
                     values = [s[test] for s in samples]
                     mean = sum(values) / len(values)
-                    cell[(pp, test)] = "%.2f \u00b1 %s" % (mean, _stdev_str(values))
+                    if arm in partial_arms:
+                        k = len(values)
+                        if k >= 2:
+                            cell[(pp, test)] = "%.2f \u00b1 %s (n=%d, %s)" % (
+                                mean, _stdev_str(values), k, partial_arms[arm]
+                            )
+                        else:
+                            cell[(pp, test)] = "%.2f (n=%d, %s)" % (mean, k, partial_arms[arm])
+                    else:
+                        cell[(pp, test)] = "%.2f \u00b1 %s" % (mean, _stdev_str(values))
                 if pp == _CTX_ACHIEVED_PP:
                     # Fail closed: a sample with no achieved n_ctx at all must
                     # never fall back to a naive default (n_prompt+n_gen) --
@@ -529,12 +559,20 @@ def _build_table_rows(results, arms):
     return rows
 
 
-def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=False):
+def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=False,
+             partial_arms=None):
     """Evaluate one matrix. Returns an exit code (0, 1 or 2).
 
     matrix: "merge-cert" or "long-prompt" (a key into MATRICES).
     arm_files: {arm_name: [path, ...]}. Every arm in MATRICES[matrix].arms
-    must be present.
+    must be present, UNLESS it is declared in `partial_arms`.
+    partial_arms: {arm_name: reason} (long-prompt only). A declared arm
+    accepts 1..runs-1 samples instead of exactly runs -- for a cell that
+    could not be fully measured (e.g. a GPU fault mid-sweep) but does have
+    some real data, which is worth reporting rather than discarding
+    (llama.cpp-z0wt scope addition, review round 5). An arm with ZERO
+    samples is not "partial", it is absent, and an arm with the FULL count
+    means the flag is stale -- both are exit 2, never silently accepted.
 
     Stream contract, which the self-test asserts rather than assumes:
       out (stdout) carries RESULTS -- the per-arm means table, the markdown
@@ -545,6 +583,7 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
     table to stdout with the failure explanation on stderr. A caller
     redirecting only stdout can still never mistake an error for a result.
     """
+    partial_arms = partial_arms or {}
     descriptor = MATRICES[matrix]
     arms = descriptor.arms
 
@@ -554,7 +593,24 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         )
         return 2
 
-    missing_arms = [a for a in sorted(arms) if a not in arm_files]
+    if partial_arms and not descriptor.supports_partial_arm:
+        err.write(
+            "INPUT ERROR: --partial-arm is long-prompt only, got --matrix %s.\n" % matrix
+        )
+        return 2
+
+    unknown_partial = [a for a in sorted(partial_arms) if a not in arms]
+    if unknown_partial:
+        err.write(
+            "INPUT ERROR: --partial-arm names unknown arm(s): %s\n" % ", ".join(unknown_partial)
+        )
+        err.write("Known arms: %s\n" % ", ".join(sorted(arms)))
+        return 2
+
+    # An arm declared partial is exempt from "must be present" -- its own
+    # sample-count check below (0 samples, or the full count) reports the
+    # more specific error instead.
+    missing_arms = [a for a in sorted(arms) if a not in arm_files and a not in partial_arms]
     if missing_arms:
         err.write("INPUT ERROR: arm(s) entirely absent: %s\n" % ", ".join(missing_arms))
         err.write("A missing arm is not a pass. All %d arms are required.\n" % len(arms))
@@ -568,8 +624,23 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
 
     results = {}
     for arm in sorted(arms):
-        paths = arm_files[arm]
-        if len(paths) != runs:
+        paths = arm_files.get(arm, [])
+        if arm in partial_arms:
+            if len(paths) == 0:
+                err.write(
+                    "INPUT ERROR: --partial-arm %s has zero samples. A partial arm "
+                    "must still have some data -- a wholly missing arm is absent, "
+                    "not partial.\n" % arm
+                )
+                return 2
+            if len(paths) >= runs:
+                err.write(
+                    "INPUT ERROR: --partial-arm %s has the full %d sample(s). The "
+                    "flag is stale once the arm is complete; remove it rather than "
+                    "leaving it to linger silently.\n" % (arm, runs)
+                )
+                return 2
+        elif len(paths) != runs:
             err.write(
                 "INPUT ERROR: %s has %d sample(s), required %d. A short arm is an "
                 "error, not a smaller sample.\n" % (arm, len(paths), runs)
@@ -590,7 +661,7 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
     table_rows = None
     if want_table:
         try:
-            table_rows = _build_table_rows(results, arms)
+            table_rows = _build_table_rows(results, arms, partial_arms)
         except ParseError as exc:
             err.write("INPUT ERROR: %s\n" % exc)
             return 2
@@ -601,7 +672,13 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
     for arm in sorted(arms):
         samples = results[arm]
         spec = arms[arm]
-        out.write("%s (%s)\n" % (arm, spec["selector"]))
+        if arm in partial_arms:
+            out.write(
+                "%s  PARTIAL (n=%d of %d) -- %s\n"
+                % (arm, len(samples), runs, partial_arms[arm])
+            )
+        else:
+            out.write("%s (%s)\n" % (arm, spec["selector"]))
         free_values = [s["free_mib"] for s in samples]
         if spec["kind"] == REPORT:
             out.write(
@@ -648,7 +725,18 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         )
         return 1
 
-    out.write(descriptor.verdict % len(arms))
+    verdict_line = descriptor.verdict % len(arms)
+    if partial_arms:
+        partial_desc = ", ".join(
+            "%s (n=%d of %d)" % (a, len(results[a]), runs) for a in sorted(partial_arms)
+        )
+        verdict_line = "%s; %d arm%s partial: %s\n" % (
+            verdict_line.rstrip("\n"),
+            len(partial_arms),
+            "" if len(partial_arms) == 1 else "s",
+            partial_desc,
+        )
+    out.write(verdict_line)
 
     if table_rows is not None:
         out.write("\n")
@@ -741,6 +829,7 @@ def self_test(out):
     #   want_table   pass --table (default False)
     #   runs         required-samples-per-arm override (default DEFAULT_RUNS)
     #   contains     substrings that must appear in stdout (default: none checked)
+    #   partial_arm  {arm: reason} passed through as evaluate()'s partial_arms
     cases = [
         dict(name="all arms good -> PASS", matrix="merge-cert",
              arms=_all_good("merge-cert"), expected=0),
@@ -803,6 +892,38 @@ def self_test(out):
         dict(name="long-prompt --runs 1 --table -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
              arms={arm: [_fixture_for_long_prompt_arm(arm)] for arm in LONG_PROMPT_ARMS},
              runs=1, want_table=True, expected=0, contains=["± n/a", "sd    n/a"]),
+
+        dict(name="long-prompt --partial-arm with 1 sample -> PASS, PARTIAL text and table cell",
+             matrix="long-prompt",
+             arms=_with("long-prompt", **{"b70-mistral-pp8192": [lp_pp8192_good]}),
+             partial_arm={"b70-mistral-pp8192": "GPU CAT error"},
+             want_table=True, expected=0,
+             contains=[
+                 "b70-mistral-pp8192  PARTIAL (n=1 of 5) -- GPU CAT error",
+                 "1 arm partial: b70-mistral-pp8192 (n=1 of 5)",
+                 "1526.48 (n=1, GPU CAT error)",
+             ]),
+        dict(name="long-prompt --partial-arm with ZERO samples -> parse error (not partial, absent)",
+             matrix="long-prompt",
+             arms=_with("long-prompt", **{"b70-mistral-pp8192": []}),
+             partial_arm={"b70-mistral-pp8192": "GPU CAT error"}, expected=2),
+        dict(name="long-prompt --partial-arm with the FULL count -> parse error (flag is stale)",
+             matrix="long-prompt",
+             arms=_all_good("long-prompt"),
+             partial_arm={"b70-mistral-pp8192": "GPU CAT error"}, expected=2),
+        dict(name="long-prompt --partial-arm names an unknown arm -> parse error",
+             matrix="long-prompt",
+             arms=_all_good("long-prompt"),
+             partial_arm={"b70-mistral-pp9999": "not a declared arm"}, expected=2),
+        dict(name="--partial-arm with merge-cert -> parse error", matrix="merge-cert",
+             # 3 samples (not 5): a mutant that removed the matrix-support
+             # check must not be masked by the pre-existing "wrong sample
+             # count" error, so this arm's count is deliberately NOT the
+             # full runs and NOT zero -- i.e. it would be a VALID partial
+             # count if the matrix-support check were skipped, so only that
+             # check can be producing the exit 2 here (review round 5).
+             arms=_with("merge-cert", **{"b50-mistral": [good] * 3}),
+             partial_arm={"b50-mistral": "reason"}, expected=2),
     ]
 
     # Expected stream occupancy per exit code. Checking this is the point:
@@ -818,7 +939,7 @@ def self_test(out):
         cap_out, cap_err = io.StringIO(), io.StringIO()
         got = evaluate(
             case["matrix"], case["arms"], case.get("runs", DEFAULT_RUNS), {},
-            cap_out, cap_err, case.get("want_table", False),
+            cap_out, cap_err, case.get("want_table", False), case.get("partial_arm", {}),
         )
         want_out, want_err = stream_contract[expected]
         streams_ok = (bool(cap_out.getvalue()) == want_out
@@ -869,6 +990,30 @@ def parse_min_free(values):
     return out
 
 
+def parse_partial_arms(values):
+    """--partial-arm b50-mistral-pp8192=GPU CAT error -> {"b50-mistral-pp8192": "GPU CAT error"}
+
+    Splits on the FIRST "=" only, so a reason containing "=" is preserved
+    verbatim; only the arm name (everything before it) is required to be
+    non-empty here -- whether it names a REAL long-prompt arm is checked by
+    the caller (evaluate()), which is the only place that knows which matrix
+    is in play and can therefore also refuse it for merge-cert.
+    """
+    out = {}
+    for item in values or []:
+        if "=" not in item:
+            raise ParseError("--partial-arm expects <arm>=<reason>, got %r" % item)
+        arm, _, reason = item.partition("=")
+        arm = arm.strip()
+        reason = reason.strip()
+        if not arm:
+            raise ParseError("--partial-arm arm name must not be empty, got %r" % item)
+        if not reason:
+            raise ParseError("--partial-arm reason must not be empty, got %r" % item)
+        out[arm] = reason
+    return out
+
+
 EPILOG = """
 exit codes -- the contract this parser exists to provide:
 
@@ -894,9 +1039,12 @@ directory that exists but is empty, an unparseable t/s cell, a table with no
 'fa' column (not the -fa 1 matrix), a log with no '- NNNNN MiB free' line
 (llama-bench run without -v, or the run failed before reaching the device),
 free VRAM below the contamination floor, --table combined with --matrix
-merge-cert, and (long-prompt --table only) a sample with no achieved n_ctx at
+merge-cert, (long-prompt --table only) a sample with no achieved n_ctx at
 all, the five processes of one arm disagreeing on the achieved n_ctx, or an
-achieved n_ctx below the arm's own prompt length -- never a silent default
+achieved n_ctx below the arm's own prompt length, and --partial-arm combined
+with --matrix merge-cert, naming an arm that isn't declared, naming an arm
+with zero samples, or naming an arm that already has the full sample count
+(the flag would then be stale) -- never a silent default or a lingering flag
 for any of these.
 
 1 and 2 are deliberately distinct: "the branch is slow" and "I could not
@@ -904,8 +1052,10 @@ measure the branch" are different facts and must not share an exit code.
 
 Matrices: merge-cert (four arms, numeric floor/band, gates merges) and
 long-prompt (twelve arms, report-only -- no floor/band exists yet).
+--partial-arm accepts 1..runs-1 samples for one declared long-prompt arm that
+could not be fully measured, instead of requiring exactly --runs.
 
-Verify the parser before trusting its verdict:  --self-test  (expects 19/19)
+Verify the parser before trusting its verdict:  --self-test  (expects 24/24)
 Gate definition: docs/backend/sycl-perf-baselines.md
 """
 
@@ -928,6 +1078,12 @@ def main(argv=None):
     ap.add_argument("--table", action="store_true",
                     help="long-prompt only: also print the sycl-perf-baselines.md "
                          "markdown rows (report-only; error with --matrix merge-cert)")
+    ap.add_argument("--partial-arm", action="append", default=[],
+                    help="long-prompt only: <arm>=<reason> (repeatable). Accept "
+                         "1..runs-1 samples for a cell that could not be fully "
+                         "measured, instead of requiring exactly --runs; a fresh "
+                         "arm (0 samples) or a complete one (the full count) is "
+                         "still an error -- error with --matrix merge-cert")
     ap.add_argument("--self-test", action="store_true",
                     help="run the parser against its committed fixtures and exit")
     args = ap.parse_args(argv)
@@ -941,6 +1097,12 @@ def main(argv=None):
 
     try:
         overrides = parse_min_free(args.min_free_mib)
+    except ParseError as exc:
+        sys.stderr.write("INPUT ERROR: %s\n" % exc)
+        return 2
+
+    try:
+        partial_arms = parse_partial_arms(args.partial_arm)
     except ParseError as exc:
         sys.stderr.write("INPUT ERROR: %s\n" % exc)
         return 2
@@ -970,7 +1132,10 @@ def main(argv=None):
         )
         return 2
 
-    return evaluate(args.matrix, arm_files, args.runs, overrides, sys.stdout, sys.stderr, args.table)
+    return evaluate(
+        args.matrix, arm_files, args.runs, overrides, sys.stdout, sys.stderr,
+        args.table, partial_arms,
+    )
 
 
 if __name__ == "__main__":

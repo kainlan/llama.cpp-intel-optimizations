@@ -11,12 +11,15 @@ These fixtures are that control. Run:
 python3 scripts/parse-sycl-bench-matrix.py --self-test
 ```
 
-It must report **19/19** and exit 0. If it does not, the parser's verdicts are
+It must report **24/24** and exit 0. If it does not, the parser's verdicts are
 not trustworthy and the gate must not be certified from them.
 
 Ten cases cover the original **merge-cert** matrix (numeric floor/band, gates
 merges); nine more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
-matrix (report-only, no gate declared yet) and its `--table` markdown output.
+matrix (report-only, no gate declared yet) and its `--table` markdown output;
+five more (llama.cpp-z0wt, scope addition) cover `--partial-arm`, the
+accept-fewer-than-`runs`-samples exception for a declared arm that could not
+be fully measured.
 
 ## What the cases prove
 
@@ -46,6 +49,17 @@ the table, when there is no second sample to compute a spread from (review
 rounds 1 and 2) — the case checks for both `"sd    n/a"` (the report line)
 and `"± n/a"` (the table cell) in stdout, not just one of the two rendering
 sites the claim covers (review round 3).
+
+Five more cases (llama.cpp-z0wt, scope addition) cover `--partial-arm ARM=
+REASON`: a declared arm with one real sample passes with the exact `PARTIAL
+(n=1 of 5)` report text, the matching mention in the verdict line, and the
+`mean (n=1, REASON)` table cell all checked in stdout (not merely exit 0 —
+the same "an exit code alone can't tell a hardcoded value from a real one"
+reasoning as the `--table` all-good case above); a declared arm with zero
+samples, one with the full sample count, an undeclared arm name, and the
+flag combined with `--matrix merge-cert` each drive exit 2. None of these
+needed new fixtures — they reuse `b70-pp8192-good.txt` (long-prompt) and
+`b50-mistral-good.txt` (merge-cert) at reduced or full sample counts.
 
 ## Provenance — what is real and what is reconstructed
 
