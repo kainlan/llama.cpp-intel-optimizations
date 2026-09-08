@@ -452,16 +452,31 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // REAL to evict. Without this setup the pool would already be empty and
     // this test could not tell "the sweep ran before the early-out" apart
     // from "the sweep never ran at all" -- both pass identically on an
-    // empty pool. 200 MiB, like kSizeA/kSizeB/kSizeC/kSizeD (300/320/340/310
-    // MiB) above, is small enough to still miss the ONEDNN zone in this
-    // process (no model is ever loaded here, so the zone's shape-derived
-    // floor stays at its 64 MiB minimum) and land in the DIRECT pool, but
-    // distinct from all four of them and comfortably under the 350 MB cap
+    // empty pool.
+    //
+    // 280 MiB, not 200: this process reserves a 256 MB ONEDNN zone even with
+    // no model loaded -- measured on hardware, `[VRAM-ARENA] Reserved single
+    // chunk: ... oneDNN=256.0 ...` -- and a request at or under that zone
+    // size is served FROM THE ZONE, never takes the DIRECT path, and so
+    // never enters the pool this setup needs it to. 200 MiB silently did
+    // exactly that: measured FAIL on hardware, the eviction-count assertion
+    // below never saw an increase, because the "parked" allocation was
+    // never pooled to begin with. 280 MiB is above that zone -- matching
+    // every other size in this file (kSizeA/kSizeB/kSizeC/kSizeD at
+    // 300/320/340/310 MiB are all above it for the identical reason, and a
+    // 300 MiB request logs "did not fit the ONEDNN zone" confirming it),
+    // distinct from all four of them, and comfortably under the 350 MB cap
     // main() sets -- so it can be parked and later evicted without itself
-    // ever engaging the cap machinery this test isn't exercising.
-    constexpr size_t kSizeParked = 200ull * 1024 * 1024;
-    void *           parked      = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
+    // ever engaging the cap machinery this test isn't exercising. The
+    // miss-count assertion right after the allocation below is this setup's
+    // own self-check against silently regressing back to a zone-served size.
+    constexpr size_t kSizeParked        = 280ull * 1024 * 1024;
+    const size_t     misses_before_park = cache->onednn_graph_scratch_pool_miss_count();
+    void *           parked             = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
     check(parked != nullptr, "the parked-entry setup allocation succeeds");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_park + 1,
+          "the parked allocation was a DIRECT-path pool miss, not served from the ONEDNN zone -- proves this "
+          "setup actually parks a poolable entry rather than silently zone-serving it");
     if (parked) {
         sycl::event release = submit_slow_release(q);
         cache->onednn_graph_scratch_free(parked, &release);
