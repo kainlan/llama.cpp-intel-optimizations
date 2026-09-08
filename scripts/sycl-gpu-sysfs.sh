@@ -110,15 +110,15 @@ is_top_level_card() {
 # NOT quiet exclusions: all three refuse() loudly instead, because silently
 # dropping any of them would change level_zero:N's meaning for every card
 # after it with no visible signal -- exactly the silent index shift this
-# whole derivation exists to prevent (llama.cpp-imns review round 2/3).
+# whole derivation exists to prevent (llama.cpp-imns).
 #
 # DERIVED_CARD/DERIVED_PCI (set at the bottom of this function) are public
 # outputs read by every CALLER of this function, not by this file itself,
 # and shellcheck cannot see across a `source`, so it flags them as unused.
 # Scope the disable to just this function (not file-wide) so an unrelated
-# unused variable anywhere else in this file would still be caught (quality
-# review finding F2 -- an earlier version placed this disable above the
-# file's very first command, which shellcheck treats as a FILE-WIDE disable).
+# unused variable anywhere else in this file would still be caught (an
+# earlier version placed this disable above the file's very first command,
+# which shellcheck treats as a FILE-WIDE disable).
 # shellcheck disable=SC2034
 derive_card_for_selector() {
     local idx="$1" c base pci vendor class resolved
@@ -139,10 +139,9 @@ derive_card_for_selector() {
         # substitutes) still succeeds (prints "."), so the `if !` around it
         # NEVER fires -- a genuine readlink failure would silently fall
         # through to `[ -n "$pci" ] || continue` as a QUIET skip, exactly
-        # the silent index shift this whole derivation exists to prevent
-        # (quality review round 3, finding F1). basename itself is still
-        # NOT piped through `xargs -r basename` (quality review finding
-        # F5): xargs word-splits its input on whitespace, so a resolved
+        # the silent index shift this whole derivation exists to prevent.
+        # basename itself is still NOT piped through `xargs -r basename`:
+        # xargs word-splits its input on whitespace, so a resolved
         # path containing a space (a DRM_ROOT under a directory with one,
         # for instance) would be split into two arguments -- the second of
         # which `basename` (called with two operands) treats as a SUFFIX to
@@ -227,14 +226,13 @@ find_card_by_pci() {
         # (see this function's own docstring above for why -- no index
         # semantics to protect, unlike derive_card_for_selector) -- written
         # as its own `if ! ...; then continue; fi`, not left as an implicit
-        # side effect of `basename` succeeding on an empty string (quality
-        # review round 3, finding F1: derive_card_for_selector's OWN
-        # implicit version of this shape hid a genuine bug, a discarded
-        # readlink status; this shape is correct, but was implicit enough
-        # to be indistinguishable from that bug at a glance). basename
-        # itself is still NOT piped through `xargs -r basename` (F5): see
-        # derive_card_for_selector's own comment on the identical
-        # whitespace-splitting hazard.
+        # side effect of `basename` succeeding on an empty string
+        # (derive_card_for_selector's OWN implicit version of this shape hid
+        # a genuine bug, a discarded readlink status; this shape is correct,
+        # but was implicit enough to be indistinguishable from that bug at a
+        # glance). basename itself is still NOT piped through
+        # `xargs -r basename`: see derive_card_for_selector's own comment on
+        # the identical whitespace-splitting hazard.
         if ! resolved="$(readlink -f "$c/device" 2>/dev/null)"; then
             continue
         fi

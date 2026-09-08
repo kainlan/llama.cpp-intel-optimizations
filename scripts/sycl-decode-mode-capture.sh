@@ -439,7 +439,7 @@ parse_tg128() {
     # crashed bench can leave a cell like "#") to 0 and reports mode=slow --
     # the exact verdict this capture exists to detect -- so a value that
     # fails this check must become "" (mode=unknown), never pass through.
-    printf '%s\n' "$value" | grep -qE '^[0-9]+([.][0-9]+)?$' || { echo ""; return 0; }
+    grep -qE '^[0-9]+([.][0-9]+)?$' <<<"$value" || { echo ""; return 0; }
     echo "$value"
 }
 
