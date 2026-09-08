@@ -5,8 +5,9 @@
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
 # already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
-# --pgrep-cmd, --journalctl-cmd, --df-cmd -- the last three are test hooks,
-# same as --meminfo/--sysfs-card, so the logic is testable without hardware).
+# --pgrep-cmd, --journalctl-cmd, --df-cmd, --drm-root -- the last four are
+# test hooks, same as --meminfo/--sysfs-card, so the logic is testable
+# without hardware).
 # The Shmem ceiling check compares Shmem net of tmpfs file usage (summed
 # "Used" from `df -k -t tmpfs`, override with --df-cmd): ordinary tmpfs files
 # (/tmp, /dev/shm) count toward Shmem in /proc/meminfo alongside TTM GPU-BO
@@ -35,20 +36,17 @@
 # /sys/class/drm), never a fixed PCI address table (CLAUDE.md: DRM numbering
 # AND PCI bus addresses move across boots -- verified 2026-09-05, when the
 # discrete cards moved from 0000:03:00.0/07:00.0 to 0000:04:00.0/09:00.0).
-# derive_pci_for_selector() below enumerates top-level cards (card[0-9]+
-# only -- connector entries like card1-DP-1 are excluded by name), keeps
-# discrete Intel display controllers (device/vendor 0x8086, device/class
-# 0x0300*, PCI bus 00 on any domain so the integrated GPU is excluded), sorts the
-# survivors by PCI address (lexical order on the zero-padded dddd:bb:dd.f
-# string is bus/device/function order), and maps level_zero:N to the N-th
-# survivor, zero-based. This assumes Level Zero orders the two discrete
-# cards by ascending PCI address -- true on every boot observed so far (the
-# B70 is always the lower address, i.e. level_zero:0). --pci ADDR and
-# --sysfs-card DIR remain explicit overrides that bypass the derivation
-# entirely. The selector match is EXACT (level_zero:<digit>, a single
-# digit) so a multi-device or other-form selector (level_zero:0,1,
-# level_zero:gpu, ...) falls through to the explicit "cannot derive card"
-# refusal instead of silently picking one of the cards it names.
+# derive_card_for_selector() (below; see its own docstring for the
+# enumerate/filter/sort mechanics) maps level_zero:N to the N-th discrete
+# GPU by ascending PCI address, zero-based. This assumes Level Zero orders
+# the discrete cards by ascending PCI address -- true on every boot
+# observed so far (the B70 is always the lower address, i.e.
+# level_zero:0). --pci ADDR and --sysfs-card DIR remain explicit overrides
+# that bypass the derivation entirely. The selector match is EXACT
+# (level_zero:<digit>, a single digit) so a multi-device or other-form
+# selector (level_zero:0,1, level_zero:gpu, ...) falls through to the
+# explicit "cannot derive card" refusal instead of silently picking one of
+# the cards it names.
 set -euo pipefail
 SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}" DRM_ROOT=/sys/class/drm
 SHMEM_CEIL_KB=$((10*1024*1024))
@@ -73,34 +71,33 @@ esac; done
 
 refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 
-# derive_pci_for_selector IDX -- enumerate top-level DRM cards under
-# $DRM_ROOT, keep discrete Intel display controllers, sort by PCI address,
-# and print "<sysfs card path>|<pci address>" for the IDX-th (zero-based)
-# survivor on stdout. Calls refuse() (exit 3) directly on any failure.
-#
-# Invocation safety: a command substitution ($(...)) runs this function in
-# a SUBSHELL whose `errexit` is OFF by default even though the caller has
-# `set -e` -- bash only inherits errexit into a command substitution when
-# `shopt -s inherit_errexit` is set (bash >= 4.4), which this script does
-# NOT set (verified empirically, not folklore: a `false` inside a function
-# called via `x="$(f)"` is silently swallowed here and the next line in `f`
-# still runs). So a raw filesystem probe failing inside the loop below
-# would, left unguarded, either be silently swallowed (this function
-# called via command substitution, the normal case below) or silently
-# abort the WHOLE script with no message and exit 1 (this function called
-# directly, where the caller's real errexit applies) -- both wrong, and
-# which one happens depends on the CALLER, not on this function. Every
-# probe below that can genuinely fail (as opposed to a file legitimately
-# not existing, which is a normal `continue`) is therefore checked with an
-# explicit `if ! ...; then refuse ...; fi`, which behaves the same either
-# way: refuse() loudly instead of silently dropping a card and shifting
-# the indices of the ones after it. refuse()'s own `exit 3` is separately
-# safe regardless of all the above -- `exit` is unconditional, not gated
-# by errexit -- so it still propagates correctly through the plain
-# command-substitution assignment this function is called with below
-# (RESULT="$(derive_pci_for_selector ...)"), which is why that pattern
-# (not `read` from a herestring, which would swallow the same refuse()
-# silently) is what the caller uses.
+# is_top_level_card DIR -- true iff DIR exists and its basename matches
+# card[0-9]+, i.e. a numbered top-level card rather than a connector entry
+# (card1-DP-1, ...). Shared by derive_card_for_selector and
+# find_card_by_pci so the two enumeration loops cannot drift onto
+# different filters.
+is_top_level_card() {
+    local c="$1" base
+    [ -e "$c" ] || return 1
+    base="$(basename "$c")"
+    [[ "$base" =~ ^card[0-9]+$ ]]
+}
+
+# derive_card_for_selector IDX -- enumerate top-level DRM cards under
+# $DRM_ROOT (is_top_level_card), keep discrete Intel display controllers
+# (device/vendor 0x8086, device/class 0x0300*), excluding PCI bus 00 on
+# any domain, which is the integrated GPU, sort the survivors by PCI
+# address (lexical order on the zero-padded dddd:bb:dd.f string is
+# domain/bus/device/function order), and set DERIVED_CARD/DERIVED_PCI to
+# the sysfs card path and PCI address of the IDX-th (zero-based) survivor.
+# Calls refuse() (exit 3) directly on any failure. Called directly, never
+# via a command substitution, so `set -e` applies to it exactly as it does
+# to the rest of the script; every probe below that can genuinely fail (as
+# opposed to a file legitimately not existing, which is a normal
+# `continue`) is still checked with an explicit `if ! ...; then refuse
+# ...; fi` purely to give a specific, actionable message -- an unguarded
+# failure under `set -e` would abort the whole script with no context at
+# all.
 #
 # A card that legitimately lacks a `device` link at all is excluded quietly
 # -- only the ordering of the SURVIVING cards is index-significant, and the
@@ -125,13 +122,12 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # dropping any of them would change level_zero:N's meaning for every card
 # after it with no visible signal -- exactly the silent index shift this
 # whole derivation exists to prevent (llama.cpp-imns review round 2/3).
-derive_pci_for_selector() {
+derive_card_for_selector() {
     local idx="$1" c base pci vendor class
     local -a entries=()
     for c in "$DRM_ROOT"/card*; do
-        [ -e "$c" ] || continue
+        is_top_level_card "$c" || continue
         base="$(basename "$c")"
-        [[ "$base" =~ ^card[0-9]+$ ]] || continue   # skip connectors (card1-DP-1, ...)
         if [ ! -e "$c/device" ] && [ ! -L "$c/device" ]; then
             continue   # no device link at all: legitimate skip
         fi
@@ -161,17 +157,18 @@ derive_pci_for_selector() {
             refuse "failed to read $c/device/class (probe error after it was confirmed readable)"
         fi
         case "$class" in 0x0300*) : ;; *) continue;; esac
-        case "$pci" in ????:00:*) continue;; esac    # exclude the integrated GPU (bus 00, any domain)
+        case "$pci" in *:00:*) continue;; esac    # exclude PCI bus 00 on any domain (any width) -- the integrated GPU
         entries+=("$base"$'\t'"$pci"$'\t'"$c")
     done
     local sorted_str=""
     if [ "${#entries[@]}" -gt 0 ]; then
-        # Lexical sort on field 2 (the PCI address) is bus/device/function
-        # order for the zero-padded dddd:bb:dd.f form; force LC_ALL=C so a
-        # non-C locale cannot reorder it. The explicit `if !` (not relying
-        # on mapfile's own status, which never sees a failure from inside
-        # a process substitution) is what makes a sort probe failure
-        # refuse() instead of silently yielding zero or partial candidates.
+        # Lexical sort on field 2 (the PCI address) is domain/bus/device/
+        # function order for the zero-padded dddd:bb:dd.f form; force
+        # LC_ALL=C so a non-C locale cannot reorder it. The explicit `if !`
+        # (not relying on mapfile's own status, which never sees a failure
+        # from inside a process substitution) is what makes a sort probe
+        # failure refuse() instead of silently yielding zero or partial
+        # candidates.
         if ! sorted_str="$(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t $'\t' -k2,2)"; then
             refuse "failed to sort discrete GPU candidates under $DRM_ROOT (sort probe error)"
         fi
@@ -188,23 +185,29 @@ derive_pci_for_selector() {
         done
         refuse "level_zero:$idx is out of range; found $n discrete Intel GPU(s): $disp"
     fi
-    local b p path
-    IFS=$'\t' read -r b p path <<< "${sorted[$idx]}"
-    printf '%s|%s\n' "$path" "$p"
+    local p path
+    IFS=$'\t' read -r _ p path <<< "${sorted[$idx]}"
+    DERIVED_CARD="$path"
+    DERIVED_PCI="$p"
 }
 
 # find_card_by_pci PCI -- scan top-level DRM cards under $DRM_ROOT (same
-# card[0-9]+ filter as derive_pci_for_selector, so a connector entry can't
-# shadow the real card here either) and print the first matching sysfs
-# card path, or an empty line if none matches. Always exits 0 (the caller
-# decides what an empty result means), so it is safe to assign its output
-# via plain command substitution without an explicit `|| ...` guard.
+# is_top_level_card filter as derive_card_for_selector, so a connector
+# entry can't shadow the real card here either) and print the first
+# matching sysfs card path, or an empty line if none matches. Always exits
+# 0 (the caller decides what an empty result means), so it is safe to
+# assign its output via plain command substitution without an explicit
+# `|| ...` guard. Unlike derive_card_for_selector's guarded readlink, a
+# readlink failure here is a silent skip rather than a refuse(): this
+# function has no index semantics to protect -- there is one target PCI
+# address, not an ordered list whose positions shift when an entry is
+# dropped -- and a card this loop misses simply leaves SYSFS_CARD empty at
+# the call site, which reaches the loud "no DRM card for PCI $PCI" refusal
+# there.
 find_card_by_pci() {
-    local target_pci="$1" c base found=""
+    local target_pci="$1" c found=""
     for c in "$DRM_ROOT"/card*; do
-        [ -e "$c" ] || continue
-        base="$(basename "$c")"
-        [[ "$base" =~ ^card[0-9]+$ ]] || continue
+        is_top_level_card "$c" || continue
         if [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$target_pci" ]; then
             found="$c"
             break
@@ -219,19 +222,16 @@ if [ -z "$SYSFS_CARD" ]; then
             level_zero:[0-9]) : ;;
             *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
         esac
-        # Get BOTH the PCI address and the sysfs card path from the same
-        # derivation pass -- do not re-scan $DRM_ROOT afterward to find the
-        # card for that PCI: an earlier, unfiltered second scan matched a
-        # connector entry sharing the same device symlink ahead of the
-        # real card in glob order (llama.cpp-imns review round 1). Split
-        # on the LAST '|' (%|*, ##*|), not the first: a PCI address can
-        # never contain '|', but nothing stops a sysfs card path from
-        # containing one, and splitting on the first pipe would then read
-        # part of the path as the PCI address and stamp a nonsense card=
-        # in the refusal/log header (review round 2).
-        RESULT="$(derive_pci_for_selector "${SELECTOR#level_zero:}")"
-        SYSFS_CARD="${RESULT%|*}"
-        PCI="${RESULT##*|}"
+        # Derive BOTH the PCI address and the sysfs card path in the same
+        # pass (into DERIVED_PCI/DERIVED_CARD) -- do not re-scan $DRM_ROOT
+        # afterward to find the card for that PCI: an earlier, unfiltered
+        # second scan matched a connector entry sharing the same device
+        # symlink ahead of the real card in glob order (llama.cpp-imns
+        # review round 1).
+        DERIVED_CARD="" DERIVED_PCI=""
+        derive_card_for_selector "${SELECTOR#level_zero:}"
+        SYSFS_CARD="$DERIVED_CARD"
+        PCI="$DERIVED_PCI"
     else
         # --pci was given explicitly (no --sysfs-card): still need to find
         # the matching sysfs card.

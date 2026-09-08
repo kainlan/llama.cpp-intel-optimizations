@@ -6,7 +6,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GUARD="$ROOT_DIR/scripts/bench-guard.sh"
 [ -x "$GUARD" ] || { echo "SKIP: bench-guard.sh not present"; exit 77; }
 
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# chmod -R u+rwX before rm -rf: several fixtures below chmod 000 a file or
+# directory and restore it immediately after use, but an interrupt between
+# the chmod and the restore would otherwise leave a mode-000 entry the
+# plain `rm -rf` below cannot delete (llama.cpp-imns review round 4,
+# finding Q17).
+T="$(mktemp -d)"; trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 fail=0
 skipped=0
 
@@ -43,6 +48,17 @@ expect_status() {
         echo "FAIL: expected $what to exit $want, got $rc" >&2
         fail=1
     fi
+}
+
+# skip_as_root DESC -- print a "SKIP: ..." line and bump the shared
+# `skipped` counter. Used by every permission-dependent test case below
+# (chmod 000 on a fixture file/directory), each of which is unreproducible
+# as root -- root bypasses permission bits, so the fixture would silently
+# behave as if the permission change never happened (llama.cpp-imns review
+# round 4, finding Q14).
+skip_as_root() {
+    echo "SKIP: $1 not reproducible as root (root bypasses permission bits)"
+    skipped=$((skipped+1))
 }
 
 mk_tree 1 0; mk_meminfo 3000000
@@ -169,6 +185,29 @@ head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout
 
 # --- Live DRM/PCI derivation (llama.cpp-imns) ---
 #
+# mk_pci_dev DEVROOT PCI_ADDR [with_freq] -- create a fake sysfs PCI device
+# directory DEVROOT/PCI_ADDR with vendor=0x8086 and class=0x030000 (an
+# Intel display controller, discrete or integrated depending on PCI_ADDR).
+# Pass "with_freq" as the third argument to also populate a
+# tile0/gt0/freq0/throttle/status=0 + act_freq=0 tree under it -- needed
+# only for a device a test expects the guard to actually SELECT and run
+# against; skip it for an iGPU or any decoy the guard must exclude/refuse
+# before ever deriving FREQ from it. Used by every fixture builder below
+# so the near-identical inline blocks that used to build these by hand
+# cannot drift out of sync with each other (llama.cpp-imns review round 4,
+# finding Q13).
+mk_pci_dev() {
+    local devroot="$1" addr="$2" with_freq="${3:-}"
+    mkdir -p "$devroot/$addr"
+    echo 0x8086 > "$devroot/$addr/vendor"
+    echo 0x030000 > "$devroot/$addr/class"
+    if [ -n "$with_freq" ]; then
+        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
+        echo 0 > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
+        echo 0 > "$devroot/$addr/tile0/gt0/freq0/act_freq"
+    fi
+}
+
 # Builds a fake --drm-root whose card-NUMBER order deliberately differs from
 # PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0), includes an
 # integrated GPU (card1 -> 00:02.0) that must be excluded, and a connector
@@ -179,31 +218,22 @@ head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout
 # exactly what caught review round 1: an earlier, unfiltered second scan for
 # the sysfs card matching a derived PCI address matched card0-DP-1 first and
 # bound SYSFS_CARD to a connector instead of card2. The card= assertions
-# below (not just pci=) are what a regression of that would fail.
+# below (not just pci=) are what a regression of that would fail. Its own
+# device root ($T/devices-lz01) is private to this fixture -- every other
+# fixture below builds its own device root too, rather than reusing this
+# one, so reordering the test cases can never turn one case into another
+# by accident (llama.cpp-imns review round 4, finding Q15).
 mk_drmroot() {
-    local d="$T/drmroot"
-    rm -rf "$d" "$T/devices"
-    mkdir -p "$T/devices/0000:09:00.0/tile0/gt0/freq0/throttle"
-    echo 0 > "$T/devices/0000:09:00.0/tile0/gt0/freq0/throttle/status"
-    echo 0 > "$T/devices/0000:09:00.0/tile0/gt0/freq0/act_freq"
-    echo 0x8086 > "$T/devices/0000:09:00.0/vendor"
-    echo 0x030000 > "$T/devices/0000:09:00.0/class"
-
-    mkdir -p "$T/devices/0000:00:02.0"
-    echo 0x8086 > "$T/devices/0000:00:02.0/vendor"
-    echo 0x030000 > "$T/devices/0000:00:02.0/class"
-
-    mkdir -p "$T/devices/0000:04:00.0/tile0/gt0/freq0/throttle"
-    echo 0 > "$T/devices/0000:04:00.0/tile0/gt0/freq0/throttle/status"
-    echo 0 > "$T/devices/0000:04:00.0/tile0/gt0/freq0/act_freq"
-    echo 0x8086 > "$T/devices/0000:04:00.0/vendor"
-    echo 0x030000 > "$T/devices/0000:04:00.0/class"
-
+    local d="$T/drmroot" devroot="$T/devices-lz01"
+    rm -rf "$d" "$devroot"
+    mk_pci_dev "$devroot" 0000:09:00.0 with_freq
+    mk_pci_dev "$devroot" 0000:00:02.0
+    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
     mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
-    ln -s "$T/devices/0000:09:00.0" "$d/card0/device"
-    ln -s "$T/devices/0000:00:02.0" "$d/card1/device"
-    ln -s "$T/devices/0000:04:00.0" "$d/card2/device"
-    ln -s "$T/devices/0000:04:00.0" "$d/card0-DP-1/device"
+    ln -s "$devroot/0000:09:00.0" "$d/card0/device"
+    ln -s "$devroot/0000:00:02.0" "$d/card1/device"
+    ln -s "$devroot/0000:04:00.0" "$d/card2/device"
+    ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
 }
 
 mk_drmroot; mk_meminfo 3000000
@@ -225,14 +255,44 @@ head -1 "$T/run-lz1.log" | grep -q "card=$T/drmroot/card0" \
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: level_zero:2 (out of range) must refuse with exit 3, got $rc"; fail=1; }
-echo "$out" | grep -q "0000:04:00.0" && echo "$out" | grep -q "0000:09:00.0" \
+# Grouped explicitly ({ A && B; } || C), not the bare "A && B || C" chain --
+# under a bash pitfall (not just a shellcheck SC2015 nit) an intervening
+# change to A or B can make the whole expression's success/failure
+# attribution ambiguous; grouping removes the ambiguity outright
+# (llama.cpp-imns review round 4, finding Q12).
+{ echo "$out" | grep -q "0000:04:00.0" && echo "$out" | grep -q "0000:09:00.0"; } \
     || { echo "FAIL: out-of-range refusal must name both discrete cards found (got: $out)"; fail=1; }
 
+# --- --pci override / find_card_by_pci (llama.cpp-imns review round 4,
+# finding Q11): no test above exercises find_card_by_pci directly -- every
+# --drm-root test so far either omits --pci (the real
+# derive_card_for_selector branch) or supplies --sysfs-card directly
+# (bypassing find_card_by_pci entirely). RED-able the same way review
+# round 1's connector-shadowing bug was: drop the is_top_level_card filter
+# from find_card_by_pci's loop and this starts binding
+# card=$T/drmroot/card0-DP-1 (which glob-sorts before card2 and shares its
+# device symlink) instead of the real card2. ---
+out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-pci.log" -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 must resolve via find_card_by_pci, got rc=$rc (out: $out)"; fail=1; }
+head -1 "$T/run-pci.log" | grep -q "card=$T/drmroot/card2" \
+    || { echo "FAIL: --pci 0000:04:00.0 must bind card=$T/drmroot/card2, not the card0-DP-1 connector (got: $(head -1 "$T/run-pci.log"))"; fail=1; }
+
+out_nomatch="$("$GUARD" --pci 0000:99:99.9 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: an unmatched --pci must refuse with exit 3, got $rc (out: $out_nomatch)"; fail=1; }
+echo "$out_nomatch" | grep -q "no DRM card for PCI 0000:99:99.9" \
+    || { echo "FAIL: unmatched --pci refusal must name the PCI address (got: $out_nomatch)"; fail=1; }
+
+mkdir -p "$T/devices-igpu-only"
+mk_pci_dev "$T/devices-igpu-only" 0000:00:02.0
 mkdir -p "$T/drmroot-igpu-only/card1"
-ln -s "$T/devices/0000:00:02.0" "$T/drmroot-igpu-only/card1/device"
-expect_status 3 "a DRM root with only an integrated GPU must refuse" -- \
-    env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-igpu-only" --meminfo "$T/meminfo" \
-        --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+ln -s "$T/devices-igpu-only/0000:00:02.0" "$T/drmroot-igpu-only/card1/device"
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-igpu-only" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: a DRM root with only an integrated GPU must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+echo "$out" | grep -q "no discrete Intel GPU" \
+    || { echo "FAIL: igpu-only refusal must say 'no discrete Intel GPU' (got: $out)"; fail=1; }
 
 # The iGPU exclusion must be DOMAIN-agnostic (bus 00 on any domain), not
 # hardcoded to domain 0000 -- an iGPU can enumerate under a non-zero PCI
@@ -242,14 +302,9 @@ expect_status 3 "a DRM root with only an integrated GPU must refuse" -- \
 # second discrete GPU, and level_zero:1 wrongly resolves with rc=0 instead
 # of refusing out-of-range (llama.cpp-imns review round 3, finding M1).
 mk_drmroot_domain_igpu() {
-    local d="$T/drmroot-domain-igpu"
-    rm -rf "$d" "$T/devices-domain-igpu"
-    mkdir -p "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/throttle"
-    echo 0 > "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/throttle/status"
-    echo 0 > "$T/devices-domain-igpu/0000:04:00.0/tile0/gt0/freq0/act_freq"
-    echo 0x8086 > "$T/devices-domain-igpu/0000:04:00.0/vendor"
-    echo 0x030000 > "$T/devices-domain-igpu/0000:04:00.0/class"
-
+    local d="$T/drmroot-domain-igpu" devroot="$T/devices-domain-igpu"
+    rm -rf "$d" "$devroot"
+    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
     # Full throttle/act_freq sysfs on the fake iGPU too (unlike the plain
     # domain-0000 iGPU fixture above, which needs none since it's excluded
     # identically pre- and post-fix): a pre-fix guard that wrongly accepts
@@ -258,15 +313,10 @@ mk_drmroot_domain_igpu() {
     # of missing sysfs files -- otherwise the assertions below could not
     # tell "correctly excluded" from "wrongly included but happens to fail
     # differently" apart, and the RED/GREEN distinction would be void.
-    mkdir -p "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/throttle"
-    echo 0 > "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/throttle/status"
-    echo 0 > "$T/devices-domain-igpu/0001:00:02.0/tile0/gt0/freq0/act_freq"
-    echo 0x8086 > "$T/devices-domain-igpu/0001:00:02.0/vendor"
-    echo 0x030000 > "$T/devices-domain-igpu/0001:00:02.0/class"
-
+    mk_pci_dev "$devroot" 0001:00:02.0 with_freq
     mkdir -p "$d/card0" "$d/card1"
-    ln -s "$T/devices-domain-igpu/0000:04:00.0" "$d/card0/device"
-    ln -s "$T/devices-domain-igpu/0001:00:02.0" "$d/card1/device"
+    ln -s "$devroot/0000:04:00.0" "$d/card0/device"
+    ln -s "$devroot/0001:00:02.0" "$d/card1/device"
 }
 mk_drmroot_domain_igpu; mk_meminfo 3000000
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
@@ -287,17 +337,18 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
 # removed or a hot-unplug race) must refuse loudly rather than silently
 # excluding the card and shifting level_zero indices for the rest (review
 # round 2 finding 1a). TWO cards, not one: card0's symlink is dangling,
-# card1 (reusing the still-valid 0000:09:00.0 device from mk_drmroot) is
-# fine -- this is what actually reproduces the reported bug. With only one
-# (broken) card, "no discrete GPU found" would also refuse with exit 3,
-# masking the real defect: on the pre-fix code this two-card tree instead
-# silently drops card0 and hands level_zero:0 card1's address with rc=0
-# and a VALID stamp (verified against the pre-round-2 guard before this
-# fix landed).
-rm -rf "$T/drmroot-dangling"
+# card1 (a valid 0000:09:00.0 device, in this fixture's OWN private device
+# root -- llama.cpp-imns review round 4, finding Q15) is fine -- this is
+# what actually reproduces the reported bug. With only one (broken) card,
+# "no discrete GPU found" would also refuse with exit 3, masking the real
+# defect: on the pre-fix code this two-card tree instead silently drops
+# card0 and hands level_zero:0 card1's address with rc=0 and a VALID stamp
+# (verified against the pre-round-2 guard before this fix landed).
+rm -rf "$T/drmroot-dangling" "$T/devices-dangling"
+mk_pci_dev "$T/devices-dangling" 0000:09:00.0 with_freq
 mkdir -p "$T/drmroot-dangling/card0" "$T/drmroot-dangling/card1"
-ln -s "$T/devices/0000:99:00.0-does-not-exist" "$T/drmroot-dangling/card0/device"
-ln -s "$T/devices/0000:09:00.0" "$T/drmroot-dangling/card1/device"
+ln -s "$T/devices-dangling/0000:99:00.0-does-not-exist" "$T/drmroot-dangling/card0/device"
+ln -s "$T/devices-dangling/0000:09:00.0" "$T/drmroot-dangling/card1/device"
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-dangling" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: a dangling device symlink must refuse with exit 3, got $rc (out: $out)"; fail=1; }
@@ -306,22 +357,22 @@ echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must
 # An EXISTING but UNREADABLE device/vendor file must also refuse loudly
 # (review round 2 finding 1b), for the same two-card reason as above --
 # skip under root, which reads any file regardless of permission bits, so
-# chmod 000 would not reproduce this.
+# chmod 000 would not reproduce this. Its own private device root
+# ($T/devices-unreadable-vendor, review round 4 finding Q15), not shared
+# with mk_drmroot's.
 if [ "$(id -u)" -eq 0 ]; then
-    echo "SKIP: unreadable-vendor-file case not reproducible as root (root bypasses permission bits)"
-    skipped=$((skipped+1))
+    skip_as_root "unreadable-vendor-file case"
 else
-    rm -rf "$T/drmroot-unreadable-vendor" "$T/devices-unreadable"
-    mkdir -p "$T/devices-unreadable/0000:04:00.0"
-    echo 0x8086 > "$T/devices-unreadable/0000:04:00.0/vendor"
-    chmod 000 "$T/devices-unreadable/0000:04:00.0/vendor"
-    echo 0x030000 > "$T/devices-unreadable/0000:04:00.0/class"
+    rm -rf "$T/drmroot-unreadable-vendor" "$T/devices-unreadable-vendor"
+    mk_pci_dev "$T/devices-unreadable-vendor" 0000:04:00.0
+    chmod 000 "$T/devices-unreadable-vendor/0000:04:00.0/vendor"
+    mk_pci_dev "$T/devices-unreadable-vendor" 0000:09:00.0 with_freq
     mkdir -p "$T/drmroot-unreadable-vendor/card0" "$T/drmroot-unreadable-vendor/card1"
-    ln -s "$T/devices-unreadable/0000:04:00.0" "$T/drmroot-unreadable-vendor/card0/device"
-    ln -s "$T/devices/0000:09:00.0" "$T/drmroot-unreadable-vendor/card1/device"
+    ln -s "$T/devices-unreadable-vendor/0000:04:00.0" "$T/drmroot-unreadable-vendor/card0/device"
+    ln -s "$T/devices-unreadable-vendor/0000:09:00.0" "$T/drmroot-unreadable-vendor/card1/device"
     out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-vendor" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
-    chmod 644 "$T/devices-unreadable/0000:04:00.0/vendor"   # so the EXIT trap's rm -rf can clean it up
+    chmod 644 "$T/devices-unreadable-vendor/0000:04:00.0/vendor"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/vendor file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
     echo "$out" | grep -qi "not readable" || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
 fi
@@ -332,22 +383,21 @@ fi
 # cannot see this case, because a search-denied parent directory makes stat
 # on anything inside it fail the same way a legitimately absent file would,
 # so the vendor/class readability checks above never fire. Two cards, same
-# reason as the dangling-symlink and unreadable-vendor cases above: with
-# only the broken card, "no discrete GPU found" would also refuse with
-# exit 3 and mask the real defect. Skip under root, which bypasses
-# permission bits, so chmod 000 would not reproduce this.
+# reason as the dangling-symlink and unreadable-vendor cases above -- own
+# private device root (review round 4, finding Q15) -- with only the
+# broken card, "no discrete GPU found" would also refuse with exit 3 and
+# mask the real defect. Skip under root, which bypasses permission bits,
+# so chmod 000 would not reproduce this.
 if [ "$(id -u)" -eq 0 ]; then
-    echo "SKIP: unreadable-device-dir case not reproducible as root (root bypasses permission bits)"
-    skipped=$((skipped+1))
+    skip_as_root "unreadable-device-dir case"
 else
     rm -rf "$T/drmroot-unreadable-devdir" "$T/devices-unreadable-devdir"
-    mkdir -p "$T/devices-unreadable-devdir/0000:04:00.0"
-    echo 0x8086 > "$T/devices-unreadable-devdir/0000:04:00.0/vendor"
-    echo 0x030000 > "$T/devices-unreadable-devdir/0000:04:00.0/class"
+    mk_pci_dev "$T/devices-unreadable-devdir" 0000:04:00.0
     chmod 000 "$T/devices-unreadable-devdir/0000:04:00.0"
+    mk_pci_dev "$T/devices-unreadable-devdir" 0000:09:00.0 with_freq
     mkdir -p "$T/drmroot-unreadable-devdir/card0" "$T/drmroot-unreadable-devdir/card1"
     ln -s "$T/devices-unreadable-devdir/0000:04:00.0" "$T/drmroot-unreadable-devdir/card0/device"
-    ln -s "$T/devices/0000:09:00.0" "$T/drmroot-unreadable-devdir/card1/device"
+    ln -s "$T/devices-unreadable-devdir/0000:09:00.0" "$T/drmroot-unreadable-devdir/card1/device"
     out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-devdir" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
     chmod 755 "$T/devices-unreadable-devdir/0000:04:00.0"   # so the EXIT trap's rm -rf can clean it up

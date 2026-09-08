@@ -95,16 +95,18 @@ Each rule below cost a round of discarded measurements.
    # are boot-dependent (0000:03:00.0/07:00.0 before the 2026-09-05 boot,
    # 0000:04:00.0/09:00.0 after; llama.cpp-imns), so derive them live from
    # `lspci` instead, the same way bench-guard.sh's own
-   # derive_pci_for_selector does from sysfs. `-D` prints the PCI domain so
+   # derive_card_for_selector does from sysfs. `-D` prints the PCI domain so
    # the address is already in the drm-pdev dddd:bb:dd.f form (no need to
    # prefix "0000:" ourselves, which would be wrong on a host whose domain
    # isn't 0000). \[03[0-9a-f]{2}\]: matches only the PCI class-code
-   # bracket (class 0x03 = display controller, trailing ':' distinguishes
-   # it from the device-id bracket further down the line), and excluding
-   # any bus 00 (a 4-hex-digit domain followed by :00:) drops the
-   # integrated GPU regardless of domain:
+   # bracket (class 0x03 = display controller; it is the bare 4-hex-digit
+   # shape -- 03xx with no internal colon -- that distinguishes it from the
+   # device-id bracket further down the line, e.g. [8086:e212], not the
+   # trailing ':'), and excluding any bus 00 (one or more hex digits of
+   # domain followed by :00:) drops the integrated GPU regardless of domain
+   # width:
    mapfile -t gpu_pci < <(lspci -D -d 8086: -nn | grep -E '\[03[0-9a-f]{2}\]:' \
-       | awk '{print $1}' | grep -vE '^[0-9a-f]{4}:00:')
+       | awk '{print $1}' | grep -vE '^[0-9a-f]+:00:')
    for pci in "${gpu_pci[@]}"; do
        echo "== $pci =="
        for f in /proc/*/fdinfo/*; do

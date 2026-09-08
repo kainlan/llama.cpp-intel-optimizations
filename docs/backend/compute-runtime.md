@@ -22,7 +22,7 @@ in the topology section below) are the addresses as measured on their
 respective dates, not a current fact. The PCI-topology argument itself
 (different root ports, no shared switch) is unaffected; only the literal
 addresses moved. Derive the live mapping rather than trusting either literal
-form (`scripts/bench-guard.sh`'s `derive_pci_for_selector`, llama.cpp-imns).
+form (`scripts/bench-guard.sh`'s `derive_card_for_selector`, llama.cpp-imns).
 
 ## Installed runtime (system default as of 2026-05-30)
 
