@@ -102,9 +102,10 @@ sycl_preflight_selector_may_use_b50() {
 # result has no room to express a third "unreadable" state without changing
 # every caller.
 #
-# The capture below is deliberately UNBOUNDED (no `-n`, no `--since`): this
-# is a current/previous-BOOT-wide fault check by design (`-b`/`-b -1`), not
-# a windowed one like bench-guard.sh's postflight check (which has an actual
+# Both captures below (this function's and its previous-boot sibling's) are
+# deliberately UNBOUNDED (no `-n`, no `--since`): this is a
+# current/previous-BOOT-wide fault check by design (`-b`/`-b -1`), not a
+# windowed one like bench-guard.sh's postflight check (which has an actual
 # window to bound -- the run it just guarded). There is no meaningful
 # "recent enough" cutoff for "has this boot ever seen a GPU fault" short of
 # re-deriving boot time from journalctl itself, which buys nothing over just
