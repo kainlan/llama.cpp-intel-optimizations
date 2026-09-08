@@ -9925,6 +9925,10 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             // pooling in general.
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
+            // A real release, same as the cap-eviction and depth-limit
+            // sources this counter already tracks -- see its own docstring
+            // in unified-cache.hpp (llama.cpp-pqgl).
+            ++onednn_graph_scratch_pool_eviction_count_;
             // Erase the map entry once its bucket empties out rather than
             // leaving a stray empty-vector entry behind forever.
             if (bucket.empty()) {
@@ -9962,6 +9966,27 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
                                                                          std::unique_lock<std::mutex> & lock) {
     const size_t cap = onednn_graph_scratch_direct_cap_bytes(
         onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
+
+    // A single request bigger than the whole cap can NEVER fit here no
+    // matter how long this function waits -- evicting the entire pool still
+    // leaves outstanding bytes at 0 < size, and a fresh poll iteration
+    // cannot change that. Without this early-out, such a request burned the
+    // full kOnednnGraphDirectWaitTotalTimeoutMs (5 s) poll loop below before
+    // alloc_direct_locked()'s caller-visible "gave up waiting" ERROR ever
+    // fired, on every single call (llama.cpp-pqgl).
+    if (size > cap) {
+        if (!onednn_graph_scratch_oversized_request_logged_) {
+            onednn_graph_scratch_oversized_request_logged_ = true;
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: requested %.2f MB exceeds the %.2f MB cap by "
+                "itself -- no amount of waiting or eviction can make this fit; skipping the poll loop and "
+                "attempting the allocation directly (only logged once; unified_alloc() below still fails loudly "
+                "rather than handing oneDNN a null scratch pointer)\n",
+                size / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
+        }
+        return false;
+    }
+
     if (onednn_graph_scratch_evict_pool_until_fits_locked(size, cap)) {
         return true;
     }
@@ -10131,9 +10156,9 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     }
     // Normalized in place (not into a separately-named local) so this
     // function's own parameter name stays `alignment` throughout, matching
-    // the rest of the onednn_graph_scratch_*_locked() family (llama.cpp-0oxf
-    // round-6 finding H5) rather than introducing a second, differently
-    // spelled name for the same value.
+    // the rest of the onednn_graph_scratch_*_locked() family (llama.cpp-0oxf)
+    // rather than introducing a second, differently spelled name for the
+    // same value.
     alignment = (alignment != 0) ? alignment : 256;  // 256 == this file's default GPU-coalescing alignment
 
     std::unique_lock<std::mutex> lock(onednn_graph_scratch_mutex_);
@@ -10239,17 +10264,25 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
     // for the full mechanism this backs.
+    // Latched (log once), same shape as onednn_graph_scratch_first_wait_logged_
+    // above: without this, a request that structurally can never fit (the
+    // size>cap early-out in onednn_graph_scratch_wait_for_direct_headroom_locked()
+    // just above) returns false on EVERY call, and this ERROR would then
+    // fire once per SDPA call rather than once per process (llama.cpp-pqgl).
     if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock)) {
-        GGML_LOG_ERROR(
-            "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: gave up waiting for headroom before allocating "
-            "%.2f MB (outstanding=%.2f MB, cap=%.2f MB, waits so far=%zu) -- attempting the allocation anyway so a "
-            "one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather than "
-            "handing oneDNN a null scratch pointer.\n",
-            size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_cap_bytes(
-                onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
-                (1024.0 * 1024.0),
-            onednn_graph_scratch_direct_wait_count_);
+        if (!onednn_graph_scratch_gave_up_waiting_logged_) {
+            onednn_graph_scratch_gave_up_waiting_logged_ = true;
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: gave up waiting for headroom before allocating "
+                "%.2f MB (outstanding=%.2f MB, cap=%.2f MB, waits so far=%zu) -- attempting the allocation anyway "
+                "so a one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather "
+                "than handing oneDNN a null scratch pointer.\n",
+                size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
+                onednn_graph_scratch_direct_cap_bytes(
+                    onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
+                    (1024.0 * 1024.0),
+                onednn_graph_scratch_direct_wait_count_);
+        }
     }
 
     // wait_for_direct_headroom_locked() drops `lock` while it polls for an
