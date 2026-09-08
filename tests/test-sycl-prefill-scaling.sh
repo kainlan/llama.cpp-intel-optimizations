@@ -42,7 +42,15 @@
 #     real-shaped table (fa column, `±` spread, ngl=-1, log noise, rows in
 #     non-canonical order) plus a decoy row whose MODEL field contains
 #     "pp128" as a substring, the correct pp128 value is still extracted,
-#     never the decoy's (llama.cpp-y3z0 spec review round 1 finding 5).
+#     never the decoy's (llama.cpp-y3z0 spec review round 1 finding 5);
+#   - --models-dir / SYCL_PREFILL_SCALING_MODELS_DIR overrides the base
+#     directory for the mistral/gptoss entries, with the flag winning over
+#     the env var (cases 14-15); a selected model's file is checked to
+#     exist and be readable (a directory does not count) before any
+#     bench-guard invocation, refusing with exit 2 and the exact path
+#     named, hoisted once per model rather than once per pair, and gemma4
+#     (never rooted at MODELS_DIR) is proven untouched by it (cases
+#     16-17, llama.cpp-5iba).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -132,11 +140,14 @@ mk_fake_bench() {
 # ONEAPI_DEVICE_SELECTOR it received.
 mk_fake_bench_rc() {
     local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5" exitcode="$6" audit="${7:-}"
-    local audit_line=""
-    [ -n "$audit" ] && audit_line="printf '%s\n' \"\$*\" >> \"$audit\""
-    cat > "$path" <<EOF
-#!/usr/bin/env bash
-${audit_line}
+    {
+        echo '#!/usr/bin/env bash'
+        # Only emitted when an audit path was given -- folded in here,
+        # rather than always substituting a (possibly empty) variable into
+        # the heredoc below, so a stub built with no audit path is
+        # byte-identical to the pre-audit-parameter version of this helper.
+        [ -n "$audit" ] && printf '%s\n' "printf '%s\n' \"\$*\" >> \"$audit\""
+        cat <<EOF
 cat <<'TABLE'
 | model                          |       size |     params | backend    | ngl |             test |                  t/s |
 | ------------------------------ | ---------: | ---------: | ---------- | --: | ----------------: | -------------------: |
@@ -149,6 +160,7 @@ build: df51c5130 (7412)
 TABLE
 exit ${exitcode}
 EOF
+    } > "$path"
     chmod +x "$path"
 }
 
@@ -702,10 +714,13 @@ echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must r
 # --- Case 14 (llama.cpp-5iba): --models-dir DIR makes the fake bench
 # receive -m pointing at DIR's mistral file, proving the flag actually
 # changes the model path used, not merely that it is accepted as an arg.
-# Passed WITH a trailing slash ("$FLAG_MODELS_DIR/") deliberately -- this
-# is also the only case in the suite that exercises the trailing-slash
-# strip: the assertion below expects the EXACT single-slash path, so a
-# reverted/deleted strip would produce a doubled slash in the fake bench's
+# Passed WITH THREE trailing slashes ("$FLAG_MODELS_DIR///") deliberately --
+# this is also the only case in the suite that exercises the trailing-slash
+# strip, and MORE THAN ONE slash specifically: a single ${MODELS_DIR%/}
+# (collapsing the loop to a one-shot strip) would leave a doubled slash
+# behind and still pass a case that only ever tried one trailing slash. The
+# assertion below expects the EXACT single-slash path, so any such
+# under-stripping produces a doubled/tripled slash in the fake bench's
 # actual -m argument and this grep would (correctly) fail.
 FLAG_MODELS_DIR="$T/models-flag"
 mkdir -p "$FLAG_MODELS_DIR"
@@ -714,7 +729,7 @@ BENCH_ARGV_FLAG="$T/bench-argv-flag.log"
 : > "$BENCH_ARGV_FLAG"
 BENCH14="$T/fake-bench-models-dir-flag.sh"
 mk_fake_bench_audit "$BENCH14" "$BENCH_ARGV_FLAG" "1000.00" "1000.00" "900.00" "850.00"
-out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR/" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR///" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --models-dir with a valid fixture file must PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
 grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_FLAG" || { echo "FAIL: expected the fake bench to receive -m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf via --models-dir (audit: $(cat "$BENCH_ARGV_FLAG"))"; fail=1; }
@@ -750,7 +765,7 @@ grep -qF -- "$ENV_MODELS_DIR" "$BENCH_ARGV_WINS" && { echo "FAIL: the env var's 
 # invoke bench-guard at all -- BEFORE any GPU init, not after an
 # ERROR:bench-rc=1 row surfaces the problem late. Reuses STUB_GUARD (case 7
 # above, which appends its invocation's argv to $STUB_GUARD_AUDIT) with a
-# fresh audit path, rather than a second bespoke marker-guard mechanism:
+# fresh audit path, rather than a second bespoke guard stub:
 # first a POSITIVE CONTROL with a VALID --models-dir (files present, via
 # the whole-suite FAKE_MODELS_DIR fixture) proves the audit mechanism
 # itself actually detects an invocation -- without this, the "must not
@@ -809,12 +824,11 @@ echo "$out" | grep -q "(model mistral)" || { echo "FAIL: expected the refusal to
 
 # --- Case 16c (llama.cpp-5iba): --models-dir / (the filesystem root) must
 # build a single-slash path ("/mistral-7b-v0.1.Q4_0.gguf"), never
-# "//mistral-...". This is the case the plain trailing-slash strip alone
-# cannot handle: stripping "/" down to "" would leave the loop's own
-# ${MODELS_DIR: -1} indexing an empty string, so MODELS_DIR="/" is mapped
-# to the empty string separately, once, after the loop -- paths are always
-# built as "$MODELS_DIR/mistral-...", so the empty string (not "/") is
-# what produces the correct single slash. This case's expected outcome
+# "//mistral-...". The single strip loop (`while [ "${MODELS_DIR%/}" !=
+# "$MODELS_DIR" ]`) reduces a bare "/" all the way down to the empty string
+# -- paths are always built as "$MODELS_DIR/mistral-...", so it is that
+# empty string, not "/" itself, which yields the correct single slash. This
+# case's expected outcome
 # (exit 2, missing-file refusal) depends on /mistral-7b-v0.1.Q4_0.gguf NOT
 # existing on this host -- named precondition check first, so a host where
 # it somehow does exist reports a clear FAIL here rather than a confusing
@@ -879,6 +893,11 @@ GEMMA4_BENCH_AUDIT="$T/bench-argv-gemma4.log"
 BENCH17="$T/fake-bench-gemma4-untouched.sh"
 mk_fake_bench_audit "$BENCH17" "$GEMMA4_BENCH_AUDIT" "1000.00" "1000.00" "900.00" "850.00"
 : > "$GUARD_INVOKED_AUDIT"
+# $rc is captured but deliberately NOT asserted -- it is 2 (usage refusal)
+# if gemma4's real file is absent on this host, or 0 (the boundary-pass
+# BENCH2 numbers) if present, and this case is host-independent precisely
+# because it does not care which. The three absence assertions below are
+# the evidence for this case, regardless of which branch ran.
 out="$(STUB_GUARD_AUDIT="$GUARD_INVOKED_AUDIT" "$SCALING" --bench "$BENCH17" --guard "$STUB_GUARD" --only gemma4,b70 --models-dir "$NONEXISTENT_MODELS_DIR" 2>&1)" && rc=0 || rc=$?
 BAD_PATH="$NONEXISTENT_MODELS_DIR/stock-gemma-4-E4B-it.Q8_0.gguf"
 echo "$out" | grep -qF "$BAD_PATH" && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the refusal/output named $BAD_PATH (got: $out)"; fail=1; }
