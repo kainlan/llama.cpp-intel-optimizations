@@ -9963,8 +9963,10 @@ bool unified_cache::onednn_graph_scratch_pool_size_ready_locked(size_t size, siz
 bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                                          size_t                         alignment,
                                                                          int                            device_id,
-                                                                         std::unique_lock<std::mutex> & lock) {
-    const size_t cap = onednn_graph_scratch_direct_cap_bytes(
+                                                                         std::unique_lock<std::mutex> & lock,
+                                                                         bool & out_was_oversized) {
+    out_was_oversized = false;
+    const size_t cap  = onednn_graph_scratch_direct_cap_bytes(
         onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
 
     // Run the eviction sweep BEFORE the size>cap early-out below, even
@@ -9986,16 +9988,21 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     // can. Without this early-out, such a request burned the full
     // kOnednnGraphDirectWaitTotalTimeoutMs (5 s) poll loop below before
     // alloc_direct_locked()'s caller-visible "gave up waiting" ERROR ever
-    // fired, on every single call (llama.cpp-pqgl).
+    // fired, on every single call (llama.cpp-pqgl). `out_was_oversized` lets
+    // the caller tell this apart from a genuine timed-out wait -- without
+    // it, the caller logged its own "gave up waiting for headroom ... waits
+    // so far=N" ERROR on top of the WARN just below, describing a wait that
+    // never happened for this call.
     if (size > cap) {
+        out_was_oversized = true;
         if (!onednn_graph_scratch_oversized_request_logged_) {
             onednn_graph_scratch_oversized_request_logged_ = true;
-            GGML_LOG_ERROR(
+            GGML_LOG_WARN(
                 "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: requested %.2f MB exceeds the %.2f MB cap by "
                 "itself -- already evicted everything the pool could release above; no amount of additional "
                 "waiting can make this fit, so skipping the poll loop and attempting the allocation directly "
-                "(only logged once; unified_alloc() below still fails loudly rather than handing oneDNN a null "
-                "scratch pointer)\n",
+                "(only logged once; the caller's unified_alloc() attempt still fails loudly rather than handing "
+                "oneDNN a null scratch pointer)\n",
                 size / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
         }
         return false;
@@ -10279,7 +10286,16 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // size>cap early-out in onednn_graph_scratch_wait_for_direct_headroom_locked()
     // just above) returns false on EVERY call, and this ERROR would then
     // fire once per SDPA call rather than once per process (llama.cpp-pqgl).
-    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock)) {
+    //
+    // `was_oversized`: the callee returns false for TWO distinct reasons --
+    // the size>cap early-out (which already logged its own WARN above) or a
+    // genuine timed-out wait -- and this out-param tells them apart.
+    // Without it, an oversized request logged BOTH the callee's WARN and
+    // this ERROR describing a wait that never actually happened for that
+    // call (llama.cpp-pqgl review round 3, R4).
+    bool was_oversized = false;
+    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock, was_oversized) &&
+        !was_oversized) {
         if (!onednn_graph_scratch_gave_up_waiting_logged_) {
             onednn_graph_scratch_gave_up_waiting_logged_ = true;
             GGML_LOG_ERROR(

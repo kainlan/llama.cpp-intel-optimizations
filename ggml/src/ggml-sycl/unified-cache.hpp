@@ -4055,10 +4055,17 @@ class unified_cache {
     // onednn_graph_scratch_pool_size_ready_locked()'s per-iteration peek --
     // see that function's comment for why a peek that ignored them could
     // report "ready" for an entry the post-wait re-check would still miss.
+    // `out_was_oversized` is set true only when the returned false came from
+    // the size>cap early-out (no wait was attempted -- that branch already
+    // logs its own latched WARN), false in every other case including a
+    // genuine timed-out wait; lets the caller avoid logging its own
+    // "gave up waiting" ERROR for a call that never actually waited
+    // (llama.cpp-pqgl).
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                               size_t                         alignment,
                                                               int                            device_id,
-                                                              std::unique_lock<std::mutex> & lock);
+                                                              std::unique_lock<std::mutex> & lock,
+                                                              bool &                         out_was_oversized);
 
     // Releases every entry in onednn_graph_scratch_reuse_pool_ (real release
     // for an entry whose release_event has already completed; handed to

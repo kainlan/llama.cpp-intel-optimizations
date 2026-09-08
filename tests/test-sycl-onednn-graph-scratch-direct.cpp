@@ -44,7 +44,7 @@
 // same point arena_reserve() reclaims the KV/RUNTIME zones for a new
 // context, so a pooled buffer cannot outlive the context it belongs to.
 //
-// This test asserts four properties:
+// This test asserts five properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -77,12 +77,15 @@
 //       GGML_ABORT() into a latched flag plus a nullptr return. This test
 //       asserts the ERROR log line, the latch, and the nullptr return.
 //
-// RED-FIRST NOTE. All three properties are RED against the pre-0oxf code:
-// (a) and (b) have no pool, cap, or wait at all (every DIRECT allocation is
-// a fresh unified_alloc() with no bound), and (c) had no abort hook to
-// suppress -- the pre-fix function simply returned nullptr with
-// `req.suppress_failure_log = true`, so the log capture in this test would
-// find nothing and the "abort triggered" latch would not exist.
+// RED-FIRST NOTE. Three of these five properties, (a)-(c), are RED against
+// the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
+// DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
+// no abort hook to suppress -- the pre-fix function simply returned nullptr
+// with `req.suppress_failure_log = true`, so the log capture in this test
+// would find nothing and the "abort triggered" latch would not exist. (d)
+// and (e) were added by later tickets (llama.cpp-0oxf's own reclaim-safety
+// finding and llama.cpp-pqgl's review, respectively) and are not part of
+// this original RED-FIRST set.
 //
 //   (d) RECLAIM SAFETY (BLOCKING): reclaiming the
 //       pool (onednn_graph_scratch_reclaim_pool(), reached from cache
@@ -100,6 +103,17 @@
 //       same size misses the pool -- see the test's own comment for why
 //       this behavioral proxy is the strongest property observable without
 //       adding test-only introspection into mem-handle.cpp's drain worker.
+//
+//   (e) OVERSIZED REQUEST EARLY-OUT: a single request larger than the whole
+//       DIRECT cap must skip the bounded poll-loop wait entirely --
+//       observable as onednn_graph_scratch_direct_wait_count() staying
+//       unchanged, the primary proof the early-out fired rather than the
+//       wait loop -- while the eviction sweep that always runs first still
+//       does, observable as onednn_graph_scratch_pool_eviction_count()
+//       increasing for a genuinely parked entry, and the allocation still
+//       succeeds as a real (uncapped-by-this-check) allocation. Added by
+//       llama.cpp-pqgl's review, not part of the original 0oxf RED-FIRST
+//       set above.
 //
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
 // compiled in (the whole onednn_graph_scratch_* subsystem is `#if
@@ -402,23 +416,47 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
 }
 
 // --- (e) a request larger than the cap takes the size>cap early-out, not
-//         the full poll-loop wait (llama.cpp-pqgl) --------------------------
+//         the full poll-loop wait, AND the eviction sweep still runs first
+//         (llama.cpp-pqgl) --------------------------------------------------
+//
+// This must remain the ONLY oversized (size>cap) request issued anywhere in
+// this process, and the FIRST one if any other test is ever added after it:
+// onednn_graph_scratch_oversized_request_logged_ is a per-instance "log
+// once" latch, so a second oversized request anywhere else in this binary
+// -- before or after this test -- would silently not log the WARN this test
+// asserts on.
 void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     printf("DIRECT path request larger than the cap skips the poll-loop wait:\n");
 
-    // Start from a clean pool: the eviction sweep this early-out now runs
-    // BEFORE (onednn_graph_scratch_evict_pool_until_fits_locked(), moved
-    // ahead of the early-out per review) must not have anything real to
-    // evict here -- this test is purely about the early-out itself, not
-    // eviction timing, which test_bounded_eviction above already covers.
+    // Start from a clean pool.
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup");
 
     sycl::queue & q = cache->get_queue();
 
+    // Park ONE genuinely event-complete pooled entry, well under the cap,
+    // BEFORE issuing the oversized request below -- so the eviction sweep
+    // inside onednn_graph_scratch_wait_for_direct_headroom_locked() (which
+    // review round 2 moved to run BEFORE its size>cap early-out) has
+    // something REAL to evict. Without this setup the pool would already be
+    // empty and this test could not tell "the sweep ran before the
+    // early-out" apart from "the sweep never ran at all" -- both pass
+    // identically on an empty pool.
+    constexpr size_t kSizeParked = 200ull * 1024 * 1024;
+    void *           parked      = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
+    check(parked != nullptr, "the parked-entry setup allocation succeeds");
+    if (parked) {
+        sycl::event release = submit_slow_release(q);
+        cache->onednn_graph_scratch_free(parked, &release);
+        release.wait();  // ensure event-complete before the oversized request below
+    }
+
+    const size_t evictions_before  = cache->onednn_graph_scratch_pool_eviction_count();
+    const size_t wait_count_before = cache->onednn_graph_scratch_direct_wait_count();
+
     // main() sets the cap to 350 MB via GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB.
     // 366 MiB is comfortably over that ON ITS OWN -- no amount of eviction
-    // (the pool is already empty above) or waiting could ever bring
-    // outstanding+size under the cap for this request.
+    // or waiting could ever bring outstanding+size under the cap for this
+    // request.
     constexpr size_t kSizeOversized = 366ull * 1024 * 1024;
 
     g_captured_log.clear();
@@ -433,18 +471,33 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
 
     check(ptr != nullptr,
           "the oversized allocation still succeeds -- the cap bounds pooling/waiting, it is not a hard refusal");
-    // Comfortably under kOnednnGraphDirectWaitTotalTimeoutMs (5000 ms,
-    // unified-cache.cpp): if the early-out regressed back to running the
-    // full poll loop for a request that can never fit, this would instead
-    // take >= 5000 ms.
-    check(elapsed.count() < 2000, "the allocation returned well under the 5 s poll-loop timeout");
+    check(cache->onednn_graph_scratch_pool_eviction_count() > evictions_before,
+          "the eviction sweep still ran and released the parked entry before the size>cap early-out fired");
+    // Primary proof the early-out fired rather than the poll loop:
+    // onednn_graph_scratch_direct_wait_count() is only incremented once the
+    // poll loop past the early-out actually starts, which the early-out
+    // returns before reaching -- this is a stronger, non-timing-based
+    // signal than the elapsed-time check below, and not vulnerable to a
+    // slow but otherwise-correct allocation false-failing it.
+    check(cache->onednn_graph_scratch_direct_wait_count() == wait_count_before,
+          "onednn_graph_scratch_direct_wait_count() did NOT increase -- the early-out returned before any wait "
+          "was attempted, not after a completed-but-unsuccessful one");
+    // Secondary/soft timing check only -- 4000 ms, not 2000: 2000 ms equals
+    // kOnednnGraphDirectFailureDrainTimeoutMs, so a single drain-and-retry
+    // on this call's underlying unified_alloc() would false-fail a 2000 ms
+    // bound even though the early-out itself worked correctly. What this
+    // bounds is "did not run the full 5000 ms poll loop", not
+    // "was instantaneous".
+    check(elapsed.count() < 4000, "the allocation returned well under the 5 s poll-loop timeout");
     printf("    (elapsed=%lld ms)\n", static_cast<long long>(elapsed.count()));
     check(contains(g_captured_log, "exceeds the") && contains(g_captured_log, "cap by itself"),
-          "the latched oversized-request ERROR was logged");
+          "the latched oversized-request WARN was logged");
 
     if (ptr) {
         cache->onednn_graph_scratch_free(ptr, nullptr);
     }
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 
 }  // namespace
