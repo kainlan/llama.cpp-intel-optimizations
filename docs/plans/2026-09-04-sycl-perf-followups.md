@@ -1190,5 +1190,5 @@ six-pair table and the L4 long-prompt baselines, on master `0d8b160c5` (binaries
   `sycl-prefill-scaling.sh` hardcoded `/models` (llama.cpp-5iba: `--models-dir` override);
   two more stale PCI tables in sibling scripts (llama.cpp-o4fs, merged as `c19c11e52`).
   Separately, llama.cpp-0oxf (bound and pool the oneDNN Graph-scratch DIRECT path) merged
-  as `ee3c0c9e3`, with follow-ups tracked as llama.cpp-c6ah/o3a0/oyfl and integration fixes
-  merged as `586027481` (llama.cpp-pqgl).
+  as `ee3c0c9e3`, with follow-ups tracked as llama.cpp-c6ah/o3a0/oyfl, and integration
+  fixes for m1ny, o4fs and 0oxf merged as `586027481` (llama.cpp-pqgl).

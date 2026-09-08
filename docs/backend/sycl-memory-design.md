@@ -254,13 +254,13 @@ primitive-API-pair value with no floor added): `reserve_onednn_scratch`'s own
 growth guard must compare against the stored form, or the floor silently
 absorbs the pair's growth signal (every caller of either getter states in a
 comment which one it wants). **Default 64 MiB** (superseded by
-llama.cpp-0oxf: the default is now shape-derived, see the next section), not
-the 512 MiB the allocator shipped with initially: that number was sized for
-many buffers
-concurrently outstanding across a ubatch, which was only ever true while
-branch 1 above deferred reclaim on the completion event — once reclaim is
-immediate, at most ~1 buffer is outstanding at a time in the common case (TP
-excepted, branch 2). Measured high-water (`onednn_graph_scratch_high_water_bytes()`,
+llama.cpp-0oxf: the default is now shape-derived, see the next section),
+not the 512 MiB the allocator shipped with initially: that number was
+sized for many buffers concurrently outstanding across a ubatch, which
+was only ever true while branch 1 above deferred reclaim on the
+completion event — once reclaim is immediate, at most ~1 buffer is
+outstanding at a time in the common case (TP excepted, branch 2).
+Measured high-water (`onednn_graph_scratch_high_water_bytes()`,
 logged once at cache teardown, at `GGML_LOG_WARN` — `GGML_LOG_INFO` is
 dropped at default verbosity in every tool, see CLAUDE.md's "llama-bench
 traps" section, so nothing lower than WARN would reach a normal run's log at
@@ -474,9 +474,10 @@ ticket reproduced on:
   pool summary (%s): hits=%zu misses=%zu evictions=%zu peak_pooled=%.1f MB
   (cumulative for this process, not just this reclaim)` (silent if the pool
   was never used), where `%s` is `"teardown"`, `"context reclaim"`, or
-  `"runtime context update"`. Only the teardown call logs at `GGML_LOG_WARN`;
-  the context-reclaim and runtime-context-update calls log at
-  `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity in every tool
+  `"runtime context update"`. Only the teardown call logs at
+  `GGML_LOG_LEVEL_WARN`; the context-reclaim and runtime-context-update
+  calls log at `GGML_LOG_LEVEL_INFO`, which is dropped at default
+  verbosity in every tool
   (see CLAUDE.md's "llama-bench traps" section) — so those two summaries are
   invisible in a normal run unless verbosity is raised.
 
