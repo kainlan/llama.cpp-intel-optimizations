@@ -29,9 +29,17 @@
 # the wrapped command's, never the verdict.
 #
 # Postflight SUSPECT triggers: Shmem grew more than 5 GB across the run, the
-# run was killed by the timeout (rc 124/137), or the kernel log shows a GT
-# reset/guc_id/CAT error since the run started. A post-run throttle=1 reading
-# is NOT by itself suspect -- the run's own power draw asserts it.
+# run was killed by the timeout (rc 124/137), the wrapped command died by any
+# other signal (rc >= 128, e.g. 139 SIGSEGV -- a crashed bench is never a
+# valid measurement), or the kernel log shows a GT reset/guc_id/CAT error
+# since the run started. The kernel-log check counts matching lines
+# (`grep -c`, never `grep -q`) rather than testing for a match, because `-q`
+# exits at the first hit and SIGPIPEs a still-writing `journalctl` producer;
+# under `set -o pipefail` that reads as pipeline failure and takes the VALID
+# branch on exactly the runs that have a fault to report (llama.cpp-m1ny).
+# The match count is stamped in the reason (`kernel-gpu-fault:<N>`) and in the
+# header. A post-run throttle=1 reading is NOT by itself suspect -- the run's
+# own power draw asserts it.
 #
 # Card derivation is LIVE from DRM/PCI enumeration under --drm-root (default
 # /sys/class/drm), never a fixed PCI address table (CLAUDE.md: DRM numbering
@@ -354,15 +362,24 @@ fi
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     verdict="SUSPECT"
     reasons="$reasons timeout-killed:rc=$rc"
+elif [ "$rc" -ge 128 ]; then
+    verdict="SUSPECT"
+    reasons="$reasons signal:rc=$rc"
 fi
 # journalctl legitimately finds nothing (grep rc=1) on a clean run -- that's
 # inside an `if` condition, which `set -e` already exempts from tripping.
+# Count form, never `-q`: `-q` exits at the first match, which SIGPIPEs a
+# still-writing journalctl and (under pipefail) reports pipeline failure
+# instead of a match -- the exact case that must be caught (llama.cpp-m1ny).
+# `grep -c` reads its input to completion, and `|| true` covers the
+# legitimate zero-match case so `set -e` doesn't trip on grep's rc=1.
 kernel_log() {
     if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null; fi
 }
-if kernel_log | grep -qiE 'GT reset|guc_id|CAT error'; then
+kf="$(kernel_log | grep -ciE 'GT reset|guc_id|CAT error' || true)"
+if [ "${kf:-0}" -gt 0 ]; then
     verdict="SUSPECT"
-    reasons="$reasons kernel-gpu-fault"
+    reasons="$reasons kernel-gpu-fault:${kf}"
 fi
 
 verdict_line="$verdict${reasons:+:$reasons}"

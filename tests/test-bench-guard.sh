@@ -241,6 +241,64 @@ mk_tree 0 0; mk_meminfo 3000000
          --journalctl-cmd "echo kernel: xe 0000:03:00.0: GT reset triggered" \
          --log "$T/run4.log" -- true || fail=1
 head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line must stamp SUSPECT"; fail=1; }
+head -1 "$T/run4.log" | grep -q "kernel-gpu-fault:1" \
+    || { echo "FAIL: kernel-fault reason must carry the match count (got: $(head -1 "$T/run4.log"))"; fail=1; }
+
+cases=$((cases+1))
+# SIGPIPE fail-open repro (llama.cpp-m1ny): the old postflight check was
+# `kernel_log | grep -qiE 'GT reset|guc_id|CAT error'`. `grep -q` exits at
+# the FIRST match without draining its input; a producer still writing
+# thousands of lines behind that match then gets SIGPIPE on its next write,
+# and under `set -o pipefail` the pipeline's status is the non-zero SIGPIPE
+# status (141), so the `if` took the VALID branch on exactly the run that
+# has a fault to report. This needs a LIVE producer, not a fixed file piped
+# through `cat` -- `cat bigfile | grep -q` did not reproduce it on this host
+# (cat can write the whole small file before grep ever reads), but a
+# producer that emits its lines one at a time (mirroring journalctl's real
+# behaviour) reproduces it 5/5 -- verified against the unmodified guard
+# before this fix landed. The fault line must be first so grep matches
+# immediately while the producer is still emitting the 20000 filler lines
+# behind it.
+cat > "$T/journal-fault.sh" <<'FAKEJOURNAL'
+#!/usr/bin/env bash
+echo 'kernel: xe 0000:03:00.0: GT reset triggered'
+seq 1 20000 | sed 's/^/kernel: filler line /'
+FAKEJOURNAL
+chmod +x "$T/journal-fault.sh"
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/journal-fault.sh" \
+         --log "$T/run-sigpipe.log" -- true || fail=1
+head -1 "$T/run-sigpipe.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a fault line followed by 20000 filler lines must still stamp SUSPECT (SIGPIPE fail-open regression, llama.cpp-m1ny; got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+head -1 "$T/run-sigpipe.log" | grep -q "kernel-gpu-fault:1" \
+    || { echo "FAIL: kernel-fault reason must carry the match count (got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+
+cases=$((cases+1))
+# A wrapped command that dies by an uncaught signal other than the timeout's
+# SIGTERM/SIGKILL (rc 124/137) must also stamp SUSPECT -- a crashed bench is
+# never a valid measurement -- and the guard must keep mirroring the real rc
+# (139 = 128 + SIGSEGV) rather than swallowing it into the verdict.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --log "$T/run-segv.log" -- sh -c 'kill -SEGV $$' || rc=$?
+[ "$rc" -eq 139 ] || { echo "FAIL: a SIGSEGV'd wrapped command must exit 139 (got $rc)"; fail=1; }
+head -1 "$T/run-segv.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a signalled wrapped command must stamp SUSPECT (got: $(head -1 "$T/run-segv.log"))"; fail=1; }
+head -1 "$T/run-segv.log" | grep -q "signal:rc=139" \
+    || { echo "FAIL: a signalled wrapped command must carry signal:rc=139 (got: $(head -1 "$T/run-segv.log"))"; fail=1; }
+
+cases=$((cases+1))
+# The no-log branch prints the same verdict/reasons on stderr as the --log
+# header, not just a bare SUSPECT -- a signal death must be visible there too.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+err="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         -- sh -c 'kill -SEGV $$' 2>&1 >/dev/null)" || rc=$?
+[ "$rc" -eq 139 ] || { echo "FAIL: no-log signalled command must exit 139 (got $rc)"; fail=1; }
+{ echo "$err" | grep -q "SUSPECT" && echo "$err" | grep -q "signal:rc=139"; } \
+    || { echo "FAIL: no-log branch must print the same signal reason on stderr (got: $err)"; fail=1; }
 
 cases=$((cases+1))
 # Timeout kill: a wrapped command that outlives --budget must be killed
@@ -546,7 +604,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 35 ] || { echo "FAIL: expected 35 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 38 ] || { echo "FAIL: expected 38 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
