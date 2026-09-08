@@ -275,6 +275,87 @@ not attempt), so it stays a flat floor rather than a formula.
 `GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0` opts out of the whole allocator (back to
 oneDNN's default, for A/B).
 
+### The DIRECT path must be bounded, and the ONEDNN zone floor is now context-derived (llama.cpp-0oxf)
+
+The flat 64 MiB floor above was still too small for a real workload: at
+n_kv up to 8192 (a long-prompt Mistral 7B Q4_0 `llama-bench` run), every
+oneDNN SDPA `execute()` requests a ~144 MB Graph scratch — the zone's 256 MB
+default holds ~152 MB of primitive-API pair, so the request never fits, and
+**every single call** (32 layers × 16 ubatches × however many reps) takes
+branch 3, the DIRECT fallback, not just an occasional under-sized one. That
+turned a rare escape hatch into the steady-state path for that workload, and
+exposed a bug branch 3's own reasoning had not accounted for: its release is
+"always event-deferred, via `retain_handles_until_event()`" — onto the shared
+background drain worker (`mem-handle.cpp`'s `retained_handle_drain_loop`,
+a single detached thread that pops one retained-handle record, waits on its
+event, and repeats). Under host CPU contention that worker starves. DIRECT
+buffers pile up (each one's bytes stay counted as used by the unified cache
+until the worker's wait completes and the `mem_handle` destructs), the next
+`unified_alloc()` eventually fails, and the pre-0oxf code responded by
+returning `nullptr` **silently** (`req.suppress_failure_log = true`) —
+oneDNN then executed the compiled SDPA partition against an invalid scratch
+pointer: a GPU page fault (`Engine memory CAT error class=ccs`), an engine
+reset, then `UR_RESULT_ERROR_OUT_OF_RESOURCES` and a segfault. Reproduced and
+bisected on a B50 under synthetic host load (20 busy loops): 3/3 faults on
+the unmodified path, 0/3 with `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=256` raised
+enough that the request fit the zone and branch 3 was never taken at all.
+
+Two changes close this, and neither one alone would have been enough — a
+bigger zone floor helps the common case but the DIRECT path still exists for
+whatever a floor formula under-estimates, and a bounded DIRECT path with no
+floor improvement would just abort sooner on exactly the workload this
+ticket reproduced on:
+
+- **The ONEDNN zone floor is now context-derived**, not flat.
+  `onednn_graph_scratch_zone_floor_bytes()` computes
+  `floor(n_ctx) = max(64 MiB, a + b*planner_n_ctx)`, fed by
+  `unified_cache_set_planned_onednn_graph_scratch_n_ctx()` at the same
+  "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
+  `unified-cache.cpp`) that already knows `plan.planner_n_ctx`. The constants
+  are marked PROVISIONAL in that function's own comment: they are anchored so
+  `floor(8192) == 144 MB` (the one point this ticket's bisect actually
+  measured), not fit to a real sweep — replace them once pp2048/4096/8192
+  request sizes have been measured via the `GGML_SYCL_DEBUG`-gated print
+  `onednn_graph_scratch_alloc()` now emits for every request (rate-limited to
+  the first 64 per process). `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
+  overrides the formula, unchanged from before.
+- **The DIRECT path itself is now bounded and fails loudly instead of
+  silently.** `onednn_graph_scratch_alloc()` tracks outstanding DIRECT bytes
+  in a small local ledger (`onednn_graph_scratch_pending_release_`:
+  `{size, event}` pairs handed to `retain_handles_until_event()`, reaped
+  opportunistically via the existing non-blocking `event_complete()` — this
+  is a SEPARATE counter from the zone/DIRECT maps used for the high-water
+  stat above, because those clear the moment `onednn_graph_scratch_free()` is
+  *called*, before the physical memory is actually released, which is
+  exactly the population that needs to stay charged for a cap to mean
+  anything). Before allocating past `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`'s
+  cap (default: min(1 GiB, 25% of `available_budget()` snapshotted the last
+  time this device's arena was successfully planned — a snapshot, not a live
+  read, so the cap does not shrink out from under the allocator as the
+  arena's own zones consume the budget it was planned against), the
+  allocator waits, bounded, dropping its own mutex while it polls the shared
+  drain worker (`drain_retained_handles(wait_all=true, ...)` plus a watchdog
+  heartbeat) so `onednn_graph_scratch_free()` — potentially called from a
+  different thread — can keep updating the pending-release ledger this wait
+  depends on. If the wait times out, the allocator proceeds anyway rather
+  than refusing a possibly one-off spike pre-emptively; `unified_alloc()`
+  below is still checked. If that allocation genuinely fails even after one
+  drain-and-retry, the allocator now logs the sizes (request, outstanding,
+  cap, prior waits, zone capacity/used/floor) and `GGML_ABORT`s — it no
+  longer returns a null scratch pointer to oneDNN under any circumstance.
+  `onednn_graph_scratch_direct_wait_count()` reports how often a run actually
+  had to wait.
+
+Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
+see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/
+`_suppress_abort()`'s declarations in `unified-cache.hpp`) test hooks let
+`tests/test-sycl-onednn-graph-scratch-direct.cpp` drive both the cap-wait and
+the abort decision deterministically without needing genuine VRAM exhaustion
+and without crashing the test process — a fork()-based death-check was
+considered and rejected: forking a process that has already touched the
+SYCL/Level-Zero runtime is a documented hang hazard on this fork's
+development host (CLAUDE.md's SYCL Device Selection section).
+
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 
 `unified_cache::ensure_cached_alloc()` is the single allocation path that
