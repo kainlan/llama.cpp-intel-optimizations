@@ -266,9 +266,9 @@ PATH="$T/bin:$PATH" "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-since-shim.log" -- true || fail=1
 t1="$(date +%s)"
 recorded="$(cat "$since_sink")"
-echo "$recorded" | grep -qE -- '--since @[0-9]+' \
+grep -qE -- '--since @[0-9]+' <<<"$recorded" \
     || { echo "FAIL: without --journalctl-cmd the guard must call journalctl with --since @<epoch> (got: $recorded)"; fail=1; }
-since_epoch="$(echo "$recorded" | grep -oE '@[0-9]+' | tr -d '@' | head -1)"
+since_epoch="$(grep -oE '@[0-9]+' <<<"$recorded" | tr -d '@' | head -1)"
 if [ -z "$since_epoch" ] || [ "$since_epoch" -lt "$t0" ] || [ "$since_epoch" -gt "$t1" ]; then
     echo "FAIL: the --since epoch ($since_epoch) must fall within [t0=$t0, t1=$t1] -- captured right before the wrapped command starts, not a fixed window (got argv: $recorded)"
     fail=1
@@ -383,7 +383,7 @@ rc=0
 err="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
          -- sh -c 'kill -SEGV $$' 2>&1 >/dev/null)" || rc=$?
 [ "$rc" -eq 139 ] || { echo "FAIL: no-log signalled command must exit 139 (got $rc)"; fail=1; }
-{ echo "$err" | grep -q "SUSPECT" && echo "$err" | grep -q "signal:rc=139"; } \
+{ grep -q "SUSPECT" <<<"$err" && grep -q "signal:rc=139" <<<"$err"; } \
     || { echo "FAIL: no-log branch must print the same signal reason on stderr (got: $err)"; fail=1; }
 
 cases=$((cases+1))
@@ -627,7 +627,7 @@ ln -s "$T/devices-decoy/0000:55:00.0" "$T/drmroot-decoy/card0/device"
 mk_meminfo 3000000
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 DRM_ROOT="$T/drmroot-decoy" "$GUARD" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
-if echo "$out" | grep -q "0000:55:00.0"; then
+if grep -q "0000:55:00.0" <<<"$out"; then
     echo "FAIL: an inherited env DRM_ROOT must not be honoured -- the decoy tree's PCI address (0000:55:00.0) leaked into the derivation (rc=$rc, out: $out)"
     fail=1
 fi
@@ -660,12 +660,13 @@ head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
     || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
 
 cases=$((cases+1))
-# M3 (spec review round 2): the case above exercises F5's fix only inside
+# llama.cpp-o4fs: the case above exercises the space-in-resolved-path
+# (`xargs -r basename` word-splitting) fix only inside
 # derive_card_for_selector -- find_card_by_pci (the --pci override path)
-# carries the SAME `readlink -f ... | xargs -r basename` shape and was left
+# carried the SAME `readlink -f ... | xargs -r basename` shape and was left
 # uncovered. Reuses the same $T/drmroot-space fixture built just above, via
-# --pci instead of a bare selector, so this exercises find_card_by_pci's
-# own basename substitution specifically.
+# --pci instead of a bare selector, so this exercises find_card_by_pci's own
+# basename substitution specifically.
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 --log "$T/run-space-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must still resolve, got rc=$rc (out: $out)"; fail=1; }
@@ -783,32 +784,32 @@ else
 fi
 
 cases=$((cases+1))
-# F1 (quality review round 3): a readlink FAILURE -- distinct from the
+# llama.cpp-o4fs: a readlink FAILURE -- distinct from the
 # unreadable-device-DIR case above, which chmods the target dir ITSELF and
 # reaches the LATER `[ -d "$c/device" ] && { [ ! -r ] || [ ! -x ] }` check
-# -- must never become a silent, index-shifting skip. This chmods the
-# PARENT of the device target instead (an "unsearchable parent"): looking
-# up a directory ENTRY by name needs search permission on the directory
-# CONTAINING it, not on the entry's own permission bits, so this blocks
-# path resolution one level higher than the unreadable-devdir case above.
+# -- must never become a silent, index-shifting skip. This chmods the PARENT
+# of the device target instead (an "unsearchable parent"): looking up a
+# directory ENTRY by name needs search permission on the directory
+# CONTAINING it, not on the entry's own permission bits, so this blocks path
+# resolution one level higher than the unreadable-devdir case above.
 #
-# Empirically (round 3), this exact fixture is refused via the DANGLING
-# check (`[ -L "$c/device" ] && [ ! -e "$c/device" ]`, already earlier in
-# the loop), not the later "readlink probe error" line's own message: `-e`
-# and `readlink -f` both fully resolve the same symlink chain to determine
-# existence, so an unsearchable ancestor makes BOTH fail identically --
-# there is no ordinary filesystem-permission construction that fails
-# readlink -f while `-e` still succeeds (the "readlink probe error" refuse
-# exists for a genuine TOCTOU race -- the target vanishing between the
-# dangling check and the readlink call a moment later -- which a static
-# chmod fixture cannot reproduce). This is still exactly the behaviour F1
-# requires: the fix (checking readlink's own exit status, not discarding
-# it into a `basename` call that always succeeds) matters regardless of
-# which refuse() message a given failure surfaces through, and this test
-# proves the OUTCOME -- a loud refuse(), never a silent skip that would
-# shift level_zero indices for the surviving cards -- for a readlink
-# failure that reaches this fixture's construction. Skip under root, which
-# bypasses permission bits, so chmod 000 would not reproduce this.
+# Empirically, this exact fixture is refused via the DANGLING check (`[ -L
+# "$c/device" ] && [ ! -e "$c/device" ]`, already earlier in the loop), not
+# the later "readlink probe error" line's own message: `-e` and `readlink
+# -f` both fully resolve the same symlink chain to determine existence, so
+# an unsearchable ancestor makes BOTH fail identically -- there is no
+# ordinary filesystem-permission construction that fails readlink -f while
+# `-e` still succeeds (the "readlink probe error" refuse exists for a
+# genuine TOCTOU race -- the target vanishing between the dangling check and
+# the readlink call a moment later -- which a static chmod fixture cannot
+# reproduce). This is still exactly the behaviour this fix requires:
+# checking readlink's own exit status, instead of discarding it into a
+# `basename` call that always succeeds, matters regardless of which refuse()
+# message a given failure surfaces through, and this test proves the OUTCOME
+# -- a loud refuse(), never a silent skip that would shift level_zero
+# indices for the surviving cards -- for a readlink failure that reaches
+# this fixture's construction. Skip under root, which bypasses permission
+# bits, so chmod 000 would not reproduce this.
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unsearchable-parent (readlink failure) case"
 else
@@ -823,7 +824,7 @@ else
         --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
     chmod 755 "$T/devices-unreadable-parent"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unsearchable-parent (readlink failure) case must refuse with exit 3, got $rc (out: $out)"; fail=1; }
-    echo "$out" | grep -q "REFUSED:" || { echo "FAIL: an unsearchable-parent (readlink failure) case must refuse loudly, not silently skip the card (got: $out)"; fail=1; }
+    grep -q "REFUSED:" <<<"$out" || { echo "FAIL: an unsearchable-parent (readlink failure) case must refuse loudly, not silently skip the card (got: $out)"; fail=1; }
 fi
 
 # Expected total is a LITERAL, not derived from anything else in this file --

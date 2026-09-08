@@ -288,10 +288,62 @@ if PATH="$T/empty-path-bin" sycl_preflight_journal_has_current_boot_gpu_faults; 
     fail=1
 fi
 
+cases=$((cases+1))
+# This file's own top-of-file `source "$PREFLIGHT"` above already sourced it
+# once under `set -euo pipefail`; every one of this file's six sibling
+# sourcing scripts does the same. A second `source` of the SAME copy is
+# what a caller that sources this library more than once (or a caller that
+# is itself sourced more than once) would trigger, and SYCL_PREFLIGHT_FAULT_RE
+# was a bare top-level `readonly` before the fix -- a second assignment to
+# an already-readonly variable aborts the whole subshell under `set -e`,
+# not just that one line. Also assert the variable actually ENDS UP
+# readonly (`readonly -p`, matched with a `case` statement rather than a
+# `| grep -q` pipeline, which this project's gates avoid for the SIGPIPE
+# hazard documented in CLAUDE.md): the guard must not merely survive a
+# double source, it must still leave the real invariant in place
+# afterwards. Run in a fresh `bash -c` subshell (not this file's own
+# process) so a genuine abort here fails only this case, not the whole
+# suite.
+if ! bash -c '
+set -euo pipefail
+source "$1"; source "$1"
+case "$(readonly -p)" in
+    *SYCL_PREFLIGHT_FAULT_RE=*) exit 0 ;;
+    *) exit 1 ;;
+esac
+' _ "$PREFLIGHT" >/dev/null 2>&1; then
+    echo "FAIL: sourcing scripts/sycl-gpu-preflight.sh twice under set -e must not abort, and SYCL_PREFLIGHT_FAULT_RE must still be readonly afterwards"
+    fail=1
+fi
+
+cases=$((cases+1))
+# Positive control for the same fix: a bare `[ -z "${SYCL_PREFLIGHT_FAULT_RE:-}" ]`
+# emptiness guard is NOT equivalent to a readonly-ness probe -- it fails
+# OPEN on an inherited, non-readonly exported value, silently adopting it
+# instead of the real regex (and leaving the variable non-readonly, on top
+# of that). Export a value that matches nothing BEFORE sourcing (mirroring
+# an ambient/inherited environment leaking in), then feed a journal
+# containing a real fault line through the current-boot check: it must
+# still report a fault, proving the guard replaced the poisoned value with
+# the real regex rather than keeping it. This case is RED against the
+# emptiness-test form of the guard (verified by hand against a scratch
+# copy: the check silently reports NO fault) and GREEN against the
+# readonly-probe form above.
+if ! bash -c '
+set -euo pipefail
+export SYCL_PREFLIGHT_FAULT_RE="ZZZ_NEVER_MATCHES"
+source "$1"
+journalctl() { echo "kernel: xe 0000:09:00.0: Engine reset triggered"; }
+sycl_preflight_journal_has_current_boot_gpu_faults
+' _ "$PREFLIGHT" >/dev/null 2>&1; then
+    echo "FAIL: an inherited, non-readonly SYCL_PREFLIGHT_FAULT_RE environment value must not silently replace the real fault regex -- a real fault line went undetected"
+    fail=1
+fi
+
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above (llama.cpp-3e0f
 # convention).
-[ "$cases" -eq 14 ] || { echo "FAIL: expected 14 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 16 ] || { echo "FAIL: expected 16 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: sycl-gpu-preflight B50 live derivation ($cases cases)"
