@@ -66,6 +66,11 @@ export LC_NUMERIC=C
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
+# cases: total test-case count, printed in the final "OK" line (llama.cpp-3e0f
+# finding 10). Every case below bumps this exactly once, via its own
+# `cases=$((cases+1))` line placed directly above that case's own
+# "# --- Case N" comment (there is no expect_status helper in this suite to
+# do it centrally, unlike tests/test-bench-guard.sh).
 cases=0
 
 # --- fake sysfs / meminfo fixtures, mirrors test-bench-guard.sh ---
@@ -929,5 +934,12 @@ BAD_PATH="$NONEXISTENT_MODELS_DIR/stock-gemma-4-E4B-it.Q8_0.gguf"
 echo "$out" | grep -qF "$BAD_PATH" && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the refusal/output named $BAD_PATH (got: $out)"; fail=1; }
 grep -qF "$BAD_PATH" "$GEMMA4_BENCH_AUDIT" 2>/dev/null && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the fake bench's own argv audit named $BAD_PATH (audit: $(cat "$GEMMA4_BENCH_AUDIT"))"; fail=1; }
 grep -qF "$BAD_PATH" "$GUARD_INVOKED_AUDIT" 2>/dev/null && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the stub guard's own audit named $BAD_PATH (audit: $(cat "$GUARD_INVOKED_AUDIT"))"; fail=1; }
+
+# Expected total is a LITERAL, not derived from anything else in this file --
+# bump it whenever a case is added or removed above. Without this, a case
+# whose cases=$((cases+1)) increment is missing, misplaced, or silently
+# dropped would just change the printed digit rather than fail the suite
+# (llama.cpp-3e0f quality review round 1, finding Q6).
+[ "$cases" -eq 24 ] || { echo "FAIL: expected 24 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict ($cases cases)" || exit 1

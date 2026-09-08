@@ -14,6 +14,10 @@ GUARD="$ROOT_DIR/scripts/bench-guard.sh"
 T="$(mktemp -d)"; trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 fail=0
 skipped=0
+# cases: total test-case count, printed in the final "OK" line (llama.cpp-3e0f
+# finding 10). Every case below bumps this exactly once -- expect_status does
+# it for you (see its own definition); a raw (non-expect_status) case must
+# increment it itself, directly above its own case comment.
 cases=0
 
 # mk_pci_dev DEVROOT PCI_ADDR [with_freq [throttle act_freq]] -- create a
@@ -185,19 +189,21 @@ rc=0
          --max-wait 1 -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: no-log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
-# The no-log dry-run branch must still confirm the derived card on stderr,
-# carrying the same pci=/card= fields the --log header stamps at :374 --
-# without this, `ONEAPI_DEVICE_SELECTOR=level_zero:N scripts/bench-guard.sh
-# -- true` (no --log) gives an operator no confirmation of which card was
-# derived (llama.cpp-3e0f finding 7).
 cases=$((cases+1))
+# The no-log dry-run branch must still confirm the derived card on stderr,
+# carrying the same pci=/card= fields the --log header's own echo stamps --
+# both draw from bench-guard.sh's `pci_for_log=` assignment feeding into its
+# `--log` header echo (cited by symbol, not a line number, since line
+# numbers drift). Without this, `ONEAPI_DEVICE_SELECTOR=level_zero:N
+# scripts/bench-guard.sh -- true` (no --log) gives an operator no
+# confirmation of which card was derived (llama.cpp-3e0f finding 7).
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 -- true >/dev/null 2>"$T/nolog.err" || fail=1
 # "pci=override", not a bare "pci=" -- this case passes --sysfs-card
-# directly (no --pci), so $PCI is empty and pci_for_log falls back to the
-# literal "override" (bench-guard.sh:371); a bare "pci=" substring match
-# would fail open and pass even if pci_for_log were an empty string
+# directly (no --pci), so $PCI is empty and bench-guard.sh's `pci_for_log=`
+# assignment falls back to the literal "override"; a bare "pci=" substring
+# match would fail open and pass even if pci_for_log were an empty string
 # (llama.cpp-3e0f spec review round 1, finding M1).
 grep -q "pci=override" "$T/nolog.err" || { echo "FAIL: no-log dry run must print pci=override on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
 grep -q "card=$T/sys/class/drm/card9" "$T/nolog.err" \
@@ -214,13 +220,13 @@ expect_status 0 "clean host must run with --budget set" -- \
 mk_tree 0 0; rm -f "$T/sys/class/drm/card9/device/tile0/gt0/freq0/act_freq"; mk_meminfo 3000000
 expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false"
 
+cases=$((cases+1))
 # A missing/unreadable --meminfo must refuse with a clear message, not die
 # on shmem_kb()'s bare `awk` raw exit status under `set -e` (llama.cpp-imns
 # review round 5, finding F9). Capture out=/rc= like its neighbours below,
 # not just the exit status, so a regression to the raw awk failure is
 # caught by content, not only by code (llama.cpp-imns review round 6,
 # finding M1).
-cases=$((cases+1))
 mk_tree 0 0
 out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
@@ -309,6 +315,7 @@ out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" 
 { echo "$out" | grep -q "0000:04:00.0" && echo "$out" | grep -q "0000:09:00.0"; } \
     || { echo "FAIL: out-of-range refusal must name both discrete cards found (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- --pci override / find_card_by_pci (llama.cpp-imns review round 4,
 # finding Q11): no test above exercises find_card_by_pci directly -- every
 # --drm-root test so far either omits --pci (the real
@@ -318,7 +325,6 @@ out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" 
 # from find_card_by_pci's loop and this starts binding
 # card=$T/drmroot/card0-DP-1 (which glob-sorts before card2 and shares its
 # device symlink) instead of the real card2. ---
-cases=$((cases+1))
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 must resolve via find_card_by_pci, got rc=$rc (out: $out)"; fail=1; }
@@ -425,6 +431,7 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true
 
+cases=$((cases+1))
 # A dangling device symlink (target no longer resolves, e.g. a card
 # removed or a hot-unplug race) must refuse loudly rather than silently
 # excluding the card and shifting level_zero indices for the rest (review
@@ -436,7 +443,6 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
 # defect: on the pre-fix code this two-card tree instead silently drops
 # card0 and hands level_zero:0 card1's address with rc=0 and a VALID stamp
 # (verified against the pre-round-2 guard before this fix landed).
-cases=$((cases+1))
 rm -rf "$T/drmroot-dangling" "$T/devices-dangling"
 mk_pci_dev "$T/devices-dangling" 0000:09:00.0 with_freq
 mkdir -p "$T/drmroot-dangling/card0" "$T/drmroot-dangling/card1"
@@ -447,13 +453,13 @@ out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-d
 [ "$rc" -eq 3 ] || { echo "FAIL: a dangling device symlink must refuse with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must name the problem (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # An EXISTING but UNREADABLE device/vendor file must also refuse loudly
 # (review round 2 finding 1b), for the same two-card reason as above --
 # skip under root, which reads any file regardless of permission bits, so
 # chmod 000 would not reproduce this. Its own private device root
 # ($T/devices-unreadable-vendor, review round 4 finding Q15), not shared
 # with mk_drmroot's.
-cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-vendor-file case"
 else
@@ -477,13 +483,13 @@ else
         || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
 fi
 
+cases=$((cases+1))
 # An EXISTING but UNREADABLE device/class file must also refuse loudly,
 # mirroring the device/vendor case above -- bench-guard.sh checks class
 # readability as a separate `if` (derive_card_for_selector), so it needs
 # its own test rather than being implied by the vendor coverage
 # (llama.cpp-imns review round 5, finding F4). Own private device root,
 # same two-card shape, same root-skip.
-cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-class-file case"
 else
@@ -502,6 +508,7 @@ else
         || { echo "FAIL: unreadable-class refusal must name the problem (got: $out)"; fail=1; }
 fi
 
+cases=$((cases+1))
 # An unreadable/unsearchable device DIRECTORY (chmod 000 on the resolved
 # device dir itself, not just the vendor file inside it) must also refuse
 # loudly (review round 3, finding M2): `[ -e "$c/device/vendor" ]` alone
@@ -513,7 +520,6 @@ fi
 # broken card, "no discrete GPU found" would also refuse with exit 3 and
 # mask the real defect. Skip under root, which bypasses permission bits,
 # so chmod 000 would not reproduce this.
-cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-device-dir case"
 else
@@ -535,9 +541,16 @@ else
     echo "$out" | grep -qi "not readable/searchable" || { echo "FAIL: unreadable-device-dir refusal must name the problem (got: $out)"; fail=1; }
 fi
 
+# Expected total is a LITERAL, not derived from anything else in this file --
+# bump it whenever a case is added or removed above. Without this, a case
+# whose cases=$((cases+1)) increment is missing, misplaced, or silently
+# dropped would just change the printed digit rather than fail the suite
+# (llama.cpp-3e0f quality review round 1, finding Q6).
+[ "$cases" -eq 35 ] || { echo "FAIL: expected 35 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
-        echo "OK: all preflight refusals ($cases cases, $skipped skipped as root)"
+        echo "OK: all preflight refusals ($cases cases, $skipped of them skipped as root)"
     else
         echo "OK: all preflight refusals ($cases cases)"
     fi

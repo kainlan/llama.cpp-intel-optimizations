@@ -44,14 +44,14 @@
 # scripts/sycl-decode-mode-capture.sh does for the same reason. bench-guard.sh
 # has since also gained --drm-root, deliberately NOT forwarded here, because
 # this script's tests pass --sysfs-card, which bypasses derivation (same
-# reasoning as sycl-decode-mode-capture.sh:63-68). Do not add
-# -r above 2 at pp2048 (per the plan's own gotcha) -- change PP_VALUES/-r
-# only with that in mind.
+# reasoning as sycl-decode-mode-capture.sh's own header note on --drm-root).
+# Do not add -r above 2 at pp2048 (per the plan's own gotcha) -- change
+# PP_VALUES/-r only with that in mind.
 #
 # --sysfs-card, when set, is a SINGLE test hook forwarded unchanged to every
 # one of the (up to six) model/card pairs this script runs -- it does not vary
 # per card the way the real derivation (ONEAPI_DEVICE_SELECTOR) does. With
-# that hook set, both the B70 and B50 legs of a pair preflight the SAME fake
+# that hook set, both cards' pairs for a given model preflight the SAME fake
 # card; this is fine for the test suite (which fakes bench-guard's card entirely
 # and never asks it to distinguish B70 from B50), but it means --sysfs-card is
 # not a way to pin one real card's sysfs for a live multi-pair run.
@@ -349,10 +349,8 @@ for model_entry in "${MODELS[@]}"; do
         any_selected=1
 
         GUARD_ARGS=()
-        # --sysfs-card is a single test hook forwarded UNCHANGED to every
-        # selected pair -- see the header comment above. With it set, both
-        # cards' pairs preflight the same fixed fake card, not their own real
-        # sysfs tree.
+        # --sysfs-card is forwarded unchanged to every selected pair -- see
+        # the header comment above for why.
         [ -n "$SYSFS_CARD" ] && GUARD_ARGS+=(--sysfs-card "$SYSFS_CARD")
         [ -n "$MEMINFO" ] && GUARD_ARGS+=(--meminfo "$MEMINFO")
         [ -n "$PGREP_CMD" ] && GUARD_ARGS+=(--pgrep-cmd "$PGREP_CMD")
