@@ -480,9 +480,11 @@ ticket reproduced on:
   in every tool (see CLAUDE.md's "llama-bench traps" section) — so those two
   summaries are invisible in a normal run unless verbosity is raised. The
   summary call passes the enum `GGML_LOG_LEVEL_WARN` directly to
-  `ggml_log_internal()`, while the high-water line above uses the
-  `GGML_LOG_WARN` macro instead -- both spellings are correct, just two
-  different call sites' own conventions.
+  `ggml_log_internal()` because its level is a runtime choice — WARN at
+  teardown, INFO otherwise — which the level-baking
+  `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot express. The high-water line
+  above it has a single fixed level and uses the `GGML_LOG_WARN` macro
+  instead.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/

@@ -660,13 +660,13 @@ head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
     || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
 
 cases=$((cases+1))
-# llama.cpp-o4fs: the case above exercises the space-in-resolved-path
-# (`xargs -r basename` word-splitting) fix only inside
-# derive_card_for_selector -- find_card_by_pci (the --pci override path)
-# carries the SAME `readlink -f ... | xargs -r basename` shape and was
-# left uncovered. Reuses the same $T/drmroot-space fixture built just
-# above, via --pci instead of a bare selector, so this exercises
-# find_card_by_pci's own basename substitution specifically.
+# llama.cpp-o4fs: the case above exercises the space-in-resolved-path (`xargs
+# -r basename` word-splitting) fix only inside derive_card_for_selector --
+# find_card_by_pci (the --pci override path) carried the SAME `readlink -f
+# ... | xargs -r basename` shape and was left uncovered. Reuses the same
+# $T/drmroot-space fixture built just above, via --pci instead of a bare
+# selector, so this exercises find_card_by_pci's own basename substitution
+# specifically.
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 --log "$T/run-space-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must still resolve, got rc=$rc (out: $out)"; fail=1; }

@@ -315,21 +315,20 @@ grep -qi "out of range" <<<"$out_lz2_text" \
     || { echo "FAIL: out-of-range refusal must say so (got: $out_lz2_text)"; fail=1; }
 [ ! -e "$out_lz2" ] || { echo "FAIL: an out-of-range setup failure must not create --out at all"; fail=1; }
 
-# --- llama.cpp-o4fs: scripts/sycl-decode-mode-capture.sh's own
-# explicit `DRM_ROOT=/sys/class/drm` (set unconditionally before sourcing
+# --- llama.cpp-o4fs: scripts/sycl-decode-mode-capture.sh's own explicit
+# `DRM_ROOT=/sys/class/drm` (set unconditionally before sourcing
 # sycl-gpu-sysfs.sh, mirroring bench-guard.sh's own env-DRM_ROOT-leak fix)
 # had no test coverage of its own. As with bench-guard.sh's own
-# env-DRM_ROOT-leak regression test (tests/test-bench-guard.sh), this
-# cannot be exercised by ALSO passing
-# --drm-root (that flag's arg-parser assignment always wins regardless of
-# the fix) or --sysfs-card (that bypasses derivation entirely) -- the only
-# way to reach the real code path is to omit both and let full derivation
-# run, with env DRM_ROOT pointed at a decoy tree. A DECOY drm root (a
-# single fake card at a made-up address, 0000:55:00.0) is pointed to by
-# env DRM_ROOT; this run must never resolve against it -- whatever it
-# resolves against instead (this host's real /sys/class/drm, or a
-# refusal) is acceptable, since only leaking the decoy through is what
-# this guards against.
+# env-DRM_ROOT-leak regression test (tests/test-bench-guard.sh), this cannot
+# be exercised by ALSO passing --drm-root (that flag's arg-parser assignment
+# always wins regardless of the fix) or --sysfs-card (that bypasses
+# derivation entirely) -- the only way to reach the real code path is to
+# omit both and let full derivation run, with env DRM_ROOT pointed at a
+# decoy tree. A DECOY drm root (a single fake card at a made-up address,
+# 0000:55:00.0) is pointed to by env DRM_ROOT; this run must never resolve
+# against it -- whatever it resolves against instead (this host's real
+# /sys/class/drm, or a refusal) is acceptable, since only leaking the decoy
+# through is what this guards against.
 cases=$((cases+1))
 rm -rf "$T/drmroot-decoy" "$T/devices-decoy"
 mk_pci_dev "$T/devices-decoy" 0000:55:00.0 with_freq

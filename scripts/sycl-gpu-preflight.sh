@@ -12,17 +12,19 @@
 # exercised there. 15 top-level alternatives (the `(queued|started)` group
 # inside one of them is internal, not a top-level alternative of its own).
 # Guarded, not a bare top-level `readonly`: this file is sourced by six
-# sourcing scripts plus this file's own test suite under `set -e`, and a
-# second `source` of an already-sourced copy must not abort with "readonly
+# scripts plus this file's own test suite under `set -e`, and a second
+# `source` of an already-sourced copy must not abort with "readonly
 # variable". A plain `[ -z "${SYCL_PREFLIGHT_FAULT_RE:-}" ]` emptiness test
 # is NOT equivalent: it fails open on an inherited (non-readonly) exported
 # value -- the check would silently adopt whatever a caller's environment
 # happened to set, and leave the variable non-readonly afterwards, both
 # wrong. Instead probe readonly-ness directly: an assignment inside a
-# subshell fails (and only fails) when the variable is already readonly,
-# so a plain exported (non-readonly) value is still assignable here and
-# gets overwritten by the real regex below, exactly like a totally unset
-# one.
+# subshell fails (and only fails) when the variable is already readonly, so
+# a plain exported (non-readonly) value is still assignable here and gets
+# overwritten by the real regex below, exactly like a totally unset one. A
+# caller that pre-sets SYCL_PREFLIGHT_FAULT_RE readonly before sourcing this
+# file still wins over the real regex below -- unavoidable in bash, and no
+# caller does.
 if ( SYCL_PREFLIGHT_FAULT_RE=probe ) 2>/dev/null; then
     SYCL_PREFLIGHT_FAULT_RE='xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
     readonly SYCL_PREFLIGHT_FAULT_RE
