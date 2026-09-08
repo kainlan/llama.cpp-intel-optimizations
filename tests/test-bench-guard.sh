@@ -51,13 +51,20 @@ mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/me
 # run_guard <pgrep-cmd> [extra guard flags...] -- forwards anything after the
 # pgrep-cmd straight through to bench-guard.sh (e.g. --df-cmd), so callers
 # that need an extra override don't have to spell out the whole invocation.
-# Defaults --df-cmd to `true` (tmpfs=0kB) so the suite is hermetic against
-# THIS host's real tmpfs usage; a later --df-cmd in "$@" overrides it, since
-# bench-guard.sh's arg parser keeps the last occurrence of a repeated flag.
+# Defaults --df-cmd to `true` (tmpfs=0kB) and --journalctl-cmd to `true` (an
+# empty, always-succeeding kernel log) so the suite is hermetic against THIS
+# host's real tmpfs usage and real kernel journal -- a bare `journalctl`
+# fallback would pick up whatever kernel GPU faults happen to be sitting in
+# the live journal's last-10-minutes window, including ones from an
+# unrelated concurrent bench on a shared host, and stamp SUSPECT on a case
+# that expects a clean run (llama.cpp-m1ny quality review, live-journal
+# hermeticity finding). A later --df-cmd/--journalctl-cmd in "$@" overrides
+# either default, since bench-guard.sh's arg parser keeps the last
+# occurrence of a repeated flag.
 run_guard() {
     local pgrep="$1"; shift
     "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" \
-              --pgrep-cmd "$pgrep" --max-wait 1 --df-cmd true "$@" -- true
+              --pgrep-cmd "$pgrep" --max-wait 1 --journalctl-cmd true --df-cmd true "$@" -- true
 }
 
 # Assert an EXACT status, never merely non-zero (mirrors
@@ -115,7 +122,7 @@ expect_status 0 "failing df-cmd + low Shmem must still run (tmpfs=0)" -- run_gua
 
 cases=$((cases+1))
 mk_meminfo 30000000
-out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: expected failing df-cmd + high Shmem to exit 3, got $rc"; fail=1; }
 echo "$out" | grep -q "minus tmpfs 0 kB" || { echo "FAIL: refusal message must show 'minus tmpfs 0 kB' (got: $out)"; fail=1; }
 
@@ -137,7 +144,7 @@ echo "$out" | grep -q "tmpfs used (5000000 kB) meets or exceeds Shmem (3000000 k
 # exercises the real derivation branch, not the test-fixture bypass.
 expect_status 3 "level_zero:0,1 selector must not derive a card" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" \
-        --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+        --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true
 
 # --- Task A2: run + verdict stamping ---
 
@@ -145,7 +152,7 @@ cases=$((cases+1))
 # --log captures stdout+stderr behind a VALID header on a clean run.
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
-         --max-wait 1 --log "$T/run.log" -- sh -c "echo bench-output" || fail=1
+         --max-wait 1 --journalctl-cmd true --log "$T/run.log" -- sh -c "echo bench-output" || fail=1
 head -1 "$T/run.log" | grep -q "bench-guard: VALID" || { echo "FAIL: VALID stamp missing"; fail=1; }
 grep -q "bench-output" "$T/run.log" || { echo "FAIL: output not captured"; fail=1; }
 # The header must carry raw/tmpfs/net separately, not a bare net figure under
@@ -161,7 +168,7 @@ cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 12000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 20000000 4000000 16000000 20%% /tmp\n' > "$T/df-header.txt"
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" \
-         --df-cmd "cat $T/df-header.txt" --max-wait 1 --log "$T/run-header.log" -- true || fail=1
+         --df-cmd "cat $T/df-header.txt" --max-wait 1 --journalctl-cmd true --log "$T/run-header.log" -- true || fail=1
 head -1 "$T/run-header.log" | grep -q "pre_shmem_eff=8000000kB" \
     || { echo "FAIL: expected pre_shmem_eff=8000000kB in header (got: $(head -1 "$T/run-header.log"))"; fail=1; }
 
@@ -169,7 +176,7 @@ cases=$((cases+1))
 # A wrapped command that grows Shmem (rewrites the fake meminfo file mid-run)
 # must stamp SUSPECT, even though the command itself succeeds.
 mk_tree 0 0; mk_meminfo 3000000
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
          --log "$T/run2.log" -- sh -c "printf 'MemAvailable: 1 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
 head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must stamp SUSPECT"; fail=1; }
 
@@ -179,14 +186,14 @@ cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
-         --max-wait 1 --log "$T/run3.log" -- sh -c "exit 7" || rc=$?
+         --max-wait 1 --journalctl-cmd true --log "$T/run3.log" -- sh -c "exit 7" || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: --log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
 cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
-         --max-wait 1 -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
+         --max-wait 1 --journalctl-cmd true -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: no-log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
 cases=$((cases+1))
@@ -199,7 +206,7 @@ cases=$((cases+1))
 # confirmation of which card was derived (llama.cpp-3e0f finding 7).
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
-         --max-wait 1 -- true >/dev/null 2>"$T/nolog.err" || fail=1
+         --max-wait 1 --journalctl-cmd true -- true >/dev/null 2>"$T/nolog.err" || fail=1
 # "pci=override", not a bare "pci=" -- this case passes --sysfs-card
 # directly (no --pci), so $PCI is empty and bench-guard.sh's `pci_for_log=`
 # assignment falls back to the literal "override"; a bare "pci=" substring
@@ -213,7 +220,7 @@ grep -q "card=$T/sys/class/drm/card9" "$T/nolog.err" \
 mk_tree 0 0; mk_meminfo 3000000
 expect_status 0 "clean host must run with --budget set" -- \
     "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
-             --max-wait 1 --budget 5 -- true
+             --max-wait 1 --journalctl-cmd true --budget 5 -- true
 
 # A fixture tree missing act_freq must refuse with a clear message, not die
 # on cat's raw (unguarded) failure under `set -e` (A1-review FYI fix).
@@ -229,7 +236,7 @@ cases=$((cases+1))
 # finding M1).
 mk_tree 0 0
 out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: missing --meminfo must refuse cleanly with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -q "no meminfo at" || { echo "FAIL: missing --meminfo refusal must name the problem (got: $out)"; fail=1; }
 
@@ -241,13 +248,133 @@ mk_tree 0 0; mk_meminfo 3000000
          --journalctl-cmd "echo kernel: xe 0000:03:00.0: GT reset triggered" \
          --log "$T/run4.log" -- true || fail=1
 head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line must stamp SUSPECT"; fail=1; }
+head -1 "$T/run4.log" | grep -q "kernel-gpu-fault:1" \
+    || { echo "FAIL: kernel-fault reason must carry the match count (got: $(head -1 "$T/run4.log"))"; fail=1; }
+
+cases=$((cases+1))
+# SIGPIPE fail-open repro (llama.cpp-m1ny): the old postflight check was
+# `kernel_log | grep -qiE 'GT reset|guc_id|CAT error'`. `grep -q` exits at
+# the FIRST match without draining its input; a producer still writing
+# thousands of lines behind that match then gets SIGPIPE on its next write,
+# and under `set -o pipefail` the pipeline's status is the non-zero SIGPIPE
+# status (141), so the `if` took the VALID branch on exactly the run that
+# has a fault to report. This needs a LIVE producer, not a fixed file piped
+# through `cat` -- `cat bigfile | grep -q` did not reproduce it on this host
+# (cat can write the whole small file before grep ever reads), but a
+# producer that emits its lines one at a time (mirroring journalctl's real
+# behaviour) reproduces it 5/5 -- verified against the unmodified guard
+# before this fix landed. The fault line must be first so grep matches
+# immediately while the producer is still emitting the 20000 filler lines
+# behind it. Three distinct fault lines (not one), so this and the other
+# kernel-gpu-fault assertions in this file don't all pin the same count --
+# an off-by-N bug in the count itself (e.g. counting total lines rather than
+# matching lines) would pass every ":1" assertion in this file undetected
+# (llama.cpp-m1ny quality review, finding Q8).
+cat > "$T/journal-fault.sh" <<'FAKEJOURNAL'
+#!/usr/bin/env bash
+echo 'kernel: xe 0000:03:00.0: GT reset triggered'
+echo 'kernel: xe 0000:03:00.0: guc_id=3 engine reset'
+echo 'kernel: xe 0000:03:00.0: Engine memory CAT error'
+seq 1 20000 | sed 's/^/kernel: filler line /'
+FAKEJOURNAL
+chmod +x "$T/journal-fault.sh"
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/journal-fault.sh" \
+         --log "$T/run-sigpipe.log" -- true || fail=1
+head -1 "$T/run-sigpipe.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: fault lines followed by 20000 filler lines must still stamp SUSPECT (SIGPIPE fail-open regression, llama.cpp-m1ny; got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+head -1 "$T/run-sigpipe.log" | grep -q "kernel-gpu-fault:3" \
+    || { echo "FAIL: kernel-fault reason must carry the exact match count of 3 (got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+
+cases=$((cases+1))
+# A missing/failing --journalctl-cmd must NOT collapse into "zero faults
+# found" -- piping straight into `grep -c` (or `-q`) cannot distinguish "the
+# log was read and had no faults" from "the log could not be read at all",
+# and a run whose kernel log genuinely could not be checked is not a
+# verified-clean run. RED against the pre-F3 guard: this stamped VALID
+# (llama.cpp-m1ny spec review, finding F3).
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/no-such-journalctl-cmd" \
+         --log "$T/run-jl-missing.log" -- true || fail=1
+head -1 "$T/run-jl-missing.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a missing --journalctl-cmd must stamp SUSPECT, not silently VALID (got: $(head -1 "$T/run-jl-missing.log"))"; fail=1; }
+head -1 "$T/run-jl-missing.log" | grep -qE "kernel-log-unreadable:rc=[0-9]+" \
+    || { echo "FAIL: a missing --journalctl-cmd must carry a kernel-log-unreadable:rc=<N> reason (got: $(head -1 "$T/run-jl-missing.log"))"; fail=1; }
+
+cases=$((cases+1))
+# A --journalctl-cmd that FAILS but still prints a fault-looking line (e.g. a
+# flaky journalctl invocation that errors out after emitting partial output)
+# must be reported as unreadable, not silently counted as a real fault --
+# the producer's own exit status governs, checked BEFORE the line is ever
+# handed to grep -c.
+mk_tree 0 0; mk_meminfo 3000000
+cat > "$T/journal-fail-with-fault.sh" <<'FAKEJOURNAL'
+#!/usr/bin/env bash
+echo 'kernel: xe 0000:03:00.0: GT reset triggered'
+exit 1
+FAKEJOURNAL
+chmod +x "$T/journal-fail-with-fault.sh"
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/journal-fail-with-fault.sh" \
+         --log "$T/run-jl-fail-with-fault.log" -- true || fail=1
+head -1 "$T/run-jl-fail-with-fault.log" | grep -q "kernel-log-unreadable:rc=1" \
+    || { echo "FAIL: a failing journalctl-cmd that also printed a fault line must report kernel-log-unreadable:rc=1 (got: $(head -1 "$T/run-jl-fail-with-fault.log"))"; fail=1; }
+if head -1 "$T/run-jl-fail-with-fault.log" | grep -q "kernel-gpu-fault"; then
+    echo "FAIL: a failing journalctl-cmd's output must not be silently counted as a real kernel-gpu-fault (got: $(head -1 "$T/run-jl-fail-with-fault.log"))"
+    fail=1
+fi
+
+cases=$((cases+1))
+# A wrapped command that dies by an uncaught signal other than the timeout's
+# SIGTERM/SIGKILL (rc 124/137) must also stamp SUSPECT -- a crashed bench is
+# never a valid measurement -- and the guard must keep mirroring the real rc
+# (139 = 128 + SIGSEGV) rather than swallowing it into the verdict.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
+         --log "$T/run-segv.log" -- sh -c 'kill -SEGV $$' || rc=$?
+[ "$rc" -eq 139 ] || { echo "FAIL: a SIGSEGV'd wrapped command must exit 139 (got $rc)"; fail=1; }
+head -1 "$T/run-segv.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a signalled wrapped command must stamp SUSPECT (got: $(head -1 "$T/run-segv.log"))"; fail=1; }
+head -1 "$T/run-segv.log" | grep -q "signal:rc=139" \
+    || { echo "FAIL: a signalled wrapped command must carry signal:rc=139 (got: $(head -1 "$T/run-segv.log"))"; fail=1; }
+
+cases=$((cases+1))
+# The no-log branch prints the same verdict/reasons on stderr as the --log
+# header, not just a bare SUSPECT -- a signal death must be visible there too.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+err="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
+         -- sh -c 'kill -SEGV $$' 2>&1 >/dev/null)" || rc=$?
+[ "$rc" -eq 139 ] || { echo "FAIL: no-log signalled command must exit 139 (got $rc)"; fail=1; }
+{ echo "$err" | grep -q "SUSPECT" && echo "$err" | grep -q "signal:rc=139"; } \
+    || { echo "FAIL: no-log branch must print the same signal reason on stderr (got: $err)"; fail=1; }
+
+cases=$((cases+1))
+# `timeout` itself failing to execute the wrapped command (rc 125/126/127 --
+# bad `timeout` invocation, not executable, or not found) must also stamp
+# SUSPECT: none of these ever ran the actual bench, so none of them is a
+# valid measurement either, and the pre-Q6 guard let this range fall through
+# to VALID (llama.cpp-m1ny quality review, finding Q6). A nonexistent
+# command reliably reproduces rc=127 via GNU coreutils `timeout`.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
+         --log "$T/run-notexec.log" -- /nonexistent-bench-binary-xyz || rc=$?
+[ "$rc" -eq 127 ] || { echo "FAIL: a not-found wrapped command must exit 127 (got $rc)"; fail=1; }
+head -1 "$T/run-notexec.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a not-executed wrapped command must stamp SUSPECT (got: $(head -1 "$T/run-notexec.log"))"; fail=1; }
+head -1 "$T/run-notexec.log" | grep -q "not-executed:rc=127" \
+    || { echo "FAIL: a not-executed wrapped command must carry not-executed:rc=127 (got: $(head -1 "$T/run-notexec.log"))"; fail=1; }
 
 cases=$((cases+1))
 # Timeout kill: a wrapped command that outlives --budget must be killed
 # (rc 124, mirrored by the guard) and stamped SUSPECT with the reason.
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
-"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 --journalctl-cmd true \
          --budget 1 --log "$T/run5.log" -- sh -c "sleep 5" || rc=$?
 [ "$rc" -eq 124 ] || { echo "FAIL: timeout-killed command must exit 124 (got $rc)"; fail=1; }
 head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout kill must stamp SUSPECT with timeout-killed:rc=124"; fail=1; }
@@ -288,7 +415,7 @@ mk_drmroot() {
 cases=$((cases+1))
 mk_drmroot; mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz0.log" -- true || fail=1
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true --log "$T/run-lz0.log" -- true || fail=1
 head -1 "$T/run-lz0.log" | grep -q "pci=0000:04:00.0" \
     || { echo "FAIL: level_zero:0 must resolve to the LOWER PCI address 0000:04:00.0 (card0->09, card2->04; got: $(head -1 "$T/run-lz0.log"))"; fail=1; }
 head -1 "$T/run-lz0.log" | grep -q "card=$T/drmroot/card2" \
@@ -297,7 +424,7 @@ head -1 "$T/run-lz0.log" | grep -q "card=$T/drmroot/card2" \
 cases=$((cases+1))
 mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz1.log" -- true || fail=1
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true --log "$T/run-lz1.log" -- true || fail=1
 head -1 "$T/run-lz1.log" | grep -q "pci=0000:09:00.0" \
     || { echo "FAIL: level_zero:1 must resolve to the HIGHER PCI address 0000:09:00.0 (got: $(head -1 "$T/run-lz1.log"))"; fail=1; }
 head -1 "$T/run-lz1.log" | grep -q "card=$T/drmroot/card0" \
@@ -305,7 +432,7 @@ head -1 "$T/run-lz1.log" | grep -q "card=$T/drmroot/card0" \
 
 cases=$((cases+1))
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: level_zero:2 (out of range) must refuse with exit 3, got $rc"; fail=1; }
 # Grouped explicitly ({ A && B; } || C), not the bare "A && B || C" chain --
 # under a bash pitfall (not just a shellcheck SC2015 nit) an intervening
@@ -326,14 +453,14 @@ cases=$((cases+1))
 # card=$T/drmroot/card0-DP-1 (which glob-sorts before card2 and shares its
 # device symlink) instead of the real card2. ---
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-pci.log" -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true --log "$T/run-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 must resolve via find_card_by_pci, got rc=$rc (out: $out)"; fail=1; }
 head -1 "$T/run-pci.log" | grep -q "card=$T/drmroot/card2" \
     || { echo "FAIL: --pci 0000:04:00.0 must bind card=$T/drmroot/card2, not the card0-DP-1 connector (got: $(head -1 "$T/run-pci.log"))"; fail=1; }
 
 cases=$((cases+1))
 out_nomatch="$("$GUARD" --pci 0000:99:99.9 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: an unmatched --pci must refuse with exit 3, got $rc (out: $out_nomatch)"; fail=1; }
 echo "$out_nomatch" | grep -q "no DRM card for PCI 0000:99:99.9" \
     || { echo "FAIL: unmatched --pci refusal must name the PCI address (got: $out_nomatch)"; fail=1; }
@@ -344,7 +471,7 @@ mk_pci_dev "$T/devices-igpu-only" 0000:00:02.0
 mkdir -p "$T/drmroot-igpu-only/card1"
 ln -s "$T/devices-igpu-only/0000:00:02.0" "$T/drmroot-igpu-only/card1/device"
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-igpu-only" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: a DRM root with only an integrated GPU must refuse with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -q "no discrete Intel GPU" \
     || { echo "FAIL: igpu-only refusal must say 'no discrete Intel GPU' (got: $out)"; fail=1; }
@@ -376,13 +503,13 @@ mk_drmroot_domain_igpu() {
 cases=$((cases+1))
 mk_drmroot_domain_igpu; mk_meminfo 3000000
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-domain-igpu.log" -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true --log "$T/run-domain-igpu.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: level_zero:0 with a non-0000-domain iGPU present must still resolve the discrete card (got rc=$rc, out: $out)"; fail=1; }
 head -1 "$T/run-domain-igpu.log" | grep -q "pci=0000:04:00.0" \
     || { echo "FAIL: level_zero:0 must resolve to the discrete card, not be confused by the 0001:00:02.0 iGPU (got: $(head -1 "$T/run-domain-igpu.log"))"; fail=1; }
 cases=$((cases+1))
 out2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc2=0 || rc2=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc2=0 || rc2=$?
 [ "$rc2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the domain-0001 iGPU is excluded (only one discrete GPU), got rc=$rc2 (out: $out2)"; fail=1; }
 # Explicit if/then/fi, not a bare "grep -q ... && { FAIL }" -- the latter
 # reads as though the FAIL block only runs when grep succeeds, which is
@@ -420,7 +547,7 @@ mk_drmroot_wide_domain_igpu() {
 cases=$((cases+1))
 mk_drmroot_wide_domain_igpu; mk_meminfo 3000000
 out_wide2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-wide-domain-igpu" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc_wide2=0 || rc_wide2=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc_wide2=0 || rc_wide2=$?
 [ "$rc_wide2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the wide-domain iGPU (10000:00:02.0) is excluded, got rc=$rc_wide2 (out: $out_wide2)"; fail=1; }
 if echo "$out_wide2" | grep -q "10000:00:02.0"; then
     echo "FAIL: out-of-range refusal must not list the wide-domain iGPU as a discrete GPU (got: $out_wide2)"
@@ -429,7 +556,7 @@ fi
 
 expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
-        --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+        --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true
 
 cases=$((cases+1))
 # A dangling device symlink (target no longer resolves, e.g. a card
@@ -449,7 +576,7 @@ mkdir -p "$T/drmroot-dangling/card0" "$T/drmroot-dangling/card1"
 ln -s "$T/devices-dangling/0000:99:00.0-does-not-exist" "$T/drmroot-dangling/card0/device"
 ln -s "$T/devices-dangling/0000:09:00.0" "$T/drmroot-dangling/card1/device"
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-dangling" --meminfo "$T/meminfo" \
-    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: a dangling device symlink must refuse with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must name the problem (got: $out)"; fail=1; }
 
@@ -471,7 +598,7 @@ else
     ln -s "$T/devices-unreadable-vendor/0000:04:00.0" "$T/drmroot-unreadable-vendor/card0/device"
     ln -s "$T/devices-unreadable-vendor/0000:09:00.0" "$T/drmroot-unreadable-vendor/card1/device"
     out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-vendor" --meminfo "$T/meminfo" \
-        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+        --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
     chmod 644 "$T/devices-unreadable-vendor/0000:04:00.0/vendor"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/vendor file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
     # The specific message text, not just "not readable" -- that phrase
@@ -501,7 +628,7 @@ else
     ln -s "$T/devices-unreadable-class/0000:04:00.0" "$T/drmroot-unreadable-class/card0/device"
     ln -s "$T/devices-unreadable-class/0000:09:00.0" "$T/drmroot-unreadable-class/card1/device"
     out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-class" --meminfo "$T/meminfo" \
-        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+        --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
     chmod 644 "$T/devices-unreadable-class/0000:04:00.0/class"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/class file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
     echo "$out" | grep -q "device/class exists but is not readable" \
@@ -535,7 +662,7 @@ else
     ln -s "$T/devices-unreadable-devdir/0000:04:00.0" "$T/drmroot-unreadable-devdir/card0/device"
     ln -s "$T/devices-unreadable-devdir/0000:09:00.0" "$T/drmroot-unreadable-devdir/card1/device"
     out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-devdir" --meminfo "$T/meminfo" \
-        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+        --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
     chmod 755 "$T/devices-unreadable-devdir/0000:04:00.0"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device directory must refuse with exit 3, got $rc (out: $out)"; fail=1; }
     echo "$out" | grep -qi "not readable/searchable" || { echo "FAIL: unreadable-device-dir refusal must name the problem (got: $out)"; fail=1; }
@@ -546,7 +673,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 35 ] || { echo "FAIL: expected 35 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 41 ] || { echo "FAIL: expected 41 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
