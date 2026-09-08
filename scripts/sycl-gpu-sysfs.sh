@@ -121,7 +121,7 @@ is_top_level_card() {
 # file's very first command, which shellcheck treats as a FILE-WIDE disable).
 # shellcheck disable=SC2034
 derive_card_for_selector() {
-    local idx="$1" c base pci vendor class
+    local idx="$1" c base pci vendor class resolved
     local -a entries=()
     for c in "$DRM_ROOT"/card*; do
         is_top_level_card "$c" || continue
@@ -132,16 +132,25 @@ derive_card_for_selector() {
         if [ -L "$c/device" ] && [ ! -e "$c/device" ]; then
             refuse "$base's device symlink is dangling (its target no longer resolves); refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
         fi
-        # basename applied to a nested command substitution, NOT piped through
-        # `xargs -r basename`: xargs word-splits its input on whitespace, so a
-        # resolved path containing a space (a DRM_ROOT under a directory with
-        # one, for instance) used to be split into two arguments -- the second
-        # of which `basename` (called with two operands) treats as a SUFFIX to
-        # strip from the first, silently producing the wrong PCI address
-        # instead of failing (quality review finding F5).
-        if ! pci="$(basename "$(readlink -f "$c/device" 2>/dev/null)")"; then
+        # readlink's own exit status is checked SEPARATELY from basename's --
+        # `pci="$(basename "$(readlink -f ... )")"` (an earlier version of
+        # this fix) discards readlink's status entirely: `basename` of an
+        # empty string (what a failed, `2>/dev/null`-suppressed readlink
+        # substitutes) still succeeds (prints "."), so the `if !` around it
+        # NEVER fires -- a genuine readlink failure would silently fall
+        # through to `[ -n "$pci" ] || continue` as a QUIET skip, exactly
+        # the silent index shift this whole derivation exists to prevent
+        # (quality review round 3, finding F1). basename itself is still
+        # NOT piped through `xargs -r basename` (quality review finding
+        # F5): xargs word-splits its input on whitespace, so a resolved
+        # path containing a space (a DRM_ROOT under a directory with one,
+        # for instance) would be split into two arguments -- the second of
+        # which `basename` (called with two operands) treats as a SUFFIX to
+        # strip from the first, silently producing the wrong PCI address.
+        if ! resolved="$(readlink -f "$c/device" 2>/dev/null)"; then
             refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
         fi
+        pci="$(basename "$resolved")"
         [ -n "$pci" ] || continue
         if [ -d "$c/device" ] && { [ ! -r "$c/device" ] || [ ! -x "$c/device" ]; }; then
             refuse "$base's device directory ($pci) exists but is not readable/searchable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
@@ -211,14 +220,25 @@ derive_card_for_selector() {
 # the call site, which reaches the caller's own loud "no DRM card for PCI"
 # refusal there.
 find_card_by_pci() {
-    local target_pci="$1" c found=""
+    local target_pci="$1" c found="" resolved
     for c in "$DRM_ROOT"/card*; do
         is_top_level_card "$c" || continue
-        # See derive_card_for_selector's own comment on the same substitution
-        # shape (F5): basename of a nested command substitution, not piped
-        # through `xargs -r basename`, which mis-splits a path containing a
-        # space into two operands.
-        if [ "$(basename "$(readlink -f "$c/device" 2>/dev/null)")" = "$target_pci" ]; then
+        # A readlink failure here is an EXPLICIT, intentional silent skip
+        # (see this function's own docstring above for why -- no index
+        # semantics to protect, unlike derive_card_for_selector) -- written
+        # as its own `if ! ...; then continue; fi`, not left as an implicit
+        # side effect of `basename` succeeding on an empty string (quality
+        # review round 3, finding F1: derive_card_for_selector's OWN
+        # implicit version of this shape hid a genuine bug, a discarded
+        # readlink status; this shape is correct, but was implicit enough
+        # to be indistinguishable from that bug at a glance). basename
+        # itself is still NOT piped through `xargs -r basename` (F5): see
+        # derive_card_for_selector's own comment on the identical
+        # whitespace-splitting hazard.
+        if ! resolved="$(readlink -f "$c/device" 2>/dev/null)"; then
+            continue
+        fi
+        if [ "$(basename "$resolved")" = "$target_pci" ]; then
             found="$c"
             break
         fi

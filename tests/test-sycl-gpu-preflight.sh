@@ -33,16 +33,11 @@ fail=0
 # once, directly above its own case.
 cases=0
 
-mk_pci_dev() { # $1=devroot $2=addr [with_freq]
-    local devroot="$1" addr="$2" with_freq="${3:-}"
+mk_pci_dev() { # $1=devroot $2=addr
+    local devroot="$1" addr="$2"
     mkdir -p "$devroot/$addr"
     echo 0x8086 > "$devroot/$addr/vendor"
     echo 0x030000 > "$devroot/$addr/class"
-    if [ -n "$with_freq" ]; then
-        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/act_freq"
-    fi
 }
 
 # mk_drmroot: two discrete cards, card-order != PCI-order (card0 -> the
@@ -54,9 +49,9 @@ mk_pci_dev() { # $1=devroot $2=addr [with_freq]
 mk_drmroot() {
     local d="$T/drmroot" devroot="$T/devices"
     rm -rf "$d" "$devroot"
-    mk_pci_dev "$devroot" 0000:09:00.0 with_freq
+    mk_pci_dev "$devroot" 0000:09:00.0
     mk_pci_dev "$devroot" 0000:00:02.0
-    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
+    mk_pci_dev "$devroot" 0000:04:00.0
     mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
     ln -s "$devroot/0000:09:00.0" "$d/card0/device"
     ln -s "$devroot/0000:00:02.0" "$d/card1/device"
@@ -70,7 +65,7 @@ mk_drmroot() {
 mk_drmroot_single() {
     local d="$T/drmroot-single" devroot="$T/devices-single"
     rm -rf "$d" "$devroot"
-    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
+    mk_pci_dev "$devroot" 0000:04:00.0
     mkdir -p "$d/card0"
     ln -s "$devroot/0000:04:00.0" "$d/card0/device"
 }
@@ -116,6 +111,24 @@ if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_sysfs_bad; the
     :
 else
     echo "FAIL: sycl_preflight_b50_sysfs_bad must report bad (return 0) when no second discrete card can be derived"
+    fail=1
+fi
+
+# --- F8 (spec review round 3): the address DOES enumerate in DRM (a
+# healthy derivation, unlike the cannot-derive case just above) but has no
+# matching entry under the PCI root -- distinct from every other
+# sysfs_bad case, which all use $T/drmroot (a real DERIVED address) paired
+# with a pciroot fixture that DOES contain that address. An empty PCI root
+# directory (mkdir with nothing inside it) must still hit
+# `[[ -e "$b50" ]] || return 0`, the same conservative "cannot confirm
+# good -> bad" stance the missing-B50-sysfs-entry case documents. ---
+
+cases=$((cases+1))
+mkdir -p "$T/pciroot-empty"
+if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" SYCL_PREFLIGHT_PCI_ROOT="$T/pciroot-empty" sycl_preflight_b50_sysfs_bad; then
+    :
+else
+    echo "FAIL: sycl_preflight_b50_sysfs_bad must report bad (return 0) when the derived address enumerates in DRM but has no entry under an otherwise-valid, empty PCI root"
     fail=1
 fi
 
@@ -204,7 +217,7 @@ fi
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above (llama.cpp-3e0f finding
 # 10 / Q6 convention, adopted here per spec review round 2, M5).
-[ "$cases" -eq 9 ] || { echo "FAIL: expected 9 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 10 ] || { echo "FAIL: expected 10 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: sycl-gpu-preflight B50 live derivation ($cases cases)"

@@ -834,7 +834,13 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-gpu-preflight.sh
     )
-    set_tests_properties(test-sycl-gpu-preflight PROPERTIES SKIP_RETURN_CODE 77)
+    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above -- same
+    # llama_test_cmd single-valued-LABEL caveat as test-sycl-decode-mode-
+    # capture's own registration below (quality review round 3, finding F4).
+    set_tests_properties(test-sycl-gpu-preflight PROPERTIES
+        LABELS "sycl;source"
+        SKIP_RETURN_CODE 77
+    )
 
     # sycl-decode-mode-capture unit tests (plan task S4, llama.cpp-gvu7): the
     # one-run freq/throttle/RssAnon timeline + kprof capture for the B70

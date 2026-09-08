@@ -113,7 +113,7 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # must stay green across it.
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
-source "$(dirname "${BASH_SOURCE[0]}")/sycl-gpu-sysfs.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
 
 if [ -z "$SYSFS_CARD" ]; then
     if [ -z "$PCI" ]; then

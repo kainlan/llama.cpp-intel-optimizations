@@ -61,6 +61,13 @@ TICK_SECONDS="$(sed -n 's/^TICK_SECONDS=\([0-9.][0-9.]*\).*/\1/p' "$CAPTURE")"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
+# cases: total test-case count, printed in the final "OK" line and checked
+# against a literal total below -- the llama.cpp-3e0f finding 10 / Q6
+# convention tests/test-bench-guard.sh, tests/test-sycl-prefill-scaling.sh,
+# and tests/test-sycl-gpu-preflight.sh already use (spec review round 3,
+# F5). expect_status (below) increments it for you; every other case bumps
+# it itself, directly above its own case.
+cases=0
 
 # mk_tree: fake sysfs freq0 dir with ONLY throttle/status and act_freq -- like
 # test-bench-guard.sh's own fixture, it deliberately never creates cur_freq or
@@ -76,6 +83,7 @@ mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/me
 
 expect_status() {
     local want="$1" what="$2"
+    cases=$((cases+1))
     shift 2
     [ "$1" = "--" ] || { echo "expect_status: expected -- before command" >&2; exit 2; }
     shift
@@ -271,6 +279,7 @@ mk_drmroot() {
     ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
 }
 
+cases=$((cases+1))
 mk_drmroot; mk_meminfo 3000000
 out_lz0="$T/out-lz0"
 bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
@@ -280,6 +289,7 @@ env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$CAPTURE" --drm-root "$T/drmroot" --mem
 head -1 "$out_lz0/bench.log" | grep -q "card=$T/drmroot/card2" \
     || { echo "FAIL: level_zero:0 must derive card=$T/drmroot/card2 (lower PCI 0000:04:00.0; card0->09, card2->04), not the card0-DP-1 connector (got: $(head -1 "$out_lz0/bench.log" 2>/dev/null))"; fail=1; }
 
+cases=$((cases+1))
 mk_meminfo 3000000
 out_lz1="$T/out-lz1"
 bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
@@ -293,6 +303,7 @@ head -1 "$out_lz1/bench.log" | grep -q "card=$T/drmroot/card0" \
 # level_zero:2 must refuse with exit 3 -- and must not even reach $OUT
 # (setup-only failure, same rule the pre-existing setup-fail-regression
 # case below enforces for the no-selector case).
+cases=$((cases+1))
 out_lz2="$T/out-lz2"
 bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
 lz2_rc=0
@@ -318,6 +329,7 @@ echo "$out_lz2_text" | grep -qi "out of range" \
 # resolves against instead (this host's real /sys/class/drm, or a
 # refusal) is acceptable, since only leaking the decoy through is what
 # this guards against.
+cases=$((cases+1))
 rm -rf "$T/drmroot-decoy" "$T/devices-decoy"
 mk_pci_dev "$T/devices-decoy" 0000:55:00.0 with_freq
 mkdir -p "$T/drmroot-decoy/card0"
@@ -344,6 +356,7 @@ fi
 
 # --- mode computation across the two thresholds and the middle band ---
 
+cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 out_slow="$T/out-slow"
 bench="$(mk_fake_bench 28.0)"
@@ -352,12 +365,14 @@ run_capture "$out_slow" -- "$bench" || { echo "FAIL: slow-mode run failed"; fail
 grep -q "mode=slow" "$out_slow/mode.txt" 2>/dev/null || { echo "FAIL: expected mode=slow (got: $(cat "$out_slow/mode.txt" 2>/dev/null))"; fail=1; }
 grep -q "tg128=28.0" "$out_slow/mode.txt" 2>/dev/null || { echo "FAIL: expected tg128=28.0 (got: $(cat "$out_slow/mode.txt" 2>/dev/null))"; fail=1; }
 
+cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 out_fast="$T/out-fast"
 bench="$(mk_fake_bench 39.5 "$MK_FAKE_BENCH_FAST_SECONDS")"
 run_capture "$out_fast" -- "$bench" || { echo "FAIL: fast-mode run failed"; fail=1; }
 grep -q "mode=fast" "$out_fast/mode.txt" 2>/dev/null || { echo "FAIL: expected mode=fast (got: $(cat "$out_fast/mode.txt" 2>/dev/null))"; fail=1; }
 
+cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 out_mid="$T/out-unknown"
 bench="$(mk_fake_bench 34.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
@@ -366,6 +381,7 @@ grep -q "mode=unknown" "$out_mid/mode.txt" 2>/dev/null || { echo "FAIL: expected
 
 # --- timeline.tsv: >= 3 sampled rows over the fake bench's 2s sleep ---
 
+cases=$((cases+1))
 [ -s "$out_slow/timeline.tsv" ] || { echo "FAIL: timeline.tsv missing/empty"; fail=1; }
 rows=$(( $(wc -l < "$out_slow/timeline.tsv") - 1 ))
 [ "$rows" -ge 3 ] || { echo "FAIL: expected >= 3 timeline data rows, got $rows"; fail=1; }
@@ -379,6 +395,7 @@ awk -F'\t' 'NR>1 { if ($3 != "-" || $5 != "-") bad=1 } END { exit bad ? 1 : 0 }'
 
 # --- host.txt: before/after blocks with the required fields ---
 
+cases=$((cases+1))
 [ -f "$out_slow/host.txt" ] || { echo "FAIL: host.txt missing"; fail=1; }
 grep -q "=== before ===" "$out_slow/host.txt" || { echo "FAIL: host.txt missing before block"; fail=1; }
 grep -q "=== after ===" "$out_slow/host.txt" || { echo "FAIL: host.txt missing after block"; fail=1; }
@@ -404,6 +421,7 @@ grep -qE '^bench_pid=[0-9]+ comm=' "$out_slow/host.txt" \
 # timeline's peak RssAnon must clear a threshold no mere wrapper process
 # could reach. ---
 
+cases=$((cases+1))
 out_pid="$T/out-pidcheck"
 mk_tree 0 0; mk_meminfo 3000000
 bench="$(mk_fake_bench_grow 40.0)"
@@ -446,6 +464,7 @@ mk_tree_busy_then_free() {
     ( sleep 6; printf '0\n' > "$d/throttle/status"; printf '0\n' > "$d/act_freq" ) &
 }
 
+cases=$((cases+1))
 out_busy="$T/out-busycard"
 mk_tree_busy_then_free
 mk_meminfo 3000000
@@ -499,6 +518,7 @@ max_rss_busy="$(awk -F'\t' 'NR>1 && $7 != "-" { v = $7 + 0; if (v > max) max = v
 # been confirmed and is dead, so this exercises exactly that replacement
 # path. ---
 
+cases=$((cases+1))
 out_helper="$T/out-helper-race"
 mk_tree 0 0; mk_meminfo 3000000
 bench="$(mk_fake_bench_grow 40.0)"
@@ -523,6 +543,7 @@ grep -qE '^bench_pid=[0-9]+ comm=sleep ' "$out_helper/host.txt" \
 # non-data line too), and a non-numeric cell must not fall through
 # compute_mode's `v + 0` coercion into a false mode=slow. ---
 
+cases=$((cases+1))
 out_crash="$T/tg128-run1"    # path itself contains "tg128", by design
 mk_tree 0 0; mk_meminfo 3000000
 bench="$(mk_fake_bench_crash)"
@@ -533,6 +554,7 @@ run_capture "$out_crash" -- "$bench" || crash_rc=$?
 grep -qx "tg128=unknown mode=unknown" "$out_crash/mode.txt" \
     || { echo "FAIL: expected tg128=unknown mode=unknown for a no-results-table run whose --out path contains 'tg128' (got: $(cat "$out_crash/mode.txt" 2>/dev/null))"; fail=1; }
 
+cases=$((cases+1))
 out_nonnum="$T/out-nonnumeric"
 mk_tree 0 0; mk_meminfo 3000000
 bench="$(mk_fake_bench_nonnumeric)"
@@ -553,6 +575,7 @@ grep -qx "tg128=unknown mode=unknown" "$out_nonnum/mode.txt" 2>/dev/null \
 # exercises the capture script's OWN card-derivation failure, which must
 # happen -- and must exit 3 -- before the reset block is ever reached. ---
 
+cases=$((cases+1))
 out_setup_fail="$T/out-setup-fail"
 mk_tree 0 0; mk_meminfo 3000000
 bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
@@ -610,4 +633,13 @@ expect_status 3 "high-Shmem refusal into a reused --out dir must propagate as ex
 [ ! -f "$out_slow/mode.txt" ] || { echo "FAIL: refusal into a reused --out dir must remove the PRIOR run's mode.txt, not just skip writing a new one"; fail=1; }
 [ ! -f "$out_slow/bench.log" ] || { echo "FAIL: refusal into a reused --out dir must remove the PRIOR run's bench.log"; fail=1; }
 
-[ "$fail" -eq 0 ] && echo "OK: sycl-decode-mode-capture" || exit 1
+# Expected total is a LITERAL, not derived from anything else in this file --
+# bump it whenever a case is added or removed above (llama.cpp-3e0f finding
+# 10 / Q6 convention, adopted here per spec review round 3, F5).
+[ "$cases" -eq 17 ] || { echo "FAIL: expected 17 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+
+if [ "$fail" -eq 0 ]; then
+    echo "OK: sycl-decode-mode-capture ($cases cases)"
+else
+    exit 1
+fi

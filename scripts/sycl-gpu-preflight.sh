@@ -45,6 +45,18 @@ sycl_preflight_b50_pci_address() {
         DRM_ROOT="$root"
         # shellcheck disable=SC2329  # invoked indirectly, from inside derive_card_for_selector
         refuse() { exit 1; }
+        # NOT reset before the call, unlike bench-guard.sh/sycl-decode-mode-
+        # capture.sh's own DERIVED_CARD="" DERIVED_PCI="" before their calls
+        # (quality review round 3, F12): a stale DERIVED_PCI can never leak
+        # into this function's output regardless, because a FAILED
+        # derivation always reaches refuse()'s own `exit 1` -- which
+        # terminates this SUBSHELL immediately -- before the `printf` line
+        # below ever runs. Only a SUCCESSFUL derive_card_for_selector call
+        # reaches printf, and success always means DERIVED_PCI was just
+        # freshly assigned by that same call. The other two callers reset
+        # defensively because they are NOT run in a subshell of their own --
+        # a stale value there could in principle survive past a future
+        # refactor that adds a path returning without calling refuse().
         derive_card_for_selector 1 >/dev/null 2>&1
         printf '%s\n' "$DERIVED_PCI"
     )
@@ -77,6 +89,20 @@ sycl_preflight_journal_has_previous_boot_gpu_faults() {
         grep -Eiq 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
 }
 
+# sycl_preflight_b50_sysfs_bad -- true (return 0) iff the B50's sysfs
+# state looks bad (not confirmed enabled/D0/active) or its address could
+# not be derived at all; false (return 1) iff it looks good, INCLUDING the
+# idle-runtime-suspend exemption below. Bash return-code polarity: 0 means
+# "yes, bad" here, matching how the caller uses it directly as an `if`
+# condition (`sycl_preflight_selector_may_use_b50 "$selector" &&
+# sycl_preflight_b50_sysfs_bad` refuses), NOT the ordinary "0 = success,
+# entity is fine" sense a reader might otherwise assume from the name
+# alone. Two env hooks, both overridable for hermetic tests the same way
+# bench-guard.sh's own --drm-root is (see sycl_preflight_b50_pci_address
+# above for the first): $SYCL_PREFLIGHT_DRM_ROOT (default /sys/class/drm)
+# is where the B50's PCI address is derived FROM; $SYCL_PREFLIGHT_PCI_ROOT
+# (default /sys/bus/pci/devices) is where that derived address is then
+# looked UP to read enable/power_state/power/runtime_status.
 sycl_preflight_b50_sysfs_bad() {
     local pci_root="${SYCL_PREFLIGHT_PCI_ROOT:-/sys/bus/pci/devices}"
     local pci b50
