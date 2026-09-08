@@ -31,6 +31,7 @@
 // this one binary.
 
 #include "ggml-sycl/unified-cache.hpp"
+#include "test-skip.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +40,7 @@
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
     std::fprintf(stderr, "SKIP: GGML_USE_SYCL/GGML_SYCL_DNNL not both enabled; no gate was evaluated.\n");
-    return 77;  // ctest SKIP_RETURN_CODE
+    return LLAMA_TEST_EXIT_SKIP;  // spec review finding #13: use the shared skip constant, not a literal 77
 }
 #else
 
@@ -144,8 +145,15 @@ int main(int argc, char ** argv) {
 
     if (std::strcmp(mode, "override") == 0) {
         test_override();
-    } else {
+    } else if (std::strcmp(mode, "default") == 0) {
         test_default_formula();
+    } else {
+        // Spec review finding #12: an unrecognised --mode= value used to
+        // silently fall through to the default suite, which would mask a
+        // typo'd ctest registration ARGS as a passing (but wrong) test run
+        // rather than a usage error.
+        std::fprintf(stderr, "usage: %s [--mode=default|--mode=override] (got --mode=%s)\n", argv[0], mode);
+        return 2;
     }
 
     printf("%s (%d failures)\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);

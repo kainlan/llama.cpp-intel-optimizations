@@ -255,7 +255,42 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # and ggml_backend_sycl_set_runtime_context(), which does NOT call
     # arena_reserve() at all and so needs its own call site) rather than by
     # re-deriving what "correct" teardown means from scratch here.
-    checks["pool reclaimed at cache teardown"] = 'onednn_graph_scratch_reclaim_pool("teardown")' in CACHE_CPP_CODE
+    #
+    # Scoped to shutdown_resources()'s own body (spec review round 1,
+    # finding #9), matching the context-reclaim and runtime-context-update
+    # checks right below this one -- searching the whole ~27000-line file
+    # cannot tell "called at teardown" apart from "the literal string
+    # happens to appear somewhere else in the file" (a comment quoting it,
+    # for instance).
+    #
+    # Two separate calls, not one onednn_graph_scratch_reclaim_pool("teardown")
+    # (spec review round 2, finding #18): the summary log moved earlier in
+    # this function's body (right after the high-water WARN, before either
+    # "shutting down" early return) so it always prints on the common
+    # process-exit path, while the actual release stays at the later,
+    # post-drain call site -- so both the log call and the clear call must
+    # be present in this body, not the combined helper.
+    shutdown_resources_body_code = extract_function_body(CACHE_CPP_CODE, "bool unified_cache::shutdown_resources(")
+    checks["pool reclaimed at cache teardown"] = (
+        'onednn_graph_scratch_log_pool_summary_locked("teardown"' in shutdown_resources_body_code
+        and "onednn_graph_scratch_clear_pool_locked();" in shutdown_resources_body_code
+    )
+
+    # BLOCKING spec review finding #1: clear_pool_locked() must not destruct
+    # an entry whose release event has not completed -- it must hand that
+    # one to retain_handles_until_event() instead, since two of the three
+    # reclaim call sites (arena_reserve()'s context-reclaim branch,
+    # ggml_backend_sycl_set_runtime_context()) do not drain the queue first.
+    # Structural regression guard alongside the GPU test's own behavioral
+    # coverage of the same property (test_pending_event_reclaim_does_not_destruct_in_flight).
+    clear_pool_body_code = extract_function_body(
+        CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
+    )
+    checks["pool clear defers an incomplete-event entry instead of destructing it unconditionally"] = (
+        "event_complete(entry.release_event)" in normalize_ws(clear_pool_body_code)
+        and "retain_handles_until_event({ std::move(entry.owner) }, entry.release_event);"
+        in normalize_ws(clear_pool_body_code)
+    )
     # Scoped to arena_reserve()'s own body, not a same-file coincidence: the
     # reclaim call must be co-located with the KV/RUNTIME reclaim it is meant
     # to accompany, not merely present somewhere in a ~27000-line file.

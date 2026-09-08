@@ -43,7 +43,7 @@
 // same point arena_reserve() reclaims the KV/RUNTIME zones for a new
 // context, so a pooled buffer cannot outlive the context it belongs to.
 //
-// This test asserts three properties:
+// This test asserts four properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -83,6 +83,23 @@
 // `req.suppress_failure_log = true`, so the log capture in this test would
 // find nothing and the "abort triggered" latch would not exist.
 //
+//   (d) RECLAIM SAFETY (spec review finding #1, BLOCKING): reclaiming the
+//       pool (onednn_graph_scratch_reclaim_pool(), reached from cache
+//       teardown, arena_reserve()'s context-reclaim branch, and
+//       ggml_backend_sycl_set_runtime_context()) must not destruct a pooled
+//       entry whose release event has not yet completed -- doing so would
+//       return that VRAM to the general unified_alloc() pool while a queued
+//       SDPA kernel might still be reading it, the exact fault class this
+//       whole ticket exists to close. Two of the three reclaim call sites do
+//       NOT drain the queue first (only cache teardown does), so this
+//       property must hold on its own. Exercised by parking an entry with a
+//       real, unwaited slow-release event, reclaiming while it is still
+//       incomplete, and observing (a) the process stays healthy, (b) the
+//       reclaim counted it as an eviction, and (c) a fresh request of the
+//       same size misses the pool -- see the test's own comment for why
+//       this behavioral proxy is the strongest property observable without
+//       adding test-only introspection into mem-handle.cpp's drain worker.
+//
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
 // compiled in (the whole onednn_graph_scratch_* subsystem is `#if
 // GGML_SYCL_DNNL`-only).
@@ -114,6 +131,7 @@ using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_abort_triggered;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_suppress_abort;
 using ggml_sycl::unified_cache;
+using ggml_sycl::unified_cache_reclaim_onednn_graph_scratch_pool;
 
 namespace {
 
@@ -294,6 +312,72 @@ void test_loud_failure(unified_cache * cache) {
     check(contains(g_captured_log, "llama.cpp-0oxf"), "the loud ERROR log cites this ticket");
 }
 
+// --- (d) reclaim never destructs a pooled entry whose release event is
+//         still pending (spec review finding #1, BLOCKING) ----------------
+void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cache, int device) {
+    printf("Reclaim defers a pooled entry with an incomplete release event:\n");
+
+    // Start from a clean pool so this test's assertions are not sensitive to
+    // whatever the earlier tests in this process left pooled.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup");
+
+    sycl::queue & q = cache->get_queue();
+
+    constexpr size_t kSizeD = 360ull * 1024 * 1024;  // distinct from every other size in this file
+
+    void * ptr = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
+    check(ptr != nullptr, "DIRECT allocation for the pending-event reclaim setup succeeds");
+    if (!ptr) {
+        return;
+    }
+
+    // Free with a slow event and do NOT wait on it -- the entry parks in the
+    // pool with an INCOMPLETE release event, exactly the state
+    // onednn_graph_scratch_clear_pool_locked() must handle without
+    // destructing the owning mem_handle out from under a still-in-flight
+    // host_task.
+    sycl::event slow_release = submit_slow_release(q);
+    cache->onednn_graph_scratch_free(ptr, &slow_release);
+    check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeD,
+          "the entry is sitting in the pool (peak bytes reflects it) before the event completes");
+
+    const size_t evictions_before = cache->onednn_graph_scratch_pool_eviction_count();
+
+    // Reclaim now, while slow_release is (overwhelmingly likely, given
+    // kSlowReleaseMs) still incomplete -- this is the exact call
+    // ggml_backend_sycl_set_runtime_context() and arena_reserve()'s
+    // context-reclaim branch make, and unlike cache teardown, NEITHER of
+    // those two call sites drains the queue first. The pre-fix
+    // onednn_graph_scratch_clear_pool_locked() destructed every pooled
+    // entry unconditionally here, regardless of its release event's
+    // completion -- this is the property that would regress.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test reclaim");
+
+    check(cache->onednn_graph_scratch_pool_eviction_count() > evictions_before,
+          "the reclaim counted the pending entry as an eviction (it left the pool)");
+
+    // There is no public accessor for "is a handle still sitting in the
+    // shared background drain worker's retained queue rather than already
+    // freed" (retain_handles_until_event() hands ownership into
+    // mem-handle.cpp's own internal worker, which this file deliberately
+    // does not reach into) -- so the strongest property observable from
+    // here without adding test-only introspection into that worker is
+    // behavioral: the process stays healthy after the reclaim, and the pool
+    // is genuinely empty for this size afterward, not merely that a counter
+    // moved. A fresh request of the identical size must miss the pool
+    // (nothing left to reuse) and still succeed as a real allocation.
+    const size_t misses_before = cache->onednn_graph_scratch_pool_miss_count();
+    void *       fresh         = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
+    check(fresh != nullptr, "a fresh allocation of the same size succeeds after the reclaim");
+    check(cache->onednn_graph_scratch_pool_miss_count() > misses_before,
+          "the fresh allocation missed the pool -- the reclaimed entry was not left behind for reuse");
+
+    slow_release.wait();  // let the host_task finish before the process exits
+    if (fresh) {
+        cache->onednn_graph_scratch_free(fresh, nullptr);
+    }
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -329,6 +413,7 @@ int main(int, char ** argv) {
     test_pool_reuse(cache);
     test_bounded_eviction(cache);
     test_loud_failure(cache);
+    test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
 
     ggml_backend_free(backend);
 

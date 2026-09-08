@@ -2200,9 +2200,19 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         target_link_options(test-sycl-onednn-graph-scratch-direct PRIVATE "-fsycl")
     endif()
     llama_test(test-sycl-onednn-graph-scratch-direct LABEL "main")
+    # LD_LIBRARY_PATH addition (spec review finding #7): mirrors every
+    # sibling SYCL gate's ENVIRONMENT in this file -- a direct (non-ctest)
+    # invocation without oneAPI's redist lib on LD_LIBRARY_PATH prints SKIP
+    # with exit 0 (CLAUDE.md), so ctest supplies it here rather than relying
+    # on the launching shell to have sourced setvars.sh. GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1
+    # (finding #4) is what lets this specific binary call
+    # ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()/
+    # _suppress_abort() at all -- see their gated setters in unified-cache.cpp;
+    # no other registration in this file needs it, since no other test binary
+    # calls those two symbols.
     set_tests_properties(test-sycl-onednn-graph-scratch-direct PROPERTIES
         LABELS "sycl;cache;mem-handle;onednn"
-        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1"
         SKIP_RETURN_CODE 77
         TIMEOUT 300
     )
@@ -2238,8 +2248,24 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         target_link_options(test-sycl-onednn-graph-floor PRIVATE "-fsycl")
     endif()
     llama_test(test-sycl-onednn-graph-floor LABEL "main" ARGS --mode=default)
+    # ENVIRONMENT additions (spec review findings #7, #8):
+    #   - LD_LIBRARY_PATH: mirrors every sibling SYCL gate in this file, same
+    #     reasoning as test-sycl-onednn-graph-scratch-direct above -- this
+    #     binary links ggml-sycl and IntelSYCL::SYCL_CXX even though it
+    #     touches no device, so a direct invocation without oneAPI's redist
+    #     lib on the path is still the "prints SKIP, exits 0" trap CLAUDE.md
+    #     documents.
+    #   - GGML_SYCL_ONEDNN_GRAPH_ZONE_MB= (empty, i.e. explicitly cleared):
+    #     onednn_graph_scratch_zone_floor_bytes() treats an empty value the
+    #     same as unset (unified-cache.cpp: `env && env[0] != '\0'`), so this
+    #     is what actually forces --mode=default to run the FORMULA rather
+    #     than silently inheriting whatever value the invoking shell happens
+    #     to have set for this var -- without it, all seven rows in
+    #     test_default_formula() fail if the launching environment carries an
+    #     override.
     set_tests_properties(test-sycl-onednn-graph-floor PROPERTIES
         LABELS "sycl;onednn"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB="
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -2247,7 +2273,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
              COMMAND $<TARGET_FILE:test-sycl-onednn-graph-floor> --mode=override)
     set_tests_properties(test-sycl-onednn-graph-floor-override PROPERTIES
         LABELS "sycl;onednn"
-        ENVIRONMENT "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
