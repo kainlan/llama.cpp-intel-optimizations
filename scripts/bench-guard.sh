@@ -29,17 +29,24 @@
 # the wrapped command's, never the verdict.
 #
 # Postflight SUSPECT triggers: Shmem grew more than 5 GB across the run, the
-# run was killed by the timeout (rc 124/137), the wrapped command died by any
-# other signal (rc >= 128, e.g. 139 SIGSEGV -- a crashed bench is never a
-# valid measurement), or the kernel log shows a GT reset/guc_id/CAT error
-# since the run started. The kernel-log check counts matching lines
-# (`grep -c`, never `grep -q`) rather than testing for a match, because `-q`
-# exits at the first hit and SIGPIPEs a still-writing `journalctl` producer;
-# under `set -o pipefail` that reads as pipeline failure and takes the VALID
-# branch on exactly the runs that have a fault to report (llama.cpp-m1ny).
-# The match count is stamped in the reason (`kernel-gpu-fault:<N>`) and in the
-# header. A post-run throttle=1 reading is NOT by itself suspect -- the run's
-# own power draw asserts it.
+# run was killed by the timeout (rc 124/137), the wrapped command exited 128
+# or higher (which for a bench means killed by a signal, e.g. 139 SIGSEGV --
+# a crashed bench is never a valid measurement), the kernel log itself could
+# not be read (a failing/missing --journalctl-cmd or journalctl error --
+# stamped `kernel-log-unreadable:rc=<N>`, never silently treated as zero
+# faults), or the kernel log shows a GT reset/guc_id/CAT error since the run
+# started. The kernel-log check counts matching lines (`grep -c`, never
+# `grep -q`) rather than testing for a match, because `-q` exits at the first
+# hit and SIGPIPEs a still-writing `journalctl` producer; under
+# `set -o pipefail` that reads as pipeline failure and takes the VALID branch
+# on exactly the runs that have a fault to report (llama.cpp-m1ny). The match
+# count is stamped in the reason (`kernel-gpu-fault:<N>`) and in the header.
+# `--journalctl-cmd` is split on whitespace, unquoted, like every other
+# `*_CMD` override in this script -- a value that itself needs a quoted
+# argument (e.g. a `--since` timestamp with a space) must be wrapped in a
+# small script and passed by path, not spelled out inline. A post-run
+# throttle=1 reading is NOT by itself suspect -- the run's own power draw
+# asserts it.
 #
 # Card derivation is LIVE from DRM/PCI enumeration under --drm-root (default
 # /sys/class/drm), never a fixed PCI address table (CLAUDE.md: DRM numbering
@@ -366,8 +373,6 @@ elif [ "$rc" -ge 128 ]; then
     verdict="SUSPECT"
     reasons="$reasons signal:rc=$rc"
 fi
-# journalctl legitimately finds nothing (grep rc=1) on a clean run -- that's
-# inside an `if` condition, which `set -e` already exempts from tripping.
 # Count form, never `-q`: `-q` exits at the first match, which SIGPIPEs a
 # still-writing journalctl and (under pipefail) reports pipeline failure
 # instead of a match -- the exact case that must be caught (llama.cpp-m1ny).
@@ -376,10 +381,25 @@ fi
 kernel_log() {
     if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null; fi
 }
-kf="$(kernel_log | grep -ciE 'GT reset|guc_id|CAT error' || true)"
-if [ "${kf:-0}" -gt 0 ]; then
+# The producer's own exit status is captured SEPARATELY from the match
+# count, via a plain command substitution rather than piping straight into
+# grep -- otherwise a missing/failing --journalctl-cmd (bad path, bad
+# --since, journalctl itself erroring) produces no lines, `grep -c` counts
+# that as zero matches, and the run stamps VALID exactly when the kernel log
+# could not be checked at all. `|| jl_rc=$?` keeps `set -e` from tripping on
+# the producer's own non-zero status, mirroring the `|| rc=$?` pattern used
+# for the wrapped command above.
+jl_rc=0
+jl_out="$(kernel_log)" || jl_rc=$?
+if [ "$jl_rc" -ne 0 ]; then
     verdict="SUSPECT"
-    reasons="$reasons kernel-gpu-fault:${kf}"
+    reasons="$reasons kernel-log-unreadable:rc=$jl_rc"
+else
+    kf="$(printf '%s\n' "$jl_out" | grep -ciE 'GT reset|guc_id|CAT error' || true)"
+    if [ "${kf:-0}" -gt 0 ]; then
+        verdict="SUSPECT"
+        reasons="$reasons kernel-gpu-fault:${kf}"
+    fi
 fi
 
 verdict_line="$verdict${reasons:+:$reasons}"

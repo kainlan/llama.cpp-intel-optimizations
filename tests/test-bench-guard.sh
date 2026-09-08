@@ -275,6 +275,44 @@ head -1 "$T/run-sigpipe.log" | grep -q "kernel-gpu-fault:1" \
     || { echo "FAIL: kernel-fault reason must carry the match count (got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
 
 cases=$((cases+1))
+# A missing/failing --journalctl-cmd must NOT collapse into "zero faults
+# found" -- piping straight into `grep -c` (or `-q`) cannot distinguish "the
+# log was read and had no faults" from "the log could not be read at all",
+# and a run whose kernel log genuinely could not be checked is not a
+# verified-clean run. RED against the pre-F3 guard: this stamped VALID
+# (llama.cpp-m1ny spec review, finding F3).
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/no-such-journalctl-cmd" \
+         --log "$T/run-jl-missing.log" -- true || fail=1
+head -1 "$T/run-jl-missing.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a missing --journalctl-cmd must stamp SUSPECT, not silently VALID (got: $(head -1 "$T/run-jl-missing.log"))"; fail=1; }
+head -1 "$T/run-jl-missing.log" | grep -qE "kernel-log-unreadable:rc=[0-9]+" \
+    || { echo "FAIL: a missing --journalctl-cmd must carry a kernel-log-unreadable:rc=<N> reason (got: $(head -1 "$T/run-jl-missing.log"))"; fail=1; }
+
+cases=$((cases+1))
+# A --journalctl-cmd that FAILS but still prints a fault-looking line (e.g. a
+# flaky journalctl invocation that errors out after emitting partial output)
+# must be reported as unreadable, not silently counted as a real fault --
+# the producer's own exit status governs, checked BEFORE the line is ever
+# handed to grep -c.
+cat > "$T/journal-fail-with-fault.sh" <<'FAKEJOURNAL'
+#!/usr/bin/env bash
+echo 'kernel: xe 0000:03:00.0: GT reset triggered'
+exit 1
+FAKEJOURNAL
+chmod +x "$T/journal-fail-with-fault.sh"
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --journalctl-cmd "$T/journal-fail-with-fault.sh" \
+         --log "$T/run-jl-fail-with-fault.log" -- true || fail=1
+head -1 "$T/run-jl-fail-with-fault.log" | grep -q "kernel-log-unreadable:rc=1" \
+    || { echo "FAIL: a failing journalctl-cmd that also printed a fault line must report kernel-log-unreadable:rc=1 (got: $(head -1 "$T/run-jl-fail-with-fault.log"))"; fail=1; }
+if head -1 "$T/run-jl-fail-with-fault.log" | grep -q "kernel-gpu-fault"; then
+    echo "FAIL: a failing journalctl-cmd's output must not be silently counted as a real kernel-gpu-fault (got: $(head -1 "$T/run-jl-fail-with-fault.log"))"
+    fail=1
+fi
+
+cases=$((cases+1))
 # A wrapped command that dies by an uncaught signal other than the timeout's
 # SIGTERM/SIGKILL (rc 124/137) must also stamp SUSPECT -- a crashed bench is
 # never a valid measurement -- and the guard must keep mirroring the real rc
@@ -604,7 +642,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 38 ] || { echo "FAIL: expected 38 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 40 ] || { echo "FAIL: expected 40 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
