@@ -141,7 +141,7 @@ mk_fake_bench() {
 mk_fake_bench_rc() {
     local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5" exitcode="$6" audit="${7:-}"
     {
-        echo '#!/usr/bin/env bash'
+        printf '%s\n' '#!/usr/bin/env bash'
         # Only emitted when an audit path was given -- folded in here,
         # rather than always substituting a (possibly empty) variable into
         # the heredoc below, so a stub built with no audit path is
@@ -717,7 +717,7 @@ echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must r
 # Passed WITH THREE trailing slashes ("$FLAG_MODELS_DIR///") deliberately --
 # this is also the only case in the suite that exercises the trailing-slash
 # strip, and MORE THAN ONE slash specifically: a single ${MODELS_DIR%/}
-# (collapsing the loop to a one-shot strip) would leave a doubled slash
+# (collapsing the loop to a one-shot strip) would leave extra slashes
 # behind and still pass a case that only ever tried one trailing slash. The
 # assertion below expects the EXACT single-slash path, so any such
 # under-stripping produces a doubled/tripled slash in the fake bench's
@@ -824,15 +824,15 @@ echo "$out" | grep -q "(model mistral)" || { echo "FAIL: expected the refusal to
 
 # --- Case 16c (llama.cpp-5iba): --models-dir / (the filesystem root) must
 # build a single-slash path ("/mistral-7b-v0.1.Q4_0.gguf"), never
-# "//mistral-...". The single strip loop (`while [ "${MODELS_DIR%/}" !=
+# "//mistral-...". The strip loop (`while [ "${MODELS_DIR%/}" !=
 # "$MODELS_DIR" ]`) reduces a bare "/" all the way down to the empty string
 # -- paths are always built as "$MODELS_DIR/mistral-...", so it is that
 # empty string, not "/" itself, which yields the correct single slash. This
-# case's expected outcome
-# (exit 2, missing-file refusal) depends on /mistral-7b-v0.1.Q4_0.gguf NOT
-# existing on this host -- named precondition check first, so a host where
-# it somehow does exist reports a clear FAIL here rather than a confusing
-# failure three assertions down (llama.cpp-5iba quality review, finding 8).
+# case's expected outcome (exit 2, missing-file refusal) depends on
+# /mistral-7b-v0.1.Q4_0.gguf NOT existing on this host -- named
+# precondition check first, so a host where it somehow does exist reports
+# a clear FAIL here rather than a confusing failure three assertions down
+# (llama.cpp-5iba quality review, finding 8).
 [ -e "/mistral-7b-v0.1.Q4_0.gguf" ] && { echo "FAIL: precondition violated for case 16c -- /mistral-7b-v0.1.Q4_0.gguf exists on this host, so --models-dir / would find a real file instead of exercising the missing-file refusal path this case tests"; fail=1; }
 : > "$GUARD_INVOKED_AUDIT"
 out="$(STUB_GUARD_AUDIT="$GUARD_INVOKED_AUDIT" "$SCALING" --bench "$BENCH2" --guard "$STUB_GUARD" --models-dir "/" --only mistral,b70 2>&1)" && rc=0 || rc=$?
@@ -893,11 +893,12 @@ GEMMA4_BENCH_AUDIT="$T/bench-argv-gemma4.log"
 BENCH17="$T/fake-bench-gemma4-untouched.sh"
 mk_fake_bench_audit "$BENCH17" "$GEMMA4_BENCH_AUDIT" "1000.00" "1000.00" "900.00" "850.00"
 : > "$GUARD_INVOKED_AUDIT"
-# $rc is captured but deliberately NOT asserted -- it is 2 (usage refusal)
-# if gemma4's real file is absent on this host, or 0 (the boundary-pass
-# BENCH2 numbers) if present, and this case is host-independent precisely
-# because it does not care which. The three absence assertions below are
-# the evidence for this case, regardless of which branch ran.
+# $rc is captured but deliberately NOT asserted -- it is 2 (missing-file
+# refusal) if gemma4's real file is absent on this host, or 0 (BENCH17's
+# boundary-pass numbers, the same 1000/1000/900/850 as BENCH2) if present,
+# and this case is host-independent precisely because it does not care
+# which. The three absence assertions below are the evidence for this
+# case, regardless of which branch ran.
 out="$(STUB_GUARD_AUDIT="$GUARD_INVOKED_AUDIT" "$SCALING" --bench "$BENCH17" --guard "$STUB_GUARD" --only gemma4,b70 --models-dir "$NONEXISTENT_MODELS_DIR" 2>&1)" && rc=0 || rc=$?
 BAD_PATH="$NONEXISTENT_MODELS_DIR/stock-gemma-4-E4B-it.Q8_0.gguf"
 echo "$out" | grep -qF "$BAD_PATH" && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the refusal/output named $BAD_PATH (got: $out)"; fail=1; }
