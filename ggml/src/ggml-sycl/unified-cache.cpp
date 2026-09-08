@@ -10282,17 +10282,17 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
     // for the full mechanism this backs.
     // Latched (log once), same shape as onednn_graph_scratch_first_wait_logged_
-    // above: without this, a request that structurally can never fit (the
-    // size>cap early-out in onednn_graph_scratch_wait_for_direct_headroom_locked()
-    // just above) returns false on EVERY call, and this ERROR would then
-    // fire once per SDPA call rather than once per process (llama.cpp-pqgl).
+    // above: without this, a workload that repeatedly hits a genuine
+    // timed-out wait (the poll loop below expires without the request ever
+    // fitting) would log this ERROR once per SDPA call instead of once per
+    // process.
     //
     // `was_oversized`: the callee returns false for TWO distinct reasons --
     // the size>cap early-out (which already logged its own WARN above) or a
     // genuine timed-out wait -- and this out-param tells them apart.
     // Without it, an oversized request logged BOTH the callee's WARN and
     // this ERROR describing a wait that never actually happened for that
-    // call (llama.cpp-pqgl review round 3, R4).
+    // call (llama.cpp-pqgl).
     bool was_oversized = false;
     if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock, was_oversized) &&
         !was_oversized) {
