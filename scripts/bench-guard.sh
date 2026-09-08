@@ -89,8 +89,8 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # see that file's header for the full docstrings, moved there verbatim, and
 # its refuse() contract). refuse() above is already defined by this point,
 # so behaviour here is unchanged -- this source line is a pure extraction,
-# not a behaviour change: this script's own 35-case test suite must stay
-# green across it.
+# not a behaviour change: this script's own test suite (tests/test-bench-guard.sh)
+# must stay green across it.
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/sycl-gpu-sysfs.sh"

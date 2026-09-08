@@ -499,6 +499,19 @@ head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
     || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
 
 cases=$((cases+1))
+# M3 (spec review round 2): the case above exercises F5's fix only inside
+# derive_card_for_selector -- find_card_by_pci (the --pci override path)
+# carries the SAME `readlink -f ... | xargs -r basename` shape and was left
+# uncovered. Reuses the same $T/drmroot-space fixture built just above, via
+# --pci instead of a bare selector, so this exercises find_card_by_pci's
+# own basename substitution specifically.
+out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-space-pci.log" -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must still resolve, got rc=$rc (out: $out)"; fail=1; }
+head -1 "$T/run-space-pci.log" | grep -q "card=$T/drmroot-space/card0" \
+    || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must resolve card=$T/drmroot-space/card0 (find_card_by_pci's own basename substitution), got: $(head -1 "$T/run-space-pci.log" 2>/dev/null)"; fail=1; }
+
+cases=$((cases+1))
 # A dangling device symlink (target no longer resolves, e.g. a card
 # removed or a hot-unplug race) must refuse loudly rather than silently
 # excluding the card and shifting level_zero indices for the rest (review
@@ -613,7 +626,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 37 ] || { echo "FAIL: expected 37 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 38 ] || { echo "FAIL: expected 38 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then

@@ -26,6 +26,12 @@ source "$PREFLIGHT"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
+# cases: total test-case count, printed in the final "OK" line and checked
+# against a literal total below -- the llama.cpp-3e0f finding 10 / Q6
+# convention tests/test-bench-guard.sh and tests/test-sycl-prefill-scaling.sh
+# already use (spec review round 2, M5). Every case below bumps this exactly
+# once, directly above its own case.
+cases=0
 
 mk_pci_dev() { # $1=devroot $2=addr [with_freq]
     local devroot="$1" addr="$2" with_freq="${3:-}"
@@ -88,6 +94,7 @@ mk_drmroot
 # script silently the instant a derivation-failure case runs, before the
 # corresponding FAIL check ever gets a chance to fire (confirmed directly:
 # omitting `|| true` here made this file exit 1 with no output at all).
+cases=$((cases+1))
 got="$(SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" sycl_preflight_b50_pci_address)" || true
 [ "$got" = "0000:09:00.0" ] \
     || { echo "FAIL: sycl_preflight_b50_pci_address must derive 0000:09:00.0 (the HIGHER PCI address; card0->09, card2->04) for index 1 (B50), got '$got'"; fail=1; }
@@ -95,6 +102,7 @@ got="$(SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" sycl_preflight_b50_pci_address)" || 
 # --- out-of-range: a single-discrete-GPU fixture cannot derive a B50 ---
 
 mk_drmroot_single
+cases=$((cases+1))
 got_single="$(SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_pci_address)" || true
 [ -z "$got_single" ] \
     || { echo "FAIL: sycl_preflight_b50_pci_address must return empty on a single-discrete-GPU fixture (out of range for index 1), got '$got_single'"; fail=1; }
@@ -103,6 +111,7 @@ got_single="$(SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_pci
 # conservative stance the old fixed-address form took toward a genuinely
 # missing sysfs entry ([[ -e "$b50" ]] || return 0) ---
 
+cases=$((cases+1))
 if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_sysfs_bad; then
     :
 else
@@ -136,6 +145,7 @@ fi
 # (guarded with `|| rc=$?`, itself safe since by this point the subshell
 # has already finished) only affects how the ALREADY-DETERMINED exit
 # status is retrieved.
+cases=$((cases+1))
 rc=0
 ( set -e; SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_sysfs_bad ) &
 subshell_pid=$!
@@ -147,6 +157,7 @@ wait "$subshell_pid" || rc=$?
 # address must NOT be reported bad ---
 
 mk_pci_state "$T/pciroot-good" 0000:09:00.0 1 D0
+cases=$((cases+1))
 if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" SYCL_PREFLIGHT_PCI_ROOT="$T/pciroot-good" sycl_preflight_b50_sysfs_bad; then
     echo "FAIL: sycl_preflight_b50_sysfs_bad must NOT report bad for an enabled, D0, non-suspended B50"
     fail=1
@@ -156,6 +167,7 @@ fi
 # suspended) at the derived address must be reported bad ---
 
 mk_pci_state "$T/pciroot-bad" 0000:09:00.0 0 D3hot active
+cases=$((cases+1))
 if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" SYCL_PREFLIGHT_PCI_ROOT="$T/pciroot-bad" sycl_preflight_b50_sysfs_bad; then
     :
 else
@@ -168,6 +180,7 @@ fi
 # even with enable=0/power_state=D3hot (runtime PM parking an idle card) ---
 
 mk_pci_state "$T/pciroot-suspended" 0000:09:00.0 0 D3hot suspended
+cases=$((cases+1))
 if SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot" SYCL_PREFLIGHT_PCI_ROOT="$T/pciroot-suspended" sycl_preflight_b50_sysfs_bad; then
     echo "FAIL: sycl_preflight_b50_sysfs_bad must NOT report bad for a runtime-suspended B50 (idle-suspend exemption)"
     fail=1
@@ -177,13 +190,24 @@ fi
 # sycl_preflight_selector_may_use_b50 is unchanged by this fix and must
 # still gate a B70-only selector away from the B50 check entirely ---
 
+cases=$((cases+1))
 if sycl_preflight_selector_may_use_b50 "level_zero:0"; then
     echo "FAIL: sycl_preflight_selector_may_use_b50 must return false for a B70-only selector (level_zero:0)"
     fail=1
 fi
+cases=$((cases+1))
 if ! sycl_preflight_selector_may_use_b50 "level_zero:1"; then
     echo "FAIL: sycl_preflight_selector_may_use_b50 must return true for level_zero:1"
     fail=1
 fi
 
-[ "$fail" -eq 0 ] && echo "OK: sycl-gpu-preflight B50 live derivation" || exit 1
+# Expected total is a LITERAL, not derived from anything else in this file --
+# bump it whenever a case is added or removed above (llama.cpp-3e0f finding
+# 10 / Q6 convention, adopted here per spec review round 2, M5).
+[ "$cases" -eq 9 ] || { echo "FAIL: expected 9 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+
+if [ "$fail" -eq 0 ]; then
+    echo "OK: sycl-gpu-preflight B50 live derivation ($cases cases)"
+else
+    exit 1
+fi

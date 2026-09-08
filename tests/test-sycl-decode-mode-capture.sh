@@ -304,6 +304,44 @@ echo "$out_lz2_text" | grep -qi "out of range" \
     || { echo "FAIL: out-of-range refusal must say so (got: $out_lz2_text)"; fail=1; }
 [ ! -e "$out_lz2" ] || { echo "FAIL: an out-of-range setup failure must not create --out at all"; fail=1; }
 
+# --- M1 (spec review round 2): scripts/sycl-decode-mode-capture.sh's own
+# explicit `DRM_ROOT=/sys/class/drm` (set unconditionally before sourcing
+# sycl-gpu-sysfs.sh, mirroring bench-guard.sh's own F1 fix) had no test
+# coverage of its own. As with bench-guard.sh's own F1 regression test
+# (tests/test-bench-guard.sh), this cannot be exercised by ALSO passing
+# --drm-root (that flag's arg-parser assignment always wins regardless of
+# the fix) or --sysfs-card (that bypasses derivation entirely) -- the only
+# way to reach the real code path is to omit both and let full derivation
+# run, with env DRM_ROOT pointed at a decoy tree. A DECOY drm root (a
+# single fake card at a made-up address, 0000:55:00.0) is pointed to by
+# env DRM_ROOT; this run must never resolve against it -- whatever it
+# resolves against instead (this host's real /sys/class/drm, or a
+# refusal) is acceptable, since only leaking the decoy through is what
+# this guards against.
+rm -rf "$T/drmroot-decoy" "$T/devices-decoy"
+mk_pci_dev "$T/devices-decoy" 0000:55:00.0 with_freq
+mkdir -p "$T/drmroot-decoy/card0"
+ln -s "$T/devices-decoy/0000:55:00.0" "$T/drmroot-decoy/card0/device"
+out_m1="$T/out-m1-drmroot-env"
+mk_meminfo 3000000
+bench="$(mk_fake_bench 40.0 "$MK_FAKE_BENCH_FAST_SECONDS")"
+m1_rc=0
+m1_out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 DRM_ROOT="$T/drmroot-decoy" "$CAPTURE" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 \
+    --out "$out_m1" -- "$bench" 2>&1)" || m1_rc=$?
+if echo "$m1_out" | grep -q "drmroot-decoy"; then
+    echo "FAIL: an inherited env DRM_ROOT must not be honoured -- the decoy tree leaked into the derivation (rc=$m1_rc, out: $m1_out)"
+    fail=1
+fi
+if [ -f "$out_m1/bench.log" ] && grep -q "drmroot-decoy" "$out_m1/bench.log"; then
+    echo "FAIL: bench.log must not reference the decoy drm root"
+    fail=1
+fi
+if [ "$m1_rc" -ne 0 ] && [ "$m1_rc" -ne 3 ]; then
+    echo "FAIL: expected rc 0 (resolved against the real tree) or 3 (real tree has no usable discrete GPU / other refusal), got $m1_rc (out: $m1_out)"
+    fail=1
+fi
+
 # --- mode computation across the two thresholds and the middle band ---
 
 mk_tree 0 0; mk_meminfo 3000000
@@ -528,9 +566,15 @@ before_timeline="$(cat "$out_setup_fail/timeline.tsv")"
 before_host="$(cat "$out_setup_fail/host.txt")"
 
 setup_rc=0
-( unset ONEAPI_DEVICE_SELECTOR; "$CAPTURE" --out "$out_setup_fail" -- "$bench" ) >/dev/null 2>&1 || setup_rc=$?
+setup_out="$( ( unset ONEAPI_DEVICE_SELECTOR; "$CAPTURE" --out "$out_setup_fail" -- "$bench" ) 2>&1 )" || setup_rc=$?
 [ "$setup_rc" -eq 3 ] \
     || { echo "FAIL: expected a setup-only failure (no --sysfs-card, no selector) to exit 3, got $setup_rc"; fail=1; }
+# M2 (spec review round 2): confirm the selector-shape refusal actually goes
+# through refuse() (F4/F8, previous round) rather than some other message
+# shape -- a bare "exit 3" check above would pass even if this specific
+# refusal regressed back to its own bespoke prefix.
+echo "$setup_out" | grep -q "sycl-decode-mode-capture: REFUSED:" \
+    || { echo "FAIL: setup-only failure (no selector) must use the unified refuse() prefix 'sycl-decode-mode-capture: REFUSED:' (got: $setup_out)"; fail=1; }
 
 [ "$(cat "$out_setup_fail/mode.txt")" = "$before_mode" ] \
     || { echo "FAIL: setup-only failure altered mode.txt in a populated --out dir"; fail=1; }
