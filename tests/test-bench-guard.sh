@@ -194,7 +194,12 @@ cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 -- true >/dev/null 2>"$T/nolog.err" || fail=1
-grep -q "pci=" "$T/nolog.err" || { echo "FAIL: no-log dry run must print pci= on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
+# "pci=override", not a bare "pci=" -- this case passes --sysfs-card
+# directly (no --pci), so $PCI is empty and pci_for_log falls back to the
+# literal "override" (bench-guard.sh:371); a bare "pci=" substring match
+# would fail open and pass even if pci_for_log were an empty string
+# (llama.cpp-3e0f spec review round 1, finding M1).
+grep -q "pci=override" "$T/nolog.err" || { echo "FAIL: no-log dry run must print pci=override on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
 grep -q "card=$T/sys/class/drm/card9" "$T/nolog.err" \
     || { echo "FAIL: no-log dry run must print card=<derived sysfs card> on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
 

@@ -42,9 +42,9 @@
 # forwards its test hooks (--sysfs-card/--meminfo/--pgrep-cmd/--df-cmd/
 # --journalctl-cmd/--max-wait/--budget) unchanged, exactly the way
 # scripts/sycl-decode-mode-capture.sh does for the same reason. bench-guard.sh
-# has since gained a seventh hook, --drm-root, deliberately NOT forwarded
-# here, because this script's tests pass --sysfs-card, which bypasses
-# derivation (same reasoning as sycl-decode-mode-capture.sh:63-68). Do not add
+# has since also gained --drm-root, deliberately NOT forwarded here, because
+# this script's tests pass --sysfs-card, which bypasses derivation (same
+# reasoning as sycl-decode-mode-capture.sh:63-68). Do not add
 # -r above 2 at pp2048 (per the plan's own gotcha) -- change PP_VALUES/-r
 # only with that in mind.
 #
