@@ -189,11 +189,15 @@ expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false
 
 # A missing/unreadable --meminfo must refuse with a clear message, not die
 # on shmem_kb()'s bare `awk` raw exit status under `set -e` (llama.cpp-imns
-# review round 5, finding F9).
+# review round 5, finding F9). Capture out=/rc= like its neighbours below,
+# not just the exit status, so a regression to the raw awk failure is
+# caught by content, not only by code (llama.cpp-imns review round 6,
+# finding M1).
 mk_tree 0 0
-expect_status 3 "missing --meminfo must refuse cleanly" -- \
-    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
-             --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 3 ] || { echo "FAIL: missing --meminfo must refuse cleanly with exit 3, got $rc (out: $out)"; fail=1; }
+echo "$out" | grep -q "no meminfo at" || { echo "FAIL: missing --meminfo refusal must name the problem (got: $out)"; fail=1; }
 
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.

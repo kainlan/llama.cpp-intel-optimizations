@@ -100,7 +100,9 @@ is_top_level_card() {
 # matches a substring and needs no assumption about domain width, this
 # lexical sort DOES assume every survivor's domain is padded to the same
 # width, the way sysfs actually presents it; two domains of different
-# widths would sort by string length before value and could misorder),
+# widths would put the domain digits at different offsets, so the first
+# differing character decides instead of the domain's value, and could
+# misorder),
 # and set DERIVED_CARD/DERIVED_PCI to
 # the sysfs card path and PCI address of the IDX-th (zero-based) survivor.
 # Calls refuse() (exit 3) directly on any failure. Called directly, never
