@@ -252,6 +252,14 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_swa_layers;          // Number of SWA layers (0 = all full-attn)
     const bool *                   swa_layer_mask;        // Per-layer SWA flag [n_layer], NULL if no SWA
     uint32_t                       swa_layer_mask_count;  // Length of swa_layer_mask (must == n_layer)
+    // Max attention query-head count across all layers (llama.cpp-0oxf).
+    // Feeds the oneDNN Graph-scratch zone floor, which is proportional to
+    // n_head x n_ubatch x n_ctx -- see unified-cache.cpp's
+    // onednn_graph_scratch_zone_floor_bytes(). Added at the end of the
+    // struct (not inserted among the existing fields) so every existing
+    // `ggml_sycl_tensor_inventory x = {};` zero-init call site stays correct
+    // without being touched.
+    uint32_t                       n_head_max;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama

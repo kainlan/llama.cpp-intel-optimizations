@@ -15867,6 +15867,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ubatch     = inventory->n_ubatch;
     g_placement_kv_info.n_swa        = inventory->n_swa;
     g_placement_kv_info.n_swa_layers = inventory->n_swa_layers;
+    g_placement_kv_info.n_head       = inventory->n_head_max;
     if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
         g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
                                                   inventory->swa_layer_mask + inventory->swa_layer_mask_count);
@@ -16841,6 +16842,16 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
             { current->model_id, current->load_txn_id, current->slot_generation }, current->version);
     }
     g_runtime_update_succeeded = true;
+
+#if GGML_SYCL_DNNL
+    // llama.cpp-0oxf: a pooled DIRECT Graph-scratch buffer was sized for the
+    // PREVIOUS n_ctx/n_ubatch's SDPA shapes -- reclaim it here, on every
+    // successful runtime update, same as arena_reserve()'s context-reclaim
+    // branch does for KV/RUNTIME (that branch does NOT fire for this path;
+    // ggml_backend_sycl_set_runtime_context() never calls arena_reserve()
+    // itself, only updates the plan's VRAM accounting).
+    ggml_sycl::unified_cache_reclaim_onednn_graph_scratch_pool(ctx->device, "runtime context update");
+#endif
 
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(

@@ -275,6 +275,217 @@ not attempt), so it stays a flat floor rather than a formula.
 `GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0` opts out of the whole allocator (back to
 oneDNN's default, for A/B).
 
+### The DIRECT path must be bounded, and the ONEDNN zone floor is now shape-derived (llama.cpp-0oxf)
+
+The flat 64 MiB floor above was still too small for a real workload: at
+n_kv up to 8192 (a long-prompt Mistral 7B Q4_0 `llama-bench` run), every
+oneDNN SDPA `execute()` requests a ~144 MB Graph scratch — the zone's 256 MB
+default holds ~152 MB of primitive-API pair, so the request never fits, and
+**every single call** (32 layers × 16 ubatches × however many reps) takes
+branch 3, the DIRECT fallback, not just an occasional under-sized one. That
+turned a rare escape hatch into the steady-state path for that workload, and
+exposed a bug branch 3's own reasoning had not accounted for: its release is
+"always event-deferred, via `retain_handles_until_event()`" — onto the shared
+background drain worker (`mem-handle.cpp`'s `retained_handle_drain_loop`,
+a single detached thread that pops one retained-handle record, waits on its
+event, and repeats). Under host CPU contention that worker starves. DIRECT
+buffers pile up (each one's bytes stay counted as used by the unified cache
+until the worker's wait completes and the `mem_handle` destructs), the next
+`unified_alloc()` eventually fails, and the pre-0oxf code responded by
+returning `nullptr` **silently** (`req.suppress_failure_log = true`) —
+oneDNN then executed the compiled SDPA partition against an invalid scratch
+pointer: a GPU page fault (`Engine memory CAT error class=ccs`), an engine
+reset, then `UR_RESULT_ERROR_OUT_OF_RESOURCES` and a segfault. Reproduced and
+bisected on a B50 under synthetic host load (20 busy loops): 3/3 faults on
+the unmodified path, 0/3 with `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=256` raised
+enough that the request fit the zone and branch 3 was never taken at all.
+
+Two changes close this, and neither one alone would have been enough — a
+bigger zone floor helps the common case but the DIRECT path still exists for
+whatever a floor formula under-estimates, and a bounded DIRECT path with no
+floor improvement would just abort sooner on exactly the workload this
+ticket reproduced on:
+
+- **The ONEDNN zone floor is now shape-derived**, not flat, and NOT
+  context-alone — an earlier version of this fix anchored the floor to
+  `n_ctx` in isolation, which the ticket's own follow-up measurement (comment
+  c-xcop) showed was the wrong model: the same 144 MB request appeared at
+  n_kv 2048, 4096 AND 8192 on Mistral 7B Q4_0's default ubatch, but a
+  *smaller* request at a smaller ubatch and the *same* n_kv — meaning
+  `n_ubatch` drives the size just as much as `n_ctx` does. Tracing
+  `build_and_compile_sdpa()` (`fattn-onednn.cpp`) explains why: the
+  intermediate f32 tensors oneDNN's fused SDPA partition must materialize
+  carry `score_dims = {batch, H_q, ncols, ne11}` (or the 5-D GQA equivalent),
+  where `ncols` is the per-call query-row count (`key.ncols = active_params.ne01`,
+  i.e. the ubatch) and `ne11` is the per-call KV length
+  (`key.ne11 = active_params.ne11`) — every distinct `(ncols, ne11, H_q, ...)`
+  combination compiles its OWN partition via `sdpa_partition_cache`, and each
+  can request its own scratch the first time it executes.
+  `onednn_graph_scratch_zone_floor_bytes()` now computes
+  `floor = max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x sizeof(f32))`, where
+  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently in
+  flight even on an idle host (the quantity the zone must actually hold is
+  the PEAK OUTSTANDING size across whichever of those shapes are alive at
+  once, not one request in isolation). `n_head` (max query-head count across
+  layers) is threaded in from `hparams.n_head(il)` at
+  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through the
+  `ggml_sycl_tensor_inventory.n_head_max` ABI field (new, appended at the end
+  of the struct so every existing zero-init call site stays correct),
+  `placement_kv_info::n_head`, and `placement_plan::planner_n_head`, mirroring
+  how `n_ubatch`/`n_ctx` already flow through those same three layers. Fed by
+  `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
+  "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
+  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head=32) measurements
+  spanning two independent axes (48/192/768 MB at ubatch 512 and n_ctx
+  512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch 256/128) — all five match
+  to the exact byte; a sixth gemma4 (n_head=8) point did not
+  (predicted 192 MB, measured 24 MB) at first look, but is explained rather
+  than anomalous: gemma4's oneDNN-served attention layers are sliding-window
+  (window=1024), so the real `ne11` there is `min(n_ctx, window)`, and
+  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly — using
+  `planner_n_ctx` as an upper bound on `ne11` over-provisions SWA models
+  (safely, bounded by the 25% budget clamp below) rather than under-covering
+  them; a window-aware refinement is tracked separately (llama.cpp-o3a0).
+  `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
+  overrides the formula, unchanged from before. The planned zone (pair +
+  floor) is further clamped to 25% of the device's available budget —
+  floored at the primitive-API pair's own bare requirement, since that pair
+  has no DIRECT-path fallback of its own and clamping below its needs would
+  starve the GEMM path rather than just the Graph-scratch floor — logging a
+  `[VRAM-ARENA]` `GGML_LOG_WARN` naming the shortfall once if this triggers;
+  the DIRECT path (next bullet) absorbs whatever the clamp removes. The
+  per-request debug print in `onednn_graph_scratch_alloc()`
+  (`GGML_SYCL_DEBUG`) is now gated on "differs from the last size printed"
+  rather than a first-64 count, so a long run correlating shapes against
+  sizes never goes silent partway through. **Deliberate deviation from the
+  fix spec's literal "debug print of every request size" wording:**
+  printing truly per-call would flood the log for a
+  workload that repeats one shape thousands of times (every ubatch at a
+  stable KV length, across `-r N` benchmark reps), while the shape space
+  this print actually needs to surface is small — one entry per distinct
+  compiled-partition shape, not per call — so "per distinct size" is a
+  deliberate, documented substitution for "per request", not an oversight.
+- ⚠️ **The zone floor above cannot actually reach the DIRECT path's steady
+  state, and this is not a bug to fix in the floor** — it is a fact about
+  when the arena is built. Verification found that at `-p 8192 -ub 512` on
+  Mistral Q4_0, requests still took the DIRECT path (`did NOT fit the ONEDNN
+  zone`) despite the shape-derived floor, because the arena (and its ONEDNN
+  zone) is sized at MODEL LOAD, where `n_ctx` is still the conservative `512`
+  default — the real runtime `n_ctx` (from `llama_context` creation) arrives
+  much later, and nothing re-plans the zone at that point.
+  `arena_reserve()`'s own body proves why not: its `if (arena_base_) { ...;
+  return true; }` branch, taken on every call once the arena already exists,
+  ignores the `scratch_bytes`/`onednn_bytes`/`runtime_bytes` arguments it is
+  passed entirely — it only calls `zone_reclaim()` on the KV/RUNTIME zones so
+  a new context's allocations can reuse existing physical capacity. There is
+  no path in this design that grows an existing zone. (KV does not have this
+  problem for an unrelated reason: it is not a small fixed-size zone sized by
+  a formula the way ONEDNN/SCRATCH/RUNTIME are — it draws from whatever
+  headroom the arena's construction already set aside, so a different
+  context's real KV need is satisfied by fresh suballocation into that same
+  pre-existing space.) The only alternative — destroying and rebuilding the
+  whole arena once the real `n_ctx` is known — is refused by
+  `ensure_planned_arena_zones()`'s own live-allocation check the moment any
+  weight is resident, which by runtime context creation time it always is.
+  So for any model whose real `n_ctx`/`n_ubatch` shape needs more than the
+  load-time floor provisioned, EVERY oneDNN SDPA call of that shape takes the
+  DIRECT path — not an occasional one — making the path below's efficiency,
+  not just its safety, load-bearing.
+- **The DIRECT path itself is now bounded, REUSES freed buffers, and fails
+  loudly instead of silently.** Given the previous bullet, a background
+  wait-for-a-generic-drain-worker design (this fix's first iteration) just
+  means repeatedly paying a `zeMemAllocDevice` round trip for buffers of the
+  identical size, every single call. `onednn_graph_scratch_free()`'s DIRECT
+  branch instead PARKS a freed buffer in a size-bucketed reuse pool
+  (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
+  entries) instead of handing it to the shared background drain worker via
+  `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
+  that pool (for a `event_complete()`-true entry of the EXACT requested size)
+  before ever falling to a fresh `unified_alloc()`. This serves the common
+  case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
+  across `-r N` benchmark reps and across decode steps at a stable KV length.
+  A pooled-but-idle entry's bytes stay charged against
+  `onednn_graph_scratch_direct_outstanding_bytes_` (a SEPARATE ledger from
+  the zone/DIRECT maps used for the high-water stat above, because those
+  clear the moment `onednn_graph_scratch_free()` is *called*, whether or not
+  the memory is actually released at all — under this redesign it may now
+  live in the pool indefinitely) — it is still real resident VRAM, just idle
+  — so the pool cannot grow without limit alongside fresh allocations; it
+  competes with them for the same `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
+  headroom (default: min(1 GiB, 25% of `available_budget()` snapshotted the
+  last time this device's arena was successfully planned — a snapshot, not a
+  live read, so the cap does not shrink out from under the allocator as the
+  arena's own zones consume the budget it was planned against). A request
+  that cannot be served from the pool and would exceed the cap evicts (a REAL
+  release, destructing the owned `mem_handle`) completed pool entries — of
+  any size, including the requested size's own bucket (a same-size entry that
+  is complete but fails this request's alignment is exactly the kind of entry
+  this sweep can evict — bucket iteration order is otherwise unspecified),
+  stopping as soon as it fits — preserving as much of the pool as possible —
+  and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
+  — potentially called from a different thread — can keep parking newly-freed
+  entries this wait might evict on its very next poll) for an in-flight entry
+  to complete if none are immediately evictable. If the wait times out, the
+  allocator proceeds anyway rather than refusing a possibly one-off spike
+  pre-emptively; `unified_alloc()` below is still checked. If that allocation
+  genuinely fails even after one drain-and-retry, the allocator now logs the
+  sizes (request, outstanding, cap, prior waits, zone capacity/used/floor)
+  and `GGML_ABORT`s — it no longer returns a null scratch pointer to oneDNN
+  under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
+  `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
+  to wait, and how often it was served from the pool instead, respectively.
+- **The pool is bounded per size, and reclaimed at every point that could
+  otherwise leave it stale.** Nothing but the byte cap bounds how many
+  buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
+  also caps each size bucket at `onednn_graph_scratch_pool_depth_per_size()`
+  entries (default **8**, env `GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE`)
+  — a workload that walks many distinct sizes (a pp8192 run touches ~16
+  distinct ne11-derived shapes) cannot grow the pool's footprint without
+  limit just because each individual size stays under the byte cap; a size
+  whose bucket is already at the depth limit releases the overflow buffer
+  for real via the shared event-gated drain path instead of parking it.
+  Because the pool is a `unified_cache` member (survives across contexts and
+  models), it is reclaimed (real release of every entry,
+  `onednn_graph_scratch_reclaim_pool()`) at three points: cache teardown
+  (`shutdown_resources()`), the point `arena_reserve()` reclaims the
+  KV/RUNTIME zones for a new context, and — the one point that does NOT go
+  through `arena_reserve()` at all —
+  `ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`) on every
+  successful runtime `n_ctx`/`n_ubatch` update, via the free-function wrapper
+  `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that third
+  site a pooled buffer sized for one context's shapes could sit on a 16 GB
+  card holding up to the cap's worth of idle VRAM while the next model loads
+  (`llama-bench` with several `-m`, a server switching models) or while the
+  SAME model's context is resized to a different `n_ctx`. Each reclaim point
+  logs a summary line first (silent if the pool was never used):
+  `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
+  misses=%zu evictions=%zu peak_pooled=%.1f MB`, where `%s` is `"teardown"`,
+  `"context reclaim"`, or `"runtime context update"`.
+
+Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
+see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/
+`_suppress_abort()`'s declarations in `unified-cache.hpp`) test hooks let
+`tests/test-sycl-onednn-graph-scratch-direct.cpp` drive the abort decision
+deterministically without needing genuine VRAM exhaustion and without
+crashing the test process — a fork()-based death-check was considered and
+rejected: forking a process that has already touched the SYCL/Level-Zero
+runtime is a documented hang hazard on this fork's development host
+(CLAUDE.md's SYCL Device Selection section). The pool-reuse and
+eviction/wait properties need no such hook: they are exercised directly by
+freeing and re-requesting real DIRECT allocations at controlled sizes.
+**Deliberate, stated deviation:** the fix spec's
+"genuine exhaustion aborts loudly" property is exercised through this
+forced-fail hook, not real VRAM exhaustion — the test never actually drains
+a card's VRAM. This is a sound proxy for the property under test (the
+allocator's response to a failed `unified_alloc()` does not depend on WHY it
+failed), not a weaker substitute standing in for a stronger test that was
+skipped; but it should not be mistaken for direct evidence that a real OOM on
+this specific path aborts loudly on real hardware, only that the code path
+reached when `unified_alloc()` returns failure does. Since the two setters
+are gated behind `GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1` (only set by this
+test's own ctest registration), a production process cannot reach this
+simulated path at all.
+
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 
 `unified_cache::ensure_cached_alloc()` is the single allocation path that
