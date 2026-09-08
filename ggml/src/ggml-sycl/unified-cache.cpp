@@ -1628,9 +1628,14 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
     // (n_head=32): 48 MB @ (n_ubatch=512, n_ctx=512), 192 MB @ (512, 2048),
     // 768 MB @ (512, 8192), 96 MB @ (256, 2048), 48 MB @ (128, 2048) -- all
     // five match this formula to the exact byte. gemma4 (n_head=8) measured
-    // 24 MB @ (512, 8192), which this formula does NOT reproduce (predicts
-    // 192 MB) -- recorded here rather than silently dropped; the Mistral
-    // points are the ones this formula is fit to and verified against.
+    // 24 MB @ (512, 8192), which this formula does NOT reproduce at n_ctx=8192
+    // (predicts 192 MB) -- but IS explained, not a counterexample: gemma4's
+    // oneDNN-served layers are sliding-window with window=1024, so the real
+    // ne11 is min(n_ctx, window) there, and 1.5 x 8 x 512 x 1024 x 4 B == the
+    // measured 24 MB exactly; using planner_n_ctx as an upper bound on ne11
+    // over-provisions SWA models (safely, bounded by the 25% budget clamp
+    // below) rather than under-covering them, and a window-aware refinement
+    // is tracked separately (llama.cpp-o3a0).
     static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
     static constexpr uint64_t kSizeofF32     = 4;
     // Fixed-point 3/2 rather than a floating-point 1.5x: exact integer

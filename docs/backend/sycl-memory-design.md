@@ -339,9 +339,14 @@ ticket reproduced on:
   spanning two independent axes (48/192/768 MB at ubatch 512 and n_ctx
   512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch 256/128) — all five match
   to the exact byte; a sixth gemma4 (n_head=8) point did not
-  (predicted 192 MB, measured 24 MB) and is recorded rather than silently
-  dropped, since the formula is fit to and verified against the Mistral
-  points specifically. `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
+  (predicted 192 MB, measured 24 MB) at first look, but is explained rather
+  than anomalous: gemma4's oneDNN-served attention layers are sliding-window
+  (window=1024), so the real `ne11` there is `min(n_ctx, window)`, and
+  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly — using
+  `planner_n_ctx` as an upper bound on `ne11` over-provisions SWA models
+  (safely, bounded by the 25% budget clamp below) rather than under-covering
+  them; a window-aware refinement is tracked separately (llama.cpp-o3a0).
+  `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —
   floored at the primitive-API pair's own bare requirement, since that pair
