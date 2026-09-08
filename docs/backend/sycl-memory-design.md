@@ -476,10 +476,13 @@ ticket reproduced on:
   was never used), where `%s` is `"teardown"`, `"context reclaim"`, or
   `"runtime context update"`. Only the teardown call logs at
   `GGML_LOG_LEVEL_WARN`; the context-reclaim and runtime-context-update
-  calls log at `GGML_LOG_LEVEL_INFO`, which is dropped at default
-  verbosity in every tool
-  (see CLAUDE.md's "llama-bench traps" section) — so those two summaries are
-  invisible in a normal run unless verbosity is raised.
+  calls log at `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity
+  in every tool (see CLAUDE.md's "llama-bench traps" section) — so those two
+  summaries are invisible in a normal run unless verbosity is raised. The
+  summary call passes the enum `GGML_LOG_LEVEL_WARN` directly to
+  `ggml_log_internal()`, while the high-water line above uses the
+  `GGML_LOG_WARN` macro instead -- both spellings are correct, just two
+  different call sites' own conventions.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/
