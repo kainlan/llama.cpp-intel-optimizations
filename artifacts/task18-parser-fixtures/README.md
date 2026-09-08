@@ -11,7 +11,7 @@ These fixtures are that control. Run:
 python3 scripts/parse-sycl-bench-matrix.py --self-test
 ```
 
-It must report **30/30** and exit 0. If it does not, the parser's verdicts are
+It must report **31/31** and exit 0. If it does not, the parser's verdicts are
 not trustworthy and the gate must not be certified from them.
 
 Ten cases cover the original **merge-cert** matrix (numeric floor/band, gates
@@ -19,10 +19,10 @@ merges); nine more (llama.cpp-z0wt, plan task L4) cover the **long-prompt**
 matrix (report-only, no gate declared yet) and its `--table` markdown output;
 five more (llama.cpp-z0wt, scope addition) cover `--partial-arm` as
 `evaluate()` sees it -- the accept-fewer-than-`runs`-samples exception for a
-declared arm that could not be fully measured; six more (llama.cpp-z0wt,
-review round 6) call `parse_partial_arms()` directly, since none of the other
-cases ever exercise its own `ARM=REASON` splitting and validation -- they all
-hand `evaluate()` an already-parsed `{arm: reason}` dict.
+declared arm that could not be fully measured; seven more (llama.cpp-z0wt,
+review rounds 6-7) call `parse_partial_arms()` directly, since none of the
+other cases ever exercise its own `ARM=REASON` splitting and validation --
+they all hand `evaluate()` an already-parsed `{arm: reason}` dict.
 
 ## What the cases prove
 
@@ -63,6 +63,20 @@ samples, one with the full sample count, an undeclared arm name, and the
 flag combined with `--matrix merge-cert` each drive exit 2. None of these
 needed new fixtures — they reuse `b70-pp8192-good.txt` (long-prompt) and
 `b50-mistral-good.txt` (merge-cert) at reduced or full sample counts.
+
+Seven further cases call `parse_partial_arms()` itself, not `evaluate()`, and
+prove something the five above cannot: that the function fails closed on its
+own malformed input, independent of anything `evaluate()` later does with
+the result. A `--partial-arm` string with no `=` at all, an empty arm name,
+an empty reason, a reason containing `|` or a newline (either would split a
+markdown table row — the newline case was confirmed live, not just reasoned
+about), and a repeated arm name each raise `ParseError` rather than silently
+producing a corrupted or ambiguous `{arm: reason}` dict; a well-formed
+`a=b=c` case proves this isn't just blanket rejection — it still returns
+`{"a": "b=c"}`, splitting on only the FIRST `=`. Without these, a regression
+inside `parse_partial_arms()` itself could sit completely uncovered: every
+case above hands `evaluate()` an already-parsed dict, so none of them ever
+calls this function at all.
 
 ## Provenance — what is real and what is reconstructed
 

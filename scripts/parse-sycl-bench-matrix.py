@@ -988,6 +988,8 @@ def self_test(out):
              values=["ab"], expect_error=True),
         dict(name="parse_partial_arms reason containing '|' -> ParseError (would split a table row)",
              values=["a=reason with | a pipe in it"], expect_error=True),
+        dict(name="parse_partial_arms reason containing a newline -> ParseError (would split a table row)",
+             values=["a=reason with\na newline in it"], expect_error=True),
         dict(name="parse_partial_arms same arm given twice -> ParseError (later reason would silently win)",
              values=["a=first reason", "a=second reason"], expect_error=True),
     ]
@@ -1078,20 +1080,27 @@ def self_test(out):
 
 
 def parse_min_free(values):
-    """--min-free-mib b70=31000 -> {"level_zero:0": 31000}"""
+    """--min-free-mib b70=31000 -> {"level_zero:0": 31000}. The accepted card
+    names are whatever _LONG_PROMPT_CARD_SELECTORS declares, not a separately
+    hardcoded b70/b50 pair -- both error messages below are built from that
+    same map (review round 7, M2), so this docstring, "expects <...>=<mib>",
+    and "key must be one of ..." can't independently drift from it, or from
+    each other, the way three separately-typed "b70 or b50" strings could.
+    """
     # Reads the module's own card->selector map rather than a second,
     # separately-hardcoded {"b70": ..., "b50": ...} literal (review round 6):
     # a third card added to _LONG_PROMPT_CARD_SELECTORS would otherwise need
     # updating here too, silently, for --min-free-mib to learn about it.
     alias = _LONG_PROMPT_CARD_SELECTORS
+    card_list = ", ".join(sorted(alias))
     out = {}
     for item in values or []:
         if "=" not in item:
-            raise ParseError("--min-free-mib expects <b70|b50>=<mib>, got %r" % item)
+            raise ParseError("--min-free-mib expects <%s>=<mib>, got %r" % (card_list, item))
         key, _, raw = item.partition("=")
         key = key.strip().lower()
         if key not in alias:
-            raise ParseError("--min-free-mib key must be b70 or b50, got %r" % key)
+            raise ParseError("--min-free-mib key must be one of %s, got %r" % (card_list, key))
         try:
             out[alias[key]] = int(raw)
         except ValueError:
@@ -1108,13 +1117,15 @@ def parse_partial_arms(values):
     the caller (evaluate()), which is the only place that knows which matrix
     is in play and can therefore also refuse it for merge-cert.
 
-    A reason may not contain "|": it is embedded verbatim into a markdown
-    table cell (`mean (n=k, REASON)`), and an unescaped "|" there would split
-    the row into extra cells instead of staying inside one (review round 6,
-    S1). A given arm may be named at most once: silently keeping only the
-    last of several reasons would make `--partial-arm ARM=x --partial-arm
-    ARM=y` an ambiguous command whose effect depends on argument order
-    (review round 6, S2).
+    A reason may not contain "|" or a newline: it is embedded verbatim into a
+    markdown table cell (`mean (n=k, REASON)`), and either character there
+    would split the row -- a "|" into extra cells, a newline into extra rows
+    -- instead of staying inside the one cell it was given for (review round
+    6, S1; the newline case added in round 7 and confirmed live: an embedded
+    "\n" does split the rendered table). A given arm may be named at most
+    once: silently keeping only the last of several reasons would make
+    `--partial-arm ARM=x --partial-arm ARM=y` an ambiguous command whose
+    effect depends on argument order (review round 6, S2).
     """
     out = {}
     for item in values or []:
@@ -1127,11 +1138,11 @@ def parse_partial_arms(values):
             raise ParseError("--partial-arm arm name must not be empty, got %r" % item)
         if not reason:
             raise ParseError("--partial-arm reason must not be empty, got %r" % item)
-        if "|" in reason:
+        if "|" in reason or "\n" in reason or "\r" in reason:
             raise ParseError(
-                "--partial-arm reason must not contain '|', got %r -- it is embedded "
-                "verbatim in a markdown table cell, and an unescaped '|' would split "
-                "the row into extra columns instead of staying inside one" % reason
+                "--partial-arm reason must not contain '|' or a newline, got %r -- "
+                "it is embedded verbatim in a markdown table cell, and either "
+                "would split the row instead of staying inside one" % reason
             )
         if arm in out:
             raise ParseError(
@@ -1172,11 +1183,12 @@ all, the five processes of one arm disagreeing on the achieved n_ctx, or an
 achieved n_ctx below the arm's own prompt length, --partial-arm combined
 with --matrix merge-cert, naming an arm that isn't declared, naming an arm
 with zero samples, or naming an arm that already has the full sample count
-(the flag would then be stale), and --partial-arm=REASON where REASON is
-empty, contains '|' (it is embedded verbatim in a markdown table cell, and
-an unescaped '|' would split the row), or repeats an arm already given
-(the later reason would otherwise silently win) -- never a silent default
-or a lingering flag for any of these.
+(the flag would then be stale), and a --partial-arm string with no '=' at
+all, an empty arm name, an empty reason, a reason containing '|' or a
+newline (either is embedded verbatim in a markdown table cell, and would
+split the row into extra columns or extra lines), or one that repeats an
+arm already given (the later reason would otherwise silently win) -- never
+a silent default or a lingering flag for any of these.
 
 1 and 2 are deliberately distinct: "the branch is slow" and "I could not
 measure the branch" are different facts and must not share an exit code.
@@ -1186,7 +1198,7 @@ long-prompt (twelve arms, report-only -- no floor/band exists yet).
 --partial-arm accepts 1..runs-1 samples for one declared long-prompt arm that
 could not be fully measured, instead of requiring exactly --runs.
 
-Verify the parser before trusting its verdict:  --self-test  (expects 30/30)
+Verify the parser before trusting its verdict:  --self-test  (expects 31/31)
 Gate definition: docs/backend/sycl-perf-baselines.md
 """
 
