@@ -157,15 +157,17 @@ PROCESSES per cell, each behind `scripts/bench-guard.sh --log` (all stamped `VAL
 round-robin over cells so a cell's five samples are spread over ~40 minutes; the
 figure is the mean ± sample sd ACROSS processes (the in-process `±` is ignored).
 Binaries built at `6e54ba2eb` (the SYCL backend is unchanged through `0d8b160c5`);
-models read from the byte-identical NFS copies under `/Storage/GenAI/models`
-(`/models` was mid-migration); ambient load ~17; B70 free VRAM 30553 MiB and B50
+models read from `/models` for the four pre-reboot B70 n=1 Mistral/GPT-OSS runs and
+from the byte-identical NFS copies under `/Storage/GenAI/models` for the other 52
+(`/models` was mid-migration; each log's own header records its `-m` path); ambient load ~17; B70 free VRAM 30553 MiB and B50
 14618 MiB on every run. `ctx achieved` is the `llama_context: n_ctx` the pp8192 test
 actually ran with (llama-bench sizes it per test). Table rows produced by
 `python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-6ae16115c-longprompt --table --partial-arm "b50-mistral-pp8192=GPU CAT error on 2 of 2 attempts after the 2026-09-07 reboot, llama.cpp-0oxf"`
 from the archived logs; only the `notes` column was added by hand. The logs were
-captured with `scripts/bench-guard.sh` at `42184389d` under its `--pci` override,
-which predates the llama.cpp-imns `pci=`/`card=` header stamp, so the archived
-headers do not name the card (the driver log and `l3-prefill-gate.txt` do).
+captured with `scripts/bench-guard.sh` at the pre-imns master revision `8f858e763`
+under its `--pci` override, which predates the llama.cpp-imns `pci=`/`card=` header
+stamp, so the archived headers do not name the card (the driver log and
+`l3-prefill-gate.txt`, whose own run used the guard at `42184389d`, do).
 
 | card | model | PP2048 | TG128 | PP8192 | TG128 | ctx achieved | notes |
 |---|---|---|---|---|---|---|---|
