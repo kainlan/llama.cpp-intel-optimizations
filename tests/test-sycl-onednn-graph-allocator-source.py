@@ -113,6 +113,7 @@ def _has_no_blocking_token(body: str) -> bool:
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
+GGML_SYCL_CPP_CODE = strip_comments(GGML_SYCL_CPP)
 
 # Comments are stripped from the WHOLE file FIRST, and every function body is
 # then extracted from that already-stripped text -- never the other order
@@ -127,6 +128,13 @@ CACHE_CPP_CODE = strip_comments(CACHE_CPP)
 # until reviewed for it.)
 FREE_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_free(")
 ALLOC_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_alloc(")
+# The DIRECT (non-arena) allocation tail, factored out of onednn_graph_scratch_alloc()
+# into its own function -- this is where the actual unified_alloc() call
+# lives now, so the "tries the pool before a fresh allocation" ordering
+# check below needs both bodies concatenated in call order.
+DIRECT_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_alloc_direct_locked("
+)
 # Anchor on the open paren only, not the full parameter list: llama.cpp-0oxf
 # changed this function's signature twice (first to a single planner_n_ctx
 # argument, then to (n_head, n_ubatch, n_ctx) after the lead's measurement
@@ -229,24 +237,36 @@ def test_onednn_graph_allocator_source_contract() -> None:
 
     # llama.cpp-0oxf pool redesign: a freed DIRECT buffer's PRIMARY fate is
     # the size-bucketed reuse pool, not the shared drain worker -- verified
-    # here as a source contract because the whole point of the redesign
-    # (verification 2: the zone floor cannot actually be reached at runtime,
-    # so the DIRECT path is many models' steady state, not an occasional
-    # fallback) depends on this, not on the overflow path above alone.
+    # here as a source contract because the whole point of the redesign (the
+    # zone floor cannot actually be reached at runtime, so the DIRECT path
+    # is many models' steady state, not an occasional fallback) depends on
+    # this, not on the overflow path above alone.
     checks["free path parks into the reuse pool"] = (
         "onednn_graph_scratch_reuse_pool_[freed_size]" in normalize_ws(FREE_BODY_CODE)
         and "bucket.push_back(" in normalize_ws(FREE_BODY_CODE)
     )
-    checks["alloc path tries the reuse pool before a fresh allocation"] = (
-        "onednn_graph_scratch_try_reuse_pool_locked(" in ALLOC_BODY_CODE
-    )
+    # Ordering, not just presence: concatenate the two bodies in the order
+    # they run at call time (onednn_graph_scratch_alloc() calls into
+    # onednn_graph_scratch_alloc_direct_locked() only once neither the zone
+    # nor the pool could serve the request) and assert the FIRST pool-lookup
+    # call appears before the FIRST unified_alloc() call -- a check that
+    # only asserted presence of the pool-lookup call would still pass if the
+    # ordering regressed (a fresh allocation attempted first, the pool only
+    # consulted afterward).
+    alloc_path_code = ALLOC_BODY_CODE + DIRECT_BODY_CODE
+    checks["alloc path tries the reuse pool before a fresh allocation"] = alloc_path_code.index(
+        "onednn_graph_scratch_try_reuse_pool_locked("
+    ) < alloc_path_code.index("unified_alloc(")
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
     # sizes (a pp8192 run touches ~16 distinct ne11-derived shapes) could
     # grow the pool's footprint without limit even while each individual
-    # size stays under the byte cap.
-    checks["pool bounded per size, not just by total bytes"] = (
-        "onednn_graph_scratch_pool_depth_per_size()" in normalize_ws(FREE_BODY_CODE)
+    # size stays under the byte cap. Asserts the COMPARISON, not just that
+    # the depth getter is called somewhere in the body -- a call present but
+    # compared with the wrong operator (or not compared at all) would still
+    # pass a presence-only check.
+    checks["pool bounded per size, not just by total bytes"] = bool(
+        re.search(r">=\s*onednn_graph_scratch_pool_depth_per_size\s*\(\s*\)", FREE_BODY_CODE)
     )
     # Teardown/context-reclaim/runtime-update must actually release pooled
     # buffers, not just stop tracking them -- checked structurally (the
@@ -256,40 +276,43 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # arena_reserve() at all and so needs its own call site) rather than by
     # re-deriving what "correct" teardown means from scratch here.
     #
-    # Scoped to shutdown_resources()'s own body (spec review round 1,
-    # finding #9), matching the context-reclaim and runtime-context-update
-    # checks right below this one -- searching the whole ~27000-line file
-    # cannot tell "called at teardown" apart from "the literal string
-    # happens to appear somewhere else in the file" (a comment quoting it,
-    # for instance).
+    # Scoped to shutdown_resources()'s own body, matching the context-reclaim
+    # and runtime-context-update checks right below this one -- searching the
+    # whole ~27000-line file cannot tell "called at teardown" apart from "the
+    # literal string happens to appear somewhere else in the file" (a comment
+    # quoting it, for instance).
     #
-    # Two separate calls, not one onednn_graph_scratch_reclaim_pool("teardown")
-    # (spec review round 2, finding #18): the summary log moved earlier in
-    # this function's body (right after the high-water WARN, before either
-    # "shutting down" early return) so it always prints on the common
-    # process-exit path, while the actual release stays at the later,
-    # post-drain call site -- so both the log call and the clear call must
-    # be present in this body, not the combined helper.
+    # Two separate calls, not one onednn_graph_scratch_reclaim_pool("teardown"):
+    # the summary log logs earlier in this function's body (right after the
+    # high-water WARN, before either "shutting down" early return) so it
+    # always prints on the common process-exit path, while the actual
+    # release happens at the later, post-drain call site -- so both the log
+    # call and the clear call must be present in this body, not the combined
+    # helper.
     shutdown_resources_body_code = extract_function_body(CACHE_CPP_CODE, "bool unified_cache::shutdown_resources(")
     checks["pool reclaimed at cache teardown"] = (
         'onednn_graph_scratch_log_pool_summary_locked("teardown"' in shutdown_resources_body_code
         and "onednn_graph_scratch_clear_pool_locked();" in shutdown_resources_body_code
     )
 
-    # BLOCKING spec review finding #1: clear_pool_locked() must not destruct
-    # an entry whose release event has not completed -- it must hand that
-    # one to retain_handles_until_event() instead, since two of the three
-    # reclaim call sites (arena_reserve()'s context-reclaim branch,
+    # BLOCKING: clear_pool_locked() must not destruct an entry whose release
+    # event has not completed -- it must hand that one to
+    # retain_handles_until_event() instead, since two of the three reclaim
+    # call sites (arena_reserve()'s context-reclaim branch,
     # ggml_backend_sycl_set_runtime_context()) do not drain the queue first.
     # Structural regression guard alongside the GPU test's own behavioral
-    # coverage of the same property (test_pending_event_reclaim_does_not_destruct_in_flight).
+    # coverage of the same property (test_pending_event_reclaim_does_not_destruct_in_flight,
+    # whose own comment notes that coverage is itself a behavioural proxy --
+    # its assertions also hold pre-fix). Tolerant of formatting: matches the
+    # two calls' PRESENCE (not their exact argument text), which is what
+    # actually survives clang-format re-wrapping or an unrelated rename of
+    # the loop variable.
     clear_pool_body_code = extract_function_body(
         CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
     )
     checks["pool clear defers an incomplete-event entry instead of destructing it unconditionally"] = (
-        "event_complete(entry.release_event)" in normalize_ws(clear_pool_body_code)
-        and "retain_handles_until_event({ std::move(entry.owner) }, entry.release_event);"
-        in normalize_ws(clear_pool_body_code)
+        "event_complete(" in normalize_ws(clear_pool_body_code)
+        and "retain_handles_until_event(" in normalize_ws(clear_pool_body_code)
     )
     # Scoped to arena_reserve()'s own body, not a same-file coincidence: the
     # reclaim call must be co-located with the KV/RUNTIME reclaim it is meant
@@ -300,14 +323,18 @@ def test_onednn_graph_allocator_source_contract() -> None:
         in normalize_ws(arena_reserve_body_code)
         and 'onednn_graph_scratch_reclaim_pool("context reclaim")' in arena_reserve_body_code
     )
-    # arena_reserve() is NOT called by the runtime-context-update path
-    # (verified by the finding this whole reclaim site exists to fix), so
+    # arena_reserve() is NOT called by the runtime-context-update path, so
     # the check above cannot cover it -- read ggml-sycl.cpp directly (plain
     # file I/O, not the codescout index, which is documented as blind inside
     # this specific file) and scope to
-    # ggml_backend_sycl_set_runtime_context()'s own body.
-    runtime_context_body = strip_comments(
-        extract_function_body(GGML_SYCL_CPP, "void ggml_backend_sycl_set_runtime_context(")
+    # ggml_backend_sycl_set_runtime_context()'s own body. Comments are
+    # already stripped in GGML_SYCL_CPP_CODE (module scope, same "strip
+    # first, extract second" rule as every other extraction in this file --
+    # extracting from raw GGML_SYCL_CPP first and stripping the result after
+    # would let a stray brace inside a comment desync extract_function_body()'s
+    # naive brace count before strip_comments() ever ran).
+    runtime_context_body = extract_function_body(
+        GGML_SYCL_CPP_CODE, "void ggml_backend_sycl_set_runtime_context("
     )
     checks["pool reclaimed at runtime context update"] = (
         'unified_cache_reclaim_onednn_graph_scratch_pool(ctx->device, "runtime context update")'

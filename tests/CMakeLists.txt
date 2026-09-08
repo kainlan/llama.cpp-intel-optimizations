@@ -2164,13 +2164,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 
     # Gate for llama.cpp-0oxf: the oneDNN Graph-scratch DIRECT-allocation
-    # path must bound its outstanding bytes (waiting for the background drain
-    # worker rather than piling DIRECT buffers up past a cap) and must never
-    # hand oneDNN a null scratch pointer on exhaustion -- it must log and
-    # abort instead. See the file header comment for the full mechanism and
-    # why the abort itself is exercised through an always-compiled test hook
-    # rather than a fork()-based death-check (SYCL + fork is a documented
-    # hang hazard on this host, CLAUDE.md's SYCL Device Selection section).
+    # path must bound its outstanding bytes (checking, then waiting on, a
+    # size-bucketed reuse pool and a byte cap rather than piling DIRECT
+    # buffers up without limit) and must never hand oneDNN a null scratch
+    # pointer on exhaustion -- it must log and abort instead. See the file
+    # header comment for the full mechanism (the reuse pool, its per-size
+    # depth bound, and the byte cap) and why the abort itself is exercised
+    # through an always-compiled test hook rather than a fork()-based
+    # death-check (SYCL + fork is a documented hang hazard on this host,
+    # CLAUDE.md's SYCL Device Selection section).
     #
     # $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS> mirrors
     # test-sycl-fattn-onednn-gates's own pattern below: this test calls
@@ -2199,14 +2201,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         target_compile_options(test-sycl-onednn-graph-scratch-direct PRIVATE "-fsycl")
         target_link_options(test-sycl-onednn-graph-scratch-direct PRIVATE "-fsycl")
     endif()
-    llama_test(test-sycl-onednn-graph-scratch-direct LABEL "main")
-    # LD_LIBRARY_PATH addition (spec review finding #7): mirrors every
-    # sibling SYCL gate's ENVIRONMENT in this file -- a direct (non-ctest)
-    # invocation without oneAPI's redist lib on LD_LIBRARY_PATH prints SKIP
-    # with exit 0 (CLAUDE.md), so ctest supplies it here rather than relying
-    # on the launching shell to have sourced setvars.sh. GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1
-    # (finding #4) is what lets this specific binary call
-    # ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()/
+    # LABEL not passed: llama_test() defaults it to "main" already, and the
+    # set_tests_properties() call right below immediately replaces LABELS
+    # with the real set anyway, so passing it here would be dead.
+    llama_test(test-sycl-onednn-graph-scratch-direct)
+    # LD_LIBRARY_PATH addition: mirrors every sibling SYCL gate's ENVIRONMENT
+    # in this file -- a direct (non-ctest) invocation without oneAPI's redist
+    # lib on LD_LIBRARY_PATH prints SKIP with exit 0 (CLAUDE.md), so ctest
+    # supplies it here rather than relying on the launching shell to have
+    # sourced setvars.sh. GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 is what lets
+    # this specific binary call ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()/
     # _suppress_abort() at all -- see their gated setters in unified-cache.cpp;
     # no other registration in this file needs it, since no other test binary
     # calls those two symbols.
@@ -2247,8 +2251,9 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         target_compile_options(test-sycl-onednn-graph-floor PRIVATE "-fsycl")
         target_link_options(test-sycl-onednn-graph-floor PRIVATE "-fsycl")
     endif()
-    llama_test(test-sycl-onednn-graph-floor LABEL "main" ARGS --mode=default)
-    # ENVIRONMENT additions (spec review findings #7, #8):
+    # LABEL not passed here either -- same reasoning as above.
+    llama_test(test-sycl-onednn-graph-floor ARGS --mode=default)
+    # ENVIRONMENT additions:
     #   - LD_LIBRARY_PATH: mirrors every sibling SYCL gate in this file, same
     #     reasoning as test-sycl-onednn-graph-scratch-direct above -- this
     #     binary links ggml-sycl and IntelSYCL::SYCL_CXX even though it
@@ -2269,8 +2274,10 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
-    add_test(NAME test-sycl-onednn-graph-floor-override
-             COMMAND $<TARGET_FILE:test-sycl-onednn-graph-floor> --mode=override)
+    # Registered via llama_test()'s NAME/ARGS override (not a hand-rolled
+    # add_test()) so it goes through the same COMMAND-construction path as
+    # every other test in this file, keeping its ENVIRONMENT properties.
+    llama_test(test-sycl-onednn-graph-floor NAME test-sycl-onednn-graph-floor-override ARGS --mode=override)
     set_tests_properties(test-sycl-onednn-graph-floor-override PROPERTIES
         LABELS "sycl;onednn"
         ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"

@@ -40,7 +40,7 @@
 #if !defined(GGML_USE_SYCL) || !GGML_SYCL_DNNL
 int main() {
     std::fprintf(stderr, "SKIP: GGML_USE_SYCL/GGML_SYCL_DNNL not both enabled; no gate was evaluated.\n");
-    return LLAMA_TEST_EXIT_SKIP;  // spec review finding #13: use the shared skip constant, not a literal 77
+    return LLAMA_TEST_EXIT_SKIP;
 }
 #else
 
@@ -61,6 +61,16 @@ constexpr size_t kMiB = 1024ull * 1024ull;
 
 void test_default_formula() {
     printf("Shape-derived floor (no override):\n");
+
+    // Precondition, mirroring test_override()'s own check below: this mode
+    // must run WITHOUT an override in the environment, or every case in
+    // this function is really testing the escape hatch instead of the
+    // formula. Empty counts as unset (onednn_graph_scratch_zone_floor_bytes()'s
+    // own env == unset test, unified-cache.cpp).
+    const char * zone_mb_env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
+    check(zone_mb_env == nullptr || zone_mb_env[0] == '\0',
+          "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB is unset (or empty) before the first call -- "
+          "otherwise every case below tests the override, not the formula");
 
     // The floor at an all-zero shape (no model planned yet) must still
     // respect the historical 64 MiB minimum -- 0 * anything == 0, which the
@@ -136,10 +146,12 @@ void test_override() {
 }  // namespace
 
 int main(int argc, char ** argv) {
+    constexpr char kModeFlag[] = "--mode=";
+
     const char * mode = "default";
     for (int i = 1; i < argc; ++i) {
-        if (std::strncmp(argv[i], "--mode=", 7) == 0) {
-            mode = argv[i] + 7;
+        if (std::strncmp(argv[i], kModeFlag, sizeof(kModeFlag) - 1) == 0) {
+            mode = argv[i] + sizeof(kModeFlag) - 1;
         }
     }
 
@@ -148,10 +160,9 @@ int main(int argc, char ** argv) {
     } else if (std::strcmp(mode, "default") == 0) {
         test_default_formula();
     } else {
-        // Spec review finding #12: an unrecognised --mode= value used to
-        // silently fall through to the default suite, which would mask a
-        // typo'd ctest registration ARGS as a passing (but wrong) test run
-        // rather than a usage error.
+        // An unrecognised --mode= value used to silently fall through to
+        // the default suite, which would mask a typo'd ctest registration
+        // ARGS as a passing (but wrong) test run rather than a usage error.
         std::fprintf(stderr, "usage: %s [--mode=default|--mode=override] (got --mode=%s)\n", argv[0], mode);
         return 2;
     }

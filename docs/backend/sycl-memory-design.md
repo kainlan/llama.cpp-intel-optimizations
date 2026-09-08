@@ -358,8 +358,8 @@ ticket reproduced on:
   (`GGML_SYCL_DEBUG`) is now gated on "differs from the last size printed"
   rather than a first-64 count, so a long run correlating shapes against
   sizes never goes silent partway through. **Deliberate deviation from the
-  fix spec's literal "debug print of every request size" wording** (spec
-  review finding #16): printing truly per-call would flood the log for a
+  fix spec's literal "debug print of every request size" wording:**
+  printing truly per-call would flood the log for a
   workload that repeats one shape thousands of times (every ubatch at a
   stable KV length, across `-r N` benchmark reps), while the shape space
   this print actually needs to surface is small -- one entry per distinct
@@ -471,7 +471,7 @@ runtime is a documented hang hazard on this fork's development host
 (CLAUDE.md's SYCL Device Selection section). The pool-reuse and
 eviction/wait properties need no such hook: they are exercised directly by
 freeing and re-requesting real DIRECT allocations at controlled sizes.
-**Deliberate, stated deviation** (spec review finding #16): the fix spec's
+**Deliberate, stated deviation:** the fix spec's
 "genuine exhaustion aborts loudly" property is exercised through this
 forced-fail hook, not real VRAM exhaustion -- the test never actually drains
 a card's VRAM. This is a sound proxy for the property under test (the
@@ -480,9 +480,9 @@ failed), not a weaker substitute standing in for a stronger test that was
 skipped; but it should not be mistaken for direct evidence that a real OOM on
 this specific path aborts loudly on real hardware, only that the code path
 reached when `unified_alloc()` returns failure does. Since the two setters
-are now gated behind `GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1` (spec review
-finding #4, only set by this test's own ctest registration), a production
-process cannot reach this simulated path at all.
+are gated behind `GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1` (only set by this
+test's own ctest registration), a production process cannot reach this
+simulated path at all.
 
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 

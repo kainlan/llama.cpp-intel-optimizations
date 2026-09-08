@@ -1599,10 +1599,9 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
     // clamp applied to the whole ONEDNN zone in ensure_planned_arena_zones()
     // (onednn_zone_budget_cap below that function's floor-vs-budget compare)
     // -- that clamp can still reduce the zone below what this override
-    // requested (spec review finding #15; the DIRECT path absorbs whatever
-    // the clamp removes either way, so an override that exceeds the clamp is
-    // not a correctness problem, just a case where "always wins" was
-    // previously stated too strongly).
+    // requested; the DIRECT path absorbs whatever the clamp removes either
+    // way, so an override that exceeds the clamp is not a correctness
+    // problem, just a case where "always wins" would overstate it.
     static const long env_mb = [] {
         const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
         if (env && env[0] != '\0') {
@@ -3727,10 +3726,9 @@ bool unified_cache::ensure_planned_arena_zones() {
         std::max(available_budget() / 4, unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id));
     if (onednn_zone > onednn_zone_budget_cap) {
         const size_t shortfall = onednn_zone - onednn_zone_budget_cap;
-        // llama.cpp-0oxf spec review finding #14: per-instance member, not a
-        // function-local static -- see its declaration's comment in
-        // unified-cache.hpp for why a process-wide latch under-logs on a
-        // multi-GPU host.
+        // Per-instance member, not a function-local static -- see its
+        // declaration's comment in unified-cache.hpp for why a process-wide
+        // latch under-logs on a multi-GPU host.
         if (!onednn_zone_clamp_warned_.exchange(true, std::memory_order_relaxed)) {
             GGML_LOG_WARN(
                 "[VRAM-ARENA] planned ONEDNN zone %.1f MB exceeds 25%% of available budget -- clamping to %.1f MB "
@@ -3800,9 +3798,9 @@ bool unified_cache::ensure_planned_arena_zones() {
             // llama.cpp-0oxf: snapshot available_budget() at every successful
             // plan so the DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes())
             // tracks what THIS plan had to work with, not live budget that
-            // shrinks as the arena's own zones consume it. std::atomic store
-            // (spec review finding #6): this write is not synchronized with
-            // onednn_graph_scratch_mutex_, which guards every read.
+            // shrinks as the arena's own zones consume it. std::atomic store:
+            // this write is not synchronized with onednn_graph_scratch_mutex_,
+            // which guards every read.
             onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
             return true;
@@ -3868,7 +3866,7 @@ bool unified_cache::ensure_planned_arena_zones() {
 #if GGML_SYCL_DNNL
     // llama.cpp-0oxf: see the "zones_sufficient" branch above for why this is
     // snapshotted here rather than read live from onednn_graph_scratch_alloc().
-    // std::atomic store -- see that branch's comment (spec review finding #6).
+    // std::atomic store -- see that branch's comment.
     onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);
 #endif
     return true;
@@ -3944,23 +3942,28 @@ bool unified_cache::shutdown_resources() {
         GGML_LOG_WARN("[UNIFIED-CACHE] oneDNN Graph scratch high-water: %.1f MB\n",
                       onednn_graph_scratch_high_water_bytes_ / (1024.0 * 1024.0));
     }
-    // llama.cpp-0oxf spec review finding #18: log the teardown pool summary
-    // HERE, right after the high-water WARN and before either
-    // "shutting down" early return below -- the later call site (after
-    // drain_all_queues_noexcept(), further down) is only reached on the
-    // normal (non-shutting-down) exit path, so on llama-bench's usual
-    // process-exit teardown the summary previously never printed at all.
-    // Only LOGGING moves here; the actual real release of pooled buffers
-    // stays at the later call site (a queue-drained context is required to
-    // safely destruct a mem_handle's SYCL-side state or call
-    // retain_handles_until_event(), so that part cannot move earlier). This
-    // means the counts logged here can undercount by whatever that later
-    // release itself still evicts -- a small, bounded gap, judged
-    // preferable to a summary that silently never printed on the common
-    // exit path at all. Locking directly rather than going through the
-    // public onednn_graph_scratch_reclaim_pool() (which also clears): only
-    // the log half runs here, so the later call site clears without
-    // re-logging (see its own comment).
+    // llama.cpp-0oxf: log the teardown pool summary HERE, right after the
+    // high-water WARN and before either "shutting down" early return below
+    // -- the later call site (after drain_all_queues_noexcept(), further
+    // down) is only reached on the normal (non-shutting-down) exit path, so
+    // on llama-bench's usual process-exit teardown the summary previously
+    // never printed at all. Only LOGGING moves here; the actual real
+    // release of pooled buffers stays at the later call site (a queue-
+    // drained context is required to safely destruct a mem_handle's
+    // SYCL-side state or call retain_handles_until_event(), so that part
+    // cannot move earlier). This means the counts logged here can
+    // undercount by whatever that later release itself still evicts -- a
+    // small, bounded gap, judged preferable to a summary that silently
+    // never printed on the common exit path at all. Locking directly
+    // rather than going through the public onednn_graph_scratch_reclaim_pool()
+    // (which also clears): only the log half runs here, so the later call
+    // site clears without re-logging (see its own comment). Note also that
+    // shutdown_resources() can return false below (a drain failure, a
+    // pending legacy-promotion retry, an outstanding onednn_scratch_refcount_)
+    // without ever setting resources_shutdown_, so a caller that retries
+    // teardown re-runs this whole function and re-logs this summary (same
+    // as the pre-existing high-water WARN just above) -- harmless (the
+    // counts are still accurate, just re-announced), not worth a latch.
     {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         onednn_graph_scratch_log_pool_summary_locked("teardown", /*at_teardown=*/true);
@@ -3996,7 +3999,7 @@ bool unified_cache::shutdown_resources() {
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
-        // llama.cpp-0oxf spec review finding #18: onednn_graph_scratch_reuse_pool_
+        // llama.cpp-0oxf: onednn_graph_scratch_reuse_pool_
         // is not touched here, unlike the owner members just above -- it does
         // not need to be. Its entries are destroyed the same way any other
         // *_owner_ member above already safely is on this path: each pooled
@@ -4039,7 +4042,7 @@ bool unified_cache::shutdown_resources() {
         staging_owner_                    = {};
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
-        // llama.cpp-0oxf spec review finding #18: same reasoning as the
+        // llama.cpp-0oxf: same reasoning as the
         // g_sycl_shutting_down branch above -- onednn_graph_scratch_reuse_pool_'s
         // entries are mem_handles, whose own destructor is already
         // shutdown-safe (checks ggml_sycl_is_shutting_down() and abandons
@@ -4065,8 +4068,8 @@ bool unified_cache::shutdown_resources() {
     // rather than only evicting the event-complete subset. Clearing
     // directly (not via onednn_graph_scratch_reclaim_pool(), which also
     // logs) -- the summary for this teardown was already logged earlier in
-    // this function, right after the high-water WARN (spec review finding
-    // #18), so logging again here would print it twice.
+    // this function, right after the high-water WARN, so logging again here
+    // would print it twice.
     {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         onednn_graph_scratch_clear_pool_locked();
@@ -9735,8 +9738,8 @@ static std::atomic<uint32_t> g_onednn_graph_scratch_test_force_direct_fail_count
 static std::atomic<bool>     g_onednn_graph_scratch_test_suppress_abort{ false };
 static std::atomic<bool>     g_onednn_graph_scratch_test_abort_triggered{ false };
 
-// llama.cpp-0oxf spec review finding #4: always-compiled is not the same as
-// always-callable. The two setters below no-op unless this env var is set,
+// llama.cpp-0oxf: always-compiled is not the same as always-callable. The
+// two setters below no-op unless this env var is set,
 // so a production process cannot have its own DIRECT-allocation behavior
 // altered by anything that happens to call these exported symbols. Only the
 // GPU test's ctest registration sets it, via ENVIRONMENT
@@ -9797,19 +9800,20 @@ bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked(size_t siz
     if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
         return true;
     }
-    // llama.cpp-0oxf spec review finding #17: explicit iterator loop (not a
-    // range-for) so a bucket that empties out during eviction can be erased
-    // from the map -- a range-for's hidden iterator would be invalidated by
-    // erasing the element it is currently on.
+    // Explicit iterator loop (not a range-for) so a bucket that empties out
+    // during eviction can be erased from the map -- a range-for's hidden
+    // iterator would be invalidated by erasing the element it is currently
+    // on.
     for (auto bucket_it = onednn_graph_scratch_reuse_pool_.begin();
          bucket_it != onednn_graph_scratch_reuse_pool_.end();) {
         const size_t                                   pooled_size = bucket_it->first;
         std::vector<onednn_graph_scratch_pool_entry> & bucket      = bucket_it->second;
         for (size_t i = 0; i < bucket.size();) {
+            // bucket is never empty here: the loop condition above (i <
+            // bucket.size()) guarantees it, so there is no empty-bucket
+            // case to erase before this early return -- the erase that
+            // matters is the post-inner-loop one below.
             if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
-                if (bucket.empty()) {
-                    onednn_graph_scratch_reuse_pool_.erase(bucket_it);
-                }
                 return true;
             }
             if (event_complete(bucket[i].release_event)) {
@@ -9843,14 +9847,16 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
     }
     std::vector<onednn_graph_scratch_pool_entry> & bucket = pool_it->second;
     for (size_t i = 0; i < bucket.size(); ++i) {
+        // event_complete()'s pre-existing blocking behaviour on profiling
+        // queues is tracked separately, unrelated to this pool: llama.cpp-c6ah.
         if (!event_complete(bucket[i].release_event)) {
             continue;
         }
-        // Peek without popping: an alignment mismatch (spec review finding
-        // #2 -- the pool is keyed on size alone, so a size match does not
-        // guarantee this entry satisfies THIS request's alignment) must
-        // leave the entry pooled for a future request whose alignment it
-        // does satisfy, not consume it.
+        // Peek without popping: an alignment mismatch -- the pool is keyed
+        // on size alone, so a size match does not guarantee this entry
+        // satisfies THIS request's alignment -- must leave the entry
+        // pooled for a future request whose alignment it does satisfy, not
+        // consume it.
         const auto resolved = bucket[i].owner.resolve(device_id);
         if (resolved.ptr && resolved.on_device && alignment != 0 &&
             reinterpret_cast<uintptr_t>(resolved.ptr) % alignment != 0) {
@@ -9873,9 +9879,8 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             // pooling in general.
             onednn_graph_scratch_direct_outstanding_bytes_ -=
                 std::min(size, onednn_graph_scratch_direct_outstanding_bytes_);
-            // llama.cpp-0oxf spec review finding #17: erase the map entry
-            // once its bucket empties out rather than leaving a stray
-            // empty-vector entry behind forever.
+            // Erase the map entry once its bucket empties out rather than
+            // leaving a stray empty-vector entry behind forever.
             if (bucket.empty()) {
                 onednn_graph_scratch_reuse_pool_.erase(pool_it);
             }
@@ -9899,11 +9904,10 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         return true;
     }
 
-    // llama.cpp-0oxf spec review finding #14: per-instance member, not a
-    // function-local static -- see its declaration's comment in
-    // unified-cache.hpp. Always accessed under onednn_graph_scratch_mutex_
-    // (held by every caller of this "_locked" function), so a plain bool is
-    // correct here.
+    // Per-instance member, not a function-local static -- see its
+    // declaration's comment in unified-cache.hpp. Always accessed under
+    // onednn_graph_scratch_mutex_ (held by every caller of this "_locked"
+    // function), so a plain bool is correct here.
     if (!onednn_graph_scratch_first_wait_logged_) {
         onednn_graph_scratch_first_wait_logged_ = true;
         GGML_LOG_WARN(
@@ -9937,7 +9941,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
 }
 
 void unified_cache::onednn_graph_scratch_clear_pool_locked() {
-    // llama.cpp-0oxf spec review finding #1 (BLOCKING): an entry whose
+    // llama.cpp-0oxf: an entry whose
     // release_event has NOT completed must not be destructed here --
     // destructing it returns the freed VRAM to the general unified_alloc()
     // pool immediately, where it can be handed to another owner while a
@@ -9981,17 +9985,16 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
         // interesting" convention for teardown summaries elsewhere.
         return;
     }
-    // llama.cpp-0oxf spec review finding #11: only the once-per-process
-    // teardown summary stays at WARN; the routine context-reclaim/runtime-
-    // context-update summaries (one per model switch or context resize) log
-    // at INFO instead. Calling ggml_log_internal() directly (rather than the
-    // GGML_LOG_WARN/GGML_LOG_INFO macros, which each bake in a compile-time
-    // level) is what lets the level be a runtime choice here.
+    // Only the once-per-process teardown summary stays at WARN; the routine
+    // context-reclaim/runtime-context-update summaries (one per model
+    // switch or context resize) log at INFO instead. Calling
+    // ggml_log_internal() directly (rather than the GGML_LOG_WARN/
+    // GGML_LOG_INFO macros, which each bake in a compile-time level) is what
+    // lets the level be a runtime choice here.
     ggml_log_internal(
         at_teardown ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
         "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu misses=%zu evictions=%zu "
-        "peak_pooled=%.1f MB (cumulative for this process, not just this reclaim -- see this getter's own "
-        "comment)\n",
+        "peak_pooled=%.1f MB (cumulative for this process, not just this reclaim)\n",
         context, onednn_graph_scratch_pool_hit_count_, onednn_graph_scratch_pool_miss_count_,
         onednn_graph_scratch_pool_eviction_count_, onednn_graph_scratch_pool_peak_bytes_ / (1024.0 * 1024.0));
 }
@@ -9999,21 +10002,52 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
 // llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations
 // in unified-cache.hpp for the design rationale.
 //
+// llama.cpp-0oxf: shared bookkeeping for a DIRECT request served by the
+// size-bucketed reuse pool -- called from every point that checks the pool
+// (the initial check before ever considering a fresh allocation, and the
+// re-checks after a lock drop that could have let a concurrent free() park
+// this exact size while this request was waiting). Callers must hold
+// onednn_graph_scratch_mutex_.
+void * unified_cache::onednn_graph_scratch_park_pool_hit_locked(size_t size, mem_handle owner, void * ptr) {
+    onednn_graph_scratch_direct_owners_[ptr] = { std::move(owner), size };
+    ++onednn_graph_scratch_pool_hit_count_;
+    note_onednn_graph_scratch_alloc_locked(size);
+    // Gated on the FIRST hit for THIS size, not print_this_request in the
+    // caller -- print_this_request is true only on a size's very first-ever
+    // request, and a first request can never be a pool hit (nothing has
+    // been freed into the pool for that size yet), so gating on it would
+    // make this line unreachable.
+    if (onednn_graph_scratch_hit_sizes_printed_.insert(size).second) {
+        GGML_SYCL_DEBUG(
+            "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB: reused from the DIRECT pool (hit count %zu)\n",
+            size / (1024.0 * 1024.0), onednn_graph_scratch_pool_hit_count_);
+    }
+    return ptr;
+}
+
 void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, sycl::queue * q) {
     if (size == 0 || q == nullptr) {
-        // llama.cpp-0oxf spec review finding #3: no return in this function
-        // should be silent. size==0/q==nullptr is a logic error in the
-        // caller (oneDNN's allocator callback contract, or a test), not a
-        // real allocation failure -- log it so a caller-side bug is visible
-        // instead of manifesting only as a mysterious later null scratch
-        // pointer.
-        GGML_LOG_ERROR(
-            "[UNIFIED-CACHE] oneDNN Graph scratch allocator called with size=%zu queue=%p -- refusing (this is a "
-            "logic error in the caller, not a real allocation failure)\n",
-            size, static_cast<const void *>(q));
+        // No return in this function should be silent. size==0/q==nullptr
+        // is a logic error in the caller (oneDNN's allocator callback
+        // contract, or a test), not a real allocation failure -- log it so
+        // a caller-side bug is visible instead of manifesting only as a
+        // mysterious later null scratch pointer. Latched (logged once):
+        // this is a caller bug, and if the caller retries the identical bug
+        // on every SDPA call, an unbounded log would flood without adding
+        // information past the first occurrence.
+        if (!onednn_graph_scratch_invalid_request_warned_.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_ERROR(
+                "[UNIFIED-CACHE] oneDNN Graph scratch allocator called with size=%zu queue=%p -- refusing (this is "
+                "a logic error in the caller, not a real allocation failure; only logged once)\n",
+                size, static_cast<const void *>(q));
+        }
         return nullptr;
     }
     const size_t align = (alignment != 0) ? alignment : 256;  // 256 == this file's default GPU-coalescing alignment
+    // Computed once and threaded through every call below that needs it
+    // (the pool lookups and the DIRECT allocation's own request device),
+    // rather than re-deriving it from `*q` at each call site.
+    const int    device = ggml_sycl_get_device_id_from_queue(*q);
 
     std::unique_lock<std::mutex> lock(onednn_graph_scratch_mutex_);
 
@@ -10027,14 +10061,13 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // per-call print would, and unlike a first-N cap it never goes silent
     // partway through a long run that later revisits a fresh shape. This is
     // a DELIBERATE deviation from a literal "print every request" reading of
-    // the original fix spec (spec review finding #16) -- a truly per-call
-    // print would flood the log for a workload that repeats one shape
-    // thousands of times, which the per-distinct-size gate avoids while
-    // still surfacing every shape ever seen. Per-instance member, not a
-    // function-local static (finding #14) -- always accessed under
-    // onednn_graph_scratch_mutex_ (held for the whole function), so a plain
-    // size_t is still correct, just no longer shared across every
-    // unified_cache instance in the process.
+    // the original fix spec -- a truly per-call print would flood the log
+    // for a workload that repeats one shape thousands of times, which the
+    // per-distinct-size gate avoids while still surfacing every shape ever
+    // seen. Per-instance member, not a function-local static -- always
+    // accessed under onednn_graph_scratch_mutex_ (held for the whole
+    // function), so a plain size_t is still correct, just no longer shared
+    // across every unified_cache instance in the process.
     const bool print_this_request = size != onednn_graph_scratch_last_printed_request_size_;
     if (print_this_request) {
         onednn_graph_scratch_last_printed_request_size_ = size;
@@ -10058,9 +10091,9 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // is preserved; this reintroduces exactly the zeMemAllocDevice round trip
     // this change exists to avoid, so it is logged once (not per-call) so
     // under-sizing is visible without flooding the log on every SDPA call.
-    // llama.cpp-0oxf spec review finding #14: per-instance member, not a
-    // function-local static -- see onednn_graph_scratch_last_printed_request_size_'s
-    // comment above and this field's own declaration in unified-cache.hpp.
+    // Per-instance member, not a function-local static -- see
+    // onednn_graph_scratch_last_printed_request_size_'s comment above and
+    // this field's own declaration in unified-cache.hpp.
     if (!onednn_graph_scratch_zone_miss_warned_.exchange(true, std::memory_order_relaxed)) {
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB did not fit the ONEDNN zone -- falling back to a "
@@ -10086,29 +10119,30 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     {
         mem_handle pooled_owner;
         void *     pooled_ptr = nullptr;
-        if (onednn_graph_scratch_try_reuse_pool_locked(size, align, ggml_sycl_get_device_id_from_queue(*q),
-                                                       &pooled_owner, &pooled_ptr)) {
-            onednn_graph_scratch_direct_owners_[pooled_ptr] = std::move(pooled_owner);
-            onednn_graph_scratch_direct_sizes_[pooled_ptr]  = size;
-            ++onednn_graph_scratch_pool_hit_count_;
-            note_onednn_graph_scratch_alloc_locked(size);
-            // llama.cpp-0oxf spec review finding #19: gated on the FIRST hit
-            // for THIS size, not print_this_request -- print_this_request is
-            // true only on a size's very first-ever request, and a first
-            // request can never be a pool hit (nothing has been freed into
-            // the pool for that size yet), so the old gate made this line
-            // unreachable.
-            if (onednn_graph_scratch_hit_sizes_printed_.insert(size).second) {
-                GGML_SYCL_DEBUG(
-                    "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB: reused from the DIRECT pool (hit "
-                    "count %zu)\n",
-                    size / (1024.0 * 1024.0), onednn_graph_scratch_pool_hit_count_);
-            }
-            return pooled_ptr;
+        if (onednn_graph_scratch_try_reuse_pool_locked(size, align, device, &pooled_owner, &pooled_ptr)) {
+            return onednn_graph_scratch_park_pool_hit_locked(size, std::move(pooled_owner), pooled_ptr);
         }
         ++onednn_graph_scratch_pool_miss_count_;
     }
 
+    return onednn_graph_scratch_alloc_direct_locked(size, align, q, device, lock);
+}
+
+// llama.cpp-0oxf: the DIRECT (non-arena) allocation tail of
+// onednn_graph_scratch_alloc() -- reached only once neither the ONEDNN zone
+// nor the size-bucketed reuse pool could serve the request. Bounds
+// outstanding DIRECT bytes, attempts a real unified_alloc(), retries once
+// (after a background drain) on failure, and fails LOUDLY on genuine
+// exhaustion rather than returning a null scratch pointer. `lock` is held on
+// entry but may be dropped and reacquired internally (both
+// wait_for_direct_headroom_locked() and the drain-and-retry below can block
+// for a while); callers must not rely on any of this object's state being
+// unchanged across the call.
+void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t                         size,
+                                                               size_t                         align,
+                                                               sycl::queue *                  q,
+                                                               int                            device,
+                                                               std::unique_lock<std::mutex> & lock) {
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
     // for the full mechanism this backs.
@@ -10125,9 +10159,22 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
             onednn_graph_scratch_direct_wait_count_);
     }
 
+    // wait_for_direct_headroom_locked() drops `lock` while it polls for an
+    // in-flight pool entry to complete -- a concurrent onednn_graph_scratch_free()
+    // could have parked (or, on the depth-overflow path, evicted and thereby
+    // freed room for) this exact size while the lock was released. Check the
+    // pool once more before paying for a fresh unified_alloc().
+    {
+        mem_handle pooled_owner;
+        void *     pooled_ptr = nullptr;
+        if (onednn_graph_scratch_try_reuse_pool_locked(size, align, device, &pooled_owner, &pooled_ptr)) {
+            return onednn_graph_scratch_park_pool_hit_locked(size, std::move(pooled_owner), pooled_ptr);
+        }
+    }
+
     alloc_request req{};
     req.queue                          = q;
-    req.device                         = ggml_sycl_get_device_id_from_queue(*q);
+    req.device                         = device;
     req.size                           = size;
     req.alignment                      = align;
     req.intent.role                    = alloc_role::COMPUTE;
@@ -10151,10 +10198,36 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     bool         ok =
         !onednn_graph_scratch_test_should_force_direct_fail() && unified_alloc(req, &handle) && handle.ptr != nullptr;
     if (!ok) {
-        // First response to a failed DIRECT allocation: drain whatever the
-        // background worker has queued and retry ONCE, in case headroom
-        // simply had not been reclaimed yet (the common case under load).
+        // First response to a failed DIRECT allocation: drop the allocator
+        // mutex, drain whatever the shared background worker has queued,
+        // and retry ONCE, in case headroom simply had not been reclaimed
+        // yet (the common case under load). Unlocking here (not holding
+        // onednn_graph_scratch_mutex_ across the drain) matches
+        // wait_for_direct_headroom_locked()'s own pattern: drain_retained_handles()
+        // is a cv.wait_for() that can block up to
+        // kOnednnGraphDirectFailureDrainTimeoutMs (2 s), and holding this
+        // mutex across that would stall onednn_graph_scratch_free() -- the
+        // very path that returns bytes to this allocator -- for the whole
+        // wait. Still worth doing post-redesign: a freed DIRECT buffer's
+        // PRIMARY fate is now the size-bucketed reuse pool (already checked
+        // twice above), but a buffer evicted from that pool under cap
+        // pressure, released for real due to a full per-size depth bucket,
+        // or released by a zone-backed TP-deferred free, still goes through
+        // retain_handles_until_event() -- draining can release one of THOSE
+        // back to the general unified_alloc() pool in time for the retry.
+        lock.unlock();
         drain_retained_handles(/*wait_all=*/true, /*timeout_ms=*/kOnednnGraphDirectFailureDrainTimeoutMs);
+        lock.lock();
+
+        // Re-check the pool after reacquiring the lock: a concurrent
+        // onednn_graph_scratch_free() could have parked an entry of this
+        // exact size while it was dropped.
+        mem_handle pooled_owner;
+        void *     pooled_ptr = nullptr;
+        if (onednn_graph_scratch_try_reuse_pool_locked(size, align, device, &pooled_owner, &pooled_ptr)) {
+            return onednn_graph_scratch_park_pool_hit_locked(size, std::move(pooled_owner), pooled_ptr);
+        }
+
         ok = !onednn_graph_scratch_test_should_force_direct_fail() && unified_alloc(req, &handle) &&
              handle.ptr != nullptr;
     }
@@ -10194,8 +10267,7 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
         GGML_ABORT("oneDNN Graph scratch DIRECT allocation resolved off-device");
     }
     void * direct_ptr                               = resolved.ptr;
-    onednn_graph_scratch_direct_owners_[direct_ptr] = std::move(owner);
-    onednn_graph_scratch_direct_sizes_[direct_ptr]  = size;
+    onednn_graph_scratch_direct_owners_[direct_ptr] = { std::move(owner), size };
     onednn_graph_scratch_direct_outstanding_bytes_ += size;
     note_onednn_graph_scratch_alloc_locked(size);
     return direct_ptr;
@@ -10227,35 +10299,11 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // default-constructed sycl::event (the `event == nullptr` case)
         // reads as already-complete, so it needs no special handling here --
         // it is immediately eligible for reuse on the very next request.
-        mem_handle owner = std::move(direct_it->second);
+        onednn_graph_scratch_direct_entry entry = std::move(direct_it->second);
         onednn_graph_scratch_direct_owners_.erase(direct_it);
-        auto size_it = onednn_graph_scratch_direct_sizes_.find(ptr);
-        if (size_it == onednn_graph_scratch_direct_sizes_.end()) {
-            // llama.cpp-0oxf spec review finding #5: the owners and sizes
-            // maps are always populated together at every allocation site
-            // (onednn_graph_scratch_alloc()), so a miss here means the
-            // bookkeeping is broken for THIS pointer, not that its size
-            // happens to be legitimately zero. Release it for real instead
-            // of parking it: parking with an assumed size of 0 would both
-            // corrupt the size-0 pool bucket with an arbitrarily large
-            // buffer and never let its bytes be decremented from
-            // onednn_graph_scratch_direct_outstanding_bytes_ (which was
-            // never incremented under a size of 0 to begin with) -- it
-            // would simply leak, tracked nowhere.
-            GGML_LOG_ERROR(
-                "[UNIFIED-CACHE] oneDNN Graph scratch free() for DIRECT pointer %p with no recorded size -- "
-                "releasing it for real instead of pooling it under an assumed size (this indicates a bookkeeping "
-                "defect, not a legitimate zero-byte allocation)\n",
-                ptr);
-            if (event) {
-                retain_handles_until_event({ std::move(owner) }, *event);
-            }
-            // else: owner destructs here, an immediate real release.
-            return;
-        }
-        const size_t freed_size = size_it->second;
+        mem_handle & owner      = entry.owner;
+        const size_t freed_size = entry.size;
         note_onednn_graph_scratch_free_locked(freed_size);
-        onednn_graph_scratch_direct_sizes_.erase(size_it);
 
         // llama.cpp-0oxf: bound the pool PER SIZE too -- a workload that
         // walks many distinct sizes (a pp8192 run touches ~16 distinct
@@ -10265,16 +10313,15 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // real via the shared event-gated drain path instead of growing the
         // bucket further.
         //
-        // llama.cpp-0oxf spec review finding #17: find() rather than
-        // operator[] for this depth check -- operator[] would insert a
-        // permanent empty-vector entry into onednn_graph_scratch_reuse_pool_
-        // for a size the pool has never held (or has fully evicted back to
-        // zero entries), which is unbounded map-key growth over a
-        // long-running process that touches many distinct sizes over time,
-        // and is guaranteed to fire on EVERY free when
-        // GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE=0 (pool disabled) is
-        // set. operator[] is only reached below, at the point an entry is
-        // actually about to be pushed.
+        // find() rather than operator[] for this depth check -- operator[]
+        // would insert a permanent empty-vector entry into
+        // onednn_graph_scratch_reuse_pool_ for a size the pool has never
+        // held (or has fully evicted back to zero entries), which is
+        // unbounded map-key growth over a long-running process that touches
+        // many distinct sizes over time, and is guaranteed to fire on EVERY
+        // free when GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE=0 (pool
+        // disabled) is set. operator[] is only reached below, at the point
+        // an entry is actually about to be pushed.
         auto         existing_bucket_it = onednn_graph_scratch_reuse_pool_.find(freed_size);
         const size_t existing_depth =
             existing_bucket_it == onednn_graph_scratch_reuse_pool_.end() ? 0 : existing_bucket_it->second.size();

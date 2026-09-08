@@ -83,7 +83,7 @@
 // `req.suppress_failure_log = true`, so the log capture in this test would
 // find nothing and the "abort triggered" latch would not exist.
 //
-//   (d) RECLAIM SAFETY (spec review finding #1, BLOCKING): reclaiming the
+//   (d) RECLAIM SAFETY (BLOCKING): reclaiming the
 //       pool (onednn_graph_scratch_reclaim_pool(), reached from cache
 //       teardown, arena_reserve()'s context-reclaim branch, and
 //       ggml_backend_sycl_set_runtime_context()) must not destruct a pooled
@@ -313,7 +313,7 @@ void test_loud_failure(unified_cache * cache) {
 }
 
 // --- (d) reclaim never destructs a pooled entry whose release event is
-//         still pending (spec review finding #1, BLOCKING) ----------------
+//         still pending (BLOCKING) ----------------------------------------
 void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cache, int device) {
     printf("Reclaim defers a pooled entry with an incomplete release event:\n");
 
@@ -323,7 +323,14 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
 
     sycl::queue & q = cache->get_queue();
 
-    constexpr size_t kSizeD = 360ull * 1024 * 1024;  // distinct from every other size in this file
+    // 310 MiB, not 360: this must stay UNDER the 350 MB cap main() sets via
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB -- a size over
+    // the cap makes both allocations below run the full
+    // kOnednnGraphDirectWaitTotalTimeoutMs give-up wait (measured: this test
+    // took 14.2 s instead of ~3.7 s) and log misleading "gave up waiting for
+    // headroom" ERRORs for a property this test isn't even exercising.
+    // Still distinct from kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
+    constexpr size_t kSizeD = 310ull * 1024 * 1024;
 
     void * ptr = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
     check(ptr != nullptr, "DIRECT allocation for the pending-event reclaim setup succeeds");
@@ -394,6 +401,18 @@ int main(int, char ** argv) {
     // {kSizeA, kSizeB} (300/320 MB), so kSizeA (pooled) + kSizeB (requested)
     // together exceed it while either alone fits comfortably.
     setenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", "350", 1);
+    // Also memoized once per process (onednn_graph_scratch_test_hooks_enabled(),
+    // unified-cache.cpp), so it must be set here too, not only via ctest's
+    // ENVIRONMENT: a bare (non-ctest) invocation of this binary would
+    // otherwise silently no-op force_direct_alloc_fail()/suppress_abort()
+    // (see their gated setters), making test_loud_failure() actually
+    // exhaust real VRAM instead of exercising the forced-fail path, and
+    // false-FAIL on the "abort triggered" assertion. A test binary
+    // self-enabling its OWN test-only hooks is the sanctioned case the gate
+    // in unified-cache.cpp exists to allow -- only ctest's ENVIRONMENT and a
+    // direct run of this specific binary should ever set this, never a
+    // production process.
+    setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
 
     const int device = 0;  // in-process index after selector filtering
 
