@@ -425,7 +425,12 @@ ticket reproduced on:
   and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
   — potentially called from a different thread — can keep parking newly-freed
   entries this wait might evict on its very next poll) for an in-flight entry
-  to complete if none are immediately evictable. If the wait times out, the
+  to complete if none are immediately evictable. A single request larger
+  than the whole cap by itself is a separate early-out: the eviction sweep
+  above still runs (a real release of anything it can evict), but the
+  bounded wait is skipped entirely — logged once — since no amount of
+  waiting could ever make it fit, and the allocation is then attempted
+  directly, same as after a timed-out wait. If the wait times out, the
   allocator proceeds anyway rather than refusing a possibly one-off spike
   pre-emptively; `unified_alloc()` below is still checked. If that allocation
   genuinely fails even after one drain-and-retry, the allocator now logs the
