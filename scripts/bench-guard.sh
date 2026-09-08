@@ -23,9 +23,10 @@
 # (default budget 900s; --budget overrides -- load-bearing per CLAUDE.md, `-k`
 # is what prevents a hung gate binary from outliving the wrapper, never remove
 # it). With --log FILE, stdout+stderr are captured to FILE behind a
-# VALID/SUSPECT verdict header (pre/post throttle + Shmem readings); without
-# --log, the verdict is printed to stderr only. Either way bench-guard's own
-# exit code always mirrors the wrapped command's, never the verdict.
+# VALID/SUSPECT verdict header (pci/card identity, pre/post throttle + Shmem
+# readings); without --log, the verdict plus the same pci=/card= identification
+# is printed to stderr. Either way bench-guard's own exit code always mirrors
+# the wrapped command's, never the verdict.
 #
 # Postflight SUSPECT triggers: Shmem grew more than 5 GB across the run, the
 # run was killed by the timeout (rc 124/137), or the kernel log shows a GT
@@ -375,6 +376,6 @@ if [ -n "$LOG" ]; then
         cat "$tmp_out"
     } > "$LOG"
 else
-    echo "bench-guard: $verdict_line" >&2
+    echo "bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD" >&2
 fi
 exit "$rc"

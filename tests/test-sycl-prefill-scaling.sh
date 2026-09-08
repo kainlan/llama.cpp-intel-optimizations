@@ -66,6 +66,12 @@ export LC_NUMERIC=C
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail=0
+# cases: total test-case count, printed in the final "OK" line (llama.cpp-3e0f
+# finding 10). Every case below bumps this exactly once, via its own
+# `cases=$((cases+1))` line placed directly above that case's own
+# "# --- Case N" comment (there is no expect_status helper in this suite to
+# do it centrally, unlike tests/test-bench-guard.sh).
+cases=0
 
 # --- fake sysfs / meminfo fixtures, mirrors test-bench-guard.sh ---
 # mk_tree_at: general form, writes a fixture tree at an ARBITRARY
@@ -93,8 +99,10 @@ mk_meminfo 3000000
 # --df-cmd true: tmpfs usage 0 kB, so the fake Shmem above is never clamped
 # or contested by this host's real tmpfs (test-bench-guard.sh's own
 # hermeticity guard, same reasoning). --journalctl-cmd true: a clean "no
-# kernel fault" answer, matching tests/test-sycl-decode-mode-capture.sh:225
-# -- without it, every invocation below shells out to this host's REAL
+# kernel fault" answer, matching the same hook in
+# tests/test-sycl-decode-mode-capture.sh's own run_capture helper (cited by
+# symbol, not a line number, since line numbers drift) -- without it, every
+# invocation below shells out to this host's REAL
 # `journalctl -k`, which is harmless only by accident and becomes a live
 # flake risk the moment a run's own postflight check starts to matter
 # (llama.cpp-y3z0 spec review round 1 finding 6).
@@ -170,12 +178,15 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
     mk_fake_bench_rc "$1" "$3" "$4" "$5" "$6" 0 "$2"
 }
 
+cases=$((cases+1))
 # --- Case 1: the real 2026-09-04 collapse numbers (B70 Mistral 7B Q4_0),
-# docs/backend/sycl-perf-baselines.md line 156: pp128=1315 pp512=3320
-# pp1024=1437 pp2048=1474. ratio1024 = 1437/3320 = 0.4328..., far under the
-# 0.9 floor -- this is the exact regression the gate exists to keep visible,
-# not a synthetic number. Single pair via --only, and the printed table must
-# carry all four values plus the low ratio.
+# docs/backend/sycl-perf-baselines.md's "2026-09-04 snapshot" section (cited
+# by name, not a line number, since that section has since been demoted to
+# history): pp128=1315 pp512=3320 pp1024=1437 pp2048=1474. ratio1024 =
+# 1437/3320 = 0.4328..., far under the 0.9 floor -- this is the exact
+# regression the gate exists to keep visible, not a synthetic number. Single
+# pair via --only, and the printed table must carry all four values plus
+# the low ratio.
 BENCH1="$T/fake-bench-collapse.sh"
 mk_fake_bench "$BENCH1" "1315.00" "3320.00" "1437.00" "1474.00"
 out="$("$SCALING" --bench "$BENCH1" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
@@ -188,6 +199,7 @@ echo "$out" | grep -q "1474.00" || { echo "FAIL: pp2048 value missing from table
 echo "$out" | grep -qE 'ratio1024=0\.43' || { echo "FAIL: expected ratio1024=0.43... in output (got: $out)"; fail=1; }
 echo "$out" | grep -qi "FAIL" || { echo "FAIL: overall verdict must mention FAIL (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 2: ratio1024 EXACTLY 0.9 must PASS (acceptance criterion is
 # "< 0.9" fails; 0.9 itself does not qualify). pp512=1000.00, pp1024=900.00.
 BENCH2="$T/fake-bench-boundary-pass.sh"
@@ -197,6 +209,7 @@ out="$("$SCALING" --bench "$BENCH2" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)
 $out"; fail=1; }
 echo "$out" | grep -qE 'ratio1024=0\.90+([^0-9]|$)' || { echo "FAIL: expected ratio1024=0.900 in output (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 3: one unit of t/s below the boundary (pp1024=899.99) must FAIL.
 BENCH3="$T/fake-bench-boundary-fail.sh"
 mk_fake_bench "$BENCH3" "1000.00" "1000.00" "899.99" "850.00"
@@ -204,6 +217,7 @@ out="$("$SCALING" --bench "$BENCH3" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)
 [ "$rc" -eq 1 ] || { echo "FAIL: ratio1024 just under 0.9 must FAIL, got $rc. Output:
 $out"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 4: --only restricts to the requested pair(s) and no others --
 # a fake bench that always reports the SAME healthy numbers regardless of
 # model/card, so if a second, unrequested pair were run, its row would
@@ -220,6 +234,7 @@ $out"; fail=1; }
 echo "$out" | grep -qi "gptoss\|GPT-OSS" || { echo "FAIL: expected the GPT-OSS row to be present (got: $out)"; fail=1; }
 echo "$out" | grep -qi "mistral\|gemma4" && { echo "FAIL: --only must exclude other models (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 5: a bench-guard preflight refusal (throttled card) on the
 # requested pair must be reported as an ERROR distinct from a computed
 # ratio, and the script's own exit code must not be 0 or the plain verdict-
@@ -235,6 +250,7 @@ echo "$out" | grep -qi "refus\|error" || { echo "FAIL: refusal must be reported 
 echo "$out" | grep -q "ERROR:bench-guard-refused" || { echo "FAIL: expected the ERROR:bench-guard-refused label (got: $out)"; fail=1; }
 echo "$out" | grep -q "ERROR:bench-rc=" && { echo "FAIL: a genuine preflight refusal must use ERROR:bench-guard-refused, not ERROR:bench-rc= (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 5b (llama.cpp-y3z0 quality review round 1, finding 7): rc==3 is ambiguous by
 # itself -- bench-guard mirrors the WRAPPED command's own exit status, so
 # a bench that itself exits status 3 (nothing to do with a preflight
@@ -254,6 +270,7 @@ $out"; fail=1; }
 echo "$out" | grep -q "ERROR:bench-rc=3" || { echo "FAIL: a bench exiting 3 must be labelled ERROR:bench-rc=3, not mistaken for a guard refusal (got: $out)"; fail=1; }
 echo "$out" | grep -q "ERROR:bench-guard-refused" && { echo "FAIL: a bench that itself exited 3 must NOT be labelled ERROR:bench-guard-refused -- that label means the GUARD refused at preflight, which did not happen here (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 6: the pp128/pp512 intercept (fixed per-decode cost) is computed
 # from the closed-form two points (128, 128/pp128) and (512, 512/pp512):
 #   t128 = 128/1000.00 = 0.128000 s,  t512 = 512/1000.00 = 0.512000 s
@@ -276,6 +293,7 @@ mk_fake_bench "$BENCH5" "1000.00" "4000.00" "3900.00" "3800.00"
 out="$("$SCALING" --bench "$BENCH5" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
 echo "$out" | grep -qE 'intercept_ms=128\.0*([^0-9]|$)' || { echo "FAIL: expected intercept_ms=128.0 (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 7 (llama.cpp-y3z0 spec review round 1 finding 1): ONEAPI_DEVICE_SELECTOR must reach
 # bench-guard's OWN environment, set per pair -- level_zero:0 for B70,
 # level_zero:1 for B50 -- not only the wrapped bench's. A stub guard
@@ -329,6 +347,7 @@ grep -qE '^level_zero:0 .*mistral-7b-v0\.1\.Q4_0\.gguf' "$AUDIT" || { echo "FAIL
 grep -qE '^level_zero:1 .*mistral-7b-v0\.1\.Q4_0\.gguf' "$AUDIT" || { echo "FAIL: expected a level_zero:1 (B50) audit line for mistral (got: $(cat "$AUDIT"))"; fail=1; }
 grep -q '<unset>' "$AUDIT" && { echo "FAIL: ONEAPI_DEVICE_SELECTOR must never reach the guard unset (got: $(cat "$AUDIT"))"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 8 (llama.cpp-y3z0 spec review round 1 finding 2, part A): a wrapped bench that
 # prints a FULLY HEALTHY table and then exits non-zero (crashed/killed
 # right after) must be reported as an unmeasured ERROR, never a computed
@@ -349,6 +368,7 @@ echo "$out" | grep -q "990.00" && { echo "FAIL: a crashed run's numbers must not
 echo "$out" | grep -q "ERROR:bench-rc=134" || { echo "FAIL: expected the distinct label ERROR:bench-rc=134 for a non-zero bench exit (got: $out)"; fail=1; }
 echo "$out" | grep -q "ERROR:guard-not-valid" && { echo "FAIL: a non-zero bench exit must use ERROR:bench-rc=, not ERROR:guard-not-valid (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 8 (llama.cpp-y3z0 spec review round 1 finding 2, part B): a bench-guard log
 # stamped SUSPECT (here: a fake journalctl reporting a GT reset, i.e. a
 # kernel GPU fault during the run) must be reported as an unmeasured
@@ -370,6 +390,7 @@ echo "$out" | grep -qi "PASS" && { echo "FAIL: a SUSPECT run must never report P
 echo "$out" | grep -q "ERROR:guard-not-valid" || { echo "FAIL: expected the distinct label ERROR:guard-not-valid for a SUSPECT-stamped run (got: $out)"; fail=1; }
 echo "$out" | grep -q "ERROR:bench-rc=" && { echo "FAIL: a SUSPECT run (bench itself exited 0) must use ERROR:guard-not-valid, not ERROR:bench-rc= (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 8 (llama.cpp-y3z0 spec review round 2 finding N3): a positive control on the
 # exact-token VALID match. A second stub guard stamps its --log header
 # "# bench-guard: VALIDATED (should NOT count as VALID)" -- a real
@@ -405,6 +426,7 @@ $out"; fail=1; }
 echo "$out" | grep -q "ERROR:guard-not-valid" || { echo "FAIL: a 'VALIDATED' header must be rejected as ERROR:guard-not-valid, not accepted as VALID (got: $out)"; fail=1; }
 echo "$out" | grep -qi "PASS" && { echo "FAIL: a 'VALIDATED' header must never be accepted as a real VALID stamp (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 9 (llama.cpp-y3z0 spec review round 1, finding 4): precedence. One pair genuinely
 # FAILs (ratio<0.9, from the real collapse numbers), the other cannot be
 # measured at all (the fake bench exits 77 for any model path other than
@@ -441,6 +463,7 @@ echo "$out" | grep -qi "FAIL" || { echo "FAIL: expected the mistral row/summary 
 echo "$out" | grep -qi "ERROR" || { echo "FAIL: expected the gptoss row to be reported as ERROR (got: $out)"; fail=1; }
 echo "$out" | grep -qi "additionally\|also" || { echo "FAIL: the summary must name BOTH the FAIL and the unmeasured pair, not just one (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 10 (llama.cpp-y3z0 spec review round 1 finding 3): an --only token that names no
 # such pair (wrong case here: "B70" instead of "b70") must be a loud usage
 # error naming the valid keys, never a silently empty "OK" table.
@@ -463,6 +486,7 @@ echo "$out" | grep -qi "^OK" && { echo "FAIL: a typo'd --only must never read as
 # loop commented out) in this round's commit body.
 echo "$out" | grep -qw "status" && { echo "FAIL: the table header must never print for a rejected --only -- this means the UP-FRONT --only validation did not run before the header printf, and only the post-loop fallback caught it (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 11 (llama.cpp-y3z0 spec review round 1 finding 5): a REAL-shaped table -- fa
 # column, `±` spread, ngl=-1, surrounding log noise exactly like a real
 # capture (artifacts/task18-parser-fixtures/b70-mistral-good.txt), rows in
@@ -505,6 +529,7 @@ echo "$out" | grep -q "1437.33" || { echo "FAIL: pp1024 value missing (got: $out
 echo "$out" | grep -q "1474.44" || { echo "FAIL: pp2048 value missing (got: $out)"; fail=1; }
 echo "$out" | grep -q "9999.99" && { echo "FAIL: the decoy row's bogus value must never leak into the parsed table (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 12 (llama.cpp-y3z0 quality review round 1, finding 1): a run interrupted
 # mid-bench (SIGTERM) must not leave ITS OWN temp log behind. A slow fake
 # bench sleeps well past the time this case needs; the script is launched
@@ -658,6 +683,7 @@ done
 kill -0 "$guard_pid" 2>/dev/null && { echo "FAIL: bench-guard.sh (pid $guard_pid) is still running after this case's cleanup -- it must not survive past the suite"; fail=1; }
 [ -n "$timeout_pid" ] && kill -0 "$timeout_pid" 2>/dev/null && { echo "FAIL: the wrapped bench's process tree (pid $timeout_pid) is still running after this case's cleanup"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 13 (llama.cpp-y3z0 quality review round 3, finding 1): a
 # DETERMINISTIC reproduction of the race case 12's cmdline read is
 # exposed to -- bench-guard.sh exiting between the poll match and the
@@ -711,6 +737,7 @@ guarded_out="$("$GUARDED_RACE_SH" 2>&1)" && guarded_rc=0 || guarded_rc=$?
 [ "$guarded_rc" -eq 0 ] || { echo "FAIL: expected the || true -guarded form (the one case 12 actually ships) to survive the same dead-pid read, got rc=$guarded_rc, output: $guarded_out"; fail=1; }
 echo "$guarded_out" | grep -q "REACHED" || { echo "FAIL: the guarded form must reach its own echo after the dead-pid read (got: $guarded_out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 14 (llama.cpp-5iba): --models-dir DIR makes the fake bench
 # receive -m pointing at DIR's mistral file, proving the flag actually
 # changes the model path used, not merely that it is accepted as an arg.
@@ -734,6 +761,7 @@ out="$("$SCALING" --bench "$BENCH14" --models-dir "$FLAG_MODELS_DIR///" --only m
 $out"; fail=1; }
 grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_FLAG" || { echo "FAIL: expected the fake bench to receive -m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf via --models-dir (audit: $(cat "$BENCH_ARGV_FLAG"))"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 15 (llama.cpp-5iba): SYCL_PREFILL_SCALING_MODELS_DIR env var form
 # works on its own (a per-command prefix assignment here, distinct from the
 # whole-suite export above, so this case proves the mechanism directly), and
@@ -760,6 +788,7 @@ $out"; fail=1; }
 grep -qF -- "-m $FLAG_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" "$BENCH_ARGV_WINS" || { echo "FAIL: --models-dir must win over SYCL_PREFILL_SCALING_MODELS_DIR when both are given (audit: $(cat "$BENCH_ARGV_WINS"))"; fail=1; }
 grep -qF -- "$ENV_MODELS_DIR" "$BENCH_ARGV_WINS" && { echo "FAIL: the env var's path must not be used when --models-dir is also given (audit: $(cat "$BENCH_ARGV_WINS"))"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 16 (llama.cpp-5iba): a --models-dir whose mistral file is absent
 # must refuse with exit 2, name the missing path in stderr, and never
 # invoke bench-guard at all -- BEFORE any GPU init, not after an
@@ -799,6 +828,7 @@ echo "$out" | grep -qw "status" && { echo "FAIL: the table header must never pri
 echo "$out" | grep -qF "$MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected the missing path $MISSING_MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf named in the refusal (got: $out)"; fail=1; }
 [ ! -s "$GUARD_INVOKED_AUDIT" ] || { echo "FAIL: bench-guard must not be invoked at all when a selected pair's model file is missing (audit non-empty)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 16b (llama.cpp-5iba): the model-file check is hoisted out of the
 # card loop -- a model shared across BOTH selected pairs (mistral,b70 AND
 # mistral,b50, same underlying path) must be stat'd and refused ONCE, not
@@ -822,6 +852,7 @@ $out"; fail=1; }
 echo "$out" | grep -q "(model mistral)" || { echo "FAIL: expected the refusal to name the MODEL (model mistral), not a single arbitrary pair (got: $out)"; fail=1; }
 [ ! -s "$GUARD_INVOKED_AUDIT" ] || { echo "FAIL: bench-guard must not be invoked at all when a selected model's file is missing (audit non-empty)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 16c (llama.cpp-5iba): --models-dir / (the filesystem root) must
 # build a single-slash path ("/mistral-7b-v0.1.Q4_0.gguf"), never
 # "//mistral-...". The strip loop (`while [ "${MODELS_DIR%/}" !=
@@ -842,6 +873,7 @@ echo "$out" | grep -qF "/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected /m
 echo "$out" | grep -qF "//mistral-7b-v0.1.Q4_0.gguf" && { echo "FAIL: --models-dir / must never produce a doubled slash //mistral-7b-v0.1.Q4_0.gguf (got: $out)"; fail=1; }
 [ ! -s "$GUARD_INVOKED_AUDIT" ] || { echo "FAIL: bench-guard must not be invoked at all when --models-dir / has no mistral file (audit non-empty)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 16d (llama.cpp-5iba quality review, finding 3): a DIRECTORY in
 # place of the model file must be refused just like a missing file -- `-r`
 # alone passes for a directory (it only tests read permission, not that the
@@ -857,6 +889,7 @@ $out"; fail=1; }
 echo "$out" | grep -qF "$DIR_AS_MODEL_DIR/mistral-7b-v0.1.Q4_0.gguf" || { echo "FAIL: expected the directory-as-model path named in the refusal (got: $out)"; fail=1; }
 [ ! -s "$GUARD_INVOKED_AUDIT" ] || { echo "FAIL: bench-guard must not be invoked at all when the model path is a directory (audit non-empty)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 16e (llama.cpp-5iba quality review, finding 4): --models-dir ""
 # (an explicit empty flag value) must be a loud, immediate usage error
 # naming the flag -- not the filesystem root. Without this, an unrejected
@@ -871,6 +904,7 @@ out="$("$SCALING" --bench "$BENCH2" --models-dir "" --only mistral,b70 "${GUARD_
 $out"; fail=1; }
 echo "$out" | grep -qF -- "--models-dir" || { echo "FAIL: expected the refusal to name the --models-dir flag (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --- Case 17 (llama.cpp-5iba quality review, finding 9): gemma4's path is
 # NOT rooted at MODELS_DIR -- a --models-dir naming a directory that does
 # not even exist must never leak into gemma4's model path. Host-
@@ -905,4 +939,11 @@ echo "$out" | grep -qF "$BAD_PATH" && { echo "FAIL: gemma4 must never be reroote
 grep -qF "$BAD_PATH" "$GEMMA4_BENCH_AUDIT" 2>/dev/null && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the fake bench's own argv audit named $BAD_PATH (audit: $(cat "$GEMMA4_BENCH_AUDIT"))"; fail=1; }
 grep -qF "$BAD_PATH" "$GUARD_INVOKED_AUDIT" 2>/dev/null && { echo "FAIL: gemma4 must never be rerooted under --models-dir, but the stub guard's own audit named $BAD_PATH (audit: $(cat "$GUARD_INVOKED_AUDIT"))"; fail=1; }
 
-[ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict" || exit 1
+# Expected total is a LITERAL, not derived from anything else in this file --
+# bump it whenever a case is added or removed above. Without this, a case
+# whose cases=$((cases+1)) increment is missing, misplaced, or silently
+# dropped would just change the printed digit rather than fail the suite
+# (llama.cpp-3e0f quality review round 1, finding Q6).
+[ "$cases" -eq 24 ] || { echo "FAIL: expected 24 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+
+[ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict ($cases cases)" || exit 1
