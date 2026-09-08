@@ -238,7 +238,7 @@ fi
 # overridden as a shell FUNCTION (not an external script): a function
 # called on the left of a pipe still runs in its own forked subshell, so
 # the SIGPIPE mechanics are the same as a real external producer.
-mk_journal_fault_then_filler() { # $1=fault line
+mk_journal_fault_then_filler() {  # uses the global $FAULT_LINE, set by the caller before invoking this
     # shellcheck disable=SC2329  # invoked indirectly, as the `journalctl` override
     journalctl() {
         printf '%s\n' "$FAULT_LINE"
@@ -249,9 +249,7 @@ mk_journal_fault_then_filler() { # $1=fault line
 cases=$((cases+1))
 FAULT_LINE='kernel: xe 0000:04:00.0: Engine reset triggered'
 mk_journal_fault_then_filler
-if sycl_preflight_journal_has_current_boot_gpu_faults; then
-    :
-else
+if ! sycl_preflight_journal_has_current_boot_gpu_faults; then
     echo "FAIL: sycl_preflight_journal_has_current_boot_gpu_faults must detect a fault line followed by 400000 filler lines, not fail open under SIGPIPE/pipefail"
     fail=1
 fi
@@ -260,9 +258,7 @@ unset -f journalctl
 cases=$((cases+1))
 FAULT_LINE='kernel: xe 0000:04:00.0: guc_id=2 engine reset'
 mk_journal_fault_then_filler
-if sycl_preflight_journal_has_previous_boot_gpu_faults; then
-    :
-else
+if ! sycl_preflight_journal_has_previous_boot_gpu_faults; then
     echo "FAIL: sycl_preflight_journal_has_previous_boot_gpu_faults must detect a fault line followed by 400000 filler lines, not fail open under SIGPIPE/pipefail"
     fail=1
 fi
@@ -271,8 +267,10 @@ unset -f journalctl
 # --- companion checks so the F1 fix's capture-then-grep-c rewrite didn't
 # flip either function's polarity: a genuinely clean journal must still
 # read as "no fault", and a journalctl that cannot be found must still
-# reach the pre-existing documented "no fault" fail-open (see this file's
-# own comment on that decision), not a new behaviour ---
+# reach the pre-existing documented "no fault" fail-open (see
+# scripts/sycl-gpu-preflight.sh's own comment directly above the two
+# journal-check functions' definitions, not this file), not a new
+# behaviour ---
 
 cases=$((cases+1))
 journalctl() { seq 1 5000 | sed 's/^/kernel: quiet boot line /'; }

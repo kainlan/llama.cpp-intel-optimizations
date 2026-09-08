@@ -101,6 +101,16 @@ sycl_preflight_selector_may_use_b50() {
 # a deliberate difference, not an oversight, because this function's boolean
 # result has no room to express a third "unreadable" state without changing
 # every caller.
+#
+# The capture below is deliberately UNBOUNDED (no `-n`, no `--since`): this
+# is a current/previous-BOOT-wide fault check by design (`-b`/`-b -1`), not
+# a windowed one like bench-guard.sh's postflight check (which has an actual
+# window to bound -- the run it just guarded). There is no meaningful
+# "recent enough" cutoff for "has this boot ever seen a GPU fault" short of
+# re-deriving boot time from journalctl itself, which buys nothing over just
+# reading the whole boot's journal. Measured size is modest in practice
+# (~7.6 MB for a boot's kernel ring on this host) and this path already
+# avoids the SIGPIPE hazard the capture-first rewrite above exists to fix.
 sycl_preflight_journal_has_current_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
     local jl_out n
