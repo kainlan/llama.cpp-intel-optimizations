@@ -3013,9 +3013,11 @@ class unified_cache {
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 
     // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to wait
-    // for the background drain worker before it was allowed to allocate.
-    // Exposed for tests and for the teardown log line; see the private
-    // ledger this counts against in the member declarations further below.
+    // for headroom to free up under the cap -- polling the size-bucketed
+    // reuse pool for a completed in-flight entry it could evict -- before it
+    // was allowed to allocate. Exposed for tests and for the teardown log
+    // line; see the private ledger this counts against in the member
+    // declarations further below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
@@ -4076,11 +4078,14 @@ class unified_cache {
     // decrementing
     // onednn_graph_scratch_direct_outstanding_bytes_/onednn_graph_scratch_pool_bytes_
     // and counting each as an eviction regardless of which path released it.
-    // Called at cache teardown (shutdown_resources()) and at the same point
-    // arena_reserve() reclaims the KV/RUNTIME zones for a new context -- a
-    // pooled DIRECT buffer must not outlive the context it was allocated
-    // for. Callers must hold onednn_graph_scratch_mutex_ (teardown/context-
-    // reclaim call sites take it explicitly since they are not already
+    // Called at cache teardown (shutdown_resources()), at the same point
+    // arena_reserve() reclaims the KV/RUNTIME zones for a new context, and
+    // from ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) on every
+    // successful runtime n_ctx/n_ubatch update via the free-function wrapper
+    // unified_cache_reclaim_onednn_graph_scratch_pool() -- a pooled DIRECT
+    // buffer must not outlive the context it was allocated for. Callers must
+    // hold onednn_graph_scratch_mutex_ (teardown/context-reclaim/runtime-
+    // update call sites take it explicitly since they are not already
     // inside an onednn_graph_scratch_* entry point).
     void onednn_graph_scratch_clear_pool_locked();
 

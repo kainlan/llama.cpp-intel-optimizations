@@ -473,13 +473,17 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // ever engaging the cap machinery this test isn't exercising. The
     // miss-count assertion right after the allocation below is this setup's
     // own self-check against silently regressing back to a zone-served size.
-    constexpr size_t kSizeParked        = 280ull * 1024 * 1024;
-    const size_t     misses_before_park = cache->onednn_graph_scratch_pool_miss_count();
-    void *           parked             = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
+    constexpr size_t kSizeParked             = 280ull * 1024 * 1024;
+    const size_t     misses_before_park      = cache->onednn_graph_scratch_pool_miss_count();
+    const size_t     outstanding_before_park = cache->onednn_graph_scratch_direct_outstanding_bytes();
+    void *           parked                  = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
     check(parked != nullptr, "the parked-entry setup allocation succeeds");
     check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_park + 1,
           "the parked allocation was a DIRECT-path pool miss, not served from the ONEDNN zone -- proves this "
           "setup actually parks a poolable entry rather than silently zone-serving it");
+    check(cache->onednn_graph_scratch_direct_outstanding_bytes() == outstanding_before_park + kSizeParked,
+          "onednn_graph_scratch_direct_outstanding_bytes() increased by exactly the parked allocation's size -- "
+          "proves the accessor tracks a real DIRECT-path charge rather than staying inert");
     if (parked) {
         sycl::event release = submit_slow_release(q);
         cache->onednn_graph_scratch_free(parked, &release);
