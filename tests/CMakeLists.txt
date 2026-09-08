@@ -2163,6 +2163,95 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 600
     )
 
+    # Gate for llama.cpp-0oxf: the oneDNN Graph-scratch DIRECT-allocation
+    # path must bound its outstanding bytes (waiting for the background drain
+    # worker rather than piling DIRECT buffers up past a cap) and must never
+    # hand oneDNN a null scratch pointer on exhaustion -- it must log and
+    # abort instead. See the file header comment for the full mechanism and
+    # why the abort itself is exercised through an always-compiled test hook
+    # rather than a fork()-based death-check (SYCL + fork is a documented
+    # hang hazard on this host, CLAUDE.md's SYCL Device Selection section).
+    #
+    # $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS> mirrors
+    # test-sycl-fattn-onednn-gates's own pattern below: this test calls
+    # onednn_graph_scratch_* symbols that only exist in the linked ggml-sycl
+    # library when it was itself built with GGML_SYCL_DNNL=1, so the test's
+    # own `#if GGML_SYCL_DNNL` compile-time skip must see the SAME value the
+    # library was actually built with, not an independent guess.
+    #
+    # Labelled `cache;mem-handle` like test-unified-cache-unpin-event above --
+    # it allocates real GPU buffer objects, so the throttled full-suite sweep
+    # (`ctest -LE 'residency|mem-handle|cache'`) must exclude it.
+    #
+    # ENVIRONMENT pins the B50 (validation card), same reasoning as every
+    # sibling SYCL gate registered in this file: a bare `ctest` cannot then
+    # perturb a concurrent measurement on the B70. Device numbering is
+    # machine-specific -- see CLAUDE.md's selector table before changing this.
+    llama_build(test-sycl-onednn-graph-scratch-direct.cpp)
+    target_include_directories(test-sycl-onednn-graph-scratch-direct PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-onednn-graph-scratch-direct PRIVATE ggml-sycl)
+    target_compile_definitions(test-sycl-onednn-graph-scratch-direct PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-graph-scratch-direct PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-graph-scratch-direct PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-graph-scratch-direct PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-graph-scratch-direct PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-onednn-graph-scratch-direct LABEL "main")
+    set_tests_properties(test-sycl-onednn-graph-scratch-direct PROPERTIES
+        LABELS "sycl;cache;mem-handle;onednn"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+
+    # Host-only companion to the gate above: pure-function coverage of
+    # onednn_graph_scratch_zone_floor_bytes()'s context-derived floor formula
+    # (llama.cpp-0oxf), exercised through its exported test wrapper
+    # (ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes() -- the real
+    # function has internal linkage). No device needed; it still links
+    # ggml-sycl and needs -fsycl to compile the TU that declares the wrapper,
+    # but performs no queue or device work, so it is NOT given the
+    # `cache;mem-handle` labels above and DOES run in the throttled
+    # full-suite sweep.
+    #
+    # Registered TWICE against the same binary (mirrors
+    # test-unified-cache-unpin-event's --mode= argument pattern) because the
+    # floor function's env-var read is memoized once per process -- the
+    # "default" and "override" cases cannot both be exercised in one
+    # invocation. `default` must run WITHOUT GGML_SYCL_ONEDNN_GRAPH_ZONE_MB
+    # set; ctest inherits the launching shell's environment, so this also
+    # relies on the two invocations being separate processes (true for any
+    # ctest-registered test).
+    llama_build(test-sycl-onednn-graph-floor.cpp)
+    target_include_directories(test-sycl-onednn-graph-floor PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-onednn-graph-floor PRIVATE ggml-sycl)
+    target_compile_definitions(test-sycl-onednn-graph-floor PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-onednn-graph-floor PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-onednn-graph-floor PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-onednn-graph-floor PRIVATE "-fsycl")
+        target_link_options(test-sycl-onednn-graph-floor PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-onednn-graph-floor LABEL "main" ARGS --mode=default)
+    set_tests_properties(test-sycl-onednn-graph-floor PROPERTIES
+        LABELS "sycl;onednn"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+    add_test(NAME test-sycl-onednn-graph-floor-override
+             COMMAND $<TARGET_FILE:test-sycl-onednn-graph-floor> --mode=override)
+    set_tests_properties(test-sycl-onednn-graph-floor-override PROPERTIES
+        LABELS "sycl;onednn"
+        ENVIRONMENT "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+
     # Runtime gate for the SYCL settings self-report (llama.cpp-5bd8). Drives a
     # real registry -> ggml_backend_dev_init -> ggml_check_sycl() init and
     # asserts the report reaches the log callback. A source assertion would not
