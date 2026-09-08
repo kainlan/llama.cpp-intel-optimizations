@@ -471,7 +471,7 @@ ticket reproduced on:
   it actually clears the pool) — see `docs/backend/sycl-env-vars.md`'s
   `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site ordering.
   Either way the line logged is `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT
-  pool summary (%s): hits=%zu misses=%zu evictions=%zu peak_pooled=%.1f MB
+  pool summary (%s): hits=%zu misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB
   (cumulative for this process, not just this reclaim)` (silent if the pool
   was never used), where `%s` is `"teardown"`, `"context reclaim"`, or
   `"runtime context update"`. Only the teardown call logs at
@@ -506,9 +506,10 @@ failed), not a weaker substitute standing in for a stronger test that was
 skipped; but it should not be mistaken for direct evidence that a real OOM on
 this specific path aborts loudly on real hardware, only that the code path
 reached when `unified_alloc()` returns failure does. Since the two setters
-are gated behind `GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1` (only set by this
-test's own ctest registration), a production process cannot reach this
-simulated path at all.
+are gated behind `GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1` (set by this test's own
+ctest registration, and by the test binary itself via `setenv()` so a bare,
+non-ctest invocation does not silently no-op the hooks and false-fail), a
+production process cannot reach this simulated path at all.
 
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 

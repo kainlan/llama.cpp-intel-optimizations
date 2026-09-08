@@ -140,7 +140,7 @@ DIRECT_BODY_CODE = extract_function_body(
 # through onednn_graph_scratch_entry_usable_locked()) or the peek can
 # silently diverge again the way it did before this round -- see that
 # function's own comment in unified-cache.hpp. Extracted separately from
-# TRY_POOL_BODY_CODE below (this file's other reuse-pool checks) so the
+# WAIT_HEADROOM_BODY_CODE below (the wait loop's own extracted body) so the
 # "both call the shared predicate" checks read against exactly the two
 # functions the invariant is actually about.
 TRY_REUSE_POOL_BODY_CODE = extract_function_body(

@@ -12,8 +12,9 @@
 # exercised there. 15 top-level alternatives (the `(queued|started)` group
 # inside one of them is internal, not a top-level alternative of its own).
 # Guarded, not a bare top-level `readonly`: this file is sourced by six
-# scripts plus this file's own test suite under `set -e`, and a second
-# `source` of an already-sourced copy must not abort with "readonly
+# scripts plus this file's own test suite under `set -e` (most with
+# `-uo pipefail`, one -- scripts/benchmark-sycl.sh -- with bare `set -e`),
+# and a second `source` of an already-sourced copy must not abort with "readonly
 # variable". A plain `[ -z "${SYCL_PREFLIGHT_FAULT_RE:-}" ]` emptiness test
 # is NOT equivalent: it fails open on an inherited (non-readonly) exported
 # value -- the check would silently adopt whatever a caller's environment
