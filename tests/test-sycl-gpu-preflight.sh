@@ -119,9 +119,16 @@ fi
 # matching entry under the PCI root -- distinct from every other
 # sysfs_bad case, which all use $T/drmroot (a real DERIVED address) paired
 # with a pciroot fixture that DOES contain that address. An empty PCI root
-# directory (mkdir with nothing inside it) must still hit
-# `[[ -e "$b50" ]] || return 0`, the same conservative "cannot confirm
-# good -> bad" stance the missing-B50-sysfs-entry case documents. ---
+# directory (mkdir with nothing inside it) must still reach the
+# conservative CANNOT-CONFIRM-GOOD verdict (final check, quality review
+# round 4): via the `[[ -e "$b50" ]] || return 0` guard, or equivalently
+# the terminal enable/power_state fall-through if that guard were ever
+# removed -- the two are indistinguishable from outside this function
+# (deleting the guard leaves this suite green, since a missing directory
+# makes every subsequent `cat ... 2>/dev/null || true` read empty, which
+# fails the `enable != "1" || power_state != "D0"` check the same way).
+# The point this case tests is the OBSERVABLE bad verdict, not which
+# internal line produces it. ---
 
 cases=$((cases+1))
 mkdir -p "$T/pciroot-empty"
