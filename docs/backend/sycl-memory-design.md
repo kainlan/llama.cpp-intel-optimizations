@@ -416,23 +416,23 @@ ticket reproduced on:
   last time this device's arena was successfully planned — a snapshot, not a
   live read, so the cap does not shrink out from under the allocator as the
   arena's own zones consume the budget it was planned against).
-  A request that cannot be
-  served from the pool and would exceed the cap evicts (a REAL release,
-  destructing the owned `mem_handle`) completed pool entries — of any size,
-  including the requested size's own bucket (a same-size entry that is
-  complete but fails this request's alignment is exactly the kind of entry
-  this sweep can evict — bucket iteration order is otherwise unspecified),
-  stopping as soon as it fits — preserving as much of the pool as possible —
-  and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
-  — potentially called from a different thread — can keep parking newly-freed
-  entries this wait might evict on its very next poll) for an in-flight entry
-  to complete if none are immediately evictable. If the wait times out, the
-  allocator proceeds anyway rather than refusing a possibly one-off spike
-  pre-emptively; `unified_alloc()` below is still checked. If that allocation
-  genuinely fails even after one drain-and-retry, the allocator now logs the
-  sizes (request, outstanding, cap, prior waits, zone capacity/used/floor)
-  and `GGML_ABORT`s — it no longer returns a null scratch pointer to oneDNN
-  under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
+  A request that cannot be served from the pool and would exceed the cap
+  evicts (a REAL release, destructing the owned `mem_handle`) completed pool
+  entries — of any size, including the requested size's own bucket (a
+  same-size entry that is complete but fails this request's alignment is
+  exactly the kind of entry this sweep can evict — bucket iteration order is
+  otherwise unspecified), stopping as soon as it fits — preserving as much of
+  the pool as possible — and waits (bounded, dropping its own mutex so
+  `onednn_graph_scratch_free()` — potentially called from a different thread
+  — can keep parking newly-freed entries this wait might evict on its very
+  next poll) for an in-flight entry to complete if none are immediately
+  evictable. If the wait times out, the allocator proceeds anyway rather than
+  refusing a possibly one-off spike pre-emptively; `unified_alloc()` below is
+  still checked. If that allocation genuinely fails even after one
+  drain-and-retry, the allocator now logs the sizes (request, outstanding,
+  cap, prior waits, zone capacity/used/floor) and `GGML_ABORT`s — it no
+  longer returns a null scratch pointer to oneDNN under any circumstance.
+  `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
 - **The pool is bounded per size, and reclaimed at every point that could
@@ -445,17 +445,17 @@ ticket reproduced on:
   limit just because each individual size stays under the byte cap; a size
   whose bucket is already at the depth limit releases the overflow buffer
   for real via the shared event-gated drain path instead of parking it.
-  Because the pool is a
-  `unified_cache` member (survives across contexts and models), it is
-  reclaimed (real release of every entry, `onednn_graph_scratch_reclaim_pool()`)
-  at three points: cache teardown (`shutdown_resources()`), the point
-  `arena_reserve()` reclaims the KV/RUNTIME zones for a new context, and —
-  the one point that does NOT go through `arena_reserve()` at all —
+  Because the pool is a `unified_cache` member (survives across contexts and
+  models), it is reclaimed (real release of every entry,
+  `onednn_graph_scratch_reclaim_pool()`) at three points: cache teardown
+  (`shutdown_resources()`), the point `arena_reserve()` reclaims the
+  KV/RUNTIME zones for a new context, and — the one point that does NOT go
+  through `arena_reserve()` at all —
   `ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`) on every
-  successful runtime `n_ctx`/`n_ubatch` update, via the free-function wrapper
-  `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that third
-  site a pooled buffer sized for one context's shapes could sit on a 16 GB
-  card holding up to the cap's worth of idle VRAM while the next model
+  successful runtime `n_ctx`/`n_ubatch` update, via the free-function
+  wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that
+  third site a pooled buffer sized for one context's shapes could sit on a
+  16 GB card holding up to the cap's worth of idle VRAM while the next model
   loads (`llama-bench` with several `-m`, a server switching models) or
   while the SAME model's context is resized to a different `n_ctx`. Each
   reclaim point logs a summary line first (silent if the pool was never
