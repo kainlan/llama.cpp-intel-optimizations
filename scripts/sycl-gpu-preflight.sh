@@ -3,6 +3,13 @@
 # Source this file and call sycl_gpu_preflight_check "$selector" before each
 # GPU run. It intentionally does not enumerate devices through oneAPI.
 
+# Shared by both current- and previous-boot journal fault checks below (see
+# sycl_preflight_journal_has_current_boot_gpu_faults and its previous-boot
+# sibling) so the two never drift apart the way byte-for-byte duplicated
+# regexes tend to. Editing this in one place changes what BOTH functions
+# treat as a fault; the 14-case positive-control suite depends on it.
+readonly SYCL_PREFLIGHT_FAULT_RE='xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+
 sycl_preflight_repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
 }
@@ -116,7 +123,7 @@ sycl_preflight_journal_has_current_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
     local jl_out n
     jl_out="$(journalctl -k -b --no-pager 2>/dev/null)" || return 1
-    n="$(grep -ciE 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes' <<<"$jl_out" || true)"
+    n="$(grep -ciE "$SYCL_PREFLIGHT_FAULT_RE" <<<"$jl_out" || true)"
     [ "${n:-0}" -gt 0 ]
 }
 
@@ -124,7 +131,7 @@ sycl_preflight_journal_has_previous_boot_gpu_faults() {
     command -v journalctl >/dev/null 2>&1 || return 1
     local jl_out n
     jl_out="$(journalctl -k -b -1 --no-pager 2>/dev/null)" || return 1
-    n="$(grep -ciE 'xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes' <<<"$jl_out" || true)"
+    n="$(grep -ciE "$SYCL_PREFLIGHT_FAULT_RE" <<<"$jl_out" || true)"
     [ "${n:-0}" -gt 0 ]
 }
 

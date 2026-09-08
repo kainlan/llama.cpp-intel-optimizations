@@ -65,10 +65,10 @@
 # (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd, --journalctl-cmd,
 # --max-wait) unchanged. bench-guard.sh has since gained a seventh,
 # --drm-root (llama.cpp-imns) -- and, separately, THIS script itself now
-# also accepts a --drm-root of its OWN (llama.cpp-o4fs, quality review
-# round 3, F6), used purely for its OWN card derivation below (see that
-# section's comment). The two are NOT the same value crossing a boundary:
-# this script's --drm-root is still deliberately NOT forwarded to the
+# also accepts a --drm-root of its OWN (llama.cpp-o4fs), used purely for
+# its OWN card derivation below (see that section's comment). The two are
+# NOT the same value crossing a boundary: this script's --drm-root is
+# still deliberately NOT forwarded to the
 # bench-guard.sh child -- it always passes --sysfs-card explicitly (see
 # below), which bypasses bench-guard.sh's own --drm-root-based derivation
 # entirely, so there is nothing downstream for either script's --drm-root
@@ -110,9 +110,9 @@ BENCH_GUARD="$SCRIPT_DIR/bench-guard.sh"
 # script onto another tree -- the helper's own default
 # (`: "${DRM_ROOT:=/sys/class/drm}"`) only fires when DRM_ROOT is unset or
 # empty, so it would otherwise honour an ambient env var this script never
-# documented as a knob (quality review finding F1; mirrors bench-guard.sh's
-# own unconditional DRM_ROOT=/sys/class/drm on its own init line). The
-# --drm-root flag still overrides this.
+# documented as a knob (mirrors bench-guard.sh's own unconditional
+# DRM_ROOT=/sys/class/drm on its own init line). The --drm-root flag
+# still overrides this.
 DRM_ROOT=/sys/class/drm
 # Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
@@ -128,8 +128,8 @@ source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
 # ONLY refusal-message prefix this script emits: an earlier version had a
 # second, bespoke inline "cannot derive card: ..." echo+exit for the
 # selector-shape check below, giving two different refusal prefixes for
-# what is really the same class of failure (quality review findings
-# F4/F8) -- the selector-shape check now routes through refuse() too.
+# what is really the same class of failure -- the selector-shape check
+# now routes through refuse() too.
 refuse() { echo "sycl-decode-mode-capture: REFUSED: $*" >&2; exit 3; }
 
 # --- tunables (named, not inline literals, the way bench-guard.sh names its

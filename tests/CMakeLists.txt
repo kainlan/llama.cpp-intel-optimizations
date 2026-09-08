@@ -836,7 +836,7 @@ if (NOT WIN32)
     )
     # NOT `LABEL "sycl;source"` on the llama_test_cmd call above -- same
     # llama_test_cmd single-valued-LABEL caveat as test-sycl-decode-mode-
-    # capture's own registration below (quality review round 3, finding F4).
+    # capture's own registration below.
     set_tests_properties(test-sycl-gpu-preflight PROPERTIES
         LABELS "sycl;source"
         SKIP_RETURN_CODE 77
