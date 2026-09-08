@@ -559,6 +559,86 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
         --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true
 
 cases=$((cases+1))
+# F1 regression (quality review of llama.cpp-o4fs): DRM_ROOT is NOT an
+# ambient env knob -- only --drm-root overrides the built-in
+# /sys/class/drm default. An earlier version of this extraction dropped
+# bench-guard.sh's unconditional `DRM_ROOT=/sys/class/drm` init-line
+# assignment, so the shared helper's own `: "${DRM_ROOT:=/sys/class/drm}"`
+# default would silently honour an INHERITED environment DRM_ROOT instead
+# -- an env var this script never documented as a knob.
+#
+# This CANNOT be tested by also passing --drm-root: that flag's own
+# arg-parser assignment always overwrites DRM_ROOT before the helper's `:=`
+# default is ever consulted, in BOTH the broken and the fixed code, so a
+# case combining --drm-root with an env DRM_ROOT can never go RED against
+# this bug (confirmed directly: an earlier version of this test did exactly
+# that and stayed green even with the fix reverted). The only way to
+# exercise the real code path is to omit --drm-root entirely.
+#
+# Doing that without depending on real hardware: point env DRM_ROOT at a
+# DECOY tree (a single fake card at a made-up address, 0000:55:00.0) and
+# omit --drm-root/--pci/--sysfs-card so full derivation runs. The decoy's
+# PCI address must never appear in the result -- whatever the run resolves
+# against instead (this host's REAL /sys/class/drm, which the guard falls
+# back to once the env value is correctly ignored, or a "no discrete GPU"
+# refusal on a host without one) is an acceptable outcome; only leaking the
+# decoy through is what this guards against, so this test asserts a
+# NEGATIVE rather than a specific pci=, which would go stale the moment
+# this host's real topology moves again (CLAUDE.md's own PCI-address-moves
+# history).
+rm -rf "$T/drmroot-decoy" "$T/devices-decoy"
+mk_pci_dev "$T/devices-decoy" 0000:55:00.0 with_freq
+mkdir -p "$T/drmroot-decoy/card0"
+ln -s "$T/devices-decoy/0000:55:00.0" "$T/drmroot-decoy/card0/device"
+mk_meminfo 3000000
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 DRM_ROOT="$T/drmroot-decoy" "$GUARD" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+if echo "$out" | grep -q "0000:55:00.0"; then
+    echo "FAIL: an inherited env DRM_ROOT must not be honoured -- the decoy tree's PCI address (0000:55:00.0) leaked into the derivation (rc=$rc, out: $out)"
+    fail=1
+fi
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    echo "FAIL: expected rc 0 (resolved against the real tree) or 3 (real tree has no usable discrete GPU / other refusal), got $rc (out: $out)"
+    fail=1
+fi
+
+cases=$((cases+1))
+# F5 regression (quality review of llama.cpp-o4fs): a device symlink that
+# resolves through a path containing a SPACE must still be parsed
+# correctly. The pre-fix `readlink -f ... | xargs -r basename` form
+# word-splits its input on whitespace, so a resolved path with a space
+# gets mis-split into two operands -- and `basename` given two operands
+# treats the second as a SUFFIX to strip from the first, silently
+# producing the WRONG PCI address rather than failing loudly. Asserting
+# the CORRECT pci=/card= come through (not merely that the run doesn't
+# crash) is what actually catches the mis-parse.
+rm -rf "$T/drmroot-space" "$T/dev ices-space"
+mk_pci_dev "$T/dev ices-space" 0000:04:00.0 with_freq
+mkdir -p "$T/drmroot-space/card0"
+ln -s "$T/dev ices-space/0000:04:00.0" "$T/drmroot-space/card0/device"
+mk_meminfo 3000000
+out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 --log "$T/run-space.log" -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: a DRM_ROOT device path containing a space must still resolve, got rc=$rc (out: $out)"; fail=1; }
+head -1 "$T/run-space.log" | grep -q "pci=0000:04:00.0" \
+    || { echo "FAIL: a DRM_ROOT device path containing a space must resolve pci=0000:04:00.0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
+head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
+    || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
+
+cases=$((cases+1))
+# M3 (spec review round 2): the case above exercises F5's fix only inside
+# derive_card_for_selector -- find_card_by_pci (the --pci override path)
+# carries the SAME `readlink -f ... | xargs -r basename` shape and was left
+# uncovered. Reuses the same $T/drmroot-space fixture built just above, via
+# --pci instead of a bare selector, so this exercises find_card_by_pci's
+# own basename substitution specifically.
+out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 --log "$T/run-space-pci.log" -- true 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must still resolve, got rc=$rc (out: $out)"; fail=1; }
+head -1 "$T/run-space-pci.log" | grep -q "card=$T/drmroot-space/card0" \
+    || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must resolve card=$T/drmroot-space/card0 (find_card_by_pci's own basename substitution), got: $(head -1 "$T/run-space-pci.log" 2>/dev/null)"; fail=1; }
+
+cases=$((cases+1))
 # A dangling device symlink (target no longer resolves, e.g. a card
 # removed or a hot-unplug race) must refuse loudly rather than silently
 # excluding the card and shifting level_zero indices for the rest (review
@@ -668,12 +748,56 @@ else
     echo "$out" | grep -qi "not readable/searchable" || { echo "FAIL: unreadable-device-dir refusal must name the problem (got: $out)"; fail=1; }
 fi
 
+cases=$((cases+1))
+# F1 (quality review round 3): a readlink FAILURE -- distinct from the
+# unreadable-device-DIR case above, which chmods the target dir ITSELF and
+# reaches the LATER `[ -d "$c/device" ] && { [ ! -r ] || [ ! -x ] }` check
+# -- must never become a silent, index-shifting skip. This chmods the
+# PARENT of the device target instead (an "unsearchable parent"): looking
+# up a directory ENTRY by name needs search permission on the directory
+# CONTAINING it, not on the entry's own permission bits, so this blocks
+# path resolution one level higher than the unreadable-devdir case above.
+#
+# Empirically (round 3), this exact fixture is refused via the DANGLING
+# check (`[ -L "$c/device" ] && [ ! -e "$c/device" ]`, already earlier in
+# the loop), not the later "readlink probe error" line's own message: `-e`
+# and `readlink -f` both fully resolve the same symlink chain to determine
+# existence, so an unsearchable ancestor makes BOTH fail identically --
+# there is no ordinary filesystem-permission construction that fails
+# readlink -f while `-e` still succeeds (the "readlink probe error" refuse
+# exists for a genuine TOCTOU race -- the target vanishing between the
+# dangling check and the readlink call a moment later -- which a static
+# chmod fixture cannot reproduce). This is still exactly the behaviour F1
+# requires: the fix (checking readlink's own exit status, not discarding
+# it into a `basename` call that always succeeds) matters regardless of
+# which refuse() message a given failure surfaces through, and this test
+# proves the OUTCOME -- a loud refuse(), never a silent skip that would
+# shift level_zero indices for the surviving cards -- for a readlink
+# failure that reaches this fixture's construction. Skip under root, which
+# bypasses permission bits, so chmod 000 would not reproduce this.
+if [ "$(id -u)" -eq 0 ]; then
+    skip_as_root "unsearchable-parent (readlink failure) case"
+else
+    rm -rf "$T/drmroot-unreadable-parent" "$T/devices-unreadable-parent" "$T/devices-unreadable-parent-sibling"
+    mk_pci_dev "$T/devices-unreadable-parent" 0000:04:00.0
+    mk_pci_dev "$T/devices-unreadable-parent-sibling" 0000:09:00.0 with_freq
+    chmod 000 "$T/devices-unreadable-parent"
+    mkdir -p "$T/drmroot-unreadable-parent/card0" "$T/drmroot-unreadable-parent/card1"
+    ln -s "$T/devices-unreadable-parent/0000:04:00.0" "$T/drmroot-unreadable-parent/card0/device"
+    ln -s "$T/devices-unreadable-parent-sibling/0000:09:00.0" "$T/drmroot-unreadable-parent/card1/device"
+    out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-parent" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 --journalctl-cmd true -- true 2>&1)" && rc=0 || rc=$?
+    chmod 755 "$T/devices-unreadable-parent"   # so the EXIT trap's rm -rf can clean it up
+    [ "$rc" -eq 3 ] || { echo "FAIL: an unsearchable-parent (readlink failure) case must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+    echo "$out" | grep -q "REFUSED:" || { echo "FAIL: an unsearchable-parent (readlink failure) case must refuse loudly, not silently skip the card (got: $out)"; fail=1; }
+fi
+
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above. Without this, a case
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 41 ] || { echo "FAIL: expected 41 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 45 ] || { echo "FAIL: expected 45 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
