@@ -23,6 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMON_HPP = (ROOT / "ggml/src/ggml-sycl/common.hpp").read_text()
 CACHE_HPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
+# llama.cpp-0oxf: plain file I/O, not the codescout index -- CLAUDE.md
+# documents that index as blind inside this specific ~60k-line file, so a
+# tool-assisted search here would silently miss real occurrences.
+GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 
 
 # One left-to-right pass over string literals, char literals, // comments and
@@ -123,7 +127,14 @@ CACHE_CPP_CODE = strip_comments(CACHE_CPP)
 # until reviewed for it.)
 FREE_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_free(")
 ALLOC_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "void * unified_cache::onednn_graph_scratch_alloc(")
-FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes()")
+# Anchor on the open paren only, not the full parameter list: llama.cpp-0oxf
+# changed this function's signature twice (first to a single planner_n_ctx
+# argument, then to (n_head, n_ubatch, n_ctx) after the lead's measurement
+# showed n_ctx alone was the wrong independent variable) -- anchoring past
+# the paren would need updating again on the next parameter-list edit, and
+# the open paren alone is still a unique match (there is exactly one
+# definition of this function in the file).
+FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes(")
 MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 
 
@@ -204,9 +215,69 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # event_complete() name but calls get_info directly still gets caught.
     checks["no blocking token anywhere in the free path body"] = _has_no_blocking_token(FREE_BODY_CODE)
 
-    checks["direct fallback deferred via retain_handles_until_event"] = normalize_ws(
+    # llama.cpp-0oxf changed WHEN this call fires: it used to be the DIRECT
+    # branch's only release mechanism, unconditionally. Since the pool
+    # redesign it fires only when a size bucket is already at its bounded
+    # depth (onednn_graph_scratch_pool_depth_per_size()) -- the common case
+    # instead parks the buffer in onednn_graph_scratch_reuse_pool_ (checked
+    # below). The call text itself is unchanged, so this stays a valid
+    # (if now narrower) structural check: the overflow release path must
+    # still exist and still be event-gated, not silently dropped.
+    checks["direct fallback overflow release deferred via retain_handles_until_event"] = normalize_ws(
         "retain_handles_until_event({ std::move(owner) }, *event);"
     ) in normalize_ws(FREE_BODY_CODE)
+
+    # llama.cpp-0oxf pool redesign: a freed DIRECT buffer's PRIMARY fate is
+    # the size-bucketed reuse pool, not the shared drain worker -- verified
+    # here as a source contract because the whole point of the redesign
+    # (verification 2: the zone floor cannot actually be reached at runtime,
+    # so the DIRECT path is many models' steady state, not an occasional
+    # fallback) depends on this, not on the overflow path above alone.
+    checks["free path parks into the reuse pool"] = (
+        "onednn_graph_scratch_reuse_pool_[freed_size]" in normalize_ws(FREE_BODY_CODE)
+        and "bucket.push_back(" in normalize_ws(FREE_BODY_CODE)
+    )
+    checks["alloc path tries the reuse pool before a fresh allocation"] = (
+        "onednn_graph_scratch_try_reuse_pool_locked(" in ALLOC_BODY_CODE
+    )
+    # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
+    # pool redesign): without this, a workload that walks many distinct
+    # sizes (a pp8192 run touches ~16 distinct ne11-derived shapes) could
+    # grow the pool's footprint without limit even while each individual
+    # size stays under the byte cap.
+    checks["pool bounded per size, not just by total bytes"] = (
+        "onednn_graph_scratch_pool_depth_per_size()" in normalize_ws(FREE_BODY_CODE)
+    )
+    # Teardown/context-reclaim/runtime-update must actually release pooled
+    # buffers, not just stop tracking them -- checked structurally (the
+    # reclaim entry point is called from all three sites the lead
+    # specified: cache teardown, arena_reserve()'s context-reclaim branch,
+    # and ggml_backend_sycl_set_runtime_context(), which does NOT call
+    # arena_reserve() at all and so needs its own call site) rather than by
+    # re-deriving what "correct" teardown means from scratch here.
+    checks["pool reclaimed at cache teardown"] = 'onednn_graph_scratch_reclaim_pool("teardown")' in CACHE_CPP_CODE
+    # Scoped to arena_reserve()'s own body, not a same-file coincidence: the
+    # reclaim call must be co-located with the KV/RUNTIME reclaim it is meant
+    # to accompany, not merely present somewhere in a ~27000-line file.
+    arena_reserve_body_code = extract_function_body(CACHE_CPP_CODE, "bool unified_cache::arena_reserve(")
+    checks["pool reclaimed at context reclaim (same point KV/RUNTIME are reclaimed)"] = (
+        normalize_ws("zone_reclaim(vram_zone_id::KV); zone_reclaim(vram_zone_id::RUNTIME);")
+        in normalize_ws(arena_reserve_body_code)
+        and 'onednn_graph_scratch_reclaim_pool("context reclaim")' in arena_reserve_body_code
+    )
+    # arena_reserve() is NOT called by the runtime-context-update path
+    # (verified by the finding this whole reclaim site exists to fix), so
+    # the check above cannot cover it -- read ggml-sycl.cpp directly (plain
+    # file I/O, not the codescout index, which is documented as blind inside
+    # this specific file) and scope to
+    # ggml_backend_sycl_set_runtime_context()'s own body.
+    runtime_context_body = strip_comments(
+        extract_function_body(GGML_SYCL_CPP, "void ggml_backend_sycl_set_runtime_context(")
+    )
+    checks["pool reclaimed at runtime context update"] = (
+        'unified_cache_reclaim_onednn_graph_scratch_pool(ctx->device, "runtime context update")'
+        in runtime_context_body
+    )
 
     # TP fail-closed branch (gwno spec-review round 2, finding 4): under TP,
     # ctx.stream() returns the TP shared-context queue ahead of the cache's
@@ -230,15 +301,27 @@ def test_onednn_graph_allocator_source_contract() -> None:
 
     # Env-tunable floor for the concurrent within-ubatch demand, additive on
     # top of the primitive-API pair (see unified_cache_get_planned_onednn_scratchpad_bytes).
-    checks["graph scratch zone floor is additive"] = "bytes += onednn_graph_scratch_zone_floor_bytes()" in CACHE_CPP_CODE
+    # Whitespace-insensitive (llama.cpp-0oxf): the call now passes three
+    # struct-member arguments, which clang-format is more likely to re-wrap
+    # across lines than the old zero-argument call ever was.
+    checks["graph scratch zone floor is additive"] = normalize_ws(
+        "bytes += onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx);"
+    ) in normalize_ws(CACHE_CPP_CODE)
     checks["zone floor env var"] = "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" in CACHE_CPP_CODE
     checks["allocator opt-out env var name"] = "GGML_SYCL_ONEDNN_CACHE_ALLOCATOR" in CACHE_CPP_CODE
     # Token-anchored default value (llama.cpp-gwno spec-review round 2,
     # finding: this used to be untested, so a 512->64 regression or typo
     # would pass silently) -- not a bare "64" substring search, which would
     # match line numbers, byte counts, or anything else in the file.
-    # Specifically the `mb` initializer inside the floor helper's lambda.
-    checks["default floor is 64 MiB"] = bool(re.search(r"\bmb\s*=\s*64\s*;", FLOOR_BODY_CODE))
+    # llama.cpp-0oxf replaced the old `mb = 64` lambda-local variable with a
+    # `kFloorMinBytes` constexpr once the floor became a formula
+    # (max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x 4 B)) rather than a bare
+    # env-overridable constant -- anchor on that constant's own definition,
+    # not a value that could coincidentally appear elsewhere in the formula
+    # (768 MiB, 1.5, sizeof(f32) as 4, etc. are all also just numbers).
+    checks["default floor is 64 MiB"] = bool(
+        re.search(r"kFloorMinBytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", FLOOR_BODY_CODE)
+    )
 
     # High-water byte counter (llama.cpp-gwno perf follow-up): peak
     # concurrently-outstanding bytes, exposed and logged once at teardown so

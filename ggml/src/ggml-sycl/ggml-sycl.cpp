@@ -16843,6 +16843,16 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     }
     g_runtime_update_succeeded = true;
 
+#if GGML_SYCL_DNNL
+    // llama.cpp-0oxf: a pooled DIRECT Graph-scratch buffer was sized for the
+    // PREVIOUS n_ctx/n_ubatch's SDPA shapes -- reclaim it here, on every
+    // successful runtime update, same as arena_reserve()'s context-reclaim
+    // branch does for KV/RUNTIME (that branch does NOT fire for this path;
+    // ggml_backend_sycl_set_runtime_context() never calls arena_reserve()
+    // itself, only updates the plan's VRAM accounting).
+    ggml_sycl::unified_cache_reclaim_onednn_graph_scratch_pool(ctx->device, "runtime context update");
+#endif
+
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
             "[SYCL-PLAN] Runtime context update: n_ctx=%u n_ubatch=%u n_seq_max=%u kv_per_layer=%.1f MB "

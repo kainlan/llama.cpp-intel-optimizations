@@ -32,7 +32,16 @@
 // resident VRAM), so a request that cannot be served from the pool AND would
 // exceed the cap evicts (real release) completed pool entries of OTHER sizes
 // until it fits, waiting (bounded) for an in-flight entry to complete first
-// if none are immediately evictable.
+// if none are immediately evictable. Two further bounds, not directly
+// exercised by this file (both are exercised via unified-cache.cpp's own
+// source-contract gate, tests/test-sycl-onednn-graph-allocator-source.py,
+// and via reading the counters this file DOES check): each size bucket also
+// caps at onednn_graph_scratch_pool_depth_per_size() entries (default 8,
+// env-overridable) so a workload walking many distinct sizes cannot grow the
+// pool without limit even while every individual size stays under the byte
+// cap; and the pool is cleared (real release) at cache teardown and at the
+// same point arena_reserve() reclaims the KV/RUNTIME zones for a new
+// context, so a pooled buffer cannot outlive the context it belongs to.
 //
 // This test asserts three properties:
 //
@@ -164,13 +173,19 @@ void test_pool_reuse(unified_cache * cache) {
         return;
     }
 
-    // Free with no event (event == nullptr): reads as already-complete, so
-    // this entry is immediately eligible for reuse -- the simplest way to
-    // exercise (a) without a race against a real device event.
-    cache->onednn_graph_scratch_free(ptr1, nullptr);
+    // Free with a REAL (not nullptr) event -- "served from the pool once its
+    // event completes", not merely "served because no event was given". Wait
+    // for it explicitly here (unlike test_bounded_eviction below, this test
+    // is not measuring how long the allocator itself waits) so the pool
+    // lookup that follows finds a genuinely event-complete entry rather than
+    // racing the host_task.
+    sycl::event release = submit_slow_release(q);
+    cache->onednn_graph_scratch_free(ptr1, &release);
+    release.wait();
 
-    const size_t hits_before = cache->onednn_graph_scratch_pool_hit_count();
-    void *       ptr2        = cache->onednn_graph_scratch_alloc(kSizeA, 256, &q);
+    const size_t hits_before   = cache->onednn_graph_scratch_pool_hit_count();
+    const size_t misses_before = cache->onednn_graph_scratch_pool_miss_count();
+    void *       ptr2          = cache->onednn_graph_scratch_alloc(kSizeA, 256, &q);
 
     check(ptr2 != nullptr, "the reused allocation succeeds");
     check(ptr2 == ptr1,
@@ -178,6 +193,8 @@ void test_pool_reuse(unified_cache * cache) {
           "land at the same address");
     check(cache->onednn_graph_scratch_pool_hit_count() > hits_before,
           "onednn_graph_scratch_pool_hit_count() increased -- the allocator served this from the reuse pool");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before,
+          "onednn_graph_scratch_pool_miss_count() did NOT increase -- a pool hit is not also counted as a miss");
 
     if (ptr2) {
         cache->onednn_graph_scratch_free(ptr2, nullptr);
@@ -206,7 +223,10 @@ void test_bounded_eviction(unified_cache * cache) {
     sycl::event slow_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr1, &slow_release);
 
-    const size_t wait_count_before = cache->onednn_graph_scratch_direct_wait_count();
+    const size_t wait_count_before     = cache->onednn_graph_scratch_direct_wait_count();
+    const size_t eviction_count_before = cache->onednn_graph_scratch_pool_eviction_count();
+    check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeA,
+          "onednn_graph_scratch_pool_peak_bytes() reflects ptr1 sitting in the pool");
 
     // kSizeB, not kSizeA: an exact-size request would be served by the pool
     // reuse path tested above WITHOUT ever reaching the cap check at all,
@@ -229,8 +249,12 @@ void test_bounded_eviction(unified_cache * cache) {
     // distinguish "actually waited" from "returned immediately".
     check(elapsed.count() >= kSlowReleaseMs / 2,
           "the kSizeB allocation took a substantial fraction of the release delay, not ~0 ms");
-    printf("    (elapsed=%lld ms, cap wait count %zu -> %zu)\n", static_cast<long long>(elapsed.count()),
-           wait_count_before, cache->onednn_graph_scratch_direct_wait_count());
+    check(cache->onednn_graph_scratch_pool_eviction_count() > eviction_count_before,
+          "onednn_graph_scratch_pool_eviction_count() increased -- ptr1's pooled entry was actually released, "
+          "not just waited on");
+    printf("    (elapsed=%lld ms, cap wait count %zu -> %zu, eviction count %zu -> %zu)\n",
+           static_cast<long long>(elapsed.count()), wait_count_before, cache->onednn_graph_scratch_direct_wait_count(),
+           eviction_count_before, cache->onednn_graph_scratch_pool_eviction_count());
 
     if (ptr2) {
         cache->onednn_graph_scratch_free(ptr2, nullptr);

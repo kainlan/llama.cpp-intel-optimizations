@@ -425,6 +425,33 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **The pool is bounded per size, and reclaimed at every point that could
+  otherwise leave it stale.** Nothing but the byte cap bounds how many
+  buffers of ONE size the pool could hold, so
+  `onednn_graph_scratch_free()` also caps each size bucket at
+  `onednn_graph_scratch_pool_depth_per_size()` entries (default **8**, env
+  `GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE`) — a workload that walks many
+  distinct sizes (a pp8192 run touches ~16 distinct ne11-derived shapes)
+  cannot grow the pool's footprint without limit just because each
+  individual size stays under the byte cap; a size whose bucket is already
+  at the depth limit releases the overflow buffer for real via the shared
+  event-gated drain path instead of parking it. Because the pool is a
+  `unified_cache` member (survives across contexts and models), it is
+  reclaimed (real release of every entry, `onednn_graph_scratch_reclaim_pool()`)
+  at three points: cache teardown (`shutdown_resources()`), the point
+  `arena_reserve()` reclaims the KV/RUNTIME zones for a new context, and —
+  the one point that does NOT go through `arena_reserve()` at all —
+  `ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`) on every
+  successful runtime `n_ctx`/`n_ubatch` update, via the free-function wrapper
+  `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that third
+  site a pooled buffer sized for one context's shapes could sit on a 16 GB
+  card holding up to the cap's worth of idle VRAM while the next model
+  loads (`llama-bench` with several `-m`, a server switching models) or
+  while the SAME model's context is resized to a different `n_ctx`. Each
+  reclaim point logs a summary line first (silent if the pool was never
+  used): `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s):
+  hits=%zu misses=%zu evictions=%zu peak_pooled=%.1f MB`, where `%s` is
+  `"teardown"`, `"context reclaim"`, or `"runtime context update"`.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/

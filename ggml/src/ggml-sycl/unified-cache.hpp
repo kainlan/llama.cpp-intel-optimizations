@@ -3026,6 +3026,30 @@ class unified_cache {
     // count stay flat once the pool has "warmed up" with one entry per
     // distinct in-flight shape.
     size_t onednn_graph_scratch_pool_hit_count() const { return onednn_graph_scratch_pool_hit_count_; }
+
+    // See the private counters' own comments for what each answers. Exposed
+    // for tests and for the teardown/context-reclaim summary line.
+    size_t onednn_graph_scratch_pool_miss_count() const { return onednn_graph_scratch_pool_miss_count_; }
+
+    size_t onednn_graph_scratch_pool_eviction_count() const { return onednn_graph_scratch_pool_eviction_count_; }
+
+    size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
+
+    // Public, self-locking entry point: logs the pool summary then releases
+    // (for real) every pooled DIRECT Graph-scratch buffer. `context` names
+    // the call site for the log line (e.g. "teardown", "context reclaim",
+    // "runtime context update"). Called internally at cache teardown and at
+    // arena_reserve()'s context-reclaim branch; also called externally (via
+    // unified_cache_reclaim_onednn_graph_scratch_pool() below) from
+    // ggml_backend_sycl_set_runtime_context() (llama.cpp-0oxf) -- a pooled
+    // buffer must not survive a runtime n_ctx/n_ubatch change any more than
+    // it should survive a full context/model teardown, since the shape it
+    // was sized for may no longer be requested again.
+    void onednn_graph_scratch_reclaim_pool(const char * context) {
+        std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+        onednn_graph_scratch_log_pool_summary_locked(context);
+        onednn_graph_scratch_clear_pool_locked();
+    }
 #endif
 
     struct pp_moe_onednn_scratch_slot {
@@ -3777,6 +3801,24 @@ class unified_cache {
 
     // See the public onednn_graph_scratch_pool_hit_count() accessor above.
     size_t onednn_graph_scratch_pool_hit_count_ = 0;
+    // How many times a DIRECT request found no ready (event-complete) entry
+    // of its exact size in the pool -- the request then went through the
+    // cap/eviction path and, ultimately, a real allocation. Logged at
+    // teardown alongside the hit count so a run's log answers "how well is
+    // the pool actually working" without extra instrumentation.
+    size_t onednn_graph_scratch_pool_miss_count_     = 0;
+    // How many pool entries were released for real rather than reused --
+    // either evicted under cap pressure (onednn_graph_scratch_evict_pool_until_fits_locked())
+    // or released immediately because their size bucket was already at
+    // onednn_graph_scratch_pool_depth_per_size_bytes()'s per-size depth
+    // limit when onednn_graph_scratch_free() tried to park them.
+    size_t onednn_graph_scratch_pool_eviction_count_ = 0;
+    // Running total of bytes currently sitting in the pool (across every
+    // size bucket, reused or not yet), and its high-water mark. Distinct
+    // from onednn_graph_scratch_direct_outstanding_bytes_, which also
+    // includes bytes currently checked out to oneDNN.
+    size_t onednn_graph_scratch_pool_bytes_          = 0;
+    size_t onednn_graph_scratch_pool_peak_bytes_     = 0;
 
     // Try to serve `size` bytes from onednn_graph_scratch_reuse_pool_: if a
     // bucket for that exact size holds an entry whose release_event has
@@ -3812,6 +3854,25 @@ class unified_cache {
     // loudly on failure rather than refusing pre-emptively on what may be a
     // one-off spike.
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t size, std::unique_lock<std::mutex> & lock);
+
+    // Real release (destructing every owned mem_handle) of every entry in
+    // onednn_graph_scratch_reuse_pool_, decrementing
+    // onednn_graph_scratch_direct_outstanding_bytes_/onednn_graph_scratch_pool_bytes_
+    // and counting each as an eviction. Called at cache teardown
+    // (shutdown_resources()) and at the same point arena_reserve() reclaims
+    // the KV/RUNTIME zones for a new context -- a pooled DIRECT buffer must
+    // not outlive the context it was allocated for. Callers must hold
+    // onednn_graph_scratch_mutex_ (teardown/context-reclaim call sites take
+    // it explicitly since they are not already inside an
+    // onednn_graph_scratch_* entry point).
+    void onednn_graph_scratch_clear_pool_locked();
+
+    // Logs the pool hit/miss/eviction counts and peak pooled bytes exactly
+    // once per call site (teardown, context reclaim) -- silent if the pool
+    // was never used (matches the "silent unless interesting" convention
+    // used elsewhere in this file for exactly this kind of summary).
+    // Callers must hold onednn_graph_scratch_mutex_.
+    void onednn_graph_scratch_log_pool_summary_locked(const char * context) const;
 #endif
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
@@ -5318,6 +5379,16 @@ bool unified_cache_copy_from_host_async(int                              device_
 // Must be called BEFORE S1-PRELOAD to guarantee VRAM availability.
 bool unified_cache_reserve_compute_arena(int device_id, size_t arena_bytes);
 bool unified_cache_ensure_planned_arena_zones(int device_id);
+
+#if GGML_SYCL_DNNL
+// llama.cpp-0oxf: external entry point for reclaiming (real release) every
+// pooled DIRECT Graph-scratch buffer -- used by
+// ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) on a successful
+// runtime n_ctx/n_ubatch update, since a pooled buffer's shape may no longer
+// be requested once the context's shape has changed. No-op if there is no
+// cache for `device_id` yet.
+void unified_cache_reclaim_onednn_graph_scratch_pool(int device_id, const char * context);
+#endif
 
 // Try to sub-allocate from the compute arena.
 // Returns nullptr if arena is not reserved or has insufficient space.
