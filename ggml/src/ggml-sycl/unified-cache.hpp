@@ -4006,9 +4006,9 @@ class unified_cache {
     // Reached only once neither the ONEDNN zone nor the reuse pool could
     // serve the request.
     void * onednn_graph_scratch_alloc_direct_locked(size_t                         size,
-                                                    size_t                         align,
+                                                    size_t                         alignment,
                                                     sycl::queue *                  q,
-                                                    int                            device,
+                                                    int                            device_id,
                                                     std::unique_lock<std::mutex> & lock);
 
     // Evict completed (event_complete() true) reuse-pool entries -- real

@@ -209,7 +209,13 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["free method declared"] = (
         "onednn_graph_scratch_free(void * ptr, const sycl::event * event);" in CACHE_HPP_CODE
     )
-    checks["malloc routes through the ONEDNN zone"] = "zone_alloc(vram_zone_id::ONEDNN, size, align)" in ALLOC_BODY_CODE
+    # llama.cpp-0oxf round-6 finding H5: the local this call passes as the
+    # third argument was renamed from `align` to `alignment` (normalized in
+    # place from the parameter of the same name) so onednn_graph_scratch_alloc()
+    # matches the rest of the family's parameter naming.
+    checks["malloc routes through the ONEDNN zone"] = (
+        "zone_alloc(vram_zone_id::ONEDNN, size, alignment)" in ALLOC_BODY_CODE
+    )
     checks["free routes through the ONEDNN zone"] = "zone_free(vram_zone_id::ONEDNN, ptr)" in FREE_BODY_CODE
 
     # Zone-backed reclaim is IMMEDIATE, deliberately with no event wait --
@@ -311,6 +317,21 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["pool_size_ready_locked() declaration still takes alignment and device_id"] = (
         "onednn_graph_scratch_pool_size_ready_locked(size_t size, size_t alignment, int device_id) const;"
         in normalize_ws(CACHE_HPP_CODE)
+    )
+    # llama.cpp-0oxf round-6 finding H3: onednn_graph_scratch_entry_usable_locked()'s
+    # own declaration now says callers must NOT call event_complete() on an
+    # entry themselves before calling it (the predicate already performs
+    # that query internally) -- both call sites must actually honor that,
+    # not just call the predicate (checked above) while ALSO keeping a
+    # redundant, potentially-blocking event_complete() call of their own.
+    # Reuses this file's existing _has_no_blocking_token() negative-check
+    # machinery (already proven non-vacuous below, and again for these two
+    # bodies specifically in test_pool_predicate_callers_have_no_blocking_token_witness).
+    checks["try_reuse_pool_locked() body has no blocking token of its own"] = _has_no_blocking_token(
+        TRY_REUSE_POOL_BODY_CODE
+    )
+    checks["pool_size_ready_locked() body has no blocking token of its own"] = _has_no_blocking_token(
+        POOL_SIZE_READY_BODY_CODE
     )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
@@ -488,4 +509,46 @@ def test_no_blocking_wait_check_has_a_mutation_witness() -> None:
     assert _has_no_blocking_token(FREE_BODY_CODE), "the real, unmutated free path body should have no blocking token"
     assert not _has_no_blocking_token(mutated), (
         "mutation witness is broken: the injected .wait() was not detected by _has_no_blocking_token()"
+    )
+
+
+def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
+    """Mutation witness for the two checks added in llama.cpp-0oxf round-6
+    finding H3 -- proves _has_no_blocking_token() would actually catch a
+    reintroduced, redundant event_complete() call in either
+    onednn_graph_scratch_try_reuse_pool_locked() or
+    onednn_graph_scratch_pool_size_ready_locked(), the specific regression
+    those checks exist to catch (both used to call event_complete() on their
+    own ahead of the shared predicate -- llama.cpp-c6ah), rather than only
+    ever passing on the current, correct source."""
+    reuse_target = "mem_handle owner = std::move(bucket[i].owner);"
+    assert reuse_target in TRY_REUSE_POOL_BODY_CODE, "mutation target string not found -- update this witness"
+    reuse_mutated = TRY_REUSE_POOL_BODY_CODE.replace(
+        reuse_target,
+        "event_complete(bucket[i].release_event); " + reuse_target,
+        1,
+    )
+    assert reuse_mutated != TRY_REUSE_POOL_BODY_CODE
+    assert _has_no_blocking_token(TRY_REUSE_POOL_BODY_CODE), (
+        "the real, unmutated try_reuse_pool_locked() body should have no blocking token"
+    )
+    assert not _has_no_blocking_token(reuse_mutated), (
+        "mutation witness is broken: the injected event_complete() call was not detected by "
+        "_has_no_blocking_token()"
+    )
+
+    ready_target = "return true;"
+    assert ready_target in POOL_SIZE_READY_BODY_CODE, "mutation target string not found -- update this witness"
+    ready_mutated = POOL_SIZE_READY_BODY_CODE.replace(
+        ready_target,
+        "event_complete(entry.release_event); " + ready_target,
+        1,
+    )
+    assert ready_mutated != POOL_SIZE_READY_BODY_CODE
+    assert _has_no_blocking_token(POOL_SIZE_READY_BODY_CODE), (
+        "the real, unmutated pool_size_ready_locked() body should have no blocking token"
+    )
+    assert not _has_no_blocking_token(ready_mutated), (
+        "mutation witness is broken: the injected event_complete() call was not detected by "
+        "_has_no_blocking_token()"
     )

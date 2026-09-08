@@ -9886,16 +9886,27 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
         resolved_ptr                         resolved{};
         const onednn_graph_scratch_entry_fit fit =
             onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
-        if (fit == onednn_graph_scratch_entry_fit::EVENT_PENDING) {
-            continue;
-        }
-        if (fit == onednn_graph_scratch_entry_fit::ALIGNMENT_MISMATCH) {
-            // Peek without popping: the pool is keyed on size alone, so a
-            // size match does not guarantee this entry satisfies THIS
-            // request's alignment -- must leave the entry pooled for a
-            // future request whose alignment it does satisfy, not consume
-            // it.
-            continue;
+        // switch over every enumerator, no default: a fifth
+        // onednn_graph_scratch_entry_fit value added later without a case
+        // here fails the build under -Wswitch instead of silently falling
+        // through to the pop-and-reuse branch below (an if-chain's implicit
+        // "anything else" fallthrough previously would not have caught
+        // that, and would have disagreed with the peek in
+        // onednn_graph_scratch_pool_size_ready_locked(), which explicitly
+        // tests `== USABLE`).
+        switch (fit) {
+            case onednn_graph_scratch_entry_fit::EVENT_PENDING:
+                continue;
+            case onednn_graph_scratch_entry_fit::ALIGNMENT_MISMATCH:
+                // Peek without popping: the pool is keyed on size alone, so
+                // a size match does not guarantee this entry satisfies
+                // THIS request's alignment -- must leave the entry pooled
+                // for a future request whose alignment it does satisfy,
+                // not consume it.
+                continue;
+            case onednn_graph_scratch_entry_fit::USABLE:
+            case onednn_graph_scratch_entry_fit::RESOLVE_FAILED:
+                break;
         }
         mem_handle owner = std::move(bucket[i].owner);
         bucket[i]        = std::move(bucket.back());
@@ -9988,7 +9999,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
 
         // Check the requested size's OWN bucket first: an entry of the
         // exact size this request needs that onednn_graph_scratch_entry_usable_locked()
-        // reports usable (event complete, device-resident, and correctly
+        // reports USABLE (event complete, device-resident, and correctly
         // aligned -- not merely event-complete) can satisfy it with no
         // eviction at all (reuse never needed headroom in the first place --
         // see onednn_graph_scratch_try_reuse_pool_locked()'s own comment).
@@ -10118,7 +10129,12 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
         }
         return nullptr;
     }
-    const size_t align = (alignment != 0) ? alignment : 256;  // 256 == this file's default GPU-coalescing alignment
+    // Normalized in place (not into a separately-named local) so this
+    // function's own parameter name stays `alignment` throughout, matching
+    // the rest of the onednn_graph_scratch_*_locked() family (llama.cpp-0oxf
+    // round-6 finding H5) rather than introducing a second, differently
+    // spelled name for the same value.
+    alignment = (alignment != 0) ? alignment : 256;  // 256 == this file's default GPU-coalescing alignment
 
     std::unique_lock<std::mutex> lock(onednn_graph_scratch_mutex_);
 
@@ -10144,7 +10160,7 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
         onednn_graph_scratch_last_printed_request_size_ = size;
     }
 
-    if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, align)) {
+    if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, alignment)) {
         onednn_graph_scratch_zone_sizes_[ptr] = size;
         note_onednn_graph_scratch_alloc_locked(size);
         if (print_this_request) {
@@ -10186,7 +10202,7 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // computation per DIRECT request, threaded through every call below
     // that needs it (the pool lookups and the DIRECT allocation's own
     // request device).
-    const int device = ggml_sycl_get_device_id_from_queue(*q);
+    const int device_id = ggml_sycl_get_device_id_from_queue(*q);
 
     // llama.cpp-0oxf: try the size-bucketed reuse pool BEFORE the cap-wait
     // mechanism below -- reusing an already-resident buffer needs no
@@ -10198,11 +10214,11 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // counted on a miss here -- see onednn_graph_scratch_try_pool_locked()'s
     // own comment for why miss accounting waits until every re-check has
     // also had its chance.
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, align, device)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
         return p;
     }
 
-    return onednn_graph_scratch_alloc_direct_locked(size, align, q, device, lock);
+    return onednn_graph_scratch_alloc_direct_locked(size, alignment, q, device_id, lock);
 }
 
 // llama.cpp-0oxf: the DIRECT (non-arena) allocation tail of
@@ -10216,14 +10232,14 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
 // for a while); callers must not rely on any of this object's state being
 // unchanged across the call.
 void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t                         size,
-                                                               size_t                         align,
+                                                               size_t                         alignment,
                                                                sycl::queue *                  q,
-                                                               int                            device,
+                                                               int                            device_id,
                                                                std::unique_lock<std::mutex> & lock) {
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
     // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
     // for the full mechanism this backs.
-    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, align, device, lock)) {
+    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, alignment, device_id, lock)) {
         GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: gave up waiting for headroom before allocating "
             "%.2f MB (outstanding=%.2f MB, cap=%.2f MB, waits so far=%zu) -- attempting the allocation anyway so a "
@@ -10241,15 +10257,15 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // could have parked (or, on the depth-overflow path, evicted and thereby
     // freed room for) this exact size while the lock was released. Check the
     // pool once more before paying for a fresh unified_alloc().
-    if (void * p = onednn_graph_scratch_try_pool_locked(size, align, device)) {
+    if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
         return p;
     }
 
     alloc_request req{};
     req.queue                          = q;
-    req.device                         = device;
+    req.device                         = device_id;
     req.size                           = size;
-    req.alignment                      = align;
+    req.alignment                      = alignment;
     req.intent.role                    = alloc_role::COMPUTE;
     req.intent.category                = runtime_category::COMPUTE;
     req.intent.cohort_id               = "onednn_graph_scratch_direct";
@@ -10295,7 +10311,7 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         // Re-check the pool after reacquiring the lock: a concurrent
         // onednn_graph_scratch_free() could have parked an entry of this
         // exact size while it was dropped.
-        if (void * p = onednn_graph_scratch_try_pool_locked(size, align, device)) {
+        if (void * p = onednn_graph_scratch_try_pool_locked(size, alignment, device_id)) {
             return p;
         }
 

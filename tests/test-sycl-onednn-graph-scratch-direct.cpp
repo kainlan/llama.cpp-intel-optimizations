@@ -30,9 +30,10 @@
 // design (GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB) still applies: a
 // pooled-but-idle buffer's bytes stay charged against it (it is still real
 // resident VRAM), so a request that cannot be served from the pool AND would
-// exceed the cap evicts (real release) completed pool entries of OTHER sizes
-// until it fits, waiting (bounded) for an in-flight entry to complete first
-// if none are immediately evictable. Two further bounds, not directly
+// exceed the cap evicts (real release) completed pool entries of any size,
+// including the requested size's own bucket, until it fits, waiting
+// (bounded) for an in-flight entry to complete first if none are
+// immediately evictable. Two further bounds, not directly
 // exercised by this file (both are exercised via unified-cache.cpp's own
 // source-contract gate, tests/test-sycl-onednn-graph-allocator-source.py,
 // and via reading the counters this file DOES check): each size bucket also
