@@ -119,11 +119,11 @@ out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --p
 [ "$rc" -eq 3 ] || { echo "FAIL: expected failing df-cmd + high Shmem to exit 3, got $rc"; fail=1; }
 echo "$out" | grep -q "minus tmpfs 0 kB" || { echo "FAIL: refusal message must show 'minus tmpfs 0 kB' (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # The clamp branch: tmpfs usage that meets or exceeds Shmem must clamp
 # effective Shmem to 0 (not go negative) and emit an informational note on
 # stderr, without refusing -- Shmem 3,000,000 kB is comfortably under the
 # ceiling once clamped.
-cases=$((cases+1))
 mk_meminfo 3000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 8000000 5000000 3000000 63%% /tmp\n' > "$T/df-clamp.txt"
 out="$(run_guard "false" --df-cmd "cat $T/df-clamp.txt" 2>&1)" && rc=0 || rc=$?

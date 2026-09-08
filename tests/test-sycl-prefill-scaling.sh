@@ -99,8 +99,10 @@ mk_meminfo 3000000
 # --df-cmd true: tmpfs usage 0 kB, so the fake Shmem above is never clamped
 # or contested by this host's real tmpfs (test-bench-guard.sh's own
 # hermeticity guard, same reasoning). --journalctl-cmd true: a clean "no
-# kernel fault" answer, matching tests/test-sycl-decode-mode-capture.sh:225
-# -- without it, every invocation below shells out to this host's REAL
+# kernel fault" answer, matching the same hook in
+# tests/test-sycl-decode-mode-capture.sh's own run_capture helper (cited by
+# symbol, not a line number, since line numbers drift) -- without it, every
+# invocation below shells out to this host's REAL
 # `journalctl -k`, which is harmless only by accident and becomes a live
 # flake risk the moment a run's own postflight check starts to matter
 # (llama.cpp-y3z0 spec review round 1 finding 6).
@@ -178,11 +180,13 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
 
 cases=$((cases+1))
 # --- Case 1: the real 2026-09-04 collapse numbers (B70 Mistral 7B Q4_0),
-# docs/backend/sycl-perf-baselines.md line 156: pp128=1315 pp512=3320
-# pp1024=1437 pp2048=1474. ratio1024 = 1437/3320 = 0.4328..., far under the
-# 0.9 floor -- this is the exact regression the gate exists to keep visible,
-# not a synthetic number. Single pair via --only, and the printed table must
-# carry all four values plus the low ratio.
+# docs/backend/sycl-perf-baselines.md's "2026-09-04 snapshot" section (cited
+# by name, not a line number, since that section has since been demoted to
+# history): pp128=1315 pp512=3320 pp1024=1437 pp2048=1474. ratio1024 =
+# 1437/3320 = 0.4328..., far under the 0.9 floor -- this is the exact
+# regression the gate exists to keep visible, not a synthetic number. Single
+# pair via --only, and the printed table must carry all four values plus
+# the low ratio.
 BENCH1="$T/fake-bench-collapse.sh"
 mk_fake_bench "$BENCH1" "1315.00" "3320.00" "1437.00" "1474.00"
 out="$("$SCALING" --bench "$BENCH1" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
