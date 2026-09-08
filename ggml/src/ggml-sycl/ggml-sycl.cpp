@@ -15867,6 +15867,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_ubatch     = inventory->n_ubatch;
     g_placement_kv_info.n_swa        = inventory->n_swa;
     g_placement_kv_info.n_swa_layers = inventory->n_swa_layers;
+    g_placement_kv_info.n_head       = inventory->n_head_max;
     if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
         g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
                                                   inventory->swa_layer_mask + inventory->swa_layer_mask_count);

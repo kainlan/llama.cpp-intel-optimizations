@@ -2208,7 +2208,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 
     # Host-only companion to the gate above: pure-function coverage of
-    # onednn_graph_scratch_zone_floor_bytes()'s context-derived floor formula
+    # onednn_graph_scratch_zone_floor_bytes()'s shape-derived floor formula
     # (llama.cpp-0oxf), exercised through its exported test wrapper
     # (ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes() -- the real
     # function has internal linkage). No device needed; it still links

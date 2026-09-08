@@ -1,19 +1,24 @@
-// Host-only gate for llama.cpp-0oxf: the context-derived Graph-scratch zone
+// Host-only gate for llama.cpp-0oxf: the shape-derived Graph-scratch zone
 // floor formula in unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes().
 //
-// No SYCL device is needed -- this is a pure function of an env var and an
-// integer, tested through its exported wrapper
+// No SYCL device is needed -- this is a pure function of an env var and
+// three integers, tested through its exported wrapper
 // (ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(); the real function
 // has internal linkage, see its declaration in unified-cache.hpp).
 //
-// WHY THIS EXISTS. The pre-0oxf floor was a flat 64 MiB, which this ticket's
-// bisect showed does not fit a real 144 MB request at n_kv=8192 (that request
-// is exactly why the DIRECT path -- and the bug it could trigger -- exists at
-// all). The replacement floor is context-derived: floor(n_ctx) = max(64 MiB,
-// a + b*n_ctx), anchored so floor(8192) == 144 MiB (the one measured point;
-// see the PROVISIONAL constants comment in unified-cache.cpp for why this is
-// an anchor, not a fit, and what should replace it once the lead's
-// pp2048/4096/8192 sweep exists).
+// WHY THIS EXISTS, AND WHY THE FORMULA TAKES THREE ARGUMENTS NOT ONE. The
+// pre-0oxf floor was a flat 64 MiB. A first revision of this fix anchored a
+// floor to n_ctx alone, which turned out to be the wrong independent
+// variable: measurement (task llama.cpp-0oxf, comment c-xcop) showed the
+// oneDNN Graph-scratch request is the PEAK OUTSTANDING size across however
+// many compiled SDPA partitions are concurrently alive, proportional to
+// n_head x n_ubatch x n_ctx, not n_ctx in isolation --
+//   graph_peak = c * n_head * n_ubatch * n_ctx * sizeof(f32), c = 1.5
+// (c=1.5, not 1.0, because ~5 SDPA scratch buffers were measured
+// concurrently in flight even on an idle host). Five Mistral 7B Q4_0
+// (n_head=32) measurements matched this to the exact byte across two
+// different axes (n_ubatch AND n_ctx varied independently) -- see the test
+// cases below, which reproduce all five.
 //
 // TWO PROCESSES, NOT TWO MODES IN ONE. onednn_graph_scratch_zone_floor_bytes()
 // memoizes GGML_SYCL_ONEDNN_GRAPH_ZONE_MB via a function-local `static const`
@@ -54,30 +59,51 @@ void check(bool ok, const char * what) {
 constexpr size_t kMiB = 1024ull * 1024ull;
 
 void test_default_formula() {
-    printf("Context-derived floor (no override):\n");
+    printf("Shape-derived floor (no override):\n");
 
-    const size_t floor_0 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(0);
-    check(floor_0 == 64 * kMiB, "floor(n_ctx=0) is exactly the 64 MiB minimum");
+    // The floor at an all-zero shape (no model planned yet) must still
+    // respect the historical 64 MiB minimum -- 0 * anything == 0, which the
+    // max(64 MiB, ...) half of the formula must catch.
+    const size_t floor_zero = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(0, 0, 0);
+    check(floor_zero == 64 * kMiB, "floor(0, 0, 0) is exactly the 64 MiB minimum");
 
-    // The one anchor this formula is built from (see the PROVISIONAL
-    // constants comment in unified-cache.cpp): a real 144 MB request was
-    // measured at n_kv=8192. If this ever fails, either the anchor changed
-    // (update it deliberately, with a new measurement) or the formula
-    // regressed to something that no longer covers the request that
-    // motivated this whole ticket.
-    const size_t floor_8192 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(8192);
-    check(floor_8192 == 144 * kMiB, "floor(n_ctx=8192) matches the measured 144 MB anchor exactly");
+    // The five Mistral 7B Q4_0 (n_head=32) measurements this formula is
+    // fit to (task llama.cpp-0oxf, comment c-xcop) -- varying n_ubatch AND
+    // n_ctx independently, all five matching to the exact byte. If any of
+    // these ever fails, either the measurement was deliberately superseded
+    // (update it with a citation) or the formula regressed.
+    struct case_t {
+        uint32_t     n_head;
+        uint32_t     n_ubatch;
+        uint32_t     n_ctx;
+        size_t       expect_mib;
+        const char * what;
+    };
 
-    const size_t floor_2048 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(2048);
-    const size_t floor_4096 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(4096);
-    check(floor_2048 >= 64 * kMiB, "floor(2048) never drops below the 64 MiB minimum");
-    check(floor_2048 < floor_4096 && floor_4096 < floor_8192,
-          "the floor is strictly increasing with n_ctx between the measured points");
+    const case_t cases[] = {
+        { 32, 512, 512,  48,  "Mistral (n_head=32) @ ubatch=512 ctx=512 -> 48 MiB"   },
+        { 32, 512, 2048, 192, "Mistral (n_head=32) @ ubatch=512 ctx=2048 -> 192 MiB" },
+        { 32, 512, 8192, 768, "Mistral (n_head=32) @ ubatch=512 ctx=8192 -> 768 MiB" },
+        { 32, 256, 2048, 96,  "Mistral (n_head=32) @ ubatch=256 ctx=2048 -> 96 MiB"  },
+        { 32, 128, 2048, 48,  "Mistral (n_head=32) @ ubatch=128 ctx=2048 -> 48 MiB"  },
+    };
+    for (const case_t & c : cases) {
+        const size_t got = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(c.n_head, c.n_ubatch, c.n_ctx);
+        check(got == c.expect_mib * kMiB, c.what);
+    }
 
-    // A tiny n_ctx must not UNDERCUT the historical 64 MiB floor -- the
-    // "max(64 MiB, ...)" half of the formula, independent of the slope.
-    const size_t floor_1 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(1);
-    check(floor_1 >= 64 * kMiB, "floor(n_ctx=1) still respects the 64 MiB minimum");
+    // Monotonic in each axis independently -- a structural property the
+    // exact-byte cases above don't directly exercise pairwise.
+    const size_t floor_ub256 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 256, 2048);
+    const size_t floor_ub512 = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 2048);
+    check(floor_ub256 < floor_ub512, "the floor increases with n_ubatch at fixed n_head/n_ctx");
+    const size_t floor_ctx2k = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 2048);
+    const size_t floor_ctx8k = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 8192);
+    check(floor_ctx2k < floor_ctx8k, "the floor increases with n_ctx at fixed n_head/n_ubatch");
+
+    // A tiny shape must not undercut the historical 64 MiB floor.
+    const size_t floor_tiny = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(1, 1, 1);
+    check(floor_tiny >= 64 * kMiB, "floor(1, 1, 1) still respects the 64 MiB minimum");
 }
 
 void test_override() {
@@ -90,12 +116,12 @@ void test_override() {
     check(env != nullptr && std::strcmp(env, "99") == 0,
           "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99 is set (ctest ENVIRONMENT) before the first call");
 
-    // The override must win regardless of n_ctx -- it is an escape hatch for
+    // The override must win regardless of shape -- it is an escape hatch for
     // "the formula is wrong for my workload right now", not a formula input.
-    const size_t floor_small = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(0);
-    const size_t floor_large = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(1u << 20);
-    check(floor_small == 99 * kMiB, "override wins at n_ctx=0");
-    check(floor_large == 99 * kMiB, "override wins at a huge n_ctx too (the formula's slope is bypassed entirely)");
+    const size_t floor_small = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(0, 0, 0);
+    const size_t floor_large = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(128, 4096, 1u << 20);
+    check(floor_small == 99 * kMiB, "override wins at an all-zero shape");
+    check(floor_large == 99 * kMiB, "override wins at a huge shape too (the formula is bypassed entirely)");
 }
 
 }  // namespace

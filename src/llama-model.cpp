@@ -356,6 +356,17 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     }
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
+
+    // llama.cpp-0oxf: max query-head count across all layers, for the
+    // oneDNN Graph-scratch zone floor (proportional to n_head x n_ubatch x
+    // n_ctx -- see unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes()).
+    // Max rather than hparams.n_head() (layer 0 only) because a handful of
+    // architectures vary head count by layer.
+    uint32_t n_head_max = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        n_head_max = std::max(n_head_max, hparams.n_head(il));
+    }
+    inventory.n_head_max = n_head_max;
 }
 
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,

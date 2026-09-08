@@ -275,7 +275,7 @@ not attempt), so it stays a flat floor rather than a formula.
 `GGML_SYCL_ONEDNN_CACHE_ALLOCATOR=0` opts out of the whole allocator (back to
 oneDNN's default, for A/B).
 
-### The DIRECT path must be bounded, and the ONEDNN zone floor is now context-derived (llama.cpp-0oxf)
+### The DIRECT path must be bounded, and the ONEDNN zone floor is now shape-derived (llama.cpp-0oxf)
 
 The flat 64 MiB floor above was still too small for a real workload: at
 n_kv up to 8192 (a long-prompt Mistral 7B Q4_0 `llama-bench` run), every
@@ -306,19 +306,53 @@ whatever a floor formula under-estimates, and a bounded DIRECT path with no
 floor improvement would just abort sooner on exactly the workload this
 ticket reproduced on:
 
-- **The ONEDNN zone floor is now context-derived**, not flat.
-  `onednn_graph_scratch_zone_floor_bytes()` computes
-  `floor(n_ctx) = max(64 MiB, a + b*planner_n_ctx)`, fed by
-  `unified_cache_set_planned_onednn_graph_scratch_n_ctx()` at the same
+- **The ONEDNN zone floor is now shape-derived**, not flat, and NOT
+  context-alone — an earlier version of this fix anchored the floor to
+  `n_ctx` in isolation, which the ticket's own follow-up measurement (comment
+  c-xcop) showed was the wrong model: the same 144 MB request appeared at
+  n_kv 2048, 4096 AND 8192 on Mistral 7B Q4_0's default ubatch, but a
+  *smaller* request at a smaller ubatch and the *same* n_kv — meaning
+  `n_ubatch` drives the size just as much as `n_ctx` does. Tracing
+  `build_and_compile_sdpa()` (`fattn-onednn.cpp`) explains why: the
+  intermediate f32 tensors oneDNN's fused SDPA partition must materialize
+  carry `score_dims = {batch, H_q, ncols, ne11}` (or the 5-D GQA equivalent),
+  where `ncols` is the per-call query-row count (`key.ncols = active_params.ne01`,
+  i.e. the ubatch) and `ne11` is the per-call KV length
+  (`key.ne11 = active_params.ne11`) — every distinct `(ncols, ne11, H_q, ...)`
+  combination compiles its OWN partition via `sdpa_partition_cache`, and each
+  can request its own scratch the first time it executes.
+  `onednn_graph_scratch_zone_floor_bytes()` now computes
+  `floor = max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x sizeof(f32))`, where
+  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently in
+  flight even on an idle host (the quantity the zone must actually hold is
+  the PEAK OUTSTANDING size across whichever of those shapes are alive at
+  once, not one request in isolation). `n_head` (max query-head count across
+  layers) is threaded in from `hparams.n_head(il)` at
+  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through the
+  `ggml_sycl_tensor_inventory.n_head_max` ABI field (new, appended at the end
+  of the struct so every existing zero-init call site stays correct),
+  `placement_kv_info::n_head`, and `placement_plan::planner_n_head`, mirroring
+  how `n_ubatch`/`n_ctx` already flow through those same three layers. Fed by
+  `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
   "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
-  `unified-cache.cpp`) that already knows `plan.planner_n_ctx`. The constants
-  are marked PROVISIONAL in that function's own comment: they are anchored so
-  `floor(8192) == 144 MB` (the one point this ticket's bisect actually
-  measured), not fit to a real sweep — replace them once pp2048/4096/8192
-  request sizes have been measured via the `GGML_SYCL_DEBUG`-gated print
-  `onednn_graph_scratch_alloc()` now emits for every request (rate-limited to
-  the first 64 per process). `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
-  overrides the formula, unchanged from before.
+  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head=32) measurements
+  spanning two independent axes (48/192/768 MB at ubatch 512 and n_ctx
+  512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch 256/128) — all five match
+  to the exact byte; a sixth gemma4 (n_head=8) point did not
+  (predicted 192 MB, measured 24 MB) and is recorded rather than silently
+  dropped, since the formula is fit to and verified against the Mistral
+  points specifically. `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
+  overrides the formula, unchanged from before. The planned zone (pair +
+  floor) is further clamped to 25% of the device's available budget —
+  floored at the primitive-API pair's own bare requirement, since that pair
+  has no DIRECT-path fallback of its own and clamping below its needs would
+  starve the GEMM path rather than just the Graph-scratch floor — logging a
+  `[VRAM-ARENA]` `GGML_LOG_WARN` naming the shortfall once if this triggers;
+  the DIRECT path (next bullet) absorbs whatever the clamp removes. The
+  per-request debug print in `onednn_graph_scratch_alloc()`
+  (`GGML_SYCL_DEBUG`) is now gated on "differs from the last size printed"
+  rather than a first-64 count, so a long run correlating shapes against
+  sizes never goes silent partway through.
 - **The DIRECT path itself is now bounded and fails loudly instead of
   silently.** `onednn_graph_scratch_alloc()` tracks outstanding DIRECT bytes
   in a small local ledger (`onednn_graph_scratch_pending_release_`:

@@ -468,6 +468,9 @@ struct placement_kv_info {
     uint32_t          n_embd_v_gqa     = 0;
     uint32_t          n_ctx            = 0;
     uint32_t          n_ubatch         = 512;  // Physical batch size (for SWA KV sizing)
+    // llama.cpp-0oxf: max query-head count across all layers (0 if unknown/unset).
+    // Feeds the oneDNN Graph-scratch zone floor -- see placement_plan::planner_n_head.
+    uint32_t          n_head           = 0;
     bool              n_ctx_is_runtime = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
@@ -546,6 +549,9 @@ struct placement_plan {
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
     bool                         planner_n_ctx_is_runtime = false;
+    // llama.cpp-0oxf: max query-head count across all layers, threaded from
+    // placement_kv_info::n_head. Feeds onednn_graph_scratch_zone_floor_bytes().
+    uint32_t                                   planner_n_head           = 0;
     // Component-wise maxima by actual device owner. Materialization consumes
     // these values later; allocation handles never belong in this plan.
     std::vector<moe_mmid_owner_workspace_plan> moe_mmid_workspaces;
@@ -1303,11 +1309,25 @@ void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t
 //     which question it is asking.
 size_t   unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 size_t   unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
-// llama.cpp-0oxf: planner_n_ctx recorded alongside the scratchpad bytes above,
-// feeding onednn_graph_scratch_zone_floor_bytes()'s context-derived floor (see
-// unified-cache.cpp). 0 means "never planned for this device".
-void     unified_cache_set_planned_onednn_graph_scratch_n_ctx(int device_id, uint32_t n_ctx);
-uint32_t unified_cache_get_planned_onednn_graph_scratch_n_ctx(int device_id);
+
+// llama.cpp-0oxf: the SDPA shape (max query-head count, ubatch size, context
+// length) recorded alongside the scratchpad bytes above, feeding
+// onednn_graph_scratch_zone_floor_bytes()'s shape-derived floor (see
+// unified-cache.cpp) -- the Graph-scratch request is proportional to
+// n_head x n_ubatch x n_ctx, not n_ctx alone (correction on the ticket after
+// an earlier version of this fix got that wrong). All-zero means "never
+// planned for this device".
+struct onednn_graph_scratch_planned_shape {
+    uint32_t n_head   = 0;
+    uint32_t n_ubatch = 0;
+    uint32_t n_ctx    = 0;
+};
+
+void                               unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
+                                                                                        uint32_t n_head,
+                                                                                        uint32_t n_ubatch,
+                                                                                        uint32_t n_ctx);
+onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id);
 
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: test-only hooks for onednn_graph_scratch_alloc()'s DIRECT
@@ -1344,7 +1364,7 @@ bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 // -- reads GGML_SYCL_ONEDNN_GRAPH_ZONE_MB the same way the real call site
 // does, memoized on first call within the process (set the env var before
 // the first call in a test).
-size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx);
+size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 #endif
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,

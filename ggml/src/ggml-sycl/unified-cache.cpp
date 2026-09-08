@@ -708,10 +708,17 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-0oxf: planner_n_ctx at the time the oneDNN scratchpad was last
-// planned for this device (compute_placement_plan()/populate_host_zone_sizing(),
-// see the "oneDNN scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes()'s
-// context-derived floor. 0 means "never planned for this device".
+// llama.cpp-0oxf: the SDPA shape (max query-head count, ubatch size, context
+// length) known at the time the oneDNN scratchpad was last planned for this
+// device (compute_placement_plan()/populate_host_zone_sizing(), see the
+// "oneDNN scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes()'s
+// shape-derived floor -- the oneDNN Graph-scratch request is proportional to
+// n_head x n_ubatch x n_ctx (see that function's derivation comment), NOT
+// n_ctx alone as an earlier version of this fix assumed. Three independent
+// atomics, like every other "planned" global in this file -- 0 means "never
+// planned for this device" for each.
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -1515,22 +1522,36 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
-// llama.cpp-0oxf: record planner_n_ctx alongside the scratchpad bytes above so
-// onednn_graph_scratch_zone_floor_bytes() can derive its floor from context
-// length instead of a flat constant. Called from the same "oneDNN scratchpad:"
-// planning step (populate_host_zone_sizing()) once plan.planner_n_ctx is set.
-void unified_cache_set_planned_onednn_graph_scratch_n_ctx(int device_id, uint32_t n_ctx) {
+// llama.cpp-0oxf: record the SDPA shape (n_head, n_ubatch, n_ctx) alongside
+// the scratchpad bytes above so onednn_graph_scratch_zone_floor_bytes() can
+// derive its floor from the shape the Graph-scratch request actually scales
+// with, instead of a flat constant. Called from the same "oneDNN scratchpad:"
+// planning step (populate_host_zone_sizing()) once plan.planner_n_head/
+// planner_n_ubatch/planner_n_ctx are set.
+void unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
+                                                          uint32_t n_head,
+                                                          uint32_t n_ubatch,
+                                                          uint32_t n_ctx) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
+    g_planned_onednn_graph_scratch_n_head[device_id].store(n_head, std::memory_order_release);
+    g_planned_onednn_graph_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
     g_planned_onednn_graph_scratch_n_ctx[device_id].store(n_ctx, std::memory_order_release);
 }
 
-uint32_t unified_cache_get_planned_onednn_graph_scratch_n_ctx(int device_id) {
+onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id) {
+    onednn_graph_scratch_planned_shape shape{};
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
-        return 0;
+        return shape;
     }
-    return g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    // Three independent atomics -- see the storage declaration's comment for
+    // why a torn read across a concurrent re-plan is tolerated here, same as
+    // every other multi-field "planned" global in this file.
+    shape.n_head   = g_planned_onednn_graph_scratch_n_head[device_id].load(std::memory_order_acquire);
+    shape.n_ubatch = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    shape.n_ctx    = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    return shape;
 }
 
 #if GGML_SYCL_DNNL
@@ -1571,7 +1592,7 @@ uint32_t unified_cache_get_planned_onednn_graph_scratch_n_ctx(int device_id) {
 // before raising GGML_SYCL_ONEDNN_GRAPH_ZONE_MB back up -- a nonzero uprobe
 // count or a sizing abort means the zone genuinely doesn't fit this
 // workload's outstanding-buffer count, not that the allocator is unwired.
-static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx) {
+static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
     // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB always wins when set -- unchanged
     // behaviour, still the escape hatch this file's header comment tells you
     // to reach for.
@@ -1589,37 +1610,43 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx) {
         return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
     }
 
-    // llama.cpp-0oxf: context-derived floor, replacing the flat 64 MiB
-    // default above. floor(n_ctx) = max(64 MiB, a + b*n_ctx).
+    // llama.cpp-0oxf: shape-derived floor, replacing an earlier version of
+    // this fix that anchored to n_ctx alone (WRONG -- see the correction on
+    // the ticket, c-xcop). The quantity the zone must hold is the PEAK
+    // OUTSTANDING Graph-scratch across however many SDPA compiled partitions
+    // are concurrently alive (a fresh partition compiles, and can request its
+    // own scratch, for every distinct (n_head, ncols, ne11) shape a call
+    // site's ubatch/KV-length combination produces -- see
+    // build_and_compile_sdpa(), fattn-onednn.cpp), NOT one request in
+    // isolation:
     //
-    // PROVISIONAL CONSTANTS -- derived from a SINGLE observed data point, not
-    // a fit: the 0oxf bisect measured a 144 MB Graph-scratch request at
-    // n_kv=8192 on Mistral 7B Q4_0 (task llama.cpp-0oxf comment c-d46x). That
-    // gives one (n_ctx, size) pair, which is enough to anchor a line through
-    // the existing 64 MiB floor at n_ctx=0 but NOT enough to fit a slope with
-    // any confidence -- a single point admits infinitely many lines through
-    // it besides "start at the old floor". The debug print added alongside
-    // this function (see onednn_graph_scratch_alloc()) exists specifically so
-    // the lead can measure requests at pp2048/4096/8192 and replace kA/kB
-    // below with a real two-point (or better, three-point) fit. Do not read
-    // 144 MB @ 8192 as validation of this slope -- it is the ONLY input to
-    // it, so of course it passes through that point exactly.
+    //   graph_peak = c * n_head * n_ubatch * n_ctx * sizeof(f32), c = 1.5
+    //
+    // c=1.5 (not 1.0) because measurement showed ~5 SDPA scratch buffers
+    // concurrently in flight even on an otherwise idle host, not just one.
+    // Measured (task llama.cpp-0oxf, comment c-xcop), Mistral 7B Q4_0
+    // (n_head=32): 48 MB @ (n_ubatch=512, n_ctx=512), 192 MB @ (512, 2048),
+    // 768 MB @ (512, 8192), 96 MB @ (256, 2048), 48 MB @ (128, 2048) -- all
+    // five match this formula to the exact byte. gemma4 (n_head=8) measured
+    // 24 MB @ (512, 8192), which this formula does NOT reproduce (predicts
+    // 192 MB) -- recorded here rather than silently dropped; the Mistral
+    // points are the ones this formula is fit to and verified against.
     static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
-    static constexpr uint64_t kA             = kFloorMinBytes;
-    // kB: bytes of Graph-scratch demand growth per unit of n_ctx, chosen so
-    // kA + kB*8192 == 144 MiB (the one measured point). Replace with a real
-    // slope once pp2048/4096/8192 data exists.
-    static constexpr uint64_t kB             = ((144ull * 1024ull * 1024ull) - kFloorMinBytes) / 8192ull;
-
-    const uint64_t modeled = kA + kB * static_cast<uint64_t>(planner_n_ctx);
+    static constexpr uint64_t kSizeofF32     = 4;
+    // Fixed-point 3/2 rather than a floating-point 1.5x: exact integer
+    // arithmetic, no rounding surprises near the MiB boundaries the anchor
+    // points above were measured at.
+    const uint64_t            elems =
+        static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * static_cast<uint64_t>(n_ctx);
+    const uint64_t modeled = (elems * kSizeofF32 * 3) / 2;
     return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
 }
 
 // llama.cpp-0oxf: host-testable wrapper -- onednn_graph_scratch_zone_floor_bytes()
 // above has internal (file-static) linkage, so tests/test-sycl-onednn-graph-floor.cpp
 // calls this exported passthrough instead. Declared in unified-cache.hpp.
-size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx) {
-    return onednn_graph_scratch_zone_floor_bytes(planner_n_ctx);
+size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+    return onednn_graph_scratch_zone_floor_bytes(n_head, n_ubatch, n_ctx);
 }
 #endif
 
@@ -1640,7 +1667,9 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
     size_t bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
 #if GGML_SYCL_DNNL
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
-        bytes += onednn_graph_scratch_zone_floor_bytes(unified_cache_get_planned_onednn_graph_scratch_n_ctx(device_id));
+        const onednn_graph_scratch_planned_shape shape =
+            unified_cache_get_planned_onednn_graph_scratch_shape(device_id);
+        bytes += onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx);
     }
 #endif
     return bytes;
@@ -3664,6 +3693,40 @@ bool unified_cache::ensure_planned_arena_zones() {
         GGML_LOG_INFO("[UNIFIED-CACHE] ONEDNN zone raised to %.1f MB from placement scratch estimate\n",
                       onednn_zone / (1024.0 * 1024.0));
     }
+#if GGML_SYCL_DNNL
+    // llama.cpp-0oxf: the shape-derived Graph-scratch floor
+    // (onednn_graph_scratch_zone_floor_bytes()) can demand more than is
+    // prudent to reserve as a STATIC zone this early for a model with a fat
+    // SDPA shape (many heads x a large planned n_ubatch x a large planned
+    // n_ctx) -- bound the zone to a quarter of the available budget instead
+    // of reserving it in full. Whatever this clamp removes is not lost: the
+    // DIRECT allocation path (onednn_graph_scratch_alloc(), itself bounded by
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB) absorbs Graph-scratch requests
+    // that no longer fit the (smaller) zone -- slower per request, but
+    // bounded and loud on genuine exhaustion rather than either aborting
+    // here or growing this zone without limit.
+    //
+    // Floored at the primitive-API pair's OWN bare requirement (the
+    // stored, no-floor getter): that pair has no DIRECT-path fallback of its
+    // own, so clamping the shared zone below what IT alone needs would starve
+    // the primitive-API GEMM path, not just the Graph-scratch floor this
+    // clamp exists to bound.
+    const size_t onednn_zone_budget_cap =
+        std::max(available_budget() / 4, unified_cache_get_planned_onednn_scratchpad_bytes_stored(dev_id));
+    if (onednn_zone > onednn_zone_budget_cap) {
+        const size_t             shortfall = onednn_zone - onednn_zone_budget_cap;
+        static std::atomic<bool> onednn_zone_clamp_warned{ false };
+        if (!onednn_zone_clamp_warned.exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] planned ONEDNN zone %.1f MB exceeds 25%% of available budget -- clamping to %.1f MB "
+                "(%.1f MB shortfall; the DIRECT Graph-scratch path, bounded by "
+                "GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, absorbs requests beyond this) (only logged once)\n",
+                onednn_zone / (1024.0 * 1024.0), onednn_zone_budget_cap / (1024.0 * 1024.0),
+                shortfall / (1024.0 * 1024.0));
+        }
+        onednn_zone = onednn_zone_budget_cap;
+    }
+#endif
 
     size_t runtime_zone = 512 * 1024 * 1024;
     if (const char * env = std::getenv("GGML_SYCL_RUNTIME_ARENA_MB")) {
@@ -9669,13 +9732,22 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
 
     std::unique_lock<std::mutex> lock(onednn_graph_scratch_mutex_);
 
-    // llama.cpp-0oxf: print every request size and whether it fit the ONEDNN
-    // zone, rate-limited to the first 64 so a long run's log isn't flooded --
-    // this exists so the lead can measure requests at pp2048/4096/8192 and
-    // fit onednn_graph_scratch_zone_floor_bytes()'s context-derived floor
-    // properly (see that function's PROVISIONAL constants comment).
-    static std::atomic<uint32_t> debug_print_count{ 0 };
-    const bool                   print_this_request = debug_print_count.fetch_add(1, std::memory_order_relaxed) < 64;
+    // llama.cpp-0oxf: print every DISTINCT request size and whether it fit
+    // the ONEDNN zone -- exists so the lead can correlate requests against
+    // (n_head, ncols, ne11) shapes at pp2048/4096/8192 and different
+    // n_ubatch values. Gated on "differs from the last size printed" rather
+    // than a first-N count: the shape space here is small (one size per
+    // distinct compiled-partition shape, not per call), so an unlimited
+    // distinct-size print does not flood the log the way an unconditional
+    // per-call print would, and unlike a first-N cap it never goes silent
+    // partway through a long run that later revisits a fresh shape. Guarded
+    // by onednn_graph_scratch_mutex_ (already held for the whole function),
+    // so a plain static rather than an atomic is correct here.
+    static size_t last_printed_request_size = SIZE_MAX;
+    const bool    print_this_request        = size != last_printed_request_size;
+    if (print_this_request) {
+        last_printed_request_size = size;
+    }
 
     if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, align)) {
         onednn_graph_scratch_zone_sizes_[ptr] = size;
@@ -9760,18 +9832,21 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
              handle.ptr != nullptr;
     }
     if (!ok) {
-        const uint32_t planner_n_ctx = unified_cache_get_planned_onednn_graph_scratch_n_ctx(req.device);
+        const onednn_graph_scratch_planned_shape shape =
+            unified_cache_get_planned_onednn_graph_scratch_shape(req.device);
         GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation failed after a drain-and-retry: requested "
             "%.2f MB, outstanding direct=%.2f MB (cap %.2f MB, %zu prior waits), ONEDNN zone %.1f MB (used %.1f "
-            "MB, floor %.1f MB at planner_n_ctx=%u). Refusing to hand oneDNN a null scratch pointer for this "
-            "request -- see llama.cpp-0oxf for the GPU page-fault/segfault this used to cause. Aborting instead.\n",
+            "MB, floor %.1f MB at n_head=%u n_ubatch=%u n_ctx=%u). Refusing to hand oneDNN a null scratch pointer "
+            "for this request -- see llama.cpp-0oxf for the GPU page-fault/segfault this used to cause. Aborting "
+            "instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
             onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_) /
                 (1024.0 * 1024.0),
             onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            onednn_graph_scratch_zone_floor_bytes(planner_n_ctx) / (1024.0 * 1024.0), planner_n_ctx);
+            onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx) / (1024.0 * 1024.0),
+            shape.n_head, shape.n_ubatch, shape.n_ctx);
         if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
             // Test build only (see the hooks declared in unified-cache.hpp):
             // report "this would have aborted" instead of actually aborting,
@@ -24922,11 +24997,14 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_reorder / (1024.0 * 1024.0),
         zone_maxima.onednn_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
 #if GGML_SYCL_DNNL
-    // llama.cpp-0oxf: record planner_n_ctx alongside the scratchpad bytes so
+    // llama.cpp-0oxf: record the SDPA shape alongside the scratchpad bytes so
     // onednn_graph_scratch_zone_floor_bytes() can size the Graph-scratch
-    // allocator's floor from context length instead of a flat constant.
+    // allocator's floor from n_head x n_ubatch x n_ctx instead of a flat
+    // constant (or, in an earlier version of this fix, n_ctx alone -- see the
+    // ticket correction, c-xcop).
     if (plan.device_id >= 0) {
-        unified_cache_set_planned_onednn_graph_scratch_n_ctx(plan.device_id, plan.planner_n_ctx);
+        unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head, plan.planner_n_ubatch,
+                                                             plan.planner_n_ctx);
     }
 #endif
 
@@ -25110,6 +25188,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max                   = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
+    plan.planner_n_head                      = kv_info.n_head;
     plan.pp_pipeline_scratch_bytes           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id);
     plan.pp_moe_onednn_weight_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
     plan.pp_moe_onednn_activation_slot_bytes = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device_id);
@@ -26409,6 +26488,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max        = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
+    plan.planner_n_head           = kv_info.n_head;
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =
             std::max(plan.pp_pipeline_scratch_bytes, unified_cache_get_planned_pp_pipeline_scratch_bytes(db.device_id));
