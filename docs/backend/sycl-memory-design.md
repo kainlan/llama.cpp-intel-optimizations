@@ -412,11 +412,11 @@ ticket reproduced on:
   live in the pool indefinitely) — it is still real resident VRAM, just idle
   — so the pool cannot grow without limit alongside fresh allocations; it
   competes with them for the same `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
-  headroom (default:
-  min(1 GiB, 25% of `available_budget()` snapshotted the last time this
-  device's arena was successfully planned — a snapshot, not a live read, so
-  the cap does not shrink out from under the allocator as the arena's own
-  zones consume the budget it was planned against). A request that cannot be
+  headroom (default: min(1 GiB, 25% of `available_budget()` snapshotted the
+  last time this device's arena was successfully planned — a snapshot, not a
+  live read, so the cap does not shrink out from under the allocator as the
+  arena's own zones consume the budget it was planned against).
+  A request that cannot be
   served from the pool and would exceed the cap evicts (a REAL release,
   destructing the owned `mem_handle`) completed pool entries — of any size,
   including the requested size's own bucket (a same-size entry that is
@@ -441,11 +441,11 @@ ticket reproduced on:
   also caps each size bucket at `onednn_graph_scratch_pool_depth_per_size()`
   entries (default **8**, env `GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE`)
   — a workload that walks many distinct sizes (a pp8192 run touches ~16
-  distinct ne11-derived shapes)
-  cannot grow the pool's footprint without limit just because each
-  individual size stays under the byte cap; a size whose bucket is already
-  at the depth limit releases the overflow buffer for real via the shared
-  event-gated drain path instead of parking it. Because the pool is a
+  distinct ne11-derived shapes) cannot grow the pool's footprint without
+  limit just because each individual size stays under the byte cap; a size
+  whose bucket is already at the depth limit releases the overflow buffer
+  for real via the shared event-gated drain path instead of parking it.
+  Because the pool is a
   `unified_cache` member (survives across contexts and models), it is
   reclaimed (real release of every entry, `onednn_graph_scratch_reclaim_pool()`)
   at three points: cache teardown (`shutdown_resources()`), the point
