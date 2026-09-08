@@ -442,7 +442,7 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
-  - **The pool is bounded per size, and reclaimed at every point that could
+- **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
   also caps each size bucket at `onednn_graph_scratch_pool_depth_per_size()`

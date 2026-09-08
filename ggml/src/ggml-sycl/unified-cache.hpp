@@ -3012,14 +3012,15 @@ class unified_cache {
     // already finished. Zero if the allocator was never used this process.
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 
-    // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to wait
-    // for headroom to free up under the cap before it was allowed to
+    // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to
+    // wait for headroom to free up under the cap before it was allowed to
     // allocate -- polling until either exit condition is met: a same-size
     // entry in the request's own bucket becomes USABLE and can be reused
     // with nothing evicted, or the general eviction sweep frees enough
-    // headroom by releasing other in-flight entries. Exposed for tests and
-    // for the teardown log line; see the private ledger this counts against
-    // in the member declarations further below.
+    // headroom by releasing pooled entries of any size, including this
+    // one's, whose release events have completed. Exposed for tests and for
+    // the teardown log line; see the private ledger this counts against in
+    // the member declarations further below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
@@ -3059,19 +3060,18 @@ class unified_cache {
     // before log, same order as the body below and for the same reason
     // (logging first would under-report the summary by the pool's own live
     // contents at that moment). `context` names the call site for the log
-    // line (e.g. "context reclaim", "runtime
-    // context update"). Called internally at arena_reserve()'s context-
-    // reclaim branch; also called externally (via
-    // unified_cache_reclaim_onednn_graph_scratch_pool() below) from
-    // ggml_backend_sycl_set_runtime_context() -- a pooled buffer must not
-    // survive a runtime n_ctx/n_ubatch change any more than it should
-    // survive a full context/model teardown, since the shape it was sized
-    // for may no longer be requested again. Genuine cache teardown does NOT
-    // route through here: shutdown_resources() logs the teardown summary
-    // itself (ahead of its own early-return paths) and clears the pool
-    // directly, so every context this method is actually called with logs
-    // at INFO (a routine event -- a model switch or context resize, not
-    // once per process).
+    // line (e.g. "context reclaim", "runtime context update"). Called
+    // internally at arena_reserve()'s context-reclaim branch; also called
+    // externally (via unified_cache_reclaim_onednn_graph_scratch_pool()
+    // below) from ggml_backend_sycl_set_runtime_context() -- a pooled
+    // buffer must not survive a runtime n_ctx/n_ubatch change any more than
+    // it should survive a full context/model teardown, since the shape it
+    // was sized for may no longer be requested again. Genuine cache
+    // teardown does NOT route through here: shutdown_resources() logs the
+    // teardown summary itself (ahead of its own early-return paths) and
+    // clears the pool directly, so every context this method is actually
+    // called with logs at INFO (a routine event -- a model switch or
+    // context resize, not once per process).
     void onednn_graph_scratch_reclaim_pool(const char * context) {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         // Clear BEFORE logging, not after: logging first would under-report
