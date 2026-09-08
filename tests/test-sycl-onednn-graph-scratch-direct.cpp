@@ -325,12 +325,13 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     sycl::queue & q = cache->get_queue();
 
     // 310 MiB, not 360: this must stay UNDER the 350 MB cap main() sets via
-    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB -- a size over
-    // the cap makes both allocations below run the full
-    // kOnednnGraphDirectWaitTotalTimeoutMs give-up wait (measured: this test
-    // took 14.2 s instead of ~3.7 s) and log misleading "gave up waiting for
-    // headroom" ERRORs for a property this test isn't even exercising.
-    // Still distinct from kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, so both allocations below take
+    // the NORMAL pool path this test actually exercises (reclaim/pending-
+    // event handling) rather than the size>cap early-out
+    // (onednn_graph_scratch_wait_for_direct_headroom_locked(), llama.cpp-pqgl)
+    // -- that early-out has its own dedicated test below,
+    // test_oversized_request_skips_wait_loop(). Still distinct from
+    // kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
     constexpr size_t kSizeD = 310ull * 1024 * 1024;
 
     void * ptr = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
@@ -400,6 +401,52 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     }
 }
 
+// --- (e) a request larger than the cap takes the size>cap early-out, not
+//         the full poll-loop wait (llama.cpp-pqgl) --------------------------
+void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
+    printf("DIRECT path request larger than the cap skips the poll-loop wait:\n");
+
+    // Start from a clean pool: the eviction sweep this early-out now runs
+    // BEFORE (onednn_graph_scratch_evict_pool_until_fits_locked(), moved
+    // ahead of the early-out per review) must not have anything real to
+    // evict here -- this test is purely about the early-out itself, not
+    // eviction timing, which test_bounded_eviction above already covers.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup");
+
+    sycl::queue & q = cache->get_queue();
+
+    // main() sets the cap to 350 MB via GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB.
+    // 366 MiB is comfortably over that ON ITS OWN -- no amount of eviction
+    // (the pool is already empty above) or waiting could ever bring
+    // outstanding+size under the cap for this request.
+    constexpr size_t kSizeOversized = 366ull * 1024 * 1024;
+
+    g_captured_log.clear();
+    ggml_log_set(capture_log, nullptr);
+
+    const auto start = std::chrono::steady_clock::now();
+    void *     ptr   = cache->onednn_graph_scratch_alloc(kSizeOversized, 256, &q);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+    ggml_log_set(nullptr, nullptr);
+
+    check(ptr != nullptr,
+          "the oversized allocation still succeeds -- the cap bounds pooling/waiting, it is not a hard refusal");
+    // Comfortably under kOnednnGraphDirectWaitTotalTimeoutMs (5000 ms,
+    // unified-cache.cpp): if the early-out regressed back to running the
+    // full poll loop for a request that can never fit, this would instead
+    // take >= 5000 ms.
+    check(elapsed.count() < 2000, "the allocation returned well under the 5 s poll-loop timeout");
+    printf("    (elapsed=%lld ms)\n", static_cast<long long>(elapsed.count()));
+    check(contains(g_captured_log, "exceeds the") && contains(g_captured_log, "cap by itself"),
+          "the latched oversized-request ERROR was logged");
+
+    if (ptr) {
+        cache->onednn_graph_scratch_free(ptr, nullptr);
+    }
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -448,6 +495,7 @@ int main(int, char ** argv) {
     test_bounded_eviction(cache);
     test_loud_failure(cache);
     test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
+    test_oversized_request_skips_wait_loop(cache, device);
 
     ggml_backend_free(backend);
 

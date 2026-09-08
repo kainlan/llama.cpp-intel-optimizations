@@ -9967,11 +9967,24 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     const size_t cap = onednn_graph_scratch_direct_cap_bytes(
         onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
 
+    // Run the eviction sweep BEFORE the size>cap early-out below, even
+    // though a request larger than the cap can never make this call return
+    // true: for size > cap it returns false harmlessly, but it is not a
+    // no-op -- it still releases every event-complete pooled entry and
+    // decrements outstanding/pool bytes. Skipping it here (an earlier
+    // version of this fix did) would leave up to a whole cap's worth of
+    // idle pooled VRAM resident right before the fresh unified_alloc()
+    // below, which can turn a survivable oversized request into a genuine
+    // abort (llama.cpp-pqgl).
+    if (onednn_graph_scratch_evict_pool_until_fits_locked(size, cap)) {
+        return true;
+    }
+
     // A single request bigger than the whole cap can NEVER fit here no
-    // matter how long this function waits -- evicting the entire pool still
-    // leaves outstanding bytes at 0 < size, and a fresh poll iteration
-    // cannot change that. Without this early-out, such a request burned the
-    // full kOnednnGraphDirectWaitTotalTimeoutMs (5 s) poll loop below before
+    // matter how long this function waits -- a fresh poll iteration cannot
+    // change that once the sweep above has already evicted everything it
+    // can. Without this early-out, such a request burned the full
+    // kOnednnGraphDirectWaitTotalTimeoutMs (5 s) poll loop below before
     // alloc_direct_locked()'s caller-visible "gave up waiting" ERROR ever
     // fired, on every single call (llama.cpp-pqgl).
     if (size > cap) {
@@ -9979,16 +9992,13 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
             onednn_graph_scratch_oversized_request_logged_ = true;
             GGML_LOG_ERROR(
                 "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: requested %.2f MB exceeds the %.2f MB cap by "
-                "itself -- no amount of waiting or eviction can make this fit; skipping the poll loop and "
-                "attempting the allocation directly (only logged once; unified_alloc() below still fails loudly "
-                "rather than handing oneDNN a null scratch pointer)\n",
+                "itself -- already evicted everything the pool could release above; no amount of additional "
+                "waiting can make this fit, so skipping the poll loop and attempting the allocation directly "
+                "(only logged once; unified_alloc() below still fails loudly rather than handing oneDNN a null "
+                "scratch pointer)\n",
                 size / (1024.0 * 1024.0), cap / (1024.0 * 1024.0));
         }
         return false;
-    }
-
-    if (onednn_graph_scratch_evict_pool_until_fits_locked(size, cap)) {
-        return true;
     }
 
     // Per-instance member, not a function-local static -- see its
