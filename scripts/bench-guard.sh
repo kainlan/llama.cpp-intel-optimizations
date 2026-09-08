@@ -28,19 +28,24 @@
 # is printed to stderr. Either way bench-guard's own exit code always mirrors
 # the wrapped command's, never the verdict.
 #
-# Postflight SUSPECT triggers: Shmem grew more than 5 GB across the run, the
-# run was killed by the timeout (rc 124/137), the wrapped command exited 128
-# or higher (which for a bench means killed by a signal, e.g. 139 SIGSEGV --
-# a crashed bench is never a valid measurement), the kernel log itself could
-# not be read (a failing/missing --journalctl-cmd or journalctl error --
-# stamped `kernel-log-unreadable:rc=<N>`, never silently treated as zero
-# faults), or the kernel log shows a GT reset/guc_id/CAT error since the run
-# started. The kernel-log check counts matching lines (`grep -c`, never
+# Postflight SUSPECT triggers, each with its own reason token in the verdict
+# line and archived header: Shmem grew more than 5 GB across the run
+# (`shmem-grew:<N>kB`); the run was killed by the timeout
+# (`timeout-killed:rc=<N>`, rc 124/137); `timeout` itself could not execute
+# the wrapped command -- bad `timeout` invocation, command not executable, or
+# command not found (`not-executed:rc=<N>`, rc 125/126/127); the wrapped
+# command exited 128 or higher, which for a bench means killed by a signal,
+# e.g. 139 SIGSEGV -- a crashed bench is never a valid measurement
+# (`signal:rc=<N>`); the kernel log itself could not be read -- a
+# failing/missing --journalctl-cmd or a journalctl error, distinct from a
+# producer that legitimately exits 0 with no matching lines on a quiet host
+# (`kernel-log-unreadable:rc=<N>`); or the kernel log shows a GT
+# reset/guc_id/CAT error since the run started (`kernel-gpu-fault:<N>`, the
+# match count). The kernel-log check counts matching lines (`grep -c`, never
 # `grep -q`) rather than testing for a match, because `-q` exits at the first
 # hit and SIGPIPEs a still-writing `journalctl` producer; under
 # `set -o pipefail` that reads as pipeline failure and takes the VALID branch
-# on exactly the runs that have a fault to report (llama.cpp-m1ny). The match
-# count is stamped in the reason (`kernel-gpu-fault:<N>`) and in the header.
+# on exactly the runs that have a fault to report (llama.cpp-m1ny).
 # `--journalctl-cmd` is split on whitespace, unquoted, like every other
 # `*_CMD` override in this script -- a value that itself needs a quoted
 # argument (e.g. a `--since` timestamp with a space) must be wrapped in a
@@ -369,33 +374,32 @@ fi
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
     verdict="SUSPECT"
     reasons="$reasons timeout-killed:rc=$rc"
+elif [ "$rc" -ge 125 ] && [ "$rc" -le 127 ]; then
+    verdict="SUSPECT"
+    reasons="$reasons not-executed:rc=$rc"
 elif [ "$rc" -ge 128 ]; then
     verdict="SUSPECT"
     reasons="$reasons signal:rc=$rc"
 fi
-# Count form, never `-q`: `-q` exits at the first match, which SIGPIPEs a
-# still-writing journalctl and (under pipefail) reports pipeline failure
-# instead of a match -- the exact case that must be caught (llama.cpp-m1ny).
-# `grep -c` reads its input to completion, and `|| true` covers the
-# legitimate zero-match case so `set -e` doesn't trip on grep's rc=1.
 kernel_log() {
     if [ -n "$JOURNALCTL_CMD" ]; then $JOURNALCTL_CMD 2>/dev/null; else journalctl -k --since "10 minutes ago" --no-pager 2>/dev/null; fi
 }
 # The producer's own exit status is captured SEPARATELY from the match
 # count, via a plain command substitution rather than piping straight into
 # grep -- otherwise a missing/failing --journalctl-cmd (bad path, bad
-# --since, journalctl itself erroring) produces no lines, `grep -c` counts
-# that as zero matches, and the run stamps VALID exactly when the kernel log
-# could not be checked at all. `|| jl_rc=$?` keeps `set -e` from tripping on
-# the producer's own non-zero status, mirroring the `|| rc=$?` pattern used
-# for the wrapped command above.
+# --since, journalctl itself erroring) produces no lines, and there would be
+# no way to tell that apart from a producer that legitimately exits 0 with no
+# matching lines on a quiet host. `|| jl_rc=$?` keeps `set -e` from tripping
+# on the producer's own non-zero status, mirroring the `|| rc=$?` pattern
+# used for the wrapped command above.
 jl_rc=0
 jl_out="$(kernel_log)" || jl_rc=$?
 if [ "$jl_rc" -ne 0 ]; then
     verdict="SUSPECT"
     reasons="$reasons kernel-log-unreadable:rc=$jl_rc"
 else
-    kf="$(printf '%s\n' "$jl_out" | grep -ciE 'GT reset|guc_id|CAT error' || true)"
+    # Count form, never `-q` -- see the header paragraph above for why.
+    kf="$(grep -ciE 'GT reset|guc_id|CAT error' <<<"$jl_out" || true)"
     if [ "${kf:-0}" -gt 0 ]; then
         verdict="SUSPECT"
         reasons="$reasons kernel-gpu-fault:${kf}"

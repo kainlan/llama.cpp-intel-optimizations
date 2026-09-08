@@ -258,10 +258,16 @@ cases=$((cases+1))
 # behaviour) reproduces it 5/5 -- verified against the unmodified guard
 # before this fix landed. The fault line must be first so grep matches
 # immediately while the producer is still emitting the 20000 filler lines
-# behind it.
+# behind it. Three distinct fault lines (not one), so this and the other
+# kernel-gpu-fault assertions in this file don't all pin the same count --
+# an off-by-N bug in the count itself (e.g. counting total lines rather than
+# matching lines) would pass every ":1" assertion in this file undetected
+# (llama.cpp-m1ny quality review, finding Q8).
 cat > "$T/journal-fault.sh" <<'FAKEJOURNAL'
 #!/usr/bin/env bash
 echo 'kernel: xe 0000:03:00.0: GT reset triggered'
+echo 'kernel: xe 0000:03:00.0: guc_id=3 engine reset'
+echo 'kernel: xe 0000:03:00.0: Engine memory CAT error'
 seq 1 20000 | sed 's/^/kernel: filler line /'
 FAKEJOURNAL
 chmod +x "$T/journal-fault.sh"
@@ -270,9 +276,9 @@ mk_tree 0 0; mk_meminfo 3000000
          --journalctl-cmd "$T/journal-fault.sh" \
          --log "$T/run-sigpipe.log" -- true || fail=1
 head -1 "$T/run-sigpipe.log" | grep -q "SUSPECT" \
-    || { echo "FAIL: a fault line followed by 20000 filler lines must still stamp SUSPECT (SIGPIPE fail-open regression, llama.cpp-m1ny; got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
-head -1 "$T/run-sigpipe.log" | grep -q "kernel-gpu-fault:1" \
-    || { echo "FAIL: kernel-fault reason must carry the match count (got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+    || { echo "FAIL: fault lines followed by 20000 filler lines must still stamp SUSPECT (SIGPIPE fail-open regression, llama.cpp-m1ny; got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
+head -1 "$T/run-sigpipe.log" | grep -q "kernel-gpu-fault:3" \
+    || { echo "FAIL: kernel-fault reason must carry the exact match count of 3 (got: $(head -1 "$T/run-sigpipe.log"))"; fail=1; }
 
 cases=$((cases+1))
 # A missing/failing --journalctl-cmd must NOT collapse into "zero faults
@@ -296,6 +302,7 @@ cases=$((cases+1))
 # must be reported as unreadable, not silently counted as a real fault --
 # the producer's own exit status governs, checked BEFORE the line is ever
 # handed to grep -c.
+mk_tree 0 0; mk_meminfo 3000000
 cat > "$T/journal-fail-with-fault.sh" <<'FAKEJOURNAL'
 #!/usr/bin/env bash
 echo 'kernel: xe 0000:03:00.0: GT reset triggered'
@@ -337,6 +344,23 @@ err="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --p
 [ "$rc" -eq 139 ] || { echo "FAIL: no-log signalled command must exit 139 (got $rc)"; fail=1; }
 { echo "$err" | grep -q "SUSPECT" && echo "$err" | grep -q "signal:rc=139"; } \
     || { echo "FAIL: no-log branch must print the same signal reason on stderr (got: $err)"; fail=1; }
+
+cases=$((cases+1))
+# `timeout` itself failing to execute the wrapped command (rc 125/126/127 --
+# bad `timeout` invocation, not executable, or not found) must also stamp
+# SUSPECT: none of these ever ran the actual bench, so none of them is a
+# valid measurement either, and the pre-Q6 guard let this range fall through
+# to VALID (llama.cpp-m1ny quality review, finding Q6). A nonexistent
+# command reliably reproduces rc=127 via GNU coreutils `timeout`.
+mk_tree 0 0; mk_meminfo 3000000
+rc=0
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true --max-wait 1 \
+         --log "$T/run-notexec.log" -- /nonexistent-bench-binary-xyz || rc=$?
+[ "$rc" -eq 127 ] || { echo "FAIL: a not-found wrapped command must exit 127 (got $rc)"; fail=1; }
+head -1 "$T/run-notexec.log" | grep -q "SUSPECT" \
+    || { echo "FAIL: a not-executed wrapped command must stamp SUSPECT (got: $(head -1 "$T/run-notexec.log"))"; fail=1; }
+head -1 "$T/run-notexec.log" | grep -q "not-executed:rc=127" \
+    || { echo "FAIL: a not-executed wrapped command must carry not-executed:rc=127 (got: $(head -1 "$T/run-notexec.log"))"; fail=1; }
 
 cases=$((cases+1))
 # Timeout kill: a wrapped command that outlives --budget must be killed
@@ -642,7 +666,7 @@ fi
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 40 ] || { echo "FAIL: expected 40 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 41 ] || { echo "FAIL: expected 41 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
