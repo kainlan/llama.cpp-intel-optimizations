@@ -232,7 +232,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # (if now narrower) structural check: the overflow release path must
     # still exist and still be event-gated, not silently dropped.
     checks["direct fallback overflow release deferred via retain_handles_until_event"] = normalize_ws(
-        "retain_handles_until_event({ std::move(owner) }, *event);"
+        "retain_handles_until_event({ std::move(entry.owner) }, *event);"
     ) in normalize_ws(FREE_BODY_CODE)
 
     # llama.cpp-0oxf pool redesign: a freed DIRECT buffer's PRIMARY fate is
@@ -254,9 +254,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # ordering regressed (a fresh allocation attempted first, the pool only
     # consulted afterward).
     alloc_path_code = ALLOC_BODY_CODE + DIRECT_BODY_CODE
-    checks["alloc path tries the reuse pool before a fresh allocation"] = alloc_path_code.index(
-        "onednn_graph_scratch_try_reuse_pool_locked("
-    ) < alloc_path_code.index("unified_alloc(")
+    # .find() (not .index()): an absent token must fail THIS named check, not
+    # raise an unguarded ValueError that pytest would report as a collection
+    # error on a check that never ran, masking which assertion actually failed.
+    pool_probe_pos = alloc_path_code.find("onednn_graph_scratch_try_pool_locked(")
+    fresh_alloc_pos = alloc_path_code.find("unified_alloc(")
+    checks["alloc path tries the reuse pool before a fresh allocation"] = (
+        pool_probe_pos != -1 and fresh_alloc_pos != -1 and pool_probe_pos < fresh_alloc_pos
+    )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
     # sizes (a pp8192 run touches ~16 distinct ne11-derived shapes) could

@@ -3876,7 +3876,7 @@ class unified_cache {
     // How many pool entries were released for real rather than reused --
     // either evicted under cap pressure (onednn_graph_scratch_evict_pool_until_fits_locked())
     // or released immediately because their size bucket was already at
-    // onednn_graph_scratch_pool_depth_per_size_bytes()'s per-size depth
+    // onednn_graph_scratch_pool_depth_per_size()'s per-size depth
     // limit when onednn_graph_scratch_free() tried to park them.
     size_t onednn_graph_scratch_pool_eviction_count_ = 0;
     // Running total of bytes currently sitting in the pool (across every
@@ -3905,16 +3905,43 @@ class unified_cache {
                                                     mem_handle * out_owner,
                                                     void **      out_ptr);
 
+    // True if onednn_graph_scratch_reuse_pool_ already holds an
+    // event-complete entry of exactly `size` -- a peek, not a pop (does not
+    // touch ownership or any counter). Used by
+    // onednn_graph_scratch_wait_for_direct_headroom_locked()'s wait loop to
+    // recognise "the exact size this request needs just became available"
+    // and skip the general cap-eviction sweep for that iteration, so a
+    // request does not evict OTHER sizes' pool entries when its own size is
+    // already sitting there ready. Callers must hold
+    // onednn_graph_scratch_mutex_.
+    bool onednn_graph_scratch_pool_size_ready_locked(size_t size) const;
+
     // Shared bookkeeping for a DIRECT request served by the reuse pool
     // (recording ownership, the hit counter, and the once-per-size debug
-    // print) -- factored out because onednn_graph_scratch_alloc() and
-    // onednn_graph_scratch_alloc_direct_locked() both re-check the pool at
-    // more than one point (a lock drop between two checks can let a
-    // concurrent free() park the requested size). Takes ownership of
-    // `owner` and returns `ptr` unchanged, so a call site can `return
+    // print) -- factored out because onednn_graph_scratch_alloc_direct_locked()
+    // re-checks the pool at more than one point (a lock drop between checks
+    // can let a concurrent free() park the requested size). Takes ownership
+    // of `owner` and returns `ptr` unchanged, so a call site can `return
     // onednn_graph_scratch_park_pool_hit_locked(...)` directly. Callers
     // must hold onednn_graph_scratch_mutex_.
     void * onednn_graph_scratch_park_pool_hit_locked(size_t size, mem_handle owner, void * ptr);
+
+    // Single entry point for a DIRECT request's pool lookup: looks up
+    // `size`/`align` for `device` via onednn_graph_scratch_try_reuse_pool_locked()
+    // and, on a hit, threads it through onednn_graph_scratch_park_pool_hit_locked()
+    // -- returning the resolved pointer directly, so every call site reads
+    // as `if (void * p = onednn_graph_scratch_try_pool_locked(...)) return
+    // p;`. Returns nullptr on a miss, with NO side effect for the miss (no
+    // counter touched here): the pool is checked at up to three points for
+    // one DIRECT request (before ever waiting, after
+    // wait_for_direct_headroom_locked()'s poll loop, and after the
+    // drain-and-retry), and only the request's FINAL outcome -- was it ever
+    // served from the pool, or did it ultimately fall through to a fresh
+    // unified_alloc() -- should count as exactly one hit or one miss. Miss
+    // accounting lives at onednn_graph_scratch_alloc_direct_locked()'s own
+    // tail, past every re-check, not here. Callers must hold
+    // onednn_graph_scratch_mutex_.
+    void * onednn_graph_scratch_try_pool_locked(size_t size, size_t align, int device);
 
     // The DIRECT (non-arena) allocation tail of onednn_graph_scratch_alloc()
     // -- request setup, the forced-fail test hook, the unlock/drain/relock/

@@ -343,10 +343,17 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     // onednn_graph_scratch_clear_pool_locked() must handle without
     // destructing the owning mem_handle out from under a still-in-flight
     // host_task.
+    // Not asserted here: onednn_graph_scratch_pool_peak_bytes() is a
+    // cumulative process-lifetime high-water mark that never resets, so a
+    // "peak >= kSizeD" check right after this free() would be vacuous once
+    // an earlier test (test_bounded_eviction, kSizeA/kSizeB = 300/320 MiB)
+    // has already pushed the peak above kSizeD (310 MiB) -- it would hold
+    // whether or not THIS entry ever made it into the pool. The eviction-
+    // count delta asserted below is the real proof: eviction_count_ can
+    // only increase for an entry that clear_pool_locked() actually found IN
+    // the pool, so it already confirms this entry was genuinely parked.
     sycl::event slow_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr, &slow_release);
-    check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeD,
-          "the entry is sitting in the pool (peak bytes reflects it) before the event completes");
 
     const size_t evictions_before = cache->onednn_graph_scratch_pool_eviction_count();
 
