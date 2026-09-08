@@ -69,9 +69,17 @@ void test_default_formula() {
 
     // The five Mistral 7B Q4_0 (n_head=32) measurements this formula is
     // fit to (task llama.cpp-0oxf, comment c-xcop) -- varying n_ubatch AND
-    // n_ctx independently, all five matching to the exact byte. If any of
-    // these ever fails, either the measurement was deliberately superseded
-    // (update it with a citation) or the formula regressed.
+    // n_ctx independently. Three match the RAW formula to the exact byte;
+    // the other two (512x512, 128x2048) compute to a raw 48 MiB, BELOW the
+    // 64 MiB historical minimum, so their expectation here is the CLAMPED
+    // 64 MiB, not the raw 48 -- verified against the ticket's own log
+    // (comment c-xcop measured 48 MiB at both, i.e. the clamp already
+    // matches the real allocator's behavior, not just this formula in
+    // isolation). Keeping both clamped rows (rather than replacing one with
+    // an unclamped duplicate) is deliberate: it is what keeps
+    // max(64 MiB, ...) itself under test, not just the multiplication. If
+    // any of these ever fails, either the measurement was deliberately
+    // superseded (update it with a citation) or the formula regressed.
     struct case_t {
         uint32_t     n_head;
         uint32_t     n_ubatch;
@@ -81,11 +89,11 @@ void test_default_formula() {
     };
 
     const case_t cases[] = {
-        { 32, 512, 512,  48,  "Mistral (n_head=32) @ ubatch=512 ctx=512 -> 48 MiB"   },
-        { 32, 512, 2048, 192, "Mistral (n_head=32) @ ubatch=512 ctx=2048 -> 192 MiB" },
-        { 32, 512, 8192, 768, "Mistral (n_head=32) @ ubatch=512 ctx=8192 -> 768 MiB" },
-        { 32, 256, 2048, 96,  "Mistral (n_head=32) @ ubatch=256 ctx=2048 -> 96 MiB"  },
-        { 32, 128, 2048, 48,  "Mistral (n_head=32) @ ubatch=128 ctx=2048 -> 48 MiB"  },
+        { 32, 512, 512,  64,  "Mistral (n_head=32) @ ubatch=512 ctx=512 -> raw 48 MiB, clamped to 64 MiB"  },
+        { 32, 512, 2048, 192, "Mistral (n_head=32) @ ubatch=512 ctx=2048 -> 192 MiB"                       },
+        { 32, 512, 8192, 768, "Mistral (n_head=32) @ ubatch=512 ctx=8192 -> 768 MiB"                       },
+        { 32, 256, 2048, 96,  "Mistral (n_head=32) @ ubatch=256 ctx=2048 -> 96 MiB"                        },
+        { 32, 128, 2048, 64,  "Mistral (n_head=32) @ ubatch=128 ctx=2048 -> raw 48 MiB, clamped to 64 MiB" },
     };
     for (const case_t & c : cases) {
         const size_t got = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(c.n_head, c.n_ubatch, c.n_ctx);
