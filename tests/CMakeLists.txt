@@ -2292,7 +2292,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     #     override.
     set_tests_properties(test-sycl-onednn-graph-floor PROPERTIES
         LABELS "sycl;onednn"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB="
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB="
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
@@ -2302,7 +2302,7 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_test(test-sycl-onednn-graph-floor NAME test-sycl-onednn-graph-floor-override ARGS --mode=override)
     set_tests_properties(test-sycl-onednn-graph-floor-override PROPERTIES
         LABELS "sycl;onednn"
-        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
