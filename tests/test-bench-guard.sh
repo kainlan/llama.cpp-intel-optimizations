@@ -660,12 +660,12 @@ head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
     || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
 
 cases=$((cases+1))
-# M3: the case above exercises F5's fix only inside
-# derive_card_for_selector -- find_card_by_pci (the --pci override path)
-# carries the SAME `readlink -f ... | xargs -r basename` shape and was left
-# uncovered. Reuses the same $T/drmroot-space fixture built just above, via
-# --pci instead of a bare selector, so this exercises find_card_by_pci's
-# own basename substitution specifically.
+# llama.cpp-o4fs: the case above exercises the readlink-failure fix only
+# inside derive_card_for_selector -- find_card_by_pci (the --pci override
+# path) carries the SAME `readlink -f ... | xargs -r basename` shape and
+# was left uncovered. Reuses the same $T/drmroot-space fixture built just
+# above, via --pci instead of a bare selector, so this exercises
+# find_card_by_pci's own basename substitution specifically.
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --journalctl-cmd true --max-wait 1 --log "$T/run-space-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 against a space-containing DRM_ROOT device path must still resolve, got rc=$rc (out: $out)"; fail=1; }
@@ -783,7 +783,7 @@ else
 fi
 
 cases=$((cases+1))
-# F1: a readlink FAILURE -- distinct from the
+# llama.cpp-o4fs: a readlink FAILURE -- distinct from the
 # unreadable-device-DIR case above, which chmods the target dir ITSELF and
 # reaches the LATER `[ -d "$c/device" ] && { [ ! -r ] || [ ! -x ] }` check
 # -- must never become a silent, index-shifting skip. This chmods the
@@ -801,11 +801,12 @@ cases=$((cases+1))
 # readlink -f while `-e` still succeeds (the "readlink probe error" refuse
 # exists for a genuine TOCTOU race -- the target vanishing between the
 # dangling check and the readlink call a moment later -- which a static
-# chmod fixture cannot reproduce). This is still exactly the behaviour F1
-# requires: the fix (checking readlink's own exit status, not discarding
-# it into a `basename` call that always succeeds) matters regardless of
-# which refuse() message a given failure surfaces through, and this test
-# proves the OUTCOME -- a loud refuse(), never a silent skip that would
+# chmod fixture cannot reproduce). This is still exactly the behaviour
+# llama.cpp-o4fs's fix requires: checking readlink's own exit status,
+# instead of discarding it into a `basename` call that always succeeds,
+# matters regardless of which refuse() message a given failure surfaces
+# through, and this test proves the OUTCOME -- a loud refuse(), never a
+# silent skip that would
 # shift level_zero indices for the surviving cards -- for a readlink
 # failure that reaches this fixture's construction. Skip under root, which
 # bypasses permission bits, so chmod 000 would not reproduce this.

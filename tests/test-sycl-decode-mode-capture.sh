@@ -65,8 +65,8 @@ fail=0
 # against a literal total below -- the llama.cpp-3e0f finding 10 / Q6
 # convention tests/test-bench-guard.sh, tests/test-sycl-prefill-scaling.sh,
 # and tests/test-sycl-gpu-preflight.sh already use. expect_status (below)
-# increments it for you; every other case bumps
-# it itself, directly above its own case.
+# increments it for you; every other case bumps it itself, directly above
+# its own case.
 cases=0
 
 # mk_tree: fake sysfs freq0 dir with ONLY throttle/status and act_freq -- like
@@ -315,7 +315,7 @@ grep -qi "out of range" <<<"$out_lz2_text" \
     || { echo "FAIL: out-of-range refusal must say so (got: $out_lz2_text)"; fail=1; }
 [ ! -e "$out_lz2" ] || { echo "FAIL: an out-of-range setup failure must not create --out at all"; fail=1; }
 
-# --- M1: scripts/sycl-decode-mode-capture.sh's own
+# --- llama.cpp-o4fs: scripts/sycl-decode-mode-capture.sh's own
 # explicit `DRM_ROOT=/sys/class/drm` (set unconditionally before sourcing
 # sycl-gpu-sysfs.sh, mirroring bench-guard.sh's own F1 fix) had no test
 # coverage of its own. As with bench-guard.sh's own F1 regression test
@@ -592,10 +592,10 @@ setup_rc=0
 setup_out="$( ( unset ONEAPI_DEVICE_SELECTOR; "$CAPTURE" --out "$out_setup_fail" -- "$bench" ) 2>&1 )" || setup_rc=$?
 [ "$setup_rc" -eq 3 ] \
     || { echo "FAIL: expected a setup-only failure (no --sysfs-card, no selector) to exit 3, got $setup_rc"; fail=1; }
-# M2: confirm the selector-shape refusal actually goes
-# through refuse() (F4/F8) rather than some other message
-# shape -- a bare "exit 3" check above would pass even if this specific
-# refusal regressed back to its own bespoke prefix.
+# llama.cpp-o4fs: confirm the selector-shape refusal actually goes through
+# refuse() rather than some other message shape -- a bare "exit 3" check
+# above would pass even if this specific refusal regressed back to its
+# own bespoke prefix.
 grep -q "sycl-decode-mode-capture: REFUSED:" <<<"$setup_out" \
     || { echo "FAIL: setup-only failure (no selector) must use the unified refuse() prefix 'sycl-decode-mode-capture: REFUSED:' (got: $setup_out)"; fail=1; }
 

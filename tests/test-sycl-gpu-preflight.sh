@@ -288,10 +288,26 @@ if PATH="$T/empty-path-bin" sycl_preflight_journal_has_current_boot_gpu_faults; 
     fail=1
 fi
 
+cases=$((cases+1))
+# This file's own top-of-file `source "$PREFLIGHT"` above already sourced it
+# once under `set -euo pipefail`; every one of this file's six sibling
+# sourcing callers does the same. A second `source` of the SAME copy is what
+# a caller that sources this library more than once (or a caller that is
+# itself sourced more than once) would trigger, and SYCL_PREFLIGHT_FAULT_RE
+# is a bare top-level `readonly` before the fix -- a second assignment to an
+# already-readonly variable aborts the whole subshell under `set -e`, not
+# just that one line. Run in a fresh `bash -c` subshell (not this file's own
+# process) so a genuine abort here fails only this case, not the whole
+# suite.
+if ! bash -c 'set -euo pipefail; source "$1"; source "$1"' _ "$PREFLIGHT" >/dev/null 2>&1; then
+    echo "FAIL: sourcing scripts/sycl-gpu-preflight.sh twice under set -e must not abort (SYCL_PREFLIGHT_FAULT_RE readonly-reassignment)"
+    fail=1
+fi
+
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above (llama.cpp-3e0f
 # convention).
-[ "$cases" -eq 14 ] || { echo "FAIL: expected 14 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 15 ] || { echo "FAIL: expected 15 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 if [ "$fail" -eq 0 ]; then
     echo "OK: sycl-gpu-preflight B50 live derivation ($cases cases)"

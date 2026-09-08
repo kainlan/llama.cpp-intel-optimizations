@@ -7,8 +7,16 @@
 # sycl_preflight_journal_has_current_boot_gpu_faults and its previous-boot
 # sibling) so the two never drift apart the way byte-for-byte duplicated
 # regexes tend to. Editing this in one place changes what BOTH functions
-# treat as a fault; the 14-case positive-control suite depends on it.
-readonly SYCL_PREFLIGHT_FAULT_RE='xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+# treat as a fault; tests/test-sycl-gpu-preflight.sh's journal cases depend
+# on it, though only the `xe .*Engine reset` alternative is actually
+# exercised there. 15 top-level alternatives (the `(queued|started)` group
+# inside one of them is internal, not a top-level alternative of its own).
+# Guarded, not a bare top-level `readonly`: this file is sourced by six
+# callers under `set -e`, and a second `source` of an already-sourced copy
+# must not abort with "readonly variable".
+if [ -z "${SYCL_PREFLIGHT_FAULT_RE:-}" ]; then
+    readonly SYCL_PREFLIGHT_FAULT_RE='xe .*Engine reset|xe .*Schedule disable failed|xe .*reset (queued|started)|xe .*Timedout job|xe .*Kernel-submitted job timed out|Xe device coredump|guc_exec_queue_timedout_job|drm_sched_job_timedout|soft lockup|RCU.*stall|BUG:|Oops|ttm_resource_manager_usage|xe_drm_ioctl|xe_pt_zap_ptes'
+fi
 
 sycl_preflight_repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd

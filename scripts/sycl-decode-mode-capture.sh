@@ -68,9 +68,9 @@
 # also accepts a --drm-root of its OWN (llama.cpp-o4fs), used purely for
 # its OWN card derivation below (see that section's comment). The two are
 # NOT the same value crossing a boundary: this script's --drm-root is
-# still deliberately NOT forwarded to the
-# bench-guard.sh child -- it always passes --sysfs-card explicitly (see
-# below), which bypasses bench-guard.sh's own --drm-root-based derivation
+# still deliberately NOT forwarded to the bench-guard.sh child -- it
+# always passes --sysfs-card explicitly (see below), which bypasses
+# bench-guard.sh's own --drm-root-based derivation
 # entirely, so there is nothing downstream for either script's --drm-root
 # to affect on the child's path. Three of the six forwarded hooks are ALSO
 # read locally by this script for its own
