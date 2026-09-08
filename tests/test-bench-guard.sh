@@ -20,29 +20,15 @@ skipped=0
 # increment it itself, directly above its own case (above its case comment where it has one).
 cases=0
 
-# mk_pci_dev DEVROOT PCI_ADDR [with_freq [throttle act_freq]] -- create a
-# fake sysfs PCI device directory DEVROOT/PCI_ADDR with vendor=0x8086 and
-# class=0x030000 (an Intel display controller, discrete or integrated
-# depending on PCI_ADDR). Pass "with_freq" as the third argument to also
-# populate a tile0/gt0/freq0/throttle/status + act_freq tree under it --
-# needed only for a device a test expects the guard to actually SELECT
-# and run against; skip it for an iGPU or any decoy the guard must
-# exclude/refuse before ever deriving FREQ from it. throttle/act_freq
-# (4th/5th args) default to 0/0. Used by every fixture builder in this
-# file, including mk_tree just below, so none of them can drift out of
-# sync with each other (llama.cpp-imns review round 4 finding Q13; the
-# mk_tree unification is review round 5 finding F7).
-mk_pci_dev() {
-    local devroot="$1" addr="$2" with_freq="${3:-}" throttle="${4:-0}" act_freq="${5:-0}"
-    mkdir -p "$devroot/$addr"
-    echo 0x8086 > "$devroot/$addr/vendor"
-    echo 0x030000 > "$devroot/$addr/class"
-    if [ -n "$with_freq" ]; then
-        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
-        echo "$throttle" > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
-        echo "$act_freq" > "$devroot/$addr/tile0/gt0/freq0/act_freq"
-    fi
-}
+# mk_pci_dev/mk_drmroot: shared fake sysfs/DRM fixture builders (also used
+# by tests/test-sycl-decode-mode-capture.sh and
+# tests/test-sycl-gpu-preflight.sh, which fake the identical topology). Used
+# by every fixture builder in this file, including mk_tree just below, so
+# none of them can drift out of sync with each other. See their own
+# definitions in sycl-fake-drm-fixture.sh for exact signatures and
+# defaults.
+# shellcheck source=sycl-fake-drm-fixture.sh
+source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 mk_tree() { # $1=throttle $2=act_freq
     mk_pci_dev "$T/sys/class/drm/card9" device with_freq "$1" "$2"
@@ -415,36 +401,19 @@ head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout
 
 # --- Live DRM/PCI derivation (llama.cpp-imns) ---
 #
-# mk_pci_dev is defined above, alongside mk_tree, which is also one of its
-# callers (llama.cpp-imns review round 5, finding F7).
-
-# Builds a fake --drm-root whose card-NUMBER order deliberately differs from
-# PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0), includes an
-# integrated GPU (card1 -> 00:02.0) that must be excluded, and a connector
-# entry (card0-DP-1) that must be ignored by name alone -- it gets a real
-# `device` symlink to the SAME discrete device as card2 (0000:04:00.0), so
-# only the card[0-9]+ filter (not an absent symlink) is what skips it.
-# card0-DP-1 sorts lexically BEFORE card2 in glob order ('-' < '2'), which is
-# exactly what caught review round 1: an earlier, unfiltered second scan for
-# the sysfs card matching a derived PCI address matched card0-DP-1 first and
-# bound SYSFS_CARD to a connector instead of card2. The card= assertions
-# below (not just pci=) are what a regression of that would fail. Its own
-# device root ($T/devices-lz01) is private to this fixture -- every other
-# fixture below builds its own device root too, rather than reusing this
-# one, so reordering the test cases can never turn one case into another
-# by accident (llama.cpp-imns review round 4, finding Q15).
-mk_drmroot() {
-    local d="$T/drmroot" devroot="$T/devices-lz01"
-    rm -rf "$d" "$devroot"
-    mk_pci_dev "$devroot" 0000:09:00.0 with_freq
-    mk_pci_dev "$devroot" 0000:00:02.0
-    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
-    mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
-    ln -s "$devroot/0000:09:00.0" "$d/card0/device"
-    ln -s "$devroot/0000:00:02.0" "$d/card1/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card2/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
-}
+# mk_drmroot (defined in sycl-fake-drm-fixture.sh, sourced above alongside
+# mk_pci_dev) builds a fake --drm-root whose card-NUMBER order deliberately
+# differs from PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0),
+# includes an integrated GPU (card1 -> 00:02.0) that must be excluded, and a
+# connector entry (card0-DP-1) that must be ignored by name alone -- it gets
+# a real `device` symlink to the SAME discrete device as card2
+# (0000:04:00.0), so only the card[0-9]+ filter (not an absent symlink) is
+# what skips it. card0-DP-1 sorts lexically BEFORE card2 in glob order
+# ('-' < '2'), which is exactly what an earlier, unfiltered second scan for
+# the sysfs card matching a derived PCI address got wrong: it matched
+# card0-DP-1 first and bound SYSFS_CARD to a connector instead of card2. The
+# card= assertions below (not just pci=) are what a regression of that would
+# fail.
 
 cases=$((cases+1))
 mk_drmroot; mk_meminfo 3000000
