@@ -861,14 +861,19 @@ Every one of these is exit 2, not a smaller sample: a missing file, an empty
 file, an arm with fewer than five logs, an arm entirely absent, a results
 directory that does not exist, a directory that exists but is empty, an
 unparseable `t/s` cell, a table with no `fa` column (i.e. not the `-fa 1`
-matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), and a
-run whose free VRAM is below the contamination floor.
+matrix), a log with no `- NNNNN MiB free` line (i.e. run without `-v`), a run
+whose free VRAM is below the contamination floor, `--table` combined with
+`--matrix merge-cert`, and (long-prompt `--table` only) a sample with no
+achieved `n_ctx` at all, the five processes of one arm disagreeing on the
+achieved `n_ctx`, or an achieved `n_ctx` below the arm's own prompt length —
+never a silent default for any of these.
 
 **Verify the parser before trusting it.** `--self-test` runs it against the
 committed fixtures in `artifacts/task18-parser-fixtures/` and must report
-**19/19** (ten merge-cert cases plus nine covering the long-prompt matrix and
-`--table`). The cases exist to prove the parser returns *all three* exit codes —
-including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
+**19/19** (ten cases for the merge-cert matrix, nine added for long-prompt and
+`--table` — the self-test prints its own total, so this figure is not
+hand-maintained). The cases exist to prove the parser returns *all three* exit
+codes — including a below-floor fixture that must produce exit 1 — so that a `PASS` is a
 measurement rather than the only answer it is capable of giving. A checker nobody
 has seen fail is indistinguishable from a checker that cannot fail.
 

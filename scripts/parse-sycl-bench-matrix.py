@@ -54,6 +54,7 @@ Stdlib only, per the project's minimal-dependency rule.
 """
 
 import argparse
+import collections
 import glob
 import io
 import os
@@ -132,12 +133,28 @@ _LONG_PROMPT_CARD_SELECTORS = {"b70": "level_zero:0", "b50": "level_zero:1"}
 _LONG_PROMPT_MODELS = ("mistral", "gptoss", "gemma4")
 _LONG_PROMPT_PPS = (2048, 8192)
 
-MODEL_LABELS = {
+# Nothing outside this module reads these two, hence the leading underscore
+# (finding llama.cpp-z0wt review round 4). They are parallel to
+# _LONG_PROMPT_MODELS/_LONG_PROMPT_CARDS above with nothing structurally
+# tying the two together, so an import-time check enforces the key sets stay
+# equal rather than trusting two hand-maintained lists to agree forever.
+_MODEL_LABELS = {
     "mistral": "Mistral 7B Q4_0",
     "gptoss": "GPT-OSS 20B MXFP4",
     "gemma4": "gemma4 E4B Q8_0",
 }
-CARD_LABELS = {"b70": "B70", "b50": "B50"}
+if set(_MODEL_LABELS) != set(_LONG_PROMPT_MODELS):
+    raise RuntimeError(
+        "_MODEL_LABELS keys %r must match _LONG_PROMPT_MODELS %r"
+        % (sorted(_MODEL_LABELS), sorted(_LONG_PROMPT_MODELS))
+    )
+
+_CARD_LABELS = {"b70": "B70", "b50": "B50"}
+if set(_CARD_LABELS) != set(_LONG_PROMPT_CARDS):
+    raise RuntimeError(
+        "_CARD_LABELS keys %r must match _LONG_PROMPT_CARDS %r"
+        % (sorted(_CARD_LABELS), sorted(_LONG_PROMPT_CARDS))
+    )
 
 
 def _build_long_prompt_arms():
@@ -156,9 +173,35 @@ def _build_long_prompt_arms():
 
 LONG_PROMPT_ARMS = _build_long_prompt_arms()
 
+# A matrix is more than its arm dict: evaluate() also needs to know its report
+# header, its PASS-verdict line, and whether --table is meaningful for it.
+# Bundling those into one descriptor (rather than three separate
+# `if matrix == "merge-cert": ... else: ...` switches scattered through
+# evaluate()) means adding a third matrix later touches this table, not three
+# call sites (llama.cpp-z0wt review round 4).
+MatrixDescriptor = collections.namedtuple(
+    "MatrixDescriptor", ["arms", "title", "verdict", "supports_table"]
+)
+
 MATRICES = {
-    "merge-cert": MERGE_CERT_ARMS,
-    "long-prompt": LONG_PROMPT_ARMS,
+    "merge-cert": MatrixDescriptor(
+        arms=MERGE_CERT_ARMS,
+        title="Merge-certification performance matrix -- %d processes per arm\n\n",
+        verdict="VERDICT: PASS -- all %d arms present, parseable, and within gate\n",
+        supports_table=False,
+    ),
+    "long-prompt": MatrixDescriptor(
+        arms=LONG_PROMPT_ARMS,
+        title=(
+            "Long-prompt performance matrix -- %d processes per arm "
+            "(report-only: no gate declared for the long-prompt matrix)\n\n"
+        ),
+        verdict=(
+            "VERDICT: report-only: no gate declared for the long-prompt matrix -- "
+            "all %d arms present and parseable\n"
+        ),
+        supports_table=True,
+    ),
 }
 DEFAULT_MATRIX = "merge-cert"
 
@@ -377,12 +420,21 @@ def _stdev_str(values):
 # mirroring the round-2 fix to the row builder (which reads arm_tests[1]
 # rather than assuming the literal "tg128"). Every long-prompt arm measures
 # decode with the identical n_gen, so all of them must share one "tg" test
-# name; assert that invariant rather than silently trusting it.
-_tg_test_names = {spec["tests"][1] for spec in LONG_PROMPT_ARMS.values()}
-assert len(_tg_test_names) == 1, (
-    "every long-prompt arm must share one 'tg' test name, got %r" % _tg_test_names
-)
-_TG_COLUMN_LABEL = next(iter(_tg_test_names)).upper()
+# name; check that invariant rather than silently trusting it. A plain `def`
+# invoked once keeps the intermediate set from lingering as a module global
+# nothing else needs (review round 4), and raises RuntimeError rather than
+# using `assert` -- an import-time invariant must still fire under `python3
+# -O`, which strips asserts.
+def _tg_column_label():
+    names = {spec["tests"][1] for spec in LONG_PROMPT_ARMS.values()}
+    if len(names) != 1:
+        raise RuntimeError(
+            "every long-prompt arm must share one 'tg' test name, got %r" % names
+        )
+    return next(iter(names)).upper()
+
+
+_TG_COLUMN_LABEL = _tg_column_label()
 
 # Header/separator built from _LONG_PROMPT_PPS rather than hardcoded, so the
 # column list can't drift from the tuple that actually drives the rows below.
@@ -403,11 +455,21 @@ _TABLE_SEPARATOR = "|" + "---|" * len(_TABLE_COLUMNS)
 _CTX_ACHIEVED_PP = _LONG_PROMPT_PPS[-1]
 
 
-def _build_table_rows(results):
-    """Return (rows, None) or (None, error_message).
+def _build_table_rows(results, arms):
+    """Return the markdown table rows for the long-prompt matrix.
 
-    Reuses the samples already parsed into `results` -- never re-parses a
-    log -- so the table and the report above it are the same numbers.
+    Raises ParseError on any input gap -- there is no partial-success return
+    value -- so the caller folds this into the same `except ParseError` shape
+    it already uses for parse_log() (review round 4; this used to be its own
+    `(rows, error_message)` tuple convention, the only place in the file not
+    using ParseError). Reuses the samples already parsed into `results` --
+    never re-parses a log -- so the table and the report above it are the
+    same numbers.
+
+    `arms` is the long-prompt matrix's own arm dict
+    (`MATRICES["long-prompt"].arms`), passed in by the caller rather than read
+    from the module global here, so this function has no hidden dependency on
+    which matrix is being evaluated (review round 4).
     """
     rows = [_TABLE_HEADER, _TABLE_SEPARATOR]
     for card in _LONG_PROMPT_CARDS:
@@ -419,9 +481,9 @@ def _build_table_rows(results):
                 arm = "%s-%s-pp%d" % (card, model, pp)
                 samples = results[arm]
                 # Read the test names from the arm's own spec rather than
-                # hardcoding the second one ("tg128") here: MATRICES is the
+                # hardcoding the second one ("tg128") here: `arms` is the
                 # single source of truth for what an arm's tests are called.
-                arm_tests = MATRICES["long-prompt"][arm]["tests"]
+                arm_tests = arms[arm]["tests"]
                 tests_by_pp[pp] = arm_tests
                 for test in arm_tests:
                     values = [s[test] for s in samples]
@@ -434,15 +496,14 @@ def _build_table_rows(results):
                     # were the achieved one (llama.cpp-z0wt review round 1).
                     no_ctx = [s["path"] for s in samples if s["n_ctx"] is None]
                     if no_ctx:
-                        return None, (
-                            "INPUT ERROR: %s: no achieved n_ctx (no "
-                            "'llama_context: n_ctx = N' line) in: %s\n"
-                            % (arm, ", ".join(no_ctx))
+                        raise ParseError(
+                            "%s: no achieved n_ctx (no 'llama_context: n_ctx = N' "
+                            "line) in: %s" % (arm, ", ".join(no_ctx))
                         )
                     effective = [s["n_ctx"] for s in samples]
                     if len(set(effective)) != 1:
-                        return None, (
-                            "INPUT ERROR: %s: processes disagree on achieved n_ctx: %s\n"
+                        raise ParseError(
+                            "%s: processes disagree on achieved n_ctx: %s"
                             % (arm, effective)
                         )
                     ctx_achieved = effective[0]
@@ -453,11 +514,11 @@ def _build_table_rows(results):
                     # found belongs to some OTHER, smaller test in the file
                     # (e.g. tg128's own context), not the long-prompt one.
                     if ctx_achieved < pp:
-                        return None, (
-                            "INPUT ERROR: %s: achieved n_ctx %d is below the arm's "
-                            "prompt length %d\n" % (arm, ctx_achieved, pp)
+                        raise ParseError(
+                            "%s: achieved n_ctx %d is below the arm's prompt "
+                            "length %d" % (arm, ctx_achieved, pp)
                         )
-            row_cells = [CARD_LABELS[card], MODEL_LABELS[model]]
+            row_cells = [_CARD_LABELS[card], _MODEL_LABELS[model]]
             for pp in _LONG_PROMPT_PPS:
                 arm_tests = tests_by_pp[pp]
                 row_cells.append(cell[(pp, arm_tests[0])])
@@ -465,15 +526,15 @@ def _build_table_rows(results):
             row_cells.append(str(ctx_achieved))
             row_cells.append("-")
             rows.append("| " + " | ".join(row_cells) + " |")
-    return rows, None
+    return rows
 
 
 def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=False):
     """Evaluate one matrix. Returns an exit code (0, 1 or 2).
 
     matrix: "merge-cert" or "long-prompt" (a key into MATRICES).
-    arm_files: {arm_name: [path, ...]}. Every arm in MATRICES[matrix] must be
-    present.
+    arm_files: {arm_name: [path, ...]}. Every arm in MATRICES[matrix].arms
+    must be present.
 
     Stream contract, which the self-test asserts rather than assumes:
       out (stdout) carries RESULTS -- the per-arm means table, the markdown
@@ -484,9 +545,10 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
     table to stdout with the failure explanation on stderr. A caller
     redirecting only stdout can still never mistake an error for a result.
     """
-    arms = MATRICES[matrix]
+    descriptor = MATRICES[matrix]
+    arms = descriptor.arms
 
-    if want_table and matrix != "long-prompt":
+    if want_table and not descriptor.supports_table:
         err.write(
             "INPUT ERROR: --table is long-prompt only, got --matrix %s.\n" % matrix
         )
@@ -527,19 +589,14 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
 
     table_rows = None
     if want_table:
-        table_rows, table_err = _build_table_rows(results)
-        if table_err:
-            err.write(table_err)
+        try:
+            table_rows = _build_table_rows(results, arms)
+        except ParseError as exc:
+            err.write("INPUT ERROR: %s\n" % exc)
             return 2
 
     failures = []
-    if matrix == "merge-cert":
-        out.write("Merge-certification performance matrix -- %d processes per arm\n\n" % runs)
-    else:
-        out.write(
-            "Long-prompt performance matrix -- %d processes per arm "
-            "(report-only: no gate declared for the long-prompt matrix)\n\n" % runs
-        )
+    out.write(descriptor.title % runs)
 
     for arm in sorted(arms):
         samples = results[arm]
@@ -591,13 +648,7 @@ def evaluate(matrix, arm_files, runs, min_free_overrides, out, err, want_table=F
         )
         return 1
 
-    if matrix == "merge-cert":
-        out.write("VERDICT: PASS -- all %d arms present, parseable, and within gate\n" % len(arms))
-    else:
-        out.write(
-            "VERDICT: report-only: no gate declared for the long-prompt matrix -- "
-            "all %d arms present and parseable\n" % len(arms)
-        )
+    out.write(descriptor.verdict % len(arms))
 
     if table_rows is not None:
         out.write("\n")
@@ -646,18 +697,26 @@ def _fixture_for_long_prompt_arm(arm):
     One fixture per (card, pp) is committed, reused across all three models
     (llama.cpp-z0wt): the parser doesn't care which model a result table
     names, only whether the table and free-VRAM line parse.
+
+    Validity is checked against the module's own tuples (_LONG_PROMPT_CARDS/
+    _LONG_PROMPT_MODELS/_LONG_PROMPT_PPS) rather than a hardcoded
+    "(b70|b50)"/"(mistral|gptoss|gemma4)" regex, so a new card, model or pp
+    added to those tuples doesn't also need updating here (review round 4).
     """
-    m = re.match(r"^(b70|b50)-(?:mistral|gptoss|gemma4)-(pp\d+)$", arm)
-    if not m:
+    parts = arm.split("-")
+    if len(parts) != 3:
         raise ValueError("not a long-prompt arm: %r" % arm)
-    card, pp = m.groups()
-    return _fx("%s-%s-good.txt" % (card, pp))
+    card, model, pp_token = parts
+    pp_tokens = tuple("pp%d" % pp for pp in _LONG_PROMPT_PPS)
+    if card not in _LONG_PROMPT_CARDS or model not in _LONG_PROMPT_MODELS or pp_token not in pp_tokens:
+        raise ValueError("not a long-prompt arm: %r" % arm)
+    return _fx("%s-%s-good.txt" % (card, pp_token))
 
 
 def _all_good(matrix):
     """Every arm of `matrix` at DEFAULT_RUNS in-gate (or, for long-prompt,
     simply parseable) samples. The baseline every case perturbs."""
-    arms = MATRICES[matrix]
+    arms = MATRICES[matrix].arms
     if matrix == "merge-cert":
         return {arm: [_fx("%s-good.txt" % arm)] * DEFAULT_RUNS for arm in arms}
     return {arm: [_fixture_for_long_prompt_arm(arm)] * DEFAULT_RUNS for arm in arms}
@@ -720,8 +779,13 @@ def self_test(out):
              }), want_table=True, expected=2),
         dict(name="long-prompt one sample with NO achieved n_ctx -> parse error (never a default)",
              matrix="long-prompt",
+             # All five samples are the no-ctx fixture (not 4 good + 1 bad):
+             # mixing in good samples lets the n_ctx-disagreement check catch
+             # this case too, so a mutant that disabled the no-ctx check
+             # specifically would still pass (review round 4). With every
+             # sample agreeing (all None), only the no-ctx check can catch it.
              arms=_with("long-prompt", **{
-                 "b70-mistral-pp8192": [lp_pp8192_good] * 4 + [_fx("b70-pp8192-no-ctx.txt")],
+                 "b70-mistral-pp8192": [_fx("b70-pp8192-no-ctx.txt")] * DEFAULT_RUNS,
              }), want_table=True, expected=2),
         dict(name="long-prompt achieved n_ctx below the arm's own prompt length -> parse error",
              matrix="long-prompt",
@@ -731,7 +795,11 @@ def self_test(out):
         dict(name="--table with merge-cert -> parse error", matrix="merge-cert",
              arms=_all_good("merge-cert"), want_table=True, expected=2),
         dict(name="long-prompt --table all good -> PASS with markdown rows", matrix="long-prompt",
-             arms=_all_good("long-prompt"), want_table=True, expected=0),
+             arms=_all_good("long-prompt"), want_table=True, expected=0,
+             # Confirms an actual table row is on stdout, not merely exit 0 --
+             # a wrong card/model label or a hardcoded ctx cell would still
+             # have passed the old exit-code-only assertion (review round 4).
+             contains=["| B70 | Mistral 7B Q4_0 |", "| 8192 | - |"]),
         dict(name="long-prompt --runs 1 --table -> PASS, sd renders n/a (not 0.00)", matrix="long-prompt",
              arms={arm: [_fixture_for_long_prompt_arm(arm)] for arm in LONG_PROMPT_ARMS},
              runs=1, want_table=True, expected=0, contains=["± n/a", "sd    n/a"]),
@@ -765,7 +833,7 @@ def self_test(out):
                 len(cap_out.getvalue()), len(cap_err.getvalue()))
         elif missing:
             note = "  <- stdout missing %r" % missing
-        out.write("  %-62s expected %d got %d  %s%s\n"
+        out.write("  %-78s expected %d got %d  %s%s\n"
                   % (name, expected, got, "OK" if ok else "FAIL", note))
         if not ok:
             failures += 1
@@ -827,8 +895,9 @@ directory that exists but is empty, an unparseable t/s cell, a table with no
 (llama-bench run without -v, or the run failed before reaching the device),
 free VRAM below the contamination floor, --table combined with --matrix
 merge-cert, and (long-prompt --table only) a sample with no achieved n_ctx at
-all, or the five processes of one arm disagreeing on the achieved n_ctx --
-never a silent default for either.
+all, the five processes of one arm disagreeing on the achieved n_ctx, or an
+achieved n_ctx below the arm's own prompt length -- never a silent default
+for any of these.
 
 1 and 2 are deliberately distinct: "the branch is slow" and "I could not
 measure the branch" are different facts and must not share an exit code.
@@ -848,7 +917,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--matrix", choices=sorted(MATRICES), default=DEFAULT_MATRIX,
-                     help="which matrix to evaluate (default: %(default)s)")
+                    help="which matrix to evaluate (default: %(default)s)")
     ap.add_argument("--dir", help="directory holding <arm>-<n>.log|.txt")
     ap.add_argument("--arm", action="append", default=[],
                     help="<arm>=<log1>,<log2>,... (repeatable)")
@@ -876,7 +945,7 @@ def main(argv=None):
         sys.stderr.write("INPUT ERROR: %s\n" % exc)
         return 2
 
-    arms = MATRICES[args.matrix]
+    arms = MATRICES[args.matrix].arms
 
     arm_files = {}
     if args.dir:
