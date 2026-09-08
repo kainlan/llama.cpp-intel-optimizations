@@ -252,8 +252,13 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # call appears before the FIRST unified_alloc() call -- a check that
     # only asserted presence of the pool-lookup call would still pass if the
     # ordering regressed (a fresh allocation attempted first, the pool only
-    # consulted afterward).
-    alloc_path_code = ALLOC_BODY_CODE + DIRECT_BODY_CODE
+    # consulted afterward). strip_literals() first (llama.cpp-0oxf round-4
+    # finding F3): CACHE_CPP_CODE is comment-stripped but not
+    # literal-stripped, and the give-up-waiting GGML_LOG_ERROR just before
+    # the real unified_alloc() call NAMES "unified_alloc(" in its own
+    # message text -- read code, not messages, the same rule this file
+    # already applies to the negative blocking-token/sycl::free checks.
+    alloc_path_code = strip_literals(ALLOC_BODY_CODE + DIRECT_BODY_CODE)
     # .find() (not .index()): an absent token must fail THIS named check, not
     # raise an unguarded ValueError that pytest would report as a collection
     # error on a check that never ran, masking which assertion actually failed.
@@ -261,6 +266,19 @@ def test_onednn_graph_allocator_source_contract() -> None:
     fresh_alloc_pos = alloc_path_code.find("unified_alloc(")
     checks["alloc path tries the reuse pool before a fresh allocation"] = (
         pool_probe_pos != -1 and fresh_alloc_pos != -1 and pool_probe_pos < fresh_alloc_pos
+    )
+    # Narrower than the concatenated check above: that one only proves the
+    # alloc()-level pool probe precedes SOME fresh allocation somewhere
+    # across either body -- it would not catch a re-check inside
+    # onednn_graph_scratch_alloc_direct_locked() itself moved to after ITS
+    # OWN unified_alloc() call, since the earlier alloc()-level probe in
+    # ALLOC_BODY_CODE would still make the concatenated check pass. Assert
+    # the same ordering again scoped to DIRECT_BODY_CODE alone.
+    direct_code_no_literals = strip_literals(DIRECT_BODY_CODE)
+    direct_probe_pos = direct_code_no_literals.find("onednn_graph_scratch_try_pool_locked(")
+    direct_alloc_pos = direct_code_no_literals.find("unified_alloc(")
+    checks["DIRECT body's own re-check precedes its own fresh allocation"] = (
+        direct_probe_pos != -1 and direct_alloc_pos != -1 and direct_probe_pos < direct_alloc_pos
     )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct

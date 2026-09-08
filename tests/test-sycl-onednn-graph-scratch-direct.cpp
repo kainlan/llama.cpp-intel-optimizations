@@ -349,9 +349,16 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     // an earlier test (test_bounded_eviction, kSizeA/kSizeB = 300/320 MiB)
     // has already pushed the peak above kSizeD (310 MiB) -- it would hold
     // whether or not THIS entry ever made it into the pool. The eviction-
-    // count delta asserted below is the real proof: eviction_count_ can
-    // only increase for an entry that clear_pool_locked() actually found IN
-    // the pool, so it already confirms this entry was genuinely parked.
+    // count delta asserted below is the real proof, and it is attributable
+    // to exactly THIS entry (not, say, test_bounded_eviction's kSizeB
+    // buffer, which its own free() left parked with a complete event)
+    // because this function's very first line above already reclaimed the
+    // pool under "test setup" -- the pool was empty of every leftover entry
+    // before this test ever allocated kSizeD, so the only thing that can be
+    // sitting in it when evictions_before is captured just below is this
+    // entry: eviction_count_ can only increase for an entry that
+    // clear_pool_locked() actually found IN the pool, and there is nothing
+    // else in it to find.
     sycl::event slow_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr, &slow_release);
 
