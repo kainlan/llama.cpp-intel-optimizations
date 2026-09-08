@@ -31,7 +31,9 @@
 #      from 0/1 on purpose -- a silent 0 here would misreport "the gate
 #      passed" for a pair that was never actually measured.
 #   2  usage error: an --only token that names no such pair, no pair ended
-#      up selected at all, or bench-guard.sh/--guard override not found.
+#      up selected at all, bench-guard.sh/--guard override not found, or a
+#      selected model's file (validated once per model, before any
+#      bench-guard invocation) is missing or unreadable.
 #
 # Every run goes through bench-guard.sh (S5, caf7e73d0) so the same
 # throttle/tenant/Shmem preflight and VALID/SUSPECT postflight stamping
@@ -70,6 +72,21 @@
 # work. --bench (if given) wins over the env var, which wins over the
 # built-in default build/bin/llama-bench.
 #
+# --models-dir DIR / env SYCL_PREFILL_SCALING_MODELS_DIR: override the base
+# directory for the two /models-rooted entries in MODELS below (Mistral 7B
+# Q4_0, GPT-OSS 20B MXFP4) -- gemma4's path under /Storage/GenAI/models is
+# untouched by this, it already lives elsewhere. --models-dir (if given)
+# wins over the env var, which wins over the built-in default /models,
+# mirroring --bench/SYCL_PREFILL_SCALING_BENCH above exactly. Added because
+# /models (a USB-backed filesystem) was down for two days while being
+# migrated to bcachefs, with byte-identical copies available under
+# /Storage/GenAI/models, so the gate could not run at all in the meantime
+# (llama.cpp-5iba). Each selected model's file is validated once, to exist
+# and be readable, at parse time, before any bench-guard.sh invocation --
+# see the model-existence-check block below MODELS/CARDS: a missing model
+# used to surface only as an opaque ERROR:bench-rc=1 row after a full
+# GPU/driver init, not as an immediate, loud usage error naming the path.
+#
 # --guard PATH: override the bench-guard.sh invoked (default: the real
 # scripts/bench-guard.sh next to this script). Lets
 # tests/test-sycl-prefill-scaling.sh substitute a stub guard that records
@@ -88,11 +105,13 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GUARD="$SCRIPT_DIR/bench-guard.sh"
 
 BENCH="${SYCL_PREFILL_SCALING_BENCH:-$ROOT_DIR/build/bin/llama-bench}"
+MODELS_DIR="${SYCL_PREFILL_SCALING_MODELS_DIR:-/models}"
 declare -a ONLY=()
 SYSFS_CARD="" MEMINFO="" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT="" BUDGET=""
 
 while [ $# -gt 0 ]; do case "$1" in
     --bench)           BENCH="$2";          shift 2;;
+    --models-dir)      MODELS_DIR="$2";     shift 2;;
     --guard)           GUARD="$2";          shift 2;;
     --only)            ONLY+=("$2");        shift 2;;
     --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
@@ -105,13 +124,33 @@ while [ $# -gt 0 ]; do case "$1" in
     *) echo "sycl-prefill-scaling: unknown arg $1" >&2; exit 2;;
 esac; done
 
+# --models-dir "" (an explicit empty flag value) is rejected outright,
+# unlike an empty/unset env var -- the ${VAR:-/models} default above
+# already maps that to /models, and that behaviour must not change. Without
+# this, an empty flag value would silently strip down to the filesystem
+# root below instead of failing loudly (llama.cpp-5iba quality review).
+[ -n "$MODELS_DIR" ] || { echo "sycl-prefill-scaling: --models-dir requires a non-empty value" >&2; exit 2; }
+
+# Strip ALL trailing slashes (--models-dir /foo/, /foo///, or an env var
+# carrying any of these; a bare "/" reduces all the way to "") so the paths
+# built from MODELS_DIR below read $MODELS_DIR/mistral-... with exactly one
+# slash, never doubled -- and a filesystem-root override still produces the
+# correct single-slash path "/mistral-..." (llama.cpp-5iba quality review:
+# equivalent to the previous strip-loop-plus-special-case on every input --
+# "", "/", "//", "///", "/foo", "/foo/", "/foo///" -- but as one loop).
+while [ "${MODELS_DIR%/}" != "$MODELS_DIR" ]; do
+    MODELS_DIR="${MODELS_DIR%/}"
+done
+
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 
 # --- the six model/card pairs (fixed matrix; see plan task L3) ---
-# Fields are '|'-delimited: key|label|<model path or selector>.
+# Fields are '|'-delimited: key|label|<model path or selector>. The mistral
+# and gptoss paths are rooted at MODELS_DIR (--models-dir /
+# SYCL_PREFILL_SCALING_MODELS_DIR, default /models -- see the file header).
 MODELS=(
-    "mistral|Mistral 7B Q4_0|/models/mistral-7b-v0.1.Q4_0.gguf"
-    "gptoss|GPT-OSS 20B MXFP4|/models/gpt-oss-20b-mxfp4.gguf"
+    "mistral|Mistral 7B Q4_0|$MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
+    "gptoss|GPT-OSS 20B MXFP4|$MODELS_DIR/gpt-oss-20b-mxfp4.gguf"
     "gemma4|gemma4 E4B|/Storage/GenAI/models/stock-gemma-4-E4B-it.Q8_0.gguf"
 )
 CARDS=(
@@ -167,6 +206,34 @@ only_selected() {
     done
     return 1
 }
+
+# Model-file existence check (llama.cpp-5iba). Runs AFTER --only validation
+# above and BEFORE the first bench-guard invocation in the main loop below
+# -- see the file header for why this check exists at all. Checked once
+# per MODEL, not once per selected pair: hoisted out of the card loop so a
+# model selected via two --only pairs (e.g. mistral,b70 and mistral,b50)
+# stats its one shared path once, not twice, and the refusal names the
+# MODEL ("model mistral"), since the missing file is a property of the
+# model, not of whichever card happened to be checked first. A model is
+# checked at all only if at least one of its pairs is selected
+# (only_selected), never the full six-pair matrix, so an --only run is
+# never blocked by an unrelated model being absent.
+for model_entry in "${MODELS[@]}"; do
+    IFS='|' read -r m_key _ m_path <<< "$model_entry"
+    model_selected=0
+    for card_entry in "${CARDS[@]}"; do
+        IFS='|' read -r c_key _ _ <<< "$card_entry"
+        only_selected "$m_key,$c_key" && { model_selected=1; break; }
+    done
+    [ "$model_selected" -eq 1 ] || continue
+    # -f, not just -r: a DIRECTORY named like the model file passes -r (it
+    # only tests read permission) but must still be refused here rather
+    # than sailing through to llama-bench's own open() failure much later.
+    [ -f "$m_path" ] && [ -r "$m_path" ] || {
+        echo "sycl-prefill-scaling: model file not found or not readable: $m_path (model $m_key)" >&2
+        exit 2
+    }
+done
 
 # parse_cell: extracts the numeric t/s value (first token, spread stripped)
 # for the markdown table row whose `test` cell equals $2 exactly -- never a
