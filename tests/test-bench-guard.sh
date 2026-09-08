@@ -17,7 +17,7 @@ skipped=0
 # cases: total test-case count, printed in the final "OK" line (llama.cpp-3e0f
 # finding 10). Every case below bumps this exactly once -- expect_status does
 # it for you (see its own definition); a raw (non-expect_status) case must
-# increment it itself, directly above its own case comment.
+# increment it itself, directly above its own case (above its case comment where it has one).
 cases=0
 
 # mk_pci_dev DEVROOT PCI_ADDR [with_freq [throttle act_freq]] -- create a
