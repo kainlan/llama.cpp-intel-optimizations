@@ -660,10 +660,11 @@ head -1 "$T/run-space.log" | grep -q "card=$T/drmroot-space/card0" \
     || { echo "FAIL: a DRM_ROOT device path containing a space must resolve card=$T/drmroot-space/card0, got: $(head -1 "$T/run-space.log" 2>/dev/null)"; fail=1; }
 
 cases=$((cases+1))
-# llama.cpp-o4fs: the case above exercises the readlink-failure fix only
-# inside derive_card_for_selector -- find_card_by_pci (the --pci override
-# path) carries the SAME `readlink -f ... | xargs -r basename` shape and
-# was left uncovered. Reuses the same $T/drmroot-space fixture built just
+# llama.cpp-o4fs: the case above exercises the space-in-resolved-path
+# (`xargs -r basename` word-splitting) fix only inside
+# derive_card_for_selector -- find_card_by_pci (the --pci override path)
+# carries the SAME `readlink -f ... | xargs -r basename` shape and was
+# left uncovered. Reuses the same $T/drmroot-space fixture built just
 # above, via --pci instead of a bare selector, so this exercises
 # find_card_by_pci's own basename substitution specifically.
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot-space" --meminfo "$T/meminfo" \
@@ -786,30 +787,29 @@ cases=$((cases+1))
 # llama.cpp-o4fs: a readlink FAILURE -- distinct from the
 # unreadable-device-DIR case above, which chmods the target dir ITSELF and
 # reaches the LATER `[ -d "$c/device" ] && { [ ! -r ] || [ ! -x ] }` check
-# -- must never become a silent, index-shifting skip. This chmods the
-# PARENT of the device target instead (an "unsearchable parent"): looking
-# up a directory ENTRY by name needs search permission on the directory
-# CONTAINING it, not on the entry's own permission bits, so this blocks
-# path resolution one level higher than the unreadable-devdir case above.
+# -- must never become a silent, index-shifting skip. This chmods the PARENT
+# of the device target instead (an "unsearchable parent"): looking up a
+# directory ENTRY by name needs search permission on the directory
+# CONTAINING it, not on the entry's own permission bits, so this blocks path
+# resolution one level higher than the unreadable-devdir case above.
 #
-# Empirically, this exact fixture is refused via the DANGLING
-# check (`[ -L "$c/device" ] && [ ! -e "$c/device" ]`, already earlier in
-# the loop), not the later "readlink probe error" line's own message: `-e`
-# and `readlink -f` both fully resolve the same symlink chain to determine
-# existence, so an unsearchable ancestor makes BOTH fail identically --
-# there is no ordinary filesystem-permission construction that fails
-# readlink -f while `-e` still succeeds (the "readlink probe error" refuse
-# exists for a genuine TOCTOU race -- the target vanishing between the
-# dangling check and the readlink call a moment later -- which a static
-# chmod fixture cannot reproduce). This is still exactly the behaviour
-# llama.cpp-o4fs's fix requires: checking readlink's own exit status,
-# instead of discarding it into a `basename` call that always succeeds,
-# matters regardless of which refuse() message a given failure surfaces
-# through, and this test proves the OUTCOME -- a loud refuse(), never a
-# silent skip that would
-# shift level_zero indices for the surviving cards -- for a readlink
-# failure that reaches this fixture's construction. Skip under root, which
-# bypasses permission bits, so chmod 000 would not reproduce this.
+# Empirically, this exact fixture is refused via the DANGLING check (`[ -L
+# "$c/device" ] && [ ! -e "$c/device" ]`, already earlier in the loop), not
+# the later "readlink probe error" line's own message: `-e` and `readlink
+# -f` both fully resolve the same symlink chain to determine existence, so
+# an unsearchable ancestor makes BOTH fail identically -- there is no
+# ordinary filesystem-permission construction that fails readlink -f while
+# `-e` still succeeds (the "readlink probe error" refuse exists for a
+# genuine TOCTOU race -- the target vanishing between the dangling check and
+# the readlink call a moment later -- which a static chmod fixture cannot
+# reproduce). This is still exactly the behaviour this fix requires:
+# checking readlink's own exit status, instead of discarding it into a
+# `basename` call that always succeeds, matters regardless of which refuse()
+# message a given failure surfaces through, and this test proves the OUTCOME
+# -- a loud refuse(), never a silent skip that would shift level_zero
+# indices for the surviving cards -- for a readlink failure that reaches
+# this fixture's construction. Skip under root, which bypasses permission
+# bits, so chmod 000 would not reproduce this.
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unsearchable-parent (readlink failure) case"
 else

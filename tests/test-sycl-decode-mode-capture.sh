@@ -317,9 +317,10 @@ grep -qi "out of range" <<<"$out_lz2_text" \
 
 # --- llama.cpp-o4fs: scripts/sycl-decode-mode-capture.sh's own
 # explicit `DRM_ROOT=/sys/class/drm` (set unconditionally before sourcing
-# sycl-gpu-sysfs.sh, mirroring bench-guard.sh's own F1 fix) had no test
-# coverage of its own. As with bench-guard.sh's own F1 regression test
-# (tests/test-bench-guard.sh), this cannot be exercised by ALSO passing
+# sycl-gpu-sysfs.sh, mirroring bench-guard.sh's own env-DRM_ROOT-leak fix)
+# had no test coverage of its own. As with bench-guard.sh's own
+# env-DRM_ROOT-leak regression test (tests/test-bench-guard.sh), this
+# cannot be exercised by ALSO passing
 # --drm-root (that flag's arg-parser assignment always wins regardless of
 # the fix) or --sysfs-card (that bypasses derivation entirely) -- the only
 # way to reach the real code path is to omit both and let full derivation

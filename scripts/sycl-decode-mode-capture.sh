@@ -60,34 +60,32 @@
 # All host-corruption preflight (throttled/active card, stale GPU tenant,
 # elevated Shmem) is bench-guard.sh's DECISION logic, invoked here as a
 # CHILD -- this script never re-implements it, so the VALID/SUSPECT verdict
-# and the REFUSED (exit 3) path come for free. This script forwards the
-# six hooks bench-guard.sh understood as of its original A1/A2 tasks
+# and the REFUSED (exit 3) path come for free. This script forwards the six
+# hooks bench-guard.sh understood as of its original A1/A2 tasks
 # (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd, --journalctl-cmd,
 # --max-wait) unchanged. bench-guard.sh has since gained a seventh,
 # --drm-root (llama.cpp-imns) -- and, separately, THIS script itself now
-# also accepts a --drm-root of its OWN (llama.cpp-o4fs), used purely for
-# its OWN card derivation below (see that section's comment). The two are
-# NOT the same value crossing a boundary: this script's --drm-root is
-# still deliberately NOT forwarded to the bench-guard.sh child -- it
-# always passes --sysfs-card explicitly (see below), which bypasses
-# bench-guard.sh's own --drm-root-based derivation
-# entirely, so there is nothing downstream for either script's --drm-root
-# to affect on the child's path. Three of the six forwarded hooks are ALSO
-# read locally by this script for its own
-# purposes, not merely handed through: --sysfs-card additionally derives
-# FREQ for the sampler (the same card bench-guard.sh itself derives, so
-# passing --sysfs-card keeps both in agreement); --meminfo is additionally
-# read by host_snapshot for its Shmem/MemAvailable lines; --pgrep-cmd is
-# additionally read by ffmpeg_count, which pipes its output through
-# `grep -c ffmpeg` -- a
-# DIFFERENT question than bench-guard.sh's own tenant-listing use of the
-# same hook (`pgrep -a -x 'llama-cli|llama-bench|llama-completion'`). A
-# --pgrep-cmd override built only to answer bench-guard.sh's tenant
-# question (e.g. one that lists tenants but never mentions "ffmpeg") will
-# silently make every host.txt ffmpeg_count read 0 rather than fail loudly
-# -- pass a general process-listing command if ffmpeg counting matters to
-# the caller, not one filtered to llama tenants (llama.cpp-gvu7 quality
-# review).
+# also accepts a --drm-root of its OWN (llama.cpp-o4fs), used purely for its
+# OWN card derivation below (see that section's comment). The two are NOT
+# the same value crossing a boundary: this script's --drm-root is still
+# deliberately NOT forwarded to the bench-guard.sh child -- it always passes
+# --sysfs-card explicitly (see below), which bypasses bench-guard.sh's own
+# --drm-root-based derivation entirely, so there is nothing downstream for
+# either script's --drm-root to affect on the child's path. Three of the six
+# forwarded hooks are ALSO read locally by this script for its own purposes,
+# not merely handed through: --sysfs-card additionally derives FREQ for the
+# sampler (the same card bench-guard.sh itself derives, so passing
+# --sysfs-card keeps both in agreement); --meminfo is additionally read by
+# host_snapshot for its Shmem/MemAvailable lines; --pgrep-cmd is
+# additionally read by ffmpeg_count, which pipes its output through `grep -c
+# ffmpeg` -- a DIFFERENT question than bench-guard.sh's own tenant-listing
+# use of the same hook (`pgrep -a -x
+# 'llama-cli|llama-bench|llama-completion'`). A --pgrep-cmd override built
+# only to answer bench-guard.sh's tenant question (e.g. one that lists
+# tenants but never mentions "ffmpeg") will silently make every host.txt
+# ffmpeg_count read 0 rather than fail loudly -- pass a general
+# process-listing command if ffmpeg counting matters to the caller, not one
+# filtered to llama tenants (llama.cpp-gvu7 quality review).
 #
 # Card derivation for the sampler now shares scripts/sycl-gpu-sysfs.sh's
 # derive_card_for_selector with bench-guard.sh (llama.cpp-o4fs), rather than
