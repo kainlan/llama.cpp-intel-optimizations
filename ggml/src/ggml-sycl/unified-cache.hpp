@@ -3014,13 +3014,17 @@ class unified_cache {
 
     // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to
     // wait for headroom to free up under the cap before it was allowed to
-    // allocate -- polling until either exit condition is met: a same-size
-    // entry in the request's own bucket becomes USABLE and can be reused
-    // with nothing evicted, or the general eviction sweep frees enough
+    // allocate -- polling until one of three exit conditions is met: a
+    // same-size entry in the request's own bucket becomes USABLE and can be
+    // reused with nothing evicted, the general eviction sweep frees enough
     // headroom by releasing pooled entries of any size, including this
-    // one's, whose release events have completed. Exposed for tests and for
-    // the teardown log line; see the private ledger this counts against in
-    // the member declarations further below.
+    // one's, whose release events have completed, or the poll loop's own
+    // total deadline (kOnednnGraphDirectWaitTotalTimeoutMs) elapses with
+    // neither having happened. The counter increments before the loop
+    // starts, so it also counts waits that timed out, not only waits that
+    // resolved. Exposed for tests and for the teardown log line; see the
+    // private ledger this counts against in the member declarations further
+    // below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
