@@ -362,8 +362,8 @@ ticket reproduced on:
   printing truly per-call would flood the log for a
   workload that repeats one shape thousands of times (every ubatch at a
   stable KV length, across `-r N` benchmark reps), while the shape space
-  this print actually needs to surface is small -- one entry per distinct
-  compiled-partition shape, not per call -- so "per distinct size" is a
+  this print actually needs to surface is small — one entry per distinct
+  compiled-partition shape, not per call — so "per distinct size" is a
   deliberate, documented substitution for "per request", not an oversight.
 - ⚠️ **The zone floor above cannot actually reach the DIRECT path's steady
   state, and this is not a bug to fix in the floor** — it is a fact about
@@ -410,9 +410,9 @@ ticket reproduced on:
   clear the moment `onednn_graph_scratch_free()` is *called*, whether or not
   the memory is actually released at all — under this redesign it may now
   live in the pool indefinitely) — it is still real resident VRAM, just idle
-  — so the pool
-  cannot grow without limit alongside fresh allocations; it competes with
-  them for the same `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` headroom (default:
+  — so the pool cannot grow without limit alongside fresh allocations; it
+  competes with them for the same `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
+  headroom (default:
   min(1 GiB, 25% of `available_budget()` snapshotted the last time this
   device's arena was successfully planned — a snapshot, not a live read, so
   the cap does not shrink out from under the allocator as the arena's own
@@ -437,11 +437,11 @@ ticket reproduced on:
   to wait, and how often it was served from the pool instead, respectively.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
-  buffers of ONE size the pool could hold, so
-  `onednn_graph_scratch_free()` also caps each size bucket at
-  `onednn_graph_scratch_pool_depth_per_size()` entries (default **8**, env
-  `GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE`) — a workload that walks many
-  distinct sizes (a pp8192 run touches ~16 distinct ne11-derived shapes)
+  buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
+  also caps each size bucket at `onednn_graph_scratch_pool_depth_per_size()`
+  entries (default **8**, env `GGML_SYCL_ONEDNN_GRAPH_POOL_DEPTH_PER_SIZE`)
+  — a workload that walks many distinct sizes (a pp8192 run touches ~16
+  distinct ne11-derived shapes)
   cannot grow the pool's footprint without limit just because each
   individual size stays under the byte cap; a size whose bucket is already
   at the depth limit releases the overflow buffer for real via the shared
@@ -476,7 +476,7 @@ eviction/wait properties need no such hook: they are exercised directly by
 freeing and re-requesting real DIRECT allocations at controlled sizes.
 **Deliberate, stated deviation:** the fix spec's
 "genuine exhaustion aborts loudly" property is exercised through this
-forced-fail hook, not real VRAM exhaustion -- the test never actually drains
+forced-fail hook, not real VRAM exhaustion — the test never actually drains
 a card's VRAM. This is a sound proxy for the property under test (the
 allocator's response to a failed `unified_alloc()` does not depend on WHY it
 failed), not a weaker substitute standing in for a stronger test that was

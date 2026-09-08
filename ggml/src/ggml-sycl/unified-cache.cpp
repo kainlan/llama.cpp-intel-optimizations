@@ -9888,11 +9888,10 @@ bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size
             onednn_graph_scratch_entry_usable_locked(bucket[i], alignment, device_id, &resolved);
         // switch over every enumerator, no default: a fifth
         // onednn_graph_scratch_entry_fit value added later without a case
-        // here warns under -Wswitch (and fails the build under
-        // GGML_FATAL_WARNINGS=ON, off by default) instead of silently
-        // falling through to the pop-and-reuse branch below (an if-chain's
-        // implicit "anything else" fallthrough previously would not have
-        // caught that, and would have disagreed with the peek in
+        // here warns under -Wswitch instead of silently falling through to
+        // the pop-and-reuse branch below (an if-chain's implicit "anything
+        // else" fallthrough previously would not have caught that, and
+        // would have disagreed with the peek in
         // onednn_graph_scratch_pool_size_ready_locked(), which explicitly
         // tests `== USABLE`).
         switch (fit) {

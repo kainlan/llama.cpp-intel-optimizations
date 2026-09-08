@@ -36,8 +36,8 @@
 // evictable. Two further bounds, not directly exercised by this file (both
 // are exercised via unified-cache.cpp's own source-contract gate,
 // tests/test-sycl-onednn-graph-allocator-source.py, and via reading the
-// counters this file DOES check): each size bucket also
-// caps at onednn_graph_scratch_pool_depth_per_size() entries (default 8,
+// counters this file DOES check): each size bucket also caps at
+// onednn_graph_scratch_pool_depth_per_size() entries (default 8,
 // env-overridable) so a workload walking many distinct sizes cannot grow the
 // pool without limit even while every individual size stays under the byte
 // cap; and the pool is cleared (real release) at cache teardown and at the
