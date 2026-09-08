@@ -49,9 +49,16 @@ loop, which is why it runs last):
 - **PL2 throttle / active card** — `throttle/status != 0` or `act_freq != 0`,
   polled up to `--max-wait` (default 360 s) under
   `<card>/device/tile0/gt0/freq0/{throttle/status,act_freq}`. `<card>` is
-  derived **live** from the PCI device symlink (`readlink -f
-  /sys/class/drm/card*/device`) against `0000:03:00.0` (B70) or `0000:07:00.0`
-  (B50) — never a static `cardN` index; DRM numbering moves across boots.
+  derived **live**: the guard enumerates `/sys/class/drm/card*` (overridable
+  with `--drm-root`), keeps discrete Intel display controllers (excluding the
+  integrated GPU), sorts them by PCI address, and maps `level_zero:N` to the
+  N-th survivor — never a static `cardN` index or a fixed PCI-address table,
+  since both DRM numbering and the PCI bus addresses themselves move across
+  boots (`0000:03:00.0`/`0000:07:00.0` before the 2026-09-05 boot,
+  `0000:04:00.0`/`0000:09:00.0` after; the B70 has been the lower address on
+  every boot observed). `--pci`/`--sysfs-card` bypass the derivation
+  explicitly. See `scripts/bench-guard.sh`'s header comment for the full rule
+  (llama.cpp-imns).
 
 **A number whose log does not start with `# bench-guard: VALID` is not a
 baseline and must not be cited** — cite the SUSPECT reason instead, or re-run.
@@ -83,10 +90,28 @@ Each rule below cost a round of discarded measurements.
    sweep for holders:
 
    ```bash
-   # any process with non-zero drm-resident-vram0 on either card
-   for f in /proc/*/fdinfo/*; do
-       grep -l 'drm-pdev:.*0000:03:00.0' "$f" 2>/dev/null   # B70
-       grep -l 'drm-pdev:.*0000:07:00.0' "$f" 2>/dev/null   # B50
+   # any process with non-zero drm-resident-vram0 on either discrete Intel
+   # GPU. Do not hardcode a PCI-address pair here -- both cards' addresses
+   # are boot-dependent (0000:03:00.0/07:00.0 before the 2026-09-05 boot,
+   # 0000:04:00.0/09:00.0 after; llama.cpp-imns), so derive them live from
+   # `lspci` instead, the same way bench-guard.sh's own
+   # derive_card_for_selector does from sysfs. `-D` prints the PCI domain so
+   # the address is already in the drm-pdev dddd:bb:dd.f form (no need to
+   # prefix "0000:" ourselves, which would be wrong on a host whose domain
+   # isn't 0000). \[03[0-9a-f]{2}\]: matches only the PCI class-code
+   # bracket (class 0x03 = display controller; it is the bare 4-hex-digit
+   # shape -- 03xx with no internal colon -- that distinguishes it from the
+   # device-id bracket further down the line, e.g. [8086:e212], not the
+   # trailing ':'), and excluding any bus 00 (one or more hex digits of
+   # domain followed by :00:) drops the integrated GPU regardless of domain
+   # width:
+   mapfile -t gpu_pci < <(lspci -D -d 8086: -nn | grep -E '\[03[0-9a-f]{2}\]:' \
+       | awk '{print $1}' | grep -vE '^[0-9a-f]+:00:')
+   for pci in "${gpu_pci[@]}"; do
+       echo "== $pci =="
+       for f in /proc/*/fdinfo/*; do
+           grep -l "drm-pdev:.*${pci}" "$f" 2>/dev/null
+       done
    done
    ```
 

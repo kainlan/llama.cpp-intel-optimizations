@@ -60,15 +60,21 @@
 # All host-corruption preflight (throttled/active card, stale GPU tenant,
 # elevated Shmem) is bench-guard.sh's DECISION logic, invoked here as a
 # CHILD -- this script never re-implements it, so the VALID/SUSPECT verdict
-# and the REFUSED (exit 3) path come for free. All six of bench-guard.sh's
-# own test hooks (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd,
-# --journalctl-cmd, --max-wait) are forwarded to it unchanged, but three are
-# ALSO read locally by this script for its own purposes, not merely handed
-# through: --sysfs-card additionally derives FREQ for the sampler (the same
-# card bench-guard.sh itself derives, so passing --sysfs-card keeps both in
-# agreement); --meminfo is additionally read by host_snapshot for its
-# Shmem/MemAvailable lines; --pgrep-cmd is additionally read by
-# ffmpeg_count, which pipes its output through `grep -c ffmpeg` -- a
+# and the REFUSED (exit 3) path come for free. This script forwards the
+# six hooks bench-guard.sh understood as of its original A1/A2 tasks
+# (--sysfs-card, --meminfo, --pgrep-cmd, --df-cmd, --journalctl-cmd,
+# --max-wait) unchanged. bench-guard.sh has since gained a seventh,
+# --drm-root (llama.cpp-imns), deliberately NOT forwarded here: this
+# script always passes --sysfs-card explicitly (see below), which bypasses
+# bench-guard.sh's own --drm-root-based derivation entirely, so there is
+# nothing downstream for --drm-root to affect on this path. Three of the
+# six forwarded hooks are ALSO read locally by this script for its own
+# purposes, not merely handed through: --sysfs-card additionally derives
+# FREQ for the sampler (the same card bench-guard.sh itself derives, so
+# passing --sysfs-card keeps both in agreement); --meminfo is additionally
+# read by host_snapshot for its Shmem/MemAvailable lines; --pgrep-cmd is
+# additionally read by ffmpeg_count, which pipes its output through
+# `grep -c ffmpeg` -- a
 # DIFFERENT question than bench-guard.sh's own tenant-listing use of the
 # same hook (`pgrep -a -x 'llama-cli|llama-bench|llama-completion'`). A
 # --pgrep-cmd override built only to answer bench-guard.sh's tenant
@@ -78,12 +84,18 @@
 # the caller, not one filtered to llama tenants (llama.cpp-gvu7 quality
 # review).
 #
-# Card derivation for the sampler is a live PCI-symlink lookup, the same one
-# bench-guard.sh performs internally for its own preflight (0000:03:00.0 =
-# B70, level_zero:0; 0000:07:00.0 = B50, level_zero:1) -- copied here rather
-# than shared because bench-guard.sh does not expose its derived card to a
-# caller. Passing --sysfs-card explicitly (as the test suite does) makes both
-# this script and the bench-guard.sh child agree on the same fake tree.
+# Card derivation for the sampler is a live PCI-symlink lookup, copied here
+# rather than shared because bench-guard.sh does not expose its derived card
+# to a caller. Passing --sysfs-card explicitly (as the test suite does)
+# makes both this script and the bench-guard.sh child agree on the same fake
+# tree, which is why this script's own selector->PCI case below (still a
+# fixed 0000:03:00.0=B70/0000:07:00.0=B50 table, unlike bench-guard.sh's own
+# live derive_card_for_selector as of llama.cpp-imns) has level_zero:0/1 arms
+# that are never taken by the test suite (it passes --sysfs-card, or unsets
+# the selector to hit the refusal arm) and is STALE against the current
+# boot's 0000:04:00.0/0000:09:00.0 addresses -- tracked as llama.cpp-o4fs
+# (which also covers scripts/sycl-gpu-preflight.sh:38's same-shaped
+# staleness), out of llama.cpp-imns's scope (bench-guard.sh only).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

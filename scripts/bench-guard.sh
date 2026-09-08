@@ -5,8 +5,9 @@
 # throttled/active, a stale llama-cli|llama-bench|llama-completion tenant is
 # already running, or Shmem is elevated (CLAUDE.md: TTM shmem OOM history).
 # All host probes go through overridable roots (--sysfs-card, --meminfo,
-# --pgrep-cmd, --journalctl-cmd, --df-cmd -- the last three are test hooks,
-# same as --meminfo/--sysfs-card, so the logic is testable without hardware).
+# --pgrep-cmd, --journalctl-cmd, --df-cmd, --drm-root -- the last four are
+# test hooks, same as --meminfo/--sysfs-card, so the logic is testable
+# without hardware).
 # The Shmem ceiling check compares Shmem net of tmpfs file usage (summed
 # "Used" from `df -k -t tmpfs`, override with --df-cmd): ordinary tmpfs files
 # (/tmp, /dev/shm) count toward Shmem in /proc/meminfo alongside TTM GPU-BO
@@ -31,16 +32,23 @@
 # reset/guc_id/CAT error since the run started. A post-run throttle=1 reading
 # is NOT by itself suspect -- the run's own power draw asserts it.
 #
-# Default card mapping (this host, verify with --sysfs-card on other machines):
-#   level_zero:0 = B70 = PCI 0000:03:00.0 ; level_zero:1 = B50 = PCI 0000:07:00.0
-# Derivation is LIVE via the PCI device symlink, never the static card index
-# (CLAUDE.md: DRM numbering moves across boots). The selector match below is
-# EXACT ("level_zero:0", not a "level_zero:0*" glob) so a multi-device or
-# other-form selector (level_zero:0,1, level_zero:gpu, ...) falls through to
-# the explicit "cannot derive card" refusal instead of silently picking one
-# of the cards it names.
+# Card derivation is LIVE from DRM/PCI enumeration under --drm-root (default
+# /sys/class/drm), never a fixed PCI address table (CLAUDE.md: DRM numbering
+# AND PCI bus addresses move across boots -- verified 2026-09-05, when the
+# discrete cards moved from 0000:03:00.0/07:00.0 to 0000:04:00.0/09:00.0).
+# derive_card_for_selector() (below; see its own docstring for the
+# enumerate/filter/sort mechanics) maps level_zero:N to the N-th discrete
+# GPU by ascending PCI address, zero-based. This assumes Level Zero orders
+# the discrete cards by ascending PCI address -- true on every boot
+# observed so far (the B70 is always the lower address, i.e.
+# level_zero:0). --pci ADDR and --sysfs-card DIR remain explicit overrides
+# that bypass the derivation entirely. The selector match is EXACT
+# (level_zero:<digit>, a single digit) so a multi-device or other-form
+# selector (level_zero:0,1, level_zero:gpu, ...) falls through to the
+# explicit "cannot derive card" refusal instead of silently picking one of
+# the cards it names.
 set -euo pipefail
-SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
+SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}" DRM_ROOT=/sys/class/drm
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
@@ -52,6 +60,7 @@ while [ $# -gt 0 ]; do case "$1" in
     --df-cmd)          DF_CMD="$2";         shift 2;;
     --max-wait)        MAX_WAIT="$2";       shift 2;;
     --pci)             PCI="$2";            shift 2;;
+    --drm-root)        DRM_ROOT="$2";       shift 2;;
     --log)             LOG="$2";            shift 2;;
     --budget)          BUDGET="$2";         shift 2;;
     --journalctl-cmd)  JOURNALCTL_CMD="$2"; shift 2;;
@@ -62,15 +71,188 @@ esac; done
 
 refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 
-if [ -z "$SYSFS_CARD" ]; then
-    if [ -z "$PCI" ]; then case "$SELECTOR" in
-        level_zero:0) PCI="0000:03:00.0";;
-        level_zero:1) PCI="0000:07:00.0";;
-        *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:0 or level_zero:1 (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
-    esac; fi
-    for c in /sys/class/drm/card*; do
-        [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$PCI" ] && SYSFS_CARD="$c" && break
+# Without this, a missing/unreadable --meminfo reaches shmem_kb()'s bare
+# `awk` unguarded and the script dies on awk's own raw exit status (2) and
+# stderr message ("awk: can't open file ...") instead of a clean refuse()
+# -- the exact "bare command fails under set -e with no context" failure
+# mode this file guards against everywhere else (llama.cpp-imns review
+# round 5, finding F9).
+[ -r "$MEMINFO" ] || refuse "no meminfo at $MEMINFO"
+
+# is_top_level_card DIR -- true iff DIR exists and its basename matches
+# card[0-9]+, i.e. a numbered top-level card rather than a connector entry
+# (card1-DP-1, ...). Shared by derive_card_for_selector and
+# find_card_by_pci so the two enumeration loops cannot drift onto
+# different filters.
+is_top_level_card() {
+    local c="$1" base
+    [ -e "$c" ] || return 1
+    base="$(basename "$c")"
+    [[ "$base" =~ ^card[0-9]+$ ]]
+}
+
+# derive_card_for_selector IDX -- enumerate top-level DRM cards under
+# $DRM_ROOT (is_top_level_card), keep discrete Intel display controllers
+# (device/vendor 0x8086, device/class 0x0300*), excluding PCI bus 00 on
+# any domain, which is the integrated GPU, sort the survivors by PCI
+# address (lexical order on the zero-padded dddd:bb:dd.f string is
+# domain/bus/device/function order -- unlike the bus-00 exclusion, which
+# matches a substring and needs no assumption about domain width, this
+# lexical sort DOES assume every survivor's domain is padded to the same
+# width, the way sysfs actually presents it; two domains of different
+# widths would put the domain digits at different offsets, so the first
+# differing character decides instead of the domain's value, and could
+# misorder),
+# and set DERIVED_CARD/DERIVED_PCI to
+# the sysfs card path and PCI address of the IDX-th (zero-based) survivor.
+# Calls refuse() (exit 3) directly on any failure. Called directly, never
+# via a command substitution, so `set -e` applies to it exactly as it does
+# to the rest of the script; every probe below that can genuinely fail (as
+# opposed to a file legitimately not existing, which is a normal
+# `continue`) is still checked with an explicit `if ! ...; then refuse
+# ...; fi` purely to give a specific, actionable message -- an unguarded
+# failure under `set -e` would abort the whole script with no context at
+# all.
+#
+# A card that legitimately lacks a `device` link at all is excluded quietly
+# -- only the ordering of the SURVIVING cards is index-significant, and the
+# absence says nothing meaningful about whether this was ever a GPU. A card
+# whose device/vendor or device/class file legitimately does not exist, or
+# exists, IS READABLE, and simply holds an unexpected value (extra
+# whitespace, an unrelated class like 0x038000), is ALSO excluded quietly
+# the same way: everything after it shifts down by one index, exactly as
+# if it were a different vendor, and there is no way from here to tell
+# "this really is a different device" from "the file is subtly wrong".
+#
+# In contrast, a DANGLING device symlink (the card had one, but its target
+# no longer resolves -- e.g. a device removed or a hot-unplug race), an
+# UNREADABLE-OR-UNSEARCHABLE device DIRECTORY (the resolved target exists
+# but cannot be read or entered, e.g. `chmod 000` on it -- this must be
+# caught separately from the vendor/class file checks below, because an
+# unsearchable directory makes `[ -e "$c/device/vendor" ]` itself return
+# false, the same as a legitimately absent file, so those checks alone
+# cannot see it), and an EXISTING-but-UNREADABLE vendor/class file (the
+# file is there, we simply cannot read it, e.g. a permission change) are
+# NOT quiet exclusions: all three refuse() loudly instead, because silently
+# dropping any of them would change level_zero:N's meaning for every card
+# after it with no visible signal -- exactly the silent index shift this
+# whole derivation exists to prevent (llama.cpp-imns review round 2/3).
+derive_card_for_selector() {
+    local idx="$1" c base pci vendor class
+    local -a entries=()
+    for c in "$DRM_ROOT"/card*; do
+        is_top_level_card "$c" || continue
+        base="$(basename "$c")"
+        if [ ! -e "$c/device" ] && [ ! -L "$c/device" ]; then
+            continue   # no device link at all: legitimate skip
+        fi
+        if [ -L "$c/device" ] && [ ! -e "$c/device" ]; then
+            refuse "$base's device symlink is dangling (its target no longer resolves); refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
+        if ! pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"; then
+            refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
+        fi
+        [ -n "$pci" ] || continue
+        if [ -d "$c/device" ] && { [ ! -r "$c/device" ] || [ ! -x "$c/device" ]; }; then
+            refuse "$base's device directory ($pci) exists but is not readable/searchable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
+        if [ -e "$c/device/vendor" ] && [ ! -r "$c/device/vendor" ]; then
+            refuse "$base's device/vendor exists but is not readable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
+        [ -r "$c/device/vendor" ] || continue
+        if [ -e "$c/device/class" ] && [ ! -r "$c/device/class" ]; then
+            refuse "$base's device/class exists but is not readable; refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
+        fi
+        [ -r "$c/device/class" ] || continue
+        if ! vendor="$(cat "$c/device/vendor" 2>/dev/null)"; then
+            refuse "failed to read $c/device/vendor (probe error after it was confirmed readable)"
+        fi
+        [ "$vendor" = "0x8086" ] || continue
+        if ! class="$(cat "$c/device/class" 2>/dev/null)"; then
+            refuse "failed to read $c/device/class (probe error after it was confirmed readable)"
+        fi
+        case "$class" in 0x0300*) : ;; *) continue;; esac
+        case "$pci" in *:00:*) continue;; esac    # exclude PCI bus 00 on any domain (any width) -- the integrated GPU
+        entries+=("$base"$'\t'"$pci"$'\t'"$c")
     done
+    local sorted_str=""
+    if [ "${#entries[@]}" -gt 0 ]; then
+        # Lexical sort on field 2 (the PCI address) is domain/bus/device/
+        # function order for the zero-padded dddd:bb:dd.f form -- this
+        # assumes uniform domain width across survivors (see the docstring
+        # above); force LC_ALL=C so a non-C locale cannot reorder it. The
+        # explicit `if !` (not relying on mapfile's own status, which never
+        # sees a failure from inside a process substitution) is what makes
+        # a sort probe failure refuse() instead of silently yielding zero
+        # or partial candidates.
+        if ! sorted_str="$(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t $'\t' -k2,2)"; then
+            refuse "failed to sort discrete GPU candidates under $DRM_ROOT (sort probe error)"
+        fi
+    fi
+    local -a sorted=()
+    [ -z "$sorted_str" ] || mapfile -t sorted <<< "$sorted_str"
+    local n="${#sorted[@]}"
+    [ "$n" -gt 0 ] || refuse "no discrete Intel GPU display controller found under $DRM_ROOT"
+    if [ "$idx" -ge "$n" ]; then
+        local disp="" e b p
+        for e in "${sorted[@]}"; do
+            IFS=$'\t' read -r b p _ <<< "$e"
+            disp="$disp${disp:+ }$b=$p"
+        done
+        refuse "level_zero:$idx is out of range; found $n discrete Intel GPU(s): $disp"
+    fi
+    local p path
+    IFS=$'\t' read -r _ p path <<< "${sorted[$idx]}"
+    DERIVED_CARD="$path"
+    DERIVED_PCI="$p"
+}
+
+# find_card_by_pci PCI -- scan top-level DRM cards under $DRM_ROOT (same
+# is_top_level_card filter as derive_card_for_selector, so a connector
+# entry can't shadow the real card here either) and print the first
+# matching sysfs card path, or an empty line if none matches. Always exits
+# 0 (the caller decides what an empty result means), so it is safe to
+# assign its output via plain command substitution without an explicit
+# `|| ...` guard. Unlike derive_card_for_selector's guarded readlink, a
+# readlink failure here is a silent skip rather than a refuse(): this
+# function has no index semantics to protect -- there is one target PCI
+# address, not an ordered list whose positions shift when an entry is
+# dropped -- and a card this loop misses simply leaves SYSFS_CARD empty at
+# the call site, which reaches the loud "no DRM card for PCI $PCI" refusal
+# there.
+find_card_by_pci() {
+    local target_pci="$1" c found=""
+    for c in "$DRM_ROOT"/card*; do
+        is_top_level_card "$c" || continue
+        if [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$target_pci" ]; then
+            found="$c"
+            break
+        fi
+    done
+    printf '%s\n' "$found"
+}
+
+if [ -z "$SYSFS_CARD" ]; then
+    if [ -z "$PCI" ]; then
+        case "$SELECTOR" in
+            level_zero:[0-9]) : ;;
+            *) refuse "cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --pci or --sysfs-card";;
+        esac
+        # Derive BOTH the PCI address and the sysfs card path in the same
+        # pass (into DERIVED_PCI/DERIVED_CARD) -- do not re-scan $DRM_ROOT
+        # afterward to find the card for that PCI: an earlier, unfiltered
+        # second scan matched a connector entry sharing the same device
+        # symlink ahead of the real card in glob order (llama.cpp-imns
+        # review round 1).
+        DERIVED_CARD="" DERIVED_PCI=""
+        derive_card_for_selector "${SELECTOR#level_zero:}"
+        SYSFS_CARD="$DERIVED_CARD"
+        PCI="$DERIVED_PCI"
+    else
+        # --pci was given explicitly (no --sysfs-card): still need to find
+        # the matching sysfs card.
+        SYSFS_CARD="$(find_card_by_pci "$PCI")"
+    fi
     [ -n "$SYSFS_CARD" ] || refuse "no DRM card for PCI $PCI"
 fi
 FREQ="$SYSFS_CARD/device/tile0/gt0/freq0"
@@ -183,9 +365,13 @@ if kernel_log | grep -qiE 'GT reset|guc_id|CAT error'; then
 fi
 
 verdict_line="$verdict${reasons:+:$reasons}"
+# pci=/card= record which device was guarded. When --sysfs-card was passed
+# directly (bypassing derivation) and no --pci accompanied it, $PCI is
+# still empty here -- stamp the literal "override" rather than a blank.
+pci_for_log="${PCI:-override}"
 if [ -n "$LOG" ]; then
     {
-        echo "# bench-guard: $verdict_line pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
+        echo "# bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD pre_throttle=$pre_thr post_throttle=$post_thr pre_shmem_raw=${pre_shmem_raw}kB pre_tmpfs=${pre_tmpfs}kB pre_shmem_eff=${pre_shmem_eff}kB post_shmem_raw=${post_shmem_raw}kB post_tmpfs=${post_tmpfs}kB post_shmem_eff=${post_shmem_eff}kB cmd: $*"
         cat "$tmp_out"
     } > "$LOG"
 else
