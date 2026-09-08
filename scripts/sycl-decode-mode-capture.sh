@@ -100,8 +100,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_GUARD="$SCRIPT_DIR/bench-guard.sh"
+# DRM_ROOT is set unconditionally, BEFORE sourcing sycl-gpu-sysfs.sh below,
+# so an inherited environment DRM_ROOT can never silently redirect this
+# script onto another tree -- the helper's own default
+# (`: "${DRM_ROOT:=/sys/class/drm}"`) only fires when DRM_ROOT is unset or
+# empty, so it would otherwise honour an ambient env var this script never
+# documented as a knob (quality review finding F1; mirrors bench-guard.sh's
+# own unconditional DRM_ROOT=/sys/class/drm on its own init line). --drm-root
+# below still overrides this, same as before.
+DRM_ROOT=/sys/class/drm
+# Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/sycl-gpu-sysfs.sh"
+
+# refuse(): derive_card_for_selector's own contract (see
+# scripts/sycl-gpu-sysfs.sh's header comment) requires this to exist before
+# any call to derive_card_for_selector. Defined here, unconditionally, at
+# top level -- not only inside the --sysfs-card-absent branch below -- so it
+# exists regardless of which path a given invocation takes, mirroring
+# bench-guard.sh's own placement (its refuse() is defined once, early,
+# whether or not --sysfs-card ends up being used). This is also now the
+# ONLY refusal-message prefix this script emits: an earlier version had a
+# second, bespoke inline "cannot derive card: ..." echo+exit for the
+# selector-shape check below, giving two different refusal prefixes for
+# what is really the same class of failure (quality review findings
+# F4/F8) -- the selector-shape check now routes through refuse() too.
+refuse() { echo "sycl-decode-mode-capture: REFUSED: $*" >&2; exit 3; }
 
 # --- tunables (named, not inline literals, the way bench-guard.sh names its
 # own: SHMEM_CEIL_KB, SHMEM_GROWTH_SUSPECT_KB, POLL_INTERVAL). Several
@@ -128,10 +152,10 @@ CMDLINE_MAX_CHARS=120   # audit-line cmdline truncation
 export LC_NUMERIC=C
 
 OUT="" SYSFS_CARD="" MEMINFO="/proc/meminfo" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT=""
-# DRM_ROOT is NOT (re)declared here: sycl-gpu-sysfs.sh, sourced above, already
-# applied its default (`: "${DRM_ROOT:=/sys/class/drm}"`) at source time --
-# redeclaring it to "" here would stomp that default right back out before
-# --drm-root ever gets a chance to override it.
+# DRM_ROOT is NOT (re)declared here: it was already set unconditionally to
+# /sys/class/drm above, before sycl-gpu-sysfs.sh was sourced (see that
+# assignment's own comment) -- redeclaring it here would just repeat that,
+# and --drm-root below still overrides it either way.
 
 # shellcheck disable=SC2034  # --drm-root below sets DRM_ROOT, read by derive_card_for_selector (sourced above, sycl-gpu-sysfs.sh) -- shellcheck can't see across a `source`
 while [ $# -gt 0 ]; do case "$1" in
@@ -165,14 +189,8 @@ if [ -z "$SYSFS_CARD" ]; then
     SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
     case "$SELECTOR" in
         level_zero:[0-9]) : ;;
-        *) echo "sycl-decode-mode-capture: cannot derive card: ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --sysfs-card" >&2; exit 3;;
+        *) refuse "ONEAPI_DEVICE_SELECTOR must be exactly level_zero:<digit> (got '$SELECTOR'); otherwise pass --sysfs-card";;
     esac
-    # refuse(): derive_card_for_selector's own contract (see
-    # scripts/sycl-gpu-sysfs.sh's header comment) -- this mirrors this
-    # script's own prior inline refusal shape (message on stderr, exit 3),
-    # so a caller sees the same class of failure it always did.
-    # shellcheck disable=SC2329  # invoked indirectly, from inside derive_card_for_selector (sourced)
-    refuse() { echo "sycl-decode-mode-capture: REFUSED: $*" >&2; exit 3; }
     # shellcheck disable=SC2034  # DERIVED_PCI is set for symmetry with bench-guard.sh's own reset; this script only consumes DERIVED_CARD
     DERIVED_CARD="" DERIVED_PCI=""
     derive_card_for_selector "${SELECTOR#level_zero:}"

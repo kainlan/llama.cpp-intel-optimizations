@@ -110,6 +110,39 @@ else
     fail=1
 fi
 
+# --- F3 regression (quality review): the call above sits inside an `if`,
+# which is ALREADY exempt from `set -e` regardless of any internal bug --
+# it cannot catch a caller-under-set-e problem. sycl_preflight_b50_sysfs_bad's
+# own internal `pci="$(sycl_preflight_b50_pci_address)"` needs its own
+# `|| true`, because sycl_preflight_b50_pci_address legitimately returns
+# nonzero on an unresolvable root, and that assignment's status would
+# otherwise trip `set -e` in a caller that invokes this function in a
+# NON-conditional context (a bare statement, not wrapped in if/&&/||) --
+# aborting the CALLING script/shell before the documented "cannot derive ->
+# bad" verdict is ever reached.
+#
+# Reproducing this is NOT as simple as `( set -e; fn ) || rc=$?`: per bash's
+# own documented rule ("If a compound command ... executes in a context
+# where -e is being ignored, none of the commands executed within the
+# compound command ... will be affected by the -e setting"), a subshell
+# that is itself the left side of `||` has -e DISABLED for everything
+# inside it, even with an explicit `set -e` re-asserted inside -- verified
+# directly: `(set -e; x="$(false)"; echo reached) || rc=$?` prints
+# "reached" and sets rc=0 regardless of whether the assignment succeeds, so
+# that shape can never go RED against this bug at all. Backgrounding the
+# subshell and reading its status via `wait` sidesteps this: the
+# background job is not part of any &&/|| list while it runs, so -e
+# applies inside it exactly as it would to a top-level script, and `wait`
+# (guarded with `|| rc=$?`, itself safe since by this point the subshell
+# has already finished) only affects how the ALREADY-DETERMINED exit
+# status is retrieved.
+rc=0
+( set -e; SYCL_PREFLIGHT_DRM_ROOT="$T/drmroot-single" sycl_preflight_b50_sysfs_bad ) &
+subshell_pid=$!
+wait "$subshell_pid" || rc=$?
+[ "$rc" -eq 0 ] \
+    || { echo "FAIL: sycl_preflight_b50_sysfs_bad called directly under set -e in a non-conditional context, with an unresolvable root, must still reach its own bad verdict (rc 0) -- got rc=$rc, meaning its internal derivation-failure assignment tripped set -e before reaching the documented cannot-derive path"; fail=1; }
+
 # --- sycl_preflight_b50_sysfs_bad: a GOOD B50 (enabled, D0) at the derived
 # address must NOT be reported bad ---
 

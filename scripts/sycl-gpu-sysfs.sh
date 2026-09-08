@@ -12,10 +12,11 @@
 #   source "$(dirname "${BASH_SOURCE[0]}")/sycl-gpu-sysfs.sh"
 # It has NO side effects at source time beyond defining the three functions
 # below and applying a default for $DRM_ROOT (`: "${DRM_ROOT:=/sys/class/drm}"`,
-# which takes effect only if the caller has not already set DRM_ROOT -- e.g.
-# via its own --drm-root flag, whether parsed before or after this file is
-# sourced). This file does not `set -e`/`-u`/`-o pipefail` itself and never
-# touches the caller's shell options -- every function below is written to
+# which takes effect only if the caller has not already set DRM_ROOT to a
+# non-empty value -- `:=` fills an unset OR an empty variable, not just an
+# unset one -- e.g. via its own --drm-root flag, whether parsed before or
+# after this file is sourced). This file does not `set -e`/`-u`/`-o pipefail`
+# itself and never touches the caller's shell options -- every function below is written to
 # behave correctly regardless of the CALLER's `set -euo pipefail` state, so it
 # is always safe to source under `set -euo pipefail` in the caller (and safe
 # to source without it).
@@ -49,9 +50,6 @@
 # (llama.cpp-imns), aside from moving here; see git history on bench-guard.sh
 # for their original review discussion.
 
-# shellcheck disable=SC2034  # DERIVED_CARD/DERIVED_PCI (set below) are public
-# outputs read by every caller of derive_card_for_selector, not by this file
-# itself -- shellcheck cannot see across a `source`, so it reads them as unused.
 : "${DRM_ROOT:=/sys/class/drm}"
 
 # is_top_level_card DIR -- true iff DIR exists and its basename matches
@@ -113,6 +111,15 @@ is_top_level_card() {
 # dropping any of them would change level_zero:N's meaning for every card
 # after it with no visible signal -- exactly the silent index shift this
 # whole derivation exists to prevent (llama.cpp-imns review round 2/3).
+#
+# DERIVED_CARD/DERIVED_PCI (set at the bottom of this function) are public
+# outputs read by every CALLER of this function, not by this file itself,
+# and shellcheck cannot see across a `source`, so it flags them as unused.
+# Scope the disable to just this function (not file-wide) so an unrelated
+# unused variable anywhere else in this file would still be caught (quality
+# review finding F2 -- an earlier version placed this disable above the
+# file's very first command, which shellcheck treats as a FILE-WIDE disable).
+# shellcheck disable=SC2034
 derive_card_for_selector() {
     local idx="$1" c base pci vendor class
     local -a entries=()
@@ -125,7 +132,14 @@ derive_card_for_selector() {
         if [ -L "$c/device" ] && [ ! -e "$c/device" ]; then
             refuse "$base's device symlink is dangling (its target no longer resolves); refusing rather than silently excluding it, which would shift level_zero indices for the remaining cards"
         fi
-        if ! pci="$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)"; then
+        # basename applied to a nested command substitution, NOT piped through
+        # `xargs -r basename`: xargs word-splits its input on whitespace, so a
+        # resolved path containing a space (a DRM_ROOT under a directory with
+        # one, for instance) used to be split into two arguments -- the second
+        # of which `basename` (called with two operands) treats as a SUFFIX to
+        # strip from the first, silently producing the wrong PCI address
+        # instead of failing (quality review finding F5).
+        if ! pci="$(basename "$(readlink -f "$c/device" 2>/dev/null)")"; then
             refuse "failed to resolve the device symlink under $c/device (readlink probe error)"
         fi
         [ -n "$pci" ] || continue
@@ -200,7 +214,11 @@ find_card_by_pci() {
     local target_pci="$1" c found=""
     for c in "$DRM_ROOT"/card*; do
         is_top_level_card "$c" || continue
-        if [ "$(readlink -f "$c/device" 2>/dev/null | xargs -r basename)" = "$target_pci" ]; then
+        # See derive_card_for_selector's own comment on the same substitution
+        # shape (F5): basename of a nested command substitution, not piped
+        # through `xargs -r basename`, which mis-splits a path containing a
+        # space into two operands.
+        if [ "$(basename "$(readlink -f "$c/device" 2>/dev/null)")" = "$target_pci" ]; then
             found="$c"
             break
         fi

@@ -14,6 +14,7 @@ sycl_preflight_repo_root() {
 # 0000:04:00.0/0000:09:00.0 -- see CLAUDE.md. Sourcing has no side effects
 # beyond defining those functions and defaulting $DRM_ROOT; see its own
 # header comment for the full contract.
+# Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sycl-gpu-sysfs.sh"
 
@@ -79,7 +80,18 @@ sycl_preflight_journal_has_previous_boot_gpu_faults() {
 sycl_preflight_b50_sysfs_bad() {
     local pci_root="${SYCL_PREFLIGHT_PCI_ROOT:-/sys/bus/pci/devices}"
     local pci b50
-    pci="$(sycl_preflight_b50_pci_address)"
+    # `|| true`: sycl_preflight_b50_pci_address legitimately returns nonzero
+    # when it cannot derive a second discrete card (see its own docstring),
+    # and that is an EXPECTED, checked outcome here (the `[[ -n "$pci" ]] ||
+    # return 0` line right below), never a script-ending error. Without this,
+    # a caller of this function that itself has `set -e` active and calls it
+    # in a non-conditional context (not inside `if`/`&&`/`||`) would have the
+    # whole calling script/shell terminated by THIS assignment the moment
+    # derivation fails, before it ever reached the documented
+    # "cannot derive -> bad" verdict below (quality review finding F3; the
+    # same class of bug this file's own test suite hit and fixed with an
+    # identical `|| true` on its own test-side calls).
+    pci="$(sycl_preflight_b50_pci_address)" || true
     # Cannot derive a second discrete card's PCI address at all (single-GPU
     # host, topology error, ...): treat this the same conservative way the
     # old fixed-address form treated a genuinely-missing sysfs entry -- as

@@ -49,7 +49,7 @@
 # explicit "cannot derive card" refusal instead of silently picking one of
 # the cards it names.
 set -euo pipefail
-SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}"
+SYSFS_CARD="" MEMINFO=/proc/meminfo PGREP_CMD="" DF_CMD="" MAX_WAIT=360 PCI="" SELECTOR="${ONEAPI_DEVICE_SELECTOR:-}" DRM_ROOT=/sys/class/drm
 SHMEM_CEIL_KB=$((10*1024*1024))
 SHMEM_GROWTH_SUSPECT_KB=$((5*1024*1024))
 POLL_INTERVAL=5
@@ -91,6 +91,7 @@ refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 # so behaviour here is unchanged -- this source line is a pure extraction,
 # not a behaviour change: this script's own 35-case test suite must stay
 # green across it.
+# Sourced relative to this script's own directory (BASH_SOURCE[0]), not the caller's cwd.
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/sycl-gpu-sysfs.sh"
 
