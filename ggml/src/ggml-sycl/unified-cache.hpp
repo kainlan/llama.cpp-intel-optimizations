@@ -3012,17 +3012,28 @@ class unified_cache {
     // already finished. Zero if the allocator was never used this process.
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
 
-    // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to wait
-    // for the background drain worker before it was allowed to allocate.
-    // Exposed for tests and for the teardown log line; see the private
-    // ledger this counts against in the member declarations further below.
+    // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to
+    // wait for headroom to free up under the cap before it was allowed to
+    // allocate -- polling until either exit condition is met: a same-size
+    // entry in the request's own bucket becomes USABLE and can be reused
+    // with nothing evicted, or the general eviction sweep frees enough
+    // headroom by releasing pooled entries of any size, including this
+    // one's, whose release events have completed. Exposed for tests and for
+    // the teardown log line; see the private ledger this counts against in
+    // the member declarations further below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
 
     // Current outstanding DIRECT (not-yet-confirmed-released) Graph-scratch
-    // bytes. Exposed for tests that need to drive the allocator up to its cap
-    // without allocating through the same private path being tested.
+    // bytes. Exposed for tests: test-sycl-onednn-graph-scratch-direct.cpp's
+    // parked-allocation setup reads this before and after one DIRECT
+    // allocation and asserts the delta equals exactly the requested size --
+    // proof the accessor tracks a real charge rather than staying inert,
+    // without needing to allocate through the same private path being
+    // tested to observe it.
+    // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
+    // above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_outstanding_bytes() const {
         return onednn_graph_scratch_direct_outstanding_bytes_;
     }
@@ -3044,21 +3055,23 @@ class unified_cache {
 
     size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
 
-    // Public, self-locking entry point: logs the pool summary then releases
-    // (for real) every pooled DIRECT Graph-scratch buffer. `context` names
-    // the call site for the log line (e.g. "context reclaim", "runtime
-    // context update"). Called internally at arena_reserve()'s context-
-    // reclaim branch; also called externally (via
-    // unified_cache_reclaim_onednn_graph_scratch_pool() below) from
-    // ggml_backend_sycl_set_runtime_context() -- a pooled buffer must not
-    // survive a runtime n_ctx/n_ubatch change any more than it should
-    // survive a full context/model teardown, since the shape it was sized
-    // for may no longer be requested again. Genuine cache teardown does NOT
-    // route through here: shutdown_resources() logs the teardown summary
-    // itself (ahead of its own early-return paths) and clears the pool
-    // directly, so every context this method is actually called with logs
-    // at INFO (a routine event -- a model switch or context resize, not
-    // once per process).
+    // Public, self-locking entry point: releases (for real) every pooled
+    // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
+    // before log, same order as the body below and for the same reason
+    // (logging first would under-report the summary by the pool's own live
+    // contents at that moment). `context` names the call site for the log
+    // line (e.g. "context reclaim", "runtime context update"). Called
+    // internally at arena_reserve()'s context-reclaim branch; also called
+    // externally (via unified_cache_reclaim_onednn_graph_scratch_pool()
+    // below) from ggml_backend_sycl_set_runtime_context() -- a pooled
+    // buffer must not survive a runtime n_ctx/n_ubatch change any more than
+    // it should survive a full context/model teardown, since the shape it
+    // was sized for may no longer be requested again. Genuine cache
+    // teardown does NOT route through here: shutdown_resources() logs the
+    // teardown summary itself (ahead of its own early-return paths) and
+    // clears the pool directly, so every context this method is actually
+    // called with logs at INFO (a routine event -- a model switch or
+    // context resize, not once per process).
     void onednn_graph_scratch_reclaim_pool(const char * context) {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         // Clear BEFORE logging, not after: logging first would under-report
@@ -4076,12 +4089,18 @@ class unified_cache {
     // decrementing
     // onednn_graph_scratch_direct_outstanding_bytes_/onednn_graph_scratch_pool_bytes_
     // and counting each as an eviction regardless of which path released it.
-    // Called at cache teardown (shutdown_resources()) and at the same point
-    // arena_reserve() reclaims the KV/RUNTIME zones for a new context -- a
-    // pooled DIRECT buffer must not outlive the context it was allocated
-    // for. Callers must hold onednn_graph_scratch_mutex_ (teardown/context-
-    // reclaim call sites take it explicitly since they are not already
-    // inside an onednn_graph_scratch_* entry point).
+    // Called at cache teardown (shutdown_resources()), at the same point
+    // arena_reserve() reclaims the KV/RUNTIME zones for a new context, and
+    // from ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) on every
+    // successful runtime n_ctx/n_ubatch update via the free-function wrapper
+    // unified_cache_reclaim_onednn_graph_scratch_pool() -- a pooled DIRECT
+    // buffer must not outlive the context it was allocated for. Callers must
+    // hold onednn_graph_scratch_mutex_. Only the teardown call site
+    // (shutdown_resources()) takes it explicitly, since it is not already
+    // inside an onednn_graph_scratch_* entry point; the context-reclaim and
+    // runtime-update call sites both go through
+    // onednn_graph_scratch_reclaim_pool() above, which acquires the lock
+    // itself before calling this.
     void onednn_graph_scratch_clear_pool_locked();
 
     // Logs the pool hit/miss/eviction counts and peak pooled bytes -- silent

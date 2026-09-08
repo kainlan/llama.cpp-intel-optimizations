@@ -10109,9 +10109,10 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
     ggml_log_internal(
         at_teardown ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
         "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu misses=%zu evictions=%zu "
-        "peak_pooled=%.1f MB (cumulative for this process, not just this reclaim)\n",
+        "waits=%zu peak_pooled=%.1f MB (cumulative for this process, not just this reclaim)\n",
         context, onednn_graph_scratch_pool_hit_count_, onednn_graph_scratch_pool_miss_count_,
-        onednn_graph_scratch_pool_eviction_count_, onednn_graph_scratch_pool_peak_bytes_ / (1024.0 * 1024.0));
+        onednn_graph_scratch_pool_eviction_count_, onednn_graph_scratch_direct_wait_count_,
+        onednn_graph_scratch_pool_peak_bytes_ / (1024.0 * 1024.0));
 }
 
 // llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations

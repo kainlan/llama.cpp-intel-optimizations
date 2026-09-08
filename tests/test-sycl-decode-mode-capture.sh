@@ -248,36 +248,15 @@ run_capture() { # $1=out-dir, remaining = extra CAPTURE args, then -- command
 # suite could tell: every case above passes --sysfs-card explicitly, which
 # always bypasses derivation entirely.
 #
-# mk_pci_dev/mk_drmroot mirror tests/test-bench-guard.sh's own fixture
-# builders of the same name exactly (including the deliberate
-# card-order-!=-PCI-order + connector-entry shape) -- kept as a local copy
-# rather than shared, the same way this file already duplicates
-# mk_tree/mk_meminfo/expect_status from that suite, per this file's own
-# header comment.
-mk_pci_dev() {
-    local devroot="$1" addr="$2" with_freq="${3:-}"
-    mkdir -p "$devroot/$addr"
-    echo 0x8086 > "$devroot/$addr/vendor"
-    echo 0x030000 > "$devroot/$addr/class"
-    if [ -n "$with_freq" ]; then
-        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/act_freq"
-    fi
-}
-
-mk_drmroot() {
-    local d="$T/drmroot" devroot="$T/devices-lz01"
-    rm -rf "$d" "$devroot"
-    mk_pci_dev "$devroot" 0000:09:00.0 with_freq
-    mk_pci_dev "$devroot" 0000:00:02.0
-    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
-    mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
-    ln -s "$devroot/0000:09:00.0" "$d/card0/device"
-    ln -s "$devroot/0000:00:02.0" "$d/card1/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card2/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
-}
+# mk_pci_dev/mk_drmroot: shared fake sysfs/DRM fixture builders (also used
+# by tests/test-bench-guard.sh and tests/test-sycl-gpu-preflight.sh, which
+# fake the identical topology, including the deliberate
+# card-order-!=-PCI-order + connector-entry shape). See their own
+# definitions in sycl-fake-drm-fixture.sh for exact signatures and
+# defaults.
+# shellcheck source=sycl-fake-drm-fixture.sh
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 cases=$((cases+1))
 mk_drmroot; mk_meminfo 3000000

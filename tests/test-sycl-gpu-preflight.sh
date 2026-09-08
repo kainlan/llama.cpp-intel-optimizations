@@ -10,11 +10,10 @@
 # sycl_preflight_b50_sysfs_bad ignored both env vars entirely and always
 # consulted the real host's /sys/bus/pci/devices/0000:07:00.0.
 #
-# Fixture style mirrors tests/test-bench-guard.sh's own mk_pci_dev/mk_drmroot
-# (card-order != PCI-order, a connector entry that must be ignored) -- kept
-# as a local copy per this project's existing convention of each test file
-# owning its own fixture builders (test-sycl-decode-mode-capture.sh does the
-# same for its own --drm-root coverage).
+# mk_pci_dev/mk_drmroot (card-order != PCI-order, a connector entry that
+# must be ignored) are shared with tests/test-bench-guard.sh and
+# tests/test-sycl-decode-mode-capture.sh, which fake the identical
+# topology -- see sycl-fake-drm-fixture.sh.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,31 +32,9 @@ fail=0
 # case.
 cases=0
 
-mk_pci_dev() { # $1=devroot $2=addr
-    local devroot="$1" addr="$2"
-    mkdir -p "$devroot/$addr"
-    echo 0x8086 > "$devroot/$addr/vendor"
-    echo 0x030000 > "$devroot/$addr/class"
-}
-
-# mk_drmroot: two discrete cards, card-order != PCI-order (card0 -> the
-# HIGHER address 09:00.0, card2 -> the LOWER address 04:00.0), an
-# integrated GPU (card1 -> 00:02.0) that must be excluded, and a connector
-# entry (card0-DP-1, sharing card2's device symlink) that must be ignored
-# by the card[0-9]+ filter alone -- same shape as
-# tests/test-bench-guard.sh's own mk_drmroot fixture.
-mk_drmroot() {
-    local d="$T/drmroot" devroot="$T/devices"
-    rm -rf "$d" "$devroot"
-    mk_pci_dev "$devroot" 0000:09:00.0
-    mk_pci_dev "$devroot" 0000:00:02.0
-    mk_pci_dev "$devroot" 0000:04:00.0
-    mkdir -p "$d/card0" "$d/card1" "$d/card2" "$d/card0-DP-1"
-    ln -s "$devroot/0000:09:00.0" "$d/card0/device"
-    ln -s "$devroot/0000:00:02.0" "$d/card1/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card2/device"
-    ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
-}
+# shellcheck source=sycl-fake-drm-fixture.sh
+# shellcheck disable=SC1091
+source "$(dirname "${BASH_SOURCE[0]}")/sycl-fake-drm-fixture.sh"
 
 # mk_drmroot_single: only ONE discrete card -- a single-GPU host, so
 # index 1 (the B50) is out of range and sycl_preflight_b50_pci_address
@@ -291,16 +268,17 @@ fi
 cases=$((cases+1))
 # This file's own top-of-file `source "$PREFLIGHT"` above already sourced it
 # once under `set -euo pipefail`; every one of this file's six sibling
-# sourcing scripts does the same. A second `source` of the SAME copy is
-# what a caller that sources this library more than once (or a caller that
-# is itself sourced more than once) would trigger, and SYCL_PREFLIGHT_FAULT_RE
-# was a bare top-level `readonly` before the fix -- a second assignment to
-# an already-readonly variable aborts the whole subshell under `set -e`,
-# not just that one line. Also assert the variable actually ENDS UP
-# readonly (`readonly -p`, matched with a `case` statement rather than a
-# `| grep -q` pipeline, which this project's gates avoid for the SIGPIPE
-# hazard documented in CLAUDE.md): the guard must not merely survive a
-# double source, it must still leave the real invariant in place
+# sourcing scripts does the same under set -e (most with -uo pipefail; only
+# scripts/benchmark-sycl.sh uses bare `set -e`). A second `source` of the
+# SAME copy is what a caller that sources this library more than once (or a
+# caller that is itself sourced more than once) would trigger, and
+# SYCL_PREFLIGHT_FAULT_RE was a bare top-level `readonly` before the fix --
+# a second assignment to an already-readonly variable aborts the whole
+# subshell under `set -e`, not just that one line. Also assert the variable
+# actually ENDS UP readonly (`readonly -p`, matched with a `case` statement
+# rather than a `| grep -q` pipeline, which this project's gates avoid for
+# the SIGPIPE hazard documented in CLAUDE.md): the guard must not merely
+# survive a double source, it must still leave the real invariant in place
 # afterwards. Run in a fresh `bash -c` subshell (not this file's own
 # process) so a genuine abort here fails only this case, not the whole
 # suite.
