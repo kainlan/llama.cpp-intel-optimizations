@@ -375,6 +375,6 @@ if [ -n "$LOG" ]; then
         cat "$tmp_out"
     } > "$LOG"
 else
-    echo "bench-guard: $verdict_line" >&2
+    echo "bench-guard: $verdict_line pci=$pci_for_log card=$SYSFS_CARD" >&2
 fi
 exit "$rc"

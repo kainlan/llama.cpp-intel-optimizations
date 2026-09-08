@@ -14,6 +14,7 @@ GUARD="$ROOT_DIR/scripts/bench-guard.sh"
 T="$(mktemp -d)"; trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 fail=0
 skipped=0
+cases=0
 
 # mk_pci_dev DEVROOT PCI_ADDR [with_freq [throttle act_freq]] -- create a
 # fake sysfs PCI device directory DEVROOT/PCI_ADDR with vendor=0x8086 and
@@ -60,6 +61,7 @@ run_guard() {
 #   expect_status <want> <description> -- <command...>
 expect_status() {
     local want="$1" what="$2"
+    cases=$((cases+1))
     shift 2
     [ "$1" = "--" ] || { echo "expect_status: expected -- before command" >&2; exit 2; }
     shift
@@ -107,6 +109,7 @@ expect_status 0 "high Shmem explained by tmpfs must run" -- run_guard "false" --
 mk_meminfo 3000000
 expect_status 0 "failing df-cmd + low Shmem must still run (tmpfs=0)" -- run_guard "false" --df-cmd false
 
+cases=$((cases+1))
 mk_meminfo 30000000
 out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd false --df-cmd false --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: expected failing df-cmd + high Shmem to exit 3, got $rc"; fail=1; }
@@ -116,6 +119,7 @@ echo "$out" | grep -q "minus tmpfs 0 kB" || { echo "FAIL: refusal message must s
 # effective Shmem to 0 (not go negative) and emit an informational note on
 # stderr, without refusing -- Shmem 3,000,000 kB is comfortably under the
 # ceiling once clamped.
+cases=$((cases+1))
 mk_meminfo 3000000
 printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 8000000 5000000 3000000 63%% /tmp\n' > "$T/df-clamp.txt"
 out="$(run_guard "false" --df-cmd "cat $T/df-clamp.txt" 2>&1)" && rc=0 || rc=$?
@@ -133,6 +137,7 @@ expect_status 3 "level_zero:0,1 selector must not derive a card" -- \
 
 # --- Task A2: run + verdict stamping ---
 
+cases=$((cases+1))
 # --log captures stdout+stderr behind a VALID header on a clean run.
 mk_tree 0 0; mk_meminfo 3000000
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
@@ -146,6 +151,7 @@ head -1 "$T/run.log" | grep -qE 'pre_shmem_raw=[0-9]+kB pre_tmpfs=[0-9]+kB pre_s
 head -1 "$T/run.log" | grep -qE 'post_shmem_raw=[0-9]+kB post_tmpfs=[0-9]+kB post_shmem_eff=[0-9]+kB' \
     || { echo "FAIL: header missing post_shmem_raw/post_tmpfs/post_shmem_eff fields"; fail=1; }
 
+cases=$((cases+1))
 # Distinct fake Shmem/tmpfs values must reach the header arithmetically
 # correct: Shmem 12,000,000 kB minus tmpfs Used 4,000,000 kB = 8,000,000 kB.
 mk_tree 0 0; mk_meminfo 12000000
@@ -155,6 +161,7 @@ printf 'Filesystem 1K-blocks Used Available Use%% Mounted on\ntmpfs 20000000 400
 head -1 "$T/run-header.log" | grep -q "pre_shmem_eff=8000000kB" \
     || { echo "FAIL: expected pre_shmem_eff=8000000kB in header (got: $(head -1 "$T/run-header.log"))"; fail=1; }
 
+cases=$((cases+1))
 # A wrapped command that grows Shmem (rewrites the fake meminfo file mid-run)
 # must stamp SUSPECT, even though the command itself succeeds.
 mk_tree 0 0; mk_meminfo 3000000
@@ -162,6 +169,7 @@ mk_tree 0 0; mk_meminfo 3000000
          --log "$T/run2.log" -- sh -c "printf 'MemAvailable: 1 kB\nShmem: 99999999 kB\n' > '$T/meminfo'" || fail=1
 head -1 "$T/run2.log" | grep -q "SUSPECT" || { echo "FAIL: Shmem growth must stamp SUSPECT"; fail=1; }
 
+cases=$((cases+1))
 # Exit-code mirroring: bench-guard's own exit code must equal the wrapped
 # command's, in BOTH the --log and no-log paths -- never the verdict.
 mk_tree 0 0; mk_meminfo 3000000
@@ -170,11 +178,25 @@ rc=0
          --max-wait 1 --log "$T/run3.log" -- sh -c "exit 7" || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: --log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
 
+cases=$((cases+1))
 mk_tree 0 0; mk_meminfo 3000000
 rc=0
 "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
          --max-wait 1 -- sh -c "exit 7" >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 7 ] || { echo "FAIL: no-log path must mirror wrapped command exit code (got $rc, want 7)"; fail=1; }
+
+# The no-log dry-run branch must still confirm the derived card on stderr,
+# carrying the same pci=/card= fields the --log header stamps at :374 --
+# without this, `ONEAPI_DEVICE_SELECTOR=level_zero:N scripts/bench-guard.sh
+# -- true` (no --log) gives an operator no confirmation of which card was
+# derived (llama.cpp-3e0f finding 7).
+cases=$((cases+1))
+mk_tree 0 0; mk_meminfo 3000000
+"$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/meminfo" --pgrep-cmd "false" --df-cmd true \
+         --max-wait 1 -- true >/dev/null 2>"$T/nolog.err" || fail=1
+grep -q "pci=" "$T/nolog.err" || { echo "FAIL: no-log dry run must print pci= on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
+grep -q "card=$T/sys/class/drm/card9" "$T/nolog.err" \
+    || { echo "FAIL: no-log dry run must print card=<derived sysfs card> on stderr (got: $(cat "$T/nolog.err"))"; fail=1; }
 
 # --budget must parse and default the timeout without breaking a clean run.
 mk_tree 0 0; mk_meminfo 3000000
@@ -193,12 +215,14 @@ expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false
 # not just the exit status, so a regression to the raw awk failure is
 # caught by content, not only by code (llama.cpp-imns review round 6,
 # finding M1).
+cases=$((cases+1))
 mk_tree 0 0
 out="$("$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: missing --meminfo must refuse cleanly with exit 3, got $rc (out: $out)"; fail=1; }
 echo "$out" | grep -q "no meminfo at" || { echo "FAIL: missing --meminfo refusal must name the problem (got: $out)"; fail=1; }
 
+cases=$((cases+1))
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
 mk_tree 0 0; mk_meminfo 3000000
@@ -207,6 +231,7 @@ mk_tree 0 0; mk_meminfo 3000000
          --log "$T/run4.log" -- true || fail=1
 head -1 "$T/run4.log" | grep -q "SUSPECT" || { echo "FAIL: kernel GT-reset line must stamp SUSPECT"; fail=1; }
 
+cases=$((cases+1))
 # Timeout kill: a wrapped command that outlives --budget must be killed
 # (rc 124, mirrored by the guard) and stamped SUSPECT with the reason.
 mk_tree 0 0; mk_meminfo 3000000
@@ -249,6 +274,7 @@ mk_drmroot() {
     ln -s "$devroot/0000:04:00.0" "$d/card0-DP-1/device"
 }
 
+cases=$((cases+1))
 mk_drmroot; mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz0.log" -- true || fail=1
@@ -257,6 +283,7 @@ head -1 "$T/run-lz0.log" | grep -q "pci=0000:04:00.0" \
 head -1 "$T/run-lz0.log" | grep -q "card=$T/drmroot/card2" \
     || { echo "FAIL: level_zero:0 must bind card=$T/drmroot/card2, not the card0-DP-1 connector (got: $(head -1 "$T/run-lz0.log"))"; fail=1; }
 
+cases=$((cases+1))
 mk_meminfo 3000000
 env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-lz1.log" -- true || fail=1
@@ -265,6 +292,7 @@ head -1 "$T/run-lz1.log" | grep -q "pci=0000:09:00.0" \
 head -1 "$T/run-lz1.log" | grep -q "card=$T/drmroot/card0" \
     || { echo "FAIL: level_zero:1 must bind card=$T/drmroot/card0 (got: $(head -1 "$T/run-lz1.log"))"; fail=1; }
 
+cases=$((cases+1))
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: level_zero:2 (out of range) must refuse with exit 3, got $rc"; fail=1; }
@@ -285,18 +313,21 @@ out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:2 "$GUARD" --drm-root "$T/drmroot" 
 # from find_card_by_pci's loop and this starts binding
 # card=$T/drmroot/card0-DP-1 (which glob-sorts before card2 and shares its
 # device symlink) instead of the real card2. ---
+cases=$((cases+1))
 out="$("$GUARD" --pci 0000:04:00.0 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-pci.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: --pci 0000:04:00.0 must resolve via find_card_by_pci, got rc=$rc (out: $out)"; fail=1; }
 head -1 "$T/run-pci.log" | grep -q "card=$T/drmroot/card2" \
     || { echo "FAIL: --pci 0000:04:00.0 must bind card=$T/drmroot/card2, not the card0-DP-1 connector (got: $(head -1 "$T/run-pci.log"))"; fail=1; }
 
+cases=$((cases+1))
 out_nomatch="$("$GUARD" --pci 0000:99:99.9 --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 3 ] || { echo "FAIL: an unmatched --pci must refuse with exit 3, got $rc (out: $out_nomatch)"; fail=1; }
 echo "$out_nomatch" | grep -q "no DRM card for PCI 0000:99:99.9" \
     || { echo "FAIL: unmatched --pci refusal must name the PCI address (got: $out_nomatch)"; fail=1; }
 
+cases=$((cases+1))
 rm -rf "$T/drmroot-igpu-only" "$T/devices-igpu-only"
 mk_pci_dev "$T/devices-igpu-only" 0000:00:02.0
 mkdir -p "$T/drmroot-igpu-only/card1"
@@ -331,12 +362,14 @@ mk_drmroot_domain_igpu() {
     ln -s "$devroot/0000:04:00.0" "$d/card0/device"
     ln -s "$devroot/0001:00:02.0" "$d/card1/device"
 }
+cases=$((cases+1))
 mk_drmroot_domain_igpu; mk_meminfo 3000000
 out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 --log "$T/run-domain-igpu.log" -- true 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: level_zero:0 with a non-0000-domain iGPU present must still resolve the discrete card (got rc=$rc, out: $out)"; fail=1; }
 head -1 "$T/run-domain-igpu.log" | grep -q "pci=0000:04:00.0" \
     || { echo "FAIL: level_zero:0 must resolve to the discrete card, not be confused by the 0001:00:02.0 iGPU (got: $(head -1 "$T/run-domain-igpu.log"))"; fail=1; }
+cases=$((cases+1))
 out2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc2=0 || rc2=$?
 [ "$rc2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the domain-0001 iGPU is excluded (only one discrete GPU), got rc=$rc2 (out: $out2)"; fail=1; }
@@ -373,6 +406,7 @@ mk_drmroot_wide_domain_igpu() {
     ln -s "$devroot/0000:04:00.0" "$d/card0/device"
     ln -s "$devroot/10000:00:02.0" "$d/card1/device"
 }
+cases=$((cases+1))
 mk_drmroot_wide_domain_igpu; mk_meminfo 3000000
 out_wide2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-wide-domain-igpu" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc_wide2=0 || rc_wide2=$?
@@ -397,6 +431,7 @@ expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set"
 # defect: on the pre-fix code this two-card tree instead silently drops
 # card0 and hands level_zero:0 card1's address with rc=0 and a VALID stamp
 # (verified against the pre-round-2 guard before this fix landed).
+cases=$((cases+1))
 rm -rf "$T/drmroot-dangling" "$T/devices-dangling"
 mk_pci_dev "$T/devices-dangling" 0000:09:00.0 with_freq
 mkdir -p "$T/drmroot-dangling/card0" "$T/drmroot-dangling/card1"
@@ -413,6 +448,7 @@ echo "$out" | grep -qi "dangling" || { echo "FAIL: dangling-symlink refusal must
 # chmod 000 would not reproduce this. Its own private device root
 # ($T/devices-unreadable-vendor, review round 4 finding Q15), not shared
 # with mk_drmroot's.
+cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-vendor-file case"
 else
@@ -442,6 +478,7 @@ fi
 # its own test rather than being implied by the vendor coverage
 # (llama.cpp-imns review round 5, finding F4). Own private device root,
 # same two-card shape, same root-skip.
+cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-class-file case"
 else
@@ -471,6 +508,7 @@ fi
 # broken card, "no discrete GPU found" would also refuse with exit 3 and
 # mask the real defect. Skip under root, which bypasses permission bits,
 # so chmod 000 would not reproduce this.
+cases=$((cases+1))
 if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-device-dir case"
 else
@@ -494,9 +532,9 @@ fi
 
 if [ "$fail" -eq 0 ]; then
     if [ "$skipped" -gt 0 ]; then
-        echo "OK: all preflight refusals ($skipped case(s) skipped as root)"
+        echo "OK: all preflight refusals ($cases cases, $skipped skipped as root)"
     else
-        echo "OK: all preflight refusals"
+        echo "OK: all preflight refusals ($cases cases)"
     fi
 else
     exit 1
