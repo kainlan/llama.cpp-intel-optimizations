@@ -124,32 +124,30 @@ while [ $# -gt 0 ]; do case "$1" in
     *) echo "sycl-prefill-scaling: unknown arg $1" >&2; exit 2;;
 esac; done
 
+# --models-dir "" (an explicit empty flag value) is rejected outright,
+# unlike an empty/unset env var -- the ${VAR:-/models} default above
+# already maps that to /models, and that behaviour must not change. Without
+# this, an empty flag value would silently strip down to the filesystem
+# root below instead of failing loudly (llama.cpp-5iba quality review).
+[ -n "$MODELS_DIR" ] || { echo "sycl-prefill-scaling: --models-dir requires a non-empty value" >&2; exit 2; }
+
 # Strip ALL trailing slashes (--models-dir /foo/, /foo///, or an env var
-# carrying any of these) so the paths built from it below read
-# /foo/mistral-... rather than /foo//mistral-... in both the -m argument
-# and the refusal message. Looped, not a single ${MODELS_DIR%/}, so a value
-# with more than one trailing slash is fully stripped rather than left with
-# one; guarded on length > 1 so a bare "/" survives THIS loop unstripped
-# (stripping it down to "" here would make the loop condition's own
-# ${MODELS_DIR: -1} read past an empty string).
-while [ "${#MODELS_DIR}" -gt 1 ] && [ "${MODELS_DIR: -1}" = "/" ]; do
+# carrying any of these; a bare "/" reduces all the way to "") so the paths
+# built from MODELS_DIR below read $MODELS_DIR/mistral-... with exactly one
+# slash, never doubled -- and a filesystem-root override still produces the
+# correct single-slash path "/mistral-..." (llama.cpp-5iba quality review:
+# equivalent to the previous strip-loop-plus-special-case on every input --
+# "", "/", "//", "///", "/foo", "/foo/", "/foo///" -- but as one loop).
+while [ "${MODELS_DIR%/}" != "$MODELS_DIR" ]; do
     MODELS_DIR="${MODELS_DIR%/}"
 done
-# A bare "/" (or the loop above reducing --models-dir // down to it) is
-# mapped to the EMPTY string here, once, after the loop: paths below are
-# always built as "$MODELS_DIR/mistral-...", so a literal "/" would still
-# produce "//mistral-..." -- the empty string is what builds the correct
-# single-slash root path "/mistral-...".
-[ "$MODELS_DIR" = "/" ] && MODELS_DIR=""
 
 [ -x "$GUARD" ] || { echo "sycl-prefill-scaling: $GUARD not found or not executable" >&2; exit 2; }
 
 # --- the six model/card pairs (fixed matrix; see plan task L3) ---
 # Fields are '|'-delimited: key|label|<model path or selector>. The mistral
 # and gptoss paths are rooted at MODELS_DIR (--models-dir /
-# SYCL_PREFILL_SCALING_MODELS_DIR, default /models -- see the file header);
-# gemma4 stays under /Storage/GenAI/models unconditionally, it was never
-# part of the /models outage this override exists for.
+# SYCL_PREFILL_SCALING_MODELS_DIR, default /models -- see the file header).
 MODELS=(
     "mistral|Mistral 7B Q4_0|$MODELS_DIR/mistral-7b-v0.1.Q4_0.gguf"
     "gptoss|GPT-OSS 20B MXFP4|$MODELS_DIR/gpt-oss-20b-mxfp4.gguf"
@@ -211,29 +209,27 @@ only_selected() {
 
 # Model-file existence check (llama.cpp-5iba). Runs AFTER --only validation
 # above and BEFORE the first bench-guard invocation in the main loop below
-# -- and before this, only usage validation has happened, so nothing has
-# touched the GPU or a real sysfs tree yet. Checked once per model whose
-# path is shared across BOTH cards, not once per selected pair -- the -r
-# test is hoisted out of the card loop so a model selected via two --only
-# pairs (e.g. mistral,b70 and mistral,b50) stats its one shared path once,
-# not twice, and the refusal names the MODEL ("model mistral"), since the
-# missing file is a property of the model, not of whichever card happened
-# to be checked first. A model is checked at all only if at least one of
-# its pairs is selected (only_selected), never the full six-pair matrix, so
-# an --only run is never blocked by an unrelated model being absent. A
-# missing or unreadable file is a loud, immediate usage error naming the
-# exact path (exit 2) -- without this, the same problem used to surface
-# only as an opaque ERROR:bench-rc=1 row after bench-guard.sh's full
-# preflight and the wrapped bench's own GPU/driver init had already run.
+# -- see the file header for why this check exists at all. Checked once
+# per MODEL, not once per selected pair: hoisted out of the card loop so a
+# model selected via two --only pairs (e.g. mistral,b70 and mistral,b50)
+# stats its one shared path once, not twice, and the refusal names the
+# MODEL ("model mistral"), since the missing file is a property of the
+# model, not of whichever card happened to be checked first. A model is
+# checked at all only if at least one of its pairs is selected
+# (only_selected), never the full six-pair matrix, so an --only run is
+# never blocked by an unrelated model being absent.
 for model_entry in "${MODELS[@]}"; do
     IFS='|' read -r m_key _ m_path <<< "$model_entry"
-    model_selected=1
+    model_selected=0
     for card_entry in "${CARDS[@]}"; do
         IFS='|' read -r c_key _ _ <<< "$card_entry"
-        only_selected "$m_key,$c_key" && { model_selected=0; break; }
+        only_selected "$m_key,$c_key" && { model_selected=1; break; }
     done
-    [ "$model_selected" -eq 0 ] || continue
-    [ -r "$m_path" ] || {
+    [ "$model_selected" -eq 1 ] || continue
+    # -f, not just -r: a DIRECTORY named like the model file passes -r (it
+    # only tests read permission) but must still be refused here rather
+    # than sailing through to llama-bench's own open() failure much later.
+    [ -f "$m_path" ] && [ -r "$m_path" ] || {
         echo "sycl-prefill-scaling: model file not found or not readable: $m_path (model $m_key)" >&2
         exit 2
     }
