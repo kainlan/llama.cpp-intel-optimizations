@@ -708,6 +708,11 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-0oxf: planner_n_ctx at the time the oneDNN scratchpad was last
+// planned for this device (compute_placement_plan()/populate_host_zone_sizing(),
+// see the "oneDNN scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes()'s
+// context-derived floor. 0 means "never planned for this device".
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -1510,6 +1515,24 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
+// llama.cpp-0oxf: record planner_n_ctx alongside the scratchpad bytes above so
+// onednn_graph_scratch_zone_floor_bytes() can derive its floor from context
+// length instead of a flat constant. Called from the same "oneDNN scratchpad:"
+// planning step (populate_host_zone_sizing()) once plan.planner_n_ctx is set.
+void unified_cache_set_planned_onednn_graph_scratch_n_ctx(int device_id, uint32_t n_ctx) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_onednn_graph_scratch_n_ctx[device_id].store(n_ctx, std::memory_order_release);
+}
+
+uint32_t unified_cache_get_planned_onednn_graph_scratch_n_ctx(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+}
+
 #if GGML_SYCL_DNNL
 // llama.cpp-gwno: extra headroom for onednn_graph_scratch_alloc() (the Graph
 // API SDPA allocator, unified_cache::onednn_graph_scratch_alloc/free defined
@@ -1548,19 +1571,55 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
 // before raising GGML_SYCL_ONEDNN_GRAPH_ZONE_MB back up -- a nonzero uprobe
 // count or a sizing abort means the zone genuinely doesn't fit this
 // workload's outstanding-buffer count, not that the allocator is unwired.
-static size_t onednn_graph_scratch_zone_floor_bytes() {
-    static const size_t floor_bytes = [] {
-        size_t       mb  = 64;
+static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx) {
+    // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB always wins when set -- unchanged
+    // behaviour, still the escape hatch this file's header comment tells you
+    // to reach for.
+    static const long env_mb = [] {
         const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
         if (env && env[0] != '\0') {
             long parsed = std::atol(env);
             if (parsed >= 0) {
-                mb = static_cast<size_t>(parsed);
+                return parsed;
             }
         }
-        return mb * 1024ull * 1024ull;
+        return -1L;
     }();
-    return floor_bytes;
+    if (env_mb >= 0) {
+        return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
+    }
+
+    // llama.cpp-0oxf: context-derived floor, replacing the flat 64 MiB
+    // default above. floor(n_ctx) = max(64 MiB, a + b*n_ctx).
+    //
+    // PROVISIONAL CONSTANTS -- derived from a SINGLE observed data point, not
+    // a fit: the 0oxf bisect measured a 144 MB Graph-scratch request at
+    // n_kv=8192 on Mistral 7B Q4_0 (task llama.cpp-0oxf comment c-d46x). That
+    // gives one (n_ctx, size) pair, which is enough to anchor a line through
+    // the existing 64 MiB floor at n_ctx=0 but NOT enough to fit a slope with
+    // any confidence -- a single point admits infinitely many lines through
+    // it besides "start at the old floor". The debug print added alongside
+    // this function (see onednn_graph_scratch_alloc()) exists specifically so
+    // the lead can measure requests at pp2048/4096/8192 and replace kA/kB
+    // below with a real two-point (or better, three-point) fit. Do not read
+    // 144 MB @ 8192 as validation of this slope -- it is the ONLY input to
+    // it, so of course it passes through that point exactly.
+    static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
+    static constexpr uint64_t kA             = kFloorMinBytes;
+    // kB: bytes of Graph-scratch demand growth per unit of n_ctx, chosen so
+    // kA + kB*8192 == 144 MiB (the one measured point). Replace with a real
+    // slope once pp2048/4096/8192 data exists.
+    static constexpr uint64_t kB             = ((144ull * 1024ull * 1024ull) - kFloorMinBytes) / 8192ull;
+
+    const uint64_t modeled = kA + kB * static_cast<uint64_t>(planner_n_ctx);
+    return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
+}
+
+// llama.cpp-0oxf: host-testable wrapper -- onednn_graph_scratch_zone_floor_bytes()
+// above has internal (file-static) linkage, so tests/test-sycl-onednn-graph-floor.cpp
+// calls this exported passthrough instead. Declared in unified-cache.hpp.
+size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx) {
+    return onednn_graph_scratch_zone_floor_bytes(planner_n_ctx);
 }
 #endif
 
@@ -1581,7 +1640,7 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
     size_t bytes = unified_cache_get_planned_onednn_scratchpad_bytes_stored(device_id);
 #if GGML_SYCL_DNNL
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
-        bytes += onednn_graph_scratch_zone_floor_bytes();
+        bytes += onednn_graph_scratch_zone_floor_bytes(unified_cache_get_planned_onednn_graph_scratch_n_ctx(device_id));
     }
 #endif
     return bytes;
@@ -3659,6 +3718,13 @@ bool unified_cache::ensure_planned_arena_zones() {
             if (!compute_arena_ptr_ || !vram_owns(compute_arena_ptr_)) {
                 bind_compute_arena();
             }
+#if GGML_SYCL_DNNL
+            // llama.cpp-0oxf: snapshot available_budget() at every successful
+            // plan so the DIRECT Graph-scratch cap (onednn_graph_scratch_direct_cap_bytes())
+            // tracks what THIS plan had to work with, not live budget that
+            // shrinks as the arena's own zones consume it.
+            onednn_graph_scratch_direct_cap_plan_snapshot_bytes_ = available_budget();
+#endif
             return true;
         }
 
@@ -3719,6 +3785,11 @@ bool unified_cache::ensure_planned_arena_zones() {
         return false;
     }
     bind_compute_arena();
+#if GGML_SYCL_DNNL
+    // llama.cpp-0oxf: see the "zones_sufficient" branch above for why this is
+    // snapshotted here rather than read live from onednn_graph_scratch_alloc().
+    onednn_graph_scratch_direct_cap_plan_snapshot_bytes_ = available_budget();
+#endif
     return true;
 }
 
@@ -9462,6 +9533,131 @@ bool unified_cache::event_complete(const sycl::event & evt) {
 }
 
 #if GGML_SYCL_DNNL
+// llama.cpp-0oxf: default cap on outstanding DIRECT (non-arena) Graph-scratch
+// bytes, and the timeouts around it. See onednn_graph_scratch_wait_for_direct_headroom_locked()
+// for the mechanism this backs and the root cause it closes (a B50 GPU page
+// fault/segfault under host CPU contention).
+static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_bytes) {
+    static const long env_mb = [] {
+        const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB");
+        if (env && env[0] != '\0') {
+            long parsed = std::atol(env);
+            if (parsed >= 0) {
+                return parsed;
+            }
+        }
+        return -1L;
+    }();
+    if (env_mb >= 0) {
+        return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
+    }
+    static constexpr size_t kOneGiB = 1024ull * 1024ull * 1024ull;
+    if (plan_time_available_bytes == 0) {
+        // Arena never (successfully) planned for this device -- fall back to
+        // the flat 1 GiB default rather than a 0-byte cap that would refuse
+        // every DIRECT allocation outright.
+        return kOneGiB;
+    }
+    return std::min(kOneGiB, plan_time_available_bytes / 4);
+}
+
+static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
+static constexpr uint32_t kOnednnGraphDirectWaitPollTimeoutMs     = 200;
+static constexpr uint32_t kOnednnGraphDirectWaitTotalTimeoutMs    = 5000;
+
+// llama.cpp-0oxf: test-only hooks, see the declarations in unified-cache.hpp
+// for why these are always compiled rather than gated behind a _TESTING
+// build variant.
+static std::atomic<uint32_t> g_onednn_graph_scratch_test_force_direct_fail_count{ 0 };
+static std::atomic<bool>     g_onednn_graph_scratch_test_suppress_abort{ false };
+static std::atomic<bool>     g_onednn_graph_scratch_test_abort_triggered{ false };
+
+void ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(uint32_t count) {
+    g_onednn_graph_scratch_test_force_direct_fail_count.store(count, std::memory_order_release);
+}
+
+void ggml_sycl_test_onednn_graph_scratch_suppress_abort(bool suppress) {
+    g_onednn_graph_scratch_test_suppress_abort.store(suppress, std::memory_order_release);
+    if (suppress) {
+        g_onednn_graph_scratch_test_abort_triggered.store(false, std::memory_order_release);
+    }
+}
+
+bool ggml_sycl_test_onednn_graph_scratch_abort_triggered() {
+    return g_onednn_graph_scratch_test_abort_triggered.exchange(false, std::memory_order_acq_rel);
+}
+
+// Consumed once per DIRECT alloc attempt: returns true (and decrements the
+// counter) if a test asked this specific attempt to fail without touching
+// the GPU. A CAS loop rather than fetch_sub because fetch_sub on an
+// already-zero counter would wrap to UINT32_MAX instead of staying at 0.
+static bool onednn_graph_scratch_test_should_force_direct_fail() {
+    uint32_t remaining = g_onednn_graph_scratch_test_force_direct_fail_count.load(std::memory_order_acquire);
+    while (remaining > 0) {
+        if (g_onednn_graph_scratch_test_force_direct_fail_count.compare_exchange_weak(
+                remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void unified_cache::onednn_graph_scratch_reap_pending_direct_locked() {
+    auto & pending = onednn_graph_scratch_pending_release_;
+    for (size_t i = 0; i < pending.size();) {
+        if (event_complete(pending[i].event)) {
+            onednn_graph_scratch_direct_outstanding_bytes_ -=
+                std::min(pending[i].size, onednn_graph_scratch_direct_outstanding_bytes_);
+            pending[i] = std::move(pending.back());
+            pending.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
+                                                                         std::unique_lock<std::mutex> & lock) {
+    const size_t cap = onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_);
+    onednn_graph_scratch_reap_pending_direct_locked();
+    if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
+        return true;
+    }
+
+    static std::atomic<bool> first_wait_logged{ false };
+    if (!first_wait_logged.exchange(true, std::memory_order_relaxed)) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path at its cap (%.1f MB outstanding + %.1f MB requested "
+            "> %.1f MB cap) -- waiting for the background drain worker (mem-handle.cpp) to catch up before "
+            "allocating (only logged once; onednn_graph_scratch_direct_wait_count() reports how often this "
+            "recurs)\n",
+            onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0), size / (1024.0 * 1024.0),
+            cap / (1024.0 * 1024.0));
+    }
+    ++onednn_graph_scratch_direct_wait_count_;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
+    bool fits = false;
+    do {
+        // Drop the lock while waiting on the shared drain worker:
+        // drain_retained_handles() blocks on mem-handle.cpp's OWN mutex, not
+        // this one, so holding onednn_graph_scratch_mutex_ here would buy no
+        // safety -- it would only block onednn_graph_scratch_free() (called
+        // from oneDNN's free callback, possibly on a different thread) from
+        // updating the pending-release ledger this very wait depends on to
+        // ever make progress.
+        lock.unlock();
+        ggml_sycl_watchdog_heartbeat();
+        drain_retained_handles(/*wait_all=*/true, /*timeout_ms=*/kOnednnGraphDirectWaitPollTimeoutMs);
+        lock.lock();
+
+        onednn_graph_scratch_reap_pending_direct_locked();
+        fits = onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap;
+    } while (!fits && std::chrono::steady_clock::now() < deadline);
+    return fits;
+}
+
 // llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations
 // in unified-cache.hpp for the design rationale.
 //
@@ -9471,11 +9667,23 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     }
     const size_t align = (alignment != 0) ? alignment : 256;  // 256 == this file's default GPU-coalescing alignment
 
-    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+    std::unique_lock<std::mutex> lock(onednn_graph_scratch_mutex_);
+
+    // llama.cpp-0oxf: print every request size and whether it fit the ONEDNN
+    // zone, rate-limited to the first 64 so a long run's log isn't flooded --
+    // this exists so the lead can measure requests at pp2048/4096/8192 and
+    // fit onednn_graph_scratch_zone_floor_bytes()'s context-derived floor
+    // properly (see that function's PROVISIONAL constants comment).
+    static std::atomic<uint32_t> debug_print_count{ 0 };
+    const bool                   print_this_request = debug_print_count.fetch_add(1, std::memory_order_relaxed) < 64;
 
     if (void * ptr = zone_alloc(vram_zone_id::ONEDNN, size, align)) {
         onednn_graph_scratch_zone_sizes_[ptr] = size;
         note_onednn_graph_scratch_alloc_locked(size);
+        if (print_this_request) {
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB: fit the ONEDNN zone\n",
+                            size / (1024.0 * 1024.0));
+        }
         return ptr;
     }
 
@@ -9495,6 +9703,28 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
             "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB if this repeats.\n",
             size / (1024.0 * 1024.0));
     }
+    if (print_this_request) {
+        GGML_SYCL_DEBUG(
+            "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB: did NOT fit the ONEDNN zone (capacity %.1f MB, "
+            "used %.1f MB) -- taking the DIRECT path\n",
+            size / (1024.0 * 1024.0), zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0));
+    }
+
+    // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
+    // another one -- see onednn_graph_scratch_wait_for_direct_headroom_locked()
+    // for the full mechanism this backs.
+    if (!onednn_graph_scratch_wait_for_direct_headroom_locked(size, lock)) {
+        GGML_LOG_ERROR(
+            "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: gave up waiting for headroom before allocating "
+            "%.2f MB (outstanding=%.2f MB, cap=%.2f MB, waits so far=%zu) -- attempting the allocation anyway so a "
+            "one-off spike is not refused pre-emptively; unified_alloc() below still fails loudly rather than "
+            "handing oneDNN a null scratch pointer.\n",
+            size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_) /
+                (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_wait_count_);
+    }
 
     alloc_request req{};
     req.queue                          = q;
@@ -9509,20 +9739,61 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
     // preference") -- the zone is already known to be too small, so there is
     // no zone to prefer; setting it here was redundant with alloc_request's
     // own default.
-    req.suppress_failure_log           = true;
+    //
+    // suppress_failure_log intentionally left at its default (false),
+    // llama.cpp-0oxf: a DIRECT allocation failure here used to be swallowed
+    // into a null scratch pointer handed straight to oneDNN, which then
+    // executed the SDPA kernel against it -- a GPU page fault ("Engine memory
+    // CAT error"), an engine reset, then a segfault. It is now a loud,
+    // logged failure (unified_alloc()'s own error log, plus the explicit
+    // ERROR + ABORT below).
 
     alloc_handle handle{};
-    if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
-        return nullptr;
+    bool         ok =
+        !onednn_graph_scratch_test_should_force_direct_fail() && unified_alloc(req, &handle) && handle.ptr != nullptr;
+    if (!ok) {
+        // First response to a failed DIRECT allocation: drain whatever the
+        // background worker has queued and retry ONCE, in case headroom
+        // simply had not been reclaimed yet (the common case under load).
+        drain_retained_handles(/*wait_all=*/true, /*timeout_ms=*/kOnednnGraphDirectFailureDrainTimeoutMs);
+        ok = !onednn_graph_scratch_test_should_force_direct_fail() && unified_alloc(req, &handle) &&
+             handle.ptr != nullptr;
+    }
+    if (!ok) {
+        const uint32_t planner_n_ctx = unified_cache_get_planned_onednn_graph_scratch_n_ctx(req.device);
+        GGML_LOG_ERROR(
+            "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation failed after a drain-and-retry: requested "
+            "%.2f MB, outstanding direct=%.2f MB (cap %.2f MB, %zu prior waits), ONEDNN zone %.1f MB (used %.1f "
+            "MB, floor %.1f MB at planner_n_ctx=%u). Refusing to hand oneDNN a null scratch pointer for this "
+            "request -- see llama.cpp-0oxf for the GPU page-fault/segfault this used to cause. Aborting instead.\n",
+            size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_) /
+                (1024.0 * 1024.0),
+            onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
+            onednn_graph_scratch_zone_floor_bytes(planner_n_ctx) / (1024.0 * 1024.0), planner_n_ctx);
+        if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
+            // Test build only (see the hooks declared in unified-cache.hpp):
+            // report "this would have aborted" instead of actually aborting,
+            // so a test can assert the property without crashing itself.
+            g_onednn_graph_scratch_test_abort_triggered.store(true, std::memory_order_release);
+            return nullptr;
+        }
+        GGML_ABORT("oneDNN Graph scratch DIRECT allocation exhausted -- see the preceding error for sizes");
     }
     mem_handle owner    = detail::from_legacy_owned_alloc(std::move(handle), GGML_LAYOUT_AOS);
     auto       resolved = owner.resolve(req.device);
     if (!resolved.ptr || !resolved.on_device) {
-        return nullptr;  // owner destructs here, releasing the allocation
+        GGML_LOG_ERROR(
+            "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation resolved to a non-device pointer (ptr=%p "
+            "on_device=%d) -- refusing to hand oneDNN an invalid scratch pointer.\n",
+            resolved.ptr, static_cast<int>(resolved.on_device));
+        GGML_ABORT("oneDNN Graph scratch DIRECT allocation resolved off-device");
     }
     void * direct_ptr                               = resolved.ptr;
     onednn_graph_scratch_direct_owners_[direct_ptr] = std::move(owner);
     onednn_graph_scratch_direct_sizes_[direct_ptr]  = size;
+    onednn_graph_scratch_direct_outstanding_bytes_ += size;
     note_onednn_graph_scratch_alloc_locked(size);
     return direct_ptr;
 }
@@ -9550,17 +9821,37 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // cache's existing background drain worker rather than polling here.
         mem_handle owner = std::move(direct_it->second);
         onednn_graph_scratch_direct_owners_.erase(direct_it);
-        auto size_it = onednn_graph_scratch_direct_sizes_.find(ptr);
+        size_t freed_size = 0;
+        auto   size_it    = onednn_graph_scratch_direct_sizes_.find(ptr);
         if (size_it != onednn_graph_scratch_direct_sizes_.end()) {
-            note_onednn_graph_scratch_free_locked(size_it->second);
+            freed_size = size_it->second;
+            note_onednn_graph_scratch_free_locked(freed_size);
             onednn_graph_scratch_direct_sizes_.erase(size_it);
         }
+        // llama.cpp-0oxf: reap whatever the background drain worker has
+        // already completed before adding this release to the ledger, so
+        // onednn_graph_scratch_pending_release_ does not grow without bound
+        // over a long run.
+        onednn_graph_scratch_reap_pending_direct_locked();
         if (event) {
+            // The physical release is deferred to the shared drain worker
+            // (below); onednn_graph_scratch_direct_outstanding_bytes_ must
+            // stay charged for these bytes until that completes -- see
+            // onednn_graph_scratch_direct_outstanding_bytes_'s declaration in
+            // the header for why this is a SEPARATE ledger from the maps just
+            // above, not derived from note_onednn_graph_scratch_free_locked().
+            onednn_graph_scratch_pending_release_.push_back({ freed_size, *event });
             retain_handles_until_event({ std::move(owner) }, *event);
+        } else {
+            // No event given: release is immediate (owner destructs here,
+            // through the cache), so the physical bytes are already back --
+            // reflect that in the outstanding counter directly instead of
+            // parking it in the pending-release ledger with nothing to wait
+            // on. oneDNN's SYCL interop always supplies an event for a real
+            // free(); this branch only matters if that ever changes.
+            onednn_graph_scratch_direct_outstanding_bytes_ -=
+                std::min(freed_size, onednn_graph_scratch_direct_outstanding_bytes_);
         }
-        // else: no event given -- owner destructs here, releasing immediately
-        // through the cache. oneDNN's SYCL interop always supplies an event
-        // for a real free(); this branch only matters if that ever changes.
         return;
     }
 
@@ -24630,6 +24921,14 @@ static void populate_host_zone_sizing(placement_plan &                          
         "MB)\n",
         plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_reorder / (1024.0 * 1024.0),
         zone_maxima.onednn_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
+#if GGML_SYCL_DNNL
+    // llama.cpp-0oxf: record planner_n_ctx alongside the scratchpad bytes so
+    // onednn_graph_scratch_zone_floor_bytes() can size the Graph-scratch
+    // allocator's floor from context length instead of a flat constant.
+    if (plan.device_id >= 0) {
+        unified_cache_set_planned_onednn_graph_scratch_n_ctx(plan.device_id, plan.planner_n_ctx);
+    }
+#endif
 
     // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     //    dequant prefetch. This is computed exactly at inventory collection time and

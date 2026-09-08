@@ -1303,6 +1303,49 @@ void     unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t
 //     which question it is asking.
 size_t   unified_cache_get_planned_onednn_scratchpad_bytes(int device_id);
 size_t   unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
+// llama.cpp-0oxf: planner_n_ctx recorded alongside the scratchpad bytes above,
+// feeding onednn_graph_scratch_zone_floor_bytes()'s context-derived floor (see
+// unified-cache.cpp). 0 means "never planned for this device".
+void     unified_cache_set_planned_onednn_graph_scratch_n_ctx(int device_id, uint32_t n_ctx);
+uint32_t unified_cache_get_planned_onednn_graph_scratch_n_ctx(int device_id);
+
+#if GGML_SYCL_DNNL
+// llama.cpp-0oxf: test-only hooks for onednn_graph_scratch_alloc()'s DIRECT
+// allocation-exhausted path. Deliberately ALWAYS compiled (not gated behind a
+// _TESTING build variant like GGML_SYCL_PRIVATE_TESTING or
+// GGML_SYCL_RETAINED_PUBLICATION_TESTING) -- those require recompiling
+// ggml-sycl as a separate object-library target (see the ggml-sycl-q1-route-
+// test-objects/ggml-sycl-lifecycle-private-carrier pattern in
+// ggml/src/ggml-sycl/CMakeLists.txt), which is out of scope for this fix. All
+// three are single atomics consulted only inside the already-exceptional
+// DIRECT-allocation-exhausted branch; every production run leaves them at
+// their default ("off"), so the runtime cost is one relaxed/acquire atomic
+// load in a path that should never execute at all.
+//
+// Forces the next `count` DIRECT unified_alloc() attempts inside
+// onednn_graph_scratch_alloc() to fail WITHOUT touching the GPU, so a test
+// can drive the allocator to its abort decision deterministically instead of
+// needing genuine VRAM exhaustion. Pass 2 to fail both the initial attempt
+// and the drain-and-retry.
+void ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(uint32_t count);
+// While suppressed, the point that would otherwise call GGML_ABORT() instead
+// logs the identical ERROR message, latches the "triggered" flag below, and
+// returns nullptr -- letting a test observe "this would have aborted"
+// without crashing the test process. Off by default: real production
+// behaviour is to abort. Setting `suppress=true` also clears any latched
+// "triggered" flag from a previous use.
+void ggml_sycl_test_onednn_graph_scratch_suppress_abort(bool suppress);
+// True if the abort path was reached since the last call to this function,
+// which resets it to false (a single-shot latch, like a "consumed" event).
+bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
+
+// Host-testable wrapper around onednn_graph_scratch_zone_floor_bytes(), which
+// has internal (file-static) linkage. Pure function, no device/backend state
+// -- reads GGML_SYCL_ONEDNN_GRAPH_ZONE_MB the same way the real call site
+// does, memoized on first call within the process (set the env var before
+// the first call in a test).
+size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t planner_n_ctx);
+#endif
 void     unified_cache_set_planned_pp_moe_onednn_scratch(int      device_id,
                                                          size_t   weight_slot_bytes,
                                                          size_t   activation_slot_bytes,
@@ -2939,6 +2982,21 @@ class unified_cache {
     // log answer "did N MiB actually fit in the planned zone" for a run that
     // already finished. Zero if the allocator was never used this process.
     size_t onednn_graph_scratch_high_water_bytes() const { return onednn_graph_scratch_high_water_bytes_; }
+
+    // llama.cpp-0oxf: how many times the DIRECT Graph-scratch path had to wait
+    // for the background drain worker before it was allowed to allocate.
+    // Exposed for tests and for the teardown log line; see the private
+    // ledger this counts against in the member declarations further below.
+    // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
+    // just above -- advisory/diagnostic, not synchronized with the writer.
+    size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }
+
+    // Current outstanding DIRECT (not-yet-confirmed-released) Graph-scratch
+    // bytes. Exposed for tests that need to drive the allocator up to its cap
+    // without allocating through the same private path being tested.
+    size_t onednn_graph_scratch_direct_outstanding_bytes() const {
+        return onednn_graph_scratch_direct_outstanding_bytes_;
+    }
 #endif
 
     struct pp_moe_onednn_scratch_slot {
@@ -3636,6 +3694,66 @@ class unified_cache {
     // Callers must hold onednn_graph_scratch_mutex_.
     void note_onednn_graph_scratch_alloc_locked(size_t size);
     void note_onednn_graph_scratch_free_locked(size_t size);
+
+    // llama.cpp-0oxf: bound on outstanding DIRECT (non-arena) Graph-scratch
+    // bytes, closing the root cause of the B50 CAT-error/segfault under host
+    // CPU contention. See onednn_graph_scratch_alloc()'s definition for the
+    // full mechanism; the short version: every DIRECT allocation's physical
+    // release is deferred to the shared background drain worker
+    // (mem-handle.cpp retained_handle_drain_loop), and under contention that
+    // worker lags, so DIRECT buffers can pile up until unified_alloc() fails.
+    // Deliberately NOT the same population as
+    // onednn_graph_scratch_direct_owners_/_sizes_ above: those two maps are
+    // cleared the moment onednn_graph_scratch_free() is CALLED, which is
+    // before the underlying memory is actually released -- a counter derived
+    // from them would stop seeing the pile-up at exactly the point it starts
+    // mattering. This counter instead tracks bytes not yet CONFIRMED released
+    // (see onednn_graph_scratch_pending_release_ below).
+    size_t onednn_graph_scratch_direct_outstanding_bytes_ = 0;
+
+    struct onednn_graph_scratch_pending_release_entry {
+        size_t      size;
+        sycl::event event;
+    };
+
+    // Ledger of DIRECT buffers handed to retain_handles_until_event() whose
+    // completion this allocator has not yet observed. Reaped opportunistically
+    // (non-blocking, via event_complete()) every time onednn_graph_scratch_alloc()
+    // or onednn_graph_scratch_free() runs, so onednn_graph_scratch_direct_outstanding_bytes_
+    // never drifts stale for long without needing a dedicated poller thread.
+    std::vector<onednn_graph_scratch_pending_release_entry> onednn_graph_scratch_pending_release_;
+
+    // How many times onednn_graph_scratch_alloc() had to wait for the DIRECT
+    // path to free up headroom under the cap (onednn_graph_scratch_direct_cap_bytes()
+    // in the .cpp). Zero on a healthy run; logged once (WARN) on the first
+    // wait and again with the final count at cache teardown, so a run's log
+    // answers "did this ever engage" without a special env var.
+    size_t onednn_graph_scratch_direct_wait_count_ = 0;
+
+    // available_budget() snapshot taken the last time ensure_planned_arena_zones()
+    // successfully (re)planned this device's arena. The DIRECT-path cap
+    // defaults to a fraction of this rather than of live available_budget(),
+    // so the cap doesn't shrink out from under the allocator as the arena's
+    // own zones consume the budget it was planned against. 0 until the first
+    // successful plan (compute_arena_zones_snapshot() below returns 0 for
+    // "unset").
+    size_t onednn_graph_scratch_direct_cap_plan_snapshot_bytes_ = 0;
+
+    // Reap completed entries from onednn_graph_scratch_pending_release_,
+    // decrementing onednn_graph_scratch_direct_outstanding_bytes_ for each.
+    // Callers must hold onednn_graph_scratch_mutex_.
+    void onednn_graph_scratch_reap_pending_direct_locked();
+
+    // Block (bounded) until outstanding DIRECT bytes + `size` fits under the
+    // cap, or the total wait timeout expires. Drops `lock` while waiting on
+    // the shared drain worker (drain_retained_handles() blocks on a different
+    // mutex entirely, and holding ours would only block onednn_graph_scratch_free()
+    // from updating the ledger this wait depends on -- see the .cpp for the
+    // full argument) and re-acquires it before returning. Returns false if the
+    // timeout expired without fitting; the caller still attempts the
+    // allocation afterward and aborts loudly on failure rather than refusing
+    // pre-emptively on what may be a one-off spike.
+    bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t size, std::unique_lock<std::mutex> & lock);
 #endif
 
     std::vector<pp_moe_onednn_scratch_slot> pp_moe_onednn_scratch_slots_;
