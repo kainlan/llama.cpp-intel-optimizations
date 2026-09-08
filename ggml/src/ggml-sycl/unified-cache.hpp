@@ -3017,6 +3017,15 @@ class unified_cache {
     size_t onednn_graph_scratch_direct_outstanding_bytes() const {
         return onednn_graph_scratch_direct_outstanding_bytes_;
     }
+
+    // llama.cpp-0oxf: how many DIRECT allocations were served from the
+    // size-bucketed reuse pool (onednn_graph_scratch_reuse_pool_) instead of
+    // a fresh unified_alloc()/zeMemAllocDevice round trip. Exposed for tests
+    // and diagnostics -- a healthy long run should show this climbing while
+    // onednn_graph_scratch_direct_wait_count() and the DIRECT allocation
+    // count stay flat once the pool has "warmed up" with one entry per
+    // distinct in-flight shape.
+    size_t onednn_graph_scratch_pool_hit_count() const { return onednn_graph_scratch_pool_hit_count_; }
 #endif
 
     struct pp_moe_onednn_scratch_slot {
@@ -3718,30 +3727,15 @@ class unified_cache {
     // llama.cpp-0oxf: bound on outstanding DIRECT (non-arena) Graph-scratch
     // bytes, closing the root cause of the B50 CAT-error/segfault under host
     // CPU contention. See onednn_graph_scratch_alloc()'s definition for the
-    // full mechanism; the short version: every DIRECT allocation's physical
-    // release is deferred to the shared background drain worker
-    // (mem-handle.cpp retained_handle_drain_loop), and under contention that
-    // worker lags, so DIRECT buffers can pile up until unified_alloc() fails.
-    // Deliberately NOT the same population as
+    // full mechanism. Deliberately NOT the same population as
     // onednn_graph_scratch_direct_owners_/_sizes_ above: those two maps are
-    // cleared the moment onednn_graph_scratch_free() is CALLED, which is
-    // before the underlying memory is actually released -- a counter derived
-    // from them would stop seeing the pile-up at exactly the point it starts
-    // mattering. This counter instead tracks bytes not yet CONFIRMED released
-    // (see onednn_graph_scratch_pending_release_ below).
+    // cleared the moment onednn_graph_scratch_free() is CALLED, which no
+    // longer means the physical memory is released at all under the reuse
+    // pool below -- a freed buffer's bytes stay charged here for as long as
+    // it sits in onednn_graph_scratch_reuse_pool_, because it is still real
+    // resident VRAM, just idle. Decremented only when a pool entry is
+    // actually torn down (mem_handle destruction, e.g. at cache teardown).
     size_t onednn_graph_scratch_direct_outstanding_bytes_ = 0;
-
-    struct onednn_graph_scratch_pending_release_entry {
-        size_t      size;
-        sycl::event event;
-    };
-
-    // Ledger of DIRECT buffers handed to retain_handles_until_event() whose
-    // completion this allocator has not yet observed. Reaped opportunistically
-    // (non-blocking, via event_complete()) every time onednn_graph_scratch_alloc()
-    // or onednn_graph_scratch_free() runs, so onednn_graph_scratch_direct_outstanding_bytes_
-    // never drifts stale for long without needing a dedicated poller thread.
-    std::vector<onednn_graph_scratch_pending_release_entry> onednn_graph_scratch_pending_release_;
 
     // How many times onednn_graph_scratch_alloc() had to wait for the DIRECT
     // path to free up headroom under the cap (onednn_graph_scratch_direct_cap_bytes()
@@ -3759,20 +3753,64 @@ class unified_cache {
     // "unset").
     size_t onednn_graph_scratch_direct_cap_plan_snapshot_bytes_ = 0;
 
-    // Reap completed entries from onednn_graph_scratch_pending_release_,
-    // decrementing onednn_graph_scratch_direct_outstanding_bytes_ for each.
-    // Callers must hold onednn_graph_scratch_mutex_.
-    void onednn_graph_scratch_reap_pending_direct_locked();
+    // llama.cpp-0oxf, redesign after finding the ONEDNN zone cannot grow
+    // post-load (arena_reserve()'s existing-arena branch ignores the zone
+    // size arguments entirely once weights are resident -- see
+    // onednn_graph_scratch_alloc()'s comment): a DIRECT buffer that
+    // onednn_graph_scratch_free() releases is no longer hoisted back into
+    // the general unified_alloc() pool via retain_handles_until_event(). It
+    // is instead PARKED HERE, bucketed by its exact size and gated on its
+    // release event, so a future request of the identical size (the common
+    // case across ubatches within one generation, and across `-r N` reps of
+    // the same benchmark) is served by reuse instead of a fresh
+    // unified_alloc()/zeMemAllocDevice round trip. Implicitly bounded by
+    // onednn_graph_scratch_direct_outstanding_bytes_'s cap: a pooled entry's
+    // bytes stay charged against that cap (see the field's own comment
+    // above), so the pool cannot grow without limit alongside fresh
+    // allocations -- it competes with them for the same headroom.
+    struct onednn_graph_scratch_pool_entry {
+        mem_handle  owner;
+        sycl::event release_event;
+    };
+
+    std::unordered_map<size_t, std::vector<onednn_graph_scratch_pool_entry>> onednn_graph_scratch_reuse_pool_;
+
+    // See the public onednn_graph_scratch_pool_hit_count() accessor above.
+    size_t onednn_graph_scratch_pool_hit_count_ = 0;
+
+    // Try to serve `size` bytes from onednn_graph_scratch_reuse_pool_: if a
+    // bucket for that exact size holds an entry whose release_event has
+    // completed, pops it, resolves it for `device_id`, and returns true with
+    // *out_owner/*out_ptr set. Does NOT touch
+    // onednn_graph_scratch_direct_outstanding_bytes_ (a pooled entry's bytes
+    // were never removed from it) or note_onednn_graph_scratch_alloc_locked()
+    // (the caller does that, same as for a fresh allocation) -- this helper
+    // only does the pool lookup/resolve. Callers must hold
+    // onednn_graph_scratch_mutex_.
+    bool onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
+                                                    int          device_id,
+                                                    mem_handle * out_owner,
+                                                    void **      out_ptr);
+
+    // Evict completed (event_complete() true) reuse-pool entries -- real
+    // release, destructing the owned mem_handle -- stopping as soon as
+    // outstanding DIRECT bytes + `size` fits under `cap`, so as much of the
+    // pool survives as possible. Returns whether it fits after evicting
+    // (which may already have been true before evicting anything). Callers
+    // must hold onednn_graph_scratch_mutex_.
+    bool onednn_graph_scratch_evict_pool_until_fits_locked(size_t size, size_t cap);
 
     // Block (bounded) until outstanding DIRECT bytes + `size` fits under the
-    // cap, or the total wait timeout expires. Drops `lock` while waiting on
-    // the shared drain worker (drain_retained_handles() blocks on a different
-    // mutex entirely, and holding ours would only block onednn_graph_scratch_free()
-    // from updating the ledger this wait depends on -- see the .cpp for the
-    // full argument) and re-acquires it before returning. Returns false if the
-    // timeout expired without fitting; the caller still attempts the
-    // allocation afterward and aborts loudly on failure rather than refusing
-    // pre-emptively on what may be a one-off spike.
+    // cap, or the total wait timeout expires (by polling for pool entries to
+    // complete and evicting them via onednn_graph_scratch_evict_pool_until_fits_locked()
+    // above). Drops `lock` while waiting -- holding it would only block
+    // onednn_graph_scratch_free() (called from oneDNN's free callback,
+    // possibly on a different thread) from parking a newly-freed entry this
+    // wait might otherwise evict on its very next poll -- and re-acquires it
+    // before returning. Returns false if the timeout expired without
+    // fitting; the caller still attempts the allocation afterward and aborts
+    // loudly on failure rather than refusing pre-emptively on what may be a
+    // one-off spike.
     bool onednn_graph_scratch_wait_for_direct_headroom_locked(size_t size, std::unique_lock<std::mutex> & lock);
 #endif
 

@@ -9670,25 +9670,74 @@ static bool onednn_graph_scratch_test_should_force_direct_fail() {
     return false;
 }
 
-void unified_cache::onednn_graph_scratch_reap_pending_direct_locked() {
-    auto & pending = onednn_graph_scratch_pending_release_;
-    for (size_t i = 0; i < pending.size();) {
-        if (event_complete(pending[i].event)) {
-            onednn_graph_scratch_direct_outstanding_bytes_ -=
-                std::min(pending[i].size, onednn_graph_scratch_direct_outstanding_bytes_);
-            pending[i] = std::move(pending.back());
-            pending.pop_back();
-        } else {
-            ++i;
+// llama.cpp-0oxf: evict pool entries (real release: destructing the owned
+// mem_handle) whose release_event has completed, stopping as soon as
+// outstanding + `size` fits under `cap` -- preserves as much of the pool as
+// possible rather than blanket-clearing it, so sizes that are NOT under
+// pressure right now stay reusable. Only entries with a COMPLETED event are
+// eligible; an entry still in flight cannot be released without risking a
+// live GPU read. Returns whether it fits after evicting. Callers must hold
+// onednn_graph_scratch_mutex_.
+bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked(size_t size, size_t cap) {
+    if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
+        return true;
+    }
+    for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
+        const size_t                                   pooled_size = bucket_kv.first;
+        std::vector<onednn_graph_scratch_pool_entry> & bucket      = bucket_kv.second;
+        for (size_t i = 0; i < bucket.size();) {
+            if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
+                return true;
+            }
+            if (event_complete(bucket[i].release_event)) {
+                onednn_graph_scratch_direct_outstanding_bytes_ -=
+                    std::min(pooled_size, onednn_graph_scratch_direct_outstanding_bytes_);
+                bucket[i] = std::move(bucket.back());
+                bucket.pop_back();
+            } else {
+                ++i;
+            }
         }
     }
+    return onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap;
+}
+
+bool unified_cache::onednn_graph_scratch_try_reuse_pool_locked(size_t       size,
+                                                               int          device_id,
+                                                               mem_handle * out_owner,
+                                                               void **      out_ptr) {
+    auto pool_it = onednn_graph_scratch_reuse_pool_.find(size);
+    if (pool_it == onednn_graph_scratch_reuse_pool_.end()) {
+        return false;
+    }
+    std::vector<onednn_graph_scratch_pool_entry> & bucket = pool_it->second;
+    for (size_t i = 0; i < bucket.size(); ++i) {
+        if (!event_complete(bucket[i].release_event)) {
+            continue;
+        }
+        mem_handle owner = std::move(bucket[i].owner);
+        bucket[i]        = std::move(bucket.back());
+        bucket.pop_back();
+        const auto resolved = owner.resolve(device_id);
+        if (!resolved.ptr || !resolved.on_device) {
+            // Should not happen for a still-owned handle -- fall through and
+            // let `owner` destruct here (a real, immediate release), same as
+            // any other unusable resolution. Do not retry another bucket
+            // entry: something is wrong with this specific handle, not with
+            // pooling in general.
+            return false;
+        }
+        *out_owner = std::move(owner);
+        *out_ptr   = resolved.ptr;
+        return true;
+    }
+    return false;
 }
 
 bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t                         size,
                                                                          std::unique_lock<std::mutex> & lock) {
     const size_t cap = onednn_graph_scratch_direct_cap_bytes(onednn_graph_scratch_direct_cap_plan_snapshot_bytes_);
-    onednn_graph_scratch_reap_pending_direct_locked();
-    if (onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap) {
+    if (onednn_graph_scratch_evict_pool_until_fits_locked(size, cap)) {
         return true;
     }
 
@@ -9696,7 +9745,7 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     if (!first_wait_logged.exchange(true, std::memory_order_relaxed)) {
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT path at its cap (%.1f MB outstanding + %.1f MB requested "
-            "> %.1f MB cap) -- waiting for the background drain worker (mem-handle.cpp) to catch up before "
+            "> %.1f MB cap) -- waiting for an in-flight pooled buffer to complete and evicting it before "
             "allocating (only logged once; onednn_graph_scratch_direct_wait_count() reports how often this "
             "recurs)\n",
             onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0), size / (1024.0 * 1024.0),
@@ -9708,20 +9757,18 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         std::chrono::steady_clock::now() + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
     bool fits = false;
     do {
-        // Drop the lock while waiting on the shared drain worker:
-        // drain_retained_handles() blocks on mem-handle.cpp's OWN mutex, not
-        // this one, so holding onednn_graph_scratch_mutex_ here would buy no
-        // safety -- it would only block onednn_graph_scratch_free() (called
-        // from oneDNN's free callback, possibly on a different thread) from
-        // updating the pending-release ledger this very wait depends on to
-        // ever make progress.
+        // Drop the lock while waiting: nothing we hold it for makes an
+        // in-flight pool entry's SYCL event complete any sooner, and holding
+        // it would only block onednn_graph_scratch_free() (called from
+        // oneDNN's free callback, possibly on a different thread) from
+        // parking a newly-freed entry this wait might otherwise be able to
+        // evict on its very next poll.
         lock.unlock();
         ggml_sycl_watchdog_heartbeat();
-        drain_retained_handles(/*wait_all=*/true, /*timeout_ms=*/kOnednnGraphDirectWaitPollTimeoutMs);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kOnednnGraphDirectWaitPollTimeoutMs));
         lock.lock();
 
-        onednn_graph_scratch_reap_pending_direct_locked();
-        fits = onednn_graph_scratch_direct_outstanding_bytes_ + size <= cap;
+        fits = onednn_graph_scratch_evict_pool_until_fits_locked(size, cap);
     } while (!fits && std::chrono::steady_clock::now() < deadline);
     return fits;
 }
@@ -9786,6 +9833,32 @@ void * unified_cache::onednn_graph_scratch_alloc(size_t size, size_t alignment, 
             "used %.1f MB) -- taking the DIRECT path\n",
             size / (1024.0 * 1024.0), zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0));
+    }
+
+    // llama.cpp-0oxf: try the size-bucketed reuse pool BEFORE the cap-wait
+    // mechanism below -- reusing an already-resident buffer needs no
+    // headroom check at all (its bytes are already charged against
+    // onednn_graph_scratch_direct_outstanding_bytes_, since they never left
+    // it while pooled -- see that field's comment), and it avoids the
+    // zeMemAllocDevice round trip entirely. See onednn_graph_scratch_free()'s
+    // DIRECT branch for where entries are parked here on release.
+    {
+        mem_handle pooled_owner;
+        void *     pooled_ptr = nullptr;
+        if (onednn_graph_scratch_try_reuse_pool_locked(size, ggml_sycl_get_device_id_from_queue(*q), &pooled_owner,
+                                                       &pooled_ptr)) {
+            onednn_graph_scratch_direct_owners_[pooled_ptr] = std::move(pooled_owner);
+            onednn_graph_scratch_direct_sizes_[pooled_ptr]  = size;
+            ++onednn_graph_scratch_pool_hit_count_;
+            note_onednn_graph_scratch_alloc_locked(size);
+            if (print_this_request) {
+                GGML_SYCL_DEBUG(
+                    "[UNIFIED-CACHE] oneDNN Graph scratch request %.2f MB: reused from the DIRECT pool (hit "
+                    "count %zu)\n",
+                    size / (1024.0 * 1024.0), onednn_graph_scratch_pool_hit_count_);
+            }
+            return pooled_ptr;
+        }
     }
 
     // llama.cpp-0oxf: bound outstanding DIRECT bytes before allocating
@@ -9888,17 +9961,22 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     auto direct_it = onednn_graph_scratch_direct_owners_.find(ptr);
     if (direct_it != onednn_graph_scratch_direct_owners_.end()) {
         // DIRECT (non-arena) allocation: a real, individually mem_handle-owned
-        // allocation from unified_alloc(), not a zone suballocation -- the
-        // ONLY lifetime guard available for it is the handle itself (mirrors
-        // reserve_onednn_scratch's defer_published_direct_release,
-        // llama.cpp-ndn9). Always deferred through retain_handles_until_event():
-        // unlike the zone path below, immediate reclaim here is NOT backed by
-        // an in-order-queue argument (a DIRECT block, once released, goes back
-        // to the unified cache's general pool, not straight back into this
-        // allocator's own reuse loop, so nothing pins its next consumer to the
-        // same queue as its last one) -- so an event-gated release is the only
-        // correct option. retain_handles_until_event() hands the wait to the
-        // cache's existing background drain worker rather than polling here.
+        // allocation from unified_alloc(), not a zone suballocation.
+        //
+        // llama.cpp-0oxf (redesign, see onednn_graph_scratch_alloc()'s
+        // comment on why): park it in the size-bucketed reuse pool instead
+        // of handing it to the shared background drain worker via
+        // retain_handles_until_event(). The ONEDNN zone cannot grow after
+        // weights load (arena_reserve()'s existing-arena branch ignores the
+        // zone-size arguments it is passed), so avoiding a repeat
+        // zeMemAllocDevice round trip for the same shape matters more than
+        // returning this memory to the general unified_alloc() pool --
+        // especially since the model that hit the DIRECT path once is very
+        // likely to request the identical shape again (the next ubatch at
+        // the same n_ctx across `-r N` reps, or a later decode step). A
+        // default-constructed sycl::event (the `event == nullptr` case)
+        // reads as already-complete, so it needs no special handling here --
+        // it is immediately eligible for reuse on the very next request.
         mem_handle owner = std::move(direct_it->second);
         onednn_graph_scratch_direct_owners_.erase(direct_it);
         size_t freed_size = 0;
@@ -9908,30 +9986,10 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             note_onednn_graph_scratch_free_locked(freed_size);
             onednn_graph_scratch_direct_sizes_.erase(size_it);
         }
-        // llama.cpp-0oxf: reap whatever the background drain worker has
-        // already completed before adding this release to the ledger, so
-        // onednn_graph_scratch_pending_release_ does not grow without bound
-        // over a long run.
-        onednn_graph_scratch_reap_pending_direct_locked();
-        if (event) {
-            // The physical release is deferred to the shared drain worker
-            // (below); onednn_graph_scratch_direct_outstanding_bytes_ must
-            // stay charged for these bytes until that completes -- see
-            // onednn_graph_scratch_direct_outstanding_bytes_'s declaration in
-            // the header for why this is a SEPARATE ledger from the maps just
-            // above, not derived from note_onednn_graph_scratch_free_locked().
-            onednn_graph_scratch_pending_release_.push_back({ freed_size, *event });
-            retain_handles_until_event({ std::move(owner) }, *event);
-        } else {
-            // No event given: release is immediate (owner destructs here,
-            // through the cache), so the physical bytes are already back --
-            // reflect that in the outstanding counter directly instead of
-            // parking it in the pending-release ledger with nothing to wait
-            // on. oneDNN's SYCL interop always supplies an event for a real
-            // free(); this branch only matters if that ever changes.
-            onednn_graph_scratch_direct_outstanding_bytes_ -=
-                std::min(freed_size, onednn_graph_scratch_direct_outstanding_bytes_);
-        }
+        // onednn_graph_scratch_direct_outstanding_bytes_ stays charged for
+        // these bytes for as long as they sit in the pool -- see that
+        // field's own comment for why (it is still real resident VRAM).
+        onednn_graph_scratch_reuse_pool_[freed_size].push_back({ std::move(owner), event ? *event : sycl::event{} });
         return;
     }
 

@@ -358,42 +358,85 @@ ticket reproduced on:
   (`GGML_SYCL_DEBUG`) is now gated on "differs from the last size printed"
   rather than a first-64 count, so a long run correlating shapes against
   sizes never goes silent partway through.
-- **The DIRECT path itself is now bounded and fails loudly instead of
-  silently.** `onednn_graph_scratch_alloc()` tracks outstanding DIRECT bytes
-  in a small local ledger (`onednn_graph_scratch_pending_release_`:
-  `{size, event}` pairs handed to `retain_handles_until_event()`, reaped
-  opportunistically via the existing non-blocking `event_complete()` — this
-  is a SEPARATE counter from the zone/DIRECT maps used for the high-water
-  stat above, because those clear the moment `onednn_graph_scratch_free()` is
-  *called*, before the physical memory is actually released, which is
-  exactly the population that needs to stay charged for a cap to mean
-  anything). Before allocating past `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`'s
-  cap (default: min(1 GiB, 25% of `available_budget()` snapshotted the last
-  time this device's arena was successfully planned — a snapshot, not a live
-  read, so the cap does not shrink out from under the allocator as the
-  arena's own zones consume the budget it was planned against), the
-  allocator waits, bounded, dropping its own mutex while it polls the shared
-  drain worker (`drain_retained_handles(wait_all=true, ...)` plus a watchdog
-  heartbeat) so `onednn_graph_scratch_free()` — potentially called from a
-  different thread — can keep updating the pending-release ledger this wait
-  depends on. If the wait times out, the allocator proceeds anyway rather
-  than refusing a possibly one-off spike pre-emptively; `unified_alloc()`
-  below is still checked. If that allocation genuinely fails even after one
-  drain-and-retry, the allocator now logs the sizes (request, outstanding,
-  cap, prior waits, zone capacity/used/floor) and `GGML_ABORT`s — it no
-  longer returns a null scratch pointer to oneDNN under any circumstance.
-  `onednn_graph_scratch_direct_wait_count()` reports how often a run actually
-  had to wait.
+- ⚠️ **The zone floor above cannot actually reach the DIRECT path's steady
+  state, and this is not a bug to fix in the floor** — it is a fact about
+  when the arena is built. Verification found that at `-p 8192 -ub 512` on
+  Mistral Q4_0, requests still took the DIRECT path (`did NOT fit the ONEDNN
+  zone`) despite the shape-derived floor, because the arena (and its ONEDNN
+  zone) is sized at MODEL LOAD, where `n_ctx` is still the conservative `512`
+  default — the real runtime `n_ctx` (from `llama_context` creation) arrives
+  much later, and nothing re-plans the zone at that point.
+  `arena_reserve()`'s own body proves why not: its `if (arena_base_) { ...;
+  return true; }` branch, taken on every call once the arena already exists,
+  ignores the `scratch_bytes`/`onednn_bytes`/`runtime_bytes` arguments it is
+  passed entirely — it only calls `zone_reclaim()` on the KV/RUNTIME zones so
+  a new context's allocations can reuse existing physical capacity. There is
+  no path in this design that grows an existing zone. (KV does not have this
+  problem for an unrelated reason: it is not a small fixed-size zone sized by
+  a formula the way ONEDNN/SCRATCH/RUNTIME are — it draws from whatever
+  headroom the arena's construction already set aside, so a different
+  context's real KV need is satisfied by fresh suballocation into that same
+  pre-existing space.) The only alternative — destroying and rebuilding the
+  whole arena once the real `n_ctx` is known — is refused by
+  `ensure_planned_arena_zones()`'s own live-allocation check the moment any
+  weight is resident, which by runtime context creation time it always is.
+  So for any model whose real `n_ctx`/`n_ubatch` shape needs more than the
+  load-time floor provisioned, EVERY oneDNN SDPA call of that shape takes the
+  DIRECT path — not an occasional one — making the path below's efficiency,
+  not just its safety, load-bearing.
+- **The DIRECT path itself is now bounded, REUSES freed buffers, and fails
+  loudly instead of silently.** Given the previous bullet, a background
+  wait-for-a-generic-drain-worker design (this fix's first iteration) just
+  means repeatedly paying a `zeMemAllocDevice` round trip for buffers of the
+  identical size, every single call. `onednn_graph_scratch_free()`'s DIRECT
+  branch instead PARKS a freed buffer in a size-bucketed reuse pool
+  (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
+  entries) instead of handing it to the shared background drain worker via
+  `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
+  that pool (for a `event_complete()`-true entry of the EXACT requested size)
+  before ever falling to a fresh `unified_alloc()`. This serves the common
+  case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
+  across `-r N` benchmark reps and across decode steps at a stable KV length.
+  A pooled-but-idle entry's bytes stay charged against
+  `onednn_graph_scratch_direct_outstanding_bytes_` (a SEPARATE ledger from
+  the zone/DIRECT maps used for the high-water stat above, because those
+  clear the moment `onednn_graph_scratch_free()` is *called*, whether or not
+  the memory is actually released at all — under this redesign it may now
+  live in the pool indefinitely) — it is still real resident VRAM, just idle
+  — so the pool
+  cannot grow without limit alongside fresh allocations; it competes with
+  them for the same `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` headroom (default:
+  min(1 GiB, 25% of `available_budget()` snapshotted the last time this
+  device's arena was successfully planned — a snapshot, not a live read, so
+  the cap does not shrink out from under the allocator as the arena's own
+  zones consume the budget it was planned against). A request that cannot be
+  served from the pool and would exceed the cap evicts (a REAL release,
+  destructing the owned `mem_handle`) completed pool entries of OTHER sizes,
+  stopping as soon as it fits — preserving as much of the pool as possible —
+  and waits (bounded, dropping its own mutex so `onednn_graph_scratch_free()`
+  — potentially called from a different thread — can keep parking newly-freed
+  entries this wait might evict on its very next poll) for an in-flight entry
+  to complete if none are immediately evictable. If the wait times out, the
+  allocator proceeds anyway rather than refusing a possibly one-off spike
+  pre-emptively; `unified_alloc()` below is still checked. If that allocation
+  genuinely fails even after one drain-and-retry, the allocator now logs the
+  sizes (request, outstanding, cap, prior waits, zone capacity/used/floor)
+  and `GGML_ABORT`s — it no longer returns a null scratch pointer to oneDNN
+  under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
+  `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
+  to wait, and how often it was served from the pool instead, respectively.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/
 `_suppress_abort()`'s declarations in `unified-cache.hpp`) test hooks let
-`tests/test-sycl-onednn-graph-scratch-direct.cpp` drive both the cap-wait and
-the abort decision deterministically without needing genuine VRAM exhaustion
-and without crashing the test process — a fork()-based death-check was
-considered and rejected: forking a process that has already touched the
-SYCL/Level-Zero runtime is a documented hang hazard on this fork's
-development host (CLAUDE.md's SYCL Device Selection section).
+`tests/test-sycl-onednn-graph-scratch-direct.cpp` drive the abort decision
+deterministically without needing genuine VRAM exhaustion and without
+crashing the test process — a fork()-based death-check was considered and
+rejected: forking a process that has already touched the SYCL/Level-Zero
+runtime is a documented hang hazard on this fork's development host
+(CLAUDE.md's SYCL Device Selection section). The pool-reuse and
+eviction/wait properties need no such hook: they are exercised directly by
+freeing and re-requesting real DIRECT allocations at controlled sizes.
 
 ### The one sanctioned exception: `ensure_cached_alloc()` (test-only)
 
