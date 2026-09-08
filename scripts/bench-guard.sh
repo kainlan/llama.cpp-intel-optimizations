@@ -71,6 +71,14 @@ esac; done
 
 refuse() { echo "bench-guard: REFUSED: $*" >&2; exit 3; }
 
+# Without this, a missing/unreadable --meminfo reaches shmem_kb()'s bare
+# `awk` unguarded and the script dies on awk's own raw exit status (2) and
+# stderr message ("awk: can't open file ...") instead of a clean refuse()
+# -- the exact "bare command fails under set -e with no context" failure
+# mode this file guards against everywhere else (llama.cpp-imns review
+# round 5, finding F9).
+[ -r "$MEMINFO" ] || refuse "no meminfo at $MEMINFO"
+
 # is_top_level_card DIR -- true iff DIR exists and its basename matches
 # card[0-9]+, i.e. a numbered top-level card rather than a connector entry
 # (card1-DP-1, ...). Shared by derive_card_for_selector and
@@ -88,7 +96,12 @@ is_top_level_card() {
 # (device/vendor 0x8086, device/class 0x0300*), excluding PCI bus 00 on
 # any domain, which is the integrated GPU, sort the survivors by PCI
 # address (lexical order on the zero-padded dddd:bb:dd.f string is
-# domain/bus/device/function order), and set DERIVED_CARD/DERIVED_PCI to
+# domain/bus/device/function order -- unlike the bus-00 exclusion, which
+# matches a substring and needs no assumption about domain width, this
+# lexical sort DOES assume every survivor's domain is padded to the same
+# width, the way sysfs actually presents it; two domains of different
+# widths would sort by string length before value and could misorder),
+# and set DERIVED_CARD/DERIVED_PCI to
 # the sysfs card path and PCI address of the IDX-th (zero-based) survivor.
 # Calls refuse() (exit 3) directly on any failure. Called directly, never
 # via a command substitution, so `set -e` applies to it exactly as it does
@@ -163,12 +176,13 @@ derive_card_for_selector() {
     local sorted_str=""
     if [ "${#entries[@]}" -gt 0 ]; then
         # Lexical sort on field 2 (the PCI address) is domain/bus/device/
-        # function order for the zero-padded dddd:bb:dd.f form; force
-        # LC_ALL=C so a non-C locale cannot reorder it. The explicit `if !`
-        # (not relying on mapfile's own status, which never sees a failure
-        # from inside a process substitution) is what makes a sort probe
-        # failure refuse() instead of silently yielding zero or partial
-        # candidates.
+        # function order for the zero-padded dddd:bb:dd.f form -- this
+        # assumes uniform domain width across survivors (see the docstring
+        # above); force LC_ALL=C so a non-C locale cannot reorder it. The
+        # explicit `if !` (not relying on mapfile's own status, which never
+        # sees a failure from inside a process substitution) is what makes
+        # a sort probe failure refuse() instead of silently yielding zero
+        # or partial candidates.
         if ! sorted_str="$(printf '%s\n' "${entries[@]}" | LC_ALL=C sort -t $'\t' -k2,2)"; then
             refuse "failed to sort discrete GPU candidates under $DRM_ROOT (sort probe error)"
         fi

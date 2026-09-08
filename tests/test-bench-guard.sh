@@ -15,11 +15,32 @@ T="$(mktemp -d)"; trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 fail=0
 skipped=0
 
+# mk_pci_dev DEVROOT PCI_ADDR [with_freq [throttle act_freq]] -- create a
+# fake sysfs PCI device directory DEVROOT/PCI_ADDR with vendor=0x8086 and
+# class=0x030000 (an Intel display controller, discrete or integrated
+# depending on PCI_ADDR). Pass "with_freq" as the third argument to also
+# populate a tile0/gt0/freq0/throttle/status + act_freq tree under it --
+# needed only for a device a test expects the guard to actually SELECT
+# and run against; skip it for an iGPU or any decoy the guard must
+# exclude/refuse before ever deriving FREQ from it. throttle/act_freq
+# (4th/5th args) default to 0/0. Used by every fixture builder in this
+# file, including mk_tree just below, so none of them can drift out of
+# sync with each other (llama.cpp-imns review round 4 finding Q13; the
+# mk_tree unification is review round 5 finding F7).
+mk_pci_dev() {
+    local devroot="$1" addr="$2" with_freq="${3:-}" throttle="${4:-0}" act_freq="${5:-0}"
+    mkdir -p "$devroot/$addr"
+    echo 0x8086 > "$devroot/$addr/vendor"
+    echo 0x030000 > "$devroot/$addr/class"
+    if [ -n "$with_freq" ]; then
+        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
+        echo "$throttle" > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
+        echo "$act_freq" > "$devroot/$addr/tile0/gt0/freq0/act_freq"
+    fi
+}
+
 mk_tree() { # $1=throttle $2=act_freq
-    local d="$T/sys/class/drm/card9/device/tile0/gt0/freq0"
-    mkdir -p "$d/throttle"
-    echo "$1" > "$d/throttle/status"
-    echo "$2" > "$d/act_freq"
+    mk_pci_dev "$T/sys/class/drm/card9" device with_freq "$1" "$2"
 }
 mk_meminfo() { printf 'MemAvailable: 190000000 kB\nShmem: %s kB\n' "$1" > "$T/meminfo"; }
 # run_guard <pgrep-cmd> [extra guard flags...] -- forwards anything after the
@@ -166,6 +187,14 @@ expect_status 0 "clean host must run with --budget set" -- \
 mk_tree 0 0; rm -f "$T/sys/class/drm/card9/device/tile0/gt0/freq0/act_freq"; mk_meminfo 3000000
 expect_status 3 "missing act_freq sysfs must refuse cleanly" -- run_guard "false"
 
+# A missing/unreadable --meminfo must refuse with a clear message, not die
+# on shmem_kb()'s bare `awk` raw exit status under `set -e` (llama.cpp-imns
+# review round 5, finding F9).
+mk_tree 0 0
+expect_status 3 "missing --meminfo must refuse cleanly" -- \
+    "$GUARD" --sysfs-card "$T/sys/class/drm/card9" --meminfo "$T/no-such-meminfo" \
+             --pgrep-cmd false --df-cmd true --max-wait 1 -- true
+
 # --journalctl-cmd is fakeable like every other probe: a fake command that
 # emits a "GT reset" line must stamp SUSPECT, even on an otherwise-clean run.
 mk_tree 0 0; mk_meminfo 3000000
@@ -185,28 +214,8 @@ head -1 "$T/run5.log" | grep -q "timeout-killed:rc=124" || { echo "FAIL: timeout
 
 # --- Live DRM/PCI derivation (llama.cpp-imns) ---
 #
-# mk_pci_dev DEVROOT PCI_ADDR [with_freq] -- create a fake sysfs PCI device
-# directory DEVROOT/PCI_ADDR with vendor=0x8086 and class=0x030000 (an
-# Intel display controller, discrete or integrated depending on PCI_ADDR).
-# Pass "with_freq" as the third argument to also populate a
-# tile0/gt0/freq0/throttle/status=0 + act_freq=0 tree under it -- needed
-# only for a device a test expects the guard to actually SELECT and run
-# against; skip it for an iGPU or any decoy the guard must exclude/refuse
-# before ever deriving FREQ from it. Used by every fixture builder below
-# so the near-identical inline blocks that used to build these by hand
-# cannot drift out of sync with each other (llama.cpp-imns review round 4,
-# finding Q13).
-mk_pci_dev() {
-    local devroot="$1" addr="$2" with_freq="${3:-}"
-    mkdir -p "$devroot/$addr"
-    echo 0x8086 > "$devroot/$addr/vendor"
-    echo 0x030000 > "$devroot/$addr/class"
-    if [ -n "$with_freq" ]; then
-        mkdir -p "$devroot/$addr/tile0/gt0/freq0/throttle"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/throttle/status"
-        echo 0 > "$devroot/$addr/tile0/gt0/freq0/act_freq"
-    fi
-}
+# mk_pci_dev is defined above, alongside mk_tree, which is also one of its
+# callers (llama.cpp-imns review round 5, finding F7).
 
 # Builds a fake --drm-root whose card-NUMBER order deliberately differs from
 # PCI-address order (card0 -> 09:00.0, card2 -> 04:00.0), includes an
@@ -284,7 +293,7 @@ out_nomatch="$("$GUARD" --pci 0000:99:99.9 --drm-root "$T/drmroot" --meminfo "$T
 echo "$out_nomatch" | grep -q "no DRM card for PCI 0000:99:99.9" \
     || { echo "FAIL: unmatched --pci refusal must name the PCI address (got: $out_nomatch)"; fail=1; }
 
-mkdir -p "$T/devices-igpu-only"
+rm -rf "$T/drmroot-igpu-only" "$T/devices-igpu-only"
 mk_pci_dev "$T/devices-igpu-only" 0000:00:02.0
 mkdir -p "$T/drmroot-igpu-only/card1"
 ln -s "$T/devices-igpu-only/0000:00:02.0" "$T/drmroot-igpu-only/card1/device"
@@ -327,7 +336,47 @@ head -1 "$T/run-domain-igpu.log" | grep -q "pci=0000:04:00.0" \
 out2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-domain-igpu" --meminfo "$T/meminfo" \
     --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc2=0 || rc2=$?
 [ "$rc2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the domain-0001 iGPU is excluded (only one discrete GPU), got rc=$rc2 (out: $out2)"; fail=1; }
-echo "$out2" | grep -q "0001:00:02.0" && { echo "FAIL: out-of-range refusal must not list the domain-0001 iGPU as a discrete GPU (got: $out2)"; fail=1; }
+# Explicit if/then/fi, not a bare "grep -q ... && { FAIL }" -- the latter
+# reads as though the FAIL block only runs when grep succeeds, which is
+# true here, but the form invites exactly the kind of ambiguity Q12 fixed
+# for a positive assertion; spelling out the conditional removes any doubt
+# for a negative one too (llama.cpp-imns review round 5, finding F6).
+if echo "$out2" | grep -q "0001:00:02.0"; then
+    echo "FAIL: out-of-range refusal must not list the domain-0001 iGPU as a discrete GPU (got: $out2)"
+    fail=1
+fi
+
+# The `*:00:*` widening (llama.cpp-imns review round 4, finding Q8) has no
+# RED-able coverage of its own: the domain-igpu fixture above uses
+# 0001:00:02.0, whose domain is still exactly 4 hex digits, so reverting
+# the pattern to the narrower `????:00:*` (each `?` matching exactly one
+# character) leaves that fixture's assertions unchanged and the suite
+# green. A domain of a DIFFERENT width is what actually distinguishes the
+# two patterns: `????:00:*` requires precisely 4 characters before the
+# first colon, so a 5-digit domain like 10000 fails to match it and would
+# wrongly survive as a second discrete GPU (llama.cpp-imns review round 5,
+# finding F1).
+mk_drmroot_wide_domain_igpu() {
+    local d="$T/drmroot-wide-domain-igpu" devroot="$T/devices-wide-domain-igpu"
+    rm -rf "$d" "$devroot"
+    mk_pci_dev "$devroot" 0000:04:00.0 with_freq
+    # Full throttle/act_freq sysfs here too, same reason as the
+    # 0001:00:02.0 fixture above: a wrongly-included card must be able to
+    # run all the way to VALID, not incidentally refuse for an unrelated
+    # reason, or a RED/GREEN distinction based on rc alone would be void.
+    mk_pci_dev "$devroot" 10000:00:02.0 with_freq
+    mkdir -p "$d/card0" "$d/card1"
+    ln -s "$devroot/0000:04:00.0" "$d/card0/device"
+    ln -s "$devroot/10000:00:02.0" "$d/card1/device"
+}
+mk_drmroot_wide_domain_igpu; mk_meminfo 3000000
+out_wide2="$(env ONEAPI_DEVICE_SELECTOR=level_zero:1 "$GUARD" --drm-root "$T/drmroot-wide-domain-igpu" --meminfo "$T/meminfo" \
+    --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc_wide2=0 || rc_wide2=$?
+[ "$rc_wide2" -eq 3 ] || { echo "FAIL: level_zero:1 must be out of range once the wide-domain iGPU (10000:00:02.0) is excluded, got rc=$rc_wide2 (out: $out_wide2)"; fail=1; }
+if echo "$out_wide2" | grep -q "10000:00:02.0"; then
+    echo "FAIL: out-of-range refusal must not list the wide-domain iGPU as a discrete GPU (got: $out_wide2)"
+    fail=1
+fi
 
 expect_status 3 "level_zero:0,1 must not derive a card even with --drm-root set" -- \
     env ONEAPI_DEVICE_SELECTOR=level_zero:0,1 "$GUARD" --drm-root "$T/drmroot" --meminfo "$T/meminfo" \
@@ -374,7 +423,37 @@ else
         --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
     chmod 644 "$T/devices-unreadable-vendor/0000:04:00.0/vendor"   # so the EXIT trap's rm -rf can clean it up
     [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/vendor file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
-    echo "$out" | grep -qi "not readable" || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
+    # The specific message text, not just "not readable" -- that phrase
+    # also appears in the device/class-unreadable and unreadable-device-
+    # directory refusals below, so a bare substring match would pass even
+    # if this refusal fired for the WRONG reason (llama.cpp-imns review
+    # round 5, finding F3).
+    echo "$out" | grep -q "device/vendor exists but is not readable" \
+        || { echo "FAIL: unreadable-vendor refusal must name the problem (got: $out)"; fail=1; }
+fi
+
+# An EXISTING but UNREADABLE device/class file must also refuse loudly,
+# mirroring the device/vendor case above -- bench-guard.sh checks class
+# readability as a separate `if` (derive_card_for_selector), so it needs
+# its own test rather than being implied by the vendor coverage
+# (llama.cpp-imns review round 5, finding F4). Own private device root,
+# same two-card shape, same root-skip.
+if [ "$(id -u)" -eq 0 ]; then
+    skip_as_root "unreadable-class-file case"
+else
+    rm -rf "$T/drmroot-unreadable-class" "$T/devices-unreadable-class"
+    mk_pci_dev "$T/devices-unreadable-class" 0000:04:00.0
+    chmod 000 "$T/devices-unreadable-class/0000:04:00.0/class"
+    mk_pci_dev "$T/devices-unreadable-class" 0000:09:00.0 with_freq
+    mkdir -p "$T/drmroot-unreadable-class/card0" "$T/drmroot-unreadable-class/card1"
+    ln -s "$T/devices-unreadable-class/0000:04:00.0" "$T/drmroot-unreadable-class/card0/device"
+    ln -s "$T/devices-unreadable-class/0000:09:00.0" "$T/drmroot-unreadable-class/card1/device"
+    out="$(env ONEAPI_DEVICE_SELECTOR=level_zero:0 "$GUARD" --drm-root "$T/drmroot-unreadable-class" --meminfo "$T/meminfo" \
+        --pgrep-cmd false --df-cmd true --max-wait 1 -- true 2>&1)" && rc=0 || rc=$?
+    chmod 644 "$T/devices-unreadable-class/0000:04:00.0/class"   # so the EXIT trap's rm -rf can clean it up
+    [ "$rc" -eq 3 ] || { echo "FAIL: an unreadable device/class file must refuse with exit 3, got $rc (out: $out)"; fail=1; }
+    echo "$out" | grep -q "device/class exists but is not readable" \
+        || { echo "FAIL: unreadable-class refusal must name the problem (got: $out)"; fail=1; }
 fi
 
 # An unreadable/unsearchable device DIRECTORY (chmod 000 on the resolved
@@ -392,9 +471,13 @@ if [ "$(id -u)" -eq 0 ]; then
     skip_as_root "unreadable-device-dir case"
 else
     rm -rf "$T/drmroot-unreadable-devdir" "$T/devices-unreadable-devdir"
+    # Build BOTH devices first, then chmod the target one -- not
+    # interleaved -- so the fixture's construction order can't accidentally
+    # depend on chmod 000 having already been applied when the second
+    # mk_pci_dev call runs (llama.cpp-imns review round 5, finding F8).
     mk_pci_dev "$T/devices-unreadable-devdir" 0000:04:00.0
-    chmod 000 "$T/devices-unreadable-devdir/0000:04:00.0"
     mk_pci_dev "$T/devices-unreadable-devdir" 0000:09:00.0 with_freq
+    chmod 000 "$T/devices-unreadable-devdir/0000:04:00.0"
     mkdir -p "$T/drmroot-unreadable-devdir/card0" "$T/drmroot-unreadable-devdir/card1"
     ln -s "$T/devices-unreadable-devdir/0000:04:00.0" "$T/drmroot-unreadable-devdir/card0/device"
     ln -s "$T/devices-unreadable-devdir/0000:09:00.0" "$T/drmroot-unreadable-devdir/card1/device"
