@@ -1,0 +1,15 @@
+# L3 prefill scaling gate, 2026-09-07 20:44 EDT, master 0d8b160c5 (binaries built at 6e54ba2eb), frozen scripts sycl-prefill-scaling.sh@d7bf48a19 + bench-guard.sh@42184389d, models /Storage/GenAI/models, load ~17, kernel-fault-lines-during-gate=0
+# command: sycl-prefill-scaling.sh --models-dir /Storage/GenAI/models --budget 1500  (llama-bench -p 128,512,1024,2048 -n 0 -r 2 per pair, each run bench-guard VALID)
+model                card        pp128      pp512     pp1024     pp2048  ratio1024   intercept_ms status
+Mistral 7B Q4_0      B70       1220.01    3217.23    2906.69    2816.19 ratio1024=0.903 intercept_ms=86.8 PASS
+Mistral 7B Q4_0      B50        478.81    1329.95    1265.53    1210.46 ratio1024=0.952 intercept_ms=228.1 PASS
+GPT-OSS 20B MXFP4    B70        586.64    1653.30    1557.09    1521.73 ratio1024=0.942 intercept_ms=187.7 PASS
+GPT-OSS 20B MXFP4    B50        293.15     852.38     840.70     811.37 ratio1024=0.986 intercept_ms=382.0 PASS
+gemma4 E4B           B70       1354.63    3250.24    2867.69    2635.89 ratio1024=0.882 intercept_ms=73.5 FAIL(ratio1024<0.9)
+gemma4 E4B           B50        674.11    1636.45    1534.87    1448.94 ratio1024=0.938 intercept_ms=148.9 PASS
+# exit rc=1
+# B70 resample (--only gemma4,b70 --only mistral,b70, two passes, 20:50):
+# run1: Mistral 7B Q4_0 B70 1322.28 3317.04 3096.16 2953.97 ratio1024=0.933 intercept_ms=77.6 PASS
+# run1: gemma4 E4B B70 1365.92 3257.49 2850.15 2645.39 ratio1024=0.875 intercept_ms=72.6 FAIL
+# run2: Mistral 7B Q4_0 B70 1321.21 3336.43 3104.29 2957.27 ratio1024=0.930 intercept_ms=78.0 PASS
+# run2: gemma4 E4B B70 1342.75 3217.36 2882.64 2624.80 ratio1024=0.896 intercept_ms=74.1 FAIL

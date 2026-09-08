@@ -144,7 +144,88 @@ Each rule below cost a round of discarded measurements.
 
 ---
 
-## 2026-09-04 snapshot — master `2c2570fe3`, driver 26.31 (NOT bench-guard VALID; not gates)
+## Long-Prompt Baselines (pp2048 / pp8192) — 2026-09-07, master `0d8b160c5`, driver 26.31, bench-guard VALID
+
+Added under llama.cpp-bn5k item 3 (plan task L4, run as llama.cpp-2egq). The vLLM
+comparison (llama.cpp-wm4j c-dpug) showed the attention gap grows 2.4x → 15.3x from
+pp128 → pp2048, so the pp512-only gates above understate attention wins and regressions
+at realistic prompt lengths; the 2026-09-04 snapshot below showed the same thing from
+the other side (a prefill collapse past one ubatch that pp512 could not see).
+
+**Protocol.** Five separate `llama-bench -m <model> -p <N> -n 128 -fa 1 -r 5 -v`
+PROCESSES per cell, each behind `scripts/bench-guard.sh --log` (all stamped `VALID`),
+round-robin over cells so a cell's five samples are spread over ~40 minutes; the
+figure is the mean ± sample sd ACROSS processes (the in-process `±` is ignored).
+Binaries built at `6e54ba2eb` (the SYCL backend is unchanged through `0d8b160c5`);
+models read from the byte-identical NFS copies under `/Storage/GenAI/models`
+(`/models` was mid-migration); ambient load ~17; B70 free VRAM 30553 MiB and B50
+14618 MiB on every run. `ctx achieved` is the `llama_context: n_ctx` the pp8192 test
+actually ran with (llama-bench sizes it per test). Table produced by
+`python3 scripts/parse-sycl-bench-matrix.py --matrix long-prompt --dir artifacts/perf-6ae16115c-longprompt --table --partial-arm "b50-mistral-pp8192=GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf"`
+from the archived logs, never by hand.
+
+| card | model | PP2048 | TG128 | PP8192 | TG128 | ctx achieved | notes |
+|---|---|---|---|---|---|---|---|
+| B70 | Mistral 7B Q4_0 | 2859.24 ± 54.97 | 109.70 ± 2.11 | 1555.38 ± 48.27 | 110.36 ± 2.63 | 8192 | - |
+| B70 | GPT-OSS 20B MXFP4 | 1544.44 ± 43.28 | 48.40 ± 9.68 | 1262.05 ± 25.68 | 49.60 ± 7.52 | 8192 | tg bimodal, see note 2 |
+| B70 | gemma4 E4B Q8_0 | 2533.00 ± 106.25 | 75.26 ± 1.27 | 1948.32 ± 69.98 | 75.63 ± 1.57 | 8192 | first process fastest, note 3 |
+| B50 | Mistral 7B Q4_0 | 1229.01 ± 8.17 | 47.01 ± 0.43 | 804.16 (n=1, GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf) | 46.56 (n=1, GPU CAT error on 2 of 3 attempts, llama.cpp-0oxf) | 8192 | note 1 |
+| B50 | GPT-OSS 20B MXFP4 | 799.69 ± 9.45 | 36.16 ± 2.21 | 653.61 ± 6.74 | 37.08 ± 1.44 | 8192 | - |
+| B50 | gemma4 E4B Q8_0 | 1372.74 ± 91.87 | 35.37 ± 0.28 | 1047.87 ± 8.97 | 35.46 ± 0.32 | 8192 | pp2048 sample 1 = 1210 (in-process ± 453), note 3 |
+
+These are **report-only rows, not gates**: no floor or band is declared for the
+long-prompt matrix until the owner rules on one (CLAUDE.md: a new guardrail is an
+owner decision). The parser refuses (exit 2, nothing on stdout) on any missing or
+short arm, so a future run cannot silently drop a cell.
+
+Notes:
+
+1. **B50 Mistral pp8192 is a partial cell (n=1).** The one sample passed before the
+   2026-09-07 20:02 reboot; after it the same command faulted on 2 of 2 attempts with
+   `xe 0000:09:00.0: Engine memory CAT error class=ccs` + engine reset, then
+   `UR_RESULT_ERROR_OUT_OF_RESOURCES` and (once) a segfault. Tracked as
+   **llama.cpp-0oxf (P1)**; the faulted log is kept as
+   `artifacts/perf-6ae16115c-longprompt/b50-mistral-pp8192-2.log.FAULT`. The card
+   recovered without a reboot (Mistral gate correct afterwards) and every other B50
+   run's own kernel-log window was fault-free.
+2. **B70 GPT-OSS tg128 is bimodal** (39-42 vs 57-59 across the five processes, sd 9.7):
+   the host-CPU-contention slow mode documented in the snapshot below and
+   llama.cpp-gvu7, not a regression; the pp columns are unaffected (sd 2-3 %).
+3. **The first process of a card's session runs faster** on gemma4 B70 (2713 vs
+   2437-2519 pp2048) — thermal steady state, which is why five processes are required.
+   The B50 gemma4 pp2048 outlier (1210, in-process ± 453) is one slow rep in the first
+   process; samples 2-5 sit at 1404-1435 (sd 13).
+4. **bench-guard's kernel-fault stamp was blind during this campaign**
+   (llama.cpp-m1ny: its `grep -q` check is SIGPIPE fail-open); every run's journal
+   window was therefore checked independently by the driver and the only fault lines
+   on the boot are the three windows around note 1.
+
+**Prefill scaling on the same tree** (plan task L3 gate, `scripts/sycl-prefill-scaling.sh
+--models-dir /Storage/GenAI/models`; `llama-bench -p 128,512,1024,2048 -n 0 -r 2` per
+pair, guard-VALID, no kernel faults; full output in
+`artifacts/perf-6ae16115c-longprompt/l3-prefill-gate.txt`):
+
+| model | card | pp128 | pp512 | pp1024 | pp2048 | ratio1024 | intercept_ms | status |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Mistral 7B Q4_0 | B70 | 1220.01 | 3217.23 | 2906.69 | 2816.19 | 0.903 | 86.8 | PASS |
+| Mistral 7B Q4_0 | B50 | 478.81 | 1329.95 | 1265.53 | 1210.46 | 0.952 | 228.1 | PASS |
+| GPT-OSS 20B MXFP4 | B70 | 586.64 | 1653.30 | 1557.09 | 1521.73 | 0.942 | 187.7 | PASS |
+| GPT-OSS 20B MXFP4 | B50 | 293.15 | 852.38 | 840.70 | 811.37 | 0.986 | 382.0 | PASS |
+| gemma4 E4B Q8_0 | B70 | 1354.63 | 3250.24 | 2867.69 | 2635.89 | 0.882 | 73.5 | FAIL (< 0.9) |
+| gemma4 E4B Q8_0 | B50 | 674.11 | 1636.45 | 1534.87 | 1448.94 | 0.938 | 148.9 | PASS |
+
+The collapse in the snapshot below (pp1024/pp512 of 0.30-0.69) is gone after L2/L2b
+(llama.cpp-dfo0 steps 1-2, llama.cpp-h9uv): five of six pairs are at or above the 0.9
+floor. gemma4 on the B70 is reproducibly 0.875-0.896 (three runs), 1-3 points under it,
+and the per-decode fixed cost (the `intercept_ms` column: ~75-90 ms B70 dense, ~190 ms
+B70 MoE, 150-380 ms B50) is the residual the gate records; both stay open on
+**llama.cpp-dfo0**. Repeated single runs of the B70 ratio move by ±3 points
+(Mistral 0.903 / 0.933 / 0.930), so treat a one-run ratio near 0.9 as a coin toss and
+re-run before calling a regression.
+
+---
+
+## 2026-09-04 snapshot — master `2c2570fe3`, driver 26.31 (NOT bench-guard VALID; not gates; SUPERSEDED 2026-09-07 by the Long-Prompt Baselines section above, kept as history)
 
 Taken after the llama.cpp-pktr / llama.cpp-6cgq merges, on the rebuilt master in the main
 checkout. **These rows are orientation, not baselines**, and the reason is recorded rather than
@@ -193,6 +274,10 @@ Two things this snapshot established that the gate tables above cannot show:
    is not a prefill profile. The per-ubatch cost is unattributed; tracked as **llama.cpp-dfo0
    (P1)**. Until it lands, any prefill claim must carry a pp1024 or pp2048 point; the
    long-prompt table planned under llama.cpp-bn5k item 3 (pp2048 / pp8192) is still owed.
+   **Resolved 2026-09-07:** the collapse is gone after L2/L2b (see the Long-Prompt Baselines
+   section above: five of six pairs at or above the 0.9 pp1024/pp512 floor, gemma4 B70 at
+   0.88, per-decode intercept ~75-90 ms B70); the long-prompt table is in that section; the
+   residual stays on llama.cpp-dfo0.
 
 ---
 
