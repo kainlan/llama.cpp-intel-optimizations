@@ -190,7 +190,9 @@ Notes:
    2026-09-07 20:02 reboot; after it the same command faulted on 2 of 2 attempts with
    `xe 0000:09:00.0: Engine memory CAT error class=ccs` + engine reset, then
    `UR_RESULT_ERROR_OUT_OF_RESOURCES` and (once) a segfault. Tracked as
-   **llama.cpp-0oxf (P1)**; both faulted logs are kept as
+   **llama.cpp-0oxf (P1) — fixed and merged as `ee3c0c9e3`.** This cell must
+   still be re-measured on a post-fix build before it stops being partial;
+   both faulted logs are kept as
    `artifacts/perf-6ae16115c-longprompt/b50-mistral-pp8192-2-first-attempt.log.FAULT`
    (the segfaulting first attempt, with its RssAnon sidecar) and
    `b50-mistral-pp8192-2.log.FAULT` (the retry). The card

@@ -1184,6 +1184,8 @@ six-pair table and the L4 long-prompt baselines, on master `0d8b160c5` (binaries
   and refused every run because the cards moved to 04:00.0/09:00.0 at the 2026-09-05 boot
   (llama.cpp-imns: live DRM/PCI derivation; CLAUDE.md table corrected in 8f858e763); its
   kernel-fault stamp is SIGPIPE fail-open and stamped a faulted run VALID (llama.cpp-m1ny,
-  open, P1; the driver checked each run's journal window independently);
+  merged as `845584f40`; the driver checked each run's journal window independently);
   `sycl-prefill-scaling.sh` hardcoded `/models` (llama.cpp-5iba: `--models-dir` override);
-  two more stale PCI tables in sibling scripts (llama.cpp-o4fs, open).
+  two more stale PCI tables in sibling scripts (llama.cpp-o4fs, merged as `c19c11e52`).
+  Separately, llama.cpp-0oxf (bound and pool the oneDNN Graph-scratch DIRECT path) merged
+  as `ee3c0c9e3`, with follow-ups tracked as llama.cpp-c6ah/o3a0/oyfl.
