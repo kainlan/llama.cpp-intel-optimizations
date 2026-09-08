@@ -10283,9 +10283,9 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
     // for the full mechanism this backs.
     // Latched (log once), same shape as onednn_graph_scratch_first_wait_logged_
     // above: without this, a workload that repeatedly hits a genuine
-    // timed-out wait (the poll loop below expires without the request ever
-    // fitting) would log this ERROR once per SDPA call instead of once per
-    // process.
+    // timed-out wait (the poll loop in the callee above expires without the
+    // request ever fitting) would log this ERROR once per SDPA call instead
+    // of once per process.
     //
     // `was_oversized`: the callee returns false for TWO distinct reasons --
     // the size>cap early-out (which already logged its own WARN above) or a

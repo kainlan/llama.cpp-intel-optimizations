@@ -220,7 +220,7 @@ if ! sycl_preflight_selector_may_use_b50 "level_zero:1"; then
     fail=1
 fi
 
-# --- llama.cpp-pqgl F1 positive control: SIGPIPE fail-open under this
+# --- llama.cpp-pqgl positive control: SIGPIPE fail-open under this
 # file's own `set -o pipefail` (see the top of this file). The old form was
 # `journalctl -k -b [-1] --no-pager 2>/dev/null | grep -Eiq '<patterns>'`.
 # `grep -q` exits at the FIRST match without draining the rest of its
@@ -264,7 +264,7 @@ if ! sycl_preflight_journal_has_previous_boot_gpu_faults; then
 fi
 unset -f journalctl
 
-# --- companion checks so the F1 fix's capture-then-grep-c rewrite didn't
+# --- companion checks so the llama.cpp-pqgl fix's capture-then-grep-c rewrite didn't
 # flip either function's polarity: a genuinely clean journal must still
 # read as "no fault", and a journalctl that cannot be found must still
 # reach the pre-existing documented "no fault" fail-open (see

@@ -305,15 +305,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["DIRECT body's own re-check precedes its own fresh allocation"] = (
         direct_probe_pos != -1 and direct_alloc_pos != -1 and direct_probe_pos < direct_alloc_pos
     )
-    # llama.cpp-pqgl: the size>cap early-out must run AFTER the eviction
-    # sweep, not before it -- an earlier version of this fix returned
-    # before ever calling the sweep for an oversized request,
-    # which skips a real VRAM release (the sweep evicts event-complete
-    # pooled entries unconditionally, even for a request it can never make
-    # fit) right before the caller's fresh unified_alloc(). Ordering, not
-    # just presence, mirrors the pool-before-fresh-allocation checks above:
-    # a presence-only check would still pass if the early-out moved back
-    # ahead of the sweep.
+    # llama.cpp-pqgl: the size>cap early-out must run AFTER the eviction sweep,
+    # not before it -- an earlier version of this fix returned before ever
+    # calling the sweep for an oversized request, which skips a real VRAM
+    # release (the sweep evicts event-complete pooled entries unconditionally,
+    # even for a request it can never make fit) right before the caller's
+    # fresh unified_alloc(). Ordering, not just presence, mirrors the
+    # pool-before-fresh-allocation checks above: a presence-only check would
+    # still pass if the early-out moved back ahead of the sweep.
     wait_headroom_code = strip_literals(WAIT_HEADROOM_BODY_CODE)
     evict_sweep_pos = wait_headroom_code.find("onednn_graph_scratch_evict_pool_until_fits_locked(")
     size_cap_match = re.search(r"size\s*>\s*cap", wait_headroom_code)

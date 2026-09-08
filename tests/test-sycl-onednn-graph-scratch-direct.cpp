@@ -161,14 +161,17 @@ void check(bool ok, const char * what) {
 
 std::string g_captured_log;
 
-// A level TAG is prefixed onto each new (non-continuation) line so a check
-// can assert not just that some text was logged, but that it was logged AT
-// a specific level -- e.g. distinguishing the oversized-request WARN from
-// what would otherwise be an indistinguishable-by-text ERROR (llama.cpp-pqgl
-// review: capturing text alone made a WARN-vs-ERROR downgrade unverifiable).
-// GGML_LOG_LEVEL_CONT (a continuation of the previous log call) gets no
-// fresh tag, so a message split across multiple callback invocations still
-// reads as one tagged line rather than being interrupted mid-sentence.
+// A level TAG ("[ERROR] " / "[WARN] ") is prefixed onto each new
+// (non-continuation) ERROR or WARN line so a check can assert not just that
+// some text was logged, but that it was logged AT that specific level --
+// e.g. distinguishing the oversized-request WARN from what would otherwise
+// be an indistinguishable-by-text ERROR (llama.cpp-pqgl: capturing text
+// alone made a WARN-vs-ERROR downgrade unverifiable). INFO and DEBUG lines
+// are captured with no tag at all -- no check in this file needs to tell
+// them apart from each other. GGML_LOG_LEVEL_CONT (a continuation of the
+// previous log call) also gets no fresh tag, so a message split across
+// multiple callback invocations still reads as one tagged line rather than
+// being interrupted mid-sentence.
 void capture_log(enum ggml_log_level level, const char * text, void * user_data) {
     GGML_UNUSED(user_data);
     if (text != nullptr) {
@@ -523,13 +526,27 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // "was instantaneous".
     check(elapsed.count() < 4000, "the allocation returned well under the 5 s poll-loop timeout");
     printf("    (elapsed=%lld ms)\n", static_cast<long long>(elapsed.count()));
-    check(contains(g_captured_log, "[WARN] ") && contains(g_captured_log, "exceeds the") &&
+    // Adjacency, not three independent substring searches: the "[WARN] " tag
+    // is prepended immediately before the message text (capture_log above),
+    // and GGML_LOG_WARN emits the whole line in one callback, so the tag and
+    // the message start are always contiguous when this really was logged
+    // at WARN -- a check that only searched for "[WARN] " and the message
+    // text independently could pass on an unrelated WARN elsewhere plus an
+    // ERROR carrying this text, which is exactly the confusion this check
+    // exists to rule out.
+    check(contains(g_captured_log, "[WARN] [UNIFIED-CACHE] oneDNN Graph scratch DIRECT path: requested") &&
               contains(g_captured_log, "cap by itself"),
           "the latched oversized-request WARN was logged, and at WARN level (not ERROR)");
-    // R4: the caller (onednn_graph_scratch_alloc_direct_locked) must NOT
-    // also log its own "gave up waiting for headroom" ERROR for this call --
-    // that message describes a genuine timed-out wait, and this call never
-    // waited at all, having returned via the early-out instead.
+    // llama.cpp-pqgl: the caller (onednn_graph_scratch_alloc_direct_locked)
+    // must NOT also log its own "gave up waiting for headroom" ERROR for
+    // this call -- that message describes a genuine timed-out wait, and
+    // this call never waited at all, having returned via the early-out
+    // instead. This binds only while
+    // onednn_graph_scratch_gave_up_waiting_logged_ has not already latched
+    // from an earlier genuine timeout elsewhere in this process (no test in
+    // this file triggers one) -- otherwise the message would stay silent
+    // regardless of whether this call's own early-out guard still exists,
+    // and this check would pass vacuously.
     check(!contains(g_captured_log, "gave up waiting for headroom"),
           "the caller did not log its timed-out-wait ERROR for a call that never waited");
 
