@@ -1823,6 +1823,73 @@ case to `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`. **Do not raise the
 estimate back to `any_tensor` to silence it** — persistent growth is worse than
 the original over-provision, but so is reinstating it.
 
+### A non-tensor consumer: the non-FA batched mul_mat scratch floor
+
+Every consumer above sizes from a maximum over the *tensor inventory* —
+`zone_scoped_maxima()`'s classifier groups tensors by `(type, ne)`. The
+non-flash-attention batched mul_mat scratch demand
+(`unified_cache_nonfa_attn_scratch_demand_bytes()`, llama.cpp-oyfl) is
+**not** that kind of consumer: nothing it needs is a weight tensor. When
+flash attention is off, each layer's attention runs through
+`ggml_sycl_mul_mat_batched_sycl()` (`ggml-sycl.cpp`) twice — KQ =
+`mul_mat(K, Q)`, then KQV = `mul_mat(V, softmax(KQ))` — and both calls stage
+their non-f16 operand into an f16 buffer via `scoped_unified_queue_temp`, a
+COMPUTE-role transient that *prefers* the SCRATCH zone
+(`ggml_sycl_transient_device_intent()`, `common.hpp`). The KQV call's staged
+operand is `kq_soft_max`, shaped `[n_kv, n_ubatch, n_head]` — at long context
+this dwarfs the KQ call's staged Q operand — so the formula keeps only that
+term:
+
+```
+demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3 / 2
+```
+
+**Rule for adding a consumer, extended:** when the demand scales with
+*runtime shape* rather than any tensor's byte size, do not force it through
+`zone_tensor_desc`/`zone_scoped_maxima` — follow the pattern this consumer's
+sibling, `onednn_graph_scratch_zone_floor_bytes()`, already established: a
+free function taking the shape directly (`n_head`, `n_ubatch`, `n_ctx`),
+fed by a `unified_cache_set_planned_*_shape()`/`get_planned_*_shape()` pair
+of atomics (one triplet per consumer — the non-FA one is **not** a reuse of
+the oneDNN triplet, because it is unconditional while the oneDNN one is
+gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
+right where `plan.planner_n_head/n_ubatch/n_ctx` are already known.
+
+**The c=3/2 concurrency factor is carried over by analogy, not
+independently measured.** The oneDNN floor's own c=1.5 came from five real
+captures (llama.cpp-0oxf, comment c-xcop) showing ~5 SDPA scratch buffers
+concurrently in flight even on an idle host, because
+`scoped_unified_queue_temp::release()` submits a marker event and retains
+the handle until it completes rather than freeing synchronously. The non-FA
+consumer shares that exact release mechanism, so a nonzero concurrency
+factor is the right shape of correction — but no GPU access was available
+when this was authored, so treat
+`unified_cache_nonfa_attn_scratch_demand_bytes()` as a starting floor to
+tighten from a real capture, not a validated constant, the same caveat the
+oneDNN floor's own doc comment carries for its window-aware refinement
+(gemma4, tracked llama.cpp-o3a0).
+
+**Where this can and cannot help.** Like every zone above, the SCRATCH zone
+is sized once, before the arena's single physical chunk is allocated at
+model load — raising it later cannot resize that chunk.
+`ensure_planned_arena_zones()` raises `scratch_zone` from this formula the
+same way it raises `onednn_zone` and `runtime_zone` from theirs, but at
+model-load time the envelope's
+`flash_attn_type` is always `AUTO` (`llama-model.cpp` hardcodes it) and
+`plan.planner_n_ctx` is the load-time conservative default, not the context
+a later `llama_new_context_with_model()` will actually request
+(llama.cpp-fkpg) — so this plan-time raise is defense in depth, not the
+fix. The authoritative check is in
+`ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`), which runs once
+the REAL `n_ctx`/`n_ubatch` and the caller's resolved `flash_attn_enabled`
+(threaded from `llama-context.cpp`'s `cparams.flash_attn`) are known: it
+compares the demand against `zone_capacity(vram_zone_id::SCRATCH)` — the
+zone's actual reserved size, fixed since arena reservation — and refuses the
+context update (same style, same call site, as the pre-existing KV budget
+refusal) rather than let `ggml_sycl_mul_mat_batched_sycl()`'s fallback ladder
+abort mid-prefill with `GGML_ABORT("batched F16 mul_mat failed — no
+recovery path available.")`.
+
 ### Known limits (load-bearing — read before changing any of this)
 
 1. **The ONEDNN scratchpad's two halves are in different units, deliberately.**
