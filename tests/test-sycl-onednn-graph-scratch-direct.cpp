@@ -710,16 +710,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     // eviction sweep observes that) for long enough that the request below
     // is guaranteed to observe the cap and enter the wait loop, rather than
     // racing a fast release.
-    slow_release_result slow_release = submit_slow_release(q);
-    // llama.cpp-c6ah (finding 29): identity check, test side -- prints the
-    // address of slow_release.release_event itself (the object the pointer
-    // handed to onednn_graph_scratch_free() below actually points at), to
-    // compare against the `event` pointer address onednn_graph_scratch_free()
-    // logs on its own side (hooks-gated, same [c6ah-f29] tag) for the SAME
-    // call. The two addresses trivially must match (this is a plain
-    // pointer, not a copy), but this is cheap and rules that class of
-    // confusion out explicitly rather than leaving it assumed.
-    printf("    (identity: &slow_release.release_event=%p)\n", static_cast<void *>(&slow_release.release_event));
+    slow_release_result slow_release    = submit_slow_release(q);
     // llama.cpp-c6ah (finding 31): the free() call itself must return fast
     // -- this is the exact regression finding 31 caught: the earlier
     // host_task-based watcher design (finding 28) made SUBMITTING the
@@ -746,71 +737,16 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeA,
           "onednn_graph_scratch_pool_peak_bytes() reflects ptr1 sitting in the pool");
 
-    // llama.cpp-c6ah (finding 28, extended finding 29): instrumentation
-    // only -- onednn_graph_scratch_pool_entry_flag_true_for_test() reads
-    // ptr1's own completion flag directly (gated the same way as every
-    // other hook, a no-op unless GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1)
-    // without an alloc()/free() round trip that would itself consume or
-    // re-park the entry being observed. Polls up to 2.5 s (comfortably
-    // above kSlowReleaseMs's 1500 ms target plus the watcher's own async
-    // dispatch latency).
-    //
-    // llama.cpp-c6ah (finding 29, resolved by finding 31): at the FIRST
-    // true reading (t_flag), this ALSO waits on the underlying SYCL event
-    // itself and times that (t_wait), originally to discriminate two
-    // candidate causes of a suspiciously early t_flag reported by the c6ah
-    // GPU run 10 report: t_wait close to the kernel's target would mean
-    // the (then host_task-based) watcher genuinely ran ahead of its own
-    // dependency completing; t_wait close to zero would mean the event
-    // handed to onednn_graph_scratch_free() was already complete at park
-    // time (an identity bug). Both readings came back ~0 ms on both cards
-    // (build-c6ah-12) with the identity hash confirmed equal -- and
-    // finding 31 traced the real cause to neither candidate: submitting a
-    // host_task whose depends_on() names a cross-queue event blocks the
-    // SUBMITTING thread until that event completes, so by the time
-    // anything downstream could observe the watcher firing or query the
-    // event, the kernel really was already done. This block is kept
-    // (mechanism updated to the marker-kernel design that replaced the
-    // host_task watcher) as a standing diagnostic, not because the
-    // question it was built to answer is still open -- see the
-    // [c6ah-f29] identity log onednn_graph_scratch_free() itself prints,
-    // and this test's own "&slow_release.release_event=" print just above
-    // the free() call, for the identity half of that evidence.
-    // wait_and_throw() here is safe regardless of which outcome holds: if
-    // t_flag is already this early, onednn_graph_scratch_pool_entry_release_complete()
-    // already treats the entry as complete for every OTHER caller too
-    // (including the kSizeB request just below), so this block does not
-    // create a new race -- it only makes an already-occurring outcome
-    // explicit and diagnosable instead of silent. actual_kernel_duration_ms()
-    // is safe to call afterward because wait_and_throw() guarantees the
-    // command has finished by then, regardless of what the flag said.
-    {
-        const auto flag_poll_start    = std::chrono::steady_clock::now();
-        const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
-        long long  t_flag_ms          = -1;
-        while (std::chrono::steady_clock::now() < flag_poll_deadline) {
-            if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeA)) {
-                t_flag_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                                  flag_poll_start)
-                                .count();
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (t_flag_ms >= 0) {
-            const auto wait_start = std::chrono::steady_clock::now();
-            slow_release.release_event.wait_and_throw();
-            const long long t_wait_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start)
-                    .count();
-            printf(
-                "    (flag poll: t_flag=%lld ms, t_wait=%lld ms, actual kernel duration=%lld ms, kernel "
-                "target=%lld ms)\n",
-                t_flag_ms, t_wait_ms, actual_kernel_duration_ms(slow_release.release_event), slow_release.duration_ms);
-        } else {
-            printf("    (flag poll: never read true within 2.5 s, kernel target=%lld ms)\n", slow_release.duration_ms);
-        }
-    }
+    // llama.cpp-c6ah (finding 32): the finding-29 t_flag/t_wait diagnostic
+    // that used to live here was moved to its own standalone sub-test,
+    // test_flag_timing_diagnostic() -- see that function's own comment.
+    // Running it here (between the park just above and the timed kSizeB
+    // request just below) consumed the ~1500 ms delay this test's own
+    // cap-wait bound depends on measuring: build-c6ah-15 showed the pre-
+    // wait eviction sweep observing ptr1 already complete (the diagnostic
+    // had already polled the flag AND waited on the event before the timed
+    // request even started) and evicting it in 3-4 ms with zero cap waits,
+    // making the bound below vacuous.
 
     // kSizeB, not kSizeA: an exact-size request would be served by the pool
     // reuse path tested above WITHOUT ever reaching the cap check at all,
@@ -1746,6 +1682,85 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 
+// llama.cpp-c6ah (finding 32): standalone t_flag/t_wait diagnostic, moved
+// out of test_bounded_eviction() (finding 29's original home for it) after
+// build-c6ah-15 showed running it there consumed the ~1500 ms delay that
+// test's own cap-wait bound depends on measuring -- the pre-wait eviction
+// sweep observed ptr1 already complete (this diagnostic's own poll+wait
+// had already let the kernel finish before the timed request even
+// started) and evicted it in 3-4 ms with zero cap waits, making that
+// bound vacuous. The mechanism itself is confirmed understood
+// (build-c6ah-15, both cards): t_flag lands just after the kernel's own
+// actual duration (B50: t_flag=1533 ms vs actual=1515 ms; B70: 1527 ms vs
+// 1516 ms) and t_wait taken right after t_flag reads ~0 ms, so this
+// function keeps the measurement available as a standing, assertion-free
+// diagnostic (beyond the one bound every slow-release test in this file
+// already applies to its own free() call) rather than dropping it
+// entirely. Deliberately called LAST in main(), after every other test's
+// own teardown reclaim, so nothing it does here can perturb another
+// test's own timing the way its old placement did.
+void test_flag_timing_diagnostic(unified_cache * cache, int device) {
+    printf("Flag timing diagnostic (finding 32):\n");
+
+    sycl::queue & q = cache->get_queue();
+
+    // Leading reclaim -- order-independence insurance, same rationale as
+    // every other test in this file that reuses a size (here, kSizeA)
+    // another test also uses.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (flag timing diagnostic)");
+
+    void * ptr = cache->onednn_graph_scratch_alloc(kSizeA, 256, &q);
+    check(ptr != nullptr, "DIRECT allocation for the flag timing diagnostic succeeds");
+    if (!ptr) {
+        return;
+    }
+
+    slow_release_result slow_release    = submit_slow_release(q);
+    // Same bound every other slow-release park in this file applies (see
+    // test_bounded_eviction()'s own comment for the full history) -- kept
+    // here too since this is the last place in the binary that parks a
+    // slow-release event, so it is also the last chance to catch a
+    // regression back to a blocking arm.
+    const auto          free_call_start = std::chrono::steady_clock::now();
+    cache->onednn_graph_scratch_free(ptr, &slow_release.release_event);
+    const long long free_call_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - free_call_start)
+            .count();
+    printf("    (onednn_graph_scratch_free() itself returned in %lld ms, release duration (calibrated)=%lld ms)\n",
+           free_call_ms, slow_release.duration_ms);
+    check(free_call_ms < slow_release.duration_ms / 3,
+          "onednn_graph_scratch_free() itself returned in well under a third of the release delay -- arming the "
+          "completion flag did not block the park call");
+
+    const auto flag_poll_start    = std::chrono::steady_clock::now();
+    const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
+    long long  t_flag_ms          = -1;
+    while (std::chrono::steady_clock::now() < flag_poll_deadline) {
+        if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeA)) {
+            t_flag_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                              flag_poll_start)
+                            .count();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (t_flag_ms >= 0) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        slow_release.release_event.wait_and_throw();
+        const long long t_wait_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start)
+                .count();
+        printf(
+            "    (flag poll: t_flag=%lld ms, t_wait=%lld ms, actual kernel duration=%lld ms, kernel "
+            "target=%lld ms)\n",
+            t_flag_ms, t_wait_ms, actual_kernel_duration_ms(slow_release.release_event), slow_release.duration_ms);
+    } else {
+        printf("    (flag poll: never read true within 2.5 s, kernel target=%lld ms)\n", slow_release.duration_ms);
+    }
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (flag timing diagnostic)");
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -1813,6 +1828,10 @@ int main(int, char ** argv) {
     test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
     test_oversized_request_skips_wait_loop(cache, device);
     test_in_flight_entry_is_skipped_not_waited(cache, device);
+
+    // llama.cpp-c6ah (finding 32): LAST, deliberately -- see this
+    // function's own comment for why.
+    test_flag_timing_diagnostic(cache, device);
 
     ggml_backend_free(backend);
 

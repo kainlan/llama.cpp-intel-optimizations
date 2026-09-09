@@ -10802,10 +10802,12 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
 
         // llama.cpp-c6ah (finding 29): the exact sycl::event COPY that gets
         // parked below, computed ONCE here rather than re-evaluated again
-        // at push_back() -- so the identity log just below and the entry
-        // actually stored are provably the same object, not two separately
-        // constructed copies of `*event` that a reader could not otherwise
-        // rule out as the source of a discrepancy.
+        // at push_back() -- avoids constructing two separate copies of
+        // `*event` for no reason. (An identity check comparing this copy
+        // against the caller's own event by hash lived here through
+        // finding 29's investigation and confirmed they were always the
+        // same underlying command -- removed once that question was
+        // settled; finding 31 found the real cause elsewhere.)
         sycl::event release_event_copy = event ? *event : sycl::event{};
 
         // llama.cpp-c6ah (finding 31): arms a DEVICE MARKER KERNEL, not a
@@ -10846,27 +10848,6 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                             onednn_graph_scratch_flag_slot_free_list_.pop_back();
                             flag_slot       = static_cast<int32_t>(slot);
                             flag_generation = gen;
-                            // llama.cpp-c6ah (finding 29): identity check --
-                            // print a hash of both the caller's own event
-                            // object (*event, what depends_on() above was
-                            // just given) and release_event_copy (the exact
-                            // copy about to be parked, made from that same
-                            // *event just above), plus whether they compare
-                            // equal. sycl::event's common reference
-                            // semantics guarantee std::hash<sycl::event>
-                            // and operator==() both compare the underlying
-                            // command identity, not the local sycl::event
-                            // wrapper's address -- if this ever prints
-                            // unequal, the copy stored in the pool is NOT
-                            // the same underlying command the marker kernel
-                            // was armed against.
-                            if (onednn_graph_scratch_test_hooks_enabled()) {
-                                GGML_LOG_WARN(
-                                    "[UNIFIED-CACHE] [c6ah-f29] identity caller_event_hash=%zu "
-                                    "parked_copy_hash=%zu equal=%d\n",
-                                    std::hash<sycl::event>{}(*event), std::hash<sycl::event>{}(release_event_copy),
-                                    (*event == release_event_copy) ? 1 : 0);
-                            }
                         } catch (const sycl::exception & e) {
                             // Leave flag_slot at -1: onednn_graph_scratch_pool_entry_release_complete()
                             // falls back to the old (blocking, but correct)
@@ -10886,26 +10867,6 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                     }
                 }
             }
-        }
-
-        // llama.cpp-c6ah (finding 28, extended finding 29 with the `event`
-        // pointer address, mechanism updated by finding 31): park-time
-        // diagnostic, gated behind the same test-hooks env var as every
-        // setter above rather than always-on, so it never reaches a
-        // production log -- this exists to let a GPU test run correlate
-        // WHICH entries got a real marker-kernel flag vs. which fell back
-        // (and why), against the wait-loop's own per-poll log below, and
-        // (the pointer) to confirm the SAME `event` this call was actually
-        // given is the one the arm attempt and the identity log above
-        // operated on. GGML_LOG_WARN (not INFO) so it reaches the log
-        // without needing llama-bench's `-v`/verbosity-threshold plumbing
-        // (see CLAUDE.md's llama-bench traps) -- a test binary calls
-        // ggml_backend_sycl_init() directly and never raises that
-        // threshold.
-        if (onednn_graph_scratch_test_hooks_enabled()) {
-            GGML_LOG_WARN("[UNIFIED-CACHE] [c6ah-f28] park size=%.1fMB flag=%s slot=%d event=%p force_unwatched=%d\n",
-                          freed_size / (1024.0 * 1024.0), flag_slot >= 0 ? "armed" : (event ? "fallback" : "no-event"),
-                          flag_slot, static_cast<const void *>(event), force_unwatched_for_test ? 1 : 0);
         }
 
         // onednn_graph_scratch_direct_outstanding_bytes_ stays charged for
