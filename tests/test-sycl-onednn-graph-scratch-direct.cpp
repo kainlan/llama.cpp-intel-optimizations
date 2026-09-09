@@ -484,11 +484,56 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     check(cache->onednn_graph_scratch_direct_outstanding_bytes() == outstanding_before_park + kSizeParked,
           "onednn_graph_scratch_direct_outstanding_bytes() increased by exactly the parked allocation's size -- "
           "proves the accessor tracks a real DIRECT-path charge rather than staying inert");
+
+    // onednn_graph_scratch_high_water_bytes() had no caller anywhere in
+    // this binary before this test -- every sibling accessor above has one,
+    // so give it one here too. Its only write site,
+    // note_onednn_graph_scratch_alloc_locked()
+    // (unified-cache.cpp:10595-10600), is called from the zone-fit path
+    // (unified-cache.cpp:10208) AND both DIRECT paths (pool-hit at
+    // unified-cache.cpp:10143, fresh alloc at unified-cache.cpp:10419) --
+    // so, unlike onednn_graph_scratch_direct_outstanding_bytes() above, it
+    // tracks zone-served and DIRECT allocations combined, as a running max
+    // per unified_cache INSTANCE (unified-cache.hpp:~3790), not scoped to
+    // this test -- and this binary drives a single instance for device 0.
+    // By the time this test runs, main() has already run the three earlier
+    // tests that actually complete an allocation (pool_reuse,
+    // bounded_eviction, pending_event_reclaim); test_loud_failure's kSizeC
+    // (340 MiB) request is deliberately forced to fail
+    // (ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(2),
+    // asserted via ptr == nullptr) and returns before ever reaching this
+    // counter's write site, so it contributes nothing. kSizeA/kSizeB/kSizeD
+    // (300/320/310 MiB) already push the high-water past kSizeParked (280
+    // MiB) on their own -- so the check below cannot isolate the parked
+    // allocation's own contribution to that floor; it only proves the
+    // accessor is not inert (it would read 0 if the write site above never
+    // ran). The non-decrease-after-release check further below
+    // distinguishes a high-water mark from a live outstanding count; it
+    // cannot fully discriminate that from a counter merely frozen at or
+    // above kSizeParked, since the combined
+    // onednn_graph_scratch_outstanding_bytes_ it tracks has no accessor of
+    // its own to check directly, and no cheaper, fully discriminating check
+    // is available here.
+    check(cache->onednn_graph_scratch_high_water_bytes() >= kSizeParked,
+          "onednn_graph_scratch_high_water_bytes() is not inert -- it reports at least the parked allocation's "
+          "size, a floor the earlier completed tests in this binary already exceeded on their own");
+    const size_t high_water_after_park = cache->onednn_graph_scratch_high_water_bytes();
+
     if (parked) {
         sycl::event release = submit_slow_release(q);
         cache->onednn_graph_scratch_free(parked, &release);
         release.wait();  // ensure event-complete before the oversized request below
     }
+
+    // High-water is a max, never lowered by a free() -- note_onednn_graph_-
+    // scratch_free_locked() (unified-cache.cpp:10602-10604) only decrements
+    // onednn_graph_scratch_outstanding_bytes_, and nothing anywhere writes
+    // onednn_graph_scratch_high_water_bytes_ except the max-update inside
+    // note_onednn_graph_scratch_alloc_locked() cited above, so releasing
+    // the parked allocation must not move it back down.
+    check(cache->onednn_graph_scratch_high_water_bytes() >= high_water_after_park,
+          "onednn_graph_scratch_high_water_bytes() does not decrease after the parked allocation is released -- "
+          "it is a high-water mark, not a live outstanding count");
 
     const size_t evictions_before  = cache->onednn_graph_scratch_pool_eviction_count();
     const size_t wait_count_before = cache->onednn_graph_scratch_direct_wait_count();
