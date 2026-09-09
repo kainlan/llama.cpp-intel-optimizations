@@ -720,7 +720,18 @@ static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEV
 // verified), NOT a single n_head x n_ctx term for every layer as an
 // earlier version of this fix assumed.
 // Five independent atomics, like every other "planned" global in this file
-// -- 0 means "never planned for this device" for each.
+// -- 0 means "never planned for this device" for each. A torn read across
+// a concurrent re-plan can therefore combine fields from two different
+// plans -- e.g. a NEW plan's nonzero n_head_swa_max with the OLD plan's
+// stale n_swa=0 (a dense model's plan, read mid-transition to an SWA
+// model's) -- which under-provisions the swa term (window collapses to
+// min(n_ctx, n_ubatch) instead of the real min(n_ctx, n_swa + n_ubatch)).
+// This is moot in practice for the same reason every other multi-field
+// "planned" global in this file tolerates torn reads: all five stores
+// happen back-to-back inside one setter call with no yield point between
+// them, so the torn-read window is a handful of instructions during a
+// re-plan, which itself is rare (model load / runtime context change)
+// relative to reads.
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head_ctx_max[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head_swa_max[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_swa[GGML_SYCL_MAX_DEVICES]{};

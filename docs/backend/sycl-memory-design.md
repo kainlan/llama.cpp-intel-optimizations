@@ -409,7 +409,9 @@ ticket reproduced on:
   Re-planning the Graph-scratch shape on a runtime context change is
   tracked separately (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line
   below prints the `n_ctx` it actually used, which is what makes this
-  gap visible in a real log.
+  gap visible in a real log -- provided the run captures `GGML_LOG_INFO`
+  output at all, which is dropped at default verbosity in every tool
+  (`-v` on `llama-bench`, or a raised verbosity threshold elsewhere).
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —

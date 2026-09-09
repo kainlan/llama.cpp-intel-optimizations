@@ -416,33 +416,51 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                  inventory.pp_moe_onednn_output_slot_bytes);
         }
     }
-    inventory.n_swa        = hparams.n_swa;
-    inventory.n_swa_layers = 0;
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (hparams.is_swa(il)) {
-            inventory.n_swa_layers++;
-        }
-    }
+    // llama.cpp-o3a0: window-aware refinement of the query-head count that
+    // feeds the oneDNN Graph-scratch zone floor (see the field comment in
+    // ggml-sycl.h), merged into this same loop over [0, n_layer) rather
+    // than a second pass over the identical range. Split the max by
+    // attention window class -- non-SWA (effective KV window == n_ctx) vs
+    // SWA (effective KV window == min(n_ctx, n_swa + n_ubatch); n_swa is
+    // already captured above) -- and restrict to layers eligible for the
+    // oneDNN SDPA route: a layer that can never reach oneDNN must not
+    // inflate a floor sized for oneDNN's own scratch demand. Max rather
+    // than layer 0 alone because a handful of architectures vary head
+    // count (and head dim) by layer. MLA architectures (deepseek2,
+    // glm-dsa, kimi-k3, kimi-linear) build attention at
+    // hparams.n_embd_head_k_mla(), a model-global (not per-layer)
+    // "decompressed" head size, not hparams.n_embd_head_k(il) -- the
+    // eligibility screen must use that value when hparams.is_mla(), or it
+    // screens a head dim the real oneDNN gate never actually sees for
+    // these models (over-counting eligibility, the safe direction, but
+    // reachable in-tree). is_mla()/n_embd_head_k_mla() are themselves
+    // model-global, so hoisted out of the loop once rather than
+    // re-derived per layer, alongside f_attention_scale (also
+    // model-global). This closes the known-exception list
+    // llama_model_sycl_onednn_head_dim_eligible()'s own comment describes:
+    // gemma-family's literal-1.0f pre-scaled-Q layers and now MLA's
+    // decompressed head dim are both accounted for by their respective
+    // callers of that helper.
+    inventory.n_swa                = hparams.n_swa;
+    inventory.n_swa_layers         = 0;
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
 
-    // llama.cpp-o3a0: window-aware refinement of the query-head count that
-    // feeds the oneDNN Graph-scratch zone floor (see the field comment in
-    // ggml-sycl.h). Split the max by attention window class -- non-SWA
-    // (effective KV window == n_ctx) vs SWA (effective KV window ==
-    // min(n_ctx, n_swa + n_ubatch); n_swa is already captured above) --
-    // and restrict to layers eligible for the oneDNN SDPA route: a layer
-    // that can never reach oneDNN must not inflate a floor sized for
-    // oneDNN's own scratch demand. Max rather than
-    // layer 0 alone because a handful of architectures vary head count (and
-    // head dim) by layer.
-    uint32_t n_head_ctx_max = 0;
-    uint32_t n_head_swa_max = 0;
+    uint32_t       n_head_ctx_max        = 0;
+    uint32_t       n_head_swa_max        = 0;
+    const bool     model_is_mla          = hparams.is_mla();
+    const uint32_t mla_head_dim          = model_is_mla ? hparams.n_embd_head_k_mla() : 0;
+    const float    model_attention_scale = hparams.f_attention_scale;
     for (uint32_t il = 0; il < n_layer; ++il) {
-        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), hparams.f_attention_scale)) {
+        const bool is_swa_layer = hparams.is_swa(il);
+        if (is_swa_layer) {
+            inventory.n_swa_layers++;
+        }
+        const uint32_t head_dim = model_is_mla ? mla_head_dim : hparams.n_embd_head_k(il);
+        if (!llama_model_sycl_onednn_head_dim_eligible(head_dim, model_attention_scale)) {
             continue;
         }
-        if (hparams.is_swa(il)) {
+        if (is_swa_layer) {
             n_head_swa_max = std::max(n_head_swa_max, hparams.n_head(il));
         } else {
             n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));

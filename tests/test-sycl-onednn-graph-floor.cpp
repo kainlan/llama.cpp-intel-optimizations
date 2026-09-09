@@ -193,12 +193,17 @@ void test_swa_formula() {
          "gemma4 E4B (real: n_head_swa_max=8, n_swa=512) @ ubatch=512 ctx=8192 -> raw 24 MiB, clamped to 64 MiB"    },
         // A HYPOTHETICAL n_swa=1024 shape -- NOT gemma4's actual value
         // (see the row above and the ⚠️ correction in this file's header
-        // comment) -- kept as a formula/arithmetic test: it independently
-        // exercises the same min(n_ctx, n_swa + n_ubatch) clamp-vs-window
-        // arithmetic at a different n_swa, still below the 64 MiB minimum.
-        // 1.5 x 8 x 512 x min(8192, 1024 + 512) x 4 B == 36 MiB exactly.
-        { 0,  8,  1024, 512, 8192, 64,
-         "hypothetical (n_head_swa_max=8, n_swa=1024, NOT gemma4's real value) -> raw 36 MiB, clamped to 64 MiB"    },
+        // comment) -- kept as a formula/arithmetic test at a DIFFERENT
+        // n_swa. An earlier version of this row used
+        // n_head_swa_max=8, giving a raw 36 MiB that still clamped to
+        // 64 MiB -- indistinguishable from the gemma4 row above, which
+        // also clamps to 64 MiB, so it exercised no arithmetic the row
+        // above did not already cover. n_head_swa_max=16 clears the
+        // clamp, so this row's expectation actually depends on n_swa=1024
+        // (not just "some value below 64 MiB").
+        // 1.5 x 16 x 512 x min(8192, 1024 + 512) x 4 B == 72 MiB exactly.
+        { 0,  16, 1024, 512, 8192, 72,
+         "hypothetical (n_head_swa_max=16, n_swa=1024, NOT gemma4's real value) -> raw 72 MiB, NOT clamped"         },
         // A genuine (non-void) positive control for the +n_ubatch term
         // itself: 32 heads x a window that DOES clear the clamp only once
         // n_ubatch is added. Raw with the OLD (WRONG) n_swa-alone window:
@@ -268,6 +273,18 @@ void test_swa_formula() {
     const size_t via_no_swa_overload = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(32, 512, 8192);
     check(via_swa_empty_class == via_no_swa_overload,
           "an empty SWA class (n_head_swa_max=0, n_swa=0) matches the no-SWA overload exactly");
+
+    // n_head_swa_max=0 must zero the swa term regardless of what n_swa
+    // itself says the window is -- even a big, nonzero n_swa (8192 here,
+    // deliberately far from 0) must not leak into the result. This is a
+    // DIFFERENT case from the empty-class check above (which used n_swa=0
+    // too, so it could not tell "zeroed by the head-count multiplication"
+    // apart from "zeroed because the window itself was 0"); this row
+    // isolates the head-count zeroing specifically.
+    const size_t zero_swa_heads_big_window =
+        ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(32, 0, 8192, 512, 8192);
+    check(zero_swa_heads_big_window == via_no_swa_overload,
+          "n_head_swa_max=0 zeroes the swa term even with a large nonzero n_swa window");
 }
 
 void test_override() {

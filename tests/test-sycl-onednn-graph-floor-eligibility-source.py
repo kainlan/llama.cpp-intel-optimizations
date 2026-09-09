@@ -66,6 +66,22 @@ LLAMA_MODEL_ELIGIBLE_BODY = extract_function_body(
 FATTN_ONEDNN_D512_SCALE_RELAXED_BODY = extract_function_body(
     FATTN_ONEDNN_CPP, "bool ggml_sycl_fa_onednn_d512_scale_relaxed() {"
 )
+# The real gate itself -- scoping the D-threshold and tolerance-constant
+# assertions below to this body (instead of searching FATTN_ONEDNN_CPP,
+# the whole file, comments included) matches how the llama-model.cpp side
+# is already scoped to LLAMA_MODEL_ELIGIBLE_BODY, and rules out a stray
+# comment elsewhere in this ~60k-line file coincidentally satisfying a
+# check that should be reading the actual gate.
+FATTN_ONEDNN_PLAN_BODY = extract_function_body(
+    FATTN_ONEDNN_CPP, "ggml_sycl_flash_attn_ext_onednn_plan(const fattn_params & params,"
+)
+# The eligibility helper's CALLER -- pins the MLA head-dim branch, which
+# lives at the call site (populate_inventory), not inside
+# llama_model_sycl_onednn_head_dim_eligible() itself.
+POPULATE_INVENTORY_BODY = extract_function_body(
+    LLAMA_MODEL_CPP,
+    "static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,",
+)
 
 
 def test_both_copies_read_the_identical_env_var() -> None:
@@ -110,10 +126,31 @@ def test_llama_model_copy_uses_the_same_d_thresholds_as_the_sycl_gate() -> None:
         "the D <= 256 unconditional-eligibility threshold must be replicated exactly "
         "(the `params.ne00 > 256` gate in fattn-onednn.cpp)"
     )
-    assert re.search(r"ne00\s*>\s*512", FATTN_ONEDNN_CPP), "fattn-onednn.cpp's own D > 512 reject moved or was renamed"
     assert re.search(
-        r"ne00\s*>\s*256\s*&&\s*!onednn_d512_scale_relaxed", FATTN_ONEDNN_CPP
+        r"ne00\s*>\s*512", FATTN_ONEDNN_PLAN_BODY
+    ), "fattn-onednn.cpp's own D > 512 reject moved or was renamed"
+    assert re.search(
+        r"ne00\s*>\s*256\s*&&\s*!onednn_d512_scale_relaxed", FATTN_ONEDNN_PLAN_BODY
     ), "fattn-onednn.cpp's own D > 256 scale-relaxed gate moved or was renamed"
+
+
+def test_populate_inventory_screens_the_mla_head_dim_for_mla_models() -> None:
+    # MLA architectures (deepseek2, glm-dsa, kimi-k3, kimi-linear) build
+    # attention at hparams.n_embd_head_k_mla() -- a model-global
+    # "decompressed" head size -- not hparams.n_embd_head_k(il). The
+    # eligibility screen at the call site must branch on hparams.is_mla()
+    # to use the right value, or it screens a head dim the real oneDNN
+    # gate never actually sees for these models.
+    assert re.search(
+        r"model_is_mla\s*=\s*hparams\.is_mla\(\)", POPULATE_INVENTORY_BODY
+    ), "populate_inventory must query hparams.is_mla() once (model-global, not per-layer)"
+    assert re.search(
+        r"mla_head_dim\s*=\s*model_is_mla\s*\?\s*hparams\.n_embd_head_k_mla\(\)\s*:\s*0", POPULATE_INVENTORY_BODY
+    ), "populate_inventory must derive the MLA head dim from hparams.n_embd_head_k_mla() when is_mla()"
+    assert re.search(
+        r"head_dim\s*=\s*model_is_mla\s*\?\s*mla_head_dim\s*:\s*hparams\.n_embd_head_k\(il\)",
+        POPULATE_INVENTORY_BODY,
+    ), "the eligibility call site must branch per-layer between the MLA and non-MLA head dim"
 
 
 def eligibility_disjunction_checks(body: str) -> dict:
@@ -188,7 +225,7 @@ def test_both_copies_use_the_same_tolerance_constant() -> None:
         "llama_model_sycl_onednn_head_dim_eligible() must compare against the 1e-3f tolerance"
     )
     assert re.search(
-        r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", FATTN_ONEDNN_CPP
+        r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", FATTN_ONEDNN_PLAN_BODY
     ), "fattn-onednn.cpp's own scale-tolerance check must compare against 1e-3f"
 
 
@@ -205,10 +242,10 @@ def test_changing_the_tolerance_constant_is_caught_on_either_side() -> None:
         r"1\.0f\s*/\s*kq_scale\s*-\s*sqrtf\(.*?\)\s*<\s*1e-3f", mutated_llama
     ), "the llama-model.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
 
-    mutated_fattn = FATTN_ONEDNN_CPP.replace(
+    mutated_fattn = FATTN_ONEDNN_PLAN_BODY.replace(
         "sqrtf(static_cast<float>(params.ne00))) >= 1e-3f", "sqrtf(static_cast<float>(params.ne00))) >= 1e-4f"
     )
-    assert mutated_fattn != FATTN_ONEDNN_CPP, "the fattn-onednn.cpp tolerance text was not found to mutate"
+    assert mutated_fattn != FATTN_ONEDNN_PLAN_BODY, "the fattn-onednn.cpp tolerance text was not found to mutate"
     assert not re.search(
         r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", mutated_fattn
     ), "the fattn-onednn.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
