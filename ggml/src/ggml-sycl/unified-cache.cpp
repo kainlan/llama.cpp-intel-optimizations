@@ -9898,6 +9898,18 @@ bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
 // cache_backing=true: this is the cache's own internal bootstrap
 // allocation, the same TU-static-adopt case staging_ already uses (see
 // the SYCL Memory Ownership contract in CLAUDE.md).
+//
+// File-scope (not function-local) so the park site's exhaustion WARN can
+// report the retired-slot count against this same total without
+// duplicating the literal. 256 slots (1 KiB) is comfortably above
+// onednn_graph_scratch_pool_depth_per_size()'s default (8) times the
+// largest realistic distinct-shape count this pool sees concurrently in
+// one process (~16 distinct ne11-derived shapes for a pp8192 run, per this
+// file's own comment on that function) -- exhaustion falls back to the
+// unwatched-event path for that one entry (see the free-list check at the
+// call site), the same degradation a failed queue/submit already uses.
+static constexpr size_t kOnednnGraphScratchFlagSlabCapacity = 256;
+
 bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     if (onednn_graph_scratch_flag_slab_ != nullptr) {
         return true;
@@ -9908,15 +9920,6 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
         // blocking fallback, not a per-entry one.
         return false;
     }
-    // 256 slots (1 KiB) is comfortably above
-    // onednn_graph_scratch_pool_depth_per_size()'s default (8) times the
-    // largest realistic distinct-shape count this pool sees concurrently in
-    // one process (~16 distinct ne11-derived shapes for a pp8192 run, per
-    // this file's own comment on that function) -- exhaustion falls back
-    // to the unwatched-event path for that one entry (see the free-list
-    // check at the call site), the same degradation a failed queue/submit
-    // already uses.
-    static constexpr size_t kOnednnGraphScratchFlagSlabCapacity = 256;
     const size_t            bytes                               = kOnednnGraphScratchFlagSlabCapacity * sizeof(int32_t);
     void * raw = unified_cache_malloc_host_tracked(bytes, queue_, "unified_cache:onednn_graph_scratch_flag_slab");
     if (!raw) {
@@ -9934,6 +9937,14 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
     onednn_graph_scratch_flag_slab_owner_ = detail::from_legacy_owned_alloc(std::move(owner), GGML_LAYOUT_AOS);
     void * resolved                       = onednn_graph_scratch_flag_slab_owner_.resolve().ptr;
     if (!resolved) {
+        // llama.cpp-c6ah: reset the owner rather than leaving it
+        // holding a live CACHE_BACKING host allocation this function can
+        // never use -- onednn_graph_scratch_flag_slab_ stays nullptr, so no
+        // caller can reach it through the normal path, but leaving the
+        // owner alive would keep it registered as a live cache-backing
+        // control (the pre-teardown census admits it, unable to tell it
+        // apart from a real, in-use slab) for the rest of the process.
+        onednn_graph_scratch_flag_slab_owner_        = {};
         onednn_graph_scratch_flag_slab_alloc_warned_ = true;
         GGML_LOG_WARN(
             "[UNIFIED-CACHE] Failed to resolve the oneDNN Graph-scratch pool's completion-flag slab owner; "
@@ -10234,10 +10245,17 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     // silent on exactly the call that matters when a request is satisfied
     // this fast. log_pool_state_for_test() is gated behind the test-hooks
     // env var like every other hook in this file (a no-op, and reads
-    // nothing, when it is not set) and reads
+    // nothing, when it is not set) and, for an ARMED entry only, reads
     // onednn_graph_scratch_pool_entry_release_complete() itself (the same
     // predicate the sweep/poll actually use), so it can never disagree with
-    // what the real decision was for the same entry on the same call.
+    // what the real decision was for that entry on the same call. This
+    // diagnostic must NEVER itself issue a blocking query: an unwatched
+    // entry (flag_slot == -1 -- the RED-arm hook, or an arming failure)
+    // would fall through that predicate to the blocking bare
+    // event_complete() query, and the pre-wait-sweep call site below runs
+    // BEFORE a timed window, which is exactly the finding-32 hazard this
+    // file's history already fixed once for the park site -- so an
+    // unwatched entry's completion is never queried here at all.
     const auto wait_loop_entry         = std::chrono::steady_clock::now();
     auto       log_pool_state_for_test = [&](const char * where) {
         if (!onednn_graph_scratch_test_hooks_enabled()) {
@@ -10248,13 +10266,20 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
                 .count();
         for (const auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
             for (const auto & poll_entry : bucket_kv.second) {
+                if (poll_entry.flag_slot < 0) {
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] [c6ah-pool-diag] %s elapsed=%lldms requested=%.1fMB bucket=%.1fMB "
+                              "flag=unwatched (not queried)\n",
+                        where, static_cast<long long>(elapsed_ms), size / (1024.0 * 1024.0),
+                        bucket_kv.first / (1024.0 * 1024.0));
+                    continue;
+                }
                 const bool poll_complete = onednn_graph_scratch_pool_entry_release_complete(poll_entry);
                 GGML_LOG_WARN(
                     "[UNIFIED-CACHE] [c6ah-pool-diag] %s elapsed=%lldms requested=%.1fMB bucket=%.1fMB "
-                          "flag=%s slot=%d complete=%d\n",
+                          "flag=armed slot=%d complete=%d\n",
                     where, static_cast<long long>(elapsed_ms), size / (1024.0 * 1024.0),
-                    bucket_kv.first / (1024.0 * 1024.0), poll_entry.flag_slot >= 0 ? "armed" : "unwatched",
-                    poll_entry.flag_slot, poll_complete ? 1 : 0);
+                    bucket_kv.first / (1024.0 * 1024.0), poll_entry.flag_slot, poll_complete ? 1 : 0);
             }
         }
     };
@@ -10414,6 +10439,14 @@ void unified_cache::onednn_graph_scratch_clear_pool_locked() {
             // or submit already does.
             if (entry_complete && entry.flag_slot >= 0) {
                 onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(entry.flag_slot));
+            } else if (entry.flag_slot >= 0) {
+                // llama.cpp-c6ah: an armed-but-incomplete entry's
+                // slot lands here -- permanently retired above, never
+                // returned. Count it so a long-running process does not
+                // need to wait for the once-only exhaustion WARN to notice
+                // the slab shrinking; see the public accessor's own
+                // comment.
+                ++onednn_graph_scratch_flag_slot_retired_count_;
             }
         }
     }
@@ -10436,10 +10469,11 @@ void unified_cache::onednn_graph_scratch_log_pool_summary_locked(const char * co
     ggml_log_internal(
         at_teardown ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
         "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu misses=%zu evictions=%zu "
-        "waits=%zu peak_pooled=%.1f MB (cumulative for this process, not just this reclaim)\n",
+        "waits=%zu peak_pooled=%.1f MB retired_flag_slots=%zu (cumulative for this process, not just this "
+        "reclaim)\n",
         context, onednn_graph_scratch_pool_hit_count_, onednn_graph_scratch_pool_miss_count_,
         onednn_graph_scratch_pool_eviction_count_, onednn_graph_scratch_direct_wait_count_,
-        onednn_graph_scratch_pool_peak_bytes_ / (1024.0 * 1024.0));
+        onednn_graph_scratch_pool_peak_bytes_ / (1024.0 * 1024.0), onednn_graph_scratch_flag_slot_retired_count_);
 }
 
 // llama.cpp-gwno: oneDNN Graph SYCL allocator backing. See the declarations
@@ -10946,10 +10980,16 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                         }
                     } else if (!onednn_graph_scratch_flag_slots_exhausted_warned_) {
                         onednn_graph_scratch_flag_slots_exhausted_warned_ = true;
+                        // llama.cpp-c6ah: name how many of the
+                        // checked-out slots are PERMANENTLY retired (never
+                        // coming back) vs. merely all currently in flight --
+                        // the former means the slab's effective capacity has
+                        // genuinely shrunk, the latter is transient.
                         GGML_LOG_WARN(
                             "[UNIFIED-CACHE] oneDNN Graph-scratch pool's completion-flag slab is fully checked "
-                            "out; falling back to blocking completion checks until a slot frees up (only "
-                            "logged once)\n");
+                            "out (%zu of %zu slots permanently retired); falling back to blocking completion "
+                            "checks until a slot frees up (only logged once)\n",
+                            onednn_graph_scratch_flag_slot_retired_count_, kOnednnGraphScratchFlagSlabCapacity);
                     }
                 }
             }

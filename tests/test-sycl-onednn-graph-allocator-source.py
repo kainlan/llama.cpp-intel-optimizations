@@ -27,6 +27,8 @@ CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 # documents that index as blind inside this specific ~60k-line file, so a
 # tool-assisted search here would silently miss real occurrences.
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+# llama.cpp-c6ah: source for the doc-presence check below.
+MEMORY_DESIGN_MD = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
 
 
 # One left-to-right pass over string literals, char literals, // comments and
@@ -93,6 +95,113 @@ def normalize_ws(s: str) -> str:
     clang-format re-wrapping a call across lines when an unrelated edit
     changes surrounding line lengths."""
     return re.sub(r"\s+", " ", s).strip()
+
+
+# llama.cpp-c6ah: CACHE_BACKING is mintable through exactly two
+# allowlisted unified_cache_adopt_raw_host_allocation(cache_backing=true)
+# call sites -- the cache's own staging buffer, and the oneDNN Graph-scratch
+# pool's completion-flag slab this ticket added as the second, reviewed mint
+# (allocation-provenance.hpp; docs/design/sycl-canonical-memory-architecture.md
+# section 3.1). This is the REGISTERED half of that gate, independently
+# re-deriving the same allowlist from unified-cache.cpp's actual call sites;
+# tests/test-sycl-owner-allocation-migration.py enforces the identical
+# allowlist too (unregistered -- see that file), and the two must never
+# disagree.
+ADOPT_MINT_HELPER = "unified_cache_adopt_raw_host_allocation"
+ADOPT_CACHE_BACKING_ARG = 6  # 0-based: ptr, size, queue, role, category, cohort_id, cache_backing
+ADOPT_COHORT_ARG = 5  # 0-based: ptr, size, queue, role, category, cohort_id
+ADOPT_CACHE_BACKING_ALLOWLIST = (
+    '"unified_cache:staging"',
+    '"unified_cache:onednn_graph_scratch_flag_slab"',
+)
+
+
+def _split_top_level_arguments(argument_text: str) -> list:
+    """Split a call's argument text on top-level commas only, respecting
+    nested (), [], {} and not splitting inside a string literal."""
+    arguments, depth, current, in_string = [], 0, "", False
+    for char in argument_text:
+        if char == '"':
+            in_string = not in_string
+        if not in_string:
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                arguments.append(current.strip())
+                current = ""
+                continue
+        current += char
+    if current.strip():
+        arguments.append(current.strip())
+    return arguments
+
+
+def _adopt_cache_backing_cohorts(code: str) -> list:
+    """Cohort tags (with their quotes) of every ADOPT_MINT_HELPER call in
+    `code` whose cache_backing argument is the literal `true`. `code` must
+    already be comment-stripped (see strip_comments()), so a comment merely
+    naming the helper in prose is never mistaken for a call."""
+    cohorts = []
+    for match in re.finditer(r"\b%s\s*\(" % ADOPT_MINT_HELPER, code):
+        if re.search(r"alloc_handle[ \t]+$", code[max(0, match.start() - 40):match.start()]):
+            continue  # a forward declaration/signature line, not a call
+        depth, index = 1, match.end()
+        while index < len(code) and depth:
+            if code[index] == "(":
+                depth += 1
+            elif code[index] == ")":
+                depth -= 1
+            index += 1
+        arguments = _split_top_level_arguments(code[match.end():index - 1])
+        if len(arguments) > ADOPT_CACHE_BACKING_ARG and arguments[ADOPT_CACHE_BACKING_ARG] == "true":
+            cohorts.append(arguments[ADOPT_COHORT_ARG] if len(arguments) > ADOPT_COHORT_ARG else "<missing>")
+    return cohorts
+
+
+# llama.cpp-c6ah: the withdrawn "the bare query lies once a
+# watcher/host_task exists" reading (see docstring's "Hardened" note --
+# c6ah's own history, not a hypothetical) must stay HISTORY-framed wherever
+# it is still mentioned in prose, never restated as the current explanation.
+_LIES_WORD_RE = re.compile(r"\blies\b", re.IGNORECASE)
+
+
+def _withdrawn_lies_phrasing_is_history_framed(raw_text: str) -> bool:
+    """True iff every standalone occurrence of "lies" in raw_text (the RAW,
+    comment-bearing text -- this checks comment PROSE, not code, so it must
+    not run against a comment-stripped copy) sits inside a passage that also
+    says "earlier" or "misdiagnos", within a window generous enough to cover
+    this codebase's multi-line comment style. Vacuously true if the word
+    does not occur at all -- this check exists to catch a REINTRODUCTION of
+    the withdrawn reading without its framing, not to require the mention to
+    exist."""
+    for match in _LIES_WORD_RE.finditer(raw_text):
+        window = raw_text[max(0, match.start() - 350):match.end() + 350]
+        if not re.search(r"earlier|misdiagnos", window, re.IGNORECASE):
+            return False
+    return True
+
+
+# llama.cpp-c6ah: the two MEASURED facts that replaced the
+# withdrawn reading, as currently worded in docs/backend/sycl-memory-design.md.
+# Whitespace-normalized on both sides (normalize_ws) so a markdown reflow
+# that does not change the words themselves cannot break this check.
+DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS = (
+    "`command_execution_status` query BLOCKS rather than polls on any profiling-enabled queue"
+)
+DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER = (
+    "SUBMITTING a host_task whose `depends_on()` names an event from ANOTHER queue BLOCKS THE SUBMITTING "
+    "THREAD until that event completes"
+)
+
+
+def _design_doc_states_measured_facts() -> bool:
+    normalized = normalize_ws(MEMORY_DESIGN_MD)
+    return (
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in normalized
+        and normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in normalized
+    )
 
 
 BLOCKING_TOKENS = (
@@ -605,6 +714,29 @@ def test_onednn_graph_allocator_source_contract() -> None:
         "host_task(" not in strip_literals(FREE_BODY_CODE)
     )
 
+    # llama.cpp-c6ah: CACHE_BACKING's two-site allowlist -- see
+    # the module-level comment above ADOPT_MINT_HELPER. A third
+    # cache_backing=true call site (a new bootstrap mint added without
+    # review), a missing cohort tag, or a cohort tag that does not match
+    # either allowlisted string must all fail this check.
+    checks["cache_backing=true mints are exactly the two-site allowlist"] = sorted(
+        _adopt_cache_backing_cohorts(CACHE_CPP_CODE)
+    ) == sorted(ADOPT_CACHE_BACKING_ALLOWLIST)
+
+    # llama.cpp-c6ah: the withdrawn "bare query lies" reading must
+    # stay history-framed everywhere it is still mentioned -- checked against
+    # the RAW (comment-bearing) source, since this is a check on comment
+    # prose, not on code behavior (see the module docstring's stated
+    # exception for the in-order-queue check, which this joins).
+    checks["every withdrawn 'query lies' mention is history-framed"] = _withdrawn_lies_phrasing_is_history_framed(
+        CACHE_CPP
+    ) and _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP)
+
+    # llama.cpp-c6ah: the design doc must still state the two
+    # MEASURED facts that replaced the withdrawn reading, not just avoid the
+    # withdrawn wording.
+    checks["design doc states the two measured completion-check facts"] = _design_doc_states_measured_facts()
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
 
@@ -786,3 +918,78 @@ def test_free_body_has_no_host_task_mutation_witness() -> None:
     assert "host_task(" in mutated, (
         "mutation witness is broken: the reintroduced host_task() call was not present in the mutated text"
     )
+
+
+def test_cache_backing_allowlist_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the
+    "cache_backing=true mints are exactly the two-site allowlist" check in
+    the main contract test above would actually catch a reintroduced THIRD
+    bootstrap mint -- a new unified_cache_adopt_raw_host_allocation() call
+    site passing cache_backing=true with a cohort tag outside the two
+    reviewed ones, added without the review this gate exists to force."""
+    real_cohorts = _adopt_cache_backing_cohorts(CACHE_CPP_CODE)
+    assert sorted(real_cohorts) == sorted(ADOPT_CACHE_BACKING_ALLOWLIST), (
+        "the real, unmutated source should carry exactly the two allowlisted cache_backing=true cohorts -- "
+        f"found {real_cohorts}"
+    )
+
+    third_call_probe = (
+        '\nstatic alloc_handle _c6ah_finding41_mutation_probe(sycl::queue & q) {\n'
+        '    return %s(nullptr, 0, q, alloc_role::OTHER, runtime_category::OTHER, '
+        '"unified_cache:not_allowlisted", true);\n'
+        '}\n'
+    ) % ADOPT_MINT_HELPER
+    mutated = CACHE_CPP_CODE + third_call_probe
+    mutated_cohorts = _adopt_cache_backing_cohorts(mutated)
+    assert sorted(mutated_cohorts) != sorted(ADOPT_CACHE_BACKING_ALLOWLIST), (
+        "mutation witness is broken: the injected third cache_backing=true call site was not detected"
+    )
+
+
+def test_withdrawn_lies_phrasing_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the "every
+    withdrawn 'query lies' mention is history-framed" check above would
+    catch the SPECIFIC regression it exists to prevent -- the withdrawn
+    reading restated as if it were still the current explanation, with no
+    "earlier"/"misdiagnos" framing anywhere nearby."""
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP), (
+        "the real, unmutated unified-cache.hpp text should already pass this check"
+    )
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_CPP), (
+        "the real, unmutated unified-cache.cpp text should already pass this check"
+    )
+    unframed_reintroduction = (
+        "\n// The bare event query lies about completion once a watcher is attached.\n"
+    )
+    mutated = CACHE_HPP + unframed_reintroduction
+    assert not _withdrawn_lies_phrasing_is_history_framed(mutated), (
+        "mutation witness is broken: the reintroduced, unframed 'lies' mention was not detected"
+    )
+    # A positive control the other way: the same sentence WITH framing must
+    # still pass, proving this isn't just "reject any new occurrence of the
+    # word".
+    framed_reintroduction = (
+        "\n// An earlier draft of this comment claimed the bare event query lies about completion once a "
+        "watcher is attached; that was a misdiagnosis.\n"
+    )
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + framed_reintroduction), (
+        "the check should not reject a NEW mention that is properly history-framed"
+    )
+
+
+def test_design_doc_measured_facts_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the "design
+    doc states the two measured completion-check facts" check above would
+    catch either fact being edited or removed from
+    docs/backend/sycl-memory-design.md."""
+    assert _design_doc_states_measured_facts(), "the real, unmutated design doc should already pass this check"
+    mutated_missing_first_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS), "", 1
+    )
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) not in mutated_missing_first_fact
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in mutated_missing_first_fact
+    mutated_missing_second_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER), "", 1
+    )
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) not in mutated_missing_second_fact
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in mutated_missing_second_fact

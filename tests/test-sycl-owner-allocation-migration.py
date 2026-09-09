@@ -441,15 +441,25 @@ def check_dot_directory_skip_is_live() -> list:
 
 
 # CACHE_BACKING's second mint path. The unified_cache constructor's staging adopt
-# passes cache_backing=true as a plain bool to unified_cache_adopt_raw_host_allocation().
-# It cannot route through unified_allocate_owner_backing() -- that adopt runs during
-# cache construction and would depend circularly on the coordinator -- so it stays a
-# bootstrap mint. Unlike the token, nothing about a bool parameter is unforgeable by
-# construction, so its containment is asserted here instead: the helper must stay
-# TU-static (unreachable from another translation unit) AND exactly one call site may
-# pass true (so a second bootstrap mint cannot be added without review).
+# passes cache_backing=true as a plain bool to unified_cache_adopt_raw_host_allocation();
+# the oneDNN Graph-scratch pool's completion-flag slab (llama.cpp-c6ah) does the same,
+# lazily, under the cache's own mutex. Neither can route through
+# unified_allocate_owner_backing() -- that adopt would depend circularly on the
+# coordinator -- so both stay bootstrap mints. Unlike the token, nothing about a bool
+# parameter is unforgeable by construction, so containment is asserted here instead:
+# the helper must stay TU-static (unreachable from another translation unit) AND
+# exactly the two-site ALLOWLIST below may pass true, one call per cohort tag, so a
+# THIRD bootstrap mint cannot be added without review -- reviewed and accepted
+# as a two-site allowlist rather than flipped to EXTERNAL_EXACT; see
+# allocation-provenance.hpp and
+# docs/design/sycl-canonical-memory-architecture.md section 3.1.
 ADOPT_MINT_HELPER = "unified_cache_adopt_raw_host_allocation"
 ADOPT_CACHE_BACKING_ARG = 6  # 0-based: ptr, size, queue, role, category, cohort_id, cache_backing
+ADOPT_COHORT_ARG = 5  # 0-based: ptr, size, queue, role, category, cohort_id
+ADOPT_CACHE_BACKING_ALLOWLIST = (
+    '"unified_cache:staging"',
+    '"unified_cache:onednn_graph_scratch_flag_slab"',
+)
 
 
 def _call_argument_lists(source: str, function: str) -> list:
@@ -513,15 +523,17 @@ def check_internal_backing_mint_stays_private(cache_cpp: str) -> list:
     # code, not that the codebase became safe.
     if not calls:
         problems.append("found no call to %s -- the call-site scan matched nothing" % ADOPT_MINT_HELPER)
-    minting = []
+    minting_cohorts = []
     for argument_text in calls:
         arguments = _split_top_level_arguments(argument_text)
         if len(arguments) > ADOPT_CACHE_BACKING_ARG and arguments[ADOPT_CACHE_BACKING_ARG] == "true":
-            minting.append(" ".join(argument_text.split())[:80])
-    if len(minting) != 1:
+            cohort = arguments[ADOPT_COHORT_ARG] if len(arguments) > ADOPT_COHORT_ARG else "<missing>"
+            minting_cohorts.append(cohort)
+    if sorted(minting_cohorts) != sorted(ADOPT_CACHE_BACKING_ALLOWLIST):
         problems.append(
-            "expected exactly 1 bootstrap mint (cache_backing=true) call to %s, found %d: %s" %
-            (ADOPT_MINT_HELPER, len(minting), minting))
+            "expected exactly the 2 allowlisted bootstrap mints (cache_backing=true) to %s -- one call per "
+            "cohort tag %s -- found cohorts %s" %
+            (ADOPT_MINT_HELPER, list(ADOPT_CACHE_BACKING_ALLOWLIST), minting_cohorts))
     return problems
 
 

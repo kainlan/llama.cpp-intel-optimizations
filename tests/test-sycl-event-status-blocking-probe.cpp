@@ -248,7 +248,15 @@ int main(int, char ** argv) {
             sycl::event     evt  = submit_host_task(q_profiling);
             const long long q_ms = measure_query_ms(evt);
             evt.wait_and_throw();
-            check(true, "host_task / profiling queue: query returned without hanging");
+            // llama.cpp-c6ah: assert the relation this file's own
+            // MEASURED result found, not merely "did not hang" -- a driver
+            // change that made this combination block would leave a bare
+            // check(true, ...) green. kHostTaskMs (not kernel_ms -- no
+            // kernel runs in this combination) is the relevant duration to
+            // compare against.
+            check(q_ms < kHostTaskMs / 2,
+                  "host_task / profiling queue: query returns well under the host_task's "
+                  "own sleep duration, not close to it");
             printf("  host_task,     profiling queue: query=%lld ms\n", q_ms);
         }
 
@@ -259,7 +267,11 @@ int main(int, char ** argv) {
             sycl::event     evt  = submit_host_task(q_non_profiling);
             const long long q_ms = measure_query_ms(evt);
             evt.wait_and_throw();
-            check(true, "host_task / non-profiling queue: query returned without hanging");
+            // llama.cpp-c6ah: same reasoning as the profiling-queue
+            // host_task case above.
+            check(q_ms < kHostTaskMs / 2,
+                  "host_task / non-profiling queue: query returns well under the "
+                  "host_task's own sleep duration, not close to it");
             printf("  host_task, non-profiling queue: query=%lld ms\n", q_ms);
         }
 
@@ -274,7 +286,16 @@ int main(int, char ** argv) {
             const long long q_ms    = measure_query_ms(evt);
             evt.wait_and_throw();
             const long long kernel_ms = ms_since(k_start);
-            check(true, "device kernel / profiling queue: query returned without hanging");
+            // llama.cpp-c6ah: this is the combination the
+            // ticket's premise most needs to hold for (see the comment
+            // above) -- assert it against THIS run's own measured
+            // kernel_ms, matching the printf below's own stated
+            // interpretation, rather than leaving a bare check(true, ...)
+            // that a driver change making this non-blocking would leave
+            // green.
+            check(q_ms >= kernel_ms / 2,
+                  "device kernel / profiling queue: query takes at least half the "
+                  "kernel's own measured duration, i.e. it blocks rather than polls");
             // The default GGML_TEST_SPIN_ITERATIONS (2,000,000) targets
             // roughly 120 ms on the hardware this fork validates against
             // (measured range: 110-122 ms across both discrete cards) --
@@ -298,7 +319,12 @@ int main(int, char ** argv) {
             const long long q_ms    = measure_query_ms(evt);
             evt.wait_and_throw();
             const long long kernel_ms = ms_since(k_start);
-            check(true, "device kernel / non-profiling queue: query returned without hanging");
+            // llama.cpp-c6ah: the queue property the ticket's
+            // fix does NOT depend on, but this file measures anyway (see
+            // the file header) -- assert against this run's own kernel_ms.
+            check(q_ms < kernel_ms / 2,
+                  "device kernel / non-profiling queue: query returns well under the "
+                  "kernel's own measured duration, not close to it");
             printf(
                 "  kernel,    non-profiling queue: query=%lld ms  (kernel total duration=%lld ms, "
                 "iterations=%lld)\n",

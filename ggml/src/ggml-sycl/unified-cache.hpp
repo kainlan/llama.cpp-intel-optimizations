@@ -3141,6 +3141,22 @@ class unified_cache {
 
     size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
 
+    // llama.cpp-c6ah: how many completion-flag slab slots have been
+    // PERMANENTLY retired -- never returned to the free list -- because
+    // onednn_graph_scratch_clear_pool_locked() removed their owning entry
+    // while its marker kernel was still in flight (see that function's own
+    // comment for why the slot cannot be reused). Monotonically
+    // non-decreasing for the life of the process; a value approaching the
+    // slab's fixed capacity (256) means parks are silently degrading to the
+    // blocking event_complete() fallback one slot at a time, with only a
+    // once-only WARN at full exhaustion to notice it by -- exposed here, and
+    // in the DIRECT pool summary log line, so a long-running process does
+    // not need to wait for that WARN to see it coming. Same unlocked-read
+    // convention as the other counters on this page.
+    size_t onednn_graph_scratch_flag_slot_retired_count() const {
+        return onednn_graph_scratch_flag_slot_retired_count_;
+    }
+
     // llama.cpp-c6ah: test-only instrumentation accessor -- true if ANY
     // entry currently parked in the
     // `size` bucket is release-complete per
@@ -3688,14 +3704,26 @@ class unified_cache {
     // -- which runs in REVERSE declaration order -- destroys the QUEUE
     // first and this SLAB second. drain_all_queues_noexcept() (called
     // explicitly, before any member destructor runs, from
-    // shutdown_resources()) is the guarantee that actually matters: it
-    // waits for every in-flight marker kernel, including any still
-    // targeting this slab, before teardown proceeds -- see that function's
-    // own comment. This declaration order is defense-in-depth on top of
-    // that drain, not a substitute for it: with the queue destroyed first
-    // regardless, a marker kernel that somehow outlived the drain would
-    // fail against an already-destroyed queue rather than write through a
-    // freed host pointer.
+    // shutdown_resources()) is the guarantee that actually matters on the
+    // NORMAL teardown path: it waits for every in-flight marker kernel,
+    // including any still targeting this slab, before teardown proceeds --
+    // see that function's own comment. This declaration order is
+    // defense-in-depth on top of that drain, not a substitute for it: with
+    // the queue destroyed first regardless, a marker kernel that somehow
+    // outlived the drain would fail against an already-destroyed queue
+    // rather than write through a freed host pointer.
+    //
+    // shutdown_resources() has two early-return paths that skip the drain
+    // entirely -- the g_sycl_shutting_down branch and the "SYCL context is
+    // already invalid" catch, both reached only when the SYCL runtime
+    // itself is already gone (static destruction order, or process exit).
+    // Both are safe without a drain for the same reason: this slab's owning
+    // mem_handle (onednn_graph_scratch_flag_slab_owner_) is never assigned
+    // {} or otherwise released on either path, so it ABANDONS the
+    // allocation rather than calling sycl::free() on it -- the same pattern
+    // every other owner member on those paths follows. No marker kernel can
+    // write through freed memory, because the memory is never freed there;
+    // it is deliberately leaked for the remainder of the process.
     //
     // No std::once_flag here (unlike event_watch_queue_ below): every real
     // caller of onednn_graph_scratch_ensure_flag_slab_locked() is already
@@ -3719,6 +3747,10 @@ class unified_cache {
     uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
     bool                         onednn_graph_scratch_flag_slab_alloc_warned_      = false;
     bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
+    // llama.cpp-c6ah: see the public accessor's own comment above.
+    // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
+    // removal site that can retire an armed-but-incomplete entry's slot.
+    size_t                       onednn_graph_scratch_flag_slot_retired_count_     = 0;
     // Lazily created by get_event_watch_queue(); out-of-order,
     // non-profiling. Guards first-use construction against concurrent
     // callers -- onednn_graph_scratch_free() parks entries under

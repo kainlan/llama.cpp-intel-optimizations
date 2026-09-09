@@ -489,8 +489,8 @@ void ensure_slow_release_calibrated(sycl::queue & q) {
 // iterations never dereferences g_slow_release_cell) kernel.
 slow_release_result submit_slow_release(sycl::queue & q) {
     check(g_slow_release_scaled_iterations > 0,
-          "submit_slow_release() was NOT called before ensure_slow_release_calibrated() ran -- if this fails, "
-          "main() is missing the explicit calibration call");
+          "the slow-release kernel was calibrated in main() before this submit -- if this fails, main() is "
+          "missing the explicit calibration call");
 
     sycl::event evt = submit_spin_kernel(q, g_slow_release_cell, g_slow_release_scaled_iterations);
     return { evt, kSlowReleaseMs };
@@ -1716,11 +1716,20 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     slow_release_result old_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr_old, &old_release.release_event);
 
-    // Diagnostic only: the free list's size right before the reclaim, read
-    // via the hooks-gated accessor -- lets a failing run distinguish "the
-    // reclaim retired more slots than the one it should have" from every
-    // other explanation.
-    const size_t free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    // RED witness (llama.cpp-c6ah): capture ptr_old's own slot
+    // and the free list's size BEFORE the reclaim, both via hooks-gated
+    // accessors. The free list is LIFO, and on the pre-fix code ptr_old's
+    // marker fires within milliseconds of the wait below -- well before
+    // ptr_new's park below could reset that same slot and arm a new
+    // generation -- so a check that only waits and then re-polls cannot
+    // distinguish "retired" from "returned and already overwritten by the
+    // time anything looked". Comparing the free list's size and ptr_new's
+    // slot against these captured values does not have that blind spot:
+    // both fail on the pre-fix code (which returns ptr_old's slot to the
+    // free list at reclaim time) and both pass on the fix, independent of
+    // timing.
+    const int32_t old_entry_flag_slot = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeReclaimRetire);
+    const size_t  free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
 
     // Reclaim the pool WHILE ptr_old's marker kernel is still in flight --
     // the exact hazard this test exists to catch. Before the fix,
@@ -1729,10 +1738,14 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test reclaim (entry still in flight)");
 
     const size_t free_list_size_after_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
-    printf(
-        "    (free list size: before reclaim=%zu, after reclaim=%zu -- ptr_old's own slot must be "
-        "PERMANENTLY retired, not returned)\n",
-        free_list_size_before_reclaim, free_list_size_after_reclaim);
+    printf("    (old entry's slot=%d; free list size: before reclaim=%zu, after reclaim=%zu)\n", old_entry_flag_slot,
+           free_list_size_before_reclaim, free_list_size_after_reclaim);
+    // RED witness 1/2: ptr_old's slot must be PERMANENTLY retired, never
+    // returned to the free list -- the free list's size must be unchanged
+    // by this reclaim (this test's pool holds no other entry, so nothing
+    // else could legitimately change it either).
+    check(free_list_size_after_reclaim == free_list_size_before_reclaim,
+          "the reclaim does not grow the free list -- ptr_old's slot was retired, not returned");
 
     // q is a single IN-ORDER queue and old_release's kernel was never waited
     // on above, so without this wait, new_release's kernel (submitted next,
@@ -1758,9 +1771,16 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     const int32_t  new_entry_flag_slot = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeReclaimRetire);
     const uint32_t new_entry_flag_generation =
         cache->onednn_graph_scratch_pool_entry_flag_generation_for_test(kSizeReclaimRetire);
-    printf("    (new entry parked: flag_slot=%d (%s), flag_generation=%u)\n", new_entry_flag_slot,
+    printf("    (old entry's slot=%d; new entry parked: flag_slot=%d (%s), flag_generation=%u)\n", old_entry_flag_slot,
+           new_entry_flag_slot,
            new_entry_flag_slot >= 0 ? "armed" : "unwatched -- falls back to the bare blocking query",
            new_entry_flag_generation);
+    // RED witness 2/2: the new entry must never be handed ptr_old's own
+    // (retired) slot. On the pre-fix code, with the free list LIFO and
+    // this test's pool otherwise empty, ptr_old's slot -- if wrongly
+    // returned -- would be exactly the next slot popped, so this comparison
+    // fails on the pre-fix code and passes on the fix regardless of timing.
+    check(new_entry_flag_slot != old_entry_flag_slot, "the new entry's slot is never ptr_old's own (retired) slot");
 
     // Poll the new entry's own flag directly (no alloc()/free() round trip
     // that would itself consume/re-park it) until it reads true -- must

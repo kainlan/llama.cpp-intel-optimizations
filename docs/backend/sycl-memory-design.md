@@ -468,11 +468,19 @@ ticket reproduced on:
   because submitting a device kernel the same way does NOT block its
   submitting thread (measured, both cards). The slab is owned via the
   sanctioned allocation path (`unified_cache_malloc_host_tracked()` +
-  `unified_cache_adopt_raw_host_allocation()`, the same bootstrap pattern
-  the cache's own staging buffer uses), sized once, and never reallocated
-  — a marker kernel already in flight can hold a raw pointer into a
-  specific slot, so growing the slab could leave it writing through a
-  dangling host pointer; a free list plus the per-park generation tag make
+  `unified_cache_adopt_raw_host_allocation()` with `cache_backing=true`) as
+  the SECOND of exactly two allowlisted `CACHE_BACKING` mints — the first is
+  the cache's own staging buffer; see
+  `docs/design/sycl-canonical-memory-architecture.md` §3.1. `CACHE_BACKING`
+  is required here, not merely reused as a convenient existing pattern: the
+  slab must survive destructive teardown the same way the staging buffer
+  does, because a marker kernel already in flight can hold a raw pointer
+  into a specific slot at the moment shutdown runs, and `EXTERNAL_EXACT`
+  carries no exemption from the pre-teardown census's live-allocation
+  refusal. It is sized once and never reallocated
+  — growing it later could leave an in-flight marker kernel's already-held
+  raw pointer writing through a dangling host pointer; a free list plus the
+  per-park generation tag make
   a slot safe to hand to a different pooled entry once its previous
   occupant is popped or evicted. Every reader of a pool entry's
   completion — `onednn_graph_scratch_entry_usable_locked()`,

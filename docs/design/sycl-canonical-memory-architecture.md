@@ -400,25 +400,48 @@ anyone.
    > compile-failure gate, under **`llama.cpp-fhqe`**. Do not "clean this up"
    > back to `= default`, and note that a future standard bump to C++20 would
    > mask the defect rather than fix it.
-2. **A plain `bool` parameter on `unified_cache_adopt_raw_host_allocation()`**,
-   for the unified cache's **own staging buffer**. That adopt runs during
-   `unified_cache` construction and cannot route through the coordinator without
-   a circular dependency, so it stays a bootstrap mint. **Enforced instead by the
-   helper being TU-static in `unified-cache.cpp`** — unreachable from any other
-   translation unit — **plus a source gate pinning it to a single call site.**
+2. **A plain `bool` parameter on `unified_cache_adopt_raw_host_allocation()`**.
+   That adopt cannot route through the coordinator without a circular
+   dependency (for the first site below, it runs during `unified_cache`
+   construction; for the second, lazily under the cache's own mutex), so it
+   stays a bootstrap mint. **Enforced instead by the helper being TU-static in
+   `unified-cache.cpp`** — unreachable from any other translation unit —
+   **plus a source gate pinning it to a two-site ALLOWLIST**, one cohort tag
+   per site, and refusing a third:
+   - `"unified_cache:staging"` — the unified cache's own staging buffer.
+   - `"unified_cache:onednn_graph_scratch_flag_slab"` — the oneDNN
+     Graph-scratch pool's completion-flag slab (`llama.cpp-c6ah`). This site
+     needs `CACHE_BACKING` for the same reason the staging buffer does: a
+     device marker kernel can still be in flight, holding a raw pointer into
+     the slab, when shutdown runs (see `unified-cache.cpp:18338`'s
+     pre-teardown census), so the slab must survive destructive teardown
+     rather than being refused as a live non-`CACHE_BACKING` control.
+     Reviewed and accepted as the second allowlisted mint rather than
+     reclassified `EXTERNAL_EXACT`, because `EXTERNAL_EXACT` carries no such
+     teardown exemption.
 
 Mechanism 2 is not weaker in *reach*, only in the kind of proof: staticness and
 the gate are checked by the build and by the test, not by the type system. **Do
-not describe the token as the only mint path** — that overstatement was a review
-finding against the code comments (`llama.cpp-81gt`, comment `c-by9u`) and it is
-equally wrong here.
+not describe the token as the only mint path, and do not describe mechanism 2
+as a single-site mint path** — the "only mint path" overstatement was a review
+finding against the code comments (`llama.cpp-81gt`, comment `c-by9u`); the
+single-site framing is equally wrong now that a second site is allowlisted.
 
-`tests/test-sycl-owner-allocation-migration.py` is the enforceable half of this
-subsection. It asserts that `cache_backing` is absent from the public request
-structs, that `allocation-provenance.hpp` is included only by `unified-cache.cpp`
-and `pinned-pool.cpp`, and that the bootstrap helper is still `static` with
-exactly one call site passing `true`. Mechanism 1 needs no gate — it is a
-compile error.
+Two gates enforce this subsection and must agree with each other, since they
+check the same allowlist from different files:
+
+- `tests/test-sycl-owner-allocation-migration.py` asserts that `cache_backing`
+  is absent from the public request structs, that
+  `allocation-provenance.hpp` is included only by `unified-cache.cpp` and
+  `pinned-pool.cpp`, and that the bootstrap helper is still `static` with
+  exactly the two-site allowlist above passing `true` (one call per cohort
+  tag, no third site).
+- `tests/test-sycl-onednn-graph-allocator-source.py` independently re-derives
+  the same two-cohort allowlist from `unified-cache.cpp`'s actual call sites,
+  as the registered gate for the oneDNN Graph-scratch allocator's own change
+  history.
+
+Mechanism 1 needs no gate — it is a compile error.
 
 ---
 
