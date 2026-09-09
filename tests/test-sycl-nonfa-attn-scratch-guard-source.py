@@ -140,6 +140,42 @@ def test_guard_consults_the_demand_formula():
         "a refusal must report the largest fitting n_ctx (same style as the KV budget refusal's "
         "ggml_sycl_largest_fitting_n_ctx()), not just an error with no remediation"
     )
+    assert "runtime context rejected" in body_norm, (
+        "this guard's own refusals must say \"runtime context rejected\", not reuse the pre-existing "
+        "KV budget refusal's \"runtime KV update rejected\" wording -- they are different checks"
+    )
+    assert "GGML_SYCL_NONFA_ATTN_SCRATCH_MB" in body_norm, (
+        "the SCRATCH-zone refusal must name the env var and the exact MB value that would let this "
+        "shape proceed, since that is the only automatic-at-load-time remediation available "
+        "(llama.cpp-fkpg gates piping the real n_ctx into pre-load sizing)"
+    )
+    assert "unified_cache_ensure_planned_arena_zones(" in body_norm, (
+        "the guard must make the opportunistic re-plan attempt (same call reserve_onednn_scratch() "
+        "already documents as succeeding only while the arena is still unused) before checking capacity"
+    )
+    assert "unified_cache_set_planned_nonfa_attn_scratch_shape(" in body_norm, (
+        "the opportunistic re-plan must record the REAL runtime shape first, not the load-time one"
+    )
+
+    # The complementary whole-plan check: weights+KV (already tracked in
+    # next_plan.vram_bytes) plus this consumer's own transient footprint,
+    # against next_plan.vram_budget.
+    assert "vram_bytes" in body_norm and "vram_budget" in body_norm, (
+        "the complementary whole-plan check must compare against next_plan.vram_bytes/vram_budget, "
+        "the same totals the KV budget refusal already tracks"
+    )
+    assert "sizeof(float)" in body_norm, (
+        "the whole-plan check must add the scheduler-owned KQ/KQV f32 buffer's bytes "
+        "(n_head * n_ctx * n_ubatch * sizeof(float))"
+    )
+    assert "ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info)" in body_norm, (
+        "the whole-plan check's remediation must include the KV-based largest-fitting figure, "
+        "not only the SCRATCH-zone-based one"
+    )
+    assert "std::min(fits_kv, fits_scr)" in body_norm, (
+        "the whole-plan check's remediation must be the MIN of the KV-based and SCRATCH-zone-based "
+        "largest-fitting figures, per the reviewed design -- not either alone"
+    )
 
 
 def test_for_model_forwards_flash_attn_enabled():
@@ -176,6 +212,36 @@ def test_formula_and_inverse_are_declared_and_defined():
     assert demand_def != -1
     preceding = cpp_norm[max(0, demand_def - 40) : demand_def]
     assert "static" not in preceding, "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
+
+
+def test_auto_flash_attn_resolution_rechecks_the_guard():
+    """llama.cpp-oyfl F4: cparams.flash_attn defaults true for AUTO before
+    resolve_fused_ops() resolves it (llama-context.cpp's cparams init runs
+    before the constructor's runtime-context call), so an AUTO context that
+    resolves to OFF must re-trigger the SYCL runtime-context call with the
+    now-resolved value, or the guard above never sees it for that context."""
+    ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
+    assert "void llama_context::sycl_resync_runtime_context_flash_attn()" in ctx_norm, (
+        "expected a shared helper re-running the runtime-context call, callable from both the "
+        "constructor and resolve_fused_ops()"
+    )
+
+    resolve_start = ctx_norm.find("void llama_context::resolve_fused_ops(")
+    assert resolve_start != -1, "resolve_fused_ops() definition not found"
+    resolve_body = ctx_norm[resolve_start : resolve_start + 4000]
+    assert re.search(r"if \(cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
+                      r"sycl_resync_runtime_context_flash_attn\(\);", resolve_body), (
+        "resolve_fused_ops() must call sycl_resync_runtime_context_flash_attn() inside the same "
+        "if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly once, right when "
+        "the real value becomes known"
+    )
+
+    # The helper's own header declaration exists too, so both callers compile
+    # against a real class member, not an undeclared symbol this test alone
+    # would not catch.
+    ctx_h = (ROOT / "src/llama-context.h").read_text()
+    ctx_h_norm = _normalize_ws(strip_comments(ctx_h))
+    assert "void sycl_resync_runtime_context_flash_attn();" in ctx_h_norm
 
 
 def test_plan_time_shape_is_recorded_unconditionally():

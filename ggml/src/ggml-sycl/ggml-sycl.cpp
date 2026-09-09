@@ -16810,40 +16810,113 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
 
     // llama.cpp-oyfl: the KV/MMID replan above fits the device budget, but a
     // fitting KV shape says nothing about the non-flash-attention batched
-    // mul_mat path's per-op scratch demand -- that consumer never went
-    // through replan_moe_mmid_workspaces_for_runtime() at all. When flash
-    // attention is off, check it separately against the SCRATCH zone the
-    // arena already reserved (fixed at first reservation -- this cannot grow
-    // the zone, only refuse the update, the same limitation the KV refusal
-    // above has). See ggml-sycl.cpp:62541-area's abort site
-    // ("batched F16 mul_mat failed -- no recovery path available") for what
-    // this refusal exists to prevent: that abort fires mid-prefill, after
-    // weights and KV are already committed, with no arithmetic printed.
+    // mul_mat path's own demand -- that consumer never went through
+    // replan_moe_mmid_workspaces_for_runtime() at all. When flash attention
+    // is off, run two independent checks. See ggml-sycl.cpp's
+    // ggml_sycl_mul_mat_batched_sycl() abort site ("batched F16 mul_mat
+    // failed -- no recovery path available") for what both exist to
+    // prevent: that abort fires mid-prefill, after weights and KV are
+    // already committed, with no arithmetic printed.
     if (!flash_attn_enabled) {
         ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
         if (cache && cache->arena_active()) {
-            const size_t   scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
-            const uint32_t n_head           = next_plan.planner_n_head;
-            const size_t   nonfa_demand =
+            const uint32_t n_head = next_plan.planner_n_head;
+
+            // Opportunistic re-plan: record the REAL runtime shape (not the
+            // load-time conservative default populate_host_zone_sizing() saw)
+            // and ask the arena to re-check its planned zones. This succeeds
+            // only in the same "rare case where the arena is still empty"
+            // reserve_onednn_scratch()'s own comment already documents (no
+            // live weight leases yet) -- for the standard model-load flow it
+            // is a no-op, because llama_model_sycl_make_placement_envelope()
+            // (llama-model.cpp) hardcodes envelope.n_ctx = 0, so the SCRATCH
+            // zone was never sized for this shape to begin with. Cheap and
+            // safe either way: on success the capacity check below sees a
+            // larger zone and may pass; on failure it logs its own existing
+            // "live allocations prevent rebuild" message and changes nothing.
+            if (n_head > 0) {
+                ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(ctx->device, n_head,
+                                                                              next_kv_info.n_ubatch, n_ctx);
+                (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(ctx->device);
+            }
+
+            const size_t scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+            const size_t nonfa_demand =
                 ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, next_kv_info.n_ubatch, n_ctx);
+
+            // Check 1 (primary -- this is the one that explains and catches
+            // the llama.cpp-oyfl Mistral 7B Q4_0 repro): does the staging
+            // demand fit the SCRATCH zone's actual reserved capacity, fixed
+            // since first reservation (the re-plan above notwithstanding)?
             if (n_head > 0 && nonfa_demand > scratch_capacity) {
-                const double   mb   = 1024.0 * 1024.0;
-                const uint32_t fits = ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(
+                const double   mb           = 1024.0 * 1024.0;
+                const uint32_t fits_scratch = ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(
                     scratch_capacity, n_head, next_kv_info.n_ubatch);
+                const long remediation_mb = (static_cast<long>(nonfa_demand) + (1024 * 1024 - 1)) / (1024 * 1024);
                 GGML_LOG_ERROR(
-                    "[SYCL-PLAN] runtime KV update rejected: non-FA attention scratch exceeds the reserved "
+                    "[SYCL-PLAN] runtime context rejected: non-FA attention scratch exceeds the reserved "
                     "SCRATCH zone -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB zone=%.1f MB "
                     "over_by=%.1f MB\n",
                     n_ctx, next_kv_info.n_ubatch, n_head, nonfa_demand / mb, scratch_capacity / mb,
                     (nonfa_demand - scratch_capacity) / mb);
-                if (fits >= 256) {
+                GGML_LOG_ERROR(
+                    "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention path "
+                    "does not fit the device budget at this length; pass -fa 1/auto to use flash attention, "
+                    "or set GGML_SYCL_NONFA_ATTN_SCRATCH_MB=%ld before loading the model to size the SCRATCH "
+                    "zone for this shape%s\n",
+                    remediation_mb, fits_scratch >= 256 ? "" : ", or reduce -c/-p to fit the default zone");
+                if (fits_scratch >= 256) {
                     GGML_LOG_ERROR(
-                        "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention "
-                        "path does not fit the device budget at this length; the largest non-FA context "
-                        "estimated to fit is about -c %u, or pass -fa 1/auto to use flash attention instead\n",
-                        fits);
+                        "[SYCL-PLAN] without raising the zone, the largest non-FA context estimated to fit "
+                        "is about -c %u\n",
+                        fits_scratch);
                 }
                 return;
+            }
+
+            // Check 2 (complementary -- a different, larger-model regime
+            // this repro does not exercise): even with the SCRATCH zone
+            // satisfied, does the WHOLE plan (weights + KV, already tracked
+            // in next_plan.vram_bytes, plus this consumer's own transient
+            // footprint) still fit the device budget? The transient
+            // footprint is the scheduler-owned KQ/KQV f32 buffer -- counted
+            // ONCE, not twice: ggml_gallocr_allocate_node() (ggml-alloc.c)
+            // reuses a parent's buffer in place for GGML_OP_SOFT_MAX when it
+            // has exactly one consumer and matching layout, which is exactly
+            // llama-graph.cpp's `kq = ggml_soft_max_ext(ctx0, kq, ...)` --
+            // plus the same staging demand as check 1.
+            if (n_head > 0) {
+                const uint64_t kq_tensor_bytes = static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ctx) *
+                                                 static_cast<uint64_t>(next_kv_info.n_ubatch) * sizeof(float);
+                const uint64_t whole_plan_needed =
+                    static_cast<uint64_t>(next_plan.vram_bytes) + kq_tensor_bytes + nonfa_demand;
+                if (whole_plan_needed > next_plan.vram_budget) {
+                    const double   mb       = 1024.0 * 1024.0;
+                    const uint32_t fits_kv  = ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info);
+                    const uint32_t fits_scr = ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(
+                        scratch_capacity, n_head, next_kv_info.n_ubatch);
+                    // MIN of the two independently-derived figures, not a
+                    // true joint inversion of (KV + kq + staging) against
+                    // n_ctx -- both kq_tensor_bytes and nonfa_demand also
+                    // scale with n_ctx, so the true whole-plan-fitting value
+                    // could be somewhat smaller than either alone. This is a
+                    // conservative approximation, not exact.
+                    const uint32_t fits_whole = std::min(fits_kv, fits_scr);
+                    GGML_LOG_ERROR(
+                        "[SYCL-PLAN] runtime context rejected: whole-plan budget exceeded with non-FA attention "
+                        "-- n_ctx=%u n_ubatch=%u vram=%.1f MB (weights+kv %.1f + kq/kqv %.1f + staging %.1f) "
+                        "budget=%.1f MB over_by=%.1f MB\n",
+                        n_ctx, next_kv_info.n_ubatch, whole_plan_needed / mb, next_plan.vram_bytes / mb,
+                        kq_tensor_bytes / mb, nonfa_demand / mb, next_plan.vram_budget / mb,
+                        (whole_plan_needed - next_plan.vram_budget) / mb);
+                    if (fits_whole >= 256) {
+                        GGML_LOG_ERROR(
+                            "[SYCL-PLAN] the largest non-FA context estimated to fit the whole plan is about "
+                            "-c %u (the smaller of the KV-budget and SCRATCH-zone figures)\n",
+                            fits_whole);
+                    }
+                    return;
+                }
             }
         }
     }

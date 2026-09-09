@@ -16,12 +16,13 @@
 // available" (ggml-sycl.cpp, formerly line 62541) at n_head=32, n_ubatch=512,
 // n_ctx=8192 -- Mistral 7B's query-head count, llama-bench's default ubatch,
 // and the prompt length driving the KV/attention shape. The formula:
-//   demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3 / 2
-// (see the formula's derivation comment in unified-cache.hpp for why the
-// KQV term alone is kept, and why c=3/2 is carried over by analogy from the
-// oneDNN Graph-scratch floor rather than independently measured -- no GPU
-// access at authoring time). At the repro shape this computes to an EXACT
-// 384 MiB, which is the anchor case below.
+//   demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3
+// (see the formula's derivation comment in unified-cache.cpp for why the
+// KQV term alone is kept, and why c=3 is MEASURED from the repro log's own
+// SCRATCH_ZONE occupancy at the moment of failure -- not an analogy to the
+// oneDNN Graph-scratch floor's c=1.5, an earlier version of this formula's
+// mistake). At the repro shape this computes to an EXACT 768 MiB, which is
+// the anchor case below.
 
 #include "ggml-sycl/unified-cache.hpp"
 #include "test-skip.h"
@@ -80,11 +81,11 @@ void test_default_formula() {
 
     const case_t cases[] = {
         // The B50 repro shape (llama.cpp-oyfl): exact.
-        { 32, 512, 8192, 384, "Mistral B50 repro (n_head=32, n_ubatch=512, n_ctx=8192) -> 384 MiB" },
-        { 32, 512, 2048, 96,  "n_head=32, n_ubatch=512, n_ctx=2048 -> 96 MiB"                      },
-        { 32, 256, 2048, 48,  "n_head=32, n_ubatch=256, n_ctx=2048 -> 48 MiB"                      },
-        // Raw 24 MiB, above the 16 MiB floor -- exercises the formula, not the clamp.
-        { 32, 512, 512,  24,  "n_head=32, n_ubatch=512, n_ctx=512 -> 24 MiB"                       },
+        { 32, 512, 8192, 768, "Mistral B50 repro (n_head=32, n_ubatch=512, n_ctx=8192) -> 768 MiB" },
+        { 32, 512, 2048, 192, "n_head=32, n_ubatch=512, n_ctx=2048 -> 192 MiB"                     },
+        { 32, 256, 2048, 96,  "n_head=32, n_ubatch=256, n_ctx=2048 -> 96 MiB"                      },
+        // Raw 48 MiB, above the 16 MiB floor -- exercises the formula, not the clamp.
+        { 32, 512, 512,  48,  "n_head=32, n_ubatch=512, n_ctx=512 -> 48 MiB"                       },
         // Raw well below 16 MiB -- exercises the clamp.
         { 1,  1,   1,    16,  "n_head=1, n_ubatch=1, n_ctx=1 -> clamped to 16 MiB"                 },
     };
@@ -132,10 +133,12 @@ void test_largest_fitting_n_ctx() {
     // pre-existing floor) at the repro's n_head/n_ubatch fits LESS than
     // 8192 -- this is the concrete case the runtime-context-update guard
     // must refuse rather than let ggml_sycl_mul_mat_batched_sycl() abort on.
+    // Exact value: 512 MiB / (32 * 512 * 6) = 5461.33, rounded down to the
+    // nearest 256 = 5376.
     const uint32_t fits_default_zone = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(512 * kMiB, 32, 512);
-    check(fits_default_zone < 8192,
-          "the default 512 MiB SCRATCH zone does not fit the repro's n_ctx=8192 at n_head=32/n_ubatch=512");
-    check(fits_default_zone > 0, "the default 512 MiB SCRATCH zone still fits SOME positive n_ctx");
+    check(fits_default_zone == 5376,
+          "the default 512 MiB SCRATCH zone fits exactly n_ctx=5376 at n_head=32/n_ubatch=512, below the "
+          "repro's n_ctx=8192");
 
     // A zone capacity of 0 fits nothing.
     check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(0, 32, 512) == 0,

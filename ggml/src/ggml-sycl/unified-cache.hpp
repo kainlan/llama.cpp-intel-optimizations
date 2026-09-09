@@ -1335,9 +1335,14 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // attention runs through ggml_sycl_mul_mat_batched_sycl() (ggml-sycl.cpp)
 // twice per layer: KQ = mul_mat(K, Q), then KQV = mul_mat(V, softmax(KQ)).
 // Both calls stage their non-f16 operand into an f16 buffer via
-// scoped_unified_queue_temp, a COMPUTE-role transient that PREFERS the
-// SCRATCH zone (ggml_sycl_transient_device_intent(), common.hpp). Unlike the
-// oneDNN Graph-scratch floor above, this path is independent of
+// scoped_unified_queue_temp, a transient allocation shaped by
+// ggml_sycl_transient_device_intent() (common.hpp): on the calling thread's
+// COMPUTE path (not recording a command graph -- the common case for this
+// dispatch), that constraint sets prefer_vram_zone = SCRATCH; while recording,
+// it takes the GRAPH_TMP shape instead and does not name SCRATCH at all (see
+// that function's own comment for why the two shapes must not be conflated).
+// This formula models the COMPUTE-path demand. Unlike the oneDNN Graph-scratch
+// floor above, this path is independent of
 // GGML_SYCL_DNNL -- it is the native SYCL/oneMath batched path, so this
 // declaration and its implementation are unconditional.
 //
@@ -1375,14 +1380,16 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB overrides the oneDNN floor: an explicit
 // non-negative value always wins.
 //
-// NOT independently measured on hardware at authoring time (no GPU access) --
-// unlike the oneDNN floor's c=1.5, which was fit to five real captures
-// (llama.cpp-0oxf, comment c-xcop), this concurrency factor is carried over
-// by analogy (scoped_unified_queue_temp's release() is the SAME async
-// marker-event release architecture on both paths -- see its definition in
-// ggml-sycl.cpp -- so more than one generation's buffer can plausibly be live
-// under load here too). Treat this as a starting floor to be tightened from a
-// real capture, not a validated constant.
+// The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro log's
+// own SCRATCH_ZONE occupancy at the moment of failure -- not carried over by
+// analogy from the oneDNN floor's c=1.5 (an earlier version of this formula
+// did exactly that, and it under-covered the repro). See the derivation
+// comment on unified_cache_nonfa_attn_scratch_demand_bytes()'s definition
+// (unified-cache.cpp) for the exact log lines and arithmetic. It is inferred
+// from ONE repro's zone-state snapshot, not fit to several independent
+// hardware measurements the way the oneDNN c=1.5 was (five captures,
+// llama.cpp-0oxf comment c-xcop) -- treat it as a floor to tighten from a
+// real multi-point capture, not a validated constant.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 
 // Inverse of the formula above: the largest n_ctx whose modeled demand still
