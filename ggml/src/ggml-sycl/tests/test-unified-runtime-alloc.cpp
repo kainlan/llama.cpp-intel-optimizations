@@ -6,10 +6,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-#include "../unified-cache.hpp"
 #include "../ggml-sycl-test.hpp"
+#include "../unified-cache.hpp"
 #include "../zone-sizing.hpp"
-
+#include "sycl-spin-kernel.hpp"
 #include "sycl-test-skip.hpp"
 
 #include <algorithm>
@@ -20,9 +20,9 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <sycl/sycl.hpp>
 #include <thread>
 #include <vector>
-#include <sycl/sycl.hpp>
 
 static int g_tests_run    = 0;
 static int g_tests_passed = 0;
@@ -892,15 +892,7 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
     int * cell = sycl::malloc_device<int>(1, dq);
     TEST_ASSERT(cell != nullptr, "device marker cell allocation failed (setup, not the regression)");
     dq.memset(cell, 0, sizeof(int)).wait();
-    sycl::event release_event = dq.submit([&](sycl::handler & h) {
-        h.single_task([=]() {
-            int acc = 0;
-            for (long long i = 0; i < 2000000; ++i) {
-                acc   = acc + *cell + 1;
-                *cell = acc;
-            }
-        });
-    });
+    sycl::event release_event = submit_spin_kernel(dq, cell, 2000000);
 
     cache->onednn_graph_scratch_free(ptr, &release_event);
 
@@ -1008,15 +1000,7 @@ static bool onednn_graph_scratch_flag_slab_released_at_module_shutdown(sycl::que
     int * cell = sycl::malloc_device<int>(1, dq);
     TEST_ASSERT(cell != nullptr, "device marker cell allocation failed");
     dq.memset(cell, 0, sizeof(int)).wait();
-    sycl::event release_event = dq.submit([&](sycl::handler & h) {
-        h.single_task([=]() {
-            int acc = 0;
-            for (long long i = 0; i < 2000000; ++i) {
-                acc   = acc + *cell + 1;
-                *cell = acc;
-            }
-        });
-    });
+    sycl::event release_event = submit_spin_kernel(dq, cell, 2000000);
 
     cache->onednn_graph_scratch_free(ptr, &release_event);
 
@@ -1373,6 +1357,46 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--static-destruction-child") == 0) {
         zone_sizing_record_observation("static-destruction-child");
         return get_unified_cache(q) ? 0 : 1;
+    }
+
+    // llama.cpp-me60: run exactly ONE of the two shutdown-poisoning cases,
+    // in its OWN process, so a refused shutdown_unified_cache() call from
+    // one never carries over into the other. Measured on hardware (see
+    // onednn_graph_scratch_flag_slab_released_at_module_shutdown()'s own
+    // comment): a refused shutdown is not retryable-safe for the oneDNN
+    // Graph-scratch DIRECT pool -- it leaves the cache partially torn down,
+    // and a later onednn_graph_scratch_alloc() on that same cache resolved
+    // off-device and hit GGML_ABORT. Two ctest entries of THIS SAME binary
+    // (same ENVIRONMENT/LABELS/TIMEOUT as the default registration, names
+    // suffixed with the case) invoke this with `--case <name>` so each is a
+    // valid, independent regression witness; the plain no-argument run
+    // below still calls both back-to-back, unchanged, for local/manual
+    // convenience -- fine for a human reading the combined output, but not
+    // what the registered gates use.
+    if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
+#if GGML_SYCL_DNNL
+        const char * case_name = argv[2];
+        bool         case_ok;
+        if (std::strcmp(case_name, "onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim") == 0) {
+            case_ok = onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(q);
+        } else if (std::strcmp(case_name, "onednn_graph_scratch_flag_slab_released_at_module_shutdown") == 0) {
+            case_ok = onednn_graph_scratch_flag_slab_released_at_module_shutdown(q);
+        } else {
+            fprintf(stderr, "unknown --case %s\n", case_name);
+            return 1;
+        }
+        fprintf(stderr, "-------------------------------------------\n");
+        fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+        return case_ok ? 0 : 1;
+#else
+        // The two named cases only exist under GGML_SYCL_DNNL (the whole
+        // onednn_graph_scratch_* subsystem is guarded the same way) --
+        // consistent with this binary's other GGML_SYCL_DNNL-gated
+        // behavior, report a real SKIP (77) rather than silently falling
+        // through to the full default suite below.
+        fprintf(stderr, "SKIP: --case %s requires GGML_SYCL_DNNL, not enabled in this build\n", argv[2]);
+        return SYCL_TEST_SKIP;
+#endif
     }
 
     bool ok = true;
