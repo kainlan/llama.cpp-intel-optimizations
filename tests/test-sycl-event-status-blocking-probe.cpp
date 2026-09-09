@@ -168,6 +168,13 @@ long long measure_query_ms(sycl::event & evt) {
 }  // namespace
 
 int main(int, char ** argv) {
+    // Same pinning convention as every sibling SYCL gate in this directory
+    // -- see sycl-selector-fallback.hpp's own comment for why a plain
+    // setenv() in main() would be too late. MUST be the first statement of
+    // main(): the fallback can re-exec the whole process, and anything run
+    // before it would run twice (once before the re-exec, once after).
+    sycl_test_selector_fallback(argv, "level_zero:1");
+
     // Line-buffer stdout (regardless of whether it lands on a terminal or,
     // as under ctest, a redirected file) so a run killed mid-measurement
     // (e.g. an unexpectedly long default iteration count, or a hung device)
@@ -179,11 +186,6 @@ int main(int, char ** argv) {
     // stdout), so nothing printed at all before that run was killed --
     // this fixes both the count (below) and the buffering.
     setvbuf(stdout, nullptr, _IOLBF, 0);
-
-    // Same pinning convention as every sibling SYCL gate in this directory
-    // -- see sycl-selector-fallback.hpp's own comment for why a plain
-    // setenv() in main() would be too late.
-    sycl_test_selector_fallback(argv, "level_zero:1");
 
     // GGML_TEST_SPIN_ITERATIONS: the spin kernel's iteration count is a
     // hardware-speed-dependent guess (this file was authored without GPU
