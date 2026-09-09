@@ -1728,9 +1728,10 @@ size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n
     // it only needs to catch the case where the formula itself underflows to
     // near-zero (n_head, n_ubatch, or n_ctx == 0, e.g. before any context is
     // known) and floor to something a single small allocation can still need.
-    // (kNonfaAttnScratchFloorBytes, defined above env_mb_override(), is this
-    // same 16 MiB value -- hoisted to file scope so
-    // ensure_planned_arena_zones() can reference it too.)
+    // (kNonfaAttnScratchFloorBytes, defined at file scope just above
+    // unified_cache_nonfa_attn_scratch_demand_bytes(), is this same 16 MiB
+    // value -- hoisted to file scope so ensure_planned_arena_zones() can
+    // reference it too.)
     static constexpr uint64_t kSizeofF16        = 2;
     static constexpr uint64_t kConcurrencyFloor = 3;  // see the derivation above
     const uint64_t            elems =
