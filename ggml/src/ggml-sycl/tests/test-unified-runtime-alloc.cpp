@@ -826,6 +826,110 @@ static bool explicit_global_cache_shutdown_is_clean() {
     return true;
 }
 
+#if GGML_SYCL_DNNL
+// llama.cpp-me60 F1, STEP 0 (RED test only -- no fix in this commit): the
+// oneDNN Graph-scratch completion-flag slab
+// (onednn_graph_scratch_flag_slab_owner_, allocated lazily by
+// onednn_graph_scratch_ensure_flag_slab_locked() the first time a DIRECT
+// entry is parked with a real release event) is adopted into the global
+// runtime-allocation registry as a bootstrap CACHE_BACKING control, but
+// shutdown_resources() never releases it on the normal path -- it is left
+// to ~unified_cache() member destruction, which runs AFTER
+// unified_cache_shutdown_retryable_postconditions_clean()'s sweep. That
+// sweep (see runtime_allocation_owned_by_cache_snapshot()) accepts only
+// rows classified via contains_pinned()/contains_pinned_backing_allocation()
+// against host_arena_ -- it never consults allocation_control_class -- so
+// the slab's row, host USM allocated OUTSIDE the pinned pool, fails it
+// regardless of being CACHE_BACKING. shutdown_unified_cache() then returns
+// false with "[UNIFIED-CACHE] runtime allocation registry still populated
+// at shutdown boundary" once any DIRECT entry has ever been parked with a
+// real event in this process.
+//
+// This case targets exactly that sweep: park one DIRECT Graph-scratch
+// entry with a device-kernel release event (so the slab is allocated and
+// armed, mirroring a real oneDNN free callback -- a nullptr event takes
+// the "complete unconditionally" branch and never allocates the slab at
+// all, per onednn_graph_scratch_free()'s own comment), then call the same
+// module-level shutdown_unified_cache() every other case in this file
+// already asserts succeeds.
+//
+// EXPECTED ON UNFIXED CODE (pre-llama.cpp-me60): FAILS with the registry
+// message above. Once F1 lands (the fix releases the slab under
+// onednn_graph_scratch_mutex_ inside shutdown_resources()'s normal path),
+// this case passes.
+//
+// Deliberately placed and called LAST, after
+// explicit_global_cache_shutdown_is_clean(): that case already leaves the
+// global cache shut down, so get_unified_cache(q) here lazily recreates a
+// fresh one -- a clean slate rather than reusing state any earlier case
+// left behind.
+static bool onednn_graph_scratch_flag_slab_released_at_module_shutdown(sycl::queue & q) {
+    TEST_BEGIN("onednn_graph_scratch_flag_slab_released_at_module_shutdown");
+
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+
+    sycl::queue & dq = cache->get_queue();
+
+    // Must exceed the natural ~256 MB no-model ONEDNN zone floor (measured
+    // on hardware -- see test-sycl-onednn-graph-scratch-direct.cpp's own
+    // kZoneFloorBytes comment: GGML_SYCL_ONEDNN_GRAPH_ZONE_MB does not
+    // shrink it for a no-model arena) so this request deterministically
+    // takes the DIRECT (non-arena) path that can allocate/arm the flag
+    // slab, and stays under the 700 MB cap main() raises via
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB before first cache use.
+    constexpr size_t size = 300ull * 1024 * 1024;
+
+    void * ptr = cache->onednn_graph_scratch_alloc(size, 256, &dq);
+    TEST_ASSERT(ptr != nullptr, "DIRECT allocation for the shutdown-repro fixture failed");
+
+    // A short device-kernel release event -- a real command, not a
+    // default-constructed sycl::event -- so onednn_graph_scratch_free()
+    // takes the arming branch and onednn_graph_scratch_ensure_flag_slab_locked()
+    // actually allocates the slab this case targets.
+    int * cell = sycl::malloc_device<int>(1, dq);
+    TEST_ASSERT(cell != nullptr, "device marker cell allocation failed");
+    dq.memset(cell, 0, sizeof(int)).wait();
+    sycl::event release_event = dq.submit([&](sycl::handler & h) {
+        h.single_task([=]() {
+            int acc = 0;
+            for (long long i = 0; i < 2000000; ++i) {
+                acc   = acc + *cell + 1;
+                *cell = acc;
+            }
+        });
+    });
+
+    cache->onednn_graph_scratch_free(ptr, &release_event);
+
+    // Wait for the release event AND the separate, asynchronous marker
+    // kernel that arms its flag slot (see
+    // onednn_graph_scratch_pool_entry::flag_slot's own comment in
+    // unified-cache.hpp) so this parks a genuine, complete registry row
+    // rather than one still mid-arming when shutdown runs. Not load-bearing
+    // for the defect itself -- the slab's OWN row is what the sweep
+    // refuses, independent of any individual pooled entry's completion
+    // state -- but matches what a real oneDNN free callback leaves behind.
+    release_event.wait();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    while (!cache->onednn_graph_scratch_pool_entry_flag_true_for_test(size) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    sycl::free(cell, dq);
+
+    // THE ACTUAL REGRESSION CHECK.
+    TEST_ASSERT(shutdown_unified_cache(),
+                "module shutdown refused once a DIRECT Graph-scratch entry had been parked -- the "
+                "completion-flag slab's registry row is not released inside shutdown_resources() "
+                "(llama.cpp-me60 F1); look for \"[UNIFIED-CACHE] runtime allocation registry still populated at "
+                "shutdown boundary\" in stderr above");
+
+    TEST_PASS();
+    return true;
+}
+#endif  // GGML_SYCL_DNNL
+
 static bool independent_exact_token_defers_owned_release(sycl::queue & q) {
     TEST_BEGIN("B50_B70_independent_exact_token_defers_owned_release");
     unified_cache * cache = get_unified_cache(q);
@@ -1107,6 +1211,29 @@ int main(int argc, char ** argv) {
         set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
     }
 
+#if GGML_SYCL_DNNL
+    // llama.cpp-me60 F1: both memoize their env var in a function-local
+    // static on first read (onednn_graph_scratch_direct_cap_bytes(),
+    // onednn_graph_scratch_test_hooks_enabled() in unified-cache.cpp), so
+    // setting either later would be a silent no-op -- nothing before this
+    // point in main() touches the oneDNN Graph-scratch subsystem, so this
+    // is genuinely before any such first read.
+    //
+    // CAP: 700 MB, not the default -- raised so
+    // onednn_graph_scratch_flag_slab_released_at_module_shutdown()'s 300 MiB
+    // DIRECT request (see that function's own comment for why it must
+    // exceed the ~256 MB no-model zone floor) has headroom under the cap
+    // regardless of what this process's own arena planning leaves the
+    // default at; mirrors tests/test-sycl-onednn-graph-scratch-direct.cpp's
+    // own kCapMiB rationale.
+    set_env_var("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", "700");
+    // TEST HOOKS: without this,
+    // onednn_graph_scratch_pool_entry_flag_true_for_test() returns false
+    // unconditionally (see its own comment in unified-cache.hpp) and the
+    // new case's poll loop would just run out its deadline every time.
+    set_env_var("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1");
+#endif
+
     // Select a device BEFORE constructing the queue. The bare `sycl::queue q;`
     // this replaced default-constructs through the default selector, which THROWS
     // on a device-less host -- from outside the try, so the process aborted (exit
@@ -1172,6 +1299,12 @@ int main(int argc, char ** argv) {
     // retry drains the process-global cache while q and SYCL are still alive.
     ok &= retained_pinned_suballocation_refuses_preteardown(q);
     ok &= explicit_global_cache_shutdown_is_clean();
+#if GGML_SYCL_DNNL
+    // llama.cpp-me60 F1: deliberately after explicit_global_cache_shutdown_is_clean()
+    // -- see that function's own comment for why running after a shutdown is
+    // the clean starting state this case wants.
+    ok &= onednn_graph_scratch_flag_slab_released_at_module_shutdown(q);
+#endif
 
     fprintf(stderr, "-------------------------------------------\n");
     fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
