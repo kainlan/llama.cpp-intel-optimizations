@@ -17334,10 +17334,14 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // figure this process has since drawn down, typically lower -- a
     // boundary shape the full transaction allowed can therefore still be
     // refused here. (Not guaranteed lower: another tenant releasing VRAM
-    // between the two reads could raise it instead.) That refusal surfaces
-    // as the std::runtime_error sycl_recheck_runtime_context_flash_attn()
-    // throws (llama-context.cpp) when this returns
-    // GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
+    // between the two reads could raise it instead, or the two reads
+    // could land inside the same 10 ms TTL cache window (MEM_CACHE_TTL_NS)
+    // on ggml_backend_sycl_get_device_memory() and return the identical
+    // figure instead -- not the case here, since memory init and the
+    // probe graph_reserve() separate the two reads by more than that.)
+    // That refusal surfaces as the std::runtime_error
+    // sycl_recheck_runtime_context_flash_attn() throws (llama-context.cpp)
+    // when this returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
                                            current->plan->planner_n_head_all_max, flash_attn_enabled,

@@ -192,9 +192,9 @@ void test_largest_fitting_n_ctx() {
           "the default 512 MiB SCRATCH zone fits exactly n_ctx=5376 at n_head=32/n_ubatch=512, below the "
           "repro's n_ctx=8192");
 
-    // A zone capacity of 0 fits nothing.
+    // A capacity of 0 fits nothing.
     check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(0, 32, 512) == 0,
-          "a zero-capacity zone fits no context");
+          "a zero capacity fits no context");
 
     // n_head or n_ubatch of 0 is undefined for the formula -- must not divide
     // by zero, and must report "fits nothing" rather than a garbage large
@@ -204,10 +204,10 @@ void test_largest_fitting_n_ctx() {
     check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(512 * kMiB, 32, 0) == 0,
           "n_ubatch=0 reports 0 rather than dividing by zero");
 
-    // Monotonic in zone capacity.
+    // Monotonic in capacity.
     const uint32_t fits_small = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(64 * kMiB, 32, 512);
     const uint32_t fits_large = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(256 * kMiB, 32, 512);
-    check(fits_small < fits_large, "the largest fitting n_ctx increases with zone capacity");
+    check(fits_small < fits_large, "the largest fitting n_ctx increases with capacity");
 
     // The result is always a multiple of 256 (the same cell-rounding
     // convention the KV-side ggml_sycl_largest_fitting_n_ctx() uses).
@@ -216,11 +216,11 @@ void test_largest_fitting_n_ctx() {
 
     // Floor-vs-inverse interaction, scored to the outcome the inverse
     // function's own comment documents: the inverse IGNORES
-    // kNonfaAttnScratchFloorBytes, so for a zone capacity small enough that
+    // kNonfaAttnScratchFloorBytes, so for a capacity small enough that
     // the raw (unfloored) formula at the reported n_ctx is still below the
     // 16 MiB floor, the inverse's own "fits" answer is optimistic --
     // feeding it back into the forward formula (which DOES apply the floor)
-    // reports a demand larger than the zone capacity the inverse was asked
+    // reports a demand larger than the capacity the inverse was asked
     // about. n_head=1, n_ubatch=1 keeps the per-context-cell cost tiny (6
     // bytes), so a capacity of just 2000 bytes still rounds up to a
     // non-zero, 256-aligned n_ctx rather than degenerating to the n_ctx=0
