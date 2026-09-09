@@ -9856,7 +9856,8 @@ void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force) {
 // llama.cpp-c6ah: see this function's declaration comment in
 // unified-cache.hpp for the full mechanism and the finding-28/29/31
 // history of what this predicate used to be and why.
-bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) {
+bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
+    const onednn_graph_scratch_pool_entry & entry) const {
     if (entry.flag_slot >= 0) {
         return onednn_graph_scratch_flag_slab_[entry.flag_slot] == static_cast<int32_t>(entry.flag_generation);
     }

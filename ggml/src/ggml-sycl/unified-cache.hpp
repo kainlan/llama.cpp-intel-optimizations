@@ -4168,8 +4168,13 @@ class unified_cache {
     // it also lets the RED arm exercise onednn_graph_scratch_free() itself
     // taking the unarmed path, not just this function's fallback branch in
     // isolation). This function's flag_slot == -1 fallback is what the RED
-    // arm actually exercises.
-    bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry);
+    // arm actually exercises. `const` (finding 31): it only READS
+    // onednn_graph_scratch_flag_slab_ through the entry's own flag_slot/
+    // flag_generation and calls the static event_complete() -- both const-
+    // compatible -- and several callers (e.g.
+    // onednn_graph_scratch_entry_usable_locked()) are themselves const
+    // member functions, which cannot call a non-const one on `this`.
+    bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) const;
 
     // llama.cpp-c6ah (finding 31): lazily allocates
     // onednn_graph_scratch_flag_slab_ (a plain already-allocated check, NOT
