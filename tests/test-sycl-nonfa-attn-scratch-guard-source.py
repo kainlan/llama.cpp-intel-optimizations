@@ -183,6 +183,15 @@ def test_guard_consults_the_headroom_predicate():
         "the guard must read the empirical outside-arena reserve "
         "(unified_cache_nonfa_attn_outside_arena_reserve_bytes(), 928 MiB) rather than hardcoding it"
     )
+    assert "unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(" in body_norm, (
+        "the refusal's largest-fitting capacity must come from "
+        "unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), the inverse of fits_headroom()'s "
+        "own comparison -- not a hand-written free_mem - reserve subtraction, which can drift from "
+        "the predicate it is supposed to invert"
+    )
+    assert not re.search(r"free_mem\s*>\s*reserve\s*\?", body_norm), (
+        "the hand-written headroom-capacity subtraction must not return -- call the helper instead"
+    )
     assert not re.search(
         r"nonfa_demand\s*<=\s*scratch_capacity|scratch_capacity\s*>=\s*nonfa_demand", body_norm
     ), (
@@ -456,8 +465,12 @@ def test_for_model_forwards_flash_attn_enabled():
 
 
 def test_formula_and_inverse_are_declared_and_defined():
-    """The demand formula and its inverse must be declared (header) and
-    defined (implementation) -- both exported (not file-static), unlike the
+    """llama.cpp-pvjr: covers the demand formula and its inverse, plus the
+    headroom predicate's own exported surface (the reserve, fits_headroom,
+    guard_disabled, and headroom_capacity_bytes). The presence assertions
+    below (declared in the header, defined in the implementation) check
+    only the original two names; the not-file-static loop further down
+    covers all six -- each must be exported (not file-static), unlike the
     oneDNN Graph-scratch floor sibling, because ggml-sycl.cpp (a different
     translation unit) must call them directly."""
     hpp_norm = _normalize_ws(CACHE_HPP_CODE)
@@ -476,7 +489,8 @@ def test_formula_and_inverse_are_declared_and_defined():
     # `static` on the DECLARATION would give each translation unit that
     # includes the header its own internal-linkage copy, which is just as
     # wrong even though it happens to still compile. Checked in both files
-    # for both functions (four checks), with a "static ... name(" bridge
+    # for every name in checked_names below (two files x six names), with a
+    # "static ... name(" bridge
     # that does not name a return type at all -- `\bstatic\b[^;{}]*?\bname\(`
     # -- so it is not fooled by a return-type spelling change ("static
     # std::size_t", say) or a storage-class keyword or attribute stacked

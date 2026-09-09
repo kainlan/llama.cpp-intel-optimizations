@@ -17331,13 +17331,12 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // is re-evaluated honestly here too. This call also runs LATER than
     // the full transaction's own read (it fires from resolve_fused_ops(),
     // after memory init and a probe graph_reserve()), so it reads a free
-    // figure this process has since drawn down (memory init plus the
-    // probe graph_reserve()), typically lower -- a boundary shape the
-    // full transaction allowed can therefore still be refused here. (Not
-    // guaranteed lower: another tenant releasing VRAM between the two
-    // reads could raise it instead.) That refusal surfaces as the
-    // std::runtime_error sycl_recheck_runtime_context_flash_attn() throws
-    // (llama-context.cpp) when this returns
+    // figure this process has since drawn down, typically lower -- a
+    // boundary shape the full transaction allowed can therefore still be
+    // refused here. (Not guaranteed lower: another tenant releasing VRAM
+    // between the two reads could raise it instead.) That refusal surfaces
+    // as the std::runtime_error sycl_recheck_runtime_context_flash_attn()
+    // throws (llama-context.cpp) when this returns
     // GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
