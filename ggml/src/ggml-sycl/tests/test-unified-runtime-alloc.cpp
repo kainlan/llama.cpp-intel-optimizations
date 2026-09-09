@@ -1430,9 +1430,11 @@ int main(int argc, char ** argv) {
     // (same ENVIRONMENT/LABELS/TIMEOUT as the default registration, names
     // suffixed with the case) invoke this with `--case <name>` so each is a
     // valid, independent regression witness; the plain no-argument run
-    // below still calls both back-to-back, unchanged, for local/manual
-    // convenience -- fine for a human reading the combined output, but not
-    // what the registered gates use.
+    // below does NOT call either case -- it prints one line naming them and
+    // why (see that block's own comment): any completed
+    // shutdown_unified_cache() call earlier in the process poisons a
+    // lazily recreated cache, so a default-run invocation would exercise a
+    // test-only defect rather than either case's own target property.
     if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
