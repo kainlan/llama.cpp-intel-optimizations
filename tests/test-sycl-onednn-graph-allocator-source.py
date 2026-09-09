@@ -532,14 +532,18 @@ def test_onednn_graph_allocator_source_contract() -> None:
         re.search(r"kFloorMinBytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", FLOOR_SWA_BODY_CODE)
     )
     # llama.cpp-o3a0: mutation witness for the two-class window logic itself
-    # -- if either the per-class min(n_ctx, n_swa) window or the
+    # -- if either the per-class min(n_ctx, n_swa + n_ubatch) window or the
     # max(ctx_term, swa_term) class selection is dropped (e.g. a careless
-    # "simplification" back to a single term), this fails even though the
-    # Mistral (SWA-free) test rows in test-sycl-onednn-graph-floor.cpp would
-    # not catch it, since n_head_swa_max=0 makes the SWA term vanish there
-    # regardless of whether min/max are present at all.
+    # "simplification" back to a single term or to n_swa alone -- the
+    # LATTER is a real regression this ticket shipped once, GPU-verified:
+    # the SWA window is n_swa + n_ubatch, not n_swa alone), this fails even
+    # though the Mistral (SWA-free) test rows in
+    # test-sycl-onednn-graph-floor.cpp would not catch it, since
+    # n_head_swa_max=0 makes the SWA term vanish there regardless of
+    # whether min/max or the +n_ubatch term are present at all.
     checks["swa formula windows each class independently"] = bool(
-        re.search(r"std::min\s*\(\s*n_ctx\s*,\s*n_swa\s*\)", FLOOR_SWA_BODY_CODE)
+        re.search(r"std::min\s*\(\s*static_cast<uint64_t>\(n_ctx\)\s*,\s*static_cast<uint64_t>\(n_swa\)\s*\+\s*"
+                 r"static_cast<uint64_t>\(n_ubatch\)\s*\)", FLOOR_SWA_BODY_CODE)
     )
     checks["swa formula takes the max across classes, not the sum"] = bool(
         re.search(r"std::max\s*\(\s*ctx_term\s*,\s*swa_term\s*\)", FLOOR_SWA_BODY_CODE)

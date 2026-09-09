@@ -1327,8 +1327,10 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes_stored(int device_id);
 // onednn_graph_scratch_zone_floor_bytes_swa()'s shape-derived floor (see
 // unified-cache.cpp) -- the Graph-scratch request is proportional to
 // n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
-// min(n_ctx, n_swa) for SWA layers, not a single n_head x n_ctx term for
-// every layer (correction on the ticket, llama.cpp-o3a0, after an earlier
+// min(n_ctx, n_swa + n_ubatch) for SWA layers -- a ubatch of n_ubatch
+// queries against an n_swa-key sliding window spans n_swa + n_ubatch keys
+// in total, GPU-verified -- not a single n_head x n_ctx term for every
+// layer (correction on the ticket, llama.cpp-o3a0, after an earlier
 // version of this fix assumed every oneDNN-served layer's window was
 // n_ctx). All-zero means "never planned for this device".
 struct onednn_graph_scratch_planned_shape {

@@ -715,8 +715,10 @@ static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEV
 // scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
 // shape-derived floor -- the oneDNN Graph-scratch request is proportional to
 // n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
-// min(n_ctx, n_swa) for SWA layers (llama.cpp-o3a0), NOT a single n_head x
-// n_ctx term for every layer as an earlier version of this fix assumed.
+// min(n_ctx, n_swa + n_ubatch) for SWA layers (llama.cpp-o3a0; the span a
+// ubatch of n_ubatch queries scans over an n_swa-key sliding window, GPU-
+// verified), NOT a single n_head x n_ctx term for every layer as an
+// earlier version of this fix assumed.
 // Five independent atomics, like every other "planned" global in this file
 // -- 0 means "never planned for this device" for each.
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head_ctx_max[GGML_SYCL_MAX_DEVICES]{};
@@ -1611,19 +1613,22 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // placement_plan -> onednn_graph_scratch_planned_shape) plus the single
 // sliding-window size n_swa, and gives each attention class its own
 // effective KV window: non-SWA layers see n_ctx, SWA layers see
-// min(n_ctx, n_swa). Non-SWA and SWA layers can both be oneDNN-eligible in
-// the same model, so the true peak is whichever CLASS demands more, not
-// their sum -- the compiled partitions for each class are not concurrently
-// outstanding for the same request. A hypothetical n_swa=1024 SWA shape
-// (n_head_swa_max=8, n_head_ctx_max=0) now computes 24 MiB at n_ctx=8192
-// exactly, instead of the 192 MiB the old flat formula predicted -- see
-// the 3-arg overload's own comment below, kept for history. ⚠️ gemma4 E4B's
-// REAL GGUF attention.sliding_window is 512, not 1024 (GPU-verified on the
-// B50 via the "[SYCL-PLAN] oneDNN Graph-scratch zone floor:" log line):
-// at that value this same shape (D=512 global
-// layers still ineligible by default, so n_head_ctx_max=0) computes 12 MiB
-// raw, clamped to 64 MiB -- see test_swa_formula()'s gemma4 row,
-// tests/test-sycl-onednn-graph-floor.cpp.
+// min(n_ctx, n_swa + n_ubatch) -- a sliding window of n_swa keys seen by a
+// ubatch of n_ubatch queries spans n_swa + n_ubatch keys in total (the
+// first query in the ubatch looks n_swa keys back, the last one n_ubatch
+// further along than that), and the oneDNN SDPA scratch scales with that
+// whole span, not n_swa alone (GPU-verified on the B50: solving
+// 1.5 x n_head x n_ubatch x K x sizeof(f32) for K against measured
+// Graph-scratch requests gives K = n_swa + n_ubatch exactly at two
+// different ubatch sizes -- see the gemma4 real-shape derivation below).
+// Non-SWA and SWA layers can both be oneDNN-eligible in the same model, so
+// the true peak is whichever CLASS demands more, not their sum -- the
+// compiled partitions for each class are not concurrently outstanding for
+// the same request. gemma4 E4B's real shape (n_head_swa_max=8, n_swa=512,
+// D=512 global layers still ineligible by default so n_head_ctx_max=0)
+// computes 24 MiB raw at n_ubatch=512 n_ctx=8192, clamped to 64 MiB --
+// matching the GPU probe exactly (see test_swa_formula()'s gemma4 row,
+// tests/test-sycl-onednn-graph-floor.cpp).
 static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                         uint32_t n_head_swa_max,
                                                         uint32_t n_swa,
@@ -1674,29 +1679,41 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
     // hypothesis was that its oneDNN-served layers are sliding-window with
     // window=1024 (matching 1.5 x 8 x 512 x 1024 x 4 B == the measured
     // 24 MB exactly), which is what motivated min(n_ctx, n_swa) rather than
-    // n_ctx as the correct ne11 for SWA layers. ⚠️ THAT WINDOW VALUE WAS
-    // WRONG (GPU-verified on the B50 via the "[SYCL-PLAN] oneDNN
-    // Graph-scratch zone floor:" log line): gemma4
-    // E4B's real GGUF attention.sliding_window is 512, at which this
-    // formula predicts 12 MiB raw (clamped to 64 MiB), not the historically
-    // measured 24 MB -- the gap between that 24 MB measurement and the
-    // 12 MiB this formula predicts at the REAL window is NOT resolved by
-    // this ticket. The qualitative fix stands regardless of that gap: the
-    // flat n_ctx-for-every-layer formula predicts 192 MB independent of the
-    // window value, so a window-aware ne11 is a large improvement either
-    // way. An earlier version of this fix used planner_n_ctx as ne11 for
-    // every layer regardless of class, which over-provisions this SWA model
-    // 16x at the real n_swa=512 -- safely, bounded by the 25% budget clamp
-    // below, but wasting VRAM the model never needed.
+    // n_ctx as the correct ne11 for SWA layers. ⚠️ THAT WINDOW VALUE OF
+    // n_swa ALONE WAS WRONG (GPU-verified on the B50, GGML_SYCL_DEBUG=1
+    // probe of gemma4 E4B's own SWA layers, not the formula in isolation):
+    // gemma4's real GGUF attention.sliding_window is 512, not 1024, and
+    // min(n_ctx, n_swa) alone at that value predicts 12 MiB -- but the
+    // probe's OWN measured Graph-scratch requests at n_ubatch=512 were
+    // 24.00 MB (x2) and 12.00 MB (x2), high-water 24.0 MB, and at
+    // n_ubatch=256 were 9.00/6.00/3.00 MB, high-water 9.0 MB. Solving
+    // 1.5 x 8 x n_ubatch x K x 4 B for K gives exactly K = n_swa + n_ubatch
+    // both times (1024 = 512 + 512 at ubatch=512; 768 = 512 + 256 at
+    // ubatch=256) -- a sliding window of n_swa keys seen by a ubatch of
+    // n_ubatch queries spans n_swa + n_ubatch keys, not n_swa alone (the
+    // first query in the ubatch looks n_swa keys back, the last one
+    // n_ubatch further along). This ALSO resolves the exact number this
+    // ticket originally cited: 1.5 x 8 x 512 x (512+512) x 4 B == the
+    // historically measured 24 MB exactly -- the "window=1024" guess above
+    // was wrong about WHY, but the arithmetic happened to match because
+    // 512+512 == 1024. The formula below now uses
+    // min(n_ctx, n_swa + n_ubatch) as ne11 for the SWA class. An earlier
+    // version of this fix used planner_n_ctx as ne11 for every layer
+    // regardless of class, which over-provisions this SWA model 8x at the
+    // real n_swa=512/n_ubatch=512 (192 MB flat vs. 24 MiB raw here) --
+    // safely, bounded by the 25% budget clamp below, but wasting VRAM the
+    // model never needed.
     static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
     static constexpr uint64_t kSizeofF32     = 4;
     const uint64_t            ctx_term       = static_cast<uint64_t>(n_head_ctx_max) * static_cast<uint64_t>(n_ctx);
-    const uint64_t swa_term = static_cast<uint64_t>(n_head_swa_max) * static_cast<uint64_t>(std::min(n_ctx, n_swa));
+    const uint64_t            swa_term =
+        static_cast<uint64_t>(n_head_swa_max) *
+        std::min(static_cast<uint64_t>(n_ctx), static_cast<uint64_t>(n_swa) + static_cast<uint64_t>(n_ubatch));
     // Fixed-point 3/2 rather than a floating-point 1.5x: exact integer
     // arithmetic, no rounding surprises near the MiB boundaries the anchor
     // points above were measured at.
-    const uint64_t elems    = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch);
-    const uint64_t modeled  = (elems * kSizeofF32 * 3) / 2;
+    const uint64_t elems   = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch);
+    const uint64_t modeled = (elems * kSizeofF32 * 3) / 2;
     return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
 }
 
@@ -1705,9 +1722,10 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
 // allocator-source.py pins this exact form, and
 // ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes() below still exposes
 // it) -- treats the caller's n_head as the non-SWA class with an empty SWA
-// class (n_head_swa_max=0, n_swa=0 => the min(n_ctx, n_swa) term is always 0
-// and never contributes), matching this overload's pre-o3a0 behaviour byte
-// for byte.
+// class (n_head_swa_max=0 => the swa_term product is always 0 regardless
+// of what min(n_ctx, n_swa + n_ubatch) evaluates to, since it is
+// multiplied by a zero head count and never contributes), matching this
+// overload's pre-o3a0 behaviour byte for byte.
 static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
     return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx);
 }
@@ -25664,9 +25682,10 @@ static void populate_host_zone_sizing(placement_plan &                          
     // llama.cpp-0oxf/o3a0: record the SDPA shape alongside the scratchpad
     // bytes so onednn_graph_scratch_zone_floor_bytes_swa() can size the
     // Graph-scratch allocator's floor from each attention class's own
-    // effective KV window (n_ctx for non-SWA layers, min(n_ctx, n_swa) for
-    // SWA layers) instead of a flat n_head x n_ctx term applied to every
-    // layer regardless of class -- see the ticket correction, llama.cpp-o3a0
+    // effective KV window (n_ctx for non-SWA layers, min(n_ctx, n_swa +
+    // n_ubatch) for SWA layers) instead of a flat n_head x n_ctx term
+    // applied to every layer regardless of class -- see the ticket
+    // correction, llama.cpp-o3a0
     // (itself following an earlier correction from n_ctx alone, c-xcop).
     if (plan.device_id >= 0) {
         unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head_ctx_max,

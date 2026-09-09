@@ -327,7 +327,8 @@ ticket reproduced on:
   `onednn_graph_scratch_zone_floor_bytes_swa()` now computes, per
   attention window class,
   `floor = max(64 MiB, 1.5 x max(n_head_ctx_max x n_ctx,
-  n_head_swa_max x min(n_ctx, n_swa)) x n_ubatch x sizeof(f32))`, where
+  n_head_swa_max x min(n_ctx, n_swa + n_ubatch)) x n_ubatch x
+  sizeof(f32))`, where
   the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
   in flight even on an idle host (the quantity the zone must actually
   hold is the PEAK OUTSTANDING size across whichever of those shapes are
@@ -359,21 +360,27 @@ ticket reproduced on:
   point (n_head_swa_max=8) did not match the FLAT formula this replaced
   (predicted 192 MB, measured 24 MB), but was explained rather than
   anomalous: gemma4's oneDNN-served attention layers are sliding-window,
-  so their real `ne11` is `min(n_ctx, n_swa)`, not `n_ctx`.
-  llama.cpp-o3a0 closed that gap: instead of using `n_ctx` as `ne11` for
-  every layer regardless of class (safe but wasteful), the formula now
-  gives each class its own effective window and takes the max across
-  classes. ⚠️ **The `n_swa=1024` used to explain the 24 MB measurement
-  was WRONG** (GPU-verified on the B50 via the `[SYCL-PLAN]`
-  floor log line): gemma4 E4B's real GGUF `attention.sliding_window`
-  is 512, at which this formula predicts 12 MiB raw (clamped to the
-  64 MiB minimum), not 24 MiB — the gap between the historical 24 MB
-  measurement and the 12 MiB this formula predicts at the real window
-  is NOT resolved here. The qualitative point stands regardless: the
-  flat formula predicts 192 MB independent of the window value, so
-  gemma4 (at its real `n_swa=512`) now computes 64 MiB (12 MiB raw,
-  clamped) instead of 192 MiB — over-provisioned 16x by the flat
-  formula, not the 8x an `n_swa=1024` assumption would suggest.
+  so their real `ne11` is `min(n_ctx, n_swa + n_ubatch)`, not `n_ctx`
+  and not `min(n_ctx, n_swa)` either — a ubatch of `n_ubatch` queries
+  against an `n_swa`-key sliding window spans `n_swa + n_ubatch` keys in
+  total (the first query looks `n_swa` keys back, the last one
+  `n_ubatch` further along), and the oneDNN SDPA scratch scales with
+  that whole span. llama.cpp-o3a0 closed the flat-formula gap first,
+  using `min(n_ctx, n_swa)` (`n_swa` alone) — GPU-verified WRONG on the
+  B50 (`GGML_SYCL_DEBUG=1` probe of gemma4 E4B's own SWA layers): at
+  `n_ubatch=512` the measured Graph-scratch requests were
+  24.00/12.00 MB (high-water 24.0 MB), and at `n_ubatch=256` they were
+  9.00/6.00/3.00 MB (high-water 9.0 MB). Solving
+  `1.5 x 8 x n_ubatch x K x 4 B` for `K` gives exactly
+  `K = n_swa + n_ubatch` both times against gemma4's real `n_swa=512`
+  (1024 = 512+512; 768 = 512+256) — which also resolves this section's
+  own historical 24 MB measurement exactly
+  (`1.5 x 8 x 512 x (512+512) x 4 B == 24 MB`). The formula now uses
+  `min(n_ctx, n_swa + n_ubatch)` and takes the max across classes, so
+  gemma4 (at its real `n_swa=512`, `n_ubatch=512`) computes 24 MiB raw,
+  clamped to 64 MiB, matching the probe exactly — an 8x reduction in
+  modeled demand vs. the flat formula's 192 MB (still 3x after the
+  64 MiB clamp).
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -394,9 +401,10 @@ ticket reproduced on:
   NOT call `unified_cache_set_planned_onednn_graph_scratch_shape()`
   again, so the ONEDNN Graph-scratch shape (and this floor) stays frozen
   at its load-time value regardless. So the SWA window term only
-  actually narrows (`n_swa < n_ctx`) once the Graph-scratch shape is
-  re-planned against the real context, which no code path does today --
-  the 12 MiB/192 MiB comparison above is the formula's behavior at
+  actually narrows (`n_swa + n_ubatch < n_ctx`) once the Graph-scratch
+  shape is re-planned against the real context, which no code path
+  does today --
+  the 24 MiB/192 MiB comparison above is the formula's behavior at
   whatever `n_ctx` it is given, not what a default run computes today.
   Re-planning the Graph-scratch shape on a runtime context change is
   tracked separately (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line
