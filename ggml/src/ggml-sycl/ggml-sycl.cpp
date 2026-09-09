@@ -17253,10 +17253,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
     }
 
-    // Re-validate under the lock exactly as the full transaction does
-    // above: the snapshot pointer may have changed between the
-    // lock-free read of `current` and acquiring the lock (a concurrent
-    // model load/unload or another runtime-context call).
+    // Confirm under the lock that the snapshot read above is still the
+    // live one -- it may have changed between the lock-free read of
+    // `current` and acquiring the lock (a concurrent model load/unload
+    // or another runtime-context call).
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;

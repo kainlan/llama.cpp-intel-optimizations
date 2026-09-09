@@ -138,7 +138,7 @@ void test_override_zero() {
     // env_mb_override() (unified-cache.cpp) treats "0" as a genuine parsed
     // value (env_mb == 0), distinct from an unset/empty var (env_mb == -1,
     // which falls through to the formula). A caller with this override set
-    // gets EXACTLY 0 bytes back -- the 16 MiB kFloorMinBytes clamp is part
+    // gets EXACTLY 0 bytes back -- the 16 MiB kNonfaAttnScratchFloorBytes clamp is part
     // of the FORMULA branch only and is bypassed entirely once an override
     // (any non-negative value, including 0) is in effect, the same way a
     // 77 MiB override above is not itself clamped to 16 MiB.
@@ -199,7 +199,7 @@ void test_largest_fitting_n_ctx() {
 
     // Floor-vs-inverse interaction, scored to the outcome the inverse
     // function's own comment documents: the inverse IGNORES
-    // kFloorMinBytes, so for a zone capacity small enough that the raw
+    // kNonfaAttnScratchFloorBytes, so for a zone capacity small enough that the raw
     // (unfloored) formula at the reported n_ctx is still below the 16 MiB
     // floor, the inverse's own "fits" answer is optimistic -- feeding it
     // back into the forward formula (which DOES apply the floor) reports a
@@ -220,8 +220,8 @@ void test_largest_fitting_n_ctx() {
     check(demand_at_fits_tiny_zone > kTinyZoneBytes,
           "the inverse's own \"fits\" answer does not actually fit once the forward formula's floor is applied "
           "-- exactly the caveat unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()'s comment "
-          "documents (it ignores kFloorMinBytes), so a caller must not treat its result as exact for a zone "
-          "this small");
+          "documents (it ignores kNonfaAttnScratchFloorBytes), so a caller must not treat its result as exact "
+          "for a zone this small");
 }
 
 }  // namespace

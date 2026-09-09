@@ -1751,7 +1751,8 @@ uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zon
     // 256 -- the same cell-rounding convention the KV-side
     // ggml_sycl_largest_fitting_n_ctx() (ggml-sycl.cpp) uses, so the two
     // "largest context that fits" figures a refusal can print are directly
-    // comparable. This ignores the kFloorMinBytes clamp above (a tiny zone
+    // comparable. This ignores the kNonfaAttnScratchFloorBytes clamp
+    // unified_cache_nonfa_attn_scratch_demand_bytes() applies (a tiny zone
     // capacity below the floor would still fail a real allocation attempt;
     // reporting a fitting n_ctx > 0 there would be misleading), which the
     // caller must not rely on to be exact for a zone that small.
@@ -3989,9 +3990,10 @@ bool unified_cache::ensure_planned_arena_zones() {
                     // fact no shape is known at all.
                     GGML_LOG_INFO(
                         "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) to meet the non-FA attention "
-                        "scratch formula's own 16 MiB floor (no shape known yet; the arena's SCRATCH zone was "
-                        "below the floor)\n",
-                        planned_nonfa_attn_scratch / (1024.0 * 1024.0));
+                        "scratch formula's own %.0f MiB floor (no shape known yet; the arena's SCRATCH zone "
+                        "was below the floor)\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0),
+                        kNonfaAttnScratchFloorBytes / (1024.0 * 1024.0));
                 }
                 scratch_zone = planned_nonfa_attn_scratch;
             }
