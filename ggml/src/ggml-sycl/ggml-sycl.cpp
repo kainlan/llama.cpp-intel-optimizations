@@ -16661,8 +16661,8 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // contract requires g_tensor_inventory_mutex, which resolve_fused_ops()'s
 // caller does not hold when it merely wants to know whether an
 // already-published shape still fits), or restore anything on refusal --
-// it only asks whether the ALREADY-PUBLISHED shape fits the CURRENT
-// SCRATCH capacity.
+// it only asks whether the ALREADY-PUBLISHED shape still fits the device's
+// current outside-arena headroom.
 static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                uint32_t n_ctx,
                                                uint32_t n_ubatch,
@@ -16670,6 +16670,14 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                bool     flash_attn_enabled,
                                                bool     allow_replan) {
     if (flash_attn_enabled) {
+        return true;
+    }
+    if (ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled()) {
+        // llama.cpp-pvjr: an explicit GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a
+        // deliberate "disable this guard entirely" request -- skip before
+        // any comparison. 0 + reserve compared against free would otherwise
+        // refuse any card with less than the reserve free, which is not
+        // what "disable" means.
         return true;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
@@ -16689,8 +16697,29 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
         return true;
     }
 
+    // llama.cpp-pvjr: read LIVE device free memory at guard time -- BEFORE
+    // the opportunistic SCRATCH-zone re-plan below, not after. If the
+    // re-plan grew the SCRATCH zone out of the arena's own budget, a
+    // post-replan free-memory read would double count that same demand:
+    // once as the (already-committed) zone growth and again as the
+    // headroom this guard then requires on top of it. Reading first also
+    // means a budget-pct override or another tenant on the card is
+    // reflected honestly, not stale from before the re-plan.
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    // A failed query does not reach here: ggml_backend_sycl_get_device_memory()
+    // std::exit(1)s on a sycl::exception. total_mem == 0 therefore means a
+    // device that genuinely reports zero total memory -- kept as a sanity
+    // check rather than a query-failure path.
+    if (total_mem == 0) {
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] non-FA attention scratch guard could not evaluate (device reports zero "
+            "total memory) -- skipping the check for n_ctx=%u n_ubatch=%u\n",
+            n_ctx, n_ubatch);
+        return true;
+    }
+
     ggml_sycl::nonfa_attn_scratch_planned_shape prev_shape{};
-    size_t                                      scratch_capacity;
     if (allow_replan) {
         // Remember the previously recorded triplet so a refused shape (see
         // below) can be undone -- the recording just below stays
@@ -16711,7 +16740,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
         const size_t scratch_capacity_before = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
         ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, n_head, n_ubatch, n_ctx);
         (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device);
-        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+        const size_t scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
         if (scratch_capacity > scratch_capacity_before) {
             // "(observed)": this is the guard's own re-plan attempt seeing
             // the zone grow, not the plan-time raise
@@ -16735,47 +16764,58 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                 "[UNIFIED-CACHE] non-FA attention re-plan did not raise the SCRATCH zone (%.1f MB unchanged)\n",
                 scratch_capacity / (1024.0 * 1024.0));
         }
-    } else {
-        // Narrow re-check: no record, no re-plan attempt, no
-        // restore-on-refusal -- only ask whether the shape the caller
-        // already published still fits the CURRENT SCRATCH capacity.
-        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
     }
+    // Narrow re-check (allow_replan=false): no record, no re-plan attempt,
+    // no restore-on-refusal -- only ask whether the shape the caller
+    // already published still fits the device's current outside-arena
+    // headroom, using the free-memory reading taken above.
 
     const size_t nonfa_demand = ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
-    if (nonfa_demand <= scratch_capacity) {
+
+    if (ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom(nonfa_demand, free_mem)) {
         return true;
     }
 
-    const double   mb = 1024.0 * 1024.0;
-    // "scratch-limited": this figure is the SCRATCH zone's own capacity
-    // limit, not a whole-device worst case -- the real limit
-    // (llama.cpp-k1ev's unexplained outside-arena consumer) is smaller and
-    // currently unmeasured, so a context at or below this figure is not
-    // guaranteed to run, only known not to be refused by this specific
-    // check.
-    const uint32_t fits_scratch =
-        ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(scratch_capacity, n_head, n_ubatch);
+    const double   mb             = 1024.0 * 1024.0;
+    const size_t   reserve        = ggml_sycl::unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+    // Computed in double precision, not by summing nonfa_demand + reserve as
+    // size_t first -- unified_cache_nonfa_attn_scratch_fits_headroom() above
+    // already made the refuse/fits decision with its own overflow guard;
+    // this is purely for the log line, and doubles cannot wrap the way a
+    // size_t sum theoretically could for a pathological demand.
+    const double   demand_mb      = nonfa_demand / mb;
+    const double   reserve_mb     = reserve / mb;
+    const double   needs_mb       = demand_mb + reserve_mb;
+    const double   free_mb        = free_mem / mb;
+    // "headroom-limited": this figure is bounded by THIS device's current
+    // live outside-arena headroom (free memory minus the empirical
+    // reserve), not a whole-device or zone-only guarantee -- another tenant
+    // on the card or a budget-pct change moves it. Derived through
+    // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), the
+    // inverse of fits_headroom()'s own comparison above, rather than
+    // re-subtracting the reserve by hand here -- the two must not drift.
+    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_mem);
+    const uint32_t fits_headroom_ctx =
+        ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_bytes, n_head, n_ubatch);
     GGML_LOG_ERROR(
-        "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the reserved "
-        "SCRATCH zone -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB zone=%.1f MB over_by=%.1f MB\n",
-        n_ctx, n_ubatch, n_head, nonfa_demand / mb, scratch_capacity / mb, (nonfa_demand - scratch_capacity) / mb);
+        "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the device's "
+        "outside-arena headroom -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB (demand %.1f MB + reserve "
+        "%.1f MB) free=%.1f MB over_by=%.1f MB\n",
+        n_ctx, n_ubatch, n_head, needs_mb, demand_mb, reserve_mb, free_mb, needs_mb - free_mb);
     // GGML_SYCL_NONFA_ATTN_SCRATCH_MB is NOT offered as a remediation here:
-    // a hardware sweep (768 MiB, 1536 MiB, plus raised arena headroom to
-    // 3-4 GB) still aborted on both cards (llama.cpp-k1ev) -- it is an
-    // experimentation knob for that investigation, not a fix a user should
-    // reach for. Flash attention or a smaller context are the only
-    // remediations with hardware support.
+    // it only replaces the demand term d, not the reserve or the headroom
+    // comparison, so it is an experimentation knob (llama.cpp-k1ev), not a
+    // fix a user should reach for. Flash attention or a smaller context are
+    // the only remediations with hardware support.
     GGML_LOG_ERROR(
         "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention path does not "
         "fit the device budget at this length; pass -fa 1/auto to use flash attention, or reduce -c/-p%s\n",
-        fits_scratch >= 256 ? "" : " (no non-FA context at this shape is known to fit this device)");
-    if (fits_scratch >= 256) {
+        fits_headroom_ctx >= 256 ? "" : " (no non-FA context at this shape is known to fit this device)");
+    if (fits_headroom_ctx >= 256) {
         GGML_LOG_ERROR(
-            "[SYCL-PLAN] the largest non-FA context estimated to fit the SCRATCH zone is about -c %u "
-            "(scratch-limited; not a guarantee against llama.cpp-k1ev's unexplained outside-arena "
-            "consumption)\n",
-            fits_scratch);
+            "[SYCL-PLAN] the largest non-FA context estimated to fit this device's current headroom is "
+            "about -c %u (headroom-limited; EMPIRICAL reserve, see docs/backend/sycl-memory-design.md)\n",
+            fits_headroom_ctx);
     }
 
     if (allow_replan) {
@@ -16963,32 +17003,49 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // fitting KV shape says nothing about the non-flash-attention batched
     // mul_mat path's own scratch demand -- that consumer never went through
     // replan_moe_mmid_workspaces_for_runtime() at all. When flash attention
-    // is off, check it separately against the SCRATCH zone the arena
-    // already reserved. See ggml-sycl.cpp's ggml_sycl_mul_mat_batched_sycl()
-    // abort site ("batched F16 mul_mat failed -- no recovery path
-    // available") for what this exists to prevent: that abort fires
-    // mid-prefill, after weights and KV are already committed, with no
-    // arithmetic printed.
+    // is off, check it separately. See ggml-sycl.cpp's
+    // ggml_sycl_mul_mat_batched_sycl() abort site ("batched F16 mul_mat
+    // failed -- no recovery path available") for what this exists to
+    // prevent: that abort fires mid-prefill, after weights and KV are
+    // already committed, with no arithmetic printed.
     //
-    // THIS PREDICATE IS EMPIRICAL, NOT A MODELED WORST CASE. An earlier
-    // revision of this check attempted to model exactly what can spill
-    // outside the fixed arena (this zone's own overflow, the oneDNN
-    // scratchpad's fragmentation-driven overflow, and the SYCL scheduler's
-    // compute buffer regrowing to the real n_kv) and compare it against live
-    // free VRAM outside the arena. Hardware measurement falsified that
-    // model: a non-FA prefill at this shape was measured consuming
-    // ~2-4 GB OUTSIDE the fixed arena on BOTH discrete cards (B50 and B70),
-    // roughly double to triple what the model predicted, and no zone size,
-    // arena budget percentage, or external-headroom override closed the
-    // gap on either card -- see llama.cpp-k1ev, filed for that unexplained
-    // consumer. Until k1ev is closed, "does the demand exceed the SCRATCH
-    // zone" is the only check with real hardware support: it refuses on
-    // every measured case that actually aborts, and (this is what makes it
-    // usable despite not being a true worst-case model) nothing measured so
-    // far runs with a demand above the zone, on either card, at any zone
-    // size or headroom setting tried. Do not reintroduce a live-free-VRAM
-    // or compute-buffer-regrowth term without new hardware evidence that
-    // k1ev's consumer is understood and bounded.
+    // THIS PREDICATE IS EMPIRICAL, NOT A MODELED WORST CASE, AND HAS ALREADY
+    // BEEN REVISED ONCE ON NEW HARDWARE EVIDENCE (llama.cpp-pvjr). The first
+    // revision (llama.cpp-oyfl round 2) compared the demand formula against
+    // the SCRATCH zone's own reserved capacity, after an even earlier
+    // live-free-VRAM model was hardware-falsified by a non-FA prefill
+    // measured consuming several GB outside the fixed arena on both cards
+    // (llama.cpp-k1ev, filed for that still-unexplained consumer). The
+    // SCRATCH-zone-capacity check was itself falsified by a later sweep on
+    // this merged tree (o3a0 + oyfl + rqak, f594574bf): p6144/p7168 both
+    // exceed the 512 MiB SCRATCH zone yet ran clean guard-off on BOTH
+    // cards, and the B70 additionally ran p8192 clean -- all three would
+    // have been wrongly refused by the zone-capacity predicate, which keys
+    // off a resource (the SCRATCH zone) unrelated to what actually runs out
+    // (outside-arena VRAM on a card with less of it, principally the 16 GB
+    // B50). The B70's own outside-arena consumption above p6144 IS now
+    // explained by visible terms (the sched compute buffer, which doubles
+    // there from the f32 KQ tensor scaling with n_ctx, plus batched-F16 src1
+    // staging, plus oneDNN scratch overflow); the B50 still carries an
+    // extra ~0.1-0.9 GB k1ev cannot yet attribute, down from the "2-4 GB on
+    // both cards" the pre-o3a0 measurement found.
+    //
+    // THE CURRENT PREDICATE: refuse iff demand + reserve > free, with
+    // `free` LIVE device free memory read at guard time (not the arena's
+    // stored external_headroom(), so a budget-pct override or another
+    // tenant on the card -- e.g. ComfyUI holding VRAM on the B70 -- changes
+    // the answer honestly) and `reserve` the EMPIRICAL 928 MiB constant
+    // (unified_cache_nonfa_attn_outside_arena_reserve_bytes(),
+    // unified-cache.cpp) bracketed from hardware: B50 859 < R <= 955 MiB,
+    // B70 893 < R <= 989 MiB, intersection 893 < R <= 955 MiB. See that
+    // constant's own derivation comment for the exact measured points and
+    // arithmetic, and docs/backend/sycl-memory-design.md's "A non-tensor
+    // consumer" subsection for the full narrative. The zone comparison is
+    // dropped from the refusal entirely (it is what over-refused above);
+    // the opportunistic SCRATCH-zone re-plan below is unchanged and still
+    // runs for its own INFO logging. Do not reintroduce a zone-capacity or
+    // compute-buffer-regrowth-only predicate without new hardware evidence
+    // that k1ev's consumer is understood and bounded.
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
                                             /*allow_replan=*/true)) {
@@ -17265,6 +17322,22 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
     }
 
+    // llama.cpp-pvjr: this re-check reads LIVE device free memory itself
+    // (ggml_backend_sycl_get_device_memory(), inside the shared guard) even
+    // though it takes no new plan-time action -- the headroom predicate
+    // depends on the CURRENT free-memory reading, not whatever was true when
+    // the plan this snapshot carries was first published, so a card whose
+    // free memory has since dropped (another tenant, a budget-pct change)
+    // is re-evaluated honestly here too. This call also runs LATER than
+    // the full transaction's own read (it fires from resolve_fused_ops(),
+    // after memory init and a probe graph_reserve()), so it reads a free
+    // figure this process has since drawn down, typically lower -- a
+    // boundary shape the full transaction allowed can therefore still be
+    // refused here. (Not guaranteed lower: another tenant releasing VRAM
+    // between the two reads could raise it instead.) That refusal surfaces
+    // as the std::runtime_error sycl_recheck_runtime_context_flash_attn()
+    // throws (llama-context.cpp) when this returns
+    // GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
                                            current->plan->planner_n_head_all_max, flash_attn_enabled,

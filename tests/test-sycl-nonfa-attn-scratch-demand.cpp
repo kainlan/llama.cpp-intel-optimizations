@@ -1,9 +1,14 @@
-// Host-only gate for llama.cpp-oyfl: the non-flash-attention batched mul_mat
-// scratch demand formula in unified-cache.cpp/hpp
+// Host-only gate for llama.cpp-oyfl + llama.cpp-pvjr: the non-flash-attention
+// batched mul_mat scratch demand formula in unified-cache.cpp/hpp
 // (unified_cache_nonfa_attn_scratch_demand_bytes() and its inverse,
-// unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()).
+// unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()), plus the
+// headroom predicate that replaced the SCRATCH-zone-capacity refusal
+// (unified_cache_nonfa_attn_outside_arena_reserve_bytes(),
+// unified_cache_nonfa_attn_scratch_fits_headroom(),
+// unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), and
+// unified_cache_nonfa_attn_scratch_guard_disabled()).
 //
-// No SYCL device is needed -- both are pure functions of an env var and a
+// No SYCL device is needed -- all are pure functions of an env var and a
 // few integers. Modeled closely on tests/test-sycl-onednn-graph-floor.cpp,
 // which gates the sibling oneDNN Graph-scratch floor this formula was
 // derived by analogy from -- but this one is NOT gated behind
@@ -30,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -39,7 +45,11 @@ int main() {
 #else
 
 using ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch;
+using ggml_sycl::unified_cache_nonfa_attn_outside_arena_reserve_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes;
 
 namespace {
 
@@ -65,6 +75,8 @@ void test_default_formula() {
     check(scratch_mb_env == nullptr || scratch_mb_env[0] == '\0',
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB is unset (or empty) before the first call -- "
           "otherwise every case below tests the override, not the formula");
+    check(!unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "the guard is NOT disabled when GGML_SYCL_NONFA_ATTN_SCRATCH_MB is unset");
 
     // All-zero shape (nothing planned yet) must still respect the 16 MiB
     // minimum -- 0 * anything == 0, which the max(16 MiB, ...) half must catch.
@@ -125,6 +137,8 @@ void test_override() {
     const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
     check(env != nullptr && std::strcmp(env, "77") == 0,
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77 is set (ctest ENVIRONMENT) before the first call");
+    check(!unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "a non-zero override (77) is NOT the disable case -- only an explicit 0 disables the guard");
 
     const size_t demand_small = unified_cache_nonfa_attn_scratch_demand_bytes(0, 0, 0);
     const size_t demand_large = unified_cache_nonfa_attn_scratch_demand_bytes(128, 4096, 1u << 20);
@@ -145,6 +159,8 @@ void test_override_zero() {
     const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
     check(env != nullptr && std::strcmp(env, "0") == 0,
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set (ctest ENVIRONMENT) before the first call");
+    check(unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "an explicit 0 override IS the disable case -- the guard must return true before any comparison");
 
     const size_t demand_zero_shape = unified_cache_nonfa_attn_scratch_demand_bytes(0, 0, 0);
     const size_t demand_real_shape = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 8192);
@@ -155,7 +171,7 @@ void test_override_zero() {
 }
 
 void test_largest_fitting_n_ctx() {
-    printf("Inverse: largest fitting n_ctx for a SCRATCH zone capacity:\n");
+    printf("Inverse: largest fitting n_ctx for a byte capacity:\n");
 
     // Exact round trip against the B50 repro shape's own demand: a zone
     // sized to exactly hold n_ctx=8192's demand must report 8192 back (it is
@@ -166,10 +182,11 @@ void test_largest_fitting_n_ctx() {
 
     // The default 512 MiB SCRATCH zone (ensure_planned_arena_zones()'s
     // pre-existing floor) at the repro's n_head/n_ubatch fits LESS than
-    // 8192 -- this is the concrete case the runtime-context-update guard
-    // must refuse rather than let ggml_sycl_mul_mat_batched_sycl() abort on.
-    // Exact value: 512 MiB / (32 * 512 * 6) = 5461.33, rounded down to the
-    // nearest 256 = 5376.
+    // 8192 -- the concrete case the RETIRED zone-capacity predicate
+    // (llama.cpp-oyfl round 3) refused. The current headroom guard
+    // (llama.cpp-pvjr) never consults the zone, so this row now pins only
+    // the inverse's own arithmetic. Exact value: 512 MiB / (32 * 512 * 6)
+    // = 5461.33, rounded down to the nearest 256 = 5376.
     const uint32_t fits_default_zone = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(512 * kMiB, 32, 512);
     check(fits_default_zone == 5376,
           "the default 512 MiB SCRATCH zone fits exactly n_ctx=5376 at n_head=32/n_ubatch=512, below the "
@@ -224,6 +241,101 @@ void test_largest_fitting_n_ctx() {
           "for a zone this small");
 }
 
+// llama.cpp-pvjr: the headroom predicate that replaced the SCRATCH-zone-
+// capacity check -- refuse iff demand + reserve > free. Reserve and the
+// four bracket points below are taken directly from task llama.cpp-pvjr's
+// comments c-1hv7/c-gnyc (the sweep that decided R = 928 MiB); see this
+// file's header comment and unified_cache_nonfa_attn_outside_arena_reserve_
+// bytes()'s own derivation comment (unified-cache.cpp) for the full
+// narrative.
+void test_headroom_predicate() {
+    printf("Non-FA attention scratch outside-arena headroom predicate:\n");
+
+    const size_t reserve = unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+    check(reserve == 928 * kMiB, "the outside-arena reserve is exactly 928 MiB");
+
+    // Measured live device free bytes at guard time (task c-1hv7/c-gnyc),
+    // in the same "MB" == MiB convention the [SYCL-BUDGET] free= log line
+    // uses -- NOT decimal megabytes.
+    const size_t h_b50 = static_cast<size_t>(1627.3 * static_cast<double>(kMiB));
+    const size_t h_b70 = static_cast<size_t>(2045.2 * static_cast<double>(kMiB));
+
+    // B50: p7168 (d=672 MiB) ran clean guard-off; p8192 (d=768 MiB) aborted
+    // with the VRAM exhausted (free=29 MB) -- both at n_head=32, n_ubatch=512.
+    const size_t d_b50_7168 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 7168);
+    const size_t d_b50_8192 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 8192);
+    check(d_b50_7168 == 672 * kMiB, "sanity: demand(32, 512, 7168) is 672 MiB");
+    check(d_b50_8192 == 768 * kMiB, "sanity: demand(32, 512, 8192) is 768 MiB");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(d_b50_7168, h_b50),
+          "B50: n_ctx=7168 (d=672 MiB) fits the measured 1627.3 MB headroom at R=928 MiB");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(d_b50_8192, h_b50),
+          "B50: n_ctx=8192 (d=768 MiB) does NOT fit -- this is the shape that aborted on hardware");
+
+    // B70: p11264 (d=1056 MiB) ran clean; p12288 (d=1152 MiB) exhausted
+    // outside-arena VRAM 4 times, surviving only on the scalar fallback --
+    // treated as refuse per the decided predicate.
+    const size_t d_b70_11264 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 11264);
+    const size_t d_b70_12288 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 12288);
+    check(d_b70_11264 == 1056 * kMiB, "sanity: demand(32, 512, 11264) is 1056 MiB");
+    check(d_b70_12288 == 1152 * kMiB, "sanity: demand(32, 512, 12288) is 1152 MiB");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(d_b70_11264, h_b70),
+          "B70: n_ctx=11264 (d=1056 MiB) fits the measured 2045.2 MB headroom at R=928 MiB");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(d_b70_12288, h_b70),
+          "B70: n_ctx=12288 (d=1152 MiB) does NOT fit -- degraded on hardware (scalar fallback), "
+          "treated as refuse");
+
+    // Overflow: a demand within [0, SIZE_MAX - reserve] must not overflow;
+    // above that, the helper must treat the sum as refuse rather than wrap
+    // to a small value that would read as "fits".
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max(),
+                                                          std::numeric_limits<size_t>::max()),
+          "demand == SIZE_MAX refuses even against a SIZE_MAX free_bytes (demand + reserve would overflow)");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max() - reserve + 1,
+                                                          std::numeric_limits<size_t>::max()),
+          "demand one byte past the exact overflow boundary (SIZE_MAX - reserve + 1) refuses even against "
+          "a SIZE_MAX free_bytes");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max() - reserve,
+                                                         std::numeric_limits<size_t>::max()),
+          "demand exactly at the overflow boundary (SIZE_MAX - reserve) does not overflow and fits a "
+          "SIZE_MAX free_bytes");
+
+    // A card with less free memory than the reserve alone refuses any
+    // positive demand, however small.
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(1, reserve - 1),
+          "free_bytes below the reserve alone refuses even a 1-byte demand");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(0, reserve),
+          "free_bytes exactly equal to the reserve fits a zero demand");
+
+    // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(): the
+    // inverse of fits_headroom()'s own comparison (free - reserve, clamped
+    // to 0). Boundary rows first, independent of any hardware figure.
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(reserve) == 0,
+          "capacity at free == reserve is exactly 0 (nothing above the reserve to spend)");
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(reserve + 1) == 1,
+          "capacity at free == reserve + 1 is exactly 1 byte");
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(0) == 0,
+          "capacity at free == 0 is 0, not an underflowed huge value (free <= reserve is clamped)");
+
+    // Largest-fitting n_ctx at capacity = headroom_capacity_bytes(H) on both
+    // cards (the headroom-limited remediation the runtime refusal reports),
+    // now going through the function under test rather than re-subtracting
+    // the reserve by hand. Expected values computed by hand: floor((H - R) /
+    // (n_head * n_ubatch * 6)) rounded down to the nearest multiple of 256.
+    //   B50: H=1627.3 MiB, R=928 MiB -> capacity ~= 733,269,196 B
+    //        (~699.3 MiB); 733269196 / 98304 = 7459.86..., rounded down to
+    //        the nearest multiple of 256 (7459 / 256 = 29.14...) -> 7424.
+    const size_t capacity_b50 = unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(h_b50);
+    check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b50, 32, 512) == 7424,
+          "B50 headroom-limited largest fitting n_ctx at R=928 MiB is 7424");
+
+    //   B70: H=2045.2 MiB, R=928 MiB -> capacity ~= 1,171,469,107 B
+    //        (~1117.2 MiB); 1171469107 / 98304 = 11916.4..., rounded down
+    //        to the nearest multiple of 256 (11916 / 256 = 46.5...) -> 11776.
+    const size_t capacity_b70 = unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(h_b70);
+    check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b70, 32, 512) == 11776,
+          "B70 headroom-limited largest fitting n_ctx at R=928 MiB is 11776");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -243,6 +355,7 @@ int main(int argc, char ** argv) {
     } else if (std::strcmp(mode, "default") == 0) {
         test_default_formula();
         test_largest_fitting_n_ctx();
+        test_headroom_predicate();
     } else {
         std::fprintf(stderr, "usage: %s [--mode=default|--mode=override|--mode=override-zero] (got --mode=%s)\n",
                      argv[0], mode);

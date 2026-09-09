@@ -1950,15 +1950,15 @@ c-xcop).
 **Two opposing pressures on this constant, both real.** Raise it only on
 new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
 occupancy across a whole pp8192 run) — never lower it without such
-evidence, because lowering trades away the margin this check exists to
-keep ahead of the abort it prevents. But raising it is not free either:
-this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
-larger `c` also refuses **more** contexts that would actually have run —
-trading false refusals for margin, on the same unvalidated single
+evidence, because lowering trades away the margin this check exists
+to keep ahead of the abort it prevents. But raising it is not free
+either: this is a headroom check, not a true worst-case model, so a
+larger `c` also refuses **more** contexts that would actually have run
+— trading false refusals for margin, on the same unvalidated single
 snapshot. Neither direction is free; do not move this value without a
 multi-point capture backing the move. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`
-overrides the formula outright, so applying a future measurement needs no
-code change.
+overrides the formula outright, so applying a future measurement needs
+no code change.
 
 **Where this can and cannot help, and why the automatic case is
 llama.cpp-fkpg's scope, not this one's.** Like every zone above, the
@@ -1998,10 +1998,11 @@ recorded shape feeds is already a no-op past model load for the reason
 above -- weights hold live leases by the time any runtime-context call
 happens, so there is nothing for a missed recording to have changed.
 
-**The check is EMPIRICAL, not a modeled worst case — read this before
-tightening or loosening it.** A first draft of this predicate (llama.cpp
--oyfl round 2) reasoned from first principles that a SCRATCH-zone-capacity
-comparison alone was insufficient: a zone overflow does not fail outright
+**The check is EMPIRICAL, not a modeled worst case, and has already been
+revised once on new hardware evidence — read this before tightening or
+loosening it.** A first draft of this predicate (llama.cpp-oyfl round 2)
+reasoned from first principles that a SCRATCH-zone-capacity comparison
+alone was insufficient: a zone overflow does not fail outright
 (`unified_alloc()`, `unified-cache.cpp`, falls through to a raw device
 allocation OUTSIDE the fixed arena when a preferred zone is full), and
 that same outside-arena headroom is what the SYCL scheduler's own compute
@@ -2017,7 +2018,7 @@ run once `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` (the exact `c=3` demand)
 eliminated the SCRATCH term (predicted available ~1334 MiB vs. ~1200 MiB
 needed).
 
-**Hardware measurement falsified that model.** On the B50, the same
+**Hardware measurement falsified that first model.** On the B50, the same
 `-fa 0 -p 8192` repro with `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` still
 aborted (rc=134, staging-allocation failures, a VRAM-exhaustion line) — a
 sweep across `768`/`1536` MiB zone sizes, `GGML_SYCL_VRAM_BUDGET_PCT=85`
@@ -2026,30 +2027,106 @@ explicit `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=3072` override all
 still aborted, each time with tens of MB free rather than the modeled
 headroom. The B70 (default ~2 GB outside its arena, and again with
 headroom raised to ~4.0 GB) aborted identically. So the non-FA `-p 8192`
-prefill consumes roughly 2–4 GB **outside the fixed arena on both discrete
+prefill consumed roughly 2–4 GB **outside the fixed arena on both discrete
 cards**, far beyond anything the compute-buffer/SCRATCH/oneDNN model
-above accounts for, and no zone size or headroom override recovers it —
+above accounted for, and no zone size or headroom override recovered it —
 filed as **llama.cpp-k1ev**, an unidentified outside-arena consumer
-specific to the non-FA path. This also falsifies the model's original
-motivating concern (a card with more outside-arena headroom, e.g. the
-B70, would wrongly refuse a shape that actually runs): both cards abort
-at the same shape, so the zone-only check is not observed to be more
-conservative than reality on either card measured so far.
+specific to the non-FA path. On the pre-o3a0 tree this was read as also
+falsifying the model's original motivating concern (a card with more
+outside-arena headroom, e.g. the B70, would wrongly refuse a shape that
+actually runs): both cards aborted at the same shape there, so the
+zone-only check that shipped (llama.cpp-oyfl round 3) was not observed to
+be more conservative than reality on either card measured so far, and it
+was adopted as the refusal: refuse when `nonfa_demand >
+zone_capacity(SCRATCH)`, labeled **"scratch-limited"**.
 
-**The refusal is therefore left as the empirical SCRATCH-zone-capacity
-check**, unchanged in shape from before round 2: refuse when `nonfa_demand
-> zone_capacity(SCRATCH)`, reporting `needs`/`zone`/`over_by` and the
-zone's own largest-fitting `-c` (labeled **"scratch-limited"**, since it
-is a limit on this one zone, not a whole-device guarantee against k1ev's
-consumer). The refusal names `-fa 1`/`auto` or a smaller `-c` as the only
-remediations with hardware support — it deliberately does **not** suggest
-`GGML_SYCL_NONFA_ATTN_SCRATCH_MB`, since the sweep above shows setting it
-does not reliably fix anything; treat that variable as an experimentation
-knob for investigating k1ev, not a user-facing fix. Do not reintroduce a
-live-free-VRAM or compute-buffer-regrowth predicate without new hardware
-evidence that k1ev's consumer is understood and bounded — the reasoning
-that motivated one was sound in isolation and still wrong in practice,
-which is the whole lesson of this subsection.
+**That zone-capacity predicate was itself falsified on 2026-09-09, on the
+tree merging llama.cpp-o3a0 + oyfl + rqak (`f594574bf`) — task
+llama.cpp-pvjr.** A bracketing sweep with the guard disabled
+(`GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, so each shape runs or fails on its
+own hardware merits, not the guard's opinion) on Mistral 7B Q4_0,
+`-fa 0`, `n_ubatch=512`:
+
+| card | `-p` | demand `d` | outcome |
+|------|-----:|-----------:|---------|
+| B50 (free 1627.3 MB) | 6144 | 576 MiB | ran clean |
+| B50 | 7168 | 672 MiB | ran clean |
+| B50 | 8192 | 768 MiB | **aborted** (VRAM exhausted, free=29 MB) |
+| B70 (free 2045.2 MB) | 8192 | 768 MiB | ran clean |
+| B70 | 11264 | 1056 MiB | ran clean |
+| B70 | 12288 | 1152 MiB | 4 outside-arena staging failures, survived only on the scalar fallback |
+
+`p6144`/`p7168` both exceed the 512 MiB SCRATCH zone yet ran clean on
+BOTH cards, and the B70 additionally ran `p8192` clean — all three would
+have been wrongly refused by the zone-capacity predicate, which keys off
+a resource (this one SCRATCH zone) unrelated to what actually runs out
+(outside-arena VRAM on the card with less of it). The B70's own
+outside-arena growth above `p6144` is now explained by visible terms: the
+scheduler's compute buffer (the f32 KQ tensor, which doubles there as it
+scales with `n_ctx`) plus the batched-F16 `src1` staging buffer (up to
+~370 MB at `p12288`) plus oneDNN scratch overflow (~126 MB) sum to
+almost exactly its measured outside-arena headroom at `p12288`. The B50
+still carries an extra, unattributed ~0.1–0.9 GB over the measured range
+— llama.cpp-k1ev's consumer, now bounded far tighter than the pre-o3a0
+"2–4 GB on both cards" figure, and apparently absent on the B70 within
+this range.
+
+**The refusal predicate is now: refuse iff `demand + reserve > free`**,
+with `free` the device's LIVE free memory at guard time
+(`ggml_backend_sycl_get_device_memory()`, not the arena's stored
+`external_headroom()`, so a `GGML_SYCL_VRAM_BUDGET_PCT` override or
+another tenant on the card — e.g. ComfyUI holding VRAM on the B70 —
+changes the answer honestly instead of going stale) and `reserve` the
+EMPIRICAL constant
+`unified_cache_nonfa_attn_outside_arena_reserve_bytes()` = **928 MiB**.
+That figure is bracketed from the sweep above: the B50 bracket (`p7168`
+clean, `p8192` refused) gives `859 < R <= 955` MiB; the B70 bracket
+(`p11264` clean, `p12288` degraded — treated as refuse, since a caller
+that wants that context to run should not silently get a
+perf-degraded one instead) gives `893 < R <= 989` MiB; the intersection
+is `893 < R <= 955` MiB, and `R = 928 MiB` was chosen near its middle —
+margins at the four measured bracket points are 27–69 MB, i.e. at the
+sweep's own 1024-token resolution, not exact. `R` absorbs the oneDNN
+overflow, the `src1` staging buffer, and the B50's residual k1ev
+consumption, all **only over the measured range**; a shape well beyond it
+is refused conservatively rather than extrapolated.
+
+The demand term `d` itself is unchanged — still `n_head * n_ubatch *
+n_ctx * sizeof(f16) * 3` (6 bytes/element) — even though the B70's own
+visible consumers above scale closer to ~10 bytes/element (the doubling
+f32 KQ compute buffer on top of the f16 staging term). A single `R` does
+not fit both cards at that higher slope (at 10 B/elem the B70 would need
+a fixed term ≤ 203 MB while the B50 needs > 289 MB — no single value
+satisfies both), which is itself the k1ev signature: the B50 carries an
+outside-arena consumer the B70 does not. Keeping `d` at 6 B/element and
+letting `R` absorb the difference is what makes one constant work for
+both cards across the measured range.
+
+The zone comparison is dropped from the refusal entirely — it is exactly
+what over-refused `p6144`/`p7168` above. The opportunistic SCRATCH-zone
+re-plan (`unified_cache_ensure_planned_arena_zones()`) is unchanged; it
+still runs for its own INFO logging, but only on the full transaction
+(`allow_replan=true`) — never on the narrow re-check, and not at all when
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, since the explicit-0 skip returns
+before either the re-plan or the fit/refuse decision. A refusal now
+reports `needs` (= demand + reserve, broken out as `demand`/`reserve`),
+`free`, and `over_by`, plus the largest-fitting `-c` at `capacity = free -
+reserve` (`unified_cache_nonfa_attn_scratch_headroom_capacity_bytes()`,
+labeled **"headroom-limited"**, replacing "scratch-limited" — it is
+bounded by this device's own live outside-arena headroom, not a zone or a
+whole-device guarantee). An explicit `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`
+skips the guard entirely, before any comparison — `0 + reserve` compared
+against `free` would otherwise refuse any card with less than 928 MiB
+free, which is not what "disable" means. The refusal still names `-fa
+1`/`auto` or a smaller `-c` as the only remediations with hardware support
+— it deliberately does **not** suggest `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`,
+since that variable only replaces the demand term `d`, not the reserve
+or the headroom comparison; treat it as an experimentation knob for
+investigating k1ev, not a user-facing fix. Do not reintroduce a
+zone-capacity-only or compute-buffer-regrowth-only predicate without
+new hardware evidence that k1ev's consumer is understood and bounded
+— the reasoning behind each retired predicate was sound in isolation
+and still wrong in practice, which is the whole lesson of this subsection.
 
 ### Known limits (load-bearing — read before changing any of this)
 
