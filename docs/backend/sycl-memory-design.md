@@ -466,7 +466,8 @@ ticket reproduced on:
   (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
   entries) instead of handing it to the shared background drain worker via
   `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
-  that pool (for a `event_complete()`-true entry of the EXACT requested size)
+  that pool (for a completion-confirmed entry of the EXACT requested size --
+  see the completion-flag bullet below for what "confirmed" means)
   before ever falling to a fresh `unified_alloc()`. This serves the common
   case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
   across `-r N` benchmark reps and across decode steps at a stable KV length.
@@ -505,6 +506,65 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **Pool completion checks go through a host-visible flag written by a
+  device marker kernel, not a direct SYCL event query, and not a
+  host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
+  `command_execution_status` query BLOCKS rather than polls on any
+  profiling-enabled queue, and every backend stream — including the one
+  oneDNN's free callback supplies `release_event` on — is
+  profiling-enabled (see that function's own comment). Querying
+  `release_event` directly from the reuse pool therefore WAITS for an
+  in-flight SDPA kernel to finish instead of skipping it, defeating the
+  "park and skip in-flight entries" design; this bare-query block remains
+  the fallback for an entry whose flag could not be armed. The first fix
+  attempt armed a `host_task`, on a new, lazily-created
+  `get_event_watch_queue()`, `depends_on()`-ing `release_event`. That was
+  measured (both discrete cards, 2026-09-09) to have a fatal flaw no GPU
+  test caught: SUBMITTING a host_task whose `depends_on()` names an event
+  from ANOTHER queue BLOCKS THE SUBMITTING THREAD until that event
+  completes — so `onednn_graph_scratch_free()` itself stalled for the
+  parked SDPA kernel's full duration on every single park, worse than the
+  blocking-query bug this design exists to fix. The shipped design instead
+  arms a DEVICE MARKER KERNEL on that same watch queue —
+  `depends_on(release_event)` then a `single_task` writing a per-park
+  generation value into a slot of a small, fixed-capacity host-USM slab —
+  because submitting a device kernel the same way does NOT block its
+  submitting thread (measured, both cards). The slab is owned via the
+  sanctioned allocation path (`unified_cache_malloc_host_tracked()` +
+  `unified_cache_adopt_raw_host_allocation()` with `cache_backing=true`) as
+  the SECOND of exactly two allowlisted `CACHE_BACKING` mints — the first is
+  the cache's own staging buffer; see
+  `docs/design/sycl-canonical-memory-architecture.md` §3.1. `CACHE_BACKING`
+  is required here, not merely reused as a convenient existing pattern: the
+  slab must survive destructive teardown the same way the staging buffer
+  does, because a marker kernel already in flight can hold a raw pointer
+  into a specific slot at the moment shutdown runs, and `EXTERNAL_EXACT`
+  carries no exemption from the pre-teardown census's live-allocation
+  refusal. It is sized once and never reallocated
+  — growing it later could leave an in-flight marker kernel's already-held
+  raw pointer writing through a dangling host pointer; a free list plus the
+  per-park generation tag make
+  a slot safe to hand to a different pooled entry once its previous
+  occupant is popped or evicted. Every reader of a pool entry's
+  completion — `onednn_graph_scratch_entry_usable_locked()`,
+  `onednn_graph_scratch_evict_pool_until_fits_locked()`, and
+  `onednn_graph_scratch_clear_pool_locked()` — goes through
+  `onednn_graph_scratch_pool_entry_release_complete()`, which prefers this
+  flag and falls back to the bare `event_complete()` query only when no
+  flag could be armed for that entry (slab allocation failed, every slot
+  was checked out, or the marker-kernel submit threw). A test-only hook,
+  `ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()`, makes
+  the park site skip arming the flag so a GPU test can demonstrate that
+  fallback directly. Confirmed on hardware, both discrete cards this fork
+  validates against (`tests/test-sycl-event-status-blocking-probe.cpp`,
+  isolated from the pool allocator entirely): the blocking behavior is
+  specific to a DEVICE-KERNEL-produced `release_event` on a
+  profiling-enabled queue (B50: query time 118 ms against a 122 ms kernel;
+  B70: 110 ms against 114 ms) — a host_task-produced event, or a
+  device-kernel event on a non-profiling queue, both measured a few ms or
+  less either way. Every real pool release event in production is
+  device-kernel-produced (oneDNN's own free callback), matching the case
+  that actually blocks.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`

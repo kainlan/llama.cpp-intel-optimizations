@@ -27,6 +27,8 @@ CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 # documents that index as blind inside this specific ~60k-line file, so a
 # tool-assisted search here would silently miss real occurrences.
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+# llama.cpp-c6ah: source for the doc-presence check below.
+MEMORY_DESIGN_MD = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
 
 
 # One left-to-right pass over string literals, char literals, // comments and
@@ -95,6 +97,143 @@ def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# llama.cpp-c6ah: CACHE_BACKING is mintable through exactly two
+# allowlisted unified_cache_adopt_raw_host_allocation(cache_backing=true)
+# call sites -- the cache's own staging buffer, and the oneDNN Graph-scratch
+# pool's completion-flag slab this ticket added as the second, reviewed mint
+# (allocation-provenance.hpp; docs/design/sycl-canonical-memory-architecture.md
+# section 3.1). This is the REGISTERED half of that gate, independently
+# re-deriving the same allowlist from unified-cache.cpp's actual call sites;
+# tests/test-sycl-owner-allocation-migration.py enforces the identical
+# allowlist too (unregistered -- see that file), and the two must never
+# disagree.
+ADOPT_MINT_HELPER = "unified_cache_adopt_raw_host_allocation"
+ADOPT_CACHE_BACKING_ARG = 6  # 0-based: ptr, size, queue, role, category, cohort_id, cache_backing
+ADOPT_COHORT_ARG = 5  # 0-based: ptr, size, queue, role, category, cohort_id
+ADOPT_CACHE_BACKING_ALLOWLIST = (
+    '"unified_cache:staging"',
+    '"unified_cache:onednn_graph_scratch_flag_slab"',
+)
+
+
+def _split_top_level_arguments(argument_text: str) -> list:
+    """Split a call's argument text on top-level commas only, respecting
+    nested (), [], {} and not splitting inside a string literal."""
+    arguments, depth, current, in_string = [], 0, "", False
+    for char in argument_text:
+        if char == '"':
+            in_string = not in_string
+        if not in_string:
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+            elif char == "," and depth == 0:
+                arguments.append(current.strip())
+                current = ""
+                continue
+        current += char
+    if current.strip():
+        arguments.append(current.strip())
+    return arguments
+
+
+def _adopt_cache_backing_cohorts(code: str) -> list:
+    """Cohort tags (with their quotes) of every ADOPT_MINT_HELPER call in
+    `code` whose cache_backing argument is the literal `true`. `code` must
+    already be comment-stripped (see strip_comments()), so a comment merely
+    naming the helper in prose is never mistaken for a call."""
+    cohorts = []
+    for match in re.finditer(r"\b%s\s*\(" % ADOPT_MINT_HELPER, code):
+        if re.search(r"alloc_handle[ \t]+$", code[max(0, match.start() - 40):match.start()]):
+            continue  # a forward declaration/signature line, not a call
+        depth, index = 1, match.end()
+        while index < len(code) and depth:
+            if code[index] == "(":
+                depth += 1
+            elif code[index] == ")":
+                depth -= 1
+            index += 1
+        arguments = _split_top_level_arguments(code[match.end():index - 1])
+        if len(arguments) > ADOPT_CACHE_BACKING_ARG and arguments[ADOPT_CACHE_BACKING_ARG] == "true":
+            cohorts.append(arguments[ADOPT_COHORT_ARG] if len(arguments) > ADOPT_COHORT_ARG else "<missing>")
+    return cohorts
+
+
+# llama.cpp-c6ah: the withdrawn "the bare query lies once a
+# watcher/host_task exists" reading (see docstring's "Hardened" note --
+# c6ah's own history, not a hypothetical) must stay HISTORY-framed wherever
+# it is still mentioned in prose, never restated as the current explanation.
+# Both spellings actually used in this codebase's comments ("LIES" as a
+# claim, "lying" in "there is no lying query") must be caught -- a
+# single-spelling word boundary would leave the other silently unchecked.
+_LIES_WORD_RE = re.compile(r"\bl(?:ies|ying)\b", re.IGNORECASE)
+# A boundary a framing check should not cross: the end of a sentence
+# ("word. " or "word." at end of text) or a blank "//" comment line (a
+# paragraph break). Bounding a match's window at the NEAREST such boundary
+# in each direction -- rather than a fixed character count -- means framing
+# only counts when it is in the same sentence, or at worst the same
+# paragraph if no blank comment line intervenes; a fixed-size window would
+# also credit an unframed sentence merely sitting near an unrelated framed
+# one.
+_SENTENCE_OR_PARAGRAPH_BOUNDARY_RE = re.compile(r"\.(?:\s|$)|\n[ \t]*//[ \t]*\n")
+
+
+def _sentence_bounded_window(text: str, start: int, end: int) -> str:
+    left = 0
+    for m in _SENTENCE_OR_PARAGRAPH_BOUNDARY_RE.finditer(text, 0, start):
+        left = m.end()
+    right_match = _SENTENCE_OR_PARAGRAPH_BOUNDARY_RE.search(text, end)
+    right = right_match.end() if right_match else len(text)
+    return text[left:right]
+
+
+def _withdrawn_lies_phrasing_is_history_framed(raw_text: str) -> bool:
+    """True iff every occurrence of "lies"/"lying" in raw_text (the RAW,
+    comment-bearing text -- this checks comment PROSE, not code, so it must
+    not run against a comment-stripped copy) that is actually ABOUT A QUERY
+    (its own sentence/paragraph window also contains "quer", matching
+    "query"/"queries") sits inside that same window as "earlier" or
+    "misdiagnos". A "lies"/"lying" mention with no "quer" nearby is ordinary
+    English (e.g. "the slab lies before the queue") -- not the withdrawn
+    reading at all, and skipped rather than demanding framing it has no
+    reason to carry. Vacuously true if no query-related mention exists --
+    this check exists to catch a REINTRODUCTION of the withdrawn reading
+    without its framing, not to require the mention to exist."""
+    for match in _LIES_WORD_RE.finditer(raw_text):
+        window = _sentence_bounded_window(raw_text, match.start(), match.end())
+        if not re.search(r"quer", window, re.IGNORECASE):
+            continue
+        if not re.search(r"earlier|misdiagnos", window, re.IGNORECASE):
+            return False
+    return True
+
+
+# llama.cpp-c6ah: the two MEASURED facts that replaced the
+# withdrawn reading, as currently worded in docs/backend/sycl-memory-design.md.
+# Whitespace-normalized on both sides (normalize_ws) so a markdown reflow
+# that does not change the words themselves cannot break this check.
+DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS = (
+    "`command_execution_status` query BLOCKS rather than polls on any profiling-enabled queue"
+)
+DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER = (
+    "SUBMITTING a host_task whose `depends_on()` names an event from ANOTHER queue BLOCKS THE SUBMITTING "
+    "THREAD until that event completes"
+)
+
+
+def _design_doc_states_measured_facts(doc_text: str = MEMORY_DESIGN_MD) -> bool:
+    # llama.cpp-c6ah: `doc_text` defaults to the real doc but accepts a
+    # substitute so a mutation witness can call this SAME function against
+    # mutated text, rather than re-deriving its own separate check that
+    # could silently drift from what the real check actually does.
+    normalized = normalize_ws(doc_text)
+    return (
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in normalized
+        and normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in normalized
+    )
+
+
 BLOCKING_TOKENS = (
     ".wait(",
     "wait_and_throw",
@@ -108,6 +247,20 @@ def _has_no_blocking_token(body: str) -> bool:
     # says about them.
     code = strip_literals(body)
     return not any(token in code for token in BLOCKING_TOKENS)
+
+
+RELEASE_COMPLETE_CALL = "onednn_graph_scratch_pool_entry_release_complete("
+
+
+def _routes_through_release_complete(body: str) -> bool:
+    """llama.cpp-c6ah: true iff `body` calls the single choke point every
+    pool-entry completion check must use, and calls NO bare event_complete()
+    anywhere in its own text -- a positive-presence check alone would still
+    pass if a redundant direct query were added alongside it (the same
+    reasoning _has_no_blocking_token() above already applies one level up,
+    to the wider set of blocking tokens)."""
+    code = strip_literals(body)
+    return RELEASE_COMPLETE_CALL in code and "event_complete(" not in code
 
 
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
@@ -184,6 +337,36 @@ MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine mak
 # sweep, both inside this one function.
 WAIT_HEADROOM_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("
+)
+# llama.cpp-c6ah: the three functions that actually decide whether a pooled
+# entry's release is done. Extracted separately (not reused from
+# TRY_REUSE_POOL_BODY_CODE/POOL_SIZE_READY_BODY_CODE above, which call
+# onednn_graph_scratch_entry_usable_locked() rather than the completion
+# check itself) so the checks below can assert exactly where the query
+# lives and where it does not.
+ENTRY_USABLE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratch_entry_usable_locked("
+)
+EVICT_UNTIL_FITS_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked("
+)
+CLEAR_POOL_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
+)
+# llama.cpp-c6ah: the choke point's OWN body, extracted
+# separately from the three caller bodies above -- those checks assert what
+# the CALLERS query (RELEASE_COMPLETE_CALL, never a bare event_complete());
+# this one asserts what the choke point ITSELF does, specifically that its
+# only remaining event_complete() call is the flag_slot == -1 fallback
+# (the armed predicate was renamed from a release_done
+# std::shared_ptr<std::atomic<bool>> to a flag_slot/flag_generation pair
+# into a host-USM slab; the shape of this check -- exactly one call, no
+# hook branch -- is unchanged), not a second call reintroduced by a RED-arm
+# hook branch (the earlier, incorrect design this redesign replaced -- see
+# the function's own comment for why a check-time hook branch could not
+# reproduce pre-fix behaviour).
+RELEASE_COMPLETE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_entry_release_complete("
 )
 
 
@@ -375,6 +558,27 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["pool_size_ready_locked() body has no blocking token of its own"] = _has_no_blocking_token(
         POOL_SIZE_READY_BODY_CODE
     )
+    # llama.cpp-c6ah: the single choke point every pool-entry completion
+    # check must route through, instead of a direct event_complete() query
+    # on release_event -- see onednn_graph_scratch_pool_entry_release_complete()'s
+    # own comment for why (event_complete()'s bare command_execution_status
+    # query BLOCKS rather than polls on the profiling-enabled queue
+    # release_event lives on). Three call sites: the shared usability
+    # predicate both try_reuse_pool_locked() and pool_size_ready_locked()
+    # apply (checked above to call the predicate; this asserts what the
+    # PREDICATE ITSELF queries), the eviction sweep, and the pool-clear
+    # reclaim path (checked again, alongside its own retain_handles_until_event()
+    # requirement, below). Reuses _routes_through_release_complete() -- proven
+    # non-vacuous in test_pool_entry_release_complete_is_the_single_choke_point.
+    checks["entry_usable_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(ENTRY_USABLE_BODY_CODE)
+    )
+    checks["evict_pool_until_fits_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(EVICT_UNTIL_FITS_BODY_CODE)
+    )
+    checks["clear_pool_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(CLEAR_POOL_BODY_CODE)
+    )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
     # sizes (a pp8192 run touches ~16 distinct ne11-derived shapes) could
@@ -424,13 +628,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # its assertions also hold pre-fix). Tolerant of formatting: matches the
     # two calls' PRESENCE (not their exact argument text), which is what
     # actually survives clang-format re-wrapping or an unrelated rename of
-    # the loop variable.
-    clear_pool_body_code = extract_function_body(
-        CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
-    )
+    # the loop variable. llama.cpp-c6ah: the completion query this body makes
+    # is RELEASE_COMPLETE_CALL, not a direct event_complete() -- see the
+    # dedicated check above (a direct query here would BLOCK, same as it
+    # used to for the other two pool-lookup call sites); this check adds the
+    # retain_handles_until_event() half that one does not cover.
     checks["pool clear defers an incomplete-event entry instead of destructing it unconditionally"] = (
-        "event_complete(" in normalize_ws(clear_pool_body_code)
-        and "retain_handles_until_event(" in normalize_ws(clear_pool_body_code)
+        RELEASE_COMPLETE_CALL in normalize_ws(CLEAR_POOL_BODY_CODE)
+        and "retain_handles_until_event(" in normalize_ws(CLEAR_POOL_BODY_CODE)
     )
     # Scoped to arena_reserve()'s own body, not a same-file coincidence: the
     # reclaim call must be co-located with the KV/RUNTIME reclaim it is meant
@@ -576,6 +781,58 @@ def test_onednn_graph_allocator_source_contract() -> None:
     )
     checks["free no-cache branch does not call sycl::free"] = "sycl::free(" not in free_fn_code
 
+    # llama.cpp-c6ah: the choke point itself must call event_complete() exactly once -- the
+    # flag_slot == -1 fallback -- and never branch on the RED-arm test hook.
+    # A branch there would still be querying a WATCHED event whenever
+    # flag_slot was armed, so the RED arm can only be correct if this
+    # function stays this simple and the hook instead lives in
+    # onednn_graph_scratch_free()'s park site (checked below), which
+    # decides whether flag_slot gets armed in the first place.
+    checks["release_complete()'s only event_complete() call is the flag_slot == -1 fallback"] = (
+        strip_literals(RELEASE_COMPLETE_BODY_CODE).count("event_complete(") == 1
+    )
+    checks["release_complete() does not branch on the RED-arm test hook"] = (
+        "g_onednn_graph_scratch_test_force_blocking_pool_check" not in RELEASE_COMPLETE_BODY_CODE
+    )
+    checks["free() park site consults the RED-arm test hook before arming the flag"] = (
+        "g_onednn_graph_scratch_test_force_blocking_pool_check" in FREE_BODY_CODE
+    )
+    # llama.cpp-c6ah: the pool's completion flag is armed by a
+    # DEVICE marker kernel, never a host_task -- a host_task whose
+    # depends_on() names an event from another queue (which the release
+    # event always is here) was measured, both cards, to block the
+    # SUBMITTING thread until that event completes, i.e. it would stall
+    # this very function for the parked kernel's whole duration on every
+    # single park. strip_literals first: the WARN messages in this body
+    # name "host_task" in prose (describing what NOT to do), and a negative
+    # check must read code, not messages.
+    checks["free() body submits no host_task (the finding-31 marker-kernel design, not a watcher)"] = (
+        "host_task(" not in strip_literals(FREE_BODY_CODE)
+    )
+
+    # llama.cpp-c6ah: CACHE_BACKING's two-site allowlist -- see
+    # the module-level comment above ADOPT_MINT_HELPER. A third
+    # cache_backing=true call site (a new bootstrap mint added without
+    # review), a missing cohort tag, or a cohort tag that does not match
+    # either allowlisted string must all fail this check.
+    checks["cache_backing=true mints are exactly the two-site allowlist"] = sorted(
+        _adopt_cache_backing_cohorts(CACHE_CPP_CODE)
+    ) == sorted(ADOPT_CACHE_BACKING_ALLOWLIST)
+
+    # llama.cpp-c6ah: the withdrawn "bare query lies" reading must
+    # stay history-framed everywhere it is still mentioned -- checked against
+    # the RAW (comment-bearing) source, since this is a check on comment
+    # prose, not on code behavior (see the module docstring's stated
+    # exception for the in-order-queue check, which this joins).
+    checks["every withdrawn 'query lies' mention is history-framed"] = _withdrawn_lies_phrasing_is_history_framed(
+        CACHE_CPP
+    ) and _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP)
+
+    # llama.cpp-c6ah: the design doc must still state the two
+    # MEASURED facts that replaced the withdrawn reading, not just avoid the
+    # withdrawn wording.
+    checks["design doc states the two measured completion-check facts"] = _design_doc_states_measured_facts()
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
 
@@ -609,14 +866,21 @@ def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
     those checks exist to catch (both used to call event_complete() on their
     own ahead of the shared predicate -- llama.cpp-c6ah), rather than only
     ever passing on the current, correct source."""
+    # Whitespace-insensitive (llama.cpp-c6ah): this declaration sits next to
+    # a comment block whose length determines whether clang-format pulls it
+    # into a multi-line alignment group with a sibling declaration further
+    # down, which changes the exact spacing between `mem_handle` and
+    # `owner` -- normalize before matching so an unrelated comment edit
+    # nearby cannot silently break this witness.
     reuse_target = "mem_handle owner = std::move(bucket[i].owner);"
-    assert reuse_target in TRY_REUSE_POOL_BODY_CODE, "mutation target string not found -- update this witness"
-    reuse_mutated = TRY_REUSE_POOL_BODY_CODE.replace(
+    reuse_body_normalized = normalize_ws(TRY_REUSE_POOL_BODY_CODE)
+    assert reuse_target in reuse_body_normalized, "mutation target string not found -- update this witness"
+    reuse_mutated = reuse_body_normalized.replace(
         reuse_target,
         "event_complete(bucket[i].release_event); " + reuse_target,
         1,
     )
-    assert reuse_mutated != TRY_REUSE_POOL_BODY_CODE
+    assert reuse_mutated != reuse_body_normalized
     assert _has_no_blocking_token(TRY_REUSE_POOL_BODY_CODE), (
         "the real, unmutated try_reuse_pool_locked() body should have no blocking token"
     )
@@ -626,17 +890,246 @@ def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
     )
 
     ready_target = "return true;"
-    assert ready_target in POOL_SIZE_READY_BODY_CODE, "mutation target string not found -- update this witness"
-    ready_mutated = POOL_SIZE_READY_BODY_CODE.replace(
+    ready_body_normalized = normalize_ws(POOL_SIZE_READY_BODY_CODE)
+    assert ready_target in ready_body_normalized, "mutation target string not found -- update this witness"
+    ready_mutated = ready_body_normalized.replace(
         ready_target,
         "event_complete(entry.release_event); " + ready_target,
         1,
     )
-    assert ready_mutated != POOL_SIZE_READY_BODY_CODE
+    assert ready_mutated != ready_body_normalized
     assert _has_no_blocking_token(POOL_SIZE_READY_BODY_CODE), (
         "the real, unmutated pool_size_ready_locked() body should have no blocking token"
     )
     assert not _has_no_blocking_token(ready_mutated), (
         "mutation witness is broken: the injected event_complete() call was not detected by "
         "_has_no_blocking_token()"
+    )
+
+
+def test_pool_entry_release_complete_is_the_single_choke_point() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the three
+    "calls RELEASE_COMPLETE_CALL, never a bare event_complete()" checks in
+    the main contract test above would actually catch a reintroduced direct
+    event_complete() query on a pool entry's release_event -- the specific
+    regression this ticket fixes (querying that event directly BLOCKS rather
+    than polls on the profiling-enabled queue it lives on, turning "skip an
+    in-flight entry" back into "wait for it"). Without this witness, a
+    check that always reports the CURRENT (correct) source as passing could
+    just as easily never fire on the mutation it claims to guard against."""
+
+    def assert_catches_direct_event_complete(body: str, label: str, target: str) -> None:
+        assert target in body, f"{label}: mutation target string not found -- update this witness"
+        mutated = body.replace(target, "event_complete(entry.release_event); " + target, 1)
+        assert mutated != body
+        assert _routes_through_release_complete(body), (
+            f"{label}: the real, unmutated body should call {RELEASE_COMPLETE_CALL!r} and nothing named "
+            "event_complete("
+        )
+        assert not _routes_through_release_complete(mutated), (
+            f"{label}: mutation witness is broken -- the injected direct event_complete() call was not "
+            "detected"
+        )
+
+    assert_catches_direct_event_complete(
+        ENTRY_USABLE_BODY_CODE,
+        "onednn_graph_scratch_entry_usable_locked()",
+        "return onednn_graph_scratch_entry_fit::EVENT_PENDING;",
+    )
+    assert_catches_direct_event_complete(
+        EVICT_UNTIL_FITS_BODY_CODE,
+        "onednn_graph_scratch_evict_pool_until_fits_locked()",
+        "for (auto bucket_it = onednn_graph_scratch_reuse_pool_.begin();",
+    )
+    assert_catches_direct_event_complete(
+        CLEAR_POOL_BODY_CODE,
+        "onednn_graph_scratch_clear_pool_locked()",
+        "for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {",
+    )
+
+
+def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah (anchor tracks the
+    flag_slot/flag_generation redesign, same property this witness always
+    checked): proves the two checks added for it in the main contract test
+    above would actually catch the SPECIFIC regression they exist to
+    prevent -- a RED-arm test hook branch reintroduced inside
+    onednn_graph_scratch_pool_entry_release_complete() itself, querying
+    release_event directly whenever the hook is forced, regardless of
+    flag_slot. That design was tried and found incorrect (it would still
+    query a WATCHED event, a separate hazard documented in the function's
+    own comment), which is why the fix moved the hook to
+    onednn_graph_scratch_free()'s park site instead; this witness proves a
+    regression back to the check-time branch would be caught, not merely
+    that the current source happens to pass."""
+    anchor = "if (entry.flag_slot >= 0) {"
+    assert anchor in RELEASE_COMPLETE_BODY_CODE, "mutation target string not found -- update this witness"
+    reintroduced_hook_branch = (
+        "if (onednn_graph_scratch_test_hooks_enabled() && "
+        "g_onednn_graph_scratch_test_force_blocking_pool_check.load(std::memory_order_acquire)) { "
+        "return event_complete(entry.release_event); } "
+    )
+    mutated = RELEASE_COMPLETE_BODY_CODE.replace(anchor, reintroduced_hook_branch + anchor, 1)
+    assert mutated != RELEASE_COMPLETE_BODY_CODE
+
+    real_count = strip_literals(RELEASE_COMPLETE_BODY_CODE).count("event_complete(")
+    mutated_count = strip_literals(mutated).count("event_complete(")
+    assert real_count == 1, (
+        "the real, unmutated release_complete() body should call event_complete() exactly once "
+        f"(the flag_slot == -1 fallback); found {real_count}"
+    )
+    assert mutated_count != 1, (
+        "mutation witness is broken: the reintroduced hook branch's extra event_complete() call was not "
+        "detected by the call-count check"
+    )
+
+    assert "g_onednn_graph_scratch_test_force_blocking_pool_check" not in RELEASE_COMPLETE_BODY_CODE, (
+        "the real, unmutated release_complete() body should not reference the RED-arm hook at all"
+    )
+    assert "g_onednn_graph_scratch_test_force_blocking_pool_check" in mutated, (
+        "mutation witness is broken: the reintroduced hook reference was not present in the mutated text"
+    )
+
+
+def test_free_body_has_no_host_task_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the "free()
+    body submits no host_task" check in the main contract test above would
+    actually catch the SPECIFIC regression it exists to prevent -- a
+    host_task reintroduced into onednn_graph_scratch_free()'s completion-
+    flag arm, the exact design this fork replaced after measuring (both
+    cards, 2026-09-09) that submitting a host_task with a cross-queue
+    dependency blocks the SUBMITTING thread -- i.e. this very function,
+    called from oneDNN's free callback -- until that dependency
+    completes."""
+    anchor = "depends_on(*event);"
+    stripped_free_body = strip_literals(FREE_BODY_CODE)
+    assert anchor in stripped_free_body, "mutation target string not found -- update this witness"
+    mutated = stripped_free_body.replace(
+        anchor,
+        anchor + " h.host_task([]() {});",
+        1,
+    )
+    assert mutated != stripped_free_body
+    assert "host_task(" not in stripped_free_body, "the real, unmutated free() body should submit no host_task"
+    assert "host_task(" in mutated, (
+        "mutation witness is broken: the reintroduced host_task() call was not present in the mutated text"
+    )
+
+
+def test_cache_backing_allowlist_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the
+    "cache_backing=true mints are exactly the two-site allowlist" check in
+    the main contract test above would actually catch a reintroduced THIRD
+    bootstrap mint -- a new unified_cache_adopt_raw_host_allocation() call
+    site passing cache_backing=true with a cohort tag outside the two
+    reviewed ones, added without the review this gate exists to force."""
+    real_cohorts = _adopt_cache_backing_cohorts(CACHE_CPP_CODE)
+    assert sorted(real_cohorts) == sorted(ADOPT_CACHE_BACKING_ALLOWLIST), (
+        "the real, unmutated source should carry exactly the two allowlisted cache_backing=true cohorts -- "
+        f"found {real_cohorts}"
+    )
+
+    third_call_probe = (
+        '\nstatic alloc_handle _c6ah_finding41_mutation_probe(sycl::queue & q) {\n'
+        '    return %s(nullptr, 0, q, alloc_role::OTHER, runtime_category::OTHER, '
+        '"unified_cache:not_allowlisted", true);\n'
+        '}\n'
+    ) % ADOPT_MINT_HELPER
+    mutated = CACHE_CPP_CODE + third_call_probe
+    mutated_cohorts = _adopt_cache_backing_cohorts(mutated)
+    assert sorted(mutated_cohorts) != sorted(ADOPT_CACHE_BACKING_ALLOWLIST), (
+        "mutation witness is broken: the injected third cache_backing=true call site was not detected"
+    )
+
+
+def test_withdrawn_lies_phrasing_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the "every
+    withdrawn 'query lies' mention is history-framed" check above would
+    catch the SPECIFIC regression it exists to prevent -- the withdrawn
+    reading restated as if it were still the current explanation, with no
+    "earlier"/"misdiagnos" framing anywhere nearby."""
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP), (
+        "the real, unmutated unified-cache.hpp text should already pass this check"
+    )
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_CPP), (
+        "the real, unmutated unified-cache.cpp text should already pass this check"
+    )
+    unframed_reintroduction = (
+        "\n// The bare event query lies about completion once a watcher is attached.\n"
+    )
+    mutated = CACHE_HPP + unframed_reintroduction
+    assert not _withdrawn_lies_phrasing_is_history_framed(mutated), (
+        "mutation witness is broken: the reintroduced, unframed 'lies' mention was not detected"
+    )
+    # A positive control the other way: the same sentence WITH framing must
+    # still pass, proving this isn't just "reject any new occurrence of the
+    # word".
+    framed_reintroduction = (
+        "\n// An earlier draft of this comment claimed the bare event query lies about completion once a "
+        "watcher is attached; that was a misdiagnosis.\n"
+    )
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + framed_reintroduction), (
+        "the check should not reject a NEW mention that is properly history-framed"
+    )
+    # llama.cpp-c6ah: the specific gap a fixed-size character window left --
+    # an UNFRAMED sentence sitting in the same paragraph as, but not the
+    # same sentence as, a genuinely framed one used to inherit that framing
+    # merely by being nearby. Two sentences, same paragraph (no blank
+    # comment line between them): the first is framed and would pass on its
+    # own; the second restates the withdrawn claim with no framing of its
+    # own and must fail even though "misdiagnosis" appears a few words
+    # earlier in the same paragraph.
+    adjacent_unframed_reintroduction = (
+        "\n// An earlier draft mishandled this timing. That was a misdiagnosis of a different effect.\n"
+        "// The bare event query lies about completion once a watcher is attached.\n"
+    )
+    assert not _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + adjacent_unframed_reintroduction), (
+        "mutation witness is broken: an unframed 'lies' sentence merely ADJACENT (same paragraph, different "
+        "sentence) to an unrelated framed one was not detected -- framing must be in the same sentence, not "
+        "merely nearby"
+    )
+    # llama.cpp-c6ah: the OTHER half of this ticket's own regression -- the
+    # "lying" spelling (used in this codebase's own comments: "there was no
+    # lying query") must be caught by the same mechanism, unframed.
+    unframed_lying_reintroduction = "\n// There is no lying query here, this function tells the truth.\n"
+    assert not _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + unframed_lying_reintroduction), (
+        "mutation witness is broken: an unframed 'lying' mention was not detected -- only the 'lies' "
+        "spelling was being matched"
+    )
+    # llama.cpp-c6ah: an ORDINARY English "lies"/"lying" sentence with
+    # nothing to do with a query must never be flagged, unframed or not --
+    # "queue" deliberately does NOT contain "quer" as a substring, so this
+    # is a genuine negative case, not an accidental match.
+    unrelated_lies_sentence = "\n// The slab lies before the queue in the class body.\n"
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + unrelated_lies_sentence), (
+        "the check should not flag an ordinary English use of 'lies' that has nothing to do with a query"
+    )
+
+
+def test_design_doc_measured_facts_check_has_a_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the "design
+    doc states the two measured completion-check facts" check above would
+    catch either fact being edited or removed from
+    docs/backend/sycl-memory-design.md -- by calling
+    _design_doc_states_measured_facts() itself against the mutated text
+    (not a separately re-derived local check that could silently drift
+    from what the real check actually tests)."""
+    assert _design_doc_states_measured_facts(), "the real, unmutated design doc should already pass this check"
+    mutated_missing_first_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS), "", 1
+    )
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) not in mutated_missing_first_fact
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in mutated_missing_first_fact
+    assert not _design_doc_states_measured_facts(mutated_missing_first_fact), (
+        "mutation witness is broken: removing the first measured fact was not detected by the real check "
+        "function"
+    )
+    mutated_missing_second_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
+        normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER), "", 1
+    )
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) not in mutated_missing_second_fact
+    assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in mutated_missing_second_fact
+    assert not _design_doc_states_measured_facts(mutated_missing_second_fact), (
+        "mutation witness is broken: removing the second measured fact was not detected by the real check "
+        "function"
     )
