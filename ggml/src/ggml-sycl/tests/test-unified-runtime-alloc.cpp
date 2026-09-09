@@ -844,8 +844,8 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // introduced the DIRECT reuse pool.
 //
 // This case isolates the two: reclaim the pool explicitly, through the
-// same public entry point ggml_sycl_set_runtime_context() already uses in
-// production (ggml-sycl.cpp), BEFORE calling shutdown -- releasing the
+// same public entry point ggml_backend_sycl_set_runtime_context() already
+// uses in production (ggml-sycl.cpp), BEFORE calling shutdown -- releasing the
 // parked buffer's own control ahead of the pre-teardown census so it
 // cannot be what refuses this time. Whatever shutdown_unified_cache()
 // returns here says whether the FLAG SLAB's own registry row (what F1 as
@@ -897,27 +897,22 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // explicit_global_cache_shutdown_is_clean() alone, several cases earlier
 // in main()'s default run, is enough to poison every case after it this
 // way -- not just the two shutdown-poisoning cases poisoning each other.
-static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(sycl::queue & q) {
-    TEST_BEGIN("onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim");
 
-    unified_cache * cache = get_unified_cache(q);
-    TEST_ASSERT(cache != nullptr, "cache unavailable");
-    TEST_ASSERT(cache->onednn_graph_scratch_direct_outstanding_bytes() == 0,
-                "cache did not start from a clean slate -- a prior case left DIRECT Graph-scratch bytes "
-                "outstanding, which would make this case's own isolation step meaningless");
-
-    sycl::queue & dq = cache->get_queue();
-
-    // A different size than the other case's 300 MiB: not load-bearing any
-    // more (each case now verifies its own clean starting state above,
-    // rather than relying on ordering alone for correctness), but keeps
-    // the two cases' failures distinguishable by size in a log if ever
-    // needed. Same zone-floor/cap reasoning as the other case's own
-    // comment.
-    constexpr size_t size = 320ull * 1024 * 1024;
-
+// llama.cpp-me60: shared setup for both shutdown-repro cases below --
+// allocate one oneDNN Graph-scratch DIRECT buffer of `size` bytes on `dq`,
+// free it with a short device-kernel release event (so
+// onednn_graph_scratch_free() takes the arming branch and actually
+// allocates the completion-flag slab both cases target), then wait for
+// both the release event and the separate, asynchronous marker kernel that
+// arms its flag slot (see onednn_graph_scratch_pool_entry::flag_slot's own
+// comment in unified-cache.hpp) so this parks a genuine, complete registry
+// row rather than one still mid-arming when a caller proceeds. Every step
+// is already TEST_ASSERT'd here, so a caller only needs to
+// TEST_ASSERT(park_one_direct_entry(...), ...) once around the whole call
+// -- the printed failure message names which specific step failed.
+static bool park_one_direct_entry(unified_cache * cache, sycl::queue & dq, size_t size) {
     void * ptr = cache->onednn_graph_scratch_alloc(size, 256, &dq);
-    TEST_ASSERT(ptr != nullptr, "DIRECT allocation for the isolation fixture failed (setup, not the regression)");
+    TEST_ASSERT(ptr != nullptr, "DIRECT allocation for the shutdown-repro fixture failed (setup, not the regression)");
 
     int * cell = sycl::malloc_device<int>(1, dq);
     TEST_ASSERT(cell != nullptr, "device marker cell allocation failed (setup, not the regression)");
@@ -926,16 +921,47 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
 
     cache->onednn_graph_scratch_free(ptr, &release_event);
 
-    // Same reasoning as the other case's own comment: wait for the release
-    // event AND the asynchronous marker kernel so the parked entry is
-    // genuinely complete before it is reclaimed below.
     release_event.wait();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
     while (!cache->onednn_graph_scratch_pool_entry_flag_true_for_test(size) &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    TEST_ASSERT(cache->onednn_graph_scratch_pool_entry_flag_true_for_test(size),
+                "marker flag did not arm within 2500 ms -- setup, not the regression");
     sycl::free(cell, dq);
+    return true;
+}
+
+static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(sycl::queue & q) {
+    TEST_BEGIN("onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim");
+
+    unified_cache * cache = get_unified_cache(q);
+    TEST_ASSERT(cache != nullptr, "cache unavailable");
+    TEST_ASSERT(cache->onednn_graph_scratch_direct_outstanding_bytes() == 0,
+                "cache did not start from a clean slate -- a prior case left DIRECT Graph-scratch bytes "
+                "outstanding, which would make this case's own isolation step meaningless");
+    TEST_ASSERT(!ggml_sycl_is_shutting_down(),
+                "g_sycl_shutting_down is already set -- this process is not the fresh one this case requires; "
+                "its own shutdown_resources() would take the abandon branch this case does not target");
+
+    sycl::queue & dq = cache->get_queue();
+
+    // A different size than the other case's 300 MiB: not load-bearing --
+    // the REAL protection is that each case runs in its own ctest-launched
+    // process (see the comment above this function), so nothing else in
+    // this binary can have parked a DIRECT entry or left
+    // g_sycl_shutting_down set before this case runs. The two asserts just
+    // above are a belt-and-suspenders check that would catch it loudly if
+    // that process isolation were ever broken (e.g. by a future edit
+    // calling this case from main()'s default path again); the size
+    // difference from the other case's 300 MiB just keeps the two cases'
+    // failures distinguishable by size in a log if ever needed. Same
+    // zone-floor/cap reasoning as the other case's own comment.
+    constexpr size_t size = 320ull * 1024 * 1024;
+
+    TEST_ASSERT(park_one_direct_entry(cache, dq, size),
+                "parking one complete DIRECT Graph-scratch entry failed (setup, not the regression)");
 
     // THE ISOLATION STEP: the parked entry is already complete (waited on
     // above), so onednn_graph_scratch_clear_pool_locked() takes its
@@ -1038,6 +1064,9 @@ static bool onednn_graph_scratch_flag_slab_released_at_module_shutdown(sycl::que
     TEST_ASSERT(cache->onednn_graph_scratch_direct_outstanding_bytes() == 0,
                 "cache did not start from a clean slate -- a prior case left DIRECT Graph-scratch bytes "
                 "outstanding, which would make this case's own park-and-shutdown check meaningless");
+    TEST_ASSERT(!ggml_sycl_is_shutting_down(),
+                "g_sycl_shutting_down is already set -- this process is not the fresh one this case requires; "
+                "its own shutdown_resources() would take the abandon branch this case does not target");
 
     sycl::queue & dq = cache->get_queue();
 
@@ -1050,35 +1079,8 @@ static bool onednn_graph_scratch_flag_slab_released_at_module_shutdown(sycl::que
     // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB before first cache use.
     constexpr size_t size = 300ull * 1024 * 1024;
 
-    void * ptr = cache->onednn_graph_scratch_alloc(size, 256, &dq);
-    TEST_ASSERT(ptr != nullptr, "DIRECT allocation for the shutdown-repro fixture failed");
-
-    // A short device-kernel release event -- a real command, not a
-    // default-constructed sycl::event -- so onednn_graph_scratch_free()
-    // takes the arming branch and onednn_graph_scratch_ensure_flag_slab_locked()
-    // actually allocates the slab this case targets.
-    int * cell = sycl::malloc_device<int>(1, dq);
-    TEST_ASSERT(cell != nullptr, "device marker cell allocation failed");
-    dq.memset(cell, 0, sizeof(int)).wait();
-    sycl::event release_event = submit_spin_kernel(dq, cell, 2000000);
-
-    cache->onednn_graph_scratch_free(ptr, &release_event);
-
-    // Wait for the release event AND the separate, asynchronous marker
-    // kernel that arms its flag slot (see
-    // onednn_graph_scratch_pool_entry::flag_slot's own comment in
-    // unified-cache.hpp) so this parks a genuine, complete registry row
-    // rather than one still mid-arming when shutdown runs. Not load-bearing
-    // for the defect itself -- the slab's OWN row is what the sweep
-    // refuses, independent of any individual pooled entry's completion
-    // state -- but matches what a real oneDNN free callback leaves behind.
-    release_event.wait();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
-    while (!cache->onednn_graph_scratch_pool_entry_flag_true_for_test(size) &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    sycl::free(cell, dq);
+    TEST_ASSERT(park_one_direct_entry(cache, dq, size),
+                "parking one complete DIRECT Graph-scratch entry failed (setup, not the regression)");
 
     // THE ACTUAL REGRESSION CHECK.
     TEST_ASSERT(shutdown_unified_cache(),
@@ -1435,7 +1437,18 @@ int main(int argc, char ** argv) {
     // shutdown_unified_cache() call earlier in the process poisons a
     // lazily recreated cache, so a default-run invocation would exercise a
     // test-only defect rather than either case's own target property.
-    if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
+    if (argc >= 2 && std::strcmp(argv[1], "--case") == 0) {
+        // Checked BEFORE any argv[2] use below (both the GGML_SYCL_DNNL
+        // dispatch and its #else SKIP branch dereference argv[2]) -- an
+        // arity check folded into the outer `if` alongside the flag match
+        // (the form this replaced) fails OPEN on wrong arity: `--case`
+        // with no name at all does not match `argc == 3`, so it fell
+        // through silently to the full default suite below instead of
+        // being reported as a usage error.
+        if (argc != 3) {
+            fprintf(stderr, "usage: %s --case <name>\n", argv[0]);
+            return 1;
+        }
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
         bool         case_ok;
