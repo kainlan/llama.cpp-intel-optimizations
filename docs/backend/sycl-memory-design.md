@@ -1893,115 +1893,67 @@ for the standard model-load flow this can never fire with the real shape:
 `envelope.n_ctx = 0` unconditionally, so no caller's real `-c`/`-p` reaches
 `plan.planner_n_ctx` before weights stream into the arena. Piping the real
 context size back into pre-load sizing is llama.cpp-fkpg's scope — this
-raise only takes effect automatically once that lands, or manually today by
-setting `GGML_SYCL_NONFA_ATTN_SCRATCH_MB` as a process environment variable
-before the model loads (read at the same first-reservation call as the
-pre-existing `GGML_SYCL_COMPUTE_ARENA_MB`, so a value the operator already
-knows sidesteps the gap entirely). `ggml_backend_sycl_set_runtime_context()`
-also makes one opportunistic re-plan attempt with the real runtime shape
-(`unified_cache_ensure_planned_arena_zones()`, the same call
-`reserve_onednn_scratch()`'s own comment already documents as succeeding
-only in "the rare case where the arena is still empty") — cheap and
-harmless, but not expected to succeed once weights hold live leases.
+raise only takes effect automatically once that lands. `ggml_backend_sycl
+_set_runtime_context()` also makes one opportunistic re-plan attempt with
+the real runtime shape (`unified_cache_ensure_planned_arena_zones()`, the
+same call `reserve_onednn_scratch()`'s own comment already documents as
+succeeding only in "the rare case where the arena is still empty") —
+cheap and harmless, but not expected to succeed once weights hold live
+leases; its own log line only claims "raised" when the zone's capacity
+actually grew, and says "re-plan skipped: arena has live leases" otherwise.
 
-**A SCRATCH-zone-capacity comparison alone is not the authoritative
-check, and an earlier version of this design used exactly that and would
-have missed the repro on a card with more headroom.** A zone overflow does
-not fail outright: `unified_alloc()` (`unified-cache.cpp`) falls through to
-a raw device allocation OUTSIDE the fixed arena when a preferred zone is
-full. That same outside-arena headroom is what the SYCL scheduler's own
-compute buffer draws on when it regrows — `llama_context::graph_reserve()`
-reserves it at the KV cache's own reserve-time n_kv
-(`llama_kv_cache::get_n_kv()`, sized from currently-used cells, which is 0
-at construction, not the real `n_ctx`; a deliberate upstream design for
-graph-shape stability, not something to change here), so the buffer WILL
-regrow, outside the arena, once a real ubatch reaches this context's actual
-n_kv — and what the oneDNN scratchpad does when its own 256 MB zone
-fragments (the repro's "sub-allocation failed with sufficient ONEDNN zone
-capacity" line: capacity was never the problem there either). A
-card with more outside-arena headroom (a B70 has roughly 3 GB where this
-B50 repro has ~1.6 GB) can absorb a shape a zone-only predicate would
-wrongly refuse.
+**The check is EMPIRICAL, not a modeled worst case — read this before
+tightening or loosening it.** A first draft of this predicate (llama.cpp
+-oyfl round 2) reasoned from first principles that a SCRATCH-zone-capacity
+comparison alone was insufficient: a zone overflow does not fail outright
+(`unified_alloc()`, `unified-cache.cpp`, falls through to a raw device
+allocation OUTSIDE the fixed arena when a preferred zone is full), and
+that same outside-arena headroom is what the SYCL scheduler's own compute
+buffer draws on when it regrows to the context's real `n_kv`
+(`llama_context::graph_reserve()` reserves it at the KV cache's own
+reserve-time `n_kv`, `llama_kv_cache::get_n_kv()`, sized from
+currently-used cells — 0 at construction — not the real `n_ctx`; a
+deliberate upstream design for graph-shape stability, not something to
+change here). That draft modeled and summed every such term (compute
+-buffer regrowth, SCRATCH overflow, oneDNN scratchpad) and compared the
+sum against live free VRAM outside the arena, predicting the repro would
+run once `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` (the exact `c=3` demand)
+eliminated the SCRATCH term (predicted available ~1334 MiB vs. ~1200 MiB
+needed).
 
-The authoritative check, in `ggml_backend_sycl_set_runtime_context()`
-(`ggml-sycl.cpp`), instead sums everything that can spill outside the arena
-and compares it against the VRAM actually available outside it, queried
-live via `ggml_backend_sycl_get_device_memory()`:
+**Hardware measurement falsified that model.** On the B50, the same
+`-fa 0 -p 8192` repro with `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` still
+aborted (rc=134, staging-allocation failures, a VRAM-exhaustion line) — a
+sweep across `768`/`1536` MiB zone sizes, `GGML_SYCL_VRAM_BUDGET_PCT=85`
+(shrinking the arena to grow outside-arena headroom to ~4.0 GB), and an
+explicit `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=3072` override all
+still aborted, each time with tens of MB free rather than the modeled
+headroom. The B70 (default ~2 GB outside its arena, and again with
+headroom raised to ~4.0 GB) aborted identically. So the non-FA `-p 8192`
+prefill consumes roughly 2–4 GB **outside the fixed arena on both discrete
+cards**, far beyond anything the compute-buffer/SCRATCH/oneDNN model
+above accounts for, and no zone size or headroom override recovers it —
+filed as **llama.cpp-k1ev**, an unidentified outside-arena consumer
+specific to the non-FA path. This also falsifies the model's original
+motivating concern (a card with more outside-arena headroom, e.g. the
+B70, would wrongly refuse a shape that actually runs): both cards abort
+at the same shape, so the zone-only check is not observed to be more
+conservative than reality on either card measured so far.
 
-```
-compute_buffer_term = reserved_compute_buffer_bytes + n_head * n_ubatch * n_ctx * sizeof(f32)
-scratch_overflow     = max(0, nonfa_demand - zone_capacity(SCRATCH))
-onednn_term          = unified_cache_get_planned_onednn_scratchpad_bytes()   // counted WHOLESALE
-total_outside        = compute_buffer_term + scratch_overflow + onednn_term
-
-margin    = max(256 MiB, 10% of live_free)
-available = live_free + reserved_compute_buffer_bytes - margin
-
-refuse iff total_outside > available
-```
-
-`reserved_compute_buffer_bytes` is `ggml_backend_sched_get_buffer_size()`
-for the SYCL backend, read by a dedicated post-`sched_reserve()` call
-(`llama_context::sched_reserve()`, `llama-context.cpp`) once that
-function's graph-reserve passes have actually allocated the buffer — 0 for
-the two earlier calls (the constructor's own call, and the one made when an
-AUTO `flash_attn_type` resolves), which only makes their check MORE
-conservative, never less. `compute_buffer_term`'s "full new kq/kqv buffer"
-does not subtract what the OLD, smaller kq/kqv already contributed to
-`reserved_compute_buffer_bytes` — getting the exact reserve-time n_kv would
-need a new virtual method on `llama_memory_context_i`
-(`src/llama-memory.h`), which none of its ~7 concrete implementations
-currently expose; the omission over-counts by a few tens of MB, in the safe
-direction. `onednn_term` is counted in full rather than only its own zone's
-overflow, because the repro's oneDNN failure was fragmentation, which a
-capacity comparison cannot see. The margin (calibrated on this repro: a
-predicted ~1.4 GB against an observed exhaustion at ~1.59 GB free) covers
-driver/runtime allocations neither term models.
-
-**Why live free VRAM, and not the zone's capacity alone, is queried here
-(unlike a check that ran before any of this — e.g. the plan-time raise
-above — where capacity is the only number available):** by the time this
-authoritative call runs, `sched_reserve()` has already made its first
-compute-buffer allocation, so a live query at this point reflects a real,
-current state of the device, not an empty snapshot from before any
-allocation happened. Both the constructor's and the AUTO-resolution call's
-live-VRAM reading would differ (taken earlier, before `sched_reserve()`
-runs) — that's fine, since compute_buffer_term=0 there and the whole
-expression stays conservative on those readings too.
-
-The refusal names the exact `GGML_SYCL_NONFA_ATTN_SCRATCH_MB` value that
-would let this specific shape proceed, so a refused run always carries its
-own remediation. It also reports two independently-derived "largest
-fitting `-c`" figures (the SCRATCH-zone-based inverse and a compute
--buffer-based one) and takes their MIN — a conservative approximation, not
-a true joint inversion of every term against `n_ctx`.
-
-**A second, complementary check** compares a coarser whole-plan estimate —
-`next_plan.vram_bytes` (weights + KV, the same total the KV budget refusal
-already tracks) plus this consumer's own transient demand (the KQ/KQV f32
-scheduler buffer, counted ONCE — see below — plus the f16 staging demand
-above) — against `next_plan.vram_budget`. `next_plan.vram_bytes` covers
-only weights + KV + the MoE MMID pool; it does NOT include the
-ONEDNN/RUNTIME/SCRATCH zone reservations the arena is separately sized
-from (see `ensure_planned_arena_zones()`), so this check can
-UNDER-estimate total device usage on its own — the authoritative check
-above is what covers those zones, so the two together do not both miss the
-same gap. This second check is NOT what explains or catches the Mistral 7B
-Q4_0 repro: at that shape weights+KV is only ~4.9 GB against a 14.6 GB
-budget, so this check does not fire there even with the transient terms
-added; the authoritative check above is what fires and explains the repro.
-This second check exists for a different, larger regime this repro does
-not exercise — a model whose weights+KV footprint already sits close to
-the device budget, where the SCRATCH zone might still have nominal
-capacity but the whole plan would not actually fit once the non-FA
-transient is added. The KQ (before softmax) and `kq_soft_max` (after)
-tensors are counted as **one** f32 buffer, not two, in both checks:
-`ggml_gallocr_allocate_node()` (`ggml-alloc.c`) reuses a parent's buffer in
-place when the op supports it (`ggml_op_can_inplace()` includes
-`GGML_OP_SOFT_MAX`), the parent has exactly one consumer, and the layouts
-match — all three hold for `llama-graph.cpp`'s
-`kq = ggml_soft_max_ext(ctx0, kq, ...)`, which reassigns `kq` to the
-softmax result with the pre-softmax `kq` having no other consumer.
+**The refusal is therefore left as the empirical SCRATCH-zone-capacity
+check**, unchanged in shape from before round 2: refuse when `nonfa_demand
+> zone_capacity(SCRATCH)`, reporting `needs`/`zone`/`over_by` and the
+zone's own largest-fitting `-c` (labeled **"scratch-limited"**, since it
+is a limit on this one zone, not a whole-device guarantee against k1ev's
+consumer). The refusal names `-fa 1`/`auto` or a smaller `-c` as the only
+remediations with hardware support — it deliberately does **not** suggest
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB`, since the sweep above shows setting it
+does not reliably fix anything; treat that variable as an experimentation
+knob for investigating k1ev, not a user-facing fix. Do not reintroduce a
+live-free-VRAM or compute-buffer-regrowth predicate without new hardware
+evidence that k1ev's consumer is understood and bounded — the reasoning
+that motivated one was sound in isolation and still wrong in practice,
+which is the whole lesson of this subsection.
 
 ### Known limits (load-bearing — read before changing any of this)
 
