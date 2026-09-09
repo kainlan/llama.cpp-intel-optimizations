@@ -59,6 +59,30 @@ def extract_function_body(src: str, signature_anchor: str) -> str:
     raise AssertionError(f"unbalanced braces extracting function body for {signature_anchor!r}")
 
 
+_LEXEME_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
+    r"|'(?:\\.|[^'\\\n])*'"  # char literal (kept)
+    r"|//[^\n]*"  # line comment (dropped)
+    r"|/\*.*?\*/",  # block comment (dropped)
+    flags=re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    """Remove // and /* */ comments so a NEGATIVE substring check ("this
+    identifier does not appear") is not fooled by an explanatory comment
+    that names the very thing the code deliberately does NOT do. Mirrors
+    test-sycl-onednn-graph-allocator-source.py's helper of the same name."""
+
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] in "\"'":
+            return tok
+        return " " if tok.startswith("//") else re.sub(r"[^\n]", " ", tok)
+
+    return _LEXEME_RE.sub(repl, src)
+
+
 LLAMA_MODEL_ELIGIBLE_BODY = extract_function_body(
     LLAMA_MODEL_CPP,
     "static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim, float f_attention_scale) {",
@@ -75,9 +99,10 @@ FATTN_ONEDNN_D512_SCALE_RELAXED_BODY = extract_function_body(
 FATTN_ONEDNN_PLAN_BODY = extract_function_body(
     FATTN_ONEDNN_CPP, "ggml_sycl_flash_attn_ext_onednn_plan(const fattn_params & params,"
 )
-# The eligibility helper's CALLER -- pins the MLA head-dim branch, which
-# lives at the call site (populate_inventory), not inside
-# llama_model_sycl_onednn_head_dim_eligible() itself.
+# The eligibility helper's CALLER -- pins that the head-dim argument
+# passed at the call site is hparams.n_embd_head_k(il) unconditionally,
+# with no MLA-specific branch (see
+# test_populate_inventory_uses_n_embd_head_k_unconditionally() below).
 POPULATE_INVENTORY_BODY = extract_function_body(
     LLAMA_MODEL_CPP,
     "static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,",
@@ -134,23 +159,33 @@ def test_llama_model_copy_uses_the_same_d_thresholds_as_the_sycl_gate() -> None:
     ), "fattn-onednn.cpp's own D > 256 scale-relaxed gate moved or was renamed"
 
 
-def test_populate_inventory_screens_the_mla_head_dim_for_mla_models() -> None:
-    # MLA architectures (deepseek2, glm-dsa, kimi-k3, kimi-linear) build
-    # attention at hparams.n_embd_head_k_mla() -- a model-global
-    # "decompressed" head size -- not hparams.n_embd_head_k(il). The
-    # eligibility screen at the call site must branch on hparams.is_mla()
-    # to use the right value, or it screens a head dim the real oneDNN
-    # gate never actually sees for these models.
+def test_populate_inventory_uses_n_embd_head_k_unconditionally() -> None:
+    # MLA architectures (deepseek2, glm-dsa, kimi-k3, kimi-linear) already
+    # write kv_lora_rank + n_rot into n_embd_head_k via the conversion
+    # scripts' key_length field -- the SAME width the absorbed-MLA path's
+    # Q tensor actually has (ggml_concat(q_nope_absorbed, q_pe, 0)) and so
+    # the SAME ne00 the real oneDNN gate reads. There is no MLA-specific
+    # branch to pin here: n_embd_head_k(il) is already correct for these
+    # models, and hparams.n_embd_head_k_mla()/is_mla() must NOT appear in
+    # this eligibility call site at all -- that accessor is the
+    # model-global decompressed size v_mla applies AFTER build_attn
+    # returns, a size the flash-attention op itself never sees.
     assert re.search(
-        r"model_is_mla\s*=\s*hparams\.is_mla\(\)", POPULATE_INVENTORY_BODY
-    ), "populate_inventory must query hparams.is_mla() once (model-global, not per-layer)"
-    assert re.search(
-        r"mla_head_dim\s*=\s*model_is_mla\s*\?\s*hparams\.n_embd_head_k_mla\(\)\s*:\s*0", POPULATE_INVENTORY_BODY
-    ), "populate_inventory must derive the MLA head dim from hparams.n_embd_head_k_mla() when is_mla()"
-    assert re.search(
-        r"head_dim\s*=\s*model_is_mla\s*\?\s*mla_head_dim\s*:\s*hparams\.n_embd_head_k\(il\)",
-        POPULATE_INVENTORY_BODY,
-    ), "the eligibility call site must branch per-layer between the MLA and non-MLA head dim"
+        r"llama_model_sycl_onednn_head_dim_eligible\(\s*hparams\.n_embd_head_k\(il\)\s*,", POPULATE_INVENTORY_BODY
+    ), "populate_inventory's eligibility call site must pass hparams.n_embd_head_k(il) directly"
+    # Comment-stripped for both negative checks: the function's own comment
+    # NAMES n_embd_head_k_mla()/is_mla() to explain why they are not used,
+    # which would otherwise make a raw substring check on the
+    # comment-bearing body fail vacuously.
+    code_only = strip_comments(POPULATE_INVENTORY_BODY)
+    assert "n_embd_head_k_mla" not in code_only, (
+        "populate_inventory must not branch on the MLA decompressed head size -- "
+        "n_embd_head_k(il) is already the post-absorption Q width for MLA archs"
+    )
+    assert "is_mla" not in code_only, (
+        "populate_inventory's eligibility call site has no reason to query is_mla() -- "
+        "the head-dim screen does not vary by MLA-ness"
+    )
 
 
 def eligibility_disjunction_checks(body: str) -> dict:

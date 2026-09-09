@@ -426,38 +426,36 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // oneDNN SDPA route: a layer that can never reach oneDNN must not
     // inflate a floor sized for oneDNN's own scratch demand. Max rather
     // than layer 0 alone because a handful of architectures vary head
-    // count (and head dim) by layer. MLA architectures (deepseek2,
-    // glm-dsa, kimi-k3, kimi-linear) build attention at
-    // hparams.n_embd_head_k_mla(), a model-global (not per-layer)
-    // "decompressed" head size, not hparams.n_embd_head_k(il) -- the
-    // eligibility screen must use that value when hparams.is_mla(), or it
-    // screens a head dim the real oneDNN gate never actually sees for
-    // these models (over-counting eligibility, the safe direction, but
-    // reachable in-tree). is_mla()/n_embd_head_k_mla() are themselves
-    // model-global, so hoisted out of the loop once rather than
-    // re-derived per layer, alongside f_attention_scale (also
-    // model-global). This closes the known-exception list
-    // llama_model_sycl_onednn_head_dim_eligible()'s own comment describes:
-    // gemma-family's literal-1.0f pre-scaled-Q layers and now MLA's
-    // decompressed head dim are both accounted for by their respective
-    // callers of that helper.
+    // count (and head dim) by layer. hparams.n_embd_head_k(il) is used
+    // UNCONDITIONALLY, including for MLA architectures (deepseek2,
+    // glm-dsa, kimi-k3, kimi-linear): on the absorbed MLA path Q is built
+    // as ggml_concat(q_nope_absorbed, q_pe, 0) (src/models/deepseek2.cpp),
+    // giving ne0 == kv_lora_rank + n_rot -- exactly the key_length the
+    // conversion scripts already write into n_embd_head_k, and exactly
+    // the ne00 the real oneDNN gate reads (params.ne00 = Q->ne[0],
+    // fattn.cpp). hparams.n_embd_head_k_mla() is the model-global
+    // "decompressed" head size v_mla applies AFTER build_attn returns
+    // (llama-graph.cpp) -- a size the flash-attention op itself never
+    // sees -- so branching on it here would screen the wrong dimension
+    // and wrongly accept layers oneDNN will never serve (DeepSeek-V3:
+    // n_embd_head_k_mla()=192, <=256 and so eligible, vs. the real
+    // ne00=576, >512 and so correctly ineligible at fattn-onednn.cpp).
+    // f_attention_scale is model-global too, so hoisted out of the loop
+    // once rather than re-derived per layer.
     inventory.n_swa                = hparams.n_swa;
     inventory.n_swa_layers         = 0;
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
 
-    uint32_t       n_head_ctx_max        = 0;
-    uint32_t       n_head_swa_max        = 0;
-    const bool     model_is_mla          = hparams.is_mla();
-    const uint32_t mla_head_dim          = model_is_mla ? hparams.n_embd_head_k_mla() : 0;
-    const float    model_attention_scale = hparams.f_attention_scale;
+    uint32_t    n_head_ctx_max        = 0;
+    uint32_t    n_head_swa_max        = 0;
+    const float model_attention_scale = hparams.f_attention_scale;
     for (uint32_t il = 0; il < n_layer; ++il) {
         const bool is_swa_layer = hparams.is_swa(il);
         if (is_swa_layer) {
             inventory.n_swa_layers++;
         }
-        const uint32_t head_dim = model_is_mla ? mla_head_dim : hparams.n_embd_head_k(il);
-        if (!llama_model_sycl_onednn_head_dim_eligible(head_dim, model_attention_scale)) {
+        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), model_attention_scale)) {
             continue;
         }
         if (is_swa_layer) {
