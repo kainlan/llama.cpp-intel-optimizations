@@ -545,14 +545,26 @@ ticket reproduced on:
   raw pointer writing through a dangling host pointer; a free list plus the
   per-park generation tag make
   a slot safe to hand to a different pooled entry once its previous
-  occupant is popped or evicted. Every reader of a pool entry's
+  occupant is popped or evicted. `onednn_graph_scratch_clear_pool_locked()`
+  (llama.cpp-c6ah) PERMANENTLY retires the slot of any entry it finds
+  armed but still incomplete when it runs — never returning that slot to
+  the free list — because the stale occupant's own marker kernel could
+  still fire afterward and overwrite a new occupant's already-complete
+  generation; the running total is exposed both in the DIRECT pool
+  summary line's `retired_flag_slots=%zu` field and via the
+  `onednn_graph_scratch_flag_slot_retired_count()` accessor, and a
+  process that eventually checks out every slot this way degrades to the
+  blocking `event_complete()` fallback with a once-only WARN, the same
+  fallback path an individual arming failure already uses. Every reader
+  of a pool entry's
   completion — `onednn_graph_scratch_entry_usable_locked()`,
   `onednn_graph_scratch_evict_pool_until_fits_locked()`, and
   `onednn_graph_scratch_clear_pool_locked()` — goes through
   `onednn_graph_scratch_pool_entry_release_complete()`, which prefers this
   flag and falls back to the bare `event_complete()` query only when no
   flag could be armed for that entry (slab allocation failed, every slot
-  was checked out, or the marker-kernel submit threw). A test-only hook,
+  was checked out, the marker-kernel submit threw, `get_event_watch_queue()`
+  returned `nullptr`, or the entry's own release event was null). A test-only hook,
   `ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()`, makes
   the park site skip arming the flag so a GPU test can demonstrate that
   fallback directly. Confirmed on hardware, both discrete cards this fork
@@ -595,8 +607,9 @@ ticket reproduced on:
   `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
   row for the exact per-site ordering. Either way the line logged is
   `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
-  misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB (cumulative for
-  this process, not just this reclaim)` (silent if the pool was never used),
+  misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB
+  retired_flag_slots=%zu (cumulative for this process, not just this
+  reclaim)` (silent if the pool was never used),
   where `%s` is `"teardown"`, `"context reclaim"`, or `"runtime context
   update"`. Only the teardown call logs at `GGML_LOG_LEVEL_WARN`; the
   context-reclaim and runtime-context-update calls log at
