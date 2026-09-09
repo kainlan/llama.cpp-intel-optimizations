@@ -226,6 +226,62 @@ def test_both_callers_wire_into_the_shared_guard():
     ), "ggml_backend_sycl_recheck_runtime_context_flash_attn() must be declared in ggml-sycl.h"
 
 
+def test_callers_pass_the_all_layers_head_count():
+    """llama.cpp-rqak: both guard call sites -- the full transaction's
+    next_plan and the narrow re-check's current->plan -- must pass the
+    ALL-LAYERS head-count field into ggml_sycl_check_nonfa_attn_scratch().
+    The non-FA attention path runs on EVERY attention layer, so its demand
+    model (max(16 MiB, n_head x n_ubatch x n_ctx x 2 B x 3)) needs the
+    maximum query-head count over all layers -- not llama.cpp-o3a0's
+    n_head_ctx_max/n_head_swa_max, which are maxima over oneDNN-ELIGIBLE
+    layers only and both read 0 for a model where every layer is
+    ineligible (e.g. a DeepSeek-V3-class model, D=576), which would push
+    this guard into its "could not evaluate" WARN path and leave that
+    exact shape unguarded. And never the pre-o3a0 planner_n_head name,
+    which o3a0 removed -- git's clean auto-merge of o3a0 (per-class
+    maxima) with llama.cpp-oyfl (this guard, developed against the
+    pre-o3a0 single field) left the guard referencing a member that no
+    longer exists."""
+    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    assert full_start != -1
+    full_next = GGML_SYCL_CPP_CODE.find(
+        "ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1
+    )
+    assert full_next != -1
+    full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
+
+    recheck_start = GGML_SYCL_CPP_CODE.find(
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn("
+    )
+    assert recheck_start != -1
+    recheck_next = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_n_ctx(", recheck_start + 1)
+    assert recheck_next != -1
+    recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
+
+    for caller_name, body in (
+        ("the full transaction (ggml_backend_sycl_set_runtime_context)", full_body_norm),
+        ("the narrow re-check (ggml_backend_sycl_recheck_runtime_context_flash_attn)", recheck_body_norm),
+    ):
+        assert "planner_n_head_all" in body, (
+            f"{caller_name} must pass the all-layers head-count field (planner_n_head_all) into "
+            "ggml_sycl_check_nonfa_attn_scratch() -- see llama.cpp-rqak"
+        )
+        # \b requires a non-word char on both sides, and "_" is a word char,
+        # so this cannot match inside planner_n_head_all/planner_n_head_ctx_max/
+        # planner_n_head_swa_max -- it only matches the bare, pre-o3a0 name.
+        assert not re.search(r"\bplanner_n_head\b", body), (
+            f"{caller_name} must not reference the removed planner_n_head field (llama.cpp-o3a0 replaced "
+            "it with the per-class n_head_ctx_max/n_head_swa_max maxima; this guard needs its own "
+            "all-layers field, planner_n_head_all, not either of those)"
+        )
+        assert "n_head_ctx_max" not in body and "n_head_swa_max" not in body, (
+            f"{caller_name} must not pass the o3a0 per-class oneDNN-eligible-only maxima "
+            "(n_head_ctx_max / n_head_swa_max) into the non-FA attention guard -- those exclude "
+            "oneDNN-ineligible layers and can both be 0 for a model where every layer is ineligible, "
+            "which would silently leave that model's non-FA scratch demand unguarded"
+        )
+
+
 def test_narrow_recheck_forbids_replan_and_takes_the_lock():
     """The narrow re-check must call the shared guard with allow_replan=false
     (never recording, re-planning, or restoring the plan-time SCRATCH-zone
@@ -442,7 +498,7 @@ def test_plan_time_shape_is_recorded_unconditionally():
     UNCONDITIONALLY (not gated behind #if GGML_SYCL_DNNL like the oneDNN
     sibling) -- the path this sizes for is independent of oneDNN."""
     cpp_norm = _normalize_ws(CACHE_CPP_CODE)
-    assert "unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head, plan.planner_n_ubatch, plan.planner_n_ctx)" in cpp_norm
+    assert "unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all, plan.planner_n_ubatch, plan.planner_n_ctx)" in cpp_norm
 
     # Comment-stripped text drops "#if GGML_SYCL_DNNL" lines too (they are
     # preprocessor directives, not comments -- re-check against the RAW,

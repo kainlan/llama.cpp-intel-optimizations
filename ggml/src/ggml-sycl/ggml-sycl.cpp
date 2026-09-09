@@ -15869,6 +15869,7 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     g_placement_kv_info.n_swa_layers   = inventory->n_swa_layers;
     g_placement_kv_info.n_head_ctx_max = inventory->n_head_ctx_max;
     g_placement_kv_info.n_head_swa_max = inventory->n_head_swa_max;
+    g_placement_kv_info.n_head_all_max = inventory->n_head_all_max;
     if (inventory->swa_layer_mask != nullptr && inventory->swa_layer_mask_count > 0) {
         g_placement_kv_info.swa_layer_mask.assign(inventory->swa_layer_mask,
                                                   inventory->swa_layer_mask + inventory->swa_layer_mask_count);
@@ -16677,8 +16678,8 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     }
     if (n_head == 0) {
         // Name the reason the guard is silently skipping rather than
-        // leaving no trace at all -- planner_n_head is only 0 before the
-        // model's own hyperparameters have been threaded into the plan,
+        // leaving no trace at all -- planner_n_head_all is only 0 before
+        // the model's own hyperparameters have been threaded into the plan,
         // which should not happen for a real runtime-context call, so this
         // is worth a WARN if it ever does.
         GGML_LOG_WARN(
@@ -16988,7 +16989,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // size or headroom setting tried. Do not reintroduce a live-free-VRAM
     // or compute-buffer-regrowth term without new hardware evidence that
     // k1ev's consumer is understood and bounded.
-    if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head,
+    if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all,
                                             flash_attn_enabled, /*allow_replan=*/true)) {
         return;
     }
@@ -17265,7 +17266,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
 
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
-                                           current->plan->planner_n_head, flash_attn_enabled,
+                                           current->plan->planner_n_head_all, flash_attn_enabled,
                                            /*allow_replan=*/false);
     return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }

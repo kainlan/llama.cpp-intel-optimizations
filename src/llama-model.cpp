@@ -453,12 +453,18 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
 
     uint32_t    n_head_ctx_max        = 0;
     uint32_t    n_head_swa_max        = 0;
+    uint32_t    n_head_all_max        = 0;
     const float model_attention_scale = hparams.f_attention_scale;
     for (uint32_t il = 0; il < n_layer; ++il) {
         const bool is_swa_layer = hparams.is_swa(il);
         if (is_swa_layer) {
             inventory.n_swa_layers++;
         }
+        // llama.cpp-rqak: the all-layers maximum must be taken BEFORE the
+        // eligibility `continue` below -- the non-FA attention guard this
+        // feeds runs on every attention layer, not just the oneDNN-eligible
+        // ones the two per-class maxima below are scoped to.
+        n_head_all_max = std::max(n_head_all_max, hparams.n_head(il));
         if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), model_attention_scale)) {
             continue;
         }
@@ -470,6 +476,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     }
     inventory.n_head_ctx_max = n_head_ctx_max;
     inventory.n_head_swa_max = n_head_swa_max;
+    inventory.n_head_all_max = n_head_all_max;
 }
 
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
