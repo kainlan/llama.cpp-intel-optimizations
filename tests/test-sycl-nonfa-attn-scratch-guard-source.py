@@ -1,8 +1,16 @@
 """Source contract for llama.cpp-oyfl: the runtime-context-update guard that
-refuses a context whose non-flash-attention batched mul_mat scratch demand
-does not fit the SCRATCH zone the arena already reserved, instead of letting
-ggml_sycl_mul_mat_batched_sycl() abort mid-prefill (the "batched F16 mul_mat
-failed -- no recovery path available" GGML_ABORT in ggml-sycl.cpp).
+refuses a context whose non-flash-attention batched mul_mat path would
+exceed the VRAM available outside the SYCL backend's fixed arena, instead of
+letting ggml_sycl_mul_mat_batched_sycl() abort mid-prefill (the "batched F16
+mul_mat failed -- no recovery path available" GGML_ABORT in ggml-sycl.cpp).
+A SCRATCH-zone-capacity check alone is not sufficient -- a zone overflow
+spills to a raw device allocation OUTSIDE the arena instead of failing
+outright (unified-cache.cpp's unified_alloc()), and the SYCL scheduler's own
+compute buffer draws on that same outside-arena headroom when it regrows to
+a real ubatch's actual n_kv -- so the guard compares the sum of everything
+that can spill outside the arena (compute-buffer regrowth, SCRATCH overflow,
+oneDNN scratchpad) against the VRAM actually available outside it, queried
+live.
 
 Host-only, pure text assertions -- no SYCL device required, matching
 test-sycl-onednn-graph-allocator-source.py's pytest-collectible pattern
@@ -12,9 +20,11 @@ scored as a failure by design, not a skip).
 
 Checks run against COMMENT-STRIPPED text (see strip_comments()) so a
 positive structural check cannot be fooled by prose that quotes a call the
-code does not actually make -- the same hardening
-test-sycl-onednn-graph-allocator-source.py applies, and for the same reason
-(that file's docstring cites the gwno spec-review finding that motivated it).
+code does not actually make -- a comment can describe a call site
+accurately without the code actually containing it, and a substring check
+against raw (comment-bearing) text cannot tell the difference; stripping
+comments first closes that gap. test-sycl-onednn-graph-allocator-source.py
+applies the same hardening for the same reason.
 """
 
 import re
@@ -73,21 +83,30 @@ def _normalize_ws(text: str) -> str:
 
 
 def test_api_carries_flash_attn_enabled():
-    """Both public entry points must declare the new parameter -- without it
-    ggml_backend_sycl_set_runtime_context() has no way to know whether flash
-    attention is on for this context, and the guard below cannot be gated on
-    the real per-context state."""
+    """Both public entry points must declare flash_attn_enabled AND
+    reserved_compute_buffer_bytes -- without the first, the guard cannot
+    know whether flash attention is on for this context; without the
+    second, it cannot know the SYCL scheduler's actual compute-buffer size,
+    which the authoritative (post-sched_reserve) call needs to predict
+    regrowth."""
     header_norm = _normalize_ws(GGML_SYCL_H_CODE)
     assert "ggml_backend_sycl_set_runtime_context(ggml_backend_t backend" in header_norm
     assert re.search(
         r"ggml_backend_sycl_set_runtime_context\(ggml_backend_t backend,"
-        r".*?bool\s+flash_attn_enabled\);",
+        r".*?bool\s+flash_attn_enabled,\s*size_t\s+reserved_compute_buffer_bytes\);",
         header_norm,
-    ), "ggml_backend_sycl_set_runtime_context() declaration must carry a bool flash_attn_enabled parameter"
+    ), (
+        "ggml_backend_sycl_set_runtime_context() declaration must carry bool flash_attn_enabled "
+        "followed by size_t reserved_compute_buffer_bytes"
+    )
     assert re.search(
-        r"ggml_backend_sycl_set_runtime_context_for_model\(.*?bool\s+flash_attn_enabled\);",
+        r"ggml_backend_sycl_set_runtime_context_for_model\(.*?bool\s+flash_attn_enabled,\s*"
+        r"size_t\s+reserved_compute_buffer_bytes\);",
         header_norm,
-    ), "ggml_backend_sycl_set_runtime_context_for_model() declaration must carry a bool flash_attn_enabled parameter"
+    ), (
+        "ggml_backend_sycl_set_runtime_context_for_model() declaration must carry bool "
+        "flash_attn_enabled followed by size_t reserved_compute_buffer_bytes"
+    )
 
 
 def test_llama_context_threads_real_flash_attn_state():
@@ -97,7 +116,8 @@ def test_llama_context_threads_real_flash_attn_state():
     real for the one caller that matters."""
     ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
     matches = re.findall(
-        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,\s*cparams\.flash_attn\)", ctx_norm
+        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,\s*cparams\.flash_attn,\s*reserved_compute_buffer_bytes\)",
+        ctx_norm,
     )
     assert len(matches) >= 2, (
         "expected at least two runtime_context_fn(...) call sites in llama-context.cpp "
@@ -133,8 +153,9 @@ def test_guard_consults_the_demand_formula():
         "unified_cache_nonfa_attn_scratch_demand_bytes() to size the guard"
     )
     assert "zone_capacity(" in body_norm and "vram_zone_id::SCRATCH" in body_norm, (
-        "the guard must compare the demand against the SCRATCH zone's actual reserved capacity "
-        "(cache->zone_capacity(vram_zone_id::SCRATCH)), not a re-derived or assumed size"
+        "the guard must read the SCRATCH zone's actual reserved capacity "
+        "(cache->zone_capacity(vram_zone_id::SCRATCH)) to compute the scratch-overflow term, "
+        "not a re-derived or assumed size"
     )
     assert "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(" in body_norm, (
         "a refusal must report the largest fitting n_ctx (same style as the KV budget refusal's "
@@ -151,10 +172,40 @@ def test_guard_consults_the_demand_formula():
     )
     assert "unified_cache_ensure_planned_arena_zones(" in body_norm, (
         "the guard must make the opportunistic re-plan attempt (same call reserve_onednn_scratch() "
-        "already documents as succeeding only while the arena is still unused) before checking capacity"
+        "already documents as succeeding only while the arena is still unused) before checking"
     )
     assert "unified_cache_set_planned_nonfa_attn_scratch_shape(" in body_norm, (
         "the opportunistic re-plan must record the REAL runtime shape first, not the load-time one"
+    )
+    assert "scratch_capacity > scratch_capacity_before" in body_norm, (
+        "the re-plan's own log line must be gated on the zone actually having grown -- logging "
+        "\"raised\" when unified_cache_ensure_planned_arena_zones() could not rebuild (live weight "
+        "leases) would misreport a no-op as a success"
+    )
+
+    # The outside-arena predicate: a zone-capacity-only comparison is not
+    # sufficient because overflow spills outside the fixed arena instead of
+    # failing outright, and the SYCL scheduler's own compute buffer draws on
+    # that same headroom when it regrows to the real n_kv.
+    assert "ggml_backend_sycl_get_device_memory(" in body_norm, (
+        "the guard must query live free VRAM (not a static planned budget) to know how much "
+        "headroom exists outside the fixed arena"
+    )
+    assert "reserved_compute_buffer_bytes" in body_norm, (
+        "the guard must fold in the SYCL scheduler's actual compute-buffer size, forwarded from "
+        "the new API parameter"
+    )
+    assert "unified_cache_get_planned_onednn_scratchpad_bytes(" in body_norm, (
+        "the guard must fold in the oneDNN scratchpad's planned estimate -- its own failure mode "
+        "in the repro was fragmentation, which a capacity-only comparison cannot see"
+    )
+    assert re.search(r"margin\s*=\s*std::max<uint64_t>\(", body_norm), (
+        "the guard must apply a calibrated safety margin (documented as max(256 MiB, 10% of "
+        "live_free), covering driver/runtime allocations neither modeled term accounts for)"
+    )
+    assert "total_outside > available" in body_norm, (
+        "the primary check must compare the summed outside-arena demand against the summed "
+        "available headroom, not compare demand against zone capacity alone"
     )
 
     # The complementary whole-plan check: weights+KV (already tracked in
@@ -177,17 +228,44 @@ def test_guard_consults_the_demand_formula():
         "largest-fitting figures, per the reviewed design -- not either alone"
     )
 
+    # next_plan.vram_bytes covers only weights + KV + the MoE MMID pool; it
+    # omits the ONEDNN/RUNTIME/SCRATCH zone reservations that the arena is
+    # separately sized from. That omission must be documented, including
+    # which direction the resulting error runs (this check can UNDER
+    # -estimate total device usage), not left implicit -- checked against
+    # RAW (comment-bearing) text, since this is prose inside a comment that
+    # strip_comments() would otherwise remove before this test ever saw it.
+    raw_func_start = GGML_SYCL_CPP.find("void ggml_backend_sycl_set_runtime_context(")
+    assert raw_func_start != -1
+    raw_next_func = GGML_SYCL_CPP.find(
+        "ggml_backend_sycl_set_runtime_context_for_model(", raw_func_start + 1
+    )
+    assert raw_next_func != -1
+    raw_body = GGML_SYCL_CPP[raw_func_start:raw_next_func]
+    assert "ONEDNN/RUNTIME/SCRATCH" in raw_body, (
+        "the whole-plan check's comment must name which zone reservations next_plan.vram_bytes "
+        "omits (ONEDNN/RUNTIME/SCRATCH), so a future reader does not assume it covers everything"
+    )
+    assert "UNDER" in raw_body, (
+        "the whole-plan check's comment must state the omission's error direction (it can "
+        "under-estimate total device usage), not just that terms are missing"
+    )
+
 
 def test_for_model_forwards_flash_attn_enabled():
-    """ggml_backend_sycl_set_runtime_context_for_model() must forward its new
-    parameter into the inner call rather than dropping it on the floor."""
+    """ggml_backend_sycl_set_runtime_context_for_model() must forward both new
+    parameters into the inner call rather than dropping either on the floor."""
     func_start = GGML_SYCL_CPP_CODE.find("ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(")
     assert func_start != -1, "ggml_backend_sycl_set_runtime_context_for_model() definition not found"
     body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[func_start : func_start + 8000])
     assert re.search(
-        r"ggml_backend_sycl_set_runtime_context\(backend, n_ctx, n_ubatch, n_seq_max,\s*flash_attn_enabled\)",
+        r"ggml_backend_sycl_set_runtime_context\(backend, n_ctx, n_ubatch, n_seq_max,\s*"
+        r"flash_attn_enabled,\s*reserved_compute_buffer_bytes\)",
         body_norm,
-    ), "ggml_backend_sycl_set_runtime_context_for_model() must forward flash_attn_enabled to the inner call"
+    ), (
+        "ggml_backend_sycl_set_runtime_context_for_model() must forward flash_attn_enabled and "
+        "reserved_compute_buffer_bytes to the inner call, in that order"
+    )
 
 
 def test_formula_and_inverse_are_declared_and_defined():
@@ -215,15 +293,19 @@ def test_formula_and_inverse_are_declared_and_defined():
 
 
 def test_auto_flash_attn_resolution_rechecks_the_guard():
-    """llama.cpp-oyfl F4: cparams.flash_attn defaults true for AUTO before
-    resolve_fused_ops() resolves it (llama-context.cpp's cparams init runs
-    before the constructor's runtime-context call), so an AUTO context that
-    resolves to OFF must re-trigger the SYCL runtime-context call with the
+    """cparams.flash_attn defaults true for AUTO before resolve_fused_ops()
+    resolves it (llama-context.cpp's cparams init runs before the
+    constructor's runtime-context call), so an AUTO context that resolves
+    to OFF must re-trigger the SYCL runtime-context call with the
     now-resolved value, or the guard above never sees it for that context."""
     ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
-    assert "void llama_context::sycl_resync_runtime_context_flash_attn()" in ctx_norm, (
-        "expected a shared helper re-running the runtime-context call, callable from both the "
-        "constructor and resolve_fused_ops()"
+    assert re.search(
+        r"void llama_context::sycl_resync_runtime_context_flash_attn\(bool\s+query_reserved_compute_buffer\)",
+        ctx_norm,
+    ), (
+        "expected a shared helper re-running the runtime-context call, callable from the "
+        "constructor, resolve_fused_ops(), and sched_reserve(), parameterized on whether to "
+        "query the real compute-buffer size"
     )
 
     resolve_start = ctx_norm.find("void llama_context::resolve_fused_ops(")
@@ -231,9 +313,10 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     resolve_body = ctx_norm[resolve_start : resolve_start + 4000]
     assert re.search(r"if \(cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
                       r"sycl_resync_runtime_context_flash_attn\(\);", resolve_body), (
-        "resolve_fused_ops() must call sycl_resync_runtime_context_flash_attn() inside the same "
-        "if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly once, right when "
-        "the real value becomes known"
+        "resolve_fused_ops() must call sycl_resync_runtime_context_flash_attn() (with the default "
+        "query_reserved_compute_buffer=false, since sched_reserve() has not run yet at this point) "
+        "inside the same if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly "
+        "once, right when the real value becomes known"
     )
 
     # The helper's own header declaration exists too, so both callers compile
@@ -241,7 +324,56 @@ def test_auto_flash_attn_resolution_rechecks_the_guard():
     # would not catch.
     ctx_h = (ROOT / "src/llama-context.h").read_text()
     ctx_h_norm = _normalize_ws(strip_comments(ctx_h))
-    assert "void sycl_resync_runtime_context_flash_attn();" in ctx_h_norm
+    assert re.search(
+        r"void sycl_resync_runtime_context_flash_attn\(bool\s+query_reserved_compute_buffer\s*=\s*false\);",
+        ctx_h_norm,
+    )
+
+
+def test_sched_reserve_makes_the_authoritative_post_reserve_call():
+    """The constructor's and resolve_fused_ops()'s calls both necessarily run
+    before sched_reserve()'s graph-reserve passes allocate the SYCL
+    scheduler's real compute buffer, so neither can know its actual size.
+    sched_reserve() itself must make one more call, with
+    query_reserved_compute_buffer=true, once that size is known -- this is
+    the authoritative call the guard's compute-buffer-regrowth term depends
+    on."""
+    ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
+    reserve_sig = "void llama_context::sched_reserve()"
+    reserve_start = ctx_norm.find(reserve_sig)
+    assert reserve_start != -1, "sched_reserve() definition not found"
+    # Bound the search to sched_reserve()'s own body via the next top-level
+    # method definition after it, so a match cannot come from some unrelated
+    # later call site. Search starts past this function's OWN signature --
+    # searching from reserve_start + 1 would immediately re-match sched
+    # _reserve() itself, collapsing the body to nothing.
+    body_start = reserve_start + len(reserve_sig)
+    next_method = re.search(r"void llama_context::\w+\(", ctx_norm[body_start:])
+    assert next_method is not None, "could not bound sched_reserve()'s body"
+    reserve_body = ctx_norm[reserve_start : body_start + next_method.start()]
+
+    # The /*query_reserved_compute_buffer=*/ inline comment is itself
+    # stripped by strip_comments() before this text is seen, so the pattern
+    # below matches the call as it appears AFTER stripping: a bare `true`.
+    assert re.search(
+        r"sycl_resync_runtime_context_flash_attn\(\s*true\s*\)",
+        reserve_body,
+    ), (
+        "sched_reserve() must call sycl_resync_runtime_context_flash_attn(true) after its "
+        "graph-reserve passes complete, so the guard's authoritative check runs with the real "
+        "reserved compute-buffer size"
+    )
+
+    # The size query itself lives inside the shared helper (queried per
+    # backend there, not passed in as one externally-computed value), not
+    # literally inside sched_reserve()'s own text.
+    helper_start = ctx_norm.find("void llama_context::sycl_resync_runtime_context_flash_attn(")
+    assert helper_start != -1, "sycl_resync_runtime_context_flash_attn() definition not found"
+    helper_body = ctx_norm[helper_start : helper_start + 4000]
+    assert "ggml_backend_sched_get_buffer_size(sched.get(), backend.get())" in helper_body, (
+        "the shared helper must query the real per-backend compute-buffer size when asked, not "
+        "guess it or take it as an externally-precomputed single value"
+    )
 
 
 def test_plan_time_shape_is_recorded_unconditionally():
