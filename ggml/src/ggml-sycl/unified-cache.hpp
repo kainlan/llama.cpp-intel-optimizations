@@ -2206,7 +2206,20 @@ class unified_cache {
     // actually read (unified_cache::pool_entry_release_complete()); the
     // queue only needs to exist long enough to run that one host_task per
     // pooled entry.
-    sycl::queue & get_event_watch_queue();
+    //
+    // Returns nullptr if construction failed (logged once, at that point).
+    // llama.cpp-c6ah: there is deliberately NO fallback to
+    // another queue here. Falling back to queue_ (the main compute stream,
+    // in_order) would inject this watcher's host_task into the SAME
+    // in-order sequence as real GPU kernel submissions on that device,
+    // serialising them behind it -- exactly the kind of allocation-path-
+    // into-compute-path coupling this whole fix exists to avoid, not a
+    // harmless degradation. A caller that gets nullptr must leave
+    // release_done unset rather than substitute a different queue;
+    // onednn_graph_scratch_pool_entry_release_complete() then falls back to
+    // the pre-fix (blocking, but correct) event_complete() query for that
+    // one entry.
+    sycl::queue * get_event_watch_queue();
 
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
@@ -4131,8 +4144,9 @@ class unified_cache {
                                                     int                            device_id,
                                                     std::unique_lock<std::mutex> & lock);
 
-    // Evict completed (event_complete() true) reuse-pool entries -- real
-    // release, destructing the owned mem_handle -- stopping as soon as
+    // Evict completed (onednn_graph_scratch_pool_entry_release_complete()
+    // true) reuse-pool entries -- real release, destructing the owned
+    // mem_handle -- stopping as soon as
     // outstanding DIRECT bytes + `size` fits under `cap`, so as much of the
     // pool survives as possible. A size bucket that empties out during
     // eviction is erased from onednn_graph_scratch_reuse_pool_ entirely

@@ -229,6 +229,50 @@ sycl::event submit_slow_release(sycl::queue & q) {
     });
 }
 
+// llama.cpp-c6ah: onednn_graph_scratch_pool_entry_release_complete()'s
+// completion flag is armed by a SEPARATE, asynchronous watcher host_task
+// dispatched once a pooled entry's own release event completes (see
+// get_event_watch_queue()'s comment in unified-cache.hpp) -- waiting on
+// that event itself (sycl::event::wait()) only proves the underlying SYCL
+// command is done, not that the watcher has already run and stored the
+// flag. Polls for `target` (a specific, already-parked pointer of size
+// `size`) to become the pool's own hit for a same-size request, retrying
+// up to a bound rather than asserting on the very first call.
+//
+// A retry that lands before the watcher fires is itself a genuine MISS --
+// a fresh, already-complete decoy allocation -- immediately freed
+// (re-parked with a nullptr event, which reads as complete
+// unconditionally: no flag, no watcher, no race of its own -- see
+// event_complete()'s handling of a default-constructed event) before the
+// next attempt, so it cannot leak and cannot be mistaken for `target`.
+// `target` always sits FIRST in its size bucket (onednn_graph_scratch_free()
+// appends new entries with push_back(), and `target` is never popped until
+// it is truly USABLE), so a decoy -- always appended AFTER it -- can never
+// be handed back INSTEAD of `target` once `target` itself becomes ready;
+// a decoy can only delay how many retries this loop needs, never mask a
+// genuine failure to arm `target`'s own flag.
+//
+// 2000 ms / 5 ms: generous relative to the dispatch gap this bridges (a
+// host_task dispatched after an already-satisfied dependency is normally
+// sub-millisecond even under load), tight enough to fail fast (returning
+// false) on a genuine regression rather than hanging the test.
+bool poll_for_pool_hit(unified_cache * cache, sycl::queue & q, size_t size, void * target) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    for (;;) {
+        void * ptr = cache->onednn_graph_scratch_alloc(size, 256, &q);
+        if (ptr == target) {
+            return true;
+        }
+        if (ptr) {
+            cache->onednn_graph_scratch_free(ptr, nullptr);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+}
+
 // --- (a) freed buffer is reused for a same-size request ---------------------
 void test_pool_reuse(unified_cache * cache) {
     printf("DIRECT path pool reuse:\n");
@@ -245,24 +289,36 @@ void test_pool_reuse(unified_cache * cache) {
     // event completes", not merely "served because no event was given". Wait
     // for it explicitly here (unlike test_bounded_eviction below, this test
     // is not measuring how long the allocator itself waits) so the pool
-    // lookup that follows finds a genuinely event-complete entry rather than
+    // lookup that follows finds a genuinely complete entry rather than
     // racing the host_task.
     sycl::event release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr1, &release);
     release.wait();
 
-    const size_t hits_before   = cache->onednn_graph_scratch_pool_hit_count();
-    const size_t misses_before = cache->onednn_graph_scratch_pool_miss_count();
-    void *       ptr2          = cache->onednn_graph_scratch_alloc(kSizeA, 256, &q);
+    // llama.cpp-c6ah: release.wait() above proves the underlying
+    // SYCL command is done, but onednn_graph_scratch_pool_entry_release_complete()
+    // reads a completion flag armed by a SEPARATE, asynchronous watcher
+    // host_task (see poll_for_pool_hit()'s own comment) -- the wait does
+    // not guarantee that watcher has already run. Poll rather than
+    // asserting on the very first call. The dropped "miss count did NOT
+    // increase" assertion this replaced is no longer reliably true here: a
+    // retry that lands before the watcher fires is itself a genuine miss
+    // (see poll_for_pool_hit()) -- the hit-count check below is the
+    // property that actually matters (a pool hit is never ALSO counted as
+    // a miss for that SAME successful call, which the production code's
+    // own hit/miss invariant, documented at
+    // onednn_graph_scratch_pool_hit_count_'s declaration, already
+    // guarantees independent of this test).
+    const size_t hits_before = cache->onednn_graph_scratch_pool_hit_count();
+    const bool   became_hit  = poll_for_pool_hit(cache, q, kSizeA, ptr1);
+    void *       ptr2        = became_hit ? ptr1 : nullptr;
 
     check(ptr2 != nullptr, "the reused allocation succeeds");
-    check(ptr2 == ptr1,
-          "the SAME pointer is handed back -- this is reuse, not a fresh allocation that happens to "
-          "land at the same address");
+    check(became_hit,
+          "the SAME pointer is handed back -- this is reuse, not a fresh allocation that happens to land at "
+          "the same address (polled up to 2 s to tolerate the completion flag's async watcher dispatch)");
     check(cache->onednn_graph_scratch_pool_hit_count() > hits_before,
           "onednn_graph_scratch_pool_hit_count() increased -- the allocator served this from the reuse pool");
-    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before,
-          "onednn_graph_scratch_pool_miss_count() did NOT increase -- a pool hit is not also counted as a miss");
 
     if (ptr2) {
         cache->onednn_graph_scratch_free(ptr2, nullptr);
@@ -477,22 +533,25 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // from "the sweep never ran at all" -- both pass identically on an
     // empty pool.
     //
-    // 280 MiB, not 200: this process reserves a 256 MB ONEDNN zone even with
-    // no model loaded -- measured on hardware, `[VRAM-ARENA] Reserved single
-    // chunk: ... oneDNN=256.0 ...` -- and a request at or under that zone
-    // size is served FROM THE ZONE, never takes the DIRECT path, and so
-    // never enters the pool this setup needs it to. 200 MiB silently did
-    // exactly that: measured FAIL on hardware, the eviction-count assertion
-    // below never saw an increase, because the "parked" allocation was
-    // never pooled to begin with. 280 MiB is above that zone -- matching
-    // every other size in this file (kSizeA/kSizeB/kSizeC/kSizeD at
-    // 300/320/340/310 MiB are all above it for the identical reason, and a
-    // 300 MiB request logs "did not fit the ONEDNN zone" confirming it),
-    // distinct from all four of them, and comfortably under the 350 MB cap
-    // main() sets -- so it can be parked and later evicted without itself
-    // ever engaging the cap machinery this test isn't exercising. The
-    // miss-count assertion right after the allocation below is this setup's
-    // own self-check against silently regressing back to a zone-served size.
+    // 280 MiB: comfortably above the ONEDNN zone -- which main() now
+    // shrinks to a few MB via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB (see
+    // test_in_flight_entry_is_skipped_not_waited()'s own header comment for
+    // why), so every size in this file trivially takes the DIRECT path
+    // regardless of the zone's exact value now. This value itself predates
+    // that override: it used to matter that 280 MiB clears this process's
+    // ~256 MB NATURAL (no-model, no-override) zone floor -- 200 MiB
+    // measured FAIL on hardware there, zone-served rather than pooled,
+    // which is why this test still checks a miss below rather than trusting
+    // the size by inspection. Kept at 280 MiB now for a DIFFERENT reason:
+    // distinct from kSizeA/kSizeB/kSizeC/kSizeD (300/320/340/310 MiB)
+    // elsewhere in this file, and comfortably under the 350 MB cap main()
+    // sets so it can be parked and later evicted without itself engaging
+    // the cap machinery this test isn't exercising, while leaving enough
+    // headroom below the cap for kSizeOversized (366 MiB) below to be the
+    // request that actually needs eviction -- changing it would also mean
+    // re-deriving that cap arithmetic. The miss-count assertion right after
+    // the allocation below is this setup's own self-check against silently
+    // regressing back to a zone-served size, whichever floor is in effect.
     constexpr size_t kSizeParked             = 280ull * 1024 * 1024;
     const size_t     misses_before_park      = cache->onednn_graph_scratch_pool_miss_count();
     const size_t     outstanding_before_park = cache->onednn_graph_scratch_direct_outstanding_bytes();
@@ -542,7 +601,31 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     if (parked) {
         sycl::event release = submit_slow_release(q);
         cache->onednn_graph_scratch_free(parked, &release);
-        release.wait();  // ensure event-complete before the oversized request below
+        release.wait();  // ensure the underlying event is complete
+
+        // llama.cpp-c6ah: release.wait() above only proves the
+        // underlying SYCL command is done, not that
+        // onednn_graph_scratch_pool_entry_release_complete()'s asynchronous
+        // watcher host_task has already run and armed the flag (see
+        // poll_for_pool_hit()'s own comment). The oversized request below
+        // is a ONE-SHOT for this whole binary (see this test's own
+        // top-of-function comment: it must remain the only oversized
+        // request issued anywhere in this process), so that race cannot be
+        // resolved by retrying the real request itself the way the other
+        // tests retry a same-size allocation. Resolve it here instead: round-
+        // trip `parked` through a same-size probe (poll_for_pool_hit only
+        // succeeds once the flag is genuinely armed) and re-park it with a
+        // nullptr event, which reads as complete unconditionally -- no
+        // flag, no watcher, no race (see event_complete()'s handling of a
+        // default-constructed event) -- so the real request below cannot
+        // race this entry's own watcher.
+        const bool became_ready = poll_for_pool_hit(cache, q, kSizeParked, parked);
+        check(became_ready,
+              "the parked entry becomes reusable once its release event completes (polled up to "
+              "2 s to tolerate the completion flag's async watcher dispatch)");
+        if (became_ready) {
+            cache->onednn_graph_scratch_free(parked, nullptr);
+        }
     }
 
     // High-water is a max, never lowered by a free() -- note_onednn_graph_-
@@ -719,6 +802,17 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // test_bounded_eviction's cap-constrained wait (no cap is engaged here
     // at all -- see this test's header comment), so it can afford a
     // tighter bound while remaining well clear of scheduler/CI noise.
+    // ASSUMPTION (llama.cpp-c6ah, unverified until this runs on
+    // hardware): the DIRECT allocation path's own unified_alloc() does not
+    // itself submit anything onto `q` -- `q` currently has ptr1's slow
+    // host_task still running on it (submit_slow_release() submitted it to
+    // this same in-order queue). If that assumption is wrong, this bound
+    // would fail even with the fix correctly applied, because the fresh
+    // allocation would have to wait its turn behind the slow host_task
+    // regardless of how onednn_graph_scratch_pool_entry_release_complete()
+    // itself behaves -- a queue-ordering wait, not the blocking-query wait
+    // this check targets. Elapsed is printed either way so a failure here
+    // is diagnosable rather than a bare FAIL.
     check(elapsed.count() < kSlowReleaseMs / 3,
           "the re-request returned in well under a third of the release delay -- it did not wait for ptr1's "
           "release event to complete");
@@ -727,10 +821,20 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // Now let ptr1's release actually complete, and confirm a THIRD
     // same-size request is a genuine pool HIT -- the in-flight entry was
     // skipped above, not lost.
+    //
+    // llama.cpp-c6ah: slow_release.wait() above only proves the
+    // underlying SYCL command is done, not that the async watcher host_task
+    // that arms the completion flag has already run (see
+    // poll_for_pool_hit()'s own comment) -- poll rather than asserting on
+    // the very first call.
     slow_release.wait();
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
-    void *       ptr3              = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
-    check(ptr3 == ptr1, "once ptr1's release event completes, it is reused for a same-size request");
+    const bool   became_hit_reuse  = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
+    void *       ptr3              = became_hit_reuse ? ptr1 : nullptr;
+    check(became_hit_reuse,
+          "once ptr1's release event completes (and its watcher host_task has run), a "
+          "same-size request eventually becomes a genuine pool hit (polled up to 2 s to tolerate the async "
+          "dispatch)");
     check(cache->onednn_graph_scratch_pool_hit_count() == hits_before_reuse + 1,
           "onednn_graph_scratch_pool_hit_count() increased -- this time it really was a pool hit");
 
@@ -740,6 +844,17 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     if (ptr3) {
         cache->onednn_graph_scratch_free(ptr3, nullptr);
     }
+
+    // llama.cpp-c6ah: reclaim the pool before the RED arm below.
+    // Without this, ptr2 and ptr3's frees just above each PARK a fresh,
+    // already-complete (nullptr-event) decoy of kSizeSkip into the SAME
+    // bucket rather than releasing it for real (onednn_graph_scratch_free()'s
+    // DIRECT branch always parks under the per-size depth limit) -- so the
+    // RED arm below would find a ready-made complete entry sitting in the
+    // bucket regardless of what ptr4's OWN (still in-flight) entry is
+    // doing, making both RED-arm assertions vacuous (ptr5 would reuse a
+    // leftover decoy immediately, not ptr4).
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (RED arm)");
 
     // --- Positive control: the RED arm this GREEN binary can still produce.
     // With the hook forced, onednn_graph_scratch_pool_entry_release_complete()
@@ -766,6 +881,13 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
         // to a real blocking call instead of a poll loop -- comfortably
         // above the /3 bound the GREEN arm above must stay under, so the two
         // checks cannot both pass on the same (broken) code.
+        //
+        // If this shows ~0 ms on hardware despite the pool being reclaimed
+        // (so no leftover complete decoy of this size can explain it --
+        // see the reclaim just above), event_complete() does not actually
+        // block on this driver/queue combination and the TICKET'S OWN
+        // PREMISE needs re-testing, not this check -- do not loosen this
+        // bound to make a ~0 ms result pass silently.
         check(elapsed2.count() >= (kSlowReleaseMs * 8) / 10,
               "with the RED hook forced, the re-request took most of the release delay -- reproducing the "
               "pre-fix blocking behaviour this test would otherwise never exercise");
@@ -783,11 +905,25 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(false);
 
     // --- Eviction sweep must apply the identical skip, not just the
-    // try-reuse lookup above. Park one in-flight (incomplete) entry and one
-    // already-complete entry of a DIFFERENT size, then request a THIRD,
-    // different size that needs headroom the completed entry alone can
-    // supply -- the in-flight entry must be left alone (not evicted, not
-    // waited on) either way.
+    // try-reuse lookup above. Park one already-complete entry and one
+    // in-flight (incomplete) entry of a DIFFERENT size, then request a
+    // THIRD, different size that needs headroom the completed entry alone
+    // can supply -- the in-flight entry must be left alone (not evicted,
+    // not waited on) either way.
+    //
+    // llama.cpp-c6ah: park the COMPLETED entry FIRST, and
+    // confirm via poll_for_pool_hit's probe-and-reparent round trip (same
+    // async-watcher reasoning as elsewhere in this test) that it is
+    // genuinely, unambiguously complete BEFORE the in-flight entry is even
+    // allocated. The version this replaced submitted the in-flight entry's
+    // slow release FIRST and the "completed" entry's release SECOND, both
+    // on this same IN-ORDER queue `q`, then waited only on the second --
+    // on an in-order queue that wait is satisfied only once BOTH
+    // host_tasks have run, so the "in-flight" entry was ALSO already
+    // complete by the time the eviction sweep ran below, making the whole
+    // sub-test vacuous (it could not have told a fixed allocator apart
+    // from a broken one -- both would evict either entry with nothing to
+    // stop them).
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (eviction sweep)");
 
     constexpr size_t kSizeEvictInFlight = 200ull * 1024 * 1024;
@@ -799,6 +935,29 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // needs SOME eviction, and kSizeEvictInFlight + kSizeEvictRequest alone
     // (290 MiB) fits -- so evicting kSizeEvictComplete is both necessary and
     // SUFFICIENT; the in-flight entry never needs to be touched to succeed.
+    // Deliberately DIFFERENT sizes (not just distinct from each other for
+    // bucket separation): it lets onednn_graph_scratch_direct_outstanding_bytes()
+    // alone distinguish WHICH entry the sweep evicted below, without a
+    // third probe allocation that would itself need headroom.
+
+    void * evict_complete = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
+    check(evict_complete != nullptr, "eviction-sweep completed-entry setup allocation succeeds");
+    if (evict_complete) {
+        sycl::event complete_release = submit_slow_release(q);
+        cache->onednn_graph_scratch_free(evict_complete, &complete_release);
+        complete_release.wait();  // ensure the underlying event is complete
+
+        const bool complete_ready = poll_for_pool_hit(cache, q, kSizeEvictComplete, evict_complete);
+        check(complete_ready,
+              "the completed entry becomes reusable once its release event completes (polled "
+              "up to 2 s to tolerate the completion flag's async watcher dispatch)");
+        if (complete_ready) {
+            // Re-park with a nullptr event -- unconditionally complete (no
+            // flag, no watcher, no race of its own) for the real request
+            // below.
+            cache->onednn_graph_scratch_free(evict_complete, nullptr);
+        }
+    }
 
     void * evict_in_flight = cache->onednn_graph_scratch_alloc(kSizeEvictInFlight, 256, &q);
     check(evict_in_flight != nullptr, "eviction-sweep in-flight setup allocation succeeds");
@@ -807,15 +966,8 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
         cache->onednn_graph_scratch_free(evict_in_flight, &evict_slow_release);
     }
 
-    void * evict_complete = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
-    check(evict_complete != nullptr, "eviction-sweep completed-entry setup allocation succeeds");
-    if (evict_complete) {
-        sycl::event complete_release = submit_slow_release(q);
-        complete_release.wait();  // genuinely complete before parking
-        cache->onednn_graph_scratch_free(evict_complete, &complete_release);
-    }
-
-    const size_t sweep_evictions_before = cache->onednn_graph_scratch_pool_eviction_count();
+    const size_t sweep_evictions_before   = cache->onednn_graph_scratch_pool_eviction_count();
+    const size_t sweep_outstanding_before = cache->onednn_graph_scratch_direct_outstanding_bytes();
 
     const auto sweep_start = std::chrono::steady_clock::now();
     void *     evict_ptr   = cache->onednn_graph_scratch_alloc(kSizeEvictRequest, 256, &q);
@@ -824,7 +976,20 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
 
     check(evict_ptr != nullptr, "the headroom-needing request succeeds");
     check(cache->onednn_graph_scratch_pool_eviction_count() == sweep_evictions_before + 1,
-          "exactly one entry was evicted -- the completed one, never the in-flight one");
+          "exactly one entry was evicted");
+    // llama.cpp-c6ah: check WHICH entry the count above refers
+    // to, not just that some count went up by one -- kSizeEvictInFlight and
+    // kSizeEvictComplete are deliberately different sizes (see their own
+    // comment above), so outstanding bytes after this request can only
+    // equal kSizeEvictInFlight + kSizeEvictRequest if the COMPLETED entry
+    // (kSizeEvictComplete) was the one removed; it would instead equal
+    // kSizeEvictComplete + kSizeEvictRequest if the sweep had wrongly
+    // evicted the in-flight entry.
+    check(cache->onednn_graph_scratch_direct_outstanding_bytes() ==
+              sweep_outstanding_before - kSizeEvictComplete + kSizeEvictRequest,
+          "outstanding bytes reflect exactly the in-flight entry's size plus the fresh request -- the "
+          "completed entry's bytes were removed (evicted), the in-flight entry's were not (still pooled, "
+          "untouched)");
     check(sweep_elapsed.count() < kSlowReleaseMs / 3,
           "the eviction sweep did not wait for the in-flight entry's release event -- evicting the completed "
           "entry alone was enough headroom");
@@ -833,7 +998,19 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     if (evict_ptr) {
         cache->onednn_graph_scratch_free(evict_ptr, nullptr);
     }
-    evict_slow_release.wait();  // let the still-pooled in-flight entry's host_task finish before the process exits
+
+    // llama.cpp-c6ah: the in-flight entry must have SURVIVED,
+    // not merely gone unevicted by coincidence -- confirm it is still
+    // pooled and becomes a genuine hit once its own release completes.
+    evict_slow_release.wait();
+    const bool in_flight_survived = poll_for_pool_hit(cache, q, kSizeEvictInFlight, evict_in_flight);
+    check(in_flight_survived,
+          "the in-flight entry is still pooled and becomes a hit once its release event "
+          "completes -- it was skipped by the sweep, not silently dropped");
+    if (in_flight_survived) {
+        cache->onednn_graph_scratch_free(evict_in_flight, nullptr);
+    }
+
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 

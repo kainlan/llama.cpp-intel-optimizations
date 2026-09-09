@@ -8567,7 +8567,7 @@ sycl::queue & unified_cache::get_bcs_queue() {
     return get_dma_queue();
 }
 
-sycl::queue & unified_cache::get_event_watch_queue() {
+sycl::queue * unified_cache::get_event_watch_queue() {
     // llama.cpp-c6ah: created on first use (most processes never touch the
     // oneDNN Graph DIRECT reuse pool), out-of-order and non-profiling -- see
     // the declaration's comment in unified-cache.hpp for why (in contrast to
@@ -8589,12 +8589,11 @@ sycl::queue & unified_cache::get_event_watch_queue() {
             event_watch_queue_.reset();
         }
     });
-    // Falling back to queue_ (in-order, profiling-enabled) on creation
-    // failure is a degradation, not a correctness issue: the only thing ever
-    // submitted here is a dependency-only host_task, and its caller
-    // (onednn_graph_scratch_free()'s park site) already treats a submission
-    // failure as "leave release_done null, fall back to event_complete()".
-    return event_watch_queue_ ? *event_watch_queue_ : queue_;
+    // llama.cpp-c6ah: nullptr on failure, NOT a fallback to
+    // queue_ -- see the declaration's comment in unified-cache.hpp for why
+    // substituting the main compute stream here would be worse than simply
+    // not arming the flag for this one entry.
+    return event_watch_queue_.get();
 }
 
 // get_or_wait REMOVED — legacy synchronous blocking pattern
@@ -9918,9 +9917,11 @@ bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked(size_t siz
 // attempt) and onednn_graph_scratch_pool_size_ready_locked() (the wait
 // loop's peek) both apply -- see their declarations in unified-cache.hpp for
 // why the two disagreeing used to be a silent fail-open of the DIRECT cap.
-// Performs the ONE event_complete() query and, if that passes, the ONE
-// resolve() query this entry needs for this request -- callers must not
-// query event_complete() on the same entry themselves first (see the
+// Performs the ONE completion query (via
+// onednn_graph_scratch_pool_entry_release_complete(), not a direct
+// event_complete() -- see that function's comment) and, if that passes,
+// the ONE resolve() query this entry needs for this request -- callers
+// must not query completion on the same entry themselves first (see the
 // declaration's comment).
 unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratch_entry_usable_locked(
     const onednn_graph_scratch_pool_entry & entry,
@@ -10583,24 +10584,34 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // event handling, so release_done stays null and
         // onednn_graph_scratch_pool_entry_release_complete() falls back to
         // that (correct, non-blocking-for-a-default-event) query.
+        //
+        // llama.cpp-c6ah: get_event_watch_queue() returns nullptr
+        // rather than a fallback queue when it could not be created --
+        // leave release_done null in that case too (same fallback as a
+        // submission failure below) instead of arming on some OTHER queue.
+        // Submitting this host_task on the main compute stream would
+        // serialise real GPU kernels behind it (see that declaration's
+        // comment for why that is worse than the blocking-query fallback).
         std::shared_ptr<std::atomic<bool>> release_done;
         if (event) {
-            try {
-                auto flag = std::make_shared<std::atomic<bool>>(false);
-                get_event_watch_queue().submit([&](sycl::handler & h) {
-                    h.depends_on(*event);
-                    h.host_task([flag]() { flag->store(true, std::memory_order_release); });
-                });
-                release_done = std::move(flag);
-            } catch (const sycl::exception & e) {
-                // Leave release_done null: onednn_graph_scratch_pool_entry_release_complete()
-                // falls back to the old (blocking, but correct) event_complete()
-                // query for this one entry -- a degradation, not a
-                // correctness issue.
-                GGML_LOG_WARN(
-                    "[UNIFIED-CACHE] Failed to arm oneDNN Graph-scratch pool completion watcher, falling back "
-                    "to a blocking completion check for this entry: %s\n",
-                    e.what());
+            if (sycl::queue * watch_q = get_event_watch_queue()) {
+                try {
+                    auto flag = std::make_shared<std::atomic<bool>>(false);
+                    watch_q->submit([&](sycl::handler & h) {
+                        h.depends_on(*event);
+                        h.host_task([flag]() { flag->store(true, std::memory_order_release); });
+                    });
+                    release_done = std::move(flag);
+                } catch (const sycl::exception & e) {
+                    // Leave release_done null: onednn_graph_scratch_pool_entry_release_complete()
+                    // falls back to the old (blocking, but correct) event_complete()
+                    // query for this one entry -- a degradation, not a
+                    // correctness issue.
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] Failed to arm oneDNN Graph-scratch pool completion watcher, falling "
+                        "back to a blocking completion check for this entry: %s\n",
+                        e.what());
+                }
             }
         }
 
