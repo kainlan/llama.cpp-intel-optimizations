@@ -241,6 +241,36 @@ static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+// llama.cpp-o3a0: replicates ggml_sycl_flash_attn_ext_onednn_plan()'s D-based
+// eligibility gate (ggml/src/ggml-sycl/fattn-onednn.cpp: the `ne00 > 512`
+// UNSUPPORTED_D reject, and the `ne00 > 256` strict-scale gate) for the sole
+// purpose of the oneDNN Graph-scratch zone floor -- this is a llama-layer
+// file and cannot include the SYCL-only fattn-onednn.cpp/.hpp to share the
+// real predicate directly. D <= 256 is unconditionally eligible: the
+// GENERALIZED scale fix (llama.cpp-p0f5) writes the model's real runtime
+// divisor into the compiled partition instead of assuming sqrt(D), so a
+// pre-scaled-Q model no longer fails the scale check there. D in (256, 512]
+// is eligible only when GGML_SYCL_FA_ONEDNN_D512_SCALE is set, mirroring
+// ggml_sycl_fa_onednn_d512_scale_relaxed()'s own live getenv parse exactly
+// (same env var, same `atoi(e) != 0` truthiness) so the two copies can never
+// silently read the same variable two different ways. D > 512 is never
+// eligible (UNSUPPORTED_D, unconditional -- that gate has no hatch). Kept
+// identical to the SYCL-side predicate by
+// tests/test-sycl-onednn-graph-floor-eligibility-source.py.
+static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim) {
+    if (head_dim > 512) {
+        return false;
+    }
+    if (head_dim <= 256) {
+        return true;
+    }
+    static const bool d512_scale_relaxed = [] {
+        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512_SCALE");
+        return env ? (std::atoi(env) != 0) : false;
+    }();
+    return d512_scale_relaxed;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
@@ -357,16 +387,29 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
 
-    // llama.cpp-0oxf: max query-head count across all layers, for the
-    // oneDNN Graph-scratch zone floor (proportional to n_head x n_ubatch x
-    // n_ctx -- see unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes()).
-    // Max rather than hparams.n_head() (layer 0 only) because a handful of
-    // architectures vary head count by layer.
-    uint32_t n_head_max = 0;
+    // llama.cpp-o3a0: window-aware refinement of the query-head count that
+    // feeds the oneDNN Graph-scratch zone floor (see the field comment in
+    // ggml-sycl.h). Split the max by attention window class -- non-SWA
+    // (effective KV window == n_ctx) vs SWA (effective KV window == n_swa,
+    // already captured above) -- and restrict to layers eligible for the
+    // oneDNN SDPA route: a layer that can never reach oneDNN must not
+    // inflate a floor sized for oneDNN's own scratch demand. Max rather than
+    // layer 0 alone because a handful of architectures vary head count (and
+    // head dim) by layer.
+    uint32_t n_head_ctx_max = 0;
+    uint32_t n_head_swa_max = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
-        n_head_max = std::max(n_head_max, hparams.n_head(il));
+        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il))) {
+            continue;
+        }
+        if (hparams.is_swa(il)) {
+            n_head_swa_max = std::max(n_head_swa_max, hparams.n_head(il));
+        } else {
+            n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));
+        }
     }
-    inventory.n_head_max = n_head_max;
+    inventory.n_head_ctx_max = n_head_ctx_max;
+    inventory.n_head_swa_max = n_head_swa_max;
 }
 
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,

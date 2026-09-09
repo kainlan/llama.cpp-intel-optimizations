@@ -324,31 +324,49 @@ ticket reproduced on:
   (`key.ne11 = active_params.ne11`) — every distinct `(ncols, ne11, H_q, ...)`
   combination compiles its OWN partition via `sdpa_partition_cache`, and each
   can request its own scratch the first time it executes.
-  `onednn_graph_scratch_zone_floor_bytes()` now computes
-  `floor = max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x sizeof(f32))`, where
-  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently in
-  flight even on an idle host (the quantity the zone must actually hold is
-  the PEAK OUTSTANDING size across whichever of those shapes are alive at
-  once, not one request in isolation). `n_head` (max query-head count across
-  layers) is threaded in from `hparams.n_head(il)` at
-  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through the
-  `ggml_sycl_tensor_inventory.n_head_max` ABI field (new, appended at the end
-  of the struct so every existing zero-init call site stays correct),
-  `placement_kv_info::n_head`, and `placement_plan::planner_n_head`, mirroring
-  how `n_ubatch`/`n_ctx` already flow through those same three layers. Fed by
+  `onednn_graph_scratch_zone_floor_bytes_swa()` now computes, per
+  attention window class,
+  `floor = max(64 MiB, 1.5 x max(n_head_ctx_max x n_ctx,
+  n_head_swa_max x min(n_ctx, n_swa)) x n_ubatch x sizeof(f32))`, where
+  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
+  in flight even on an idle host (the quantity the zone must actually
+  hold is the PEAK OUTSTANDING size across whichever of those shapes are
+  alive at once, not one request in isolation, and across whichever
+  attention CLASS demands more, not their sum — the two classes' compiled
+  partitions are never both outstanding for the same request).
+  `n_head_ctx_max`/`n_head_swa_max` (max query-head count across layers
+  eligible for the oneDNN SDPA route, split into non-SWA vs SWA) are
+  threaded in from `hparams.n_head(il)`/`hparams.is_swa(il)` at
+  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through
+  the `ggml_sycl_tensor_inventory.n_head_ctx_max`/`n_head_swa_max` ABI
+  fields (llama.cpp-o3a0, appended at the end of the struct so every
+  existing zero-init call site stays correct; these replace the earlier
+  single `n_head_max` field), `placement_kv_info::n_head_ctx_max`/
+  `n_head_swa_max`, and `placement_plan::planner_n_head_ctx_max`/
+  `planner_n_head_swa_max`, mirroring how `n_ubatch`/`n_ctx` already flow
+  through those same three layers. "Eligible" replicates
+  `ggml_sycl_flash_attn_ext_onednn_plan()`'s D-based gate
+  (`fattn-onednn.cpp`) since `llama-model.cpp` cannot include that
+  SYCL-only source directly; the two copies are kept in sync by
+  `test-sycl-onednn-graph-floor-eligibility-source.py`. Fed by
   `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
   "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
-  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head=32) measurements
-  spanning two independent axes (48/192/768 MB at ubatch 512 and n_ctx
-  512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch 256/128) — all five match
-  to the exact byte; a sixth gemma4 (n_head=8) point did not
-  (predicted 192 MB, measured 24 MB) at first look, but is explained rather
-  than anomalous: gemma4's oneDNN-served attention layers are sliding-window
-  (window=1024), so the real `ne11` there is `min(n_ctx, window)`, and
-  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly — using
-  `planner_n_ctx` as an upper bound on `ne11` over-provisions SWA models
-  (safely, bounded by the 25% budget clamp below) rather than under-covering
-  them; a window-aware refinement is tracked separately (llama.cpp-o3a0).
+  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
+  no SWA layers, so the ctx term equals the old flat formula exactly)
+  measurements spanning two independent axes (48/192/768 MB at ubatch
+  512 and n_ctx 512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch
+  256/128) — all five still match to the exact byte; a sixth gemma4
+  (n_head_swa_max=8, n_swa=1024) point did not match the FLAT formula
+  this replaced (predicted 192 MB, measured 24 MB), but was explained
+  rather than anomalous: gemma4's oneDNN-served attention layers are
+  sliding-window, so their real `ne11` is `min(n_ctx, n_swa)`, and
+  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly.
+  llama.cpp-o3a0 closed that gap: instead of using `n_ctx` as `ne11` for
+  every layer regardless of class (safe but wasteful — it
+  over-provisioned this SWA model 8x, bounded only by the 25% budget
+  clamp below), the formula now gives each class its own effective
+  window and takes the max across classes, so gemma4 now computes the
+  correct 64 MiB (24 MiB raw, clamped) instead of 192 MiB.
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —

@@ -156,9 +156,20 @@ POOL_SIZE_READY_BODY_CODE = extract_function_body(
 # argument, then to (n_head, n_ubatch, n_ctx) after the lead's measurement
 # showed n_ctx alone was the wrong independent variable) -- anchoring past
 # the paren would need updating again on the next parameter-list edit, and
-# the open paren alone is still a unique match (there is exactly one
-# definition of this function in the file).
+# the open paren alone is still a unique match: the anchor's trailing "(" is
+# what keeps it from also matching onednn_graph_scratch_zone_floor_bytes_swa(
+# below (llama.cpp-o3a0) -- that name is longer, so the literal substring
+# "...zone_floor_bytes(" never occurs inside it.
+#
+# llama.cpp-o3a0: this is now a THIN WRAPPER delegating into the window-aware
+# onednn_graph_scratch_zone_floor_bytes_swa() (see FLOOR_SWA_BODY_CODE
+# below) -- checks about the FORMULA itself (the 64 MiB constant, the
+# min/max window logic) must read FLOOR_SWA_BODY_CODE, not this one; checks
+# about the DELEGATION itself belong here.
 FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes(")
+# llama.cpp-o3a0: the window-aware formula's own body -- see the comment
+# above FLOOR_BODY_CODE for why the two anchors cannot collide.
+FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes_swa(")
 MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 # llama.cpp-pqgl: the size>cap early-out's ordering relative to the eviction
 # sweep, both inside this one function.
@@ -461,14 +472,34 @@ def test_onednn_graph_allocator_source_contract() -> None:
 
     # Env-tunable floor for the concurrent within-ubatch demand, additive on
     # top of the primitive-API pair (see unified_cache_get_planned_onednn_scratchpad_bytes).
-    # Whitespace-insensitive (llama.cpp-0oxf): the call now passes three
-    # struct-member arguments, which clang-format is more likely to re-wrap
-    # across lines than the old zero-argument call ever was.
+    # Whitespace-insensitive: the call passes five struct-member arguments
+    # (llama.cpp-o3a0 split the single n_head into n_head_ctx_max/
+    # n_head_swa_max/n_swa), which clang-format is more likely to re-wrap
+    # across lines than a shorter call ever was.
     checks["graph scratch zone floor is additive"] = normalize_ws(
-        "bytes += onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx);"
+        "bytes += onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, "
+        "shape.n_swa, shape.n_ubatch, shape.n_ctx);"
     ) in normalize_ws(CACHE_CPP_CODE)
+    # llama.cpp-o3a0: mutation witness for the caller actually passing the
+    # new SWA-class fields through, not just the pre-existing ubatch/ctx pair
+    # -- narrower than the full-call check above (which a clang-format
+    # rewrap could still satisfy after a careless partial revert of one
+    # argument, since normalize_ws would still find SOME five-argument call
+    # matching the full string only if every token survives; this check
+    # isolates the two fields the full check could not easily localize a
+    # failure to).
+    checks["graph scratch zone floor caller passes the swa fields"] = (
+        "shape.n_head_swa_max" in CACHE_CPP_CODE and "shape.n_swa" in CACHE_CPP_CODE
+    )
     checks["zone floor env var"] = "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" in CACHE_CPP_CODE
     checks["allocator opt-out env var name"] = "GGML_SYCL_ONEDNN_CACHE_ALLOCATOR" in CACHE_CPP_CODE
+    # llama.cpp-o3a0: the 3-arg overload must actually delegate into the
+    # window-aware formula (not, say, keep a stale parallel copy of the
+    # formula around) -- whitespace-insensitive for the same clang-format
+    # re-wrap reason as the call above.
+    checks["3-arg overload delegates to the swa formula"] = normalize_ws(
+        "return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx);"
+    ) in normalize_ws(FLOOR_BODY_CODE)
     # Token-anchored default value (llama.cpp-gwno spec-review round 2,
     # finding: this used to be untested, so a 512->64 regression or typo
     # would pass silently) -- not a bare "64" substring search, which would
@@ -479,8 +510,25 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # env-overridable constant -- anchor on that constant's own definition,
     # not a value that could coincidentally appear elsewhere in the formula
     # (768 MiB, 1.5, sizeof(f32) as 4, etc. are all also just numbers).
+    # llama.cpp-o3a0: reads FLOOR_SWA_BODY_CODE, not FLOOR_BODY_CODE -- the
+    # constant moved into the window-aware formula when the 3-arg overload
+    # became a thin wrapper (see the comment above FLOOR_BODY_CODE's
+    # extraction).
     checks["default floor is 64 MiB"] = bool(
-        re.search(r"kFloorMinBytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", FLOOR_BODY_CODE)
+        re.search(r"kFloorMinBytes\s*=\s*64ull\s*\*\s*1024ull\s*\*\s*1024ull", FLOOR_SWA_BODY_CODE)
+    )
+    # llama.cpp-o3a0: mutation witness for the two-class window logic itself
+    # -- if either the per-class min(n_ctx, n_swa) window or the
+    # max(ctx_term, swa_term) class selection is dropped (e.g. a careless
+    # "simplification" back to a single term), this fails even though the
+    # Mistral (SWA-free) test rows in test-sycl-onednn-graph-floor.cpp would
+    # not catch it, since n_head_swa_max=0 makes the SWA term vanish there
+    # regardless of whether min/max are present at all.
+    checks["swa formula windows each class independently"] = bool(
+        re.search(r"std::min\s*\(\s*n_ctx\s*,\s*n_swa\s*\)", FLOOR_SWA_BODY_CODE)
+    )
+    checks["swa formula takes the max across classes, not the sum"] = bool(
+        re.search(r"std::max\s*\(\s*ctx_term\s*,\s*swa_term\s*\)", FLOOR_SWA_BODY_CODE)
     )
 
     # High-water byte counter (llama.cpp-gwno perf follow-up): peak

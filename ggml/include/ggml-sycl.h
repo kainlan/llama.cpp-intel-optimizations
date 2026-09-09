@@ -252,14 +252,26 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_swa_layers;          // Number of SWA layers (0 = all full-attn)
     const bool *                   swa_layer_mask;        // Per-layer SWA flag [n_layer], NULL if no SWA
     uint32_t                       swa_layer_mask_count;  // Length of swa_layer_mask (must == n_layer)
-    // Max attention query-head count across all layers (llama.cpp-0oxf).
-    // Feeds the oneDNN Graph-scratch zone floor, which is proportional to
-    // n_head x n_ubatch x n_ctx -- see unified-cache.cpp's
-    // onednn_graph_scratch_zone_floor_bytes(). Added at the end of the
-    // struct (not inserted among the existing fields) so every existing
+    // llama.cpp-o3a0: max query-head count across all layers ELIGIBLE for the
+    // oneDNN SDPA route, split by attention window class -- non-SWA layers
+    // (effective KV window == n_ctx) vs SWA layers (effective KV window ==
+    // n_swa above). Feeds the window-aware oneDNN Graph-scratch zone floor
+    // (unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes_swa()),
+    // replacing the single n_head_max (llama.cpp-0oxf) that assumed every
+    // oneDNN-served layer's window was n_ctx -- wrong for SWA models (gemma4
+    // E4B measured 24 MB vs. the 192 MB the flat formula predicted at
+    // n_ctx=8192, window=1024). "Eligible" mirrors
+    // ggml_sycl_flash_attn_ext_onednn_plan()'s D-based gate
+    // (fattn-onednn.cpp) as closely as a llama-layer file can: see
+    // llama_model_sycl_onednn_head_dim_eligible() in llama-model.cpp, which
+    // cannot include that SYCL-only source and so replicates the rule (kept
+    // in sync by test-sycl-onednn-graph-floor-eligibility-source.py). 0 if no
+    // eligible layer of that class exists. Added at the end of the struct
+    // (not inserted among the existing fields) so every existing
     // `ggml_sycl_tensor_inventory x = {};` zero-init call site stays correct
     // without being touched.
-    uint32_t                       n_head_max;
+    uint32_t                       n_head_ctx_max;
+    uint32_t                       n_head_swa_max;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama
