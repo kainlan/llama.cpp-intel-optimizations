@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #if !defined(GGML_USE_SYCL)
 int main() {
@@ -39,7 +40,9 @@ int main() {
 #else
 
 using ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch;
+using ggml_sycl::unified_cache_nonfa_attn_outside_arena_reserve_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom;
 
 namespace {
 
@@ -224,6 +227,90 @@ void test_largest_fitting_n_ctx() {
           "for a zone this small");
 }
 
+// llama.cpp-pvjr: the headroom predicate that replaced the SCRATCH-zone-
+// capacity check -- refuse iff demand + reserve > free. Reserve and the
+// four bracket points below are taken directly from task llama.cpp-pvjr's
+// comments c-1hv7/c-gnyc (the sweep that decided R = 928 MiB); see this
+// file's header comment and unified_cache_nonfa_attn_outside_arena_reserve_
+// bytes()'s own derivation comment (unified-cache.cpp) for the full
+// narrative.
+void test_headroom_predicate() {
+    printf("Non-FA attention scratch outside-arena headroom predicate:\n");
+
+    const size_t reserve = unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+    check(reserve == 928 * kMiB, "the outside-arena reserve is exactly 928 MiB");
+
+    // Measured live device free bytes at guard time (task c-1hv7/c-gnyc),
+    // in the same "MB" == MiB convention the [SYCL-BUDGET] free= log line
+    // uses -- NOT decimal megabytes.
+    const size_t h_b50 = static_cast<size_t>(1627.3 * static_cast<double>(kMiB));
+    const size_t h_b70 = static_cast<size_t>(2045.2 * static_cast<double>(kMiB));
+
+    // B50: p7168 (d=672 MiB) ran clean guard-off; p8192 (d=768 MiB) aborted
+    // with the VRAM exhausted (free=29 MB) -- both at n_head=32, n_ubatch=512.
+    const size_t d_b50_7168 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 7168);
+    const size_t d_b50_8192 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 8192);
+    check(d_b50_7168 == 672 * kMiB, "sanity: demand(32, 512, 7168) is 672 MiB");
+    check(d_b50_8192 == 768 * kMiB, "sanity: demand(32, 512, 8192) is 768 MiB");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(d_b50_7168, h_b50),
+          "B50: n_ctx=7168 (d=672 MiB) fits the measured 1627.3 MB headroom at R=928 MiB");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(d_b50_8192, h_b50),
+          "B50: n_ctx=8192 (d=768 MiB) does NOT fit -- this is the shape that aborted on hardware");
+
+    // B70: p11264 (d=1056 MiB) ran clean; p12288 (d=1152 MiB) exhausted
+    // outside-arena VRAM 4 times, surviving only on the scalar fallback --
+    // treated as refuse per the decided predicate.
+    const size_t d_b70_11264 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 11264);
+    const size_t d_b70_12288 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 12288);
+    check(d_b70_11264 == 1056 * kMiB, "sanity: demand(32, 512, 11264) is 1056 MiB");
+    check(d_b70_12288 == 1152 * kMiB, "sanity: demand(32, 512, 12288) is 1152 MiB");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(d_b70_11264, h_b70),
+          "B70: n_ctx=11264 (d=1056 MiB) fits the measured 2045.2 MB headroom at R=928 MiB");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(d_b70_12288, h_b70),
+          "B70: n_ctx=12288 (d=1152 MiB) does NOT fit -- degraded on hardware (scalar fallback), "
+          "treated as refuse");
+
+    // Overflow: a demand within [0, SIZE_MAX - reserve] must not overflow;
+    // above that, the helper must treat the sum as refuse rather than wrap
+    // to a small value that would read as "fits".
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max(),
+                                                          std::numeric_limits<size_t>::max()),
+          "demand == SIZE_MAX refuses even against a SIZE_MAX free_bytes (demand + reserve would overflow)");
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max() - reserve + 1,
+                                                          std::numeric_limits<size_t>::max()),
+          "demand one byte past the exact overflow boundary (SIZE_MAX - reserve + 1) refuses even against "
+          "a SIZE_MAX free_bytes");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(std::numeric_limits<size_t>::max() - reserve,
+                                                         std::numeric_limits<size_t>::max()),
+          "demand exactly at the overflow boundary (SIZE_MAX - reserve) does not overflow and fits a "
+          "SIZE_MAX free_bytes");
+
+    // A card with less free memory than the reserve alone refuses any
+    // positive demand, however small.
+    check(!unified_cache_nonfa_attn_scratch_fits_headroom(1, reserve - 1),
+          "free_bytes below the reserve alone refuses even a 1-byte demand");
+    check(unified_cache_nonfa_attn_scratch_fits_headroom(0, reserve),
+          "free_bytes exactly equal to the reserve fits a zero demand");
+
+    // Largest-fitting n_ctx at capacity = H - R on both cards (the
+    // headroom-limited remediation the runtime refusal reports). Computed
+    // by hand: floor((H - R) / (n_head * n_ubatch * 6)) rounded down to the
+    // nearest multiple of 256.
+    //   B50: H=1627.3 MiB, R=928 MiB -> capacity ~= 733,269,196 B
+    //        (~699.3 MiB); 733269196 / 98304 = 7459.86..., rounded down to
+    //        the nearest multiple of 256 (7459 / 256 = 29.14...) -> 7424.
+    const size_t capacity_b50 = h_b50 - reserve;
+    check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b50, 32, 512) == 7424,
+          "B50 headroom-limited largest fitting n_ctx at R=928 MiB is 7424");
+
+    //   B70: H=2045.2 MiB, R=928 MiB -> capacity ~= 1,171,469,107 B
+    //        (~1117.2 MiB); 1171469107 / 98304 = 11916.4..., rounded down
+    //        to the nearest multiple of 256 (11916 / 256 = 46.5...) -> 11776.
+    const size_t capacity_b70 = h_b70 - reserve;
+    check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b70, 32, 512) == 11776,
+          "B70 headroom-limited largest fitting n_ctx at R=928 MiB is 11776");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -243,6 +330,7 @@ int main(int argc, char ** argv) {
     } else if (std::strcmp(mode, "default") == 0) {
         test_default_formula();
         test_largest_fitting_n_ctx();
+        test_headroom_predicate();
     } else {
         std::fprintf(stderr, "usage: %s [--mode=default|--mode=override|--mode=override-zero] (got --mode=%s)\n",
                      argv[0], mode);

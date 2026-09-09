@@ -47,6 +47,12 @@ LLAMA_MODEL_CPP = (ROOT / "src/llama-model.cpp").read_text()
 # this specific ~60k-line file, so a tool-assisted search here would
 # silently miss real occurrences.
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+# llama.cpp-pvjr: the design doc's "A non-tensor consumer" subsection and the
+# GGML_SYCL_NONFA_ATTN_SCRATCH_MB env-var row -- see
+# test_docs_reflect_the_headroom_predicate() below. Prose, not source, so it
+# is read raw (not comment-stripped).
+SYCL_MEMORY_DESIGN_MD = (ROOT / "docs/backend/sycl-memory-design.md").read_text()
+SYCL_ENV_VARS_MD = (ROOT / "docs/backend/sycl-env-vars.md").read_text()
 
 
 # Single left-to-right alternation, not two sequential passes -- see
@@ -124,13 +130,14 @@ def test_llama_context_threads_real_flash_attn_state():
     )
 
 
-def test_guard_consults_the_demand_formula():
+def test_guard_consults_the_headroom_predicate():
     """ggml_sycl_check_nonfa_attn_scratch() (ggml-sycl.cpp) -- the shared
     helper both ggml_backend_sycl_set_runtime_context() and the narrow
     ggml_backend_sycl_recheck_runtime_context_flash_attn() re-check funnel
-    into -- must actually call the exported demand formula and gate it on
-    flash_attn_enabled -- declaring the parameter without consulting it
-    would be a guard that never fires."""
+    into -- must actually call the exported demand formula, read LIVE
+    device free memory, and gate the refusal on outside-arena headroom
+    (demand + reserve vs free), not the SCRATCH zone's own capacity
+    (llama.cpp-pvjr: the zone-capacity predicate over-refused the B70)."""
     func_start = GGML_SYCL_CPP_CODE.find("static bool ggml_sycl_check_nonfa_attn_scratch(")
     assert func_start != -1, "ggml_sycl_check_nonfa_attn_scratch() definition not found in ggml-sycl.cpp"
     # Bound the search to this function's body: from the definition to the
@@ -152,9 +159,25 @@ def test_guard_consults_the_demand_formula():
         "ggml_sycl_check_nonfa_attn_scratch() must call "
         "unified_cache_nonfa_attn_scratch_demand_bytes() to size the guard"
     )
-    assert "zone_capacity(" in body_norm and "vram_zone_id::SCRATCH" in body_norm, (
-        "the guard must compare the demand against the SCRATCH zone's actual reserved capacity "
-        "(cache->zone_capacity(vram_zone_id::SCRATCH)), not a re-derived or assumed size"
+    assert "ggml_backend_sycl_get_device_memory(" in body_norm, (
+        "the guard must read LIVE device free memory (ggml_backend_sycl_get_device_memory()) at guard "
+        "time -- a stored/cached headroom figure would go stale against a budget-pct override or "
+        "another tenant on the card"
+    )
+    assert "unified_cache_nonfa_attn_scratch_fits_headroom(" in body_norm, (
+        "the guard must decide fit/refuse through the shared "
+        "unified_cache_nonfa_attn_scratch_fits_headroom() helper, not a re-derived comparison"
+    )
+    assert "unified_cache_nonfa_attn_outside_arena_reserve_bytes(" in body_norm, (
+        "the guard must read the empirical outside-arena reserve "
+        "(unified_cache_nonfa_attn_outside_arena_reserve_bytes(), 928 MiB) rather than hardcoding it"
+    )
+    assert not re.search(
+        r"nonfa_demand\s*<=\s*scratch_capacity|scratch_capacity\s*>=\s*nonfa_demand", body_norm
+    ), (
+        "the refusal must no longer be decided by comparing demand against the SCRATCH zone's own "
+        "capacity (llama.cpp-pvjr) -- that predicate over-refused the B70; the SCRATCH-zone re-plan may "
+        "still run for its own INFO logging, but must not decide fit/refuse"
     )
     assert "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(" in body_norm, (
         "a refusal must report the largest fitting n_ctx (same style as the KV budget refusal's "
@@ -167,13 +190,32 @@ def test_guard_consults_the_demand_formula():
     )
     assert "GGML_SYCL_NONFA_ATTN_SCRATCH_MB" not in body_norm, (
         "the runtime refusal must NOT advertise GGML_SYCL_NONFA_ATTN_SCRATCH_MB as a remediation -- "
-        "a hardware sweep (768/1536 MiB, raised headroom to 3-4 GB) still aborted on both cards "
-        "(llama.cpp-k1ev); -fa 1/auto or a smaller -c are the only remediations with hardware support"
+        "it only replaces the demand term d, not the reserve or the headroom comparison, so it is an "
+        "experimentation knob (llama.cpp-k1ev), not a user-facing fix; -fa 1/auto or a smaller -c are "
+        "the only remediations with hardware support"
     )
-    assert "scratch-limited" in body_norm, (
-        "the largest-fitting-n_ctx remediation must be labeled \"scratch-limited\" -- it is the "
-        "SCRATCH zone's own capacity limit, not a whole-device guarantee (llama.cpp-k1ev's "
-        "unexplained outside-arena consumer is not reflected in this figure)"
+    assert "headroom-limited" in body_norm, (
+        "the largest-fitting-n_ctx remediation must be labeled \"headroom-limited\" -- it is bounded by "
+        "this device's live outside-arena headroom, not a whole-device or zone-only guarantee"
+    )
+    assert "scratch-limited" not in body_norm, (
+        "\"scratch-limited\" is the retired zone-capacity predicate's own label (llama.cpp-oyfl) -- the "
+        "headroom-based remediation must use \"headroom-limited\" instead, not both"
+    )
+    disabled_match = re.search(
+        r"unified_cache_nonfa_attn_scratch_guard_disabled\s*\(\s*\)"
+        r"|nonfa_attn_scratch_mb_override\s*\(\s*\)\s*==\s*0",
+        body_norm,
+    )
+    fits_idx = body_norm.find("unified_cache_nonfa_attn_scratch_fits_headroom(")
+    assert disabled_match is not None, (
+        "an explicit GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 must skip the guard entirely -- expected either "
+        "unified_cache_nonfa_attn_scratch_guard_disabled() or the override accessor compared against 0"
+    )
+    assert fits_idx != -1 and disabled_match.start() < fits_idx, (
+        "the explicit-0 skip must appear BEFORE the headroom fit/refuse comparison -- 0 + reserve "
+        "compared against free would otherwise refuse any card with less than the reserve free, which "
+        "is not what \"disable\" means"
     )
     assert "unified_cache_ensure_planned_arena_zones(" in body_norm, (
         "the guard must make the opportunistic re-plan attempt (same call reserve_onednn_scratch() "
@@ -561,3 +603,28 @@ def test_plan_time_shape_is_recorded_unconditionally():
         "unified_cache_set_planned_nonfa_attn_scratch_shape() call site must not be inside "
         "an #if GGML_SYCL_DNNL block"
     )
+
+
+def test_docs_reflect_the_headroom_predicate():
+    """llama.cpp-pvjr: the design doc's "A non-tensor consumer" subsection and
+    the GGML_SYCL_NONFA_ATTN_SCRATCH_MB env-var row must describe the
+    headroom predicate that replaced the zone-capacity one, not the retired
+    claims that motivated it -- both of which the pvjr sweep falsified: the
+    B70 (and B50) ran several shapes clean that exceeded the 512 MiB SCRATCH
+    zone, so "the zone-only check is not more conservative than reality" and
+    "nothing measured runs with a demand above the zone" are no longer true."""
+    for name, text in (
+        ("sycl-memory-design.md", SYCL_MEMORY_DESIGN_MD),
+        ("sycl-env-vars.md", SYCL_ENV_VARS_MD),
+    ):
+        assert "both cards abort at the same shape" not in text, (
+            f"{name} must not claim both cards abort at the same shape -- the pvjr sweep showed the "
+            "B70 running several shapes the B50 could not"
+        )
+        assert "nothing measured runs with a demand above the zone" not in text, (
+            f"{name} must not claim nothing measured runs with a demand above the SCRATCH zone -- the "
+            "pvjr sweep ran p6144/p7168 (and more) clean on both cards despite exceeding the 512 MiB "
+            "zone"
+        )
+        assert "928 MiB" in text, f"{name} must document the decided reserve, R = 928 MiB"
+        assert "headroom-limited" in text, f"{name} must use the new remediation label \"headroom-limited\""
