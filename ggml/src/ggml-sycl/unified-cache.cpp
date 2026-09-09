@@ -1721,18 +1721,17 @@ static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ul
 // snapshot, not fit to several independent hardware measurements the way the
 // oneDNN sibling's c=1.5 was (five captures, llama.cpp-0oxf comment c-xcop).
 //
-// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on new
-// hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on
+// new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
 // occupancy across a whole pp8192 run) -- never lower it without such
 // evidence, because lowering trades away the margin this check exists to
 // keep ahead of the abort it prevents. But raising it is not free either:
-// this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
-// larger c also refuses MORE contexts that would actually have run --
-// trading false refusals for margin, on the same unvalidated single
-// snapshot. Neither direction is free; do not move this value without a
-// multi-point capture backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB
-// (below) is the lever for applying a future measurement without a code
-// change.
+// this is a headroom check, not a true worst-case model, so a larger c
+// also refuses MORE contexts that would actually have run -- trading false
+// refusals for margin, on the same unvalidated single snapshot. Neither
+// direction is free; do not move this value without a multi-point capture
+// backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB (below) is the lever
+// for applying a future measurement without a code change.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
     const long env_mb = nonfa_attn_scratch_mb_override();
     if (env_mb >= 0) {
@@ -1758,7 +1757,88 @@ size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n
     return static_cast<size_t>(std::max<uint64_t>(kNonfaAttnScratchFloorBytes, modeled));
 }
 
-uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
+// llama.cpp-pvjr: the outside-arena reserve the runtime-context guard adds
+// on top of the demand formula above before comparing against LIVE device
+// free memory. This REPLACES the guard's earlier predicate (refuse when
+// demand exceeds the SCRATCH zone's own capacity), which was measured to
+// over-refuse: p6144/p7168 both exceed the 512 MiB SCRATCH zone yet ran
+// clean guard-off on both cards, and the B70 additionally ran p8192 clean --
+// all three would have been wrongly refused by the zone-capacity check.
+//
+// DERIVATION (task llama.cpp-pvjr, comments c-1hv7/c-gnyc). Measured
+// 2026-09-09 on master f594574bf, Mistral 7B Q4_0, -fa 0, n_ubatch=512,
+// guard disabled (GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0) so the shape actually
+// runs or fails on its own merits, live device free read from the
+// [SYCL-BUDGET] free= line at plan time:
+//   B50 (live free 1627.3 MB): n_ctx=7168 (d=672 MiB) ran clean; n_ctx=8192
+//     (d=768 MiB) aborted with the VRAM exhausted (free=29 MB). Bracket:
+//     859 < R <= 955 MiB.
+//   B70 (live free 2045.2 MB): n_ctx=11264 (d=1056 MiB) ran clean; n_ctx=12288
+//     (d=1152 MiB) hit 4 outside-arena staging-allocation failures, surviving
+//     only on the scalar fallback -- treated as refuse, since a caller that
+//     wants that context to run should not silently get a perf-degraded one.
+//     Bracket: 893 < R <= 989 MiB.
+// Intersection: 893 < R <= 955 MiB. R = 928 MiB, chosen near the middle of
+// that 62 MiB window; margins at the four measured bracket points are
+// 27-69 MB, i.e. at the sweep's own 1024-token resolution -- not exact.
+// EMPIRICAL: R absorbs the oneDNN scratch overflow (~126 MB), the
+// batched-F16 src1 staging buffer (up to ~370 MB at p12288), and the B50's
+// llama.cpp-k1ev extra outside-arena consumption (now bounded to roughly
+// 0.1-0.9 GB on this tree, down from the "2-4 GB on both cards" an earlier
+// pre-o3a0 measurement found) -- ONLY over the measured range; a shape well
+// beyond it is refused conservatively rather than extrapolated.
+//
+// d is kept at the existing 6 B/element (sizeof(f16) * concurrency factor
+// 3), not the ~10 B/element the B70's own visible consumers scale at above
+// p6144 (the f32 KQ compute buffer doubles there, +4 B/element, on top of
+// the f16 staging term) -- a single R does not fit both cards at the higher
+// slope (at 10 B/elem the B70 needs a fixed term <= 203 MB while the B50
+// needs > 289 MB; no single value satisfies both), which is itself the
+// k1ev signature: the B50 carries an extra outside-arena consumer the B70
+// does not. R absorbs that difference at 6 B/elem across the measured
+// range instead.
+static constexpr uint64_t kNonfaAttnOutsideArenaReserveBytes = 928ull * 1024ull * 1024ull;
+
+size_t unified_cache_nonfa_attn_outside_arena_reserve_bytes() {
+    return static_cast<size_t>(kNonfaAttnOutsideArenaReserveBytes);
+}
+
+bool unified_cache_nonfa_attn_scratch_fits_headroom(size_t demand_bytes, size_t free_bytes) {
+    const size_t reserve_bytes = unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+    // A demand this close to SIZE_MAX cannot happen from the real formula
+    // (it is bounded by n_head/n_ubatch/n_ctx each fitting in a uint32_t),
+    // but this is a pure function a test can call with any value -- guard
+    // the addition explicitly rather than let it silently wrap to a small
+    // sum that would read as "fits" when it should refuse.
+    if (demand_bytes > std::numeric_limits<size_t>::max() - reserve_bytes) {
+        return false;
+    }
+    return (demand_bytes + reserve_bytes) <= free_bytes;
+}
+
+size_t unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(size_t free_bytes) {
+    // The inverse of fits_headroom()'s own comparison: fits_headroom(d, free)
+    // is true iff d + reserve <= free, i.e. iff d <= (free - reserve) when
+    // free >= reserve, and never (for any d >= 0) when free < reserve. This
+    // function returns that same (free - reserve) capacity, clamped to 0 --
+    // a caller who wants "the largest demand still refused/allowed" must
+    // derive it from THIS function, not re-subtract the reserve by hand, so
+    // the two can never drift against each other.
+    const size_t reserve_bytes = unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+    return free_bytes > reserve_bytes ? free_bytes - reserve_bytes : 0;
+}
+
+bool unified_cache_nonfa_attn_scratch_guard_disabled() {
+    // nonfa_attn_scratch_mb_override() treats "0" as a genuine parsed value
+    // (env_mb == 0), distinct from unset/empty (env_mb == -1, which falls
+    // through to the formula) -- see its own definition above. A value of
+    // exactly 0 is the explicit "disable this guard" request; any other
+    // non-negative value still replaces the demand formula's output but
+    // remains subject to the headroom comparison.
+    return nonfa_attn_scratch_mb_override() == 0;
+}
+
+uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   capacity_bytes,
                                                                     uint32_t n_head,
                                                                     uint32_t n_ubatch) {
     if (n_head == 0 || n_ubatch == 0) {
@@ -1766,17 +1846,20 @@ uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zon
     }
     // Inverse of the formula above: modeled(n_ctx) = n_head * n_ubatch * n_ctx
     // * sizeof(f16) * 3. Solve for the largest n_ctx with
-    // modeled(n_ctx) <= zone_capacity_bytes, then round down to a multiple of
+    // modeled(n_ctx) <= capacity_bytes, then round down to a multiple of
     // 256 -- the same cell-rounding convention the KV-side
     // ggml_sycl_largest_fitting_n_ctx() (ggml-sycl.cpp) uses, so the two
     // "largest context that fits" figures a refusal can print are directly
-    // comparable. This ignores the kNonfaAttnScratchFloorBytes clamp
-    // unified_cache_nonfa_attn_scratch_demand_bytes() applies (a tiny zone
-    // capacity below the floor would still fail a real allocation attempt;
-    // reporting a fitting n_ctx > 0 there would be misleading), which the
-    // caller must not rely on to be exact for a zone that small.
+    // comparable. `capacity_bytes` is a plain byte budget, not necessarily a
+    // zone's own capacity -- llama.cpp-pvjr's caller passes (live free
+    // memory - the outside-arena reserve above). This ignores the
+    // kNonfaAttnScratchFloorBytes clamp unified_cache_nonfa_attn_scratch_
+    // demand_bytes() applies (a tiny capacity below the floor would still
+    // fail a real allocation attempt; reporting a fitting n_ctx > 0 there
+    // would be misleading), which the caller must not rely on to be exact
+    // for a capacity that small.
     const uint64_t denom   = static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * 2ull * 3ull;
-    const uint64_t raw     = static_cast<uint64_t>(zone_capacity_bytes) / denom;
+    const uint64_t raw     = static_cast<uint64_t>(capacity_bytes) / denom;
     // Clamp BEFORE rounding, not after -- std::numeric_limits<uint32_t>::max()
     // (4294967295) is not itself a multiple of 256, so rounding first and
     // clamping second could return a value that breaks the "always a
