@@ -226,6 +226,61 @@ def test_both_callers_wire_into_the_shared_guard():
     ), "ggml_backend_sycl_recheck_runtime_context_flash_attn() must be declared in ggml-sycl.h"
 
 
+def test_narrow_recheck_forbids_replan_and_takes_the_lock():
+    """The narrow re-check must call the shared guard with allow_replan=false
+    (never recording, re-planning, or restoring the plan-time SCRATCH-zone
+    shape it does not own), and must take the same module-admission guard
+    and tensor-inventory lock the full transaction takes, re-validating the
+    plan snapshot under that lock -- unified_cache_ensure_planned_arena_zones()'s
+    own contract requires g_tensor_inventory_mutex, and
+    ggml_sycl_check_nonfa_attn_scratch() reads unified_cache state that same
+    lock protects even when allow_replan=false (spec round 4 F35 = quality
+    round 2 Q-F35)."""
+    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    assert full_start != -1
+    full_next = GGML_SYCL_CPP_CODE.find("ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1)
+    assert full_next != -1
+    full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
+    # allow_replan is passed positionally as the call's 6th (final) argument
+    # -- matched by position, not by the inline `/*allow_replan=*/` comment
+    # naming it, because that comment is exactly the kind of text
+    # strip_comments() (deliberately) removes before this check ever sees
+    # the source.
+    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^()]*flash_attn_enabled,\s*true\)", full_body_norm), (
+        "the full transaction must call the shared guard with allow_replan=true (the final positional "
+        "argument, after flash_attn_enabled)"
+    )
+
+    recheck_start = GGML_SYCL_CPP_CODE.find(
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn("
+    )
+    assert recheck_start != -1
+    recheck_next = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_n_ctx(", recheck_start + 1)
+    assert recheck_next != -1
+    recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
+
+    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^()]*flash_attn_enabled,\s*false\)", recheck_body_norm), (
+        "the narrow re-check must call the shared guard with allow_replan=false (the final positional "
+        "argument, after flash_attn_enabled) -- it must not record, re-plan, or restore the plan-time "
+        "SCRATCH-zone shape"
+    )
+    assert "sycl_module_mutation_guard module_guard;" in recheck_body_norm, (
+        "the narrow re-check must take sycl_module_mutation_guard, the same admission guard the full "
+        "transaction's callers rely on, so it cannot run past a module shutdown"
+    )
+    assert "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);" in recheck_body_norm, (
+        "the narrow re-check must take g_tensor_inventory_mutex before reading unified_cache state -- "
+        "unified_cache_ensure_planned_arena_zones()'s own contract requires this lock, and "
+        "ggml_sycl_check_nonfa_attn_scratch() reads the same cache state this lock protects even when "
+        "allow_replan=false"
+    )
+    assert "ggml_sycl_global_plan_snapshot().get() != current.get()" in recheck_body_norm, (
+        "the narrow re-check must re-validate the plan snapshot under the lock, exactly as the full "
+        "transaction does, since the snapshot may have changed between the lock-free read and acquiring "
+        "the lock"
+    )
+
+
 def test_for_model_forwards_flash_attn_enabled():
     """ggml_backend_sycl_set_runtime_context_for_model() must forward its new
     parameter into the inner call rather than dropping it on the floor."""
@@ -255,16 +310,25 @@ def test_formula_and_inverse_are_declared_and_defined():
     # Neither may be declared `static` in the .cpp -- that would make them
     # unreachable from ggml-sycl.cpp, silently turning the guard above into
     # a compile error this text-only test cannot otherwise catch (a build is
-    # a stronger check, but this test runs without one). Checked as a
-    # negative pattern anchored to the definition's OWN signature (not an
-    # arbitrary N-character lookback window, which can miss "static" sitting
-    # further back than the window, or false-positive on an unrelated
-    # "static" from a prior statement that happens to fall inside it).
-    assert "static size_t unified_cache_nonfa_attn_scratch_demand_bytes(" not in cpp_norm, (
-        "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
+    # a stronger check, but this test runs without one). A regex, not a
+    # fixed literal substring, so a storage-class keyword stacked between
+    # `static` and the return type (e.g. "static inline") is still caught.
+    # Each match is reduced to a bool BEFORE the assert -- asserting
+    # directly on a `re.search()` result (or on the huge normalized-source
+    # string itself) would make a failing pytest try to render that whole
+    # multi-hundred-KB string as part of the diff.
+    demand_is_static = bool(
+        re.search(r"\bstatic\b[\w\s]*\bsize_t unified_cache_nonfa_attn_scratch_demand_bytes\(", cpp_norm)
     )
-    demand_def = cpp_norm.find("size_t unified_cache_nonfa_attn_scratch_demand_bytes(")
-    assert demand_def != -1, "unified_cache_nonfa_attn_scratch_demand_bytes() definition not found in ggml-sycl/unified-cache.cpp"
+    assert not demand_is_static, "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
+    inverse_is_static = bool(
+        re.search(
+            r"\bstatic\b[\w\s]*\buint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch\(", cpp_norm
+        )
+    )
+    assert not inverse_is_static, (
+        "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch() must not be file-static"
+    )
 
 
 def test_auto_flash_attn_resolution_rechecks_the_guard():

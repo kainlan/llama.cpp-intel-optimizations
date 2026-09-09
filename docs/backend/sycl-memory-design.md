@@ -1877,9 +1877,20 @@ still substantial) ubatches' requests are typically still occupying the
 zone when the largest one arrives. This is inferred from **one** repro's
 zone-state snapshot, not fit to several independent hardware measurements
 the way the oneDNN c=1.5 was (five captures, llama.cpp-0oxf comment
-c-xcop) — treat it as a floor to tighten from a real multi-point capture,
-not a validated constant. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB` overrides the
-formula outright, so a future measurement needs no code change.
+c-xcop).
+
+**Two opposing pressures on this constant, both real.** Raise it only on
+new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+occupancy across a whole pp8192 run) — never lower it without such
+evidence, because lowering trades away the margin this check exists to
+keep ahead of the abort it prevents. But raising it is not free either:
+this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+larger `c` also refuses **more** contexts that would actually have run —
+trading false refusals for margin, on the same unvalidated single
+snapshot. Neither direction is free; do not move this value without a
+multi-point capture backing the move. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`
+overrides the formula outright, so applying a future measurement needs no
+code change.
 
 **Where this can and cannot help, and why the automatic case is
 llama.cpp-fkpg's scope, not this one's.** Like every zone above, the

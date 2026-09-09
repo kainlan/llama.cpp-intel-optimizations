@@ -16649,11 +16649,24 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
 // attention is on, or the guard could not evaluate), false when refused
 // (the refusal's own arithmetic and remediation are logged before
 // returning).
+//
+// `allow_replan` separates the two callers' very different rights over the
+// plan-time SCRATCH-zone shape: the full transaction (allow_replan=true)
+// keeps the original record/ensure/restore-on-refusal behavior below,
+// because it already holds g_tensor_inventory_mutex and owns republishing
+// the plan. The narrow re-check (allow_replan=false) must NOT record a
+// shape, call unified_cache_ensure_planned_arena_zones() (whose own
+// contract requires g_tensor_inventory_mutex, which resolve_fused_ops()'s
+// caller does not hold when it merely wants to know whether an
+// already-published shape still fits), or restore anything on refusal --
+// it only asks whether the ALREADY-PUBLISHED shape fits the CURRENT
+// SCRATCH capacity.
 static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                uint32_t n_ctx,
                                                uint32_t n_ubatch,
                                                uint32_t n_head,
-                                               bool     flash_attn_enabled) {
+                                               bool     flash_attn_enabled,
+                                               bool     allow_replan) {
     if (flash_attn_enabled) {
         return true;
     }
@@ -16674,41 +16687,57 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
         return true;
     }
 
-    // Remember the previously recorded triplet so a refused shape (see
-    // below) can be undone -- the recording just below stays unconditional
-    // (the source gate pins that), only its effect on FUTURE plan-time
-    // SCRATCH-zone sizing is rolled back when this shape does not fit.
-    const ggml_sycl::nonfa_attn_scratch_planned_shape prev_shape =
-        ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+    ggml_sycl::nonfa_attn_scratch_planned_shape prev_shape{};
+    size_t                                      scratch_capacity;
+    if (allow_replan) {
+        // Remember the previously recorded triplet so a refused shape (see
+        // below) can be undone -- the recording just below stays
+        // unconditional (the source gate pins that), only its effect on
+        // FUTURE plan-time SCRATCH-zone sizing is rolled back when this
+        // shape does not fit.
+        prev_shape = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(device);
 
-    // Opportunistic re-plan: record the REAL runtime shape (not the
-    // load-time conservative default populate_host_zone_sizing() saw) and
-    // ask the arena to re-check its planned zones. This succeeds only in
-    // the same "rare case where the arena is still empty"
-    // reserve_onednn_scratch()'s own comment already documents (no live
-    // weight leases yet) -- for the standard model-load flow it is a no-op,
-    // because llama_model_sycl_make_placement_envelope() (llama-model.cpp)
-    // hardcodes envelope.n_ctx = 0, so the SCRATCH zone was never sized for
-    // this shape to begin with.
-    const size_t scratch_capacity_before = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
-    ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, n_head, n_ubatch, n_ctx);
-    (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device);
-    const size_t scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
-    if (scratch_capacity > scratch_capacity_before) {
-        GGML_LOG_INFO(
-            "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB from non-FA attention scratch estimate "
-            "(n_head=%u n_ubatch=%u n_ctx=%u)\n",
-            scratch_capacity / (1024.0 * 1024.0), n_head, n_ubatch, n_ctx);
+        // Opportunistic re-plan: record the REAL runtime shape (not the
+        // load-time conservative default populate_host_zone_sizing() saw)
+        // and ask the arena to re-check its planned zones. This succeeds
+        // only in the same "rare case where the arena is still empty"
+        // reserve_onednn_scratch()'s own comment already documents (no
+        // live weight leases yet) -- for the standard model-load flow it
+        // is a no-op, because llama_model_sycl_make_placement_envelope()
+        // (llama-model.cpp) hardcodes envelope.n_ctx = 0, so the SCRATCH
+        // zone was never sized for this shape to begin with.
+        const size_t scratch_capacity_before = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+        ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, n_head, n_ubatch, n_ctx);
+        (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device);
+        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+        if (scratch_capacity > scratch_capacity_before) {
+            // "(observed)": this is the guard's own re-plan attempt seeing
+            // the zone grow, not the plan-time raise
+            // ensure_planned_arena_zones() logs from its own call site
+            // ("(planned)") -- kept distinguishable so a log reader can
+            // tell which of the two code paths actually grew the zone.
+            GGML_LOG_INFO(
+                "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (observed) from non-FA attention scratch "
+                "estimate (n_head=%u n_ubatch=%u n_ctx=%u)\n",
+                scratch_capacity / (1024.0 * 1024.0), n_head, n_ubatch, n_ctx);
+        } else {
+            // State only what was actually observed (capacity unchanged).
+            // ensure_planned_arena_zones()'s return value is discarded
+            // above (this call is opportunistic/best-effort by design), so
+            // the cause is not something this code checked -- it may be
+            // live weight leases, or simply that the estimate did not
+            // exceed the zone's existing capacity. Naming a specific
+            // unverified cause here would be a claim this code cannot
+            // back.
+            GGML_LOG_INFO(
+                "[UNIFIED-CACHE] non-FA attention re-plan did not raise the SCRATCH zone (%.1f MB unchanged)\n",
+                scratch_capacity / (1024.0 * 1024.0));
+        }
     } else {
-        // State only what was actually observed (capacity unchanged).
-        // ensure_planned_arena_zones()'s return value is discarded above
-        // (this call is opportunistic/best-effort by design), so the cause
-        // is not something this code checked -- it may be live weight
-        // leases, or simply that the estimate did not exceed the zone's
-        // existing capacity. Naming a specific unverified cause here would
-        // be a claim this code cannot back.
-        GGML_LOG_INFO("[UNIFIED-CACHE] non-FA attention re-plan did not raise the SCRATCH zone (%.1f MB unchanged)\n",
-                      scratch_capacity / (1024.0 * 1024.0));
+        // Narrow re-check: no record, no re-plan attempt, no
+        // restore-on-refusal -- only ask whether the shape the caller
+        // already published still fits the CURRENT SCRATCH capacity.
+        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
     }
 
     const size_t nonfa_demand = ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
@@ -16747,11 +16776,15 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
             fits_scratch);
     }
 
-    // This shape was refused -- restore the previously recorded triplet so
-    // a rejected runtime shape does not permanently change what
-    // a FUTURE model load's plan-time SCRATCH-zone raise reads.
-    ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, prev_shape.n_head, prev_shape.n_ubatch,
-                                                                  prev_shape.n_ctx);
+    if (allow_replan) {
+        // This shape was refused -- restore the previously recorded
+        // triplet so a rejected runtime shape does not permanently change
+        // what a FUTURE model load's plan-time SCRATCH-zone raise reads.
+        // The narrow re-check never recorded anything above, so it has
+        // nothing to restore.
+        ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, prev_shape.n_head, prev_shape.n_ubatch,
+                                                                      prev_shape.n_ctx);
+    }
     return false;
 }
 
@@ -16955,7 +16988,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // or compute-buffer-regrowth term without new hardware evidence that
     // k1ev's consumer is understood and bounded.
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head,
-                                            flash_attn_enabled)) {
+                                            flash_attn_enabled, /*allow_replan=*/true)) {
         return;
     }
 
@@ -17178,9 +17211,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
 // reaccount/materialize pass, a plan republish, and (via the caller's own
 // retry loop) a BUSY backoff -- none of which a mere flash_attn_type
 // resolution has any business touching, since n_ctx/n_ubatch have not
-// changed. Read-only except for ggml_sycl_check_nonfa_attn_scratch()'s own
-// plan-time-shape bookkeeping, which is unconditional and self-restoring on
-// refusal (see that function). Used by
+// changed. NOT read-only: like the full transaction, it takes
+// sycl_module_mutation_guard (so it cannot run past a module shutdown) and
+// g_tensor_inventory_mutex, then re-validates the plan snapshot under that
+// lock, because ggml_sycl_check_nonfa_attn_scratch() reads
+// unified_cache::zone_capacity() and (when allow_replan=true, not the case
+// for this caller) the arena's own planned-zone bookkeeping, both of which
+// require that lock under their own contract
+// (unified_cache_ensure_planned_arena_zones()'s comment: "Caller must hold
+// g_tensor_inventory_mutex"). resolve_fused_ops() holds no SYCL lock of its
+// own, so there is no deadlock. Called with allow_replan=false: no record,
+// re-plan attempt, or restore-on-refusal (see that function). Used by
 // llama_context::sycl_recheck_runtime_context_flash_attn() for the
 // AUTO-resolution re-check; the constructor's own initial call still goes
 // through the full transaction above, since establishing n_ctx/n_ubatch for
@@ -17197,6 +17238,11 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     }
     auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LIFECYCLE_BUSY;
+    }
+
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
@@ -17206,9 +17252,19 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
     }
 
+    // Re-validate under the lock exactly as the full transaction does
+    // above: the snapshot pointer may have changed between the
+    // lock-free read of `current` and acquiring the lock (a concurrent
+    // model load/unload or another runtime-context call).
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
-                                           current->plan->planner_n_head, flash_attn_enabled);
+                                           current->plan->planner_n_head, flash_attn_enabled,
+                                           /*allow_replan=*/false);
     return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 

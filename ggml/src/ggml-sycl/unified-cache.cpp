@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -1595,23 +1596,39 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // "use 0 bytes", which is a real behavior difference (0 disables the
 // consumer's own floor) a user would not notice from the log alone.
 //
-// Returns -1 when the variable is unset, empty, or fails to parse (WARNed
-// once per variable name via the enclosing `static const` caching this is
-// always called through -- see both call sites): the caller falls through
-// to its own formula. Returns the parsed non-negative MB count otherwise;
-// 0 is accepted as a genuine, if unusual, override and WARNed once too, so
-// it is never mistaken for "ignored -- fell through to the formula".
+// Returns -1 when the variable is unset or empty: the caller falls through
+// to its own formula, silently -- this is the ordinary "no override" case
+// and not worth a WARN. Returns -1 and WARNs once when the value fails to
+// parse, overflows strtol()'s own range (errno == ERANGE), or exceeds
+// kMaxOverrideMb -- a value that large is never a real override, only a
+// mistake (a byte count where a megabyte count was meant, say) that would
+// otherwise silently claim the entire arena; all three are folded into one
+// message and the same fallback-to-formula behavior. Returns the parsed
+// non-negative MB count otherwise; 0 is accepted as a genuine, if unusual,
+// override and WARNed once too, so it is never mistaken for "ignored --
+// fell through to the formula".
+//
+// NOT memoized here, and must not be called directly more than once per
+// variable name: every WARN path fires on every call, not just the first.
+// The two file-scope wrapper functions below memoize the result in their
+// own `static const long`, so each variable is parsed -- and WARNed about,
+// if invalid -- at most once per process no matter how many of this
+// formula's call sites ask for it (there are three today: the demand
+// formula itself, its plan-time raise counterpart in
+// ensure_planned_arena_zones(), and the oneDNN Graph-scratch floor).
 static long env_mb_override(const char * name) {
     const char * env = std::getenv(name);
     if (!env || env[0] == '\0') {
         return -1L;
     }
-    char *     endptr = nullptr;
-    const long parsed = std::strtol(env, &endptr, 10);
-    if (endptr == env || *endptr != '\0' || parsed < 0) {
+    static constexpr long kMaxOverrideMb = 1024L * 1024L;  // 1 TiB; anything above this is a mistake, not an override
+    errno                                = 0;
+    char *     endptr                    = nullptr;
+    const long parsed                    = std::strtol(env, &endptr, 10);
+    if (endptr == env || *endptr != '\0' || parsed < 0 || errno == ERANGE || parsed > kMaxOverrideMb) {
         GGML_LOG_WARN(
-            "[UNIFIED-CACHE] %s=\"%s\" is not a valid non-negative integer -- ignoring it and using the "
-            "formula instead\n",
+            "[UNIFIED-CACHE] %s=\"%s\" is not a valid non-negative integer, or is out of range -- ignoring "
+            "it and using the formula instead\n",
             name, env);
         return -1L;
     }
@@ -1623,6 +1640,29 @@ static long env_mb_override(const char * name) {
     }
     return parsed;
 }
+
+// Memoized, WARN-at-most-once-per-process accessor for
+// GGML_SYCL_NONFA_ATTN_SCRATCH_MB -- see env_mb_override()'s comment above
+// for why callers must go through this rather than calling
+// env_mb_override() directly with their own `static const long`.
+static long nonfa_attn_scratch_mb_override() {
+    static const long value = env_mb_override("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
+    return value;
+}
+
+// Same as nonfa_attn_scratch_mb_override(), for GGML_SYCL_ONEDNN_GRAPH_ZONE_MB.
+static long onednn_graph_zone_mb_override() {
+    static const long value = env_mb_override("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
+    return value;
+}
+
+// The non-FA batched mul_mat scratch demand formula's own floor (see
+// unified_cache_nonfa_attn_scratch_demand_bytes() below for the reasoning
+// on its size) -- hoisted to file scope, rather than kept as a
+// function-local constant, so ensure_planned_arena_zones()'s plan-time
+// raise block can gate its own all-zero-shape skip on it (Q-F44) without
+// duplicating the literal.
+static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ull;
 
 // llama.cpp-oyfl: the non-FA batched mul_mat scratch demand formula. See the
 // declaration in unified-cache.hpp for the derivation and the simplification
@@ -1661,17 +1701,22 @@ static long env_mb_override(const char * name) {
 // c=3 (not 3/2) is chosen to clear the observed 2.8x with a small margin,
 // rounding to a clean multiple. This is inferred from ONE repro's zone-state
 // snapshot, not fit to several independent hardware measurements the way the
-// oneDNN sibling's c=1.5 was (five captures, llama.cpp-0oxf comment c-xcop) --
-// treat it as a conservative floor, a candidate to RAISE (never lower)
-// once a real multi-point capture traces SCRATCH_ZONE occupancy across a
-// whole pp8192 run. This value exists to keep the guard's refusal safely
-// ahead of the abort it prevents, so a future measurement is only grounds
-// to widen that margin, never to narrow it without new hardware evidence.
-// GGML_SYCL_NONFA_ATTN_SCRATCH_MB (below) is the lever for that: it
-// overrides this formula's result outright, so a future measurement does
-// not need a code change to apply.
+// oneDNN sibling's c=1.5 was (five captures, llama.cpp-0oxf comment c-xcop).
+//
+// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on new
+// hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+// occupancy across a whole pp8192 run) -- never lower it without such
+// evidence, because lowering trades away the margin this check exists to
+// keep ahead of the abort it prevents. But raising it is not free either:
+// this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+// larger c also refuses MORE contexts that would actually have run --
+// trading false refusals for margin, on the same unvalidated single
+// snapshot. Neither direction is free; do not move this value without a
+// multi-point capture backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB
+// (below) is the lever for applying a future measurement without a code
+// change.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
-    static const long env_mb = env_mb_override("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
+    const long env_mb = nonfa_attn_scratch_mb_override();
     if (env_mb >= 0) {
         return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
     }
@@ -1683,13 +1728,15 @@ size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n
     // it only needs to catch the case where the formula itself underflows to
     // near-zero (n_head, n_ubatch, or n_ctx == 0, e.g. before any context is
     // known) and floor to something a single small allocation can still need.
-    static constexpr uint64_t kFloorMinBytes    = 16ull * 1024ull * 1024ull;
+    // (kNonfaAttnScratchFloorBytes, defined above env_mb_override(), is this
+    // same 16 MiB value -- hoisted to file scope so
+    // ensure_planned_arena_zones() can reference it too.)
     static constexpr uint64_t kSizeofF16        = 2;
     static constexpr uint64_t kConcurrencyFloor = 3;  // see the derivation above
     const uint64_t            elems =
         static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * static_cast<uint64_t>(n_ctx);
     const uint64_t modeled = elems * kSizeofF16 * kConcurrencyFloor;
-    return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
+    return static_cast<size_t>(std::max<uint64_t>(kNonfaAttnScratchFloorBytes, modeled));
 }
 
 uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
@@ -1768,7 +1815,7 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
     // requested; the DIRECT path absorbs whatever the clamp removes either
     // way, so an override that exceeds the clamp is not a correctness
     // problem, just a case where "always wins" would overstate it.
-    static const long env_mb = env_mb_override("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
+    const long env_mb = onednn_graph_zone_mb_override();
     if (env_mb >= 0) {
         return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
     }
@@ -3876,18 +3923,23 @@ bool unified_cache::ensure_planned_arena_zones() {
     // a consumer whose real demand this early is only ever a guess.
     {
         const nonfa_attn_scratch_planned_shape nonfa_shape = unified_cache_get_planned_nonfa_attn_scratch_shape(dev_id);
-        // An all-zero recorded shape with no override active means
+        // An all-zero recorded shape with no override active USUALLY means
         // populate_host_zone_sizing() has not run for this device yet --
         // there is nothing real to size from, and the formula's own 16 MiB
-        // floor can never exceed the 512 MiB default scratch_zone anyway,
-        // so skip the whole block rather than compute and (not) act on a
-        // result that was never going to raise anything. When an override
-        // IS active, attribute the raise to it explicitly below instead of
-        // printing a misleading all-zero shape.
-        static const long                      nonfa_env_mb = env_mb_override("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
-        const bool                             nonfa_override_active = nonfa_env_mb >= 0;
+        // floor (kNonfaAttnScratchFloorBytes) can never exceed the 512 MiB
+        // default scratch_zone anyway, so skip the whole block rather than
+        // compute and (not) act on a result that was never going to raise
+        // anything. That reasoning only holds while scratch_zone is at
+        // least the floor, though -- a sub-floor scratch_zone (e.g. from
+        // GGML_SYCL_COMPUTE_ARENA_MB shrinking the whole arena) must still
+        // get the floor raise even with an all-zero, not-yet-known shape,
+        // so the skip is additionally gated on scratch_zone already
+        // meeting the floor. When an override IS active, attribute the
+        // raise to it explicitly below instead of printing a misleading
+        // all-zero shape.
+        const bool                             nonfa_override_active = nonfa_attn_scratch_mb_override() >= 0;
         const bool nonfa_shape_known = nonfa_shape.n_head != 0 || nonfa_shape.n_ubatch != 0 || nonfa_shape.n_ctx != 0;
-        if (nonfa_override_active || nonfa_shape_known) {
+        if (nonfa_override_active || nonfa_shape_known || scratch_zone < kNonfaAttnScratchFloorBytes) {
             size_t planned_nonfa_attn_scratch = unified_cache_nonfa_attn_scratch_demand_bytes(
                 nonfa_shape.n_head, nonfa_shape.n_ubatch, nonfa_shape.n_ctx);
             const size_t nonfa_budget_cap = available_budget() / 4;
@@ -3910,13 +3962,19 @@ bool unified_cache::ensure_planned_arena_zones() {
             if (planned_nonfa_attn_scratch > scratch_zone) {
                 if (nonfa_override_active) {
                     GGML_LOG_INFO(
-                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB from GGML_SYCL_NONFA_ATTN_SCRATCH_MB=%ld "
-                        "override\n",
-                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_env_mb);
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from "
+                        "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=%ld override\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_attn_scratch_mb_override());
                 } else {
+                    // "(planned)": this is ensure_planned_arena_zones()'s own
+                    // plan-time raise, distinguished from the guard's later
+                    // "(observed)" re-plan-attempt raise
+                    // (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp)
+                    // so a log reader can tell which of the two code paths
+                    // actually grew the zone.
                     GGML_LOG_INFO(
-                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB from non-FA attention scratch estimate "
-                        "(n_head=%u n_ubatch=%u n_ctx=%u)\n",
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from non-FA attention scratch "
+                        "estimate (n_head=%u n_ubatch=%u n_ctx=%u)\n",
                         planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_shape.n_head, nonfa_shape.n_ubatch,
                         nonfa_shape.n_ctx);
                 }
