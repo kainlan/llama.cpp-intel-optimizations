@@ -1726,7 +1726,7 @@ static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ul
 // occupancy across a whole pp8192 run) -- never lower it without such
 // evidence, because lowering trades away the margin this check exists to
 // keep ahead of the abort it prevents. But raising it is not free either:
-// this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+// this is a headroom check, not a true worst-case model, so a
 // larger c also refuses MORE contexts that would actually have run --
 // trading false refusals for margin, on the same unvalidated single
 // snapshot. Neither direction is free; do not move this value without a
@@ -1781,7 +1781,7 @@ size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n
 //     Bracket: 893 < R <= 989 MiB.
 // Intersection: 893 < R <= 955 MiB. R = 928 MiB, chosen near the middle of
 // that 62 MiB window; margins at the four measured bracket points are
-// 27-66 MB, i.e. at the sweep's own 1024-token resolution -- not exact.
+// 27-69 MB, i.e. at the sweep's own 1024-token resolution -- not exact.
 // EMPIRICAL: R absorbs the oneDNN scratch overflow (~126 MB), the
 // batched-F16 src1 staging buffer (up to ~370 MB at p12288), and the B50's
 // llama.cpp-k1ev extra outside-arena consumption (now bounded to roughly

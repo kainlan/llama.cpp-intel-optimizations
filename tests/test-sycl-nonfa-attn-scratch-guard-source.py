@@ -1,20 +1,31 @@
-"""Source contract for llama.cpp-oyfl: the runtime-context-update guard that
+"""Source contract for llama.cpp-pvjr: the runtime-context-update guard that
 refuses a context whose non-flash-attention batched mul_mat scratch demand
-exceeds the SCRATCH zone the arena already reserved, instead of letting
+exceeds this device's LIVE outside-arena headroom, instead of letting
 ggml_sycl_mul_mat_batched_sycl() abort mid-prefill (the "batched F16 mul_mat
 failed -- no recovery path available" GGML_ABORT in ggml-sycl.cpp).
 
-This predicate is EMPIRICAL, not a modeled worst case: an earlier revision
-attempted to model everything that can spill outside the fixed SYCL arena
-(compute-buffer regrowth, SCRATCH overflow, oneDNN scratchpad fragmentation)
-and compare it against live free VRAM. Hardware measurement falsified that
-model -- a non-FA prefill was measured consuming several GB more outside the
-arena than any term the model accounted for, on both discrete cards, and no
-zone size or headroom override closed the gap (llama.cpp-k1ev, filed for that
-unexplained consumer). Until k1ev is closed, "does the demand exceed the
-SCRATCH zone" is the check with real hardware support, so that is what this
-file gates -- do not resurrect the live-free-VRAM predicate without new
-evidence that k1ev's consumer is understood and bounded.
+This predicate is EMPIRICAL, not a modeled worst case, and has already been
+revised TWICE on hardware evidence -- read this before "improving" it again.
+Round 1 (llama.cpp-oyfl) modeled everything that can spill outside the fixed
+SYCL arena (compute-buffer regrowth, SCRATCH overflow, oneDNN scratchpad
+fragmentation) and compared it against live free VRAM; hardware falsified it
+-- a non-FA prefill was measured consuming several GB more outside the arena
+than any term the model accounted for, on both discrete cards, and no zone
+size or headroom override closed the gap (llama.cpp-k1ev, filed for that
+still-unexplained consumer). Round 2 (also llama.cpp-oyfl) retreated to "does
+the demand exceed the SCRATCH zone the arena already reserved" -- simpler,
+and it refused every case that actually aborted, but a 2026-09-09 bracketing
+sweep on f594574bf (task llama.cpp-pvjr, o3a0 + oyfl + rqak merged) falsified
+that one too: several shapes exceeding the 512 MiB SCRATCH zone ran clean on
+both cards, so the zone's own capacity is not the resource that actually runs
+out. That sweep is the "new evidence that k1ev's consumer is understood and
+bounded" round 1's own text asked for -- it re-derived a live-free-memory
+predicate (demand + an EMPIRICAL 928 MiB reserve vs. live free memory), this
+time bracketed from measured hardware points on both cards rather than
+modeled from first principles, so it is what this file now gates. Do not
+retreat to the SCRATCH-zone-capacity predicate (round 2) or a
+from-first-principles live-free model (round 1) without new hardware
+evidence that falsifies this one the same way.
 
 Host-only, pure text assertions -- no SYCL device required, matching
 test-sycl-onednn-graph-allocator-source.py's pytest-collectible pattern

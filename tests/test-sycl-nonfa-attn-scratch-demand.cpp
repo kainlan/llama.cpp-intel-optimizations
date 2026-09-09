@@ -43,6 +43,7 @@ using ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch;
 using ggml_sycl::unified_cache_nonfa_attn_outside_arena_reserve_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled;
 
 namespace {
 
@@ -68,6 +69,8 @@ void test_default_formula() {
     check(scratch_mb_env == nullptr || scratch_mb_env[0] == '\0',
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB is unset (or empty) before the first call -- "
           "otherwise every case below tests the override, not the formula");
+    check(!unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "the guard is NOT disabled when GGML_SYCL_NONFA_ATTN_SCRATCH_MB is unset");
 
     // All-zero shape (nothing planned yet) must still respect the 16 MiB
     // minimum -- 0 * anything == 0, which the max(16 MiB, ...) half must catch.
@@ -128,6 +131,8 @@ void test_override() {
     const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
     check(env != nullptr && std::strcmp(env, "77") == 0,
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77 is set (ctest ENVIRONMENT) before the first call");
+    check(!unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "a non-zero override (77) is NOT the disable case -- only an explicit 0 disables the guard");
 
     const size_t demand_small = unified_cache_nonfa_attn_scratch_demand_bytes(0, 0, 0);
     const size_t demand_large = unified_cache_nonfa_attn_scratch_demand_bytes(128, 4096, 1u << 20);
@@ -148,6 +153,8 @@ void test_override_zero() {
     const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
     check(env != nullptr && std::strcmp(env, "0") == 0,
           "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set (ctest ENVIRONMENT) before the first call");
+    check(unified_cache_nonfa_attn_scratch_guard_disabled(),
+          "an explicit 0 override IS the disable case -- the guard must return true before any comparison");
 
     const size_t demand_zero_shape = unified_cache_nonfa_attn_scratch_demand_bytes(0, 0, 0);
     const size_t demand_real_shape = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 8192);

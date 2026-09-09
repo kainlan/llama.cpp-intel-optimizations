@@ -2085,7 +2085,7 @@ clean, `p8192` refused) gives `859 < R <= 955` MiB; the B70 bracket
 that wants that context to run should not silently get a
 perf-degraded one instead) gives `893 < R <= 989` MiB; the intersection
 is `893 < R <= 955` MiB, and `R = 928 MiB` was chosen near its middle —
-margins at the four measured bracket points are 27–66 MB, i.e. at the
+margins at the four measured bracket points are 27–69 MB, i.e. at the
 sweep's own 1024-token resolution, not exact. `R` absorbs the oneDNN
 overflow, the `src1` staging buffer, and the B50's residual k1ev
 consumption, all **only over the measured range**; a shape well beyond it
@@ -2104,9 +2104,12 @@ both cards across the measured range.
 
 The zone comparison is dropped from the refusal entirely — it is exactly
 what over-refused `p6144`/`p7168` above. The opportunistic SCRATCH-zone
-re-plan (`unified_cache_ensure_planned_arena_zones()`) is unchanged and
-still runs on every call for its own INFO logging; it no longer feeds the
-fit/refuse decision. A refusal now reports `needs` (= demand + reserve,
+re-plan (`unified_cache_ensure_planned_arena_zones()`) is unchanged; it
+still runs for its own INFO logging, but only on the full transaction
+(`allow_replan=true`) — never on the narrow re-check, and not at all when
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, since the explicit-0 skip returns
+before either the re-plan or the fit/refuse decision. A refusal now
+reports `needs` (= demand + reserve,
 broken out as `demand`/`reserve`), `free`, and `over_by`, plus the
 largest-fitting `-c` at `capacity = free - reserve` (labeled
 **"headroom-limited"**, replacing "scratch-limited" — it is bounded by
