@@ -3723,12 +3723,13 @@ class unified_cache {
     // slab's owning mem_handle (onednn_graph_scratch_flag_slab_owner_) is
     // left untouched there; it destructs later, from ~unified_cache()'s
     // normal member teardown, the same way the pooled reuse-pool entries'
-    // mem_handles do (see the llama.cpp-0oxf comment on that field's own
-    // handling, just above these two branches in unified-cache.cpp). Both
-    // are safe without a drain for the same reason, and it has nothing to
-    // do with whether {} was assigned: the actual physical release is
-    // shutdown-guarded at its source -- allocation_release_coordinator::retire()
-    // and mem_handle::release_lease_state() (mem-handle.cpp) both check
+    // mem_handles do (see the llama.cpp-0oxf comments on that field's own
+    // handling, at the end of each of those two branches in
+    // unified-cache.cpp). Both are safe without a drain for the same
+    // reason, and it has nothing to do with whether {} was assigned: the
+    // actual physical release is shutdown-guarded at its source --
+    // allocation_release_coordinator::retire() (unified-cache.cpp) and
+    // mem_handle::release_lease_state() (mem-handle.cpp) both check
     // ggml_sycl_is_shutting_down() and ABANDON the control instead of
     // releasing it once that flag is set, whether the release was
     // triggered by an explicit `= {}` or by a destructor running later. No
