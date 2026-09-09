@@ -434,12 +434,16 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // conversion scripts already write into n_embd_head_k, and exactly
     // the ne00 the real oneDNN gate reads (params.ne00 = Q->ne[0],
     // fattn.cpp). hparams.n_embd_head_k_mla() is the model-global
-    // "decompressed" head size v_mla applies AFTER build_attn returns
-    // (llama-graph.cpp) -- a size the flash-attention op itself never
-    // sees -- so branching on it here would screen the wrong dimension
-    // and wrongly accept layers oneDNN will never serve (DeepSeek-V3:
-    // n_embd_head_k_mla()=192, <=256 and so eligible, vs. the real
-    // ne00=576, >512 and so correctly ineligible at fattn-onednn.cpp).
+    // decompressed KEY head size (qk_nope + qk_rope, the key_length_mla
+    // the conversion scripts write) that only the non-absorbed MHA path
+    // would use; on the absorbed path K stays at kv_lora_rank + n_rot and
+    // only V is decompressed, by v_mla AFTER the attention op returns
+    // (llama-graph.cpp) -- so it is a size the flash-attention op itself
+    // never sees, and branching on it here would screen the wrong
+    // dimension and wrongly accept layers oneDNN will never serve
+    // (DeepSeek-V3: n_embd_head_k_mla()=192, <=256 and so eligible, vs.
+    // the real ne00=576, >512 and so correctly ineligible at
+    // fattn-onednn.cpp).
     // f_attention_scale is model-global too, so hoisted out of the loop
     // once rather than re-derived per layer.
     inventory.n_swa                = hparams.n_swa;
