@@ -1950,15 +1950,15 @@ c-xcop).
 **Two opposing pressures on this constant, both real.** Raise it only on
 new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
 occupancy across a whole pp8192 run) — never lower it without such
-evidence, because lowering trades away the margin this check exists to
-keep ahead of the abort it prevents. But raising it is not free either:
-this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
-larger `c` also refuses **more** contexts that would actually have run —
-trading false refusals for margin, on the same unvalidated single
+evidence, because lowering trades away the margin this check exists
+to keep ahead of the abort it prevents. But raising it is not free
+either: this is a headroom check, not a true worst-case model, so a
+larger `c` also refuses **more** contexts that would actually have run
+— trading false refusals for margin, on the same unvalidated single
 snapshot. Neither direction is free; do not move this value without a
 multi-point capture backing the move. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`
-overrides the formula outright, so applying a future measurement needs no
-code change.
+overrides the formula outright, so applying a future measurement needs
+no code change.
 
 **Where this can and cannot help, and why the automatic case is
 llama.cpp-fkpg's scope, not this one's.** Like every zone above, the
@@ -2102,32 +2102,31 @@ outside-arena consumer the B70 does not. Keeping `d` at 6 B/element and
 letting `R` absorb the difference is what makes one constant work for
 both cards across the measured range.
 
-The zone comparison is dropped from the refusal entirely — it is exactly
-what over-refused `p6144`/`p7168` above. The opportunistic SCRATCH-zone
-re-plan (`unified_cache_ensure_planned_arena_zones()`) is unchanged; it
-still runs for its own INFO logging, but only on the full transaction
-(`allow_replan=true`) — never on the narrow re-check, and not at all when
-`GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, since the explicit-0 skip returns
-before either the re-plan or the fit/refuse decision. A refusal now
-reports `needs` (= demand + reserve,
-broken out as `demand`/`reserve`), `free`, and `over_by`, plus the
-largest-fitting `-c` at `capacity = free - reserve` (labeled
-**"headroom-limited"**, replacing "scratch-limited" — it is bounded by
-this device's own live outside-arena headroom, not a zone or a
-whole-device guarantee). An explicit `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`
-skips the guard entirely, before any comparison — `0 + reserve` compared
-against `free` would otherwise refuse any card with less than 928 MiB
-free, which is not what "disable" means. The refusal still names `-fa
-1`/`auto` or a smaller `-c` as the only remediations with hardware
-support — it deliberately does **not** suggest
-`GGML_SYCL_NONFA_ATTN_SCRATCH_MB`, since that variable only replaces the
-demand term `d`, not the reserve or the headroom comparison; treat it as
-an experimentation knob for investigating k1ev, not a user-facing fix. Do
-not reintroduce a zone-capacity-only or compute-buffer-regrowth-only
-predicate without new hardware evidence that k1ev's consumer is
-understood and bounded — the reasoning behind each retired predicate was
-sound in isolation and still wrong in practice, which is the whole lesson
-of this subsection.
+The zone comparison is dropped from the refusal entirely — it is
+exactly what over-refused `p6144`/`p7168` above. The opportunistic
+SCRATCH-zone re-plan (`unified_cache_ensure_planned_arena_zones()`)
+is unchanged; it still runs for its own INFO logging, but only on the
+full transaction (`allow_replan=true`) — never on the narrow re-check,
+and not at all when `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, since the
+explicit-0 skip returns before either the re-plan or the fit/refuse
+decision. A refusal now reports `needs` (= demand + reserve, broken out
+as `demand`/`reserve`), `free`, and `over_by`, plus the largest-fitting
+`-c` at `capacity = free - reserve` (labeled **"headroom-limited"**,
+replacing "scratch-limited" — it is bounded by this device's own live
+outside-arena headroom, not a zone or a whole-device guarantee). An
+explicit `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0` skips the guard entirely,
+before any comparison — `0 + reserve` compared against `free` would
+otherwise refuse any card with less than 928 MiB free, which is not
+what "disable" means. The refusal still names `-fa 1`/`auto` or a
+smaller `-c` as the only remediations with hardware support — it
+deliberately does **not** suggest `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`,
+since that variable only replaces the demand term `d`, not the reserve
+or the headroom comparison; treat it as an experimentation knob for
+investigating k1ev, not a user-facing fix. Do not reintroduce a
+zone-capacity-only or compute-buffer-regrowth-only predicate without
+new hardware evidence that k1ev's consumer is understood and bounded
+— the reasoning behind each retired predicate was sound in isolation
+and still wrong in practice, which is the whole lesson of this subsection.
 
 ### Known limits (load-bearing — read before changing any of this)
 

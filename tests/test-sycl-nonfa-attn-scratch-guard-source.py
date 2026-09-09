@@ -232,6 +232,13 @@ def test_guard_consults_the_headroom_predicate():
         "the guard must make the opportunistic re-plan attempt (same call reserve_onednn_scratch() "
         "already documents as succeeding only while the arena is still unused) before checking"
     )
+    free_idx = body_norm.find("ggml_backend_sycl_get_device_memory(")
+    replan_idx = body_norm.find("unified_cache_ensure_planned_arena_zones(")
+    assert free_idx != -1 and replan_idx != -1 and free_idx < replan_idx, (
+        "the live free-memory read must precede the opportunistic SCRATCH-zone re-plan -- reading "
+        "after it would double count a committed zone growth as both the growth and the headroom "
+        "this guard then requires on top of it"
+    )
     assert "unified_cache_set_planned_nonfa_attn_scratch_shape(" in body_norm, (
         "the opportunistic re-plan must record the REAL runtime shape first, not the load-time one"
     )

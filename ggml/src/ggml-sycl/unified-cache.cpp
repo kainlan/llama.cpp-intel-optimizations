@@ -1721,18 +1721,17 @@ static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ul
 // snapshot, not fit to several independent hardware measurements the way the
 // oneDNN sibling's c=1.5 was (five captures, llama.cpp-0oxf comment c-xcop).
 //
-// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on new
-// hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on
+// new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
 // occupancy across a whole pp8192 run) -- never lower it without such
 // evidence, because lowering trades away the margin this check exists to
 // keep ahead of the abort it prevents. But raising it is not free either:
-// this is a headroom check, not a true worst-case model, so a
-// larger c also refuses MORE contexts that would actually have run --
-// trading false refusals for margin, on the same unvalidated single
-// snapshot. Neither direction is free; do not move this value without a
-// multi-point capture backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB
-// (below) is the lever for applying a future measurement without a code
-// change.
+// this is a headroom check, not a true worst-case model, so a larger c
+// also refuses MORE contexts that would actually have run -- trading false
+// refusals for margin, on the same unvalidated single snapshot. Neither
+// direction is free; do not move this value without a multi-point capture
+// backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB (below) is the lever
+// for applying a future measurement without a code change.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
     const long env_mb = nonfa_attn_scratch_mb_override();
     if (env_mb >= 0) {
