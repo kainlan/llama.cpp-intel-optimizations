@@ -429,15 +429,19 @@ as a single-site mint path** — the "only mint path" overstatement was a review
 finding against the code comments (`llama.cpp-81gt`, comment `c-by9u`); the
 single-site framing is equally wrong now that a second site is allowlisted.
 
-Two gates enforce this subsection and must agree with each other, since they
-check the same allowlist from different files:
+Two gates are WRITTEN to enforce this subsection and check the same
+allowlist from different files, but only one is currently IN FORCE:
 
 - `tests/test-sycl-owner-allocation-migration.py` asserts that `cache_backing`
   is absent from the public request structs, that
   `allocation-provenance.hpp` is included only by `unified-cache.cpp` and
   `pinned-pool.cpp`, and that the bootstrap helper is still `static` with
   exactly the two-site allowlist above passing `true` (one call per cohort
-  tag, no third site).
+  tag, no third site). **Not currently enforced**: this script is
+  unregistered (no ctest wraps it) and aborts at pytest COLLECTION time on a
+  pre-existing stale count pin unrelated to this allowlist
+  (`llama.cpp-nmaw`), so none of its assertions — this one included — run.
+  Left as-is; fixing that pin is out of scope here.
 - `tests/test-sycl-onednn-graph-allocator-source.py` independently re-derives
   the same two-cohort allowlist from `unified-cache.cpp`'s actual call sites,
   as the registered gate for the oneDNN Graph-scratch allocator's own change

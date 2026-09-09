@@ -3898,18 +3898,8 @@ class unified_cache {
     // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
     // removal site that can retire an armed-but-incomplete entry's slot.
     size_t                       onednn_graph_scratch_flag_slot_retired_count_     = 0;
-    // Lazily created by get_event_watch_queue(); out-of-order,
-    // non-profiling. Guards first-use construction against concurrent
-    // callers -- onednn_graph_scratch_free() parks entries under
-    // onednn_graph_scratch_mutex_, but this queue is general-purpose
-    // infrastructure and must not assume every future caller already holds
-    // that (or any) lock. Every submission on this queue is a DEVICE
-    // MARKER KERNEL, not a host_task -- see get_event_watch_queue()'s own
-    // comment and onednn_graph_scratch_pool_entry::flag_slot's comment for
-    // why a host_task was tried here first and found to block the
-    // SUBMITTING thread (measured, both cards) whenever its dependency
-    // comes from another queue, which a device kernel submitted the same
-    // way does not.
+    // Device marker kernel only, never a host_task -- see
+    // get_event_watch_queue().
     std::unique_ptr<sycl::queue> event_watch_queue_;
     std::once_flag               event_watch_queue_once_;
     size_t                       budget_;                   // Total GPU memory budget (after reservations)

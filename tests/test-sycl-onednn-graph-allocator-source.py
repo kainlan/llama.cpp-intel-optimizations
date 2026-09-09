@@ -189,16 +189,21 @@ def _sentence_bounded_window(text: str, start: int, end: int) -> str:
 
 
 def _withdrawn_lies_phrasing_is_history_framed(raw_text: str) -> bool:
-    """True iff every standalone occurrence of "lies"/"lying" in raw_text
-    (the RAW, comment-bearing text -- this checks comment PROSE, not code,
-    so it must not run against a comment-stripped copy) sits inside the
-    SAME sentence (or, absent an intervening blank comment line, the same
-    paragraph) as "earlier" or "misdiagnos". Vacuously true if neither
-    spelling occurs at all -- this check exists to catch a REINTRODUCTION
-    of the withdrawn reading without its framing, not to require the
-    mention to exist."""
+    """True iff every occurrence of "lies"/"lying" in raw_text (the RAW,
+    comment-bearing text -- this checks comment PROSE, not code, so it must
+    not run against a comment-stripped copy) that is actually ABOUT A QUERY
+    (its own sentence/paragraph window also contains "quer", matching
+    "query"/"queries") sits inside that same window as "earlier" or
+    "misdiagnos". A "lies"/"lying" mention with no "quer" nearby is ordinary
+    English (e.g. "the slab lies before the queue") -- not the withdrawn
+    reading at all, and skipped rather than demanding framing it has no
+    reason to carry. Vacuously true if no query-related mention exists --
+    this check exists to catch a REINTRODUCTION of the withdrawn reading
+    without its framing, not to require the mention to exist."""
     for match in _LIES_WORD_RE.finditer(raw_text):
         window = _sentence_bounded_window(raw_text, match.start(), match.end())
+        if not re.search(r"quer", window, re.IGNORECASE):
+            continue
         if not re.search(r"earlier|misdiagnos", window, re.IGNORECASE):
             return False
     return True
@@ -1090,6 +1095,14 @@ def test_withdrawn_lies_phrasing_check_has_a_mutation_witness() -> None:
     assert not _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + unframed_lying_reintroduction), (
         "mutation witness is broken: an unframed 'lying' mention was not detected -- only the 'lies' "
         "spelling was being matched"
+    )
+    # llama.cpp-c6ah: an ORDINARY English "lies"/"lying" sentence with
+    # nothing to do with a query must never be flagged, unframed or not --
+    # "queue" deliberately does NOT contain "quer" as a substring, so this
+    # is a genuine negative case, not an accidental match.
+    unrelated_lies_sentence = "\n// The slab lies before the queue in the class body.\n"
+    assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + unrelated_lies_sentence), (
+        "the check should not flag an ordinary English use of 'lies' that has nothing to do with a query"
     )
 
 

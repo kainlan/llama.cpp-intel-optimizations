@@ -581,6 +581,26 @@ bool poll_for_pool_hit(unified_cache * cache, sycl::queue & q, size_t size, void
     }
 }
 
+// llama.cpp-c6ah: shared by every flag-poll site in this file (poll
+// onednn_graph_scratch_pool_entry_flag_true_for_test(size) until it reads
+// true, or give up after the deadline) so the deadline/interval constants
+// are named exactly once rather than duplicated at each call site. A
+// caller that also wants the elapsed time can time its own call to this
+// function -- see test_flag_timing_diagnostic() for that shape.
+constexpr int kFlagPollDeadlineMs = 2500;
+constexpr int kFlagPollIntervalMs = 20;
+
+bool poll_flag_true(unified_cache * cache, size_t size) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlagPollDeadlineMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(size)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kFlagPollIntervalMs));
+    }
+    return false;
+}
+
 // --- (a) freed buffer is reused for a same-size request ---------------------
 void test_pool_reuse(unified_cache * cache) {
     printf("DIRECT path pool reuse:\n");
@@ -719,7 +739,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     // cards, 2026-09-09). A device marker kernel submitted the same way
     // does not block its submitting thread, so this call must return in a
     // small fraction of the release delay, not most of it.
-    const auto free_call_start = std::chrono::steady_clock::now();
+    const auto          free_call_start = std::chrono::steady_clock::now();
     cache->onednn_graph_scratch_free(ptr1, &slow_release.release_event);
     const long long free_call_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - free_call_start)
@@ -1732,6 +1752,7 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     check(old_entry_flag_slot >= 0,
           "the old entry actually armed a slot -- otherwise the two witnesses below prove nothing");
     const size_t free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    const size_t retired_count_before_reclaim  = cache->onednn_graph_scratch_flag_slot_retired_count();
 
     // Reclaim the pool WHILE ptr_old's marker kernel is still in flight --
     // the exact hazard this test exists to catch. Before the fix,
@@ -1740,14 +1761,23 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test reclaim (entry still in flight)");
 
     const size_t free_list_size_after_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
-    printf("    (old entry's slot=%d; free list size: before reclaim=%zu, after reclaim=%zu)\n", old_entry_flag_slot,
-           free_list_size_before_reclaim, free_list_size_after_reclaim);
+    const size_t retired_count_after_reclaim  = cache->onednn_graph_scratch_flag_slot_retired_count();
+    printf(
+        "    (old entry's slot=%d; free list size: before reclaim=%zu, after reclaim=%zu; retired count: "
+        "before=%zu, after=%zu)\n",
+        old_entry_flag_slot, free_list_size_before_reclaim, free_list_size_after_reclaim, retired_count_before_reclaim,
+        retired_count_after_reclaim);
     // RED witness 1/2: ptr_old's slot must be PERMANENTLY retired, never
     // returned to the free list -- the free list's size must be unchanged
     // by this reclaim (this test's pool holds no other entry, so nothing
     // else could legitimately change it either).
     check(free_list_size_after_reclaim == free_list_size_before_reclaim,
           "the reclaim does not grow the free list -- ptr_old's slot was retired, not returned");
+    // Same witness, from the other counter: the public retired-slot count
+    // must rise by EXACTLY one (this reclaim retires exactly ptr_old's own
+    // slot, nothing else in this test's pool is incomplete).
+    check(retired_count_after_reclaim == retired_count_before_reclaim + 1,
+          "the reclaim's retired-slot count rose by exactly one");
 
     // q is a single IN-ORDER queue and old_release's kernel was never waited
     // on above, so without this wait, new_release's kernel (submitted next,
@@ -1787,16 +1817,7 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     // Poll the new entry's own flag directly (no alloc()/free() round trip
     // that would itself consume/re-park it) until it reads true -- must
     // happen at ITS OWN kernel's end.
-    const auto flag_poll_start    = std::chrono::steady_clock::now();
-    const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
-    bool       new_entry_complete = false;
-    while (std::chrono::steady_clock::now() < flag_poll_deadline) {
-        if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeReclaimRetire)) {
-            new_entry_complete = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    const bool new_entry_complete = poll_flag_true(cache, kSizeReclaimRetire);
     check(new_entry_complete, "the new entry's own completion flag reads true once its own release event completes");
 
     // old_release's kernel already finished (waited above, to keep it off
@@ -1861,18 +1882,13 @@ void test_flag_timing_diagnostic(unified_cache * cache, int device) {
           "onednn_graph_scratch_free() itself returned in well under a third of the release delay -- arming the "
           "completion flag did not block the park call");
 
-    const auto flag_poll_start    = std::chrono::steady_clock::now();
-    const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
-    long long  t_flag_ms          = -1;
-    while (std::chrono::steady_clock::now() < flag_poll_deadline) {
-        if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeA)) {
-            t_flag_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                              flag_poll_start)
-                            .count();
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    const auto      flag_poll_start  = std::chrono::steady_clock::now();
+    const bool      flag_became_true = poll_flag_true(cache, kSizeA);
+    const long long t_flag_ms =
+        flag_became_true ?
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - flag_poll_start)
+                .count() :
+            -1;
     if (t_flag_ms >= 0) {
         const auto wait_start = std::chrono::steady_clock::now();
         slow_release.release_event.wait_and_throw();

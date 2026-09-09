@@ -1,7 +1,7 @@
 // Decisive-experiment probe for llama.cpp-c6ah's own premise: does the bare
 // `evt.get_info<sycl::info::event::command_execution_status>()` query
 // actually BLOCK (rather than poll) on a profiling-enabled queue, the way
-// unified-cache.hpp's own get_dma_queue() comment (~2159-2166) claims?
+// unified-cache.hpp's own get_dma_queue() comment claims?
 //
 // WHY THIS EXISTS. llama.cpp-c6ah's fix replaced a direct call to that query
 // with a host-visible completion flag, on the premise that the direct call
