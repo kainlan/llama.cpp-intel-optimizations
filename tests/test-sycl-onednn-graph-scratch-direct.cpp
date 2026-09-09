@@ -500,15 +500,20 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // tests that actually complete an allocation (pool_reuse,
     // bounded_eviction, pending_event_reclaim); test_loud_failure's kSizeC
     // (340 MiB) request is deliberately forced to fail
-    // (force_direct_alloc_fail(2), asserted via ptr == nullptr) and returns
-    // before ever reaching this counter's write site, so it contributes
-    // nothing. kSizeA/kSizeB/kSizeD (300/320/310 MiB) already push the
-    // high-water past kSizeParked (280 MiB) on their own -- so the check
-    // below cannot isolate the parked allocation's own contribution to that
-    // floor; it only proves the accessor is not inert (it would read 0 if
-    // the write site above never ran). The non-decrease-after-release check
-    // further below is the one that actually proves the high-water-mark
-    // semantics.
+    // (ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(2),
+    // asserted via ptr == nullptr) and returns before ever reaching this
+    // counter's write site, so it contributes nothing. kSizeA/kSizeB/kSizeD
+    // (300/320/310 MiB) already push the high-water past kSizeParked (280
+    // MiB) on their own -- so the check below cannot isolate the parked
+    // allocation's own contribution to that floor; it only proves the
+    // accessor is not inert (it would read 0 if the write site above never
+    // ran). The non-decrease-after-release check further below
+    // distinguishes a high-water mark from a live outstanding count; it
+    // cannot fully discriminate that from a counter merely frozen at or
+    // above kSizeParked, since the combined
+    // onednn_graph_scratch_outstanding_bytes_ it tracks has no accessor of
+    // its own to check directly, and no cheaper, fully discriminating check
+    // is available here.
     check(cache->onednn_graph_scratch_high_water_bytes() >= kSizeParked,
           "onednn_graph_scratch_high_water_bytes() is not inert -- it reports at least the parked allocation's "
           "size, a floor the earlier completed tests in this binary already exceeded on their own");
@@ -524,8 +529,8 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // scratch_free_locked() (unified-cache.cpp:10602-10604) only decrements
     // onednn_graph_scratch_outstanding_bytes_, and nothing anywhere writes
     // onednn_graph_scratch_high_water_bytes_ except the max-update inside
-    // note_onednn_graph_scratch_alloc_locked() cited above, so releasing the
-    // parked allocation must not move it back down.
+    // note_onednn_graph_scratch_alloc_locked() cited above, so releasing
+    // the parked allocation must not move it back down.
     check(cache->onednn_graph_scratch_high_water_bytes() >= high_water_after_park,
           "onednn_graph_scratch_high_water_bytes() does not decrease after the parked allocation is released -- "
           "it is a high-water mark, not a live outstanding count");

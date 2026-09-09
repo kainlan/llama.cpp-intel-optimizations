@@ -3022,9 +3022,11 @@ class unified_cache {
     // total deadline (kOnednnGraphDirectWaitTotalTimeoutMs) elapses with
     // neither having happened. The counter increments before the loop
     // starts, so it also counts waits that timed out, not only waits that
-    // resolved. Exposed for tests and for the teardown log line; see the
-    // private ledger this counts against in the member declarations further
-    // below.
+    // resolved. A request larger than the cap on its own takes a separate
+    // early-out that returns before this increment, so such a request is
+    // never counted here at all. Exposed for tests and for the teardown log
+    // line; see the private ledger this counts against in the member
+    // declarations further below.
     // Unlocked read, same convention as onednn_graph_scratch_high_water_bytes()
     // just above -- advisory/diagnostic, not synchronized with the writer.
     size_t onednn_graph_scratch_direct_wait_count() const { return onednn_graph_scratch_direct_wait_count_; }

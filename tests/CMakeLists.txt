@@ -818,6 +818,9 @@ if (NOT WIN32)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         ARGS ${CMAKE_CURRENT_SOURCE_DIR}/test-bench-guard.sh
     )
+    # NOT `LABEL "sycl;source"` on the llama_test_cmd call above -- same
+    # llama_test_cmd single-valued-LABEL caveat as test-sycl-decode-mode-
+    # capture's own registration below.
     set_tests_properties(test-bench-guard PROPERTIES
         LABELS "sycl;source"
         SKIP_RETURN_CODE 77
