@@ -652,38 +652,7 @@ llama_context::llama_context(
             }
             sycl_exec_context_bound = true;
         }
-        for (auto & backend : backends) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-#    ifdef GGML_USE_SYCL
-            auto runtime_context_fn =
-                llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_set_runtime_context_for_model : nullptr;
-#    else
-            auto runtime_context_fn = llama_context_sycl_runtime_proc(dev);
-#    endif
-            if (runtime_context_fn) {
-                const auto & owner = model.get_sycl_model_token();
-                if (owner.model_id == 0 || owner.load_txn_id == 0) {
-                    continue;
-                }
-                const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
-                                                      owner.slot_generation };
-                auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                             cparams.flash_attn);
-                // Context construction may overlap enough live updates to
-                // exhaust the model's finite ticket pool transiently. Wait
-                // with bounded exponential backoff instead of spinning three
-                // immediate calls; preserve BUSY if capacity never frees.
-                constexpr int max_busy_waits = 7;
-                for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                    rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                            cparams.flash_attn);
-                }
-                if (rc != GGML_SYCL_LIFECYCLE_OK) {
-                    throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
-                }
-            }
-        }
+        sycl_resync_runtime_context_flash_attn();
 #endif
 
         // add ACCEL backends (such as BLAS)
@@ -949,6 +918,48 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+// llama.cpp-oyfl: shared by the constructor (right after model activation,
+// before any auto flash_attn_type is resolved) and resolve_fused_ops() (once
+// resolve_fused_ops() actually resolves an AUTO cparams.flash_attn) -- see
+// both call sites and the declaration in llama-context.h. Extracted rather
+// than duplicated so the two callers cannot drift on the lookup/retry logic.
+void llama_context::sycl_resync_runtime_context_flash_attn() {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+#    ifdef GGML_USE_SYCL
+        auto runtime_context_fn =
+            llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_set_runtime_context_for_model : nullptr;
+#    else
+        auto runtime_context_fn = llama_context_sycl_runtime_proc(dev);
+#    endif
+        if (runtime_context_fn) {
+            const auto & owner = model.get_sycl_model_token();
+            if (owner.model_id == 0 || owner.load_txn_id == 0) {
+                continue;
+            }
+            const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
+                                                  owner.slot_generation };
+            auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
+                                         cparams.flash_attn);
+            // Context construction may overlap enough live updates to
+            // exhaust the model's finite ticket pool transiently. Wait
+            // with bounded exponential backoff instead of spinning three
+            // immediate calls; preserve BUSY if capacity never frees.
+            constexpr int max_busy_waits = 7;
+            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
+                rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
+                                        cparams.flash_attn);
+            }
+            if (rc != GGML_SYCL_LIFECYCLE_OK) {
+                throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+            }
+        }
+    }
+#endif
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -1029,6 +1040,17 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+
+        // llama.cpp-oyfl: cparams.flash_attn just went from "not yet
+        // resolved" (defaulted true for AUTO, see its init above) to its
+        // real, hardware-resolved value. The SYCL non-FA attention scratch
+        // guard threaded through the constructor's runtime-context call saw
+        // the pre-resolution value and would have skipped the check for an
+        // AUTO context that just resolved to OFF. Re-run it now that the
+        // real value is known -- still inside sched_reserve(), called from
+        // the constructor, so a refusal here is still a clean exception,
+        // not a mid-prefill abort.
+        sycl_resync_runtime_context_flash_attn();
     }
 
     if (cparams.auto_fgdn) {

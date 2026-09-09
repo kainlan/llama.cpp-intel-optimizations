@@ -267,6 +267,18 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    // llama.cpp-oyfl: re-run the SYCL runtime-context call (the same one the
+    // constructor makes right after model activation) with the now-resolved
+    // cparams.flash_attn, for every SYCL backend. The constructor's own call
+    // runs before an AUTO flash_attn_type is resolved (resolve_fused_ops(),
+    // called from sched_reserve(), runs later in the same construction
+    // sequence), so an AUTO context that resolves to OFF would otherwise
+    // never have its non-FA attention scratch guard checked. Called once,
+    // from resolve_fused_ops() itself, only when it just performed that
+    // resolution -- still inside context construction/reservation, before
+    // any inference, so a refusal here is still a clean exception.
+    void sycl_resync_runtime_context_flash_attn();
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
