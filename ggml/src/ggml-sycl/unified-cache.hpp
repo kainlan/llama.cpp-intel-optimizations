@@ -1329,6 +1329,71 @@ void                               unified_cache_set_planned_onednn_graph_scratc
                                                                                         uint32_t n_ctx);
 onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratch_shape(int device_id);
 
+// llama.cpp-oyfl: the non-flash-attention batched mul_mat scratch floor.
+//
+// When flash attention is off (or resolves off at runtime), each layer's
+// attention runs through ggml_sycl_mul_mat_batched_sycl() (ggml-sycl.cpp)
+// twice per layer: KQ = mul_mat(K, Q), then KQV = mul_mat(V, softmax(KQ)).
+// Both calls stage their non-f16 operand into an f16 buffer via
+// scoped_unified_queue_temp, a COMPUTE-role transient that PREFERS the
+// SCRATCH zone (ggml_sycl_transient_device_intent(), common.hpp). Unlike the
+// oneDNN Graph-scratch floor above, this path is independent of
+// GGML_SYCL_DNNL -- it is the native SYCL/oneMath batched path, so this
+// declaration and its implementation are unconditional.
+//
+// The KQV call's staged operand is kq_soft_max, shaped
+// [n_kv, n_ubatch, n_head] -- at long context this dominates the KQ call's
+// staged Q operand ([head_dim, n_ubatch, n_head]), so the formula keeps only
+// this term, the same simplification the oneDNN activations-half placeholder
+// documented in docs/backend/sycl-memory-design.md's "Known limits" already
+// accepts. n_ctx stands in for n_kv the same way the oneDNN floor above uses
+// it for ne11: the planned/runtime context length is the worst-case n_kv a
+// layer's attention will ever see, and it is what every call site has on
+// hand. All-zero means "never planned for this device".
+struct nonfa_attn_scratch_planned_shape {
+    uint32_t n_head   = 0;
+    uint32_t n_ubatch = 0;
+    uint32_t n_ctx    = 0;
+};
+
+void                             unified_cache_set_planned_nonfa_attn_scratch_shape(int      device_id,
+                                                                                    uint32_t n_head,
+                                                                                    uint32_t n_ubatch,
+                                                                                    uint32_t n_ctx);
+nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_shape(int device_id);
+
+// The formula itself, exported (unlike onednn_graph_scratch_zone_floor_bytes()
+// above, which is file-static and reached only through its test wrapper):
+// ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) calls this directly
+// from a different translation unit to decide whether the SCRATCH zone the
+// arena already reserved can hold a given (n_head, n_ubatch, n_ctx) shape's
+// worst-case staging demand, so it cannot be a private helper the way the
+// oneDNN sibling is. A host-only test calls it directly too -- no separate
+// ggml_sycl_test_* wrapper is needed.
+//
+// GGML_SYCL_NONFA_ATTN_SCRATCH_MB overrides the formula the same way
+// GGML_SYCL_ONEDNN_GRAPH_ZONE_MB overrides the oneDNN floor: an explicit
+// non-negative value always wins.
+//
+// NOT independently measured on hardware at authoring time (no GPU access) --
+// unlike the oneDNN floor's c=1.5, which was fit to five real captures
+// (llama.cpp-0oxf, comment c-xcop), this concurrency factor is carried over
+// by analogy (scoped_unified_queue_temp's release() is the SAME async
+// marker-event release architecture on both paths -- see its definition in
+// ggml-sycl.cpp -- so more than one generation's buffer can plausibly be live
+// under load here too). Treat this as a starting floor to be tightened from a
+// real capture, not a validated constant.
+size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
+
+// Inverse of the formula above: the largest n_ctx whose modeled demand still
+// fits within `zone_capacity_bytes`, rounded down to a multiple of 256 (same
+// rounding convention as the KV-side ggml_sycl_largest_fitting_n_ctx()).
+// Returns 0 when n_head or n_ubatch is 0 (the formula is undefined -- avoids
+// a division by zero rather than returning a meaningless large number).
+uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
+                                                                    uint32_t n_head,
+                                                                    uint32_t n_ubatch);
+
 #if GGML_SYCL_DNNL
 // llama.cpp-0oxf: test-only hooks for onednn_graph_scratch_alloc()'s DIRECT
 // allocation-exhausted path. Deliberately ALWAYS compiled (not gated behind a

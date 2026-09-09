@@ -720,6 +720,14 @@ static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEV
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-oyfl: the same shape recorded for the non-flash-attention batched
+// mul_mat scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()) --
+// a SEPARATE triplet from the oneDNN one above, not a reuse of it, because
+// this path is unconditional (not gated behind GGML_SYCL_DNNL) and the two
+// consumers must be tunable independently.
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_head[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -1552,6 +1560,92 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
     shape.n_ubatch = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
     shape.n_ctx    = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
     return shape;
+}
+
+// llama.cpp-oyfl: see the declaration in unified-cache.hpp for the shape this
+// records and why it is a separate triplet from the oneDNN one above.
+void unified_cache_set_planned_nonfa_attn_scratch_shape(int      device_id,
+                                                        uint32_t n_head,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ctx) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_nonfa_attn_scratch_n_head[device_id].store(n_head, std::memory_order_release);
+    g_planned_nonfa_attn_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
+    g_planned_nonfa_attn_scratch_n_ctx[device_id].store(n_ctx, std::memory_order_release);
+}
+
+nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_shape(int device_id) {
+    nonfa_attn_scratch_planned_shape shape{};
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return shape;
+    }
+    shape.n_head   = g_planned_nonfa_attn_scratch_n_head[device_id].load(std::memory_order_acquire);
+    shape.n_ubatch = g_planned_nonfa_attn_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    shape.n_ctx    = g_planned_nonfa_attn_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    return shape;
+}
+
+// llama.cpp-oyfl: the non-FA batched mul_mat scratch demand formula. See the
+// declaration in unified-cache.hpp for the derivation, the simplification to
+// the KQV term alone, and why the c=3/2 concurrency factor is carried over by
+// analogy rather than independently measured. Exported (not file-static): it
+// is called from ggml-sycl.cpp (a different translation unit) as well as by
+// this file's own plan-time zone sizing.
+size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+    static const long env_mb = [] {
+        const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
+        if (env && env[0] != '\0') {
+            long parsed = std::atol(env);
+            if (parsed >= 0) {
+                return parsed;
+            }
+        }
+        return -1L;
+    }();
+    if (env_mb >= 0) {
+        return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
+    }
+
+    // Floor deliberately smaller than the oneDNN sibling's 64 MiB: this
+    // consumer shares the SCRATCH zone's own pre-existing 512 MiB default
+    // (ensure_planned_arena_zones()), not a small dedicated zone, so a tiny
+    // floor here does not risk starving the allocation at small shapes --
+    // it only needs to catch the case where the formula itself underflows to
+    // near-zero (n_head, n_ubatch, or n_ctx == 0, e.g. before any context is
+    // known) and floor to something a single small allocation can still need.
+    static constexpr uint64_t kFloorMinBytes = 16ull * 1024ull * 1024ull;
+    static constexpr uint64_t kSizeofF16     = 2;
+    const uint64_t            elems =
+        static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * static_cast<uint64_t>(n_ctx);
+    // Fixed-point 3/2, same reasoning as onednn_graph_scratch_zone_floor_bytes():
+    // exact integer arithmetic, no rounding surprises near MiB boundaries.
+    const uint64_t modeled = (elems * kSizeofF16 * 3) / 2;
+    return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
+}
+
+uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
+                                                                    uint32_t n_head,
+                                                                    uint32_t n_ubatch) {
+    if (n_head == 0 || n_ubatch == 0) {
+        return 0;
+    }
+    // Inverse of the formula above: modeled(n_ctx) = n_head * n_ubatch * n_ctx
+    // * sizeof(f16) * 3 / 2 == n_head * n_ubatch * n_ctx * 3 (the /2 and the
+    // sizeof(f16)=2 factor cancel exactly). Solve for the largest n_ctx with
+    // modeled(n_ctx) <= zone_capacity_bytes, then round down to a multiple of
+    // 256 -- the same cell-rounding convention the KV-side
+    // ggml_sycl_largest_fitting_n_ctx() (ggml-sycl.cpp) uses, so the two
+    // "largest context that fits" figures a refusal can print are directly
+    // comparable. This ignores the kFloorMinBytes clamp above (a tiny zone
+    // capacity below the floor would still fail a real allocation attempt;
+    // reporting a fitting n_ctx > 0 there would be misleading), which the
+    // caller must not rely on to be exact for a zone that small.
+    const uint64_t denom   = static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * 3ull;
+    const uint64_t raw     = static_cast<uint64_t>(zone_capacity_bytes) / denom;
+    const uint64_t rounded = (raw / 256ull) * 256ull;
+    return static_cast<uint32_t>(std::min<uint64_t>(rounded, std::numeric_limits<uint32_t>::max()));
 }
 
 #if GGML_SYCL_DNNL
@@ -3692,6 +3786,26 @@ bool unified_cache::ensure_planned_arena_zones() {
     const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
     if (arena_mb_env) {
         scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
+    }
+    // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
+    // floor the same way onednn_zone is raised below for its own planned
+    // estimate. Best-effort only -- see the comment at the
+    // unified_cache_set_planned_nonfa_attn_scratch_shape() call site
+    // (populate_host_zone_sizing()) for why the shape known this early can
+    // under-state the real runtime demand; the authoritative check is the
+    // runtime-context-update refusal in ggml-sycl.cpp.
+    {
+        const nonfa_attn_scratch_planned_shape nonfa_shape = unified_cache_get_planned_nonfa_attn_scratch_shape(dev_id);
+        const size_t                           planned_nonfa_attn_scratch =
+            unified_cache_nonfa_attn_scratch_demand_bytes(nonfa_shape.n_head, nonfa_shape.n_ubatch, nonfa_shape.n_ctx);
+        if (planned_nonfa_attn_scratch > scratch_zone) {
+            GGML_LOG_INFO(
+                "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB from non-FA attention scratch estimate "
+                "(n_head=%u n_ubatch=%u n_ctx=%u)\n",
+                planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_shape.n_head, nonfa_shape.n_ubatch,
+                nonfa_shape.n_ctx);
+            scratch_zone = planned_nonfa_attn_scratch;
+        }
     }
 
     size_t       onednn_zone         = 256 * 1024 * 1024;
@@ -25598,6 +25712,26 @@ static void populate_host_zone_sizing(placement_plan &                          
                                                              plan.planner_n_ctx);
     }
 #endif
+
+    // llama.cpp-oyfl: record the SAME shape for the non-FA batched mul_mat
+    // scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()).
+    // Unconditional (not gated behind GGML_SYCL_DNNL, unlike the oneDNN
+    // sibling above): the batched-mul_mat path this sizes is the native
+    // SYCL/oneMath route, not a oneDNN one. This is a best-effort, plan-time
+    // defense only -- at model load the envelope's flash_attn_type is always
+    // AUTO (llama-model.cpp hardcodes it) and planner_n_ctx here is the
+    // load-time conservative default, not the context a later
+    // llama_new_context_with_model() will actually request (llama.cpp-fkpg).
+    // The authoritative check, using the REAL runtime n_ctx/n_ubatch and the
+    // real flash-attention resolution, is in
+    // ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp), which cannot
+    // resize this zone after the fact (the arena is a single fixed
+    // allocation) but can refuse the update with the size arithmetic instead
+    // of letting prompt processing abort later.
+    if (plan.device_id >= 0) {
+        unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head, plan.planner_n_ubatch,
+                                                           plan.planner_n_ctx);
+    }
 
     // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     //    dequant prefetch. This is computed exactly at inventory collection time and
