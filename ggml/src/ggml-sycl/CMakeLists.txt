@@ -2285,17 +2285,19 @@ set_tests_properties(sycl-runtime-alloc PROPERTIES
 )
 
 # llama.cpp-me60: two of test-sycl-runtime-alloc's own cases each end by
-# calling shutdown_unified_cache() and EXPECT it to be refused (one always,
-# by design; the other only on unfixed code) -- and a refused shutdown was
-# measured to leave the cache partially torn down, unsafe for anything that
-# runs afterward in the SAME process (see the isolation case's own comment
-# in tests/test-unified-runtime-alloc.cpp). The plain sycl-runtime-alloc
-# registration above still runs both, back-to-back, inside one process --
-# fine for local/manual iteration, but not a trustworthy REGRESSION gate for
-# either case on its own. These two entries invoke the SAME already-built
-# binary with `--case <name>` so each runs alone, in its own process, with
-# the same ENVIRONMENT/LABELS/TIMEOUT/SKIP_RETURN_CODE as the registration
-# above.
+# calling shutdown_unified_cache() and REQUIRE it to succeed. A refusal in
+# one poisons the process for the other -- measured to leave the cache
+# partially torn down, unsafe for anything that runs afterward in the SAME
+# process (see either case's own comment in
+# tests/test-unified-runtime-alloc.cpp for the two independent hardware
+# findings this covers) -- which is exactly why they are registered
+# separately rather than sharing a process with each other or with any
+# other case in this binary. The plain sycl-runtime-alloc registration
+# above does not run either of them at all (see the "(skipping ...)" line
+# in main()'s default path) for that same reason. These two entries invoke
+# the SAME already-built binary with `--case <name>` so each runs alone, in
+# its own process, with the same ENVIRONMENT/LABELS/TIMEOUT/SKIP_RETURN_CODE
+# as the registration above.
 add_test(NAME sycl-runtime-alloc-flag-slab-survives-after-pool-reclaim
     COMMAND test-sycl-runtime-alloc --case onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim
 )

@@ -3384,18 +3384,22 @@ class unified_cache {
     // before log, same order as the body below and for the same reason
     // (logging first would under-report the summary by the pool's own live
     // contents at that moment). `context` names the call site for the log
-    // line (e.g. "context reclaim", "runtime context update"). Called
-    // internally at arena_reserve()'s context-reclaim branch; also called
-    // externally (via unified_cache_reclaim_onednn_graph_scratch_pool()
-    // below) from ggml_backend_sycl_set_runtime_context() -- a pooled
-    // buffer must not survive a runtime n_ctx/n_ubatch change any more than
-    // it should survive a full context/model teardown, since the shape it
-    // was sized for may no longer be requested again. Genuine cache
-    // teardown does NOT route through here: shutdown_resources() logs the
-    // teardown summary itself (ahead of its own early-return paths) and
-    // clears the pool directly, so every context this method is actually
-    // called with logs at INFO (a routine event -- a model switch or
-    // context resize, not once per process).
+    // line (e.g. "context reclaim", "runtime context update", "module
+    // shutdown (pre-census)"). Called internally at arena_reserve()'s
+    // context-reclaim branch; also called externally (via
+    // unified_cache_reclaim_onednn_graph_scratch_pool() below) from
+    // ggml_backend_sycl_set_runtime_context() -- a pooled buffer must not
+    // survive a runtime n_ctx/n_ubatch change any more than it should
+    // survive a full context/model teardown, since the shape it was sized
+    // for may no longer be requested again -- and, as of llama.cpp-me60,
+    // from shutdown_unified_cache() itself, once per live cache, BEFORE its
+    // pre-teardown census (a parked DIRECT entry's own EXTERNAL_EXACT
+    // allocation control would otherwise refuse that census). Genuine cache
+    // teardown ALSO still routes through shutdown_resources() further down
+    // (which logs its own teardown summary ahead of its own early-return
+    // paths and clears the pool again -- a no-op by then): the
+    // pre-census call above runs first and does the real work; the later
+    // call in shutdown_resources() finds nothing left to reclaim.
     void onednn_graph_scratch_reclaim_pool(const char * context) {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         // Clear BEFORE logging, not after: logging first would under-report

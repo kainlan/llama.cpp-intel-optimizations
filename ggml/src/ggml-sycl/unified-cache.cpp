@@ -4887,12 +4887,12 @@ bool unified_cache::shutdown_resources() {
     //
     // Placed here, after this function's own drain_all_queues_noexcept()
     // call and onednn_graph_scratch_clear_pool_locked() (both earlier in
-    // this function, immediately after the drain) have already run: every
-    // queue was synced before either of those ran, so no marker kernel can
-    // still be targeting this slab by this point -- releasing it now
-    // cannot race a device write through it. Locked, even though nothing
-    // else can be touching the slab at this point in a normal teardown,
-    // for consistency with every other access to these members
+    // this function) have already run: the drain synced every queue, and
+    // the pool clear ran after it, so no marker kernel can still be
+    // targeting this slab by this point -- releasing it now cannot race a
+    // device write through it. Locked, even though nothing else can be
+    // touching the slab at this point in a normal teardown, for
+    // consistency with every other access to these members
     // (onednn_graph_scratch_mutex_ guards them everywhere else in this
     // class).
     {
@@ -18965,7 +18965,16 @@ bool shutdown_unified_cache() {
         if (!item.second) {
             continue;
         }
-        item.second->drain_all_queues_noexcept();
+        // Result discarded deliberately: a drain failure here is not fatal
+        // to this early pass -- shutdown_resources() drains again, later in
+        // this same shutdown_unified_cache() call, and its own
+        // drain_all_queues_noexcept() return value is what actually gates
+        // teardown (its caller returns false on failure). Reclaiming the
+        // pool here with a possibly-incomplete drain is still safe:
+        // onednn_graph_scratch_clear_pool_locked() itself only destructs an
+        // entry it finds release-complete, handing an incomplete one to
+        // the background drain worker instead (see its own comment).
+        (void) item.second->drain_all_queues_noexcept();
         item.second->onednn_graph_scratch_reclaim_pool("module shutdown (pre-census)");
     }
 #endif

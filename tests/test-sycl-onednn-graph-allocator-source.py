@@ -884,7 +884,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # containment -- so the slab must be released explicitly here, on the
     # normal teardown path, not left to member destruction after that sweep
     # has already run. shutdown_resources_body_code was already extracted
-    # above, for the pool-reclaim check.
+    # above, for the teardown pool-clear check above.
     checks["oneDNN Graph-scratch flag slab owner is released inside shutdown_resources(), after the drain call"] = (
         _flag_slab_owner_released_after_drain(shutdown_resources_body_code)
     )
