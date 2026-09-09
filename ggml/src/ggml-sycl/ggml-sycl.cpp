@@ -16678,7 +16678,7 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     }
     if (n_head == 0) {
         // Name the reason the guard is silently skipping rather than
-        // leaving no trace at all -- planner_n_head_all is only 0 before
+        // leaving no trace at all -- planner_n_head_all_max is only 0 before
         // the model's own hyperparameters have been threaded into the plan,
         // which should not happen for a real runtime-context call, so this
         // is worth a WARN if it ever does.
@@ -16989,8 +16989,9 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // size or headroom setting tried. Do not reintroduce a live-free-VRAM
     // or compute-buffer-regrowth term without new hardware evidence that
     // k1ev's consumer is understood and bounded.
-    if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all,
-                                            flash_attn_enabled, /*allow_replan=*/true)) {
+    if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
+                                            flash_attn_enabled,
+                                            /*allow_replan=*/true)) {
         return;
     }
 
@@ -17266,7 +17267,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
 
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
-                                           current->plan->planner_n_head_all, flash_attn_enabled,
+                                           current->plan->planner_n_head_all_max, flash_attn_enabled,
                                            /*allow_replan=*/false);
     return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }

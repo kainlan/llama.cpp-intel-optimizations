@@ -26055,7 +26055,7 @@ static void populate_host_zone_sizing(placement_plan &                          
     // allocation) but can refuse the update with the size arithmetic instead
     // of letting prompt processing abort later.
     if (plan.device_id >= 0) {
-        unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all,
+        unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all_max,
                                                            plan.planner_n_ubatch, plan.planner_n_ctx);
     }
 
@@ -26241,7 +26241,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max              = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max              = kv_info.n_head_swa_max;
-    plan.planner_n_head_all                  = kv_info.n_head_all_max;
+    plan.planner_n_head_all_max              = kv_info.n_head_all_max;
     plan.planner_n_swa                       = kv_info.n_swa;
     plan.pp_pipeline_scratch_bytes           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id);
     plan.pp_moe_onednn_weight_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
@@ -27544,7 +27544,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max   = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;
-    plan.planner_n_head_all       = kv_info.n_head_all_max;
+    plan.planner_n_head_all_max   = kv_info.n_head_all_max;
     plan.planner_n_swa            = kv_info.n_swa;
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =

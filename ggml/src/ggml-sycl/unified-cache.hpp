@@ -484,8 +484,8 @@ struct placement_kv_info {
     // cannot use the two per-class fields above (both can be 0 when every
     // layer is oneDNN-ineligible). See
     // ggml_sycl_tensor_inventory::n_head_all_max (ggml-sycl.h) for the full
-    // rationale and placement_plan::planner_n_head_all below for where this
-    // is threaded to next.
+    // rationale and placement_plan::planner_n_head_all_max below for where
+    // this is threaded to next.
     uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
     // MoE hyperparameters (0 for dense models)
@@ -581,7 +581,7 @@ struct placement_plan {
     // every attention layer and so cannot use planner_n_head_ctx_max/
     // planner_n_head_swa_max (both can be 0 when every layer is
     // oneDNN-ineligible).
-    uint32_t                                   planner_n_head_all       = 0;
+    uint32_t                                   planner_n_head_all_max   = 0;
     // Component-wise maxima by actual device owner. Materialization consumes
     // these values later; allocation handles never belong in this plan.
     std::vector<moe_mmid_owner_workspace_plan> moe_mmid_workspaces;
@@ -1397,7 +1397,7 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 //
 // llama.cpp-rqak: n_head here is the ALL-LAYERS query-head maximum
 // (ggml_sycl_tensor_inventory::n_head_all_max / placement_plan::
-// planner_n_head_all), eligibility ignored -- deliberately NOT the oneDNN
+// planner_n_head_all_max), eligibility ignored -- deliberately NOT the oneDNN
 // sibling struct's per-window-class, oneDNN-ELIGIBLE-only maxima
 // (onednn_graph_scratch_planned_shape::n_head_ctx_max/n_head_swa_max
 // above). This path (ggml_sycl_mul_mat_batched_sycl(), the native

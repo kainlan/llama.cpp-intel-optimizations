@@ -1920,8 +1920,8 @@ fed by a `unified_cache_set_planned_*_shape()`/`get_planned_*_shape()` pair
 of atomics (one triplet per consumer — the non-FA one is **not** a reuse of
 the oneDNN triplet, because it is unconditional while the oneDNN one is
 gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
-right where `plan.planner_n_head_all/n_ubatch/n_ctx` are already known --
-`planner_n_head_all` (llama.cpp-rqak) is the max query-head count over ALL
+right where `plan.planner_n_head_all_max/n_ubatch/n_ctx` are already known --
+`planner_n_head_all_max` (llama.cpp-rqak) is the max query-head count over ALL
 attention layers, distinct from the oneDNN-eligible-only
 `planner_n_head_ctx_max`/`planner_n_head_swa_max` pair above, because this
 guard's non-FA path runs on every attention layer regardless of oneDNN
