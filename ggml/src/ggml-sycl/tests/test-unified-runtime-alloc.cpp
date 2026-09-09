@@ -853,20 +853,50 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // unified_cache_shutdown_retryable_postconditions_clean() sweep, once the
 // pool-census defect is not in the way.
 //
-// MUST RUN BEFORE onednn_graph_scratch_flag_slab_released_at_module_shutdown()
-// below, and main() calls it in that order: measured on hardware, a
-// REFUSED shutdown_unified_cache() call is not retryable-safe here -- the
-// other case's own refused shutdown left its cache PARTIALLY torn down
-// (its parked buffer's control kept the cache registered in
-// g_device_caches, but a subsequent onednn_graph_scratch_alloc() on that
-// same cache resolved off-device and hit GGML_ABORT at
-// onednn_graph_scratch_alloc_direct_locked()). So this case cannot force
-// its own clean cache by calling shutdown_unified_cache() and ignoring the
-// result (an earlier version of this case tried exactly that); it can
-// only rely on running first, right after
-// explicit_global_cache_shutdown_is_clean() genuinely leaves the cache
-// destroyed. The assertion below is what actually verifies that
-// precondition rather than merely assuming it.
+// RUNS ONLY VIA ITS OWN ctest REGISTRATION
+// (sycl-runtime-alloc-flag-slab-survives-after-pool-reclaim, `--case
+// <name>`), in a fresh process, with nothing run before it -- NOT from
+// main()'s default (no-argument) run. Two hardware findings established
+// why, in order:
+//
+// (1) A REFUSED shutdown_unified_cache() call is not retryable-safe here
+// -- the sibling case's own refused shutdown (by design -- see that
+// case's own comment) left ITS cache PARTIALLY torn down: its parked
+// buffer's control kept the cache registered in g_device_caches, but a
+// subsequent onednn_graph_scratch_alloc() on that same cache resolved
+// off-device and hit GGML_ABORT at
+// onednn_graph_scratch_alloc_direct_locked(). So this case cannot simply
+// run BEFORE the sibling case in the same process either, contrary to an
+// earlier version of this comment (main() briefly tried exactly that
+// ordering, with this case forcing its own clean cache by calling
+// shutdown_unified_cache() and ignoring the result).
+//
+// (2) Running ANY earlier case in this process that itself completes a
+// successful shutdown_unified_cache() call ALSO breaks this one --
+// verified on hardware (build-me60-4/5): g_sycl_shutting_down is left
+// `true` at the end of every SUCCESSFUL shutdown_unified_cache() call
+// (its own store(true) at the very end), and is reset to `false` only
+// MID-WAY through the NEXT shutdown_unified_cache() call -- AFTER that
+// call's own shutdown_resources() loop has already run using the STALE
+// `true` value from the PREVIOUS call. get_unified_cache(q) lazily
+// recreating a cache after such a prior shutdown does NOT reset the flag
+// (only the production reactivation hooks -- prepare_unified_cache_for_module_use(),
+// called from ggml_backend_sycl_commit_reactivate() and
+// ggml_backend_sycl_reg() -- do that; this file's plain get_unified_cache(q)
+// bypasses that whole protocol). So THIS case's own fresh cache, though
+// genuinely newly-constructed, still sees g_sycl_shutting_down == true
+// when ITS shutdown_resources() call runs, and takes the "SYCL might
+// already be gone" ABANDON branch instead of the normal release path --
+// which leaves the flag slab's registry row behind exactly the way F1
+// itself does, but for an entirely different, TEST-ONLY reason (the
+// abandon branch is correct production behavior for a real
+// process-exit/static-destruction teardown; a cache recreated after a
+// completed module shutdown, in the SAME live process, is not a scenario
+// production code creates -- see the two reactivation hooks above, both
+// of which explicitly re-arm the flag first). Measured: even
+// explicit_global_cache_shutdown_is_clean() alone, several cases earlier
+// in main()'s default run, is enough to poison every case after it this
+// way -- not just the two shutdown-poisoning cases poisoning each other.
 static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(sycl::queue & q) {
     TEST_BEGIN("onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim");
 
@@ -959,17 +989,47 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
 // EXPECTED ON UNFIXED CODE (pre-llama.cpp-me60): FAILS with the registry
 // message above. Once F1 lands (the fix releases the slab under
 // onednn_graph_scratch_mutex_ inside shutdown_resources()'s normal path),
-// this case passes.
+// this case passes -- but ONLY when it is the first thing in the process
+// to ever call shutdown_unified_cache() (see below); it is not a general
+// property of a fixed build.
 //
-// MUST RUN LAST, after onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim()
-// above (which itself must run right after explicit_global_cache_shutdown_is_clean(),
-// the case that genuinely leaves the cache destroyed): on unfixed code this
-// case's own shutdown_unified_cache() call below is REFUSED, and measured
-// on hardware a refused call is not retryable-safe here -- it leaves the
-// cache partially torn down (see the other case's own comment for the
-// GGML_ABORT this produced when something ran after it), so nothing in
-// this file may run after this case. main() calls it last for exactly that
-// reason.
+// RUNS ONLY VIA ITS OWN ctest REGISTRATION
+// (sycl-runtime-alloc-flag-slab-released-at-shutdown, `--case <name>`), in
+// a fresh process, with nothing run before it -- NOT from main()'s default
+// (no-argument) run, and not merely placed after the sibling case either
+// (an earlier version of this comment said "run last" and main() called it
+// that way). Two hardware findings established why, matching the sibling
+// case's own comment (onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(),
+// above in this file) in full -- reproduced here rather than cross-referenced,
+// since this case is the one whose own GGML_ABORT that finding names:
+//
+// (1) This case's own shutdown_unified_cache() call below is EXPECTED to
+// be refused on unfixed code (that is the whole point of this case), and a
+// refused call is not retryable-safe here -- it leaves the cache PARTIALLY
+// torn down: its own parked buffer's control keeps the cache registered in
+// g_device_caches, but a subsequent onednn_graph_scratch_alloc() on that
+// same cache resolves off-device and hits GGML_ABORT at
+// onednn_graph_scratch_alloc_direct_locked(). So nothing may run in this
+// process after this case, on unfixed code.
+//
+// (2) Independent of (1), and observed even on FIXED code: any earlier
+// case in this process that completes a successful shutdown_unified_cache()
+// call leaves g_sycl_shutting_down == true (its own store(true) at that
+// call's very end), reset to false only mid-way through the NEXT such
+// call -- after ITS OWN shutdown_resources() loop has already run using
+// the stale true value. A cache this case's own get_unified_cache(q) call
+// lazily recreates after such a prior shutdown does not reset that flag
+// (only the production reactivation hooks --
+// prepare_unified_cache_for_module_use(), called from
+// ggml_backend_sycl_commit_reactivate() and ggml_backend_sycl_reg() -- do
+// that; this file bypasses that whole protocol). So this case's own
+// shutdown_resources() call takes the "SYCL might already be gone" ABANDON
+// branch instead of the normal release path, leaving the flag slab's
+// registry row behind for a reason that has nothing to do with F1 --
+// verified on hardware (build-me60-4/5): even
+// explicit_global_cache_shutdown_is_clean() alone, several cases earlier
+// in main()'s default run, was enough to make this case fail this way on
+// an otherwise-fixed build.
 static bool onednn_graph_scratch_flag_slab_released_at_module_shutdown(sycl::queue & q) {
     TEST_BEGIN("onednn_graph_scratch_flag_slab_released_at_module_shutdown");
 
@@ -1442,15 +1502,26 @@ int main(int argc, char ** argv) {
     ok &= retained_pinned_suballocation_refuses_preteardown(q);
     ok &= explicit_global_cache_shutdown_is_clean();
 #if GGML_SYCL_DNNL
-    // llama.cpp-me60: ORDER IS LOAD-BEARING for these two, and both must run
-    // directly after explicit_global_cache_shutdown_is_clean() (the case
-    // that genuinely leaves the cache destroyed) with nothing else run
-    // after the second one -- see each case's own comment for why. The
-    // isolation case goes first (it needs a genuinely fresh cache, and
-    // cannot force one itself); the RED witness goes last (its own refused
-    // shutdown leaves the cache unsafe for anything that follows).
-    ok &= onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim(q);
-    ok &= onednn_graph_scratch_flag_slab_released_at_module_shutdown(q);
+    // llama.cpp-me60: deliberately NOT run here. Both shutdown-poisoning
+    // cases (onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim,
+    // onednn_graph_scratch_flag_slab_released_at_module_shutdown) require a
+    // cache that has NEVER been through a completed shutdown_unified_cache()
+    // call anywhere earlier in this process -- see either case's own
+    // comment for the verified mechanism (g_sycl_shutting_down staying set
+    // across a lazily-recreated cache). This default run has already run
+    // several such completed shutdowns above
+    // (retained_pinned_suballocation_refuses_preteardown,
+    // explicit_global_cache_shutdown_is_clean), so running either case here
+    // would exercise the SAME test-only defect their own comments describe,
+    // not the property either case actually targets. They run ONLY through
+    // their own ctest registrations
+    // (sycl-runtime-alloc-flag-slab-survives-after-pool-reclaim,
+    // sycl-runtime-alloc-flag-slab-released-at-shutdown), each `--case
+    // <name>` in a fresh process with nothing run before it.
+    fprintf(stderr,
+            "(skipping onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim and "
+            "onednn_graph_scratch_flag_slab_released_at_module_shutdown here -- they run only via their own "
+            "--case ctest registrations, in a fresh process)\n");
 #endif
 
     fprintf(stderr, "-------------------------------------------\n");
