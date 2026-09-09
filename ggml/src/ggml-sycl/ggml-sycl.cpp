@@ -17211,17 +17211,18 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
 // reaccount/materialize pass, a plan republish, and (via the caller's own
 // retry loop) a BUSY backoff -- none of which a mere flash_attn_type
 // resolution has any business touching, since n_ctx/n_ubatch have not
-// changed. NOT read-only: like the full transaction, it takes
-// sycl_module_mutation_guard (so it cannot run past a module shutdown) and
-// g_tensor_inventory_mutex, then re-validates the plan snapshot under that
-// lock, because ggml_sycl_check_nonfa_attn_scratch() reads
-// unified_cache::zone_capacity() and (when allow_replan=true, not the case
-// for this caller) the arena's own planned-zone bookkeeping, both of which
-// require that lock under their own contract
-// (unified_cache_ensure_planned_arena_zones()'s comment: "Caller must hold
-// g_tensor_inventory_mutex"). resolve_fused_ops() holds no SYCL lock of its
-// own, so there is no deadlock. Called with allow_replan=false: no record,
-// re-plan attempt, or restore-on-refusal (see that function). Used by
+// changed. NOT read-only: it takes sycl_module_mutation_guard (so it
+// cannot run past a module shutdown) and g_tensor_inventory_mutex -- the
+// same mutex the full transaction above serializes its own mutating work
+// under -- then confirms the plan snapshot read before the lock is still
+// the live one. This is a read-then-confirm-under-lock construction of
+// its own, guarding against acting on a plan a concurrent model
+// load/unload or runtime-context call has already superseded; it is NOT a
+// claim that some specific accessor this then reads (zone_capacity(), an
+// unsynchronized array read with no lock contract of its own) requires
+// the lock. resolve_fused_ops() holds no SYCL lock of its own, so there is
+// no deadlock. Called with allow_replan=false: no record, re-plan
+// attempt, or restore-on-refusal (see that function). Used by
 // llama_context::sycl_recheck_runtime_context_flash_attn() for the
 // AUTO-resolution re-check; the constructor's own initial call still goes
 // through the full transaction above, since establishing n_ctx/n_ubatch for

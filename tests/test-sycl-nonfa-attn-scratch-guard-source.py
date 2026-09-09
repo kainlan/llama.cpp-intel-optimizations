@@ -230,12 +230,9 @@ def test_narrow_recheck_forbids_replan_and_takes_the_lock():
     """The narrow re-check must call the shared guard with allow_replan=false
     (never recording, re-planning, or restoring the plan-time SCRATCH-zone
     shape it does not own), and must take the same module-admission guard
-    and tensor-inventory lock the full transaction takes, re-validating the
-    plan snapshot under that lock -- unified_cache_ensure_planned_arena_zones()'s
-    own contract requires g_tensor_inventory_mutex, and
-    ggml_sycl_check_nonfa_attn_scratch() reads unified_cache state that same
-    lock protects even when allow_replan=false (spec round 4 F35 = quality
-    round 2 Q-F35)."""
+    and tensor-inventory lock the full transaction serializes its own
+    mutating work under, confirming under that lock that the plan snapshot
+    read before the lock is still the live one."""
     full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
     assert full_start != -1
     full_next = GGML_SYCL_CPP_CODE.find("ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1)
@@ -269,15 +266,16 @@ def test_narrow_recheck_forbids_replan_and_takes_the_lock():
         "transaction's callers rely on, so it cannot run past a module shutdown"
     )
     assert "std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);" in recheck_body_norm, (
-        "the narrow re-check must take g_tensor_inventory_mutex before reading unified_cache state -- "
-        "unified_cache_ensure_planned_arena_zones()'s own contract requires this lock, and "
-        "ggml_sycl_check_nonfa_attn_scratch() reads the same cache state this lock protects even when "
-        "allow_replan=false"
+        "the narrow re-check must take g_tensor_inventory_mutex, the same mutex the full transaction "
+        "serializes its own mutating work under, before confirming the plan snapshot is still live -- "
+        "not because some specific accessor this then reads requires the lock (zone_capacity() is an "
+        "unsynchronized array read with no lock contract of its own)"
     )
     assert "ggml_sycl_global_plan_snapshot().get() != current.get()" in recheck_body_norm, (
-        "the narrow re-check must re-validate the plan snapshot under the lock, exactly as the full "
-        "transaction does, since the snapshot may have changed between the lock-free read and acquiring "
-        "the lock"
+        "the narrow re-check must confirm, under the lock, that the plan snapshot read before the lock "
+        "is still the live one -- a read-then-confirm-under-lock construction of its own, guarding "
+        "against acting on a plan a concurrent model load/unload or runtime-context call has already "
+        "superseded"
     )
 
 
@@ -307,28 +305,35 @@ def test_formula_and_inverse_are_declared_and_defined():
     assert "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(" in hpp_norm
     assert "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(" in cpp_norm
 
-    # Neither may be declared `static` in the .cpp -- that would make them
+    # Neither may be declared `static` -- in the .cpp that would make them
     # unreachable from ggml-sycl.cpp, silently turning the guard above into
     # a compile error this text-only test cannot otherwise catch (a build is
-    # a stronger check, but this test runs without one). A regex, not a
-    # fixed literal substring, so a storage-class keyword stacked between
-    # `static` and the return type (e.g. "static inline") is still caught.
-    # Each match is reduced to a bool BEFORE the assert -- asserting
-    # directly on a `re.search()` result (or on the huge normalized-source
-    # string itself) would make a failing pytest try to render that whole
+    # a stronger check, but this test runs without one); in the .hpp a
+    # `static` on the DECLARATION would give each translation unit that
+    # includes the header its own internal-linkage copy, which is just as
+    # wrong even though it happens to still compile. Checked in both files
+    # for both functions (four checks), with a "static ... name(" bridge
+    # that does not name a return type at all -- `\bstatic\b[^;{}]*?\bname\(`
+    # -- so it is not fooled by a return-type spelling change ("static
+    # std::size_t", say) or a storage-class keyword or attribute stacked
+    # between `static` and the type ("static inline", "static
+    # __attribute__((used)) size_t"); bounded to `[^;{}]` so it cannot
+    # cross a statement or scope boundary and match some unrelated earlier
+    # `static` against this name's own later, unrelated appearance. Each
+    # match is reduced to a bool BEFORE the assert -- asserting directly on
+    # a `re.search()` result (or on the huge normalized-source string
+    # itself) would make a failing pytest try to render that whole
     # multi-hundred-KB string as part of the diff.
-    demand_is_static = bool(
-        re.search(r"\bstatic\b[\w\s]*\bsize_t unified_cache_nonfa_attn_scratch_demand_bytes\(", cpp_norm)
-    )
-    assert not demand_is_static, "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
-    inverse_is_static = bool(
-        re.search(
-            r"\bstatic\b[\w\s]*\buint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch\(", cpp_norm
-        )
-    )
-    assert not inverse_is_static, (
-        "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch() must not be file-static"
-    )
+    def _has_static_before(text: str, name: str) -> bool:
+        return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
+
+    demand_name  = "unified_cache_nonfa_attn_scratch_demand_bytes"
+    inverse_name = "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch"
+
+    assert not _has_static_before(cpp_norm, demand_name), f"{demand_name}() must not be file-static (.cpp)"
+    assert not _has_static_before(hpp_norm, demand_name), f"{demand_name}() must not be declared static (.hpp)"
+    assert not _has_static_before(cpp_norm, inverse_name), f"{inverse_name}() must not be file-static (.cpp)"
+    assert not _has_static_before(hpp_norm, inverse_name), f"{inverse_name}() must not be declared static (.hpp)"
 
 
 def test_auto_flash_attn_resolution_rechecks_the_guard():

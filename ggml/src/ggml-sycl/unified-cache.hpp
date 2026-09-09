@@ -1383,13 +1383,13 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro log's
 // own SCRATCH_ZONE occupancy at the moment of failure -- not carried over by
 // analogy from the oneDNN floor's c=1.5 (an earlier version of this formula
-// did exactly that, and it under-covered the repro). See the derivation
-// comment on unified_cache_nonfa_attn_scratch_demand_bytes()'s definition
-// (unified-cache.cpp) for the exact log lines and arithmetic. It is inferred
-// from ONE repro's zone-state snapshot, not fit to several independent
-// hardware measurements the way the oneDNN c=1.5 was (five captures,
-// llama.cpp-0oxf comment c-xcop) -- treat it as a floor to tighten from a
-// real multi-point capture, not a validated constant.
+// did exactly that, and it under-covered the repro). It is inferred from
+// ONE repro's zone-state snapshot, not fit to several independent hardware
+// measurements the way the oneDNN c=1.5 was (five captures, llama.cpp-0oxf
+// comment c-xcop). See the derivation comment on
+// unified_cache_nonfa_attn_scratch_demand_bytes()'s definition
+// (unified-cache.cpp) for the exact log lines and arithmetic, and for what
+// moving this constant in either direction actually costs.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 
 // Inverse of the formula above: the largest n_ctx whose modeled demand still

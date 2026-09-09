@@ -336,13 +336,14 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
 // ggml_sycl_check_nonfa_attn_scratch() to the [SYCL-PLAN] log) from every
 // other result, which are argument-validation/identity failures this call
 // should not normally see at all. Guarded by the SAME broad condition as
-// the block just above (GGML_USE_SYCL || GGML_BACKEND_DL), not the
-// narrower GGML_BACKEND_DL-without-GGML_USE_SYCL condition the proc-lookup
-// helpers below need -- this only needs the enum ggml-sycl.h declares
-// under that broader condition (see the #include near the top of this
-// file), and its caller (sycl_recheck_runtime_context_flash_attn(), far
-// below) is reachable in a direct GGML_USE_SYCL build too, where the
-// narrower block never compiles at all. (Previously defined inside that
+// the block at lines 87-233 above (GGML_USE_SYCL || GGML_BACKEND_DL) --
+// NOT the narrower GGML_BACKEND_DL-without-GGML_USE_SYCL condition the
+// proc-lookup helpers immediately above this comment (lines 235-331) need.
+// This function only needs the enum ggml-sycl.h declares under that
+// broader condition (see the #include near the top of this file), and its
+// caller (sycl_recheck_runtime_context_flash_attn(), far below) is
+// reachable in a direct GGML_USE_SYCL build too, where the narrower
+// 235-331 block never compiles at all. (Previously defined inside that
 // narrower block by mistake, which left it undeclared in a direct
 // GGML_USE_SYCL build -- build-oyfl-6 caught this.)
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
@@ -355,7 +356,8 @@ static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_resul
         case GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND:
             return "FOREIGN_BACKEND (not a SYCL device)";
         case GGML_SYCL_LIFECYCLE_STALE_IDENTITY:
-            return "STALE_IDENTITY (model token no longer matches the published plan)";
+            return "STALE_IDENTITY (no plan is currently published, the model token no longer matches "
+                   "the published plan, or the plan snapshot changed under the lock)";
         case GGML_SYCL_LIFECYCLE_BUSY:
             return "BUSY (module admission refused -- shutdown in progress)";
         case GGML_SYCL_LIFECYCLE_PLAN_REJECTED:

@@ -1660,7 +1660,7 @@ static long onednn_graph_zone_mb_override() {
 // unified_cache_nonfa_attn_scratch_demand_bytes() below for the reasoning
 // on its size) -- hoisted to file scope, rather than kept as a
 // function-local constant, so ensure_planned_arena_zones()'s plan-time
-// raise block can gate its own all-zero-shape skip on it (Q-F44) without
+// raise block can gate its own all-zero-shape skip on it without
 // duplicating the literal.
 static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ull;
 
@@ -3960,23 +3960,38 @@ bool unified_cache::ensure_planned_arena_zones() {
                 planned_nonfa_attn_scratch = nonfa_budget_cap;
             }
             if (planned_nonfa_attn_scratch > scratch_zone) {
+                // "(planned)": this is ensure_planned_arena_zones()'s own
+                // plan-time raise, distinguished from the guard's later
+                // "(observed)" re-plan-attempt raise
+                // (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp) so
+                // a log reader can tell which of the two code paths
+                // actually grew the zone.
                 if (nonfa_override_active) {
                     GGML_LOG_INFO(
                         "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from "
                         "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=%ld override\n",
                         planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_attn_scratch_mb_override());
-                } else {
-                    // "(planned)": this is ensure_planned_arena_zones()'s own
-                    // plan-time raise, distinguished from the guard's later
-                    // "(observed)" re-plan-attempt raise
-                    // (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp)
-                    // so a log reader can tell which of the two code paths
-                    // actually grew the zone.
+                } else if (nonfa_shape_known) {
                     GGML_LOG_INFO(
                         "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from non-FA attention scratch "
                         "estimate (n_head=%u n_ubatch=%u n_ctx=%u)\n",
                         planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_shape.n_head, nonfa_shape.n_ubatch,
                         nonfa_shape.n_ctx);
+                } else {
+                    // Neither an override nor a known shape -- this raise
+                    // came from the sub-floor scratch_zone branch above:
+                    // the arena's own SCRATCH zone default (or a shrunk
+                    // GGML_SYCL_COMPUTE_ARENA_MB) was below the formula's
+                    // own floor even with no shape known yet. Do NOT
+                    // attribute this to a "(n_head=0 n_ubatch=0 n_ctx=0)"
+                    // estimate -- that would misleadingly imply a real
+                    // shape was measured and came out all zeros, when in
+                    // fact no shape is known at all.
+                    GGML_LOG_INFO(
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) to meet the non-FA attention "
+                        "scratch formula's own 16 MiB floor (no shape known yet; the arena's SCRATCH zone was "
+                        "below the floor)\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0));
                 }
                 scratch_zone = planned_nonfa_attn_scratch;
             }
