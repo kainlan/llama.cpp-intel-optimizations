@@ -11295,7 +11295,7 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                                 // indistinguishable from an unfired one.
                                 ++onednn_graph_scratch_flag_generation_counter_;
                             }
-                            const uint32_t gen                    = onednn_graph_scratch_flag_generation_counter_;
+                            const uint32_t gen = onednn_graph_scratch_flag_generation_counter_;
                             // Reset to "pending" before arming: the slab is
                             // zero-initialised at allocation time, but a
                             // PREVIOUS occupant of this exact slot may have
