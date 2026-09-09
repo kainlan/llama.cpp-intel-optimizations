@@ -1621,6 +1621,14 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // 1.5 x n_head x n_ubatch x K x sizeof(f32) for K against measured
 // Graph-scratch requests gives K = n_swa + n_ubatch exactly at two
 // different ubatch sizes -- see the gemma4 real-shape derivation below).
+// n_swa + n_ubatch is scoped to a SINGLE sequence (n_seq_max=1), matching
+// placement_kv_info::kv_bytes_per_swa_layer()'s identical
+// min(n_ctx, n_swa + n_ubatch) precedent (unified-cache.hpp) -- a unified
+// iSWA cache serving n_seq_max > 1 concurrent sequences could in
+// principle reach n_swa * n_seq_max + n_ubatch keys instead; threading
+// plan.planner_n_seq_max into this formula is deferred until the floor
+// is actually live at a real n_ctx (llama.cpp-fkpg), since n_seq_max > 1
+// support does not change today's n_seq_max=1-only behavior either way.
 // Non-SWA and SWA layers can both be oneDNN-eligible in the same model, so
 // the true peak is whichever CLASS demands more, not their sum -- the
 // compiled partitions for each class are not concurrently outstanding for

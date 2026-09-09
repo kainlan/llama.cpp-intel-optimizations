@@ -40,7 +40,8 @@
 // this ticket's own comments cite (24 MB, exactly what
 // 1.5 x 8 x 512 x (512+512) x 4 B predicts). An earlier revision of this
 // SAME fix used n_swa alone (min(n_ctx, n_swa), no +n_ubatch), which
-// under-provisioned SWA layers by up to n_ubatch/n_swa (2x at gemma4's
+// under-provisioned SWA layers by a factor of up to
+// (n_swa + n_ubatch)/n_swa = 1 + n_ubatch/n_swa (2x at gemma4's
 // 512/512) -- see test_swa_formula()'s "gemma4 E4B (real)" row below. The
 // swa suite (test_swa_formula()) exercises the two-class
 // max(ctx_term, swa_term) formula this ticket introduced using both the

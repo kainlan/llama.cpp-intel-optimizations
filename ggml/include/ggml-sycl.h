@@ -255,14 +255,18 @@ struct ggml_sycl_tensor_inventory {
     // llama.cpp-o3a0: max query-head count across all layers ELIGIBLE for the
     // oneDNN SDPA route, split by attention window class -- non-SWA layers
     // (effective KV window == n_ctx) vs SWA layers (effective KV window ==
-    // n_swa above). Feeds the window-aware oneDNN Graph-scratch zone floor
-    // (unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes_swa()),
-    // replacing the single n_head_max (llama.cpp-0oxf) that assumed every
-    // oneDNN-served layer's window was n_ctx -- wrong for SWA models (gemma4
-    // E4B's real GGUF attention.sliding_window is 512: 12 MiB raw vs. the
-    // 192 MB the flat formula predicted at n_ctx=8192; the 1024 figure this
-    // ticket originally used to explain an earlier 24 MB measurement was
-    // wrong, GPU-verified on the B50). "Eligible" mirrors
+    // min(n_ctx, n_swa + n_ubatch), the span a ubatch of n_ubatch queries
+    // scans over the n_swa-key sliding window above, GPU-verified). Feeds
+    // the window-aware oneDNN Graph-scratch zone floor (unified-cache.cpp's
+    // onednn_graph_scratch_zone_floor_bytes_swa()), replacing the single
+    // n_head_max (llama.cpp-0oxf) that assumed every oneDNN-served layer's
+    // window was n_ctx -- wrong for SWA models: gemma4 E4B (real GGUF
+    // attention.sliding_window=512, n_ubatch=512, n_ctx=8192) computes
+    // 24 MiB raw, clamped to 64 MiB, vs. the 192 MB the flat formula
+    // predicted. The ticket's original "window=1024" figure was
+    // numerically right at n_ubatch=512 (512 + 512 == 1024) and wrong
+    // only about WHY -- the true window is n_swa + n_ubatch, not the raw
+    // sliding_window value alone. "Eligible" mirrors
     // ggml_sycl_flash_attn_ext_onednn_plan()'s D-based gate
     // (fattn-onednn.cpp) as closely as a llama-layer file can: see
     // llama_model_sycl_onednn_head_dim_eligible() in llama-model.cpp, which

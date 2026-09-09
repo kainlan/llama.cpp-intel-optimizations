@@ -429,10 +429,11 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     // llama.cpp-o3a0: window-aware refinement of the query-head count that
     // feeds the oneDNN Graph-scratch zone floor (see the field comment in
     // ggml-sycl.h). Split the max by attention window class -- non-SWA
-    // (effective KV window == n_ctx) vs SWA (effective KV window == n_swa,
-    // already captured above) -- and restrict to layers eligible for the
-    // oneDNN SDPA route: a layer that can never reach oneDNN must not
-    // inflate a floor sized for oneDNN's own scratch demand. Max rather than
+    // (effective KV window == n_ctx) vs SWA (effective KV window ==
+    // min(n_ctx, n_swa + n_ubatch); n_swa is already captured above) --
+    // and restrict to layers eligible for the oneDNN SDPA route: a layer
+    // that can never reach oneDNN must not inflate a floor sized for
+    // oneDNN's own scratch demand. Max rather than
     // layer 0 alone because a handful of architectures vary head count (and
     // head dim) by layer.
     uint32_t n_head_ctx_max = 0;
