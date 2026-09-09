@@ -1358,14 +1358,20 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
           "ptr1's release kernel ACTUAL measured duration is at least 80% of its calibrated target -- otherwise "
           "this test's timing bounds are being checked against a kernel that undershot calibration");
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
+
     // llama.cpp-c6ah (finding 28): time the poll itself (not just assert its
     // eventual outcome below) and print when it turned into a hit -- direct
     // evidence for how long the watcher's async dispatch actually took after
     // ptr1's kernel completed, alongside test_bounded_eviction's own flag
     // poll instrumentation.
-    const auto   poll_reuse_start  = std::chrono::steady_clock::now();
-    const bool   became_hit_reuse  = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
-    const auto   poll_reuse_ms =
+    const auto      poll_reuse_start = std::chrono::steady_clock::now();
+    const bool      became_hit_reuse = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
+    // static_cast<long long>, not a bare .count(): std::chrono::milliseconds::rep
+    // is `long` on this platform, not `long long`, so printing it directly
+    // against %lld is a -Wformat mismatch -- same cast this file already
+    // applies at every other %lld duration print (e.g. this function's own
+    // elapsed2/actual_ms prints above).
+    const long long poll_reuse_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - poll_reuse_start)
             .count();
     printf("    (poll_for_pool_hit turned into a hit at %lld ms: %s)\n", poll_reuse_ms,
