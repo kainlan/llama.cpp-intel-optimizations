@@ -670,3 +670,92 @@ def test_docs_reflect_the_headroom_predicate():
         )
         assert "928 MiB" in text, f"{name} must document the decided reserve, R = 928 MiB"
         assert "headroom-limited" in text, f"{name} must use the new remediation label \"headroom-limited\""
+
+
+# Shared between the positive check and its mutation witness below, so the
+# two cannot drift apart -- a fragment edited in one place is edited in
+# both, rather than the witness carrying its own, independently-typed copy
+# that could go stale (or start passing vacuously) if the positive check's
+# wording ever changes.
+_WARN_GUARD_OFF_FRAGMENT = "turns the runtime-context non-FA attention scratch guard off"
+_WARN_NAMES_VAR_FRAGMENT = "GGML_SYCL_NONFA_ATTN_SCRATCH_MB"
+
+
+def _env_mb_override_body_norm(code: str = CACHE_CPP_CODE) -> str:
+    """Bound env_mb_override()'s own body (comment-stripped, whitespace-
+    normalized) -- from its definition to the next file-scope function
+    after it (nonfa_attn_scratch_mb_override(), the first of its two
+    memoizing wrappers), so a match cannot come from some unrelated later
+    WARN in the file. `code` defaults to the real, already comment-stripped
+    unified-cache.cpp; the mutation witness below passes a mutated,
+    already comment-stripped copy through this same accessor instead of
+    re-deriving its own find/slice/bound logic, so the two cannot drift
+    apart."""
+    func_start = code.find("static long env_mb_override(const char * name) {")
+    assert func_start != -1, "env_mb_override() definition not found in unified-cache.cpp"
+    next_func = code.find("static long nonfa_attn_scratch_mb_override(", func_start + 1)
+    assert next_func != -1, "could not bound env_mb_override()'s body"
+    return _normalize_ws(code[func_start:next_func])
+
+
+def test_explicit_zero_warn_names_the_nonfa_guard():
+    """llama.cpp-wkrx: env_mb_override()'s explicit-0 WARN string is shared
+    between GGML_SYCL_NONFA_ATTN_SCRATCH_MB and
+    GGML_SYCL_ONEDNN_GRAPH_ZONE_MB (both route through this one formula),
+    but its old parenthetical -- "this disables the consumer's own floor" --
+    understated the effect for the non-FA guard: an explicit 0 there does
+    not just drop its 16 MiB floor, it turns the whole runtime-context
+    non-FA attention scratch refusal off. The WARN text must name that guard
+    and say so, while staying accurate for the oneDNN Graph-scratch sibling
+    too (it still only loses ITS floor)."""
+    body_norm = _env_mb_override_body_norm()
+    assert _WARN_GUARD_OFF_FRAGMENT in body_norm, (
+        "env_mb_override()'s explicit-0 WARN must say that GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 turns "
+        "the runtime-context non-FA attention scratch guard off entirely, not just its 16 MiB floor -- "
+        "the shared WARN text previously said only \"this disables the consumer's own floor\", which "
+        "understated the effect for this specific consumer (llama.cpp-wkrx)"
+    )
+    assert _WARN_NAMES_VAR_FRAGMENT in body_norm, (
+        "the WARN's explicit-0 clarification must name GGML_SYCL_NONFA_ATTN_SCRATCH_MB specifically, "
+        "not just describe \"the consumer\" in the abstract"
+    )
+
+
+def test_explicit_zero_warn_has_a_mutation_witness() -> None:
+    """Mutation witness for the check above: proves it would actually catch
+    a reversion to the old, understating WARN text -- "this disables the
+    consumer's own floor", with no mention of the guard it turns off --
+    rather than only ever passing on the current, correct source.
+
+    Mutates the RAW source (the exact three C string literal lines) and
+    re-derives body_norm through the same _env_mb_override_body_norm()
+    accessor the positive check above uses, rather than hand-building the
+    already-normalized text or re-deriving its own find/slice/bound copy --
+    both would be fragile to (respectively) exactly how
+    strip_comments()/_normalize_ws() join adjacent string literals across a
+    line boundary, and to the two implementations drifting apart."""
+    current_block = (
+        '            "[UNIFIED-CACHE] %s=0 -- using an explicit 0 MB override (not \\"unset\\"; the '
+        'consumer treats 0 "\n'
+        '            "as an explicit disable -- for GGML_SYCL_NONFA_ATTN_SCRATCH_MB that "\n'
+        '            "turns the runtime-context non-FA attention scratch guard off entirely, not just '
+        'its 16 MiB floor)\\n",\n'
+    )
+    assert current_block in CACHE_CPP, "mutation target string not found -- update this witness"
+    old_block = (
+        '            "[UNIFIED-CACHE] %s=0 -- using an explicit 0 MB override (not \\"unset\\"; this '
+        'disables the "\n'
+        '            "consumer\'s own floor)\\n",\n'
+    )
+    mutated_raw = CACHE_CPP.replace(current_block, old_block, 1)
+    assert mutated_raw != CACHE_CPP
+
+    mutated_body_norm = _env_mb_override_body_norm(strip_comments(mutated_raw))
+
+    assert _WARN_GUARD_OFF_FRAGMENT not in mutated_body_norm, (
+        "mutation witness is broken: the reverted (pre-fix) text still trips the positive check above"
+    )
+    assert _WARN_NAMES_VAR_FRAGMENT not in mutated_body_norm, (
+        "mutation witness is broken: the reverted (pre-fix) text still trips the check's second "
+        "assertion (that the WARN names GGML_SYCL_NONFA_ATTN_SCRATCH_MB specifically)"
+    )
