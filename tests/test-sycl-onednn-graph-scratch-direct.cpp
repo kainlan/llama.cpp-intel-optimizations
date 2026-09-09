@@ -237,7 +237,10 @@ sycl::event submit_slow_release(sycl::queue & q) {
 // command is done, not that the watcher has already run and stored the
 // flag. Polls for `target` (a specific, already-parked pointer of size
 // `size`) to become the pool's own hit for a same-size request, retrying
-// up to a bound rather than asserting on the very first call.
+// up to a bound rather than asserting on the very first call. Returns
+// whether `target` itself was ever returned -- a caller must check the
+// return value, not just that SOME allocation eventually succeeded (see
+// the very first paragraph below for why).
 //
 // A retry that lands before the watcher fires is itself a genuine MISS --
 // a fresh, already-complete decoy allocation -- immediately freed
@@ -250,14 +253,37 @@ sycl::event submit_slow_release(sycl::queue & q) {
 // it is truly USABLE), so a decoy -- always appended AFTER it -- can never
 // be handed back INSTEAD of `target` once `target` itself becomes ready;
 // a decoy can only delay how many retries this loop needs, never mask a
-// genuine failure to arm `target`'s own flag.
+// genuine failure to arm `target`'s own flag. IMPORTANT: a decoy CAN
+// itself be returned as a hit on some EARLIER iteration than `target`'s
+// own (once re-parked, it is immediately reusable) -- callers must not
+// infer "target became a hit" from onednn_graph_scratch_pool_hit_count()
+// increasing by exactly one across a call to this function; the pointer
+// identity this function itself checks is the only reliable signal.
 //
 // 2000 ms / 5 ms: generous relative to the dispatch gap this bridges (a
 // host_task dispatched after an already-satisfied dependency is normally
 // sub-millisecond even under load), tight enough to fail fast (returning
 // false) on a genuine regression rather than hanging the test.
+//
+// RESIDUAL RACE (documented, not fully closed): at a call site where
+// `target`'s own size plus current outstanding DIRECT bytes exceeds the
+// 350 MB cap main() sets, a MISS retry's fresh allocation attempt engages
+// the cap's eviction sweep (onednn_graph_scratch_evict_pool_until_fits_locked()),
+// which walks every bucket including `target`'s own. If the watcher arms
+// `target`'s flag in the narrow window between this function's own
+// try-pool check (EVENT_PENDING) and the sweep's later check on that same
+// entry, the sweep can legitimately EVICT `target` for real (it is now
+// complete, and headroom is needed) before this function ever sees it as
+// a hit -- `target` is then genuinely gone, not merely still pending, and
+// this function will correctly time out. This is a real, rare interaction
+// between two correct mechanisms (the completion flag and the cap sweep),
+// not a bug in either; call sites where outstanding+size exceeds the cap
+// document this residual explicitly. On timeout, distinguish the two
+// failure shapes via the eviction counter so a flake is diagnosable rather
+// than a bare false return.
 bool poll_for_pool_hit(unified_cache * cache, sycl::queue & q, size_t size, void * target) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    const size_t evictions_at_start = cache->onednn_graph_scratch_pool_eviction_count();
+    const auto   deadline           = std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
     for (;;) {
         void * ptr = cache->onednn_graph_scratch_alloc(size, 256, &q);
         if (ptr == target) {
@@ -267,6 +293,18 @@ bool poll_for_pool_hit(unified_cache * cache, sycl::queue & q, size_t size, void
             cache->onednn_graph_scratch_free(ptr, nullptr);
         }
         if (std::chrono::steady_clock::now() >= deadline) {
+            if (cache->onednn_graph_scratch_pool_eviction_count() > evictions_at_start) {
+                printf(
+                    "    (poll_for_pool_hit: target=%p size=%zu timed out, AND the eviction count rose "
+                    "during the poll -- target may have been evicted by the cap-headroom sweep instead of "
+                    "becoming a hit; see this call site's own residual-race comment)\n",
+                    target, size);
+            } else {
+                printf(
+                    "    (poll_for_pool_hit: target=%p size=%zu timed out with no eviction observed -- the "
+                    "completion flag genuinely never armed within the timeout)\n",
+                    target, size);
+            }
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -309,14 +347,29 @@ void test_pool_reuse(unified_cache * cache) {
     // own hit/miss invariant, documented at
     // onednn_graph_scratch_pool_hit_count_'s declaration, already
     // guarantees independent of this test).
+    //
+    // RESIDUAL RACE, documented rather than closed (see
+    // poll_for_pool_hit()'s own "RESIDUAL RACE" paragraph for the
+    // mechanism): kSizeA is 300 MiB, so a MISS retry's fresh allocation
+    // (300 MiB new + 300 MiB already parked = 600 MiB) exceeds the 350 MB
+    // cap main() sets and engages the cap's eviction sweep, which could in
+    // principle evict ptr1 for real in the same narrow window this file's
+    // other affected sites describe. Unlike kSizeParked in
+    // test_oversized_request_skips_wait_loop(), kSizeA is shared with
+    // test_bounded_eviction()'s own cap-triggering logic below and is not
+    // free to shrink to make this site cap-safe.
     const size_t hits_before = cache->onednn_graph_scratch_pool_hit_count();
     const bool   became_hit  = poll_for_pool_hit(cache, q, kSizeA, ptr1);
     void *       ptr2        = became_hit ? ptr1 : nullptr;
 
-    check(ptr2 != nullptr, "the reused allocation succeeds");
+    // became_hit alone (not also a separate ptr2 != nullptr check --
+    // ptr2 is became_hit ? ptr1 : nullptr, and ptr1 is already known
+    // non-null, so the two predicates are identical) proves both "the
+    // reused allocation succeeds" and "the SAME pointer is handed back".
     check(became_hit,
-          "the SAME pointer is handed back -- this is reuse, not a fresh allocation that happens to land at "
-          "the same address (polled up to 2 s to tolerate the completion flag's async watcher dispatch)");
+          "the reused allocation succeeds and hands back the SAME pointer -- this is reuse, not a fresh "
+          "allocation that happens to land at the same address (polled up to 2 s to tolerate the completion "
+          "flag's async watcher dispatch)");
     check(cache->onednn_graph_scratch_pool_hit_count() > hits_before,
           "onednn_graph_scratch_pool_hit_count() increased -- the allocator served this from the reuse pool");
 
@@ -533,26 +586,34 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // from "the sweep never ran at all" -- both pass identically on an
     // empty pool.
     //
-    // 280 MiB: comfortably above the ONEDNN zone -- which main() now
+    // 120 MiB: comfortably above the ONEDNN zone -- which main() now
     // shrinks to a few MB via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB (see
     // test_in_flight_entry_is_skipped_not_waited()'s own header comment for
     // why), so every size in this file trivially takes the DIRECT path
-    // regardless of the zone's exact value now. This value itself predates
-    // that override: it used to matter that 280 MiB clears this process's
-    // ~256 MB NATURAL (no-model, no-override) zone floor -- 200 MiB
-    // measured FAIL on hardware there, zone-served rather than pooled,
-    // which is why this test still checks a miss below rather than trusting
-    // the size by inspection. Kept at 280 MiB now for a DIFFERENT reason:
-    // distinct from kSizeA/kSizeB/kSizeC/kSizeD (300/320/340/310 MiB)
-    // elsewhere in this file, and comfortably under the 350 MB cap main()
-    // sets so it can be parked and later evicted without itself engaging
-    // the cap machinery this test isn't exercising, while leaving enough
-    // headroom below the cap for kSizeOversized (366 MiB) below to be the
-    // request that actually needs eviction -- changing it would also mean
-    // re-deriving that cap arithmetic. The miss-count assertion right after
-    // the allocation below is this setup's own self-check against silently
-    // regressing back to a zone-served size, whichever floor is in effect.
-    constexpr size_t kSizeParked             = 280ull * 1024 * 1024;
+    // regardless of the zone's exact value now. Distinct from
+    // kSizeA/kSizeB/kSizeC/kSizeD (300/320/340/310 MiB) elsewhere in this
+    // file, and comfortably under the 350 MB cap main() sets so it can be
+    // parked and later evicted without itself engaging the cap machinery
+    // this test isn't exercising. Deliberately small enough that DOUBLING
+    // it (this entry parked plus a same-size probe requested while polling
+    // for it to become ready, below) still fits under the cap on its own
+    // -- unlike this constant's own earlier value (280 MiB, before this
+    // test polled for `parked` to become ready), which would make a probe
+    // retry engage the cap's eviction sweep and risk evicting THIS entry
+    // for real before the poll ever sees it as a hit (see
+    // poll_for_pool_hit()'s own "RESIDUAL RACE" comment). Unlike kSizeA
+    // (300 MiB, shared with test_bounded_eviction's own cap-triggering
+    // logic and not free to shrink), this constant is scoped to this
+    // function alone, so it was cheap to close that race outright here
+    // rather than merely document it, the way the other two affected call
+    // sites in this file must (see their own comments). The miss-count assertion
+    // right after the allocation below is this setup's own self-check
+    // against silently regressing back to a zone-served size, whichever
+    // floor is in effect; this value historically also had to clear this
+    // process's own ~256 MB NATURAL (no-model, no-override) zone floor
+    // before the override above existed -- 200 MiB measured FAIL on
+    // hardware there, zone-served rather than pooled.
+    constexpr size_t kSizeParked             = 120ull * 1024 * 1024;
     const size_t     misses_before_park      = cache->onednn_graph_scratch_pool_miss_count();
     const size_t     outstanding_before_park = cache->onednn_graph_scratch_direct_outstanding_bytes();
     void *           parked                  = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
@@ -582,7 +643,7 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // (ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(2),
     // asserted via ptr == nullptr) and returns before ever reaching this
     // counter's write site, so it contributes nothing. kSizeA/kSizeB/kSizeD
-    // (300/320/310 MiB) already push the high-water past kSizeParked (280
+    // (300/320/310 MiB) already push the high-water past kSizeParked (120
     // MiB) on their own -- so the check below cannot isolate the parked
     // allocation's own contribution to that floor; it only proves the
     // accessor is not inert (it would read 0 if the write site above never
@@ -835,7 +896,14 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
           "once ptr1's release event completes (and its watcher host_task has run), a "
           "same-size request eventually becomes a genuine pool hit (polled up to 2 s to tolerate the async "
           "dispatch)");
-    check(cache->onednn_graph_scratch_pool_hit_count() == hits_before_reuse + 1,
+    // `>`, not `== + 1`: poll_for_pool_hit() itself documents why -- a
+    // retry that lands before ptr1's own watcher fires can be served by a
+    // DECOY hit first (a fresh miss from an earlier retry, re-parked and
+    // then reused), which also increments this counter. ptr3 == ptr1
+    // (checked via became_hit_reuse above) is the real proof this was
+    // ptr1 specifically; this check only needs "at least one real hit
+    // happened", not an exact count.
+    check(cache->onednn_graph_scratch_pool_hit_count() > hits_before_reuse,
           "onednn_graph_scratch_pool_hit_count() increased -- this time it really was a pool hit");
 
     if (ptr2) {
@@ -1002,6 +1070,19 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // llama.cpp-c6ah: the in-flight entry must have SURVIVED,
     // not merely gone unevicted by coincidence -- confirm it is still
     // pooled and becomes a genuine hit once its own release completes.
+    //
+    // RESIDUAL RACE, documented rather than closed (see
+    // poll_for_pool_hit()'s own "RESIDUAL RACE" paragraph): outstanding
+    // bytes here are kSizeEvictInFlight (200 MiB, still parked) plus
+    // evict_ptr's own re-parked 90 MiB = 290 MiB, so a MISS retry's fresh
+    // 200 MiB allocation (290 + 200 = 490 MiB) exceeds the 350 MB cap and
+    // engages the eviction sweep. Shrinking kSizeEvictInFlight would not
+    // close this the way kSizeParked's own shrink did elsewhere in this
+    // file: evict_ptr's 90 MiB is itself already charged and outstanding
+    // with no cheap way to release it for real before this check (a
+    // nullptr free only re-parks it; only a genuine reclaim or driving its
+    // bucket to the per-size depth limit would truly release it, and both
+    // are more invasive than this residual is worth closing here).
     evict_slow_release.wait();
     const bool in_flight_survived = poll_for_pool_hit(cache, q, kSizeEvictInFlight, evict_in_flight);
     check(in_flight_survived,

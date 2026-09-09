@@ -2188,9 +2188,14 @@ class unified_cache {
     sycl::queue & get_bcs_queue();
 
     // --- Event-watch queue: host_task-only completion watcher (llama.cpp-c6ah) ---
-    // Lazily created on first use and torn down with the cache, same pattern
-    // as get_dma_queue()/get_bcs_queue(). Deliberately OUT-OF-ORDER (NOT
-    // in_order, unlike dma_queue_/bcs_queue_): every submission on this queue
+    // Lazily created ON FIRST USE, torn down with the cache the same way
+    // dma_queue_/bcs_queue_ are (default member destruction in
+    // ~unified_cache()) -- but unlike those two, which are constructed
+    // EAGERLY in the constructor (unified-cache.cpp, ~ctor body), this
+    // queue is not needed at all until the first DIRECT pool entry is
+    // parked, and most processes never touch that path. Deliberately
+    // OUT-OF-ORDER (NOT in_order, unlike dma_queue_/bcs_queue_): every
+    // submission on this queue
     // is a host_task depending on exactly one release event and nothing
     // else, so an in_order queue would needlessly serialise a fast release's
     // watcher behind a slower one still queued ahead of it -- there is no
@@ -2203,9 +2208,9 @@ class unified_cache {
     // it is actually used" keeps this queue's purpose legible. Never used
     // for real device work and never waited on for correctness -- the
     // std::atomic<bool> flag a host_task on this queue sets is what callers
-    // actually read (unified_cache::pool_entry_release_complete()); the
-    // queue only needs to exist long enough to run that one host_task per
-    // pooled entry.
+    // actually read (unified_cache::onednn_graph_scratch_pool_entry_release_complete());
+    // the queue only needs to exist long enough to run that one host_task
+    // per pooled entry.
     //
     // Returns nullptr if construction failed (logged once, at that point).
     // llama.cpp-c6ah: there is deliberately NO fallback to
