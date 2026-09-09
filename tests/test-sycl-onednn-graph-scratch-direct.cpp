@@ -494,19 +494,24 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // unified-cache.cpp:10143, fresh alloc at unified-cache.cpp:10419) --
     // so, unlike onednn_graph_scratch_direct_outstanding_bytes() above, it
     // tracks zone-served and DIRECT allocations combined, as a running max
-    // across the WHOLE BINARY, not scoped to this test. By the time this
-    // test runs, main() has already run the four earlier tests (pool_reuse,
-    // bounded_eviction, loud_failure, pending_event_reclaim), whose
-    // 300/320/340/310 MiB allocations (kSizeA/kSizeB/kSizeC/kSizeD) already
-    // push the high-water past kSizeParked (280 MiB) on their own -- so the
-    // check below cannot isolate the parked allocation's own contribution
-    // to that floor; it only proves the accessor is not inert (it would
-    // read 0 if the write site above never ran). The
-    // non-decrease-after-release check further below is the one that
-    // actually proves the high-water-mark semantics.
+    // per unified_cache INSTANCE (unified-cache.hpp:~3790), not scoped to
+    // this test -- and this binary drives a single instance for device 0.
+    // By the time this test runs, main() has already run the three earlier
+    // tests that actually complete an allocation (pool_reuse,
+    // bounded_eviction, pending_event_reclaim); test_loud_failure's kSizeC
+    // (340 MiB) request is deliberately forced to fail
+    // (force_direct_alloc_fail(2), asserted via ptr == nullptr) and returns
+    // before ever reaching this counter's write site, so it contributes
+    // nothing. kSizeA/kSizeB/kSizeD (300/320/310 MiB) already push the
+    // high-water past kSizeParked (280 MiB) on their own -- so the check
+    // below cannot isolate the parked allocation's own contribution to that
+    // floor; it only proves the accessor is not inert (it would read 0 if
+    // the write site above never ran). The non-decrease-after-release check
+    // further below is the one that actually proves the high-water-mark
+    // semantics.
     check(cache->onednn_graph_scratch_high_water_bytes() >= kSizeParked,
-          "onednn_graph_scratch_high_water_bytes() reflects the parked allocation as at least a new floor -- "
-          "the running max across zone-served and DIRECT allocations combined, not the current outstanding total");
+          "onednn_graph_scratch_high_water_bytes() is not inert -- it reports at least the parked allocation's "
+          "size, a floor the earlier completed tests in this binary already exceeded on their own");
     const size_t high_water_after_park = cache->onednn_graph_scratch_high_water_bytes();
 
     if (parked) {
