@@ -43,7 +43,8 @@
 // the four timings (plus each kernel's own total duration, measured
 // separately via wait(), so a human can see whether the spin loop's
 // iteration count is actually calibrated to ~1 s on the hardware it ran on)
-// and leaves the INTERPRETATION to whoever reads the numbers:
+// and leaves the INTERPRETATION to whoever reads the numbers. Two outcomes
+// were possible in principle:
 //
 //   - If all four queries return in a few tens of ms, event_complete()
 //     already polls on this driver regardless of queue properties or event
@@ -56,6 +57,23 @@
 //     premise holds, but specifically for device-kernel events -- and the
 //     ticket's own GPU test should be using a kernel-produced release
 //     event, not a host_task one, to actually exercise it.
+//
+// MEASURED (GGML_TEST_SPIN_ITERATIONS=2000000, both discrete cards this
+// fork validates against): the SECOND outcome. host_task query times were
+// ~0 ms on both queue kinds on both cards; the device-kernel query on the
+// NON-profiling queue was also ~0 ms on both cards. The device-kernel query
+// on the PROFILING queue took nearly the kernel's own full duration on
+// both cards -- B50: query=118 ms vs. kernel duration=122 ms; B70:
+// query=110 ms vs. kernel duration=114 ms. So the bare
+// command_execution_status query BLOCKS until completion specifically for
+// a device-kernel-produced event on a profiling-enabled queue, exactly as
+// unified-cache.hpp's own comment states, and exactly the shape a real
+// oneDNN Graph-scratch release event actually is in production. This is
+// why test-sycl-onednn-graph-scratch-direct.cpp's own "slow release" events
+// are device-kernel-produced (via a helper matching this file's own kernel
+// shape), not host_task-produced -- see that file's submit_slow_release()
+// for the full history of why a host_task-produced release event there
+// measured a ~6 ms RED arm instead of reproducing this block at all.
 //
 // Exits 77 (ctest SKIP_RETURN_CODE) when no SYCL GPU device is present.
 
@@ -130,6 +148,18 @@ long long measure_query_ms(sycl::event & evt) {
 }  // namespace
 
 int main(int, char ** argv) {
+    // Line-buffer stdout (regardless of whether it lands on a terminal or,
+    // as under ctest, a redirected file) so a run killed mid-measurement
+    // (e.g. an unexpectedly long default iteration count, or a hung device)
+    // still shows every line printed before the kill, not just whatever
+    // happened to be in a full stdio buffer. Measured need: the very first
+    // default iteration count this file shipped with (2,000,000,000) did
+    // not finish within a 120 s observation window on real hardware, and
+    // its output was fully buffered (the default for a non-terminal
+    // stdout), so nothing printed at all before that run was killed --
+    // this fixes both the count (below) and the buffering.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     // Same pinning convention as every sibling SYCL gate in this directory
     // -- see sycl-selector-fallback.hpp's own comment for why a plain
     // setenv() in main() would be too late.
@@ -141,8 +171,14 @@ int main(int, char ** argv) {
     // between subagents and the lead session for GPU work). Overridable
     // without a rebuild so the actual kernel duration this run prints (see
     // below) can be used to correct it on the next run rather than needing
-    // a source edit and a full SYCL rebuild for a constant tune.
-    long long iterations = 2'000'000'000LL;
+    // a source edit and a full SYCL rebuild for a constant tune. 2,000,000
+    // (not the original 2,000,000,000, three orders of magnitude larger):
+    // measured on real hardware (both discrete cards this fork validates
+    // against) at ~110-122 ms for 2,000,000 iterations -- comfortably close
+    // to kHostTaskMs (1000 ms) once scaled by roughly 8-9x, and the ORIGINAL
+    // 2,000,000,000 default measured as "did not finish in 120 s", three
+    // orders of magnitude too slow rather than too fast.
+    long long iterations = 2'000'000LL;
     if (const char * env = std::getenv("GGML_TEST_SPIN_ITERATIONS")) {
         if (env[0] != '\0') {
             iterations = std::atoll(env);

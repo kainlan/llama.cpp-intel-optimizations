@@ -466,6 +466,15 @@ ticket reproduced on:
   submission threw). A test-only hook,
   `ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()`, forces
   that fallback so a GPU test can demonstrate the difference directly.
+  Confirmed on hardware, both discrete cards this fork validates against
+  (`tests/test-sycl-event-status-blocking-probe.cpp`, isolated from the
+  pool allocator entirely): the blocking behavior is specific to a
+  DEVICE-KERNEL-produced `release_event` on a profiling-enabled queue
+  (B50: query time 118 ms against a 122 ms kernel; B70: 110 ms against
+  114 ms) — a host_task-produced event, or a device-kernel event on a
+  non-profiling queue, both measured a few ms or less either way. Every
+  real pool release event in production is device-kernel-produced
+  (oneDNN's own free callback), matching the case that actually blocks.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
