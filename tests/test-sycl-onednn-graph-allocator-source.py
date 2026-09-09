@@ -198,10 +198,14 @@ CLEAR_POOL_BODY_CODE = extract_function_body(
 # separately from the three caller bodies above -- those checks assert what
 # the CALLERS query (RELEASE_COMPLETE_CALL, never a bare event_complete());
 # this one asserts what the choke point ITSELF does, specifically that its
-# only remaining event_complete() call is the release_done-null fallback,
-# not a second call reintroduced by a RED-arm hook branch (the earlier,
-# incorrect design this redesign replaced -- see the function's own comment
-# for why a check-time hook branch could not reproduce pre-fix behaviour).
+# only remaining event_complete() call is the flag_slot == -1 fallback
+# (finding 31 renamed the armed predicate from a release_done
+# std::shared_ptr<std::atomic<bool>> to a flag_slot/flag_generation pair
+# into a host-USM slab; the shape of this check -- exactly one call, no
+# hook branch -- is unchanged), not a second call reintroduced by a RED-arm
+# hook branch (the earlier, incorrect design this redesign replaced -- see
+# the function's own comment for why a check-time hook branch could not
+# reproduce pre-fix behaviour).
 RELEASE_COMPLETE_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_entry_release_complete("
 )
@@ -572,23 +576,34 @@ def test_onednn_graph_allocator_source_contract() -> None:
     )
     checks["free no-cache branch does not call sycl::free"] = "sycl::free(" not in free_fn_code
 
-    # llama.cpp-c6ah (finding 28): the choke point itself must call
-    # event_complete() exactly once -- the release_done-null fallback --
-    # and never branch on the RED-arm test hook. A branch there would still
-    # be querying a WATCHED event whenever release_done was armed (a bare
-    # query on a watched event lies -- see event_complete()'s own comment),
-    # so the RED arm can only be correct if this function stays this simple
-    # and the hook instead lives in onednn_graph_scratch_free()'s park site
-    # (checked below), which decides whether release_done gets armed in the
-    # first place.
-    checks["release_complete()'s only event_complete() call is the release_done-null fallback"] = (
+    # llama.cpp-c6ah (finding 28, kept true under finding 31's redesign): the
+    # choke point itself must call event_complete() exactly once -- the
+    # flag_slot == -1 fallback -- and never branch on the RED-arm test hook.
+    # A branch there would still be querying a WATCHED event whenever
+    # flag_slot was armed, so the RED arm can only be correct if this
+    # function stays this simple and the hook instead lives in
+    # onednn_graph_scratch_free()'s park site (checked below), which
+    # decides whether flag_slot gets armed in the first place.
+    checks["release_complete()'s only event_complete() call is the flag_slot == -1 fallback"] = (
         strip_literals(RELEASE_COMPLETE_BODY_CODE).count("event_complete(") == 1
     )
     checks["release_complete() does not branch on the RED-arm test hook"] = (
         "g_onednn_graph_scratch_test_force_blocking_pool_check" not in RELEASE_COMPLETE_BODY_CODE
     )
-    checks["free() park site consults the RED-arm test hook before arming the watcher"] = (
+    checks["free() park site consults the RED-arm test hook before arming the flag"] = (
         "g_onednn_graph_scratch_test_force_blocking_pool_check" in FREE_BODY_CODE
+    )
+    # llama.cpp-c6ah (finding 31): the pool's completion flag is armed by a
+    # DEVICE marker kernel, never a host_task -- a host_task whose
+    # depends_on() names an event from another queue (which the release
+    # event always is here) was measured, both cards, to block the
+    # SUBMITTING thread until that event completes, i.e. it would stall
+    # this very function for the parked kernel's whole duration on every
+    # single park. strip_literals first: the WARN messages in this body
+    # name "host_task" in prose (describing what NOT to do), and a negative
+    # check must read code, not messages.
+    checks["free() body submits no host_task (the finding-31 marker-kernel design, not a watcher)"] = (
+        "host_task(" not in strip_literals(FREE_BODY_CODE)
     )
 
     failed = [name for name, ok in checks.items() if not ok]
@@ -699,18 +714,20 @@ def test_pool_entry_release_complete_is_the_single_choke_point() -> None:
 
 
 def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() -> None:
-    """Mutation witness for llama.cpp-c6ah finding 28: proves the two checks
-    added for it in the main contract test above would actually catch the
-    SPECIFIC regression they exist to prevent -- a RED-arm test hook branch
-    reintroduced inside onednn_graph_scratch_pool_entry_release_complete()
-    itself, querying release_event directly whenever the hook is forced,
-    regardless of release_done. That design was tried and found incorrect
-    (a bare query on an already-WATCHED event lies rather than blocking --
+    """Mutation witness for llama.cpp-c6ah finding 28 (anchor updated for
+    finding 31's flag_slot/flag_generation redesign, same property):
+    proves the two checks added for it in the main contract test above
+    would actually catch the SPECIFIC regression they exist to prevent -- a
+    RED-arm test hook branch reintroduced inside
+    onednn_graph_scratch_pool_entry_release_complete() itself, querying
+    release_event directly whenever the hook is forced, regardless of
+    flag_slot. That design was tried and found incorrect (it would still
+    query a WATCHED event, which finding 31 traced a separate hazard to --
     see the function's own comment), which is why the fix moved the hook to
     onednn_graph_scratch_free()'s park site instead; this witness proves a
     regression back to the check-time branch would be caught, not merely
     that the current source happens to pass."""
-    anchor = "if (entry.release_done) {"
+    anchor = "if (entry.flag_slot >= 0) {"
     assert anchor in RELEASE_COMPLETE_BODY_CODE, "mutation target string not found -- update this witness"
     reintroduced_hook_branch = (
         "if (onednn_graph_scratch_test_hooks_enabled() && "
@@ -724,7 +741,7 @@ def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() ->
     mutated_count = strip_literals(mutated).count("event_complete(")
     assert real_count == 1, (
         "the real, unmutated release_complete() body should call event_complete() exactly once "
-        f"(the release_done-null fallback); found {real_count}"
+        f"(the flag_slot == -1 fallback); found {real_count}"
     )
     assert mutated_count != 1, (
         "mutation witness is broken: the reintroduced hook branch's extra event_complete() call was not "
@@ -736,4 +753,29 @@ def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() ->
     )
     assert "g_onednn_graph_scratch_test_force_blocking_pool_check" in mutated, (
         "mutation witness is broken: the reintroduced hook reference was not present in the mutated text"
+    )
+
+
+def test_free_body_has_no_host_task_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah finding 31: proves the "free()
+    body submits no host_task" check in the main contract test above would
+    actually catch the SPECIFIC regression it exists to prevent -- a
+    host_task reintroduced into onednn_graph_scratch_free()'s completion-
+    flag arm, the exact design finding 31 replaced after measuring (both
+    cards, 2026-09-09) that submitting a host_task with a cross-queue
+    dependency blocks the SUBMITTING thread -- i.e. this very function,
+    called from oneDNN's free callback -- until that dependency
+    completes."""
+    anchor = "depends_on(*event);"
+    stripped_free_body = strip_literals(FREE_BODY_CODE)
+    assert anchor in stripped_free_body, "mutation target string not found -- update this witness"
+    mutated = stripped_free_body.replace(
+        anchor,
+        anchor + " h.host_task([]() {});",
+        1,
+    )
+    assert mutated != stripped_free_body
+    assert "host_task(" not in stripped_free_body, "the real, unmutated free() body should submit no host_task"
+    assert "host_task(" in mutated, (
+        "mutation witness is broken: the reintroduced host_task() call was not present in the mutated text"
     )

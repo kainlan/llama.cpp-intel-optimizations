@@ -77,6 +77,24 @@
 // for the full history of why a host_task-produced release event there
 // measured a ~6 ms RED arm instead of reproducing this block at all.
 //
+// RELATED, DISTINCT FINDING (llama.cpp-c6ah, finding 31), not measured by
+// this file: the pool's original fix armed a host_task, on a SEPARATE
+// queue, depending on a device-kernel release event via depends_on() --
+// not the bare-query pattern this file measures at all. A follow-up
+// measurement (both cards, 2026-09-09) found that SUBMITTING such a
+// host_task blocks the SUBMITTING thread until the dependency completes,
+// whenever the dependency comes from another queue. That fact does not
+// change anything measured here (this file never submits a host_task with
+// a cross-queue dependency), but it explains why an earlier version of
+// this ticket's own source comments (unified-cache.cpp's event_complete()
+// and onednn_graph_scratch_pool_entry_release_complete()) briefly claimed
+// the bare query above "lies" once a watcher exists -- that was a
+// misdiagnosis of the host_task-submission-blocks effect, not a property
+// of the query this file actually isolates. See
+// onednn_graph_scratch_pool_entry::flag_slot's comment in unified-cache.hpp
+// for the full incident history and the device-marker-kernel design that
+// replaced the host_task watcher.
+//
 // Exits 77 (ctest SKIP_RETURN_CODE) when no SYCL GPU device is present.
 
 #include "sycl-selector-fallback.hpp"
