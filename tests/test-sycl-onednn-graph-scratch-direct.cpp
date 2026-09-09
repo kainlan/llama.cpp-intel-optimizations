@@ -485,19 +485,25 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
           "onednn_graph_scratch_direct_outstanding_bytes() increased by exactly the parked allocation's size -- "
           "proves the accessor tracks a real DIRECT-path charge rather than staying inert");
 
-    // onednn_graph_scratch_high_water_bytes() had no caller anywhere in this
-    // binary before this test -- every sibling accessor above has one, so
-    // give it one here too. Its only write site,
-    // note_onednn_graph_scratch_alloc_locked() (unified-cache.cpp:10595-10600),
-    // is called from the zone-fit path (unified-cache.cpp:10208) AND both
-    // DIRECT paths (pool-hit at unified-cache.cpp:10143, fresh alloc at
-    // unified-cache.cpp:10419) -- so, unlike
-    // onednn_graph_scratch_direct_outstanding_bytes() above, it tracks
-    // zone-served and DIRECT allocations combined. That means it can only be
-    // asserted as a floor here, never an exact delta: the parked allocation
-    // raises the RUNNING MAX to at least kSizeParked, but earlier zone-served
-    // or DIRECT traffic elsewhere in this binary may already have pushed it
-    // higher.
+    // onednn_graph_scratch_high_water_bytes() had no caller anywhere in
+    // this binary before this test -- every sibling accessor above has one,
+    // so give it one here too. Its only write site,
+    // note_onednn_graph_scratch_alloc_locked()
+    // (unified-cache.cpp:10595-10600), is called from the zone-fit path
+    // (unified-cache.cpp:10208) AND both DIRECT paths (pool-hit at
+    // unified-cache.cpp:10143, fresh alloc at unified-cache.cpp:10419) --
+    // so, unlike onednn_graph_scratch_direct_outstanding_bytes() above, it
+    // tracks zone-served and DIRECT allocations combined, as a running max
+    // across the WHOLE BINARY, not scoped to this test. By the time this
+    // test runs, main() has already run the four earlier tests (pool_reuse,
+    // bounded_eviction, loud_failure, pending_event_reclaim), whose
+    // 300/320/340/310 MiB allocations (kSizeA/kSizeB/kSizeC/kSizeD) already
+    // push the high-water past kSizeParked (280 MiB) on their own -- so the
+    // check below cannot isolate the parked allocation's own contribution
+    // to that floor; it only proves the accessor is not inert (it would
+    // read 0 if the write site above never ran). The
+    // non-decrease-after-release check further below is the one that
+    // actually proves the high-water-mark semantics.
     check(cache->onednn_graph_scratch_high_water_bytes() >= kSizeParked,
           "onednn_graph_scratch_high_water_bytes() reflects the parked allocation as at least a new floor -- "
           "the running max across zone-served and DIRECT allocations combined, not the current outstanding total");
