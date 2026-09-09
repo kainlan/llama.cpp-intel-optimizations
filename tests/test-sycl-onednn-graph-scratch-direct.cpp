@@ -1706,6 +1706,132 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 
+// llama.cpp-c6ah (finding 30): isolates whether the anomaly the c6ah GPU
+// run 12 report describes -- inside THIS test process, a just-submitted
+// kernel event on the cache's own queue reads complete essentially
+// immediately (t_flag=0 ms, t_wait=0 ms on slow_release.release_event.wait_and_throw(),
+// while the SAME event's own profiling command_start/command_end later
+// reads ~1515 ms, and run 10's RED arm already proved the kernel really
+// does run that long on this queue) -- is a property of the CACHE'S
+// specific queue object, or a process-level effect any queue this binary
+// constructs would also show. A standalone probe using the identical
+// dpct queue construction (lazily created watch queue, async handler, a
+// prior bare query, a host_task ahead on the queue) never reproduced it
+// (tests/test-sycl-event-status-blocking-probe.cpp and the team-lead's
+// own calprobe2 probes), which narrows this to something specific to
+// running inside a libggml-sycl-linked process -- this function is the
+// next narrowing step: same process, but comparing the cache's actual
+// queue against one this test constructs itself.
+//
+// Deliberately called from main() BEFORE any other test in this binary
+// (right after calibration, before any real DIRECT allocation or free
+// has ever happened) so nothing earlier in the process's history --
+// pool churn, prior parks, prior watcher host_tasks -- can have
+// perturbed either queue's state before this probe reads it. No test
+// bound and no allocator code is touched by this function; it is
+// read-only observation and prints only.
+void test_queue_identity_probe(unified_cache * cache) {
+    printf("Queue identity probe (finding 30):\n");
+
+    sycl::queue & q1 = cache->get_queue();
+    sycl::queue   q2(q1.get_context(), q1.get_device(),
+                     sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} });
+
+    auto print_props = [](const char * label, sycl::queue & q) {
+        const bool in_order  = q.has_property<sycl::property::queue::in_order>();
+        const bool profiling = q.has_property<sycl::property::queue::enable_profiling>();
+        // llama.cpp-c6ah (finding 30c): sycl::ext::oneapi::property::queue::discard_events
+        // is a DPC++ extension, not core SYCL 2020 -- guard its use so this
+        // file still compiles against a SYCL toolchain that predates it,
+        // rather than hard-requiring the extension for a diagnostic that is
+        // useful either way.
+#    ifdef SYCL_EXT_ONEAPI_DISCARD_QUEUE_EVENTS
+        const bool discard_events = q.has_property<sycl::ext::oneapi::property::queue::discard_events>();
+#    else
+        const bool discard_events = false;  // extension not available in this SYCL toolchain
+#    endif
+        printf("    (%s: in_order=%d enable_profiling=%d discard_events=%d)\n", label, in_order, profiling,
+               discard_events);
+    };
+
+    print_props("Q1 (cache->get_queue())", q1);
+    print_props("Q2 (test-constructed, same ctx/device)", q2);
+    printf("    (Q1.get_context() == Q2.get_context(): %d)\n", q1.get_context() == q2.get_context());
+
+    // llama.cpp-c6ah (finding 30): the cache's own watch queue, inspected
+    // via the same public accessor onednn_graph_scratch_free() itself uses
+    // -- get_event_watch_queue() is std::call_once-guarded, so this call
+    // (the FIRST in the process, since nothing has parked anything yet)
+    // creates the SAME queue object every later real park in this run will
+    // reuse, rather than a separate one only this probe ever sees.
+    sycl::queue * watch_q = cache->get_event_watch_queue();
+    if (watch_q) {
+        print_props("cache watch queue", *watch_q);
+        printf("    (watch queue same context as Q1: %d)\n", watch_q->get_context() == q1.get_context());
+    } else {
+        printf("    (cache watch queue: get_event_watch_queue() returned nullptr)\n");
+    }
+
+    // (a)/(b) for one queue: submit_slow_release() reuses the SAME
+    // calibrated iteration count every other test in this binary uses, so
+    // these numbers are directly comparable to test_bounded_eviction's own
+    // t_flag/t_wait report.
+    auto probe_one_queue = [&](const char * label, sycl::queue & q) {
+        // (a) direct: submit, then wait_and_throw() immediately with no
+        // watcher involved at all -- the simplest possible "is this event
+        // honest" check for this queue.
+        slow_release_result r_a          = submit_slow_release(q);
+        const auto          wait_a_start = std::chrono::steady_clock::now();
+        r_a.release_event.wait_and_throw();
+        const long long wait_a_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_a_start)
+                .count();
+        printf("    (%s (a): direct wait_and_throw()=%lld ms, actual=%lld ms, target=%lld ms)\n", label, wait_a_ms,
+               actual_kernel_duration_ms(r_a.release_event), r_a.duration_ms);
+
+        // (b) watched: submit a SECOND kernel, arm a watcher host_task on a
+        // fresh out-of-order queue from the SAME context (matching
+        // onednn_graph_scratch_free()'s own construction), poll the flag,
+        // and time a wait_and_throw() taken right after the flag fires --
+        // this is the exact shape onednn_graph_scratch_pool_entry_release_complete()
+        // relies on, reproduced standalone against `q` specifically.
+        slow_release_result r_b = submit_slow_release(q);
+        sycl::queue         watcher_q(q.get_context(), q.get_device());
+        auto                flag      = std::make_shared<std::atomic<bool>>(false);
+        const auto          arm_start = std::chrono::steady_clock::now();
+        watcher_q.submit([&](sycl::handler & h) {
+            h.depends_on(r_b.release_event);
+            h.host_task([flag]() { flag->store(true, std::memory_order_release); });
+        });
+        long long  flag_fire_ms  = -1;
+        const auto flag_deadline = arm_start + std::chrono::milliseconds(2500);
+        while (std::chrono::steady_clock::now() < flag_deadline) {
+            if (flag->load(std::memory_order_acquire)) {
+                flag_fire_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - arm_start)
+                        .count();
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        long long post_flag_wait_ms = -1;
+        if (flag_fire_ms >= 0) {
+            const auto w2_start = std::chrono::steady_clock::now();
+            r_b.release_event.wait_and_throw();
+            post_flag_wait_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - w2_start)
+                    .count();
+        }
+        printf(
+            "    (%s (b): watcher fired at %lld ms, post-flag wait_and_throw()=%lld ms, actual=%lld ms, "
+            "target=%lld ms)\n",
+            label, flag_fire_ms, post_flag_wait_ms, actual_kernel_duration_ms(r_b.release_event), r_b.duration_ms);
+    };
+
+    probe_one_queue("Q1", q1);
+    probe_one_queue("Q2", q2);
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -1766,6 +1892,10 @@ int main(int, char ** argv) {
     // explicitly from main() (rather than lazily from the first
     // submit_slow_release() call) is load-bearing, not stylistic.
     ensure_slow_release_calibrated(cache->get_queue());
+
+    // llama.cpp-c6ah (finding 30): before any other test -- see this
+    // function's own comment for why the ordering is load-bearing here.
+    test_queue_identity_probe(cache);
 
     test_pool_reuse(cache);
     test_bounded_eviction(cache, device);
