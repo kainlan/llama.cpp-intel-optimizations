@@ -199,16 +199,15 @@ void test_largest_fitting_n_ctx() {
 
     // Floor-vs-inverse interaction, scored to the outcome the inverse
     // function's own comment documents: the inverse IGNORES
-    // kNonfaAttnScratchFloorBytes, so for a zone capacity small enough
-    // that the raw (unfloored) formula at the reported n_ctx is still
-    // below the 16 MiB
-    // floor, the inverse's own "fits" answer is optimistic -- feeding it
-    // back into the forward formula (which DOES apply the floor) reports a
-    // demand larger than the zone capacity the inverse was asked about.
-    // n_head=1, n_ubatch=1 keeps the per-context-cell cost tiny (6 bytes),
-    // so a capacity of just 2000 bytes still rounds up to a non-zero,
-    // 256-aligned n_ctx rather than degenerating to the n_ctx=0 corner case
-    // the dedicated zero-capacity check above already covers.
+    // kNonfaAttnScratchFloorBytes, so for a zone capacity small enough that
+    // the raw (unfloored) formula at the reported n_ctx is still below the
+    // 16 MiB floor, the inverse's own "fits" answer is optimistic --
+    // feeding it back into the forward formula (which DOES apply the floor)
+    // reports a demand larger than the zone capacity the inverse was asked
+    // about. n_head=1, n_ubatch=1 keeps the per-context-cell cost tiny (6
+    // bytes), so a capacity of just 2000 bytes still rounds up to a
+    // non-zero, 256-aligned n_ctx rather than degenerating to the n_ctx=0
+    // corner case the dedicated zero-capacity check above already covers.
     constexpr size_t kTinyZoneBytes = 2000;
     const uint32_t   fits_tiny_zone = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(kTinyZoneBytes, 1, 1);
     check(fits_tiny_zone == 256,
