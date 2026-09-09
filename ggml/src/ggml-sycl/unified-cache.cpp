@@ -9714,6 +9714,21 @@ sycl::event unified_cache::copy_to_device_async(void *                          
 // a host-visible std::atomic<bool> flag over this query. Leave this function
 // itself unchanged -- it still has correct, intentionally-blocking callers
 // (mem-ops weight-entry readiness, tests/test-unified-cache-unpin-event.cpp).
+//
+// llama.cpp-c6ah (finding 28): a SECOND, distinct hazard from the blocking
+// one above, and it is why "blocking" and "safe to call" are not the same
+// property. Measured on hardware (both discrete cards, 2026-09-09, a
+// standalone probe run alongside tests/test-sycl-event-status-blocking-probe.cpp's
+// scenarios): once ANY host_task has been submitted with a dependency on
+// `evt` (sycl::handler::depends_on(evt)), a bare command_execution_status
+// query on THAT SAME event afterward LIES -- it reports complete
+// immediately, even while the underlying kernel is still executing, rather
+// than merely failing to block. So this function must never be called on
+// an event that has, or may later have, a watcher host_task depending on
+// it; onednn_graph_scratch_pool_entry_release_complete()'s host-visible
+// flag exists precisely because it is the only predicate this fork trusts
+// once an event is watched. This function's remaining direct callers (see
+// the two above) query events nothing else ever attaches a dependency to.
 bool unified_cache::event_complete(const sycl::event & evt) {
     try {
         auto status = evt.get_info<sycl::info::event::command_execution_status>();
@@ -9831,22 +9846,52 @@ void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force) {
     g_onednn_graph_scratch_test_force_blocking_pool_check.store(force, std::memory_order_release);
 }
 
+// llama.cpp-c6ah (finding 28): NO test-hook branch here. An earlier version
+// of the RED arm short-circuited THIS function to query entry.release_event
+// directly whenever the hook was forced, regardless of release_done -- but
+// once release_done is armed, a watcher host_task already depends on
+// release_event, and event_complete()'s own comment documents that a bare
+// query on a WATCHED event lies (reports complete immediately, not "blocks
+// like the pre-fix code"). Branching here therefore could not reproduce
+// pre-fix behaviour; it reproduced a DIFFERENT, incorrect behaviour that
+// happened to look similar. The RED arm now works by making
+// onednn_graph_scratch_free()'s park site skip arming release_done in the
+// first place (see that hook's declaration comment in unified-cache.hpp),
+// so this function's own release_done-null fallback below -- unmodified,
+// exactly what a failed arm already fell back to -- is what the RED arm
+// exercises, against a genuinely unwatched event.
 bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) {
-    // RED arm: reproduce the pre-fix blocking behaviour on demand so a test
-    // can measure it. Gated the same way as every other hook in this file --
-    // a production process without GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 set
-    // can never observe this branch, regardless of what calls the setter.
-    if (onednn_graph_scratch_test_hooks_enabled() &&
-        g_onednn_graph_scratch_test_force_blocking_pool_check.load(std::memory_order_acquire)) {
-        return event_complete(entry.release_event);
-    }
     if (entry.release_done) {
         return entry.release_done->load(std::memory_order_acquire);
     }
-    // Flag never armed (queue creation or host_task submission failed at
-    // park time) -- fall back to the pre-fix query. Still correct, just not
-    // non-blocking.
+    // Flag never armed -- queue creation or host_task submission failed at
+    // park time, or the RED-arm test hook deliberately skipped arming it
+    // (see onednn_graph_scratch_free()'s own comment) -- fall back to the
+    // pre-fix query. Still correct here specifically BECAUSE release_event
+    // is genuinely unwatched in this branch (see event_complete()'s own
+    // comment for why "unwatched" is the condition that makes it safe, not
+    // merely "blocking").
     return event_complete(entry.release_event);
+}
+
+// llama.cpp-c6ah (finding 28): see the declaration's comment in
+// unified-cache.hpp. Self-locking (unlike the advisory unlocked counters
+// nearby) because it walks the live pool map rather than one counter.
+bool unified_cache::onednn_graph_scratch_pool_entry_flag_true_for_test(size_t size) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+    auto                        bucket_it = onednn_graph_scratch_reuse_pool_.find(size);
+    if (bucket_it == onednn_graph_scratch_reuse_pool_.end()) {
+        return false;
+    }
+    for (const auto & entry : bucket_it->second) {
+        if (entry.release_done && entry.release_done->load(std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Consumed once per DIRECT alloc attempt: returns true (and decrements the
@@ -10104,9 +10149,9 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     }
     ++onednn_graph_scratch_direct_wait_count_;
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
-    bool fits = false;
+    const auto wait_loop_entry = std::chrono::steady_clock::now();
+    const auto deadline        = wait_loop_entry + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
+    bool       fits            = false;
     do {
         // Drop the lock while waiting: nothing we hold it for makes an
         // in-flight pool entry's SYCL event complete any sooner, and holding
@@ -10118,6 +10163,33 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         ggml_sycl_watchdog_heartbeat();
         std::this_thread::sleep_for(std::chrono::milliseconds(kOnednnGraphDirectWaitPollTimeoutMs));
         lock.lock();
+
+        // llama.cpp-c6ah (finding 28): per-poll diagnostic, gated behind
+        // the test-hooks env var like every other hook in this file. Walks
+        // EVERY bucket, not just `size`'s own -- the eviction sweep below
+        // inspects every bucket too, and the entry a caller actually cares
+        // about (e.g. a slow-release setup entry of a DIFFERENT size than
+        // the size being requested) can be evicted or skipped from any of
+        // them. Reads onednn_graph_scratch_pool_entry_release_complete()
+        // itself (the same predicate the sweep uses just below), not a
+        // separate query, so this log can never disagree with what the
+        // sweep actually decided for the same entry on the same poll.
+        if (onednn_graph_scratch_test_hooks_enabled()) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - wait_loop_entry)
+                                        .count();
+            for (const auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
+                for (const auto & poll_entry : bucket_kv.second) {
+                    const bool poll_complete = onednn_graph_scratch_pool_entry_release_complete(poll_entry);
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] [c6ah-f28] poll elapsed=%lldms requested=%.1fMB bucket=%.1fMB "
+                        "watcher=%s flag=%p complete=%d\n",
+                        static_cast<long long>(elapsed_ms), size / (1024.0 * 1024.0),
+                        bucket_kv.first / (1024.0 * 1024.0), poll_entry.release_done ? "armed" : "unwatched",
+                        static_cast<void *>(poll_entry.release_done.get()), poll_complete ? 1 : 0);
+                }
+            }
+        }
 
         // Check the requested size's OWN bucket first: an entry of the
         // exact size this request needs that onednn_graph_scratch_entry_usable_locked()
@@ -10592,8 +10664,28 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // Submitting this host_task on the main compute stream would
         // serialise real GPU kernels behind it (see that declaration's
         // comment for why that is worse than the blocking-query fallback).
+        // llama.cpp-c6ah (finding 28): the RED-arm test hook forces this
+        // site to SKIP arming the watcher entirely (leave release_done
+        // null) rather than -- as an earlier version of this fix did --
+        // letting onednn_graph_scratch_pool_entry_release_complete() branch
+        // on the hook and query release_event directly regardless of
+        // release_done. See ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()'s
+        // own declaration comment in unified-cache.hpp for why: once a
+        // watcher exists for an event, a bare query on it lies, so a check-
+        // time branch would still be querying a WATCHED event and could not
+        // reproduce the real pre-fix wait. Skipping the ARM here instead
+        // means release_complete()'s existing release_done-null fallback
+        // later queries a genuinely UNWATCHED event, which blocks for real
+        // -- the actual pre-fix behaviour. Gated the same way as every
+        // other hook in this file: a production process without
+        // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 set can never take this
+        // branch, regardless of what calls the setter.
+        const bool force_unwatched_for_test =
+            onednn_graph_scratch_test_hooks_enabled() &&
+            g_onednn_graph_scratch_test_force_blocking_pool_check.load(std::memory_order_acquire);
+
         std::shared_ptr<std::atomic<bool>> release_done;
-        if (event) {
+        if (event && !force_unwatched_for_test) {
             if (sycl::queue * watch_q = get_event_watch_queue()) {
                 try {
                     auto flag = std::make_shared<std::atomic<bool>>(false);
@@ -10613,6 +10705,22 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                         e.what());
                 }
             }
+        }
+
+        // llama.cpp-c6ah (finding 28): park-time diagnostic, gated behind
+        // the same test-hooks env var as every setter above rather than
+        // always-on, so it never reaches a production log -- this exists to
+        // let a GPU test run correlate WHICH entries got a real watcher vs.
+        // which fell back (and why), against the wait-loop's own per-poll
+        // log below. GGML_LOG_WARN (not INFO) so it reaches the log without
+        // needing llama-bench's `-v`/verbosity-threshold plumbing (see
+        // CLAUDE.md's llama-bench traps) -- a test binary calls
+        // ggml_backend_sycl_init() directly and never raises that
+        // threshold.
+        if (onednn_graph_scratch_test_hooks_enabled()) {
+            GGML_LOG_WARN("[UNIFIED-CACHE] [c6ah-f28] park size=%.1fMB watcher=%s flag=%p force_unwatched=%d\n",
+                          freed_size / (1024.0 * 1024.0), release_done ? "armed" : (event ? "fallback" : "no-event"),
+                          static_cast<void *>(release_done.get()), force_unwatched_for_test ? 1 : 0);
         }
 
         // onednn_graph_scratch_direct_outstanding_bytes_ stays charged for

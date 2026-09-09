@@ -1368,16 +1368,27 @@ void ggml_sycl_test_onednn_graph_scratch_suppress_abort(bool suppress);
 // which resets it to false (a single-shot latch, like a "consumed" event).
 bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 
-// llama.cpp-c6ah: RED arm inside the GREEN binary. While forced, the reuse
-// pool's completion check (onednn_graph_scratch_pool_entry_release_complete())
-// ignores a pooled entry's host-visible release_done flag and falls back to
-// the pre-fix behaviour -- an event_complete() query directly on
-// release_event, which BLOCKS rather than polls on a profiling-enabled
-// queue (see event_complete()'s comment). A test uses this to demonstrate
-// what the fix replaced: with the hook forced, requesting a size an
-// in-flight entry occupies waits for that entry's release instead of
-// skipping it; with the hook off (the default), it does not. Off by
-// default, like every hook in this block; a no-op unless
+// llama.cpp-c6ah (finding 28): RED arm inside the GREEN binary. While
+// forced, onednn_graph_scratch_free()'s park site SKIPS ARMING the
+// host-visible release_done flag for any entry parked while this is set,
+// leaving release_done null -- NOT (as an earlier version of this hook
+// did) short-circuiting the completion CHECK to query release_event
+// directly regardless of release_done. The distinction is load-bearing: a
+// bare command_execution_status query LIES and reports complete
+// immediately once ANY host_task has been made to depend on that event via
+// depends_on() (measured on hardware, both cards, 2026-09-09 -- see
+// event_complete()'s own comment for the numbers), so short-circuiting the
+// check on an entry whose watcher had already been armed inherited that
+// same lie instead of reproducing the pre-fix behaviour it was meant to
+// demonstrate. Skipping the ARM instead means onednn_graph_scratch_pool_entry_release_complete()'s
+// existing "release_done is null" fallback runs its query against a
+// genuinely UNWATCHED event, which behaves like the real pre-fix code path:
+// it blocks for real. A test uses this to demonstrate what the fix
+// replaced: with the hook forced (set before the park, i.e. before the
+// onednn_graph_scratch_free() call that would otherwise arm the watcher),
+// requesting a size an in-flight entry occupies waits for that entry's
+// release instead of skipping it; with the hook off (the default), it does
+// not. Off by default, like every hook in this block; a no-op unless
 // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 is set (see
 // onednn_graph_scratch_test_hooks_enabled() in unified-cache.cpp).
 void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
@@ -3120,6 +3131,21 @@ class unified_cache {
 
     size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
 
+    // llama.cpp-c6ah (finding 28): test-only instrumentation accessor -- true
+    // if ANY entry currently parked in the `size` bucket has an armed
+    // release_done flag reading true (a real completion, not the pool's
+    // resolve/usability check, which also requires the entry to be device-
+    // resident and correctly aligned). Locks onednn_graph_scratch_mutex_
+    // itself (unlike the advisory unlocked counters above) because it walks
+    // the live pool map rather than reading one already-atomic-adjacent
+    // counter. Exists so a test can POLL a parked entry's flag without
+    // itself allocating -- an allocation attempt would consume/reuse the
+    // very entry being inspected, changing the thing it is trying to
+    // observe. Returns false unconditionally (never touches the pool) when
+    // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is not set, the same gate every
+    // other hook in this file uses.
+    bool onednn_graph_scratch_pool_entry_flag_true_for_test(size_t size);
+
     // Public, self-locking entry point: releases (for real) every pooled
     // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
     // before log, same order as the body below and for the same reason
@@ -3572,6 +3598,13 @@ class unified_cache {
                                      size_t                           size,
                                      const std::vector<sycl::event> & deps,
                                      sycl::queue *                    override_q = nullptr);
+    // See this function's own comment at its definition in unified-cache.cpp
+    // for the full BLOCKS-not-polls hazard, and (llama.cpp-c6ah, finding 28)
+    // a second, distinct hazard: on a profiling-enabled queue, a bare
+    // command_execution_status query on an event LIES and reports complete
+    // immediately once any host_task has been made to depend on that SAME
+    // event -- never call this on an event that has, or may have, a watcher
+    // host_task depending on it (measured on hardware, both cards).
     static bool event_complete(const sycl::event & evt);
     sycl::event submit_barrier(const std::vector<sycl::event> & deps);
     sycl::event submit_barrier_all();
@@ -3968,10 +4001,19 @@ class unified_cache {
         // ticket closes. Pool lookups must go through
         // pool_entry_release_complete() rather than event_complete()
         // directly. nullptr when the host_task could not be armed (queue
-        // creation or submission threw) -- pool_entry_release_complete()
-        // falls back to the old (blocking, but correct) event_complete()
-        // query in that case, so a failed arm degrades to pre-fix behaviour
-        // rather than misreporting readiness.
+        // creation or submission threw, or -- llama.cpp-c6ah, finding 28 --
+        // the RED-arm test hook deliberately skipped arming it; see
+        // onednn_graph_scratch_free()'s own comment) -- pool_entry_release_complete()
+        // falls back to the old (blocking, but correct FOR AN UNWATCHED
+        // EVENT -- see event_complete()'s own comment for why "unwatched"
+        // matters) event_complete() query in that case, so a failed or
+        // skipped arm degrades to pre-fix behaviour rather than misreporting
+        // readiness. Once this flag IS armed for an entry, it is the ONLY
+        // predicate that entry's release_event may be checked through --
+        // never call event_complete(release_event) directly on an entry
+        // whose release_done is non-null, since a watcher host_task now
+        // depends on that event and a bare query on it lies (reports
+        // complete immediately, regardless of the kernel's actual state).
         std::shared_ptr<std::atomic<bool>> release_done;
     };
 
@@ -4017,24 +4059,36 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_peak_bytes_     = 0;
 
     // llama.cpp-c6ah: the ONE place that decides whether a pooled entry's
-    // release is done. Prefers the host-visible `entry.release_done` flag
-    // (set async by a host_task on get_event_watch_queue()) over querying
-    // `entry.release_event` directly, because release_event lives on a
-    // profiling-enabled backend stream and event_complete()'s own comment
-    // documents that the bare command_execution_status query BLOCKS rather
-    // than polls there. Every reader of a pool entry's completion --
+    // release is done, and (finding 28) the ONLY place in this class that
+    // may call event_complete(entry.release_event) -- enforced by a source-
+    // gate test (tests/test-sycl-onednn-graph-allocator-source.py). Prefers
+    // the host-visible `entry.release_done` flag (set async by a host_task
+    // on get_event_watch_queue()) over querying `entry.release_event`
+    // directly, because release_event lives on a profiling-enabled backend
+    // stream and event_complete()'s own comment documents TWO reasons a
+    // bare query on it is unsafe once a watcher exists: it BLOCKS instead
+    // of polling there, AND (measured on hardware, both cards) it actively
+    // LIES and reports complete immediately once any host_task has been
+    // made to depend on that event -- so release_done, once armed, is the
+    // ONLY predicate this entry's completion may be checked through; this
+    // function only falls through to event_complete(entry.release_event)
+    // when release_done is null, i.e. the event is genuinely unwatched, the
+    // one case where that query is both non-lying and (still) blocking.
+    // Every reader of a pool entry's completion --
     // onednn_graph_scratch_entry_usable_locked(),
     // onednn_graph_scratch_evict_pool_until_fits_locked(), and
     // onednn_graph_scratch_clear_pool_locked() -- must call this instead of
     // event_complete() directly, so the pool's "skip in-flight entries, do
     // not wait for them" design is actually non-blocking end to end. Static
     // (same as event_complete()): needs no instance state beyond the entry
-    // itself. Gated test hook: when GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 and
-    // ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(true) has
-    // been called, this falls back to the old blocking event_complete()
-    // query regardless of release_done -- the RED arm a GPU test uses to
-    // demonstrate what this fix replaced (see the test hook declarations
-    // above).
+    // itself. llama.cpp-c6ah (finding 28): the RED-arm test hook
+    // (ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check) no
+    // longer branches inside this function at all -- it instead makes
+    // onednn_graph_scratch_free()'s park site skip arming release_done in
+    // the first place (see that hook's own declaration comment for why: a
+    // branch here would still be querying a WATCHED event and inherit the
+    // same lying-query hazard it exists to demonstrate). This function's
+    // release_done-null fallback is what the RED arm actually exercises.
     static bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry);
 
     // Outcome of testing one pool entry against a request's `alignment` and

@@ -194,6 +194,17 @@ EVICT_UNTIL_FITS_BODY_CODE = extract_function_body(
 CLEAR_POOL_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
 )
+# llama.cpp-c6ah (finding 28): the choke point's OWN body, extracted
+# separately from the three caller bodies above -- those checks assert what
+# the CALLERS query (RELEASE_COMPLETE_CALL, never a bare event_complete());
+# this one asserts what the choke point ITSELF does, specifically that its
+# only remaining event_complete() call is the release_done-null fallback,
+# not a second call reintroduced by a RED-arm hook branch (the earlier,
+# incorrect design this redesign replaced -- see the function's own comment
+# for why a check-time hook branch could not reproduce pre-fix behaviour).
+RELEASE_COMPLETE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_pool_entry_release_complete("
+)
 
 
 def test_onednn_graph_allocator_source_contract() -> None:
@@ -561,6 +572,25 @@ def test_onednn_graph_allocator_source_contract() -> None:
     )
     checks["free no-cache branch does not call sycl::free"] = "sycl::free(" not in free_fn_code
 
+    # llama.cpp-c6ah (finding 28): the choke point itself must call
+    # event_complete() exactly once -- the release_done-null fallback --
+    # and never branch on the RED-arm test hook. A branch there would still
+    # be querying a WATCHED event whenever release_done was armed (a bare
+    # query on a watched event lies -- see event_complete()'s own comment),
+    # so the RED arm can only be correct if this function stays this simple
+    # and the hook instead lives in onednn_graph_scratch_free()'s park site
+    # (checked below), which decides whether release_done gets armed in the
+    # first place.
+    checks["release_complete()'s only event_complete() call is the release_done-null fallback"] = (
+        strip_literals(RELEASE_COMPLETE_BODY_CODE).count("event_complete(") == 1
+    )
+    checks["release_complete() does not branch on the RED-arm test hook"] = (
+        "g_onednn_graph_scratch_test_force_blocking_pool_check" not in RELEASE_COMPLETE_BODY_CODE
+    )
+    checks["free() park site consults the RED-arm test hook before arming the watcher"] = (
+        "g_onednn_graph_scratch_test_force_blocking_pool_check" in FREE_BODY_CODE
+    )
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
 
@@ -665,4 +695,45 @@ def test_pool_entry_release_complete_is_the_single_choke_point() -> None:
         CLEAR_POOL_BODY_CODE,
         "onednn_graph_scratch_clear_pool_locked()",
         "for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {",
+    )
+
+
+def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() -> None:
+    """Mutation witness for llama.cpp-c6ah finding 28: proves the two checks
+    added for it in the main contract test above would actually catch the
+    SPECIFIC regression they exist to prevent -- a RED-arm test hook branch
+    reintroduced inside onednn_graph_scratch_pool_entry_release_complete()
+    itself, querying release_event directly whenever the hook is forced,
+    regardless of release_done. That design was tried and found incorrect
+    (a bare query on an already-WATCHED event lies rather than blocking --
+    see the function's own comment), which is why the fix moved the hook to
+    onednn_graph_scratch_free()'s park site instead; this witness proves a
+    regression back to the check-time branch would be caught, not merely
+    that the current source happens to pass."""
+    anchor = "if (entry.release_done) {"
+    assert anchor in RELEASE_COMPLETE_BODY_CODE, "mutation target string not found -- update this witness"
+    reintroduced_hook_branch = (
+        "if (onednn_graph_scratch_test_hooks_enabled() && "
+        "g_onednn_graph_scratch_test_force_blocking_pool_check.load(std::memory_order_acquire)) { "
+        "return event_complete(entry.release_event); } "
+    )
+    mutated = RELEASE_COMPLETE_BODY_CODE.replace(anchor, reintroduced_hook_branch + anchor, 1)
+    assert mutated != RELEASE_COMPLETE_BODY_CODE
+
+    real_count = strip_literals(RELEASE_COMPLETE_BODY_CODE).count("event_complete(")
+    mutated_count = strip_literals(mutated).count("event_complete(")
+    assert real_count == 1, (
+        "the real, unmutated release_complete() body should call event_complete() exactly once "
+        f"(the release_done-null fallback); found {real_count}"
+    )
+    assert mutated_count != 1, (
+        "mutation witness is broken: the reintroduced hook branch's extra event_complete() call was not "
+        "detected by the call-count check"
+    )
+
+    assert "g_onednn_graph_scratch_test_force_blocking_pool_check" not in RELEASE_COMPLETE_BODY_CODE, (
+        "the real, unmutated release_complete() body should not reference the RED-arm hook at all"
+    )
+    assert "g_onednn_graph_scratch_test_force_blocking_pool_check" in mutated, (
+        "mutation witness is broken: the reintroduced hook reference was not present in the mutated text"
     )
