@@ -39,6 +39,9 @@ GGML_SYCL_H = (ROOT / "ggml/include/ggml-sycl.h").read_text()
 CACHE_HPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.hpp").read_text()
 CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/unified-cache.cpp").read_text()
 LLAMA_CONTEXT_CPP = (ROOT / "src/llama-context.cpp").read_text()
+# llama.cpp-rqak: llama_model_sycl_populate_inventory() lives here -- see
+# test_all_layers_max_updates_before_eligibility_continue() below.
+LLAMA_MODEL_CPP = (ROOT / "src/llama-model.cpp").read_text()
 # llama.cpp-oyfl: plain file I/O, not the codescout index -- CLAUDE.md
 # documents that index (and search_text's live scan) as blind/oversized for
 # this specific ~60k-line file, so a tool-assisted search here would
@@ -76,6 +79,7 @@ GGML_SYCL_H_CODE = strip_comments(GGML_SYCL_H)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
 LLAMA_CONTEXT_CPP_CODE = strip_comments(LLAMA_CONTEXT_CPP)
+LLAMA_MODEL_CPP_CODE = strip_comments(LLAMA_MODEL_CPP)
 GGML_SYCL_CPP_CODE = strip_comments(GGML_SYCL_CPP)
 
 
@@ -224,6 +228,106 @@ def test_both_callers_wire_into_the_shared_guard():
     assert (
         "ggml_backend_sycl_recheck_runtime_context_flash_attn(" in header_norm
     ), "ggml_backend_sycl_recheck_runtime_context_flash_attn() must be declared in ggml-sycl.h"
+
+
+def test_callers_pass_the_all_layers_head_count():
+    """llama.cpp-rqak: both guard call sites -- the full transaction's
+    next_plan and the narrow re-check's current->plan -- must pass the
+    ALL-LAYERS head-count field into ggml_sycl_check_nonfa_attn_scratch().
+    The non-FA attention path runs on EVERY attention layer, so its demand
+    model (max(16 MiB, n_head x n_ubatch x n_ctx x 2 B x 3)) needs the
+    maximum query-head count over all layers -- not llama.cpp-o3a0's
+    n_head_ctx_max/n_head_swa_max, which are maxima over oneDNN-ELIGIBLE
+    layers only and both read 0 for a model where every layer is
+    ineligible (e.g. a DeepSeek-V3-class model, D=576), which would push
+    this guard into its "could not evaluate" WARN path and leave that
+    exact shape unguarded. And never the pre-o3a0 planner_n_head name,
+    which o3a0 removed -- git's clean auto-merge of o3a0 (per-class
+    maxima) with llama.cpp-oyfl (this guard, developed against the
+    pre-o3a0 single field) left the guard referencing a member that no
+    longer exists."""
+    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    assert full_start != -1
+    full_next = GGML_SYCL_CPP_CODE.find(
+        "ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1
+    )
+    assert full_next != -1
+    full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
+
+    recheck_start = GGML_SYCL_CPP_CODE.find(
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn("
+    )
+    assert recheck_start != -1
+    recheck_next = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_n_ctx(", recheck_start + 1)
+    assert recheck_next != -1
+    recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
+
+    for caller_name, body in (
+        ("the full transaction (ggml_backend_sycl_set_runtime_context)", full_body_norm),
+        ("the narrow re-check (ggml_backend_sycl_recheck_runtime_context_flash_attn)", recheck_body_norm),
+    ):
+        assert "planner_n_head_all_max" in body, (
+            f"{caller_name} must pass the all-layers head-count field (planner_n_head_all_max) into "
+            "ggml_sycl_check_nonfa_attn_scratch() -- see llama.cpp-rqak"
+        )
+        # \b requires a non-word char on both sides, and "_" is a word char,
+        # so this cannot match inside planner_n_head_all_max/planner_n_head_ctx_max/
+        # planner_n_head_swa_max -- it only matches the bare, pre-o3a0 name.
+        assert not re.search(r"\bplanner_n_head\b", body), (
+            f"{caller_name} must not reference the removed planner_n_head field (llama.cpp-o3a0 replaced "
+            "it with the per-class n_head_ctx_max/n_head_swa_max maxima; this guard needs its own "
+            "all-layers field, planner_n_head_all_max, not either of those)"
+        )
+        assert "n_head_ctx_max" not in body and "n_head_swa_max" not in body, (
+            f"{caller_name} must not pass the o3a0 per-class oneDNN-eligible-only maxima "
+            "(n_head_ctx_max / n_head_swa_max) into the non-FA attention guard -- those exclude "
+            "oneDNN-ineligible layers and can both be 0 for a model where every layer is ineligible, "
+            "which would silently leave that model's non-FA scratch demand unguarded"
+        )
+
+
+def test_all_layers_max_updates_before_eligibility_continue():
+    """llama.cpp-rqak: n_head_all_max is correct only because its update in
+    llama_model_sycl_populate_inventory() (src/llama-model.cpp) executes
+    BEFORE the per-layer eligibility check's `continue` -- moving the update
+    below that `continue` would leave every OTHER assertion in this file
+    green (they only check the field's NAME reaches the guard, not that the
+    loop computing it walked every layer) while silently making
+    n_head_all_max eligible-only, i.e. identical to n_head_ctx_max/
+    n_head_swa_max's union -- exactly the DeepSeek-V3-class (every layer
+    ineligible, D=576) failure mode this field exists to guard against,
+    with a value of 0 that this test suite would then have no way to catch
+    from the guard side alone.
+
+    Checked structurally (index-of-substring ordering) rather than by name
+    match, because both statements name n_head_all_max -- a substring check
+    for "n_head_all_max = std::max(" existing somewhere in the function body
+    would still pass with the update moved below the `continue`."""
+    func_start = LLAMA_MODEL_CPP_CODE.find("static void llama_model_sycl_populate_inventory(")
+    assert func_start != -1, "llama_model_sycl_populate_inventory() definition not found in llama-model.cpp"
+    # Bound to this function's own body: the next top-level function
+    # definition after it (llama_model_sycl_apply_inventory), so a match
+    # cannot come from some unrelated later call site.
+    next_func = LLAMA_MODEL_CPP_CODE.find(
+        "static void llama_model_sycl_apply_inventory(", func_start + 1
+    )
+    assert next_func != -1, "could not bound llama_model_sycl_populate_inventory()'s body"
+    body = LLAMA_MODEL_CPP_CODE[func_start:next_func]
+
+    update_idx = body.find("n_head_all_max = std::max(")
+    eligible_idx = body.find("llama_model_sycl_onednn_head_dim_eligible(")
+    assert update_idx != -1, "n_head_all_max's std::max() update not found in populate_inventory()'s body"
+    assert eligible_idx != -1, (
+        "llama_model_sycl_onednn_head_dim_eligible() call (the eligibility gate before the `continue`) "
+        "not found in populate_inventory()'s body"
+    )
+    assert update_idx < eligible_idx, (
+        "n_head_all_max's std::max() update must execute BEFORE the "
+        "llama_model_sycl_onednn_head_dim_eligible() eligibility check's `continue` -- the non-FA "
+        "attention guard this field feeds runs on every attention layer, not just oneDNN-eligible "
+        "ones, so computing it after the `continue` would silently make it eligible-only (0 for a "
+        "model where every layer is ineligible, e.g. DeepSeek-V3-class, D=576) -- see llama.cpp-rqak"
+    )
 
 
 def test_narrow_recheck_forbids_replan_and_takes_the_lock():
@@ -442,7 +546,7 @@ def test_plan_time_shape_is_recorded_unconditionally():
     UNCONDITIONALLY (not gated behind #if GGML_SYCL_DNNL like the oneDNN
     sibling) -- the path this sizes for is independent of oneDNN."""
     cpp_norm = _normalize_ws(CACHE_CPP_CODE)
-    assert "unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head, plan.planner_n_ubatch, plan.planner_n_ctx)" in cpp_norm
+    assert "unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all_max, plan.planner_n_ubatch, plan.planner_n_ctx)" in cpp_norm
 
     # Comment-stripped text drops "#if GGML_SYCL_DNNL" lines too (they are
     # preprocessor directives, not comments -- re-check against the RAW,

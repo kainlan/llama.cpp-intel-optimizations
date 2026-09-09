@@ -1908,7 +1908,7 @@ KQV call's staged operand is `kq_soft_max`, shaped
 staged Q operand — so the formula keeps only that term:
 
 ```
-demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3
+demand = max(16 MiB, n_head * n_ubatch * n_ctx * sizeof(f16) * 3)
 ```
 
 **Rule for adding a consumer, extended:** when the demand scales with
@@ -1920,7 +1920,12 @@ fed by a `unified_cache_set_planned_*_shape()`/`get_planned_*_shape()` pair
 of atomics (one triplet per consumer — the non-FA one is **not** a reuse of
 the oneDNN triplet, because it is unconditional while the oneDNN one is
 gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
-right where `plan.planner_n_head/n_ubatch/n_ctx` are already known.
+right where `plan.planner_n_head_all_max/n_ubatch/n_ctx` are already known --
+`planner_n_head_all_max` (llama.cpp-rqak) is the max query-head count over ALL
+attention layers, distinct from the oneDNN-eligible-only
+`planner_n_head_ctx_max`/`planner_n_head_swa_max` pair above, because this
+guard's non-FA path runs on every attention layer regardless of oneDNN
+eligibility.
 
 **The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro
 log, not carried over by analogy.** An earlier version of this formula
@@ -1977,6 +1982,21 @@ leases; its own log line only claims "raised" when the zone's capacity
 actually grew, and otherwise reports only what was observed ("did not
 raise the SCRATCH zone (... unchanged)") rather than naming a specific
 cause this code never actually checked.
+
+**An asymmetry between the two callers (llama.cpp-rqak), worth knowing
+before touching either path.** An explicit `-fa 0` context goes through
+the FULL transaction above and records its real runtime shape via
+`unified_cache_set_planned_nonfa_attn_scratch_shape()` (restoring the
+previous shape if the guard refuses); an AUTO context that resolves OFF
+goes through `ggml_backend_sycl_recheck_runtime_context_flash_attn()`'s
+narrow re-check instead, which deliberately records nothing (no replan, no
+restore-on-refusal -- see its `allow_replan=false` call). So an
+AUTO-resolved-OFF context is checked against whatever shape was recorded
+earlier (at load time, or by a prior explicit `-fa 0` context), never its
+own. This has no practical effect today, because the plan-time raise this
+recorded shape feeds is already a no-op past model load for the reason
+above -- weights hold live leases by the time any runtime-context call
+happens, so there is nothing for a missed recording to have changed.
 
 **The check is EMPIRICAL, not a modeled worst case — read this before
 tightening or loosening it.** A first draft of this predicate (llama.cpp

@@ -477,6 +477,16 @@ struct placement_kv_info {
     // window itself is n_swa below, already carried by this struct.
     uint32_t          n_head_ctx_max   = 0;
     uint32_t          n_head_swa_max   = 0;
+    // llama.cpp-rqak: max query-head count across ALL attention layers,
+    // eligibility ignored -- feeds the non-FA batched mul_mat attention
+    // guard (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp), which
+    // runs on every attention layer regardless of oneDNN eligibility and so
+    // cannot use the two per-class fields above (both can be 0 when every
+    // layer is oneDNN-ineligible). See
+    // ggml_sycl_tensor_inventory::n_head_all_max (ggml-sycl.h) for the full
+    // rationale and placement_plan::planner_n_head_all_max below for where
+    // this is threaded to next.
+    uint32_t          n_head_all_max   = 0;
     bool              n_ctx_is_runtime = false;
     // MoE hyperparameters (0 for dense models)
     int               n_expert_used    = 0;  // Top-k experts selected per token
@@ -563,6 +573,15 @@ struct placement_plan {
     uint32_t                                   planner_n_head_ctx_max   = 0;
     uint32_t                                   planner_n_head_swa_max   = 0;
     uint32_t                                   planner_n_swa            = 0;
+    // llama.cpp-rqak: max query-head count across ALL attention layers,
+    // eligibility ignored, threaded from placement_kv_info::n_head_all_max.
+    // This is a THIRD, distinct field from the two oneDNN-eligible-only
+    // maxima above -- it feeds the non-FA batched mul_mat attention guard
+    // (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp), which runs on
+    // every attention layer and so cannot use planner_n_head_ctx_max/
+    // planner_n_head_swa_max (both can be 0 when every layer is
+    // oneDNN-ineligible).
+    uint32_t                                   planner_n_head_all_max   = 0;
     // Component-wise maxima by actual device owner. Materialization consumes
     // these values later; allocation handles never belong in this plan.
     std::vector<moe_mmid_owner_workspace_plan> moe_mmid_workspaces;
@@ -1375,6 +1394,19 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // it for ne11: the planned/runtime context length is the worst-case n_kv a
 // layer's attention will ever see, and it is what every call site has on
 // hand. All-zero means "never planned for this device".
+//
+// llama.cpp-rqak: n_head here is the ALL-LAYERS query-head maximum
+// (ggml_sycl_tensor_inventory::n_head_all_max / placement_plan::
+// planner_n_head_all_max), eligibility ignored -- deliberately NOT the oneDNN
+// sibling struct's per-window-class, oneDNN-ELIGIBLE-only maxima
+// (onednn_graph_scratch_planned_shape::n_head_ctx_max/n_head_swa_max
+// above). This path (ggml_sycl_mul_mat_batched_sycl(), the native
+// SYCL/oneMath batched route) runs on EVERY attention layer when flash
+// attention is off, regardless of whether that layer is eligible for the
+// oneDNN SDPA route, so it needs the true all-layers maximum -- the two
+// per-class fields can both be 0 for a model where every layer is
+// oneDNN-ineligible (e.g. a DeepSeek-V3-class model, D=576), which would
+// leave that model's non-FA scratch demand unguarded.
 struct nonfa_attn_scratch_planned_shape {
     uint32_t n_head   = 0;
     uint32_t n_ubatch = 0;
@@ -1392,7 +1424,7 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) calls this directly
 // from a different translation unit to decide whether the SCRATCH zone the
 // arena already reserved can hold a given (n_head, n_ubatch, n_ctx) shape's
-// worst-case staging demand, so it cannot be a private helper the way the
+// staging demand, so it cannot be a private helper the way the
 // oneDNN sibling is. A host-only test calls it directly too -- no separate
 // ggml_sycl_test_* wrapper is needed.
 //
