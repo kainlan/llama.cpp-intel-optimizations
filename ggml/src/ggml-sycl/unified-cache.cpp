@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -708,18 +709,43 @@ static std::atomic<size_t>   g_runtime_host_cat_bytes[static_cast<int>(runtime_c
 static std::atomic<size_t>   g_runtime_managed_reserved_host_bytes{};
 static std::atomic<size_t>   g_planned_pp_pipeline_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_onednn_scratchpad_bytes[GGML_SYCL_MAX_DEVICES]{};
-// llama.cpp-0oxf: the SDPA shape (max query-head count, ubatch size, context
-// length) known at the time the oneDNN scratchpad was last planned for this
-// device (compute_placement_plan()/populate_host_zone_sizing(), see the
-// "oneDNN scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes()'s
+// llama.cpp-0oxf/o3a0: the SDPA shape (max query-head count per attention
+// window class, the SWA window itself, ubatch size, context length) known at
+// the time the oneDNN scratchpad was last planned for this device
+// (compute_placement_plan()/populate_host_zone_sizing(), see the "oneDNN
+// scratchpad:" log line). Feeds onednn_graph_scratch_zone_floor_bytes_swa()'s
 // shape-derived floor -- the oneDNN Graph-scratch request is proportional to
-// n_head x n_ubatch x n_ctx (see that function's derivation comment), NOT
-// n_ctx alone as an earlier version of this fix assumed. Three independent
-// atomics, like every other "planned" global in this file -- 0 means "never
-// planned for this device" for each.
-static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head[GGML_SYCL_MAX_DEVICES]{};
+// n_head x n_ubatch x n_ctx for non-SWA layers and n_head x n_ubatch x
+// min(n_ctx, n_swa + n_ubatch) for SWA layers (llama.cpp-o3a0; the span a
+// ubatch of n_ubatch queries scans over an n_swa-key sliding window, GPU-
+// verified), NOT a single n_head x n_ctx term for every layer as an
+// earlier version of this fix assumed.
+// Five independent atomics, like every other "planned" global in this file
+// -- 0 means "never planned for this device" for each. A torn read across
+// a concurrent re-plan can therefore combine fields from two different
+// plans -- e.g. a NEW plan's nonzero n_head_swa_max with the OLD plan's
+// stale n_swa=0 (a dense model's plan, read mid-transition to an SWA
+// model's) -- which under-provisions the swa term (window collapses to
+// min(n_ctx, n_ubatch) instead of the real min(n_ctx, n_swa + n_ubatch)).
+// This is moot in practice for the same reason every other multi-field
+// "planned" global in this file tolerates torn reads: all five stores
+// happen back-to-back inside one setter call with no yield point between
+// them, so the torn-read window is a handful of instructions during a
+// re-plan, which itself is rare (model load / runtime context change)
+// relative to reads.
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head_ctx_max[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_head_swa_max[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_swa[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_onednn_graph_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-oyfl: the same shape recorded for the non-flash-attention batched
+// mul_mat scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()) --
+// a SEPARATE triplet from the oneDNN one above, not a reuse of it, because
+// this path is unconditional (not gated behind GGML_SYCL_DNNL) and the two
+// consumers must be tunable independently.
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_head[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_nonfa_attn_scratch_n_ctx[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_weight_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
@@ -1522,20 +1548,25 @@ void unified_cache_set_planned_onednn_scratchpad_bytes(int device_id, size_t byt
     g_planned_onednn_scratchpad_bytes[device_id].store(bytes, std::memory_order_release);
 }
 
-// llama.cpp-0oxf: record the SDPA shape (n_head, n_ubatch, n_ctx) alongside
-// the scratchpad bytes above so onednn_graph_scratch_zone_floor_bytes() can
-// derive its floor from the shape the Graph-scratch request actually scales
-// with, instead of a flat constant. Called from the same "oneDNN scratchpad:"
-// planning step (populate_host_zone_sizing()) once plan.planner_n_head/
-// planner_n_ubatch/planner_n_ctx are set.
+// llama.cpp-0oxf/o3a0: record the SDPA shape (n_head_ctx_max, n_head_swa_max,
+// n_swa, n_ubatch, n_ctx) alongside the scratchpad bytes above so
+// onednn_graph_scratch_zone_floor_bytes_swa() can derive its floor from the
+// shape the Graph-scratch request actually scales with, instead of a flat
+// constant. Called from the same "oneDNN scratchpad:" planning step
+// (populate_host_zone_sizing()) once plan.planner_n_head_ctx_max/
+// planner_n_head_swa_max/planner_n_swa/planner_n_ubatch/planner_n_ctx are set.
 void unified_cache_set_planned_onednn_graph_scratch_shape(int      device_id,
-                                                          uint32_t n_head,
+                                                          uint32_t n_head_ctx_max,
+                                                          uint32_t n_head_swa_max,
+                                                          uint32_t n_swa,
                                                           uint32_t n_ubatch,
                                                           uint32_t n_ctx) {
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    g_planned_onednn_graph_scratch_n_head[device_id].store(n_head, std::memory_order_release);
+    g_planned_onednn_graph_scratch_n_head_ctx_max[device_id].store(n_head_ctx_max, std::memory_order_release);
+    g_planned_onednn_graph_scratch_n_head_swa_max[device_id].store(n_head_swa_max, std::memory_order_release);
+    g_planned_onednn_graph_scratch_n_swa[device_id].store(n_swa, std::memory_order_release);
     g_planned_onednn_graph_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
     g_planned_onednn_graph_scratch_n_ctx[device_id].store(n_ctx, std::memory_order_release);
 }
@@ -1545,16 +1576,229 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
     if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
         return shape;
     }
-    // Three independent atomics -- see the storage declaration's comment for
+    // Five independent atomics -- see the storage declaration's comment for
     // why a torn read across a concurrent re-plan is tolerated here, same as
     // every other multi-field "planned" global in this file.
-    shape.n_head   = g_planned_onednn_graph_scratch_n_head[device_id].load(std::memory_order_acquire);
-    shape.n_ubatch = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
-    shape.n_ctx    = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    shape.n_head_ctx_max = g_planned_onednn_graph_scratch_n_head_ctx_max[device_id].load(std::memory_order_acquire);
+    shape.n_head_swa_max = g_planned_onednn_graph_scratch_n_head_swa_max[device_id].load(std::memory_order_acquire);
+    shape.n_swa          = g_planned_onednn_graph_scratch_n_swa[device_id].load(std::memory_order_acquire);
+    shape.n_ubatch       = g_planned_onednn_graph_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    shape.n_ctx          = g_planned_onednn_graph_scratch_n_ctx[device_id].load(std::memory_order_acquire);
     return shape;
 }
 
+// llama.cpp-oyfl: see the declaration in unified-cache.hpp for the shape this
+// records and why it is a separate triplet from the oneDNN one above.
+void unified_cache_set_planned_nonfa_attn_scratch_shape(int      device_id,
+                                                        uint32_t n_head,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ctx) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_nonfa_attn_scratch_n_head[device_id].store(n_head, std::memory_order_release);
+    g_planned_nonfa_attn_scratch_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
+    g_planned_nonfa_attn_scratch_n_ctx[device_id].store(n_ctx, std::memory_order_release);
+}
+
+nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_shape(int device_id) {
+    nonfa_attn_scratch_planned_shape shape{};
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return shape;
+    }
+    shape.n_head   = g_planned_nonfa_attn_scratch_n_head[device_id].load(std::memory_order_acquire);
+    shape.n_ubatch = g_planned_nonfa_attn_scratch_n_ubatch[device_id].load(std::memory_order_acquire);
+    shape.n_ctx    = g_planned_nonfa_attn_scratch_n_ctx[device_id].load(std::memory_order_acquire);
+    return shape;
+}
+
+// llama.cpp-oyfl: shared MB-count env-var parser for
+// GGML_SYCL_NONFA_ATTN_SCRATCH_MB and GGML_SYCL_ONEDNN_GRAPH_ZONE_MB,
+// replacing each site's own std::atol()-based copy. atol() cannot report a
+// parse failure -- atol("abc") and atol("0") are both 0 -- so the old copies
+// silently treated a typo'd, non-numeric override exactly like an explicit
+// "use 0 bytes", which is a real behavior difference (0 disables the
+// consumer's own floor) a user would not notice from the log alone.
+//
+// Returns -1 when the variable is unset or empty: the caller falls through
+// to its own formula, silently -- this is the ordinary "no override" case
+// and not worth a WARN. Returns -1 and WARNs once when the value fails to
+// parse, overflows strtol()'s own range (errno == ERANGE), or exceeds
+// kMaxOverrideMb -- a value that large is never a real override, only a
+// mistake (a byte count where a megabyte count was meant, say) that would
+// otherwise silently claim the entire arena; all three are folded into one
+// message and the same fallback-to-formula behavior. Returns the parsed
+// non-negative MB count otherwise; 0 is accepted as a genuine, if unusual,
+// override and WARNed once too, so it is never mistaken for "ignored --
+// fell through to the formula".
+//
+// NOT memoized here, and must not be called directly more than once per
+// variable name: every WARN path fires on every call, not just the first.
+// The two file-scope wrapper functions below memoize the result in their
+// own `static const long`, so each variable is parsed -- and WARNed about,
+// if invalid -- at most once per process no matter how many of this
+// formula's call sites ask for it (there are three today: the demand
+// formula itself, its plan-time raise counterpart in
+// ensure_planned_arena_zones(), and the oneDNN Graph-scratch floor).
+static long env_mb_override(const char * name) {
+    const char * env = std::getenv(name);
+    if (!env || env[0] == '\0') {
+        return -1L;
+    }
+    static constexpr long kMaxOverrideMb = 1024L * 1024L;  // 1 TiB; anything above this is a mistake, not an override
+    errno                                = 0;
+    char *     endptr                    = nullptr;
+    const long parsed                    = std::strtol(env, &endptr, 10);
+    if (endptr == env || *endptr != '\0' || parsed < 0 || errno == ERANGE || parsed > kMaxOverrideMb) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] %s=\"%s\" is not a valid non-negative integer, or is out of range -- ignoring "
+            "it and using the formula instead\n",
+            name, env);
+        return -1L;
+    }
+    if (parsed == 0) {
+        GGML_LOG_WARN(
+            "[UNIFIED-CACHE] %s=0 -- using an explicit 0 MB override (not \"unset\"; this disables the "
+            "consumer's own floor)\n",
+            name);
+    }
+    return parsed;
+}
+
+// Memoized, WARN-at-most-once-per-process accessor for
+// GGML_SYCL_NONFA_ATTN_SCRATCH_MB -- see env_mb_override()'s comment above
+// for why callers must go through this rather than calling
+// env_mb_override() directly with their own `static const long`.
+static long nonfa_attn_scratch_mb_override() {
+    static const long value = env_mb_override("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
+    return value;
+}
+
+// The non-FA batched mul_mat scratch demand formula's own floor (see
+// unified_cache_nonfa_attn_scratch_demand_bytes() below for the reasoning
+// on its size) -- hoisted to file scope, rather than kept as a
+// function-local constant, so ensure_planned_arena_zones()'s plan-time
+// raise block can gate its own all-zero-shape skip on it without
+// duplicating the literal.
+static constexpr uint64_t kNonfaAttnScratchFloorBytes = 16ull * 1024ull * 1024ull;
+
+// llama.cpp-oyfl: the non-FA batched mul_mat scratch demand formula. See the
+// declaration in unified-cache.hpp for the derivation and the simplification
+// to the KQV term alone. Exported (not file-static): it is called from
+// ggml-sycl.cpp (a different translation unit) as well as by this file's own
+// plan-time zone sizing.
+//
+// THE CONCURRENCY FACTOR IS MEASURED FROM THE llama.cpp-oyfl REPRO LOG, not
+// carried over by analogy from the oneDNN sibling's c=1.5 (an earlier version
+// of this function did exactly that, and it under-covered the repro -- see
+// the correction below). The repro
+// (session scratchpad oyfl/fa_off-2026-09-07.log, B50, Mistral 7B Q4_0,
+// `llama-bench -p 8192 -n 0 -r 1 -fa 0 -v`) shows the failing allocation's
+// own zone state immediately before it:
+//   line 2042:       SCRATCH_ZONE    460.0 MB
+//   lines 2055-2056: [SYCL] Error in batched mul_mat: batched F16 src1
+//                    staging allocation failed -- re-throwing for fallback
+// The raw (no concurrency factor) demand at that failing request's own shape
+// (n_head=32, n_ubatch=512, n_ctx=8192) is exactly 256 MiB
+// (32*512*8192*sizeof(f16)). The zone was already 460 MiB into its 512 MiB
+// capacity, so the real pressure at the moment of failure was
+// 460 + 256 = 716 MiB against a 256 MiB single-shot request -- a ratio of
+// ~2.8x, not the 1.5x this function used to assume.
+//
+// WHAT THE CONCURRENCY IS: NOT one buffer plus a small safety margin, but
+// several DISTINCT ubatches' worth of this same staging buffer coexisting in
+// the zone at once. scoped_unified_queue_temp::release() (ggml-sycl.cpp)
+// submits a marker event and keeps the handle alive until that event
+// completes rather than freeing synchronously, and a 16-ubatch pp8192 run
+// (n_ubatch=512) submits GPU work for each ubatch faster than the previous
+// ubatch's staging buffer's release event resolves -- so by the time the
+// LARGEST request (the final ubatch, n_kv=8192) arrives, several of the
+// immediately preceding ubatches' smaller-but-still-substantial requests
+// (n_kv=7168, 7680, ...) are typically still occupying the zone.
+//
+// c=3 (not 3/2) is chosen to clear the observed 2.8x with a small margin,
+// rounding to a clean multiple. This is inferred from ONE repro's zone-state
+// snapshot, not fit to several independent hardware measurements the way the
+// oneDNN sibling's c=1.5 was (five captures, llama.cpp-0oxf comment c-xcop).
+//
+// TWO OPPOSING PRESSURES ON THIS CONSTANT, BOTH REAL. Raise it only on new
+// hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+// occupancy across a whole pp8192 run) -- never lower it without such
+// evidence, because lowering trades away the margin this check exists to
+// keep ahead of the abort it prevents. But raising it is not free either:
+// this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+// larger c also refuses MORE contexts that would actually have run --
+// trading false refusals for margin, on the same unvalidated single
+// snapshot. Neither direction is free; do not move this value without a
+// multi-point capture backing the move. GGML_SYCL_NONFA_ATTN_SCRATCH_MB
+// (below) is the lever for applying a future measurement without a code
+// change.
+size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+    const long env_mb = nonfa_attn_scratch_mb_override();
+    if (env_mb >= 0) {
+        return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
+    }
+
+    // Floor deliberately smaller than the oneDNN sibling's 64 MiB: this
+    // consumer shares the SCRATCH zone's own pre-existing 512 MiB default
+    // (ensure_planned_arena_zones()), not a small dedicated zone, so a tiny
+    // floor here does not risk starving the allocation at small shapes --
+    // it only needs to catch the case where the formula itself underflows to
+    // near-zero (n_head, n_ubatch, or n_ctx == 0, e.g. before any context is
+    // known) and floor to something a single small allocation can still need.
+    // (kNonfaAttnScratchFloorBytes, defined at file scope just above
+    // unified_cache_nonfa_attn_scratch_demand_bytes(), is this same 16 MiB
+    // value -- hoisted to file scope so ensure_planned_arena_zones() can
+    // reference it too.)
+    static constexpr uint64_t kSizeofF16        = 2;
+    static constexpr uint64_t kConcurrencyFloor = 3;  // see the derivation above
+    const uint64_t            elems =
+        static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * static_cast<uint64_t>(n_ctx);
+    const uint64_t modeled = elems * kSizeofF16 * kConcurrencyFloor;
+    return static_cast<size_t>(std::max<uint64_t>(kNonfaAttnScratchFloorBytes, modeled));
+}
+
+uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
+                                                                    uint32_t n_head,
+                                                                    uint32_t n_ubatch) {
+    if (n_head == 0 || n_ubatch == 0) {
+        return 0;
+    }
+    // Inverse of the formula above: modeled(n_ctx) = n_head * n_ubatch * n_ctx
+    // * sizeof(f16) * 3. Solve for the largest n_ctx with
+    // modeled(n_ctx) <= zone_capacity_bytes, then round down to a multiple of
+    // 256 -- the same cell-rounding convention the KV-side
+    // ggml_sycl_largest_fitting_n_ctx() (ggml-sycl.cpp) uses, so the two
+    // "largest context that fits" figures a refusal can print are directly
+    // comparable. This ignores the kNonfaAttnScratchFloorBytes clamp
+    // unified_cache_nonfa_attn_scratch_demand_bytes() applies (a tiny zone
+    // capacity below the floor would still fail a real allocation attempt;
+    // reporting a fitting n_ctx > 0 there would be misleading), which the
+    // caller must not rely on to be exact for a zone that small.
+    const uint64_t denom   = static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * 2ull * 3ull;
+    const uint64_t raw     = static_cast<uint64_t>(zone_capacity_bytes) / denom;
+    // Clamp BEFORE rounding, not after -- std::numeric_limits<uint32_t>::max()
+    // (4294967295) is not itself a multiple of 256, so rounding first and
+    // clamping second could return a value that breaks the "always a
+    // multiple of 256" invariant the caller (and this function's own test)
+    // relies on, for a raw value large enough to need clamping at all.
+    const uint64_t clamped = std::min<uint64_t>(raw, std::numeric_limits<uint32_t>::max());
+    const uint64_t rounded = (clamped / 256ull) * 256ull;
+    return static_cast<uint32_t>(rounded);
+}
+
 #if GGML_SYCL_DNNL
+// llama.cpp-rqak: moved inside this guard -- its only caller (below) is
+// itself inside #if GGML_SYCL_DNNL, and a GGML_SYCL_DNNL=0 build was
+// otherwise left with an unused-function warning for a file-scope
+// definition with no reachable call site.
+// Same as nonfa_attn_scratch_mb_override() above (which stays outside this
+// guard -- it is used unconditionally), for GGML_SYCL_ONEDNN_GRAPH_ZONE_MB.
+static long onednn_graph_zone_mb_override() {
+    static const long value = env_mb_override("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
+    return value;
+}
+
 // llama.cpp-gwno: extra headroom for onednn_graph_scratch_alloc() (the Graph
 // API SDPA allocator, unified_cache::onednn_graph_scratch_alloc/free defined
 // further below in this file), ADDITIVE on top of the primitive-API
@@ -1592,7 +1836,43 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // before raising GGML_SYCL_ONEDNN_GRAPH_ZONE_MB back up -- a nonzero uprobe
 // count or a sizing abort means the zone genuinely doesn't fit this
 // workload's outstanding-buffer count, not that the allocator is unwired.
-static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+// llama.cpp-o3a0: window-aware core formula, replacing the flat "every
+// oneDNN-served layer's window is n_ctx" assumption the 3-arg overload below
+// used to embody directly. Takes the SPLIT head-count maxima
+// (llama_model_sycl_populate_inventory's n_head_ctx_max/n_head_swa_max,
+// src/llama-model.cpp, threaded through placement_kv_info ->
+// placement_plan -> onednn_graph_scratch_planned_shape) plus the single
+// sliding-window size n_swa, and gives each attention class its own
+// effective KV window: non-SWA layers see n_ctx, SWA layers see
+// min(n_ctx, n_swa + n_ubatch) -- a sliding window of n_swa keys seen by a
+// ubatch of n_ubatch queries spans n_swa + n_ubatch keys in total (the
+// first query in the ubatch looks n_swa keys back, the last one n_ubatch
+// further along than that), and the oneDNN SDPA scratch scales with that
+// whole span, not n_swa alone (GPU-verified on the B50: solving
+// 1.5 x n_head x n_ubatch x K x sizeof(f32) for K against measured
+// Graph-scratch requests gives K = n_swa + n_ubatch exactly at two
+// different ubatch sizes -- see the gemma4 real-shape derivation below).
+// n_swa + n_ubatch is scoped to a SINGLE sequence (n_seq_max=1), matching
+// placement_kv_info::kv_bytes_per_swa_layer()'s identical
+// min(n_ctx, n_swa + n_ubatch) precedent (unified-cache.hpp) -- a unified
+// iSWA cache serving n_seq_max > 1 concurrent sequences could in
+// principle reach n_swa * n_seq_max + n_ubatch keys instead; threading
+// plan.planner_n_seq_max into this formula is deferred until the floor
+// is actually live at a real n_ctx (llama.cpp-fkpg), since n_seq_max > 1
+// support does not change today's n_seq_max=1-only behavior either way.
+// Non-SWA and SWA layers can both be oneDNN-eligible in the same model, so
+// the true peak is whichever CLASS demands more, not their sum -- the
+// compiled partitions for each class are not concurrently outstanding for
+// the same request. gemma4 E4B's real shape (n_head_swa_max=8, n_swa=512,
+// D=512 global layers still ineligible by default so n_head_ctx_max=0)
+// computes 24 MiB raw at n_ubatch=512 n_ctx=8192, clamped to 64 MiB --
+// matching the GPU probe exactly (see test_swa_formula()'s gemma4 row,
+// tests/test-sycl-onednn-graph-floor.cpp).
+static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
+                                                        uint32_t n_head_swa_max,
+                                                        uint32_t n_swa,
+                                                        uint32_t n_ubatch,
+                                                        uint32_t n_ctx) {
     // GGML_SYCL_ONEDNN_GRAPH_ZONE_MB always wins over the FORMULA when set
     // -- unchanged behaviour, still the escape hatch this file's header
     // comment tells you to reach for. It does NOT win over the 25% budget
@@ -1602,16 +1882,7 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
     // requested; the DIRECT path absorbs whatever the clamp removes either
     // way, so an override that exceeds the clamp is not a correctness
     // problem, just a case where "always wins" would overstate it.
-    static const long env_mb = [] {
-        const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB");
-        if (env && env[0] != '\0') {
-            long parsed = std::atol(env);
-            if (parsed >= 0) {
-                return parsed;
-            }
-        }
-        return -1L;
-    }();
+    const long env_mb = onednn_graph_zone_mb_override();
     if (env_mb >= 0) {
         return static_cast<size_t>(env_mb) * 1024ull * 1024ull;
     }
@@ -1626,31 +1897,67 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
     // build_and_compile_sdpa(), fattn-onednn.cpp), NOT one request in
     // isolation:
     //
-    //   graph_peak = c * n_head * n_ubatch * n_ctx * sizeof(f32), c = 1.5
+    //   graph_peak = c * n_head * n_ubatch * ne11 * sizeof(f32), c = 1.5
     //
     // c=1.5 (not 1.0) because measurement showed ~5 SDPA scratch buffers
     // concurrently in flight even on an otherwise idle host, not just one.
     // Measured (task llama.cpp-0oxf, comment c-xcop), Mistral 7B Q4_0
-    // (n_head=32): 48 MB @ (n_ubatch=512, n_ctx=512), 192 MB @ (512, 2048),
-    // 768 MB @ (512, 8192), 96 MB @ (256, 2048), 48 MB @ (128, 2048) -- all
-    // five match this formula to the exact byte. gemma4 (n_head=8) measured
-    // 24 MB @ (512, 8192), which this formula does NOT reproduce at n_ctx=8192
-    // (predicts 192 MB) -- but IS explained, not a counterexample: gemma4's
-    // oneDNN-served layers are sliding-window with window=1024, so the real
-    // ne11 is min(n_ctx, window) there, and 1.5 x 8 x 512 x 1024 x 4 B == the
-    // measured 24 MB exactly; using planner_n_ctx as an upper bound on ne11
-    // over-provisions SWA models (safely, bounded by the 25% budget clamp
-    // below) rather than under-covering them, and a window-aware refinement
-    // is tracked separately (llama.cpp-o3a0).
+    // (n_head=32, no SWA so ne11 == n_ctx): 48 MB @ (n_ubatch=512, n_ctx=512),
+    // 192 MB @ (512, 2048), 768 MB @ (512, 8192), 96 MB @ (256, 2048),
+    // 48 MB @ (128, 2048) -- all five match this formula to the exact byte.
+    // gemma4 (n_head=8) measured 24 MB @ (512, 8192): the original o3a0
+    // hypothesis was that its oneDNN-served layers are sliding-window with
+    // window=1024 (matching 1.5 x 8 x 512 x 1024 x 4 B == the measured
+    // 24 MB exactly), which is what motivated min(n_ctx, n_swa) rather than
+    // n_ctx as the correct ne11 for SWA layers. ⚠️ THAT WINDOW VALUE OF
+    // n_swa ALONE WAS WRONG (GPU-verified on the B50, GGML_SYCL_DEBUG=1
+    // probe of gemma4 E4B's own SWA layers, not the formula in isolation):
+    // gemma4's real GGUF attention.sliding_window is 512, not 1024, and
+    // min(n_ctx, n_swa) alone at that value predicts 12 MiB -- but the
+    // probe's OWN measured Graph-scratch requests at n_ubatch=512 were
+    // 24.00 MB (x2) and 12.00 MB (x2), high-water 24.0 MB, and at
+    // n_ubatch=256 were 9.00/6.00/3.00 MB, high-water 9.0 MB. Solving
+    // 1.5 x 8 x n_ubatch x K x 4 B for K gives exactly K = n_swa + n_ubatch
+    // both times (1024 = 512 + 512 at ubatch=512; 768 = 512 + 256 at
+    // ubatch=256) -- a sliding window of n_swa keys seen by a ubatch of
+    // n_ubatch queries spans n_swa + n_ubatch keys, not n_swa alone (the
+    // first query in the ubatch looks n_swa keys back, the last one
+    // n_ubatch further along). This ALSO resolves the exact number this
+    // ticket originally cited: 1.5 x 8 x 512 x (512+512) x 4 B == the
+    // historically measured 24 MB exactly -- the "window=1024" guess above
+    // was wrong about WHY, but the arithmetic happened to match because
+    // 512+512 == 1024. The formula below now uses
+    // min(n_ctx, n_swa + n_ubatch) as ne11 for the SWA class. An earlier
+    // version of this fix used planner_n_ctx as ne11 for every layer
+    // regardless of class, which over-provisions this SWA model 8x at the
+    // real n_swa=512/n_ubatch=512 (192 MB flat vs. 24 MiB raw here) --
+    // safely, bounded by the 25% budget clamp below, but wasting VRAM the
+    // model never needed.
     static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
     static constexpr uint64_t kSizeofF32     = 4;
+    const uint64_t            ctx_term       = static_cast<uint64_t>(n_head_ctx_max) * static_cast<uint64_t>(n_ctx);
+    const uint64_t            swa_term =
+        static_cast<uint64_t>(n_head_swa_max) *
+        std::min(static_cast<uint64_t>(n_ctx), static_cast<uint64_t>(n_swa) + static_cast<uint64_t>(n_ubatch));
     // Fixed-point 3/2 rather than a floating-point 1.5x: exact integer
     // arithmetic, no rounding surprises near the MiB boundaries the anchor
     // points above were measured at.
-    const uint64_t            elems =
-        static_cast<uint64_t>(n_head) * static_cast<uint64_t>(n_ubatch) * static_cast<uint64_t>(n_ctx);
+    const uint64_t elems   = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch);
     const uint64_t modeled = (elems * kSizeofF32 * 3) / 2;
     return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
+}
+
+// llama.cpp-0oxf: thin backward-compat overload for a caller with a single
+// head count and no SWA/non-SWA distinction (tests/test-sycl-onednn-graph-
+// allocator-source.py pins this exact form, and
+// ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes() below still exposes
+// it) -- treats the caller's n_head as the non-SWA class with an empty SWA
+// class (n_head_swa_max=0 => the swa_term product is always 0 regardless
+// of what min(n_ctx, n_swa + n_ubatch) evaluates to, since it is
+// multiplied by a zero head count and never contributes), matching this
+// overload's pre-o3a0 behaviour byte for byte.
+static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
+    return onednn_graph_scratch_zone_floor_bytes_swa(n_head, 0, 0, n_ubatch, n_ctx);
 }
 
 // llama.cpp-0oxf: host-testable wrapper -- onednn_graph_scratch_zone_floor_bytes()
@@ -1658,6 +1965,17 @@ static size_t onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_
 // calls this exported passthrough instead. Declared in unified-cache.hpp.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx) {
     return onednn_graph_scratch_zone_floor_bytes(n_head, n_ubatch, n_ctx);
+}
+
+// llama.cpp-o3a0: host-testable wrapper around the window-aware
+// onednn_graph_scratch_zone_floor_bytes_swa() above -- same internal-linkage/
+// memoization caveats as the wrapper immediately above.
+size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
+                                                                uint32_t n_head_swa_max,
+                                                                uint32_t n_swa,
+                                                                uint32_t n_ubatch,
+                                                                uint32_t n_ctx) {
+    return onednn_graph_scratch_zone_floor_bytes_swa(n_head_ctx_max, n_head_swa_max, n_swa, n_ubatch, n_ctx);
 }
 #endif
 
@@ -1680,7 +1998,8 @@ size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {
     if (ggml_sycl::onednn_graph_allocator_enabled()) {
         const onednn_graph_scratch_planned_shape shape =
             unified_cache_get_planned_onednn_graph_scratch_shape(device_id);
-        bytes += onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx);
+        bytes += onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
+                                                           shape.n_ubatch, shape.n_ctx);
     }
 #endif
     return bytes;
@@ -3692,6 +4011,107 @@ bool unified_cache::ensure_planned_arena_zones() {
     const char * arena_mb_env = std::getenv("GGML_SYCL_COMPUTE_ARENA_MB");
     if (arena_mb_env) {
         scratch_zone = static_cast<size_t>(std::max(0, std::atoi(arena_mb_env))) * 1024 * 1024;
+    }
+    // llama.cpp-oyfl: raise the SCRATCH zone for the non-FA batched mul_mat
+    // floor the same way onednn_zone is raised below for its own planned
+    // estimate. Best-effort and, for the standard model-load flow, NOT
+    // sufficient on its own: populate_host_zone_sizing() records this shape
+    // from plan.planner_n_ctx, and at model load that is always either 0 or
+    // the KV-info conservative default (llama_model_sycl_make_placement_envelope()
+    // hardcodes envelope.n_ctx = 0 -- llama-model.cpp -- so no real -c/-p
+    // reaches this point before weights stream in). Piping the real context
+    // size back into pre-load sizing is llama.cpp-fkpg's scope, not this
+    // ticket's -- this raise only helps when a caller's real shape happens to
+    // already be known this early, or when GGML_SYCL_NONFA_ATTN_SCRATCH_MB is
+    // set manually before the process starts (which reads the same way
+    // GGML_SYCL_COMPUTE_ARENA_MB above does: at this first reservation,
+    // before any weight bytes load). The authoritative, always-effective
+    // check is the runtime-context-update refusal in ggml-sycl.cpp, which
+    // runs once the real n_ctx/n_ubatch ARE known but cannot resize this
+    // already-fixed zone -- it can only refuse cleanly instead of letting
+    // ggml_sycl_mul_mat_batched_sycl() abort mid-prefill.
+    //
+    // Bounded to a quarter of the available budget, same reasoning and same
+    // fraction as the oneDNN zone's clamp below: a fat shape (many heads x a
+    // large planned n_ubatch x a large planned n_ctx) must not be allowed to
+    // starve the WEIGHT zone by claiming an unbounded slice of the arena for
+    // a consumer whose real demand this early is only ever a guess.
+    {
+        const nonfa_attn_scratch_planned_shape nonfa_shape = unified_cache_get_planned_nonfa_attn_scratch_shape(dev_id);
+        // An all-zero recorded shape with no override active USUALLY means
+        // populate_host_zone_sizing() has not run for this device yet --
+        // there is nothing real to size from, and the formula's own 16 MiB
+        // floor (kNonfaAttnScratchFloorBytes) can never exceed the 512 MiB
+        // default scratch_zone anyway, so skip the whole block rather than
+        // compute and (not) act on a result that was never going to raise
+        // anything. That reasoning only holds while scratch_zone is at
+        // least the floor, though -- a sub-floor scratch_zone (e.g. from
+        // GGML_SYCL_COMPUTE_ARENA_MB shrinking the whole arena) must still
+        // get the floor raise even with an all-zero, not-yet-known shape,
+        // so the skip is additionally gated on scratch_zone already
+        // meeting the floor. When an override IS active, attribute the
+        // raise to it explicitly below instead of printing a misleading
+        // all-zero shape.
+        const bool                             nonfa_override_active = nonfa_attn_scratch_mb_override() >= 0;
+        const bool nonfa_shape_known = nonfa_shape.n_head != 0 || nonfa_shape.n_ubatch != 0 || nonfa_shape.n_ctx != 0;
+        if (nonfa_override_active || nonfa_shape_known || scratch_zone < kNonfaAttnScratchFloorBytes) {
+            size_t planned_nonfa_attn_scratch = unified_cache_nonfa_attn_scratch_demand_bytes(
+                nonfa_shape.n_head, nonfa_shape.n_ubatch, nonfa_shape.n_ctx);
+            const size_t nonfa_budget_cap = available_budget() / 4;
+            if (planned_nonfa_attn_scratch > nonfa_budget_cap) {
+                // Per-instance once-latch, mirroring onednn_zone_clamp_warned_
+                // -- a function-local static here
+                // would share one latch across every device's unified_cache
+                // instance in the process (same multi-GPU bug the oneDNN
+                // sibling's own comment documents).
+                if (!nonfa_attn_scratch_clamp_warned_.exchange(true, std::memory_order_relaxed)) {
+                    GGML_LOG_WARN(
+                        "[UNIFIED-CACHE] planned non-FA attention scratch %.1f MB exceeds 25%% of available "
+                        "budget -- clamping to %.1f MB (the runtime-context-update refusal in ggml-sycl.cpp "
+                        "still checks the unclamped demand against whatever this zone ends up) (only logged "
+                        "once)\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_budget_cap / (1024.0 * 1024.0));
+                }
+                planned_nonfa_attn_scratch = nonfa_budget_cap;
+            }
+            if (planned_nonfa_attn_scratch > scratch_zone) {
+                // "(planned)": this is ensure_planned_arena_zones()'s own
+                // plan-time raise, distinguished from the guard's later
+                // "(observed)" re-plan-attempt raise
+                // (ggml_sycl_check_nonfa_attn_scratch(), ggml-sycl.cpp) so
+                // a log reader can tell which of the two code paths
+                // actually grew the zone.
+                if (nonfa_override_active) {
+                    GGML_LOG_INFO(
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from "
+                        "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=%ld override\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_attn_scratch_mb_override());
+                } else if (nonfa_shape_known) {
+                    GGML_LOG_INFO(
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) from non-FA attention scratch "
+                        "estimate (n_head=%u n_ubatch=%u n_ctx=%u)\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0), nonfa_shape.n_head, nonfa_shape.n_ubatch,
+                        nonfa_shape.n_ctx);
+                } else {
+                    // Neither an override nor a known shape -- this raise
+                    // came from the sub-floor scratch_zone branch above:
+                    // the arena's own SCRATCH zone default (or a shrunk
+                    // GGML_SYCL_COMPUTE_ARENA_MB) was below the formula's
+                    // own floor even with no shape known yet. Do NOT
+                    // attribute this to a "(n_head=0 n_ubatch=0 n_ctx=0)"
+                    // estimate -- that would misleadingly imply a real
+                    // shape was measured and came out all zeros, when in
+                    // fact no shape is known at all.
+                    GGML_LOG_INFO(
+                        "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (planned) to meet the non-FA attention "
+                        "scratch formula's own %.0f MiB floor (no shape known yet; the arena's SCRATCH zone "
+                        "was below the floor)\n",
+                        planned_nonfa_attn_scratch / (1024.0 * 1024.0),
+                        kNonfaAttnScratchFloorBytes / (1024.0 * 1024.0));
+                }
+                scratch_zone = planned_nonfa_attn_scratch;
+            }
+        }
     }
 
     size_t       onednn_zone         = 256 * 1024 * 1024;
@@ -10745,17 +11165,19 @@ void * unified_cache::onednn_graph_scratch_alloc_direct_locked(size_t           
         GGML_LOG_ERROR(
             "[UNIFIED-CACHE] oneDNN Graph scratch DIRECT allocation failed after a drain-and-retry: requested "
             "%.2f MB, outstanding direct=%.2f MB (cap %.2f MB, %zu prior waits), ONEDNN zone %.1f MB (used %.1f "
-            "MB, floor %.1f MB at n_head=%u n_ubatch=%u n_ctx=%u). Refusing to hand oneDNN a null scratch pointer "
-            "for this request -- see llama.cpp-0oxf for the GPU page-fault/segfault this used to cause. Aborting "
-            "instead.\n",
+            "MB, floor %.1f MB at n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u n_ubatch=%u n_ctx=%u). Refusing to "
+            "hand oneDNN a null scratch pointer for this request -- see llama.cpp-0oxf for the GPU "
+            "page-fault/segfault this used to cause. Aborting instead.\n",
             size / (1024.0 * 1024.0), onednn_graph_scratch_direct_outstanding_bytes_ / (1024.0 * 1024.0),
             onednn_graph_scratch_direct_cap_bytes(
                 onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire)) /
                 (1024.0 * 1024.0),
             onednn_graph_scratch_direct_wait_count_, zone_capacity(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
             zone_used(vram_zone_id::ONEDNN) / (1024.0 * 1024.0),
-            onednn_graph_scratch_zone_floor_bytes(shape.n_head, shape.n_ubatch, shape.n_ctx) / (1024.0 * 1024.0),
-            shape.n_head, shape.n_ubatch, shape.n_ctx);
+            onednn_graph_scratch_zone_floor_bytes_swa(shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa,
+                                                      shape.n_ubatch, shape.n_ctx) /
+                (1024.0 * 1024.0),
+            shape.n_head_ctx_max, shape.n_head_swa_max, shape.n_swa, shape.n_ubatch, shape.n_ctx);
         if (g_onednn_graph_scratch_test_suppress_abort.load(std::memory_order_acquire)) {
             // Test build only (see the hooks declared in unified-cache.hpp):
             // report "this would have aborted" instead of actually aborting,
@@ -26092,16 +26514,54 @@ static void populate_host_zone_sizing(placement_plan &                          
         plan.onednn_scratchpad_bytes / (1024.0 * 1024.0), zone_maxima.onednn_reorder / (1024.0 * 1024.0),
         zone_maxima.onednn_eligible / (1024.0 * 1024.0), plan.max_tensor_bytes / (1024.0 * 1024.0));
 #if GGML_SYCL_DNNL
-    // llama.cpp-0oxf: record the SDPA shape alongside the scratchpad bytes so
-    // onednn_graph_scratch_zone_floor_bytes() can size the Graph-scratch
-    // allocator's floor from n_head x n_ubatch x n_ctx instead of a flat
-    // constant (or, in an earlier version of this fix, n_ctx alone -- see the
-    // ticket correction, c-xcop).
+    // llama.cpp-0oxf/o3a0: record the SDPA shape alongside the scratchpad
+    // bytes so onednn_graph_scratch_zone_floor_bytes_swa() can size the
+    // Graph-scratch allocator's floor from each attention class's own
+    // effective KV window (n_ctx for non-SWA layers, min(n_ctx, n_swa +
+    // n_ubatch) for SWA layers) instead of a flat n_head x n_ctx term
+    // applied to every layer regardless of class -- see the ticket
+    // correction, llama.cpp-o3a0
+    // (itself following an earlier correction from n_ctx alone, c-xcop).
     if (plan.device_id >= 0) {
-        unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head, plan.planner_n_ubatch,
-                                                             plan.planner_n_ctx);
+        unified_cache_set_planned_onednn_graph_scratch_shape(plan.device_id, plan.planner_n_head_ctx_max,
+                                                             plan.planner_n_head_swa_max, plan.planner_n_swa,
+                                                             plan.planner_n_ubatch, plan.planner_n_ctx);
+        // llama.cpp-o3a0: log the floor and the shape it binds on unconditionally
+        // (not only inside the exceptional DIRECT-allocation-failure path
+        // further below) so a normal run's log alone answers "did the window
+        // narrowing apply here" -- e.g. gemma4 should show n_head_ctx_max=0
+        // n_head_swa_max=8 n_swa=512 (its real GGUF attention.sliding_window;
+        // GPU-verified on the B50) and a 64 MiB floor, not 192 MB.
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
+            "n_ubatch=%u n_ctx=%u)\n",
+            onednn_graph_scratch_zone_floor_bytes_swa(plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max,
+                                                      plan.planner_n_swa, plan.planner_n_ubatch, plan.planner_n_ctx) /
+                (1024.0 * 1024.0),
+            plan.planner_n_head_ctx_max, plan.planner_n_head_swa_max, plan.planner_n_swa, plan.planner_n_ubatch,
+            plan.planner_n_ctx);
     }
 #endif
+
+    // llama.cpp-oyfl: record the SAME shape for the non-FA batched mul_mat
+    // scratch floor (unified_cache_nonfa_attn_scratch_demand_bytes()).
+    // Unconditional (not gated behind GGML_SYCL_DNNL, unlike the oneDNN
+    // sibling above): the batched-mul_mat path this sizes is the native
+    // SYCL/oneMath route, not a oneDNN one. This is a best-effort, plan-time
+    // defense only -- at model load the envelope's flash_attn_type is always
+    // AUTO (llama-model.cpp hardcodes it) and planner_n_ctx here is the
+    // load-time conservative default, not the context a later
+    // llama_new_context_with_model() will actually request (llama.cpp-fkpg).
+    // The authoritative check, using the REAL runtime n_ctx/n_ubatch and the
+    // real flash-attention resolution, is in
+    // ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp), which cannot
+    // resize this zone after the fact (the arena is a single fixed
+    // allocation) but can refuse the update with the size arithmetic instead
+    // of letting prompt processing abort later.
+    if (plan.device_id >= 0) {
+        unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id, plan.planner_n_head_all_max,
+                                                           plan.planner_n_ubatch, plan.planner_n_ctx);
+    }
 
     // 9. PP pipeline scratch: double-buffered FP16 weight staging for prompt-processing
     //    dequant prefetch. This is computed exactly at inventory collection time and
@@ -26283,7 +26743,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max                   = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
-    plan.planner_n_head                      = kv_info.n_head;
+    plan.planner_n_head_ctx_max              = kv_info.n_head_ctx_max;
+    plan.planner_n_head_swa_max              = kv_info.n_head_swa_max;
+    plan.planner_n_head_all_max              = kv_info.n_head_all_max;
+    plan.planner_n_swa                       = kv_info.n_swa;
     plan.pp_pipeline_scratch_bytes           = unified_cache_get_planned_pp_pipeline_scratch_bytes(device_id);
     plan.pp_moe_onednn_weight_slot_bytes     = unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device_id);
     plan.pp_moe_onednn_activation_slot_bytes = unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device_id);
@@ -27583,7 +28046,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max        = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
-    plan.planner_n_head           = kv_info.n_head;
+    plan.planner_n_head_ctx_max   = kv_info.n_head_ctx_max;
+    plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;
+    plan.planner_n_head_all_max   = kv_info.n_head_all_max;
+    plan.planner_n_swa            = kv_info.n_swa;
     for (const auto & db : device_budgets) {
         plan.pp_pipeline_scratch_bytes =
             std::max(plan.pp_pipeline_scratch_bytes, unified_cache_get_planned_pp_pipeline_scratch_bytes(db.device_id));

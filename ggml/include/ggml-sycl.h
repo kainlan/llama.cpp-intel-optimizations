@@ -252,14 +252,43 @@ struct ggml_sycl_tensor_inventory {
     uint32_t                       n_swa_layers;          // Number of SWA layers (0 = all full-attn)
     const bool *                   swa_layer_mask;        // Per-layer SWA flag [n_layer], NULL if no SWA
     uint32_t                       swa_layer_mask_count;  // Length of swa_layer_mask (must == n_layer)
-    // Max attention query-head count across all layers (llama.cpp-0oxf).
-    // Feeds the oneDNN Graph-scratch zone floor, which is proportional to
-    // n_head x n_ubatch x n_ctx -- see unified-cache.cpp's
-    // onednn_graph_scratch_zone_floor_bytes(). Added at the end of the
-    // struct (not inserted among the existing fields) so every existing
+    // llama.cpp-o3a0: max query-head count across all layers ELIGIBLE for the
+    // oneDNN SDPA route, split by attention window class -- non-SWA layers
+    // (effective KV window == n_ctx) vs SWA layers (effective KV window ==
+    // min(n_ctx, n_swa + n_ubatch), the span a ubatch of n_ubatch queries
+    // scans over the n_swa-key sliding window above, GPU-verified). Feeds
+    // the window-aware oneDNN Graph-scratch zone floor (unified-cache.cpp's
+    // onednn_graph_scratch_zone_floor_bytes_swa()), replacing the single
+    // n_head_max (llama.cpp-0oxf) that assumed every oneDNN-served layer's
+    // window was n_ctx -- wrong for SWA models: gemma4 E4B (real GGUF
+    // attention.sliding_window=512, n_ubatch=512, n_ctx=8192) computes
+    // 24 MiB raw, clamped to 64 MiB, vs. the 192 MB the flat formula
+    // predicted. The ticket's original "window=1024" figure was
+    // numerically right at n_ubatch=512 (512 + 512 == 1024) and wrong
+    // only about WHY -- the true window is n_swa + n_ubatch, not the raw
+    // sliding_window value alone. "Eligible" mirrors
+    // ggml_sycl_flash_attn_ext_onednn_plan()'s D-based gate
+    // (fattn-onednn.cpp) as closely as a llama-layer file can: see
+    // llama_model_sycl_onednn_head_dim_eligible() in llama-model.cpp, which
+    // cannot include that SYCL-only source and so replicates the rule (kept
+    // in sync by test-sycl-onednn-graph-floor-eligibility-source.py). 0 if no
+    // eligible layer of that class exists. Added at the end of the struct
+    // (not inserted among the existing fields) so every existing
     // `ggml_sycl_tensor_inventory x = {};` zero-init call site stays correct
     // without being touched.
-    uint32_t                       n_head_max;
+    uint32_t                       n_head_ctx_max;
+    uint32_t                       n_head_swa_max;
+    // llama.cpp-rqak: max query-head count across ALL attention layers,
+    // eligibility ignored -- unlike n_head_ctx_max/n_head_swa_max above,
+    // which only cover layers ELIGIBLE for the oneDNN SDPA route. This is
+    // the non-FA batched mul_mat attention guard's input
+    // (ggml_sycl_check_nonfa_attn_scratch() in ggml-sycl.cpp): that path
+    // runs on every attention layer regardless of oneDNN eligibility, so
+    // its demand model needs the true all-layers maximum -- the two
+    // per-class fields above can both be 0 for a model where every layer
+    // is oneDNN-ineligible (e.g. a DeepSeek-V3-class model, D=576), which
+    // would leave that model's non-FA scratch demand unguarded.
+    uint32_t                       n_head_all_max;
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama
@@ -319,10 +348,36 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // inference context. This does not retroactively re-place already loaded
 // weights, but it lets KV/runtime consumers size cache/control allocations from
 // the active context instead of the model's training context.
+//
+// llama.cpp-oyfl: flash_attn_enabled is the caller's cparams.flash_attn,
+// not the raw llama_flash_attn_type -- but at the constructor's own call
+// (llama_context::llama_context, llama-context.cpp) an AUTO
+// llama_flash_attn_type has not been resolved yet and cparams.flash_attn
+// reads an optimistic `true` (see its init, same file): "not yet known to
+// be off" and "known to be on" are indistinguishable at that point, and
+// the guard is written to skip on true, so this call correctly does
+// nothing for an AUTO context until it resolves. That resolution and the
+// narrow re-check that follows it (ggml_backend_sycl_recheck_runtime
+// _context_flash_attn() below) are what actually evaluate an AUTO context
+// that turns out to resolve OFF. When flash_attn_enabled is false here (a
+// context whose flash attention is definitely off already), this also
+// checks whether the non-flash-attention batched mul_mat path's
+// scratch demand at (n_ctx, n_ubatch) fits the SCRATCH zone the arena
+// already reserved, and
+// refuses the update (logging the size arithmetic, same style as the KV
+// budget refusal) instead of leaving a shape that would abort mid-prefill.
+// This predicate is EMPIRICAL, not a modeled worst case: measured on both
+// discrete cards, any demand above the zone aborts regardless of how much
+// VRAM is free outside the fixed arena (a ~2-4 GB outside-arena consumer
+// specific to this path is unexplained and tracked separately,
+// llama.cpp-k1ev) -- an earlier revision of this comment described a
+// live-free-VRAM predicate that hardware measurement falsified; do not
+// reintroduce it without first closing k1ev.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                                             uint32_t       n_ctx,
                                                             uint32_t       n_ubatch,
-                                                            uint32_t       n_seq_max);
+                                                            uint32_t       n_seq_max,
+                                                            bool           flash_attn_enabled);
 
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
@@ -973,12 +1028,48 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
     struct ggml_sycl_model_token model);
 // Foundation model-bound runtime update. Context/graph code will call this
 // automatically in 1q72; callers currently bind explicitly.
+//
+// llama.cpp-oyfl: flash_attn_enabled forwards to
+// ggml_backend_sycl_set_runtime_context() -- see that declaration's comment.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
-    uint32_t                     n_seq_max);
+    uint32_t                     n_seq_max,
+    bool                         flash_attn_enabled);
+
+// llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
+// against the CURRENTLY PUBLISHED plan's shape --
+// no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
+// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
+// flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
+// ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
+// above already ran with an unresolved, optimistic `true`): re-running the
+// full transaction would touch KV/MMID state that has no reason to change
+// and would retry the same deterministic decision under BUSY backoff for
+// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
+// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
+// if the guard refuses (same message and arithmetic as the full
+// transaction's own check).
+//
+// llama.cpp-rqak: an asymmetry worth knowing before touching either path.
+// An explicit -fa 0 context goes through the FULL transaction above, which
+// records its real runtime shape via
+// unified_cache_set_planned_nonfa_attn_scratch_shape() (and restores the
+// previous shape if the guard refuses); an AUTO context that resolves OFF
+// goes through THIS narrow re-check instead, which deliberately does not
+// record anything (see ggml_sycl_check_nonfa_attn_scratch()'s allow_replan
+// parameter in ggml-sycl.cpp). So an AUTO-resolved-OFF context is checked
+// against the shape recorded at load time (or by an earlier explicit -fa 0
+// context), never its own. This has no practical effect today: the
+// plan-time raise this shape feeds is a no-op once weights hold live
+// leases (see the "Where this can and cannot help" discussion in
+// docs/backend/sycl-memory-design.md).
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
+    ggml_backend_t               backend,
+    struct ggml_sycl_model_token model,
+    bool                         flash_attn_enabled);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL

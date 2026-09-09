@@ -324,31 +324,94 @@ ticket reproduced on:
   (`key.ne11 = active_params.ne11`) — every distinct `(ncols, ne11, H_q, ...)`
   combination compiles its OWN partition via `sdpa_partition_cache`, and each
   can request its own scratch the first time it executes.
-  `onednn_graph_scratch_zone_floor_bytes()` now computes
-  `floor = max(64 MiB, 1.5 x n_head x n_ubatch x n_ctx x sizeof(f32))`, where
-  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently in
-  flight even on an idle host (the quantity the zone must actually hold is
-  the PEAK OUTSTANDING size across whichever of those shapes are alive at
-  once, not one request in isolation). `n_head` (max query-head count across
-  layers) is threaded in from `hparams.n_head(il)` at
-  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through the
-  `ggml_sycl_tensor_inventory.n_head_max` ABI field (new, appended at the end
-  of the struct so every existing zero-init call site stays correct),
-  `placement_kv_info::n_head`, and `placement_plan::planner_n_head`, mirroring
-  how `n_ubatch`/`n_ctx` already flow through those same three layers. Fed by
+  `onednn_graph_scratch_zone_floor_bytes_swa()` now computes, per
+  attention window class,
+  `floor = max(64 MiB, 1.5 x max(n_head_ctx_max x n_ctx,
+  n_head_swa_max x min(n_ctx, n_swa + n_ubatch)) x n_ubatch x
+  sizeof(f32))`, where
+  the `1.5x` factor covers ~5 SDPA scratch buffers measured concurrently
+  in flight even on an idle host (the quantity the zone must actually
+  hold is the PEAK OUTSTANDING size across whichever of those shapes are
+  alive at once, not one request in isolation, and across whichever
+  attention CLASS demands more, not their sum — the two classes' compiled
+  partitions are never both outstanding for the same request).
+  `n_head_ctx_max`/`n_head_swa_max` (max query-head count across layers
+  eligible for the oneDNN SDPA route, split into non-SWA vs SWA) are
+  threaded in from `hparams.n_head(il)`/`hparams.is_swa(il)` at
+  `llama_model_sycl_populate_inventory()` (`src/llama-model.cpp`) through
+  the `ggml_sycl_tensor_inventory.n_head_ctx_max`/`n_head_swa_max` ABI
+  fields (llama.cpp-o3a0, appended at the end of the struct so every
+  existing zero-init call site stays correct; these replace the earlier
+  single `n_head_max` field), `placement_kv_info::n_head_ctx_max`/
+  `n_head_swa_max`, and `placement_plan::planner_n_head_ctx_max`/
+  `planner_n_head_swa_max`, mirroring how `n_ubatch`/`n_ctx` already flow
+  through those same three layers. "Eligible" replicates
+  `ggml_sycl_flash_attn_ext_onednn_plan()`'s D-based gate
+  (`fattn-onednn.cpp`) since `llama-model.cpp` cannot include that
+  SYCL-only source directly; the two copies are kept in sync by
+  `test-sycl-onednn-graph-floor-eligibility-source.py`. Fed by
   `unified_cache_set_planned_onednn_graph_scratch_shape()` at the same
   "oneDNN scratchpad:" planning step (`populate_host_zone_sizing()`,
-  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head=32) measurements
-  spanning two independent axes (48/192/768 MB at ubatch 512 and n_ctx
-  512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch 256/128) — all five match
-  to the exact byte; a sixth gemma4 (n_head=8) point did not
-  (predicted 192 MB, measured 24 MB) at first look, but is explained rather
-  than anomalous: gemma4's oneDNN-served attention layers are sliding-window
-  (window=1024), so the real `ne11` there is `min(n_ctx, window)`, and
-  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly — using
-  `planner_n_ctx` as an upper bound on `ne11` over-provisions SWA models
-  (safely, bounded by the 25% budget clamp below) rather than under-covering
-  them; a window-aware refinement is tracked separately (llama.cpp-o3a0).
+  `unified-cache.cpp`). Fit to five Mistral 7B Q4_0 (n_head_ctx_max=32,
+  no SWA layers, so the ctx term equals the old flat formula exactly)
+  measurements spanning two independent axes (48/192/768 MB at ubatch
+  512 and n_ctx 512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch
+  256/128) — all five still match to the exact byte; a sixth gemma4
+  point (n_head_swa_max=8) did not match the FLAT formula this replaced
+  (predicted 192 MB, measured 24 MB), but was explained rather than
+  anomalous: gemma4's oneDNN-served attention layers are sliding-window,
+  so their real `ne11` is `min(n_ctx, n_swa + n_ubatch)`, not `n_ctx`
+  and not `min(n_ctx, n_swa)` either — a ubatch of `n_ubatch` queries
+  against an `n_swa`-key sliding window spans `n_swa + n_ubatch` keys in
+  total (the first query looks `n_swa` keys back, the last one
+  `n_ubatch` further along), and the oneDNN SDPA scratch scales with
+  that whole span. llama.cpp-o3a0 closed the flat-formula gap first,
+  using `min(n_ctx, n_swa)` (`n_swa` alone) — GPU-verified WRONG on the
+  B50 (`GGML_SYCL_DEBUG=1` probe of gemma4 E4B's own SWA layers): at
+  `n_ubatch=512` the measured Graph-scratch requests were
+  24.00/12.00 MB (high-water 24.0 MB), and at `n_ubatch=256` they were
+  9.00/6.00/3.00 MB (high-water 9.0 MB). Solving
+  `1.5 x 8 x n_ubatch x K x 4 B` for `K` gives exactly
+  `K = n_swa + n_ubatch` both times against gemma4's real `n_swa=512`
+  (1024 = 512+512; 768 = 512+256) — which also resolves this section's
+  own historical 24 MB measurement exactly
+  (`1.5 x 8 x 512 x (512+512) x 4 B == 24 MB`). The formula now uses
+  `min(n_ctx, n_swa + n_ubatch)` and takes the max across classes, so
+  gemma4 (at its real `n_swa=512`, `n_ubatch=512`) computes 24 MiB raw,
+  clamped to 64 MiB, matching the probe exactly — an 8x reduction in
+  modeled demand vs. the flat formula's 192 MB (still 3x after the
+  64 MiB clamp).
+  ⚠️ **This gemma4 example describes the formula's behavior for the
+  `n_ctx` it is actually given at PLANNING time, which is NOT today's
+  real runtime context by default.** The floor is computed once, at
+  MODEL LOAD (`populate_host_zone_sizing()`), from
+  `plan.planner_n_ctx = kv_info.n_ctx`; at that point `kv_info.n_ctx` is
+  `llama_model_sycl_populate_inventory()`'s conservative
+  `inventory.n_ctx = inventory.n_ubatch` default (both 512) -- not
+  `-c 8192` or whatever a caller eventually requests. The placement
+  envelope carries its own `n_ctx` field, but it is set to 0 at load
+  (`llama_model_sycl_make_placement_envelope()`) and its only reader
+  anywhere is a diagnostic log line
+  (`compute_placement_plan()`'s "[PLACEMENT] envelope..." print) --
+  unlike `n_ubatch`, which the envelope DOES feed into
+  `planner_n_ubatch` when set (`envelope->n_ubatch`, a separate field),
+  nothing today threads a real `n_ctx` into `planner_n_ctx` at all.
+  `ggml_backend_sycl_set_runtime_context()` later updates
+  `planner_n_ctx` and KV/VRAM accounting for the real context, but does
+  NOT call `unified_cache_set_planned_onednn_graph_scratch_shape()`
+  again, so the ONEDNN Graph-scratch shape (and this floor) stays frozen
+  at its load-time value regardless. So the SWA window term only
+  actually narrows (`n_swa + n_ubatch < n_ctx`) once the Graph-scratch
+  shape is re-planned against the real context, which no code path
+  does today --
+  the 24 MiB/192 MiB comparison above is the formula's behavior at
+  whatever `n_ctx` it is given, not what a default run computes today.
+  Re-planning the Graph-scratch shape on a runtime context change is
+  tracked separately (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line
+  below prints the `n_ctx` it actually used, which is what makes this
+  gap visible in a real log -- provided the run captures `GGML_LOG_INFO`
+  output at all, which is dropped at default verbosity in every tool
+  (`-v` on `llama-bench`, or a raised verbosity threshold elsewhere).
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —
@@ -1882,6 +1945,171 @@ defeated the predicate, correct the predicate in `zone-sizing.cpp`, and add the
 case to `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`. **Do not raise the
 estimate back to `any_tensor` to silence it** — persistent growth is worse than
 the original over-provision, but so is reinstating it.
+
+### A non-tensor consumer: the non-FA batched mul_mat scratch floor
+
+Every consumer above sizes from a maximum over the *tensor inventory* —
+`zone_scoped_maxima()`'s classifier groups tensors by `(type, ne)`. The
+non-flash-attention batched mul_mat scratch demand
+(`unified_cache_nonfa_attn_scratch_demand_bytes()`, llama.cpp-oyfl) is
+**not** that kind of consumer: nothing it needs is a weight tensor. When
+flash attention is off, each layer's attention runs through
+`ggml_sycl_mul_mat_batched_sycl()` (`ggml-sycl.cpp`) twice — KQ =
+`mul_mat(K, Q)`, then KQV = `mul_mat(V, softmax(KQ))` — and both calls
+stage their non-f16 operand into an f16 buffer via
+`scoped_unified_queue_temp`, whose shape comes from
+`ggml_sycl_transient_device_intent()` (`common.hpp`): on the calling
+thread's COMPUTE path — not recording a command graph, the common case
+for this dispatch — that sets `prefer_vram_zone = SCRATCH`; while
+recording, it takes the GRAPH_TMP shape instead and does not name SCRATCH
+at all. This formula models the COMPUTE-path demand. The
+KQV call's staged operand is `kq_soft_max`, shaped
+`[n_kv, n_ubatch, n_head]` — at long context this dwarfs the KQ call's
+staged Q operand — so the formula keeps only that term:
+
+```
+demand = max(16 MiB, n_head * n_ubatch * n_ctx * sizeof(f16) * 3)
+```
+
+**Rule for adding a consumer, extended:** when the demand scales with
+*runtime shape* rather than any tensor's byte size, do not force it through
+`zone_tensor_desc`/`zone_scoped_maxima` — follow the pattern this consumer's
+sibling, `onednn_graph_scratch_zone_floor_bytes()`, already established: a
+free function taking the shape directly (`n_head`, `n_ubatch`, `n_ctx`),
+fed by a `unified_cache_set_planned_*_shape()`/`get_planned_*_shape()` pair
+of atomics (one triplet per consumer — the non-FA one is **not** a reuse of
+the oneDNN triplet, because it is unconditional while the oneDNN one is
+gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
+right where `plan.planner_n_head_all_max/n_ubatch/n_ctx` are already known --
+`planner_n_head_all_max` (llama.cpp-rqak) is the max query-head count over ALL
+attention layers, distinct from the oneDNN-eligible-only
+`planner_n_head_ctx_max`/`planner_n_head_swa_max` pair above, because this
+guard's non-FA path runs on every attention layer regardless of oneDNN
+eligibility.
+
+**The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro
+log, not carried over by analogy.** An earlier version of this formula
+copied the oneDNN floor's c=1.5 by analogy, and it under-covered the
+repro: the log (session scratchpad `oyfl/fa_off-2026-09-07.log`) shows the
+SCRATCH zone at 460.0 MB of its 512 MB capacity immediately before the
+failing request, whose own raw (no concurrency factor) demand at that
+shape (n_head=32, n_ubatch=512, n_ctx=8192) is exactly 256 MiB — so the
+real pressure was `460 + 256 = 716` MiB against a 256 MiB single-shot
+request, a ratio of ~2.8x. c=3 clears that with a small margin. The
+concurrency is not "one buffer plus headroom": `scoped_unified_queue_temp
+::release()` (`ggml-sycl.cpp`) submits a marker event and keeps the handle
+alive until it completes rather than freeing synchronously, and a
+16-ubatch pp8192 run submits GPU work faster than each ubatch's release
+event resolves, so several of the immediately preceding (smaller but
+still substantial) ubatches' requests are typically still occupying the
+zone when the largest one arrives. This is inferred from **one** repro's
+zone-state snapshot, not fit to several independent hardware measurements
+the way the oneDNN c=1.5 was (five captures, llama.cpp-0oxf comment
+c-xcop).
+
+**Two opposing pressures on this constant, both real.** Raise it only on
+new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+occupancy across a whole pp8192 run) — never lower it without such
+evidence, because lowering trades away the margin this check exists to
+keep ahead of the abort it prevents. But raising it is not free either:
+this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+larger `c` also refuses **more** contexts that would actually have run —
+trading false refusals for margin, on the same unvalidated single
+snapshot. Neither direction is free; do not move this value without a
+multi-point capture backing the move. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`
+overrides the formula outright, so applying a future measurement needs no
+code change.
+
+**Where this can and cannot help, and why the automatic case is
+llama.cpp-fkpg's scope, not this one's.** Like every zone above, the
+SCRATCH zone is sized once, before the arena's single physical chunk is
+allocated at model load — raising it later cannot resize that chunk.
+`ensure_planned_arena_zones()` raises `scratch_zone` from this formula the
+same way it raises `onednn_zone` and `runtime_zone` from theirs (bounded to
+a quarter of the available budget, same reasoning as the oneDNN clamp), but
+for the standard model-load flow this can never fire with the real shape:
+`llama_model_sycl_make_placement_envelope()` (`llama-model.cpp`) hardcodes
+`envelope.n_ctx = 0` unconditionally, so no caller's real `-c`/`-p` reaches
+`plan.planner_n_ctx` before weights stream into the arena. Piping the real
+context size back into pre-load sizing is llama.cpp-fkpg's scope — this
+raise only takes effect automatically once that lands. `ggml_backend_sycl
+_set_runtime_context()` also makes one opportunistic re-plan attempt with
+the real runtime shape (`unified_cache_ensure_planned_arena_zones()`, the
+same call `reserve_onednn_scratch()`'s own comment already documents as
+succeeding only in "the rare case where the arena is still empty") —
+cheap and harmless, but not expected to succeed once weights hold live
+leases; its own log line only claims "raised" when the zone's capacity
+actually grew, and otherwise reports only what was observed ("did not
+raise the SCRATCH zone (... unchanged)") rather than naming a specific
+cause this code never actually checked.
+
+**An asymmetry between the two callers (llama.cpp-rqak), worth knowing
+before touching either path.** An explicit `-fa 0` context goes through
+the FULL transaction above and records its real runtime shape via
+`unified_cache_set_planned_nonfa_attn_scratch_shape()` (restoring the
+previous shape if the guard refuses); an AUTO context that resolves OFF
+goes through `ggml_backend_sycl_recheck_runtime_context_flash_attn()`'s
+narrow re-check instead, which deliberately records nothing (no replan, no
+restore-on-refusal -- see its `allow_replan=false` call). So an
+AUTO-resolved-OFF context is checked against whatever shape was recorded
+earlier (at load time, or by a prior explicit `-fa 0` context), never its
+own. This has no practical effect today, because the plan-time raise this
+recorded shape feeds is already a no-op past model load for the reason
+above -- weights hold live leases by the time any runtime-context call
+happens, so there is nothing for a missed recording to have changed.
+
+**The check is EMPIRICAL, not a modeled worst case — read this before
+tightening or loosening it.** A first draft of this predicate (llama.cpp
+-oyfl round 2) reasoned from first principles that a SCRATCH-zone-capacity
+comparison alone was insufficient: a zone overflow does not fail outright
+(`unified_alloc()`, `unified-cache.cpp`, falls through to a raw device
+allocation OUTSIDE the fixed arena when a preferred zone is full), and
+that same outside-arena headroom is what the SYCL scheduler's own compute
+buffer draws on when it regrows to the context's real `n_kv`
+(`llama_context::graph_reserve()` reserves it at the KV cache's own
+reserve-time `n_kv`, `llama_kv_cache::get_n_kv()`, sized from
+currently-used cells — 0 at construction — not the real `n_ctx`; a
+deliberate upstream design for graph-shape stability, not something to
+change here). That draft modeled and summed every such term (compute
+-buffer regrowth, SCRATCH overflow, oneDNN scratchpad) and compared the
+sum against live free VRAM outside the arena, predicting the repro would
+run once `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` (the exact `c=3` demand)
+eliminated the SCRATCH term (predicted available ~1334 MiB vs. ~1200 MiB
+needed).
+
+**Hardware measurement falsified that model.** On the B50, the same
+`-fa 0 -p 8192` repro with `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` still
+aborted (rc=134, staging-allocation failures, a VRAM-exhaustion line) — a
+sweep across `768`/`1536` MiB zone sizes, `GGML_SYCL_VRAM_BUDGET_PCT=85`
+(shrinking the arena to grow outside-arena headroom to ~4.0 GB), and an
+explicit `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=3072` override all
+still aborted, each time with tens of MB free rather than the modeled
+headroom. The B70 (default ~2 GB outside its arena, and again with
+headroom raised to ~4.0 GB) aborted identically. So the non-FA `-p 8192`
+prefill consumes roughly 2–4 GB **outside the fixed arena on both discrete
+cards**, far beyond anything the compute-buffer/SCRATCH/oneDNN model
+above accounts for, and no zone size or headroom override recovers it —
+filed as **llama.cpp-k1ev**, an unidentified outside-arena consumer
+specific to the non-FA path. This also falsifies the model's original
+motivating concern (a card with more outside-arena headroom, e.g. the
+B70, would wrongly refuse a shape that actually runs): both cards abort
+at the same shape, so the zone-only check is not observed to be more
+conservative than reality on either card measured so far.
+
+**The refusal is therefore left as the empirical SCRATCH-zone-capacity
+check**, unchanged in shape from before round 2: refuse when `nonfa_demand
+> zone_capacity(SCRATCH)`, reporting `needs`/`zone`/`over_by` and the
+zone's own largest-fitting `-c` (labeled **"scratch-limited"**, since it
+is a limit on this one zone, not a whole-device guarantee against k1ev's
+consumer). The refusal names `-fa 1`/`auto` or a smaller `-c` as the only
+remediations with hardware support — it deliberately does **not** suggest
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB`, since the sweep above shows setting it
+does not reliably fix anything; treat that variable as an experimentation
+knob for investigating k1ev, not a user-facing fix. Do not reintroduce a
+live-free-VRAM or compute-buffer-regrowth predicate without new hardware
+evidence that k1ev's consumer is understood and bounded — the reasoning
+that motivated one was sound in isolation and still wrong in practice,
+which is the whole lesson of this subsection.
 
 ### Known limits (load-bearing — read before changing any of this)
 

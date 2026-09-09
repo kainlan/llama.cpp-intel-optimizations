@@ -553,10 +553,16 @@ checks = {
         # after 75883a6 added one owned host-recipe reader (127 + 1 - 6 - 2).
         # f5f0d3758 (llama.cpp-tnse) added an eighth->ninth reader:
         # ggml_backend_sycl_kv_layer_on_device_from_dev consults the active
-        # plan snapshot's get_kv_device(il) (8 + 1).
+        # plan snapshot's get_kv_device(il) (8 + 1). llama.cpp-oyfl added a
+        # ninth->eleventh pair: the new narrow AUTO-flash-attn re-check
+        # entry point, ggml_backend_sycl_recheck_runtime_context_flash_attn(),
+        # reads the snapshot once lock-free (its own identity check against
+        # the caller's model token) and once again under
+        # g_tensor_inventory_mutex to confirm that snapshot is still the
+        # live one before acting on it (9 + 2).
         "ggml_sycl_cache_plan_owner": 120,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 9,
+        "ggml_sycl_global_plan_snapshot": 11,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"

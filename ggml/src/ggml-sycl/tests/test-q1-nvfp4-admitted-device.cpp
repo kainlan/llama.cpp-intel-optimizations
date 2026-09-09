@@ -110,8 +110,14 @@ struct lifecycle_fixture {
                     "context create failed");
             require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
                     "context bind failed");
-            require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1) ==
-                        GGML_SYCL_LIFECYCLE_OK, "model root bind failed");
+            // llama.cpp-oyfl: flash_attn_enabled=true -- this test exercises Q1
+            // NVFP4 lifecycle scoping, not the non-FA attention scratch guard;
+            // true skips that guard entirely, matching this call's pre-existing
+            // behavior before the guard was threaded through this API.
+            require(
+                ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1,
+                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                "model root bind failed");
             require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),
                     "private scope mint failed");
             scope_minted = true;
