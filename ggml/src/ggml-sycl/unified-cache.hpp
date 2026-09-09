@@ -1444,12 +1444,49 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // moving this constant in either direction actually costs.
 size_t unified_cache_nonfa_attn_scratch_demand_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 
-// Inverse of the formula above: the largest n_ctx whose modeled demand still
-// fits within `zone_capacity_bytes`, rounded down to a multiple of 256 (same
-// rounding convention as the KV-side ggml_sycl_largest_fitting_n_ctx()).
-// Returns 0 when n_head or n_ubatch is 0 (the formula is undefined -- avoids
-// a division by zero rather than returning a meaningless large number).
-uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   zone_capacity_bytes,
+// llama.cpp-pvjr: the empirical outside-arena reserve the runtime-context
+// guard adds on top of the demand formula above before comparing against
+// live device free memory (see unified_cache_nonfa_attn_scratch_fits_headroom()
+// below). Decided from a two-round hardware bracketing sweep on both discrete
+// cards -- see the derivation comment on this constant's definition
+// (unified-cache.cpp) for the exact measured brackets. EMPIRICAL, not a
+// modeled worst case: it absorbs the oneDNN scratch overflow, the batched-F16
+// src1 staging buffer, and llama.cpp-k1ev's still-unexplained extra
+// outside-arena consumption on the B50, over the measured range only.
+size_t unified_cache_nonfa_attn_outside_arena_reserve_bytes();
+
+// The guard's own fit/refuse predicate, pulled out as a pure function (no
+// device access) so a host-only test can pin it directly: fits iff
+// demand_bytes + unified_cache_nonfa_attn_outside_arena_reserve_bytes() <=
+// free_bytes, computed without overflowing size_t (a demand_bytes so large
+// that adding the reserve would wrap is treated as "does not fit" rather
+// than silently wrapping to a small sum that would otherwise read as
+// fitting).
+bool unified_cache_nonfa_attn_scratch_fits_headroom(size_t demand_bytes, size_t free_bytes);
+
+// True when GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set -- an explicit,
+// deliberate "disable this guard entirely" request, distinct from an unset
+// var (which falls through to the formula) and from any other override
+// value (which replaces the formula's own demand but is still checked
+// against headroom). The guard must return true (allow) as soon as this is
+// true, before computing or comparing anything -- 0 + reserve compared
+// against free would otherwise refuse any card with less than the reserve
+// free, which is not what "disable" means. Exported as a thin wrapper (not
+// the memoized env accessor itself, which is file-static in
+// unified-cache.cpp) so ggml-sycl.cpp, a different translation unit, can
+// call it.
+bool unified_cache_nonfa_attn_scratch_guard_disabled();
+
+// Inverse of the demand formula above: the largest n_ctx whose modeled
+// demand still fits within `capacity_bytes`, rounded down to a multiple of
+// 256 (same rounding convention as the KV-side
+// ggml_sycl_largest_fitting_n_ctx()). Returns 0 when n_head or n_ubatch is 0
+// (the formula is undefined -- avoids a division by zero rather than
+// returning a meaningless large number). `capacity_bytes` is a plain byte
+// budget, not necessarily a zone's own capacity -- llama.cpp-pvjr's caller
+// passes (live free memory - the outside-arena reserve above), so the
+// parameter is named generically rather than after any one caller's source.
+uint32_t unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(size_t   capacity_bytes,
                                                                     uint32_t n_head,
                                                                     uint32_t n_ubatch);
 
