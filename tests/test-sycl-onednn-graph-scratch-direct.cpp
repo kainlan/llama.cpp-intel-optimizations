@@ -105,15 +105,34 @@
 //       llama.cpp-pqgl's review, not part of the original 0oxf RED-FIRST
 //       set below.
 //
-// RED-FIRST NOTE. Three of these five properties, (a)-(c), are RED against
+//   (f) IN-FLIGHT ENTRIES ARE SKIPPED, NOT WAITED ON: the reuse pool's
+//       completion checks must not BLOCK a calling thread on a pooled
+//       entry's release_event -- event_complete()'s bare
+//       command_execution_status query does exactly that on any
+//       profiling-enabled queue, which every backend stream is. Parking an
+//       entry with a slow, unwaited release event and immediately
+//       re-requesting the identical size must return a fresh allocation
+//       (miss, not hit) in well under the release delay, leaving the
+//       in-flight entry pooled and un-evicted; the same must hold for the
+//       cap-eviction sweep when a DIFFERENT, already-complete entry alone
+//       supplies the needed headroom. A test-only hook forces the pre-fix
+//       blocking query as a positive control within this same (fixed)
+//       binary. Added by llama.cpp-c6ah, not part of the original 0oxf
+//       RED-FIRST set below.
+//
+// RED-FIRST NOTE. Three of these six properties, (a)-(c), are RED against
 // the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
 // DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
 // no abort hook to suppress -- the pre-fix function simply returned nullptr
 // with `req.suppress_failure_log = true`, so the log capture in this test
-// would find nothing and the "abort triggered" latch would not exist. (d)
-// and (e) above were added by later tickets (llama.cpp-0oxf's own
-// reclaim-safety finding and llama.cpp-pqgl's review, respectively) and are
-// not part of this original RED-FIRST set.
+// would find nothing and the "abort triggered" latch would not exist. (d),
+// (e) and (f) above were added by later tickets (llama.cpp-0oxf's own
+// reclaim-safety finding, llama.cpp-pqgl's review, and llama.cpp-c6ah's
+// blocking-query finding, respectively) and are not part of this original
+// RED-FIRST set -- (f) is RED against the pre-c6ah code specifically (its
+// own force_blocking_pool_check hook reproduces that RED behaviour on
+// demand within this GREEN binary, since the pre-fix source is no longer
+// buildable standalone once this fix has landed).
 //
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
 // compiled in (the whole onednn_graph_scratch_* subsystem is `#if
@@ -143,6 +162,7 @@ int main() {
 
 using ggml_sycl::get_unified_cache_for_device;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_abort_triggered;
+using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail;
 using ggml_sycl::ggml_sycl_test_onednn_graph_scratch_suppress_abort;
 using ggml_sycl::unified_cache;
@@ -606,6 +626,217 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 
+// --- (f) an in-flight pooled entry is SKIPPED, not WAITED ON -- both by a
+//         fresh same-size request and by the eviction sweep (llama.cpp-c6ah)
+//
+// BACKGROUND. unified_cache::event_complete()'s bare
+// command_execution_status query BLOCKS rather than polls on any
+// profiling-enabled queue, and every backend stream -- including the one
+// oneDNN's free callback supplies release_event on -- is profiling-enabled.
+// The DIRECT reuse pool's completion checks
+// (onednn_graph_scratch_entry_usable_locked(),
+// onednn_graph_scratch_evict_pool_until_fits_locked(),
+// onednn_graph_scratch_clear_pool_locked()) used to query that event
+// directly, so instead of SKIPPING an in-flight pooled entry -- the design
+// documented at their own declarations -- the allocator WAITED for its
+// SDPA kernel to finish, serializing the allocation path behind running
+// device work. The fix routes every one of those checks through
+// onednn_graph_scratch_pool_entry_release_complete(), which prefers a
+// host-visible std::atomic<bool> flag (armed by a host_task on a new,
+// dedicated, non-profiling watcher queue) over querying the event.
+//
+// WHY THIS TEST USES A SHRUNK ONEDNN ZONE. Proving "skipped, not waited"
+// with a wall-clock bound requires a request that does NOT need the
+// DIRECT-path cap machinery to engage at all -- otherwise a genuine,
+// unavoidable physical wait for the SAME in-flight entry's completion is
+// indistinguishable from the bug this fix closes (both take about
+// kSlowReleaseMs either way; only WHICH mechanism produces that wait
+// differs, and this file has no way to observe that internal difference
+// through the public API alone). That requires parking the SAME size twice
+// simultaneously while staying under the DIRECT_CAP_MB=350 cap main() sets
+// -- but the ONEDNN zone's natural (no-model) floor is measured elsewhere
+// in this file at ~256 MB (see kSizeParked's own comment above), and no
+// size can simultaneously exceed that floor (to reach the DIRECT path at
+// all) AND have its DOUBLED cost fit under a 350 MB cap (2 x 257 MB always
+// exceeds 350 MB). GGML_SYCL_ONEDNN_GRAPH_ZONE_MB is this codebase's own
+// sanctioned escape hatch for exactly this shape of problem ("always wins
+// over the FORMULA when set" -- see onednn_graph_scratch_zone_floor_bytes()'s
+// comment) -- main() sets it to a few MB, safely below EVERY size used
+// anywhere in this file (this test's own two-digit-MiB sizes included, and
+// every existing three-digit-MiB size above by a wide margin), so nothing
+// in this file becomes zone-served that was not already. This does not
+// change what any earlier test in this file measures -- every one of them
+// already relies on its own size exceeding whatever the zone floor is, not
+// on the floor's specific value.
+void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int device) {
+    printf("DIRECT path in-flight pooled entry is skipped, not waited on:\n");
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup");
+
+    sycl::queue & q = cache->get_queue();
+
+    // Small (relative to the shrunk zone) and DISTINCT from every size used
+    // elsewhere in this file, so this test's pool state cannot alias theirs
+    // even without today's leading reclaim call.
+    constexpr size_t kSizeSkip = 32ull * 1024 * 1024;
+
+    const size_t misses_before_setup = cache->onednn_graph_scratch_pool_miss_count();
+    void *       ptr1                = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
+    check(ptr1 != nullptr, "DIRECT allocation for the skip-not-wait setup succeeds");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_setup + 1,
+          "the setup allocation was a DIRECT-path pool miss, not served from the (shrunk) ONEDNN zone -- proves "
+          "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB actually took effect for this size");
+    if (!ptr1) {
+        return;
+    }
+
+    // Park with a slow, UNWAITED release event -- the entry sits in the pool
+    // with an INCOMPLETE release_event for the rest of this sub-scenario.
+    sycl::event slow_release = submit_slow_release(q);
+    cache->onednn_graph_scratch_free(ptr1, &slow_release);
+
+    const size_t misses_before    = cache->onednn_graph_scratch_pool_miss_count();
+    const size_t hits_before      = cache->onednn_graph_scratch_pool_hit_count();
+    const size_t evictions_before = cache->onednn_graph_scratch_pool_eviction_count();
+
+    const auto start = std::chrono::steady_clock::now();
+    void *     ptr2  = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+
+    check(ptr2 != nullptr, "the immediate same-size re-request succeeds");
+    check(ptr2 != ptr1,
+          "...as a genuinely FRESH allocation, not the still in-flight entry handed back (that would be a "
+          "USE-AFTER-FREE-shaped bug: ptr1's SDPA kernel may still be running)");
+    check(cache->onednn_graph_scratch_pool_miss_count() == misses_before + 1,
+          "onednn_graph_scratch_pool_miss_count() increased -- served by a fresh allocation, not the pool");
+    check(cache->onednn_graph_scratch_pool_hit_count() == hits_before,
+          "onednn_graph_scratch_pool_hit_count() did NOT increase -- the in-flight entry was never handed back");
+    check(cache->onednn_graph_scratch_pool_eviction_count() == evictions_before,
+          "onednn_graph_scratch_pool_eviction_count() did NOT increase -- the in-flight entry is still pooled, "
+          "not released");
+    // kSlowReleaseMs/3, not /2: this call does strictly less work than
+    // test_bounded_eviction's cap-constrained wait (no cap is engaged here
+    // at all -- see this test's header comment), so it can afford a
+    // tighter bound while remaining well clear of scheduler/CI noise.
+    check(elapsed.count() < kSlowReleaseMs / 3,
+          "the re-request returned in well under a third of the release delay -- it did not wait for ptr1's "
+          "release event to complete");
+    printf("    (elapsed=%lld ms, immediate re-request)\n", static_cast<long long>(elapsed.count()));
+
+    // Now let ptr1's release actually complete, and confirm a THIRD
+    // same-size request is a genuine pool HIT -- the in-flight entry was
+    // skipped above, not lost.
+    slow_release.wait();
+    const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
+    void *       ptr3              = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
+    check(ptr3 == ptr1, "once ptr1's release event completes, it is reused for a same-size request");
+    check(cache->onednn_graph_scratch_pool_hit_count() == hits_before_reuse + 1,
+          "onednn_graph_scratch_pool_hit_count() increased -- this time it really was a pool hit");
+
+    if (ptr2) {
+        cache->onednn_graph_scratch_free(ptr2, nullptr);
+    }
+    if (ptr3) {
+        cache->onednn_graph_scratch_free(ptr3, nullptr);
+    }
+
+    // --- Positive control: the RED arm this GREEN binary can still produce.
+    // With the hook forced, onednn_graph_scratch_pool_entry_release_complete()
+    // falls back to a direct event_complete() query -- reproducing the
+    // pre-fix blocking wait -- so the SAME scenario above should now take
+    // roughly the full release delay AND come back as a pool HIT (blocking
+    // until complete makes the entry look immediately USABLE once it
+    // returns), the opposite of both outcomes just asserted.
+    ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(true);
+
+    void * ptr4 = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
+    check(ptr4 != nullptr, "RED-arm setup allocation succeeds");
+    if (ptr4) {
+        sycl::event slow_release2 = submit_slow_release(q);
+        cache->onednn_graph_scratch_free(ptr4, &slow_release2);
+
+        const auto start2 = std::chrono::steady_clock::now();
+        void *     ptr5   = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
+        const auto elapsed2 =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start2);
+
+        // 80%, not 100%: the same poll-granularity slack test_bounded_eviction
+        // already accepts for the analogous genuine-wait case, applied here
+        // to a real blocking call instead of a poll loop -- comfortably
+        // above the /3 bound the GREEN arm above must stay under, so the two
+        // checks cannot both pass on the same (broken) code.
+        check(elapsed2.count() >= (kSlowReleaseMs * 8) / 10,
+              "with the RED hook forced, the re-request took most of the release delay -- reproducing the "
+              "pre-fix blocking behaviour this test would otherwise never exercise");
+        check(ptr5 == ptr4,
+              "...and the blocking query left the entry USABLE by the time it returned, so this was a pool HIT, "
+              "not a fresh allocation -- the opposite of the GREEN-arm outcome above");
+        printf("    (elapsed=%lld ms, RED arm / force_blocking_pool_check)\n",
+               static_cast<long long>(elapsed2.count()));
+
+        if (ptr5) {
+            cache->onednn_graph_scratch_free(ptr5, nullptr);
+        }
+    }
+
+    ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(false);
+
+    // --- Eviction sweep must apply the identical skip, not just the
+    // try-reuse lookup above. Park one in-flight (incomplete) entry and one
+    // already-complete entry of a DIFFERENT size, then request a THIRD,
+    // different size that needs headroom the completed entry alone can
+    // supply -- the in-flight entry must be left alone (not evicted, not
+    // waited on) either way.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (eviction sweep)");
+
+    constexpr size_t kSizeEvictInFlight = 200ull * 1024 * 1024;
+    constexpr size_t kSizeEvictComplete = 100ull * 1024 * 1024;
+    constexpr size_t kSizeEvictRequest  = 90ull * 1024 * 1024;
+    // kSizeEvictInFlight + kSizeEvictComplete (300 MiB) fits under the
+    // 350 MB cap on its own -- parking both must not itself force anything;
+    // + kSizeEvictRequest (390 MiB) does not, so satisfying this request
+    // needs SOME eviction, and kSizeEvictInFlight + kSizeEvictRequest alone
+    // (290 MiB) fits -- so evicting kSizeEvictComplete is both necessary and
+    // SUFFICIENT; the in-flight entry never needs to be touched to succeed.
+
+    void * evict_in_flight = cache->onednn_graph_scratch_alloc(kSizeEvictInFlight, 256, &q);
+    check(evict_in_flight != nullptr, "eviction-sweep in-flight setup allocation succeeds");
+    sycl::event evict_slow_release = submit_slow_release(q);
+    if (evict_in_flight) {
+        cache->onednn_graph_scratch_free(evict_in_flight, &evict_slow_release);
+    }
+
+    void * evict_complete = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
+    check(evict_complete != nullptr, "eviction-sweep completed-entry setup allocation succeeds");
+    if (evict_complete) {
+        sycl::event complete_release = submit_slow_release(q);
+        complete_release.wait();  // genuinely complete before parking
+        cache->onednn_graph_scratch_free(evict_complete, &complete_release);
+    }
+
+    const size_t sweep_evictions_before = cache->onednn_graph_scratch_pool_eviction_count();
+
+    const auto sweep_start = std::chrono::steady_clock::now();
+    void *     evict_ptr   = cache->onednn_graph_scratch_alloc(kSizeEvictRequest, 256, &q);
+    const auto sweep_elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sweep_start);
+
+    check(evict_ptr != nullptr, "the headroom-needing request succeeds");
+    check(cache->onednn_graph_scratch_pool_eviction_count() == sweep_evictions_before + 1,
+          "exactly one entry was evicted -- the completed one, never the in-flight one");
+    check(sweep_elapsed.count() < kSlowReleaseMs / 3,
+          "the eviction sweep did not wait for the in-flight entry's release event -- evicting the completed "
+          "entry alone was enough headroom");
+    printf("    (elapsed=%lld ms, eviction sweep)\n", static_cast<long long>(sweep_elapsed.count()));
+
+    if (evict_ptr) {
+        cache->onednn_graph_scratch_free(evict_ptr, nullptr);
+    }
+    evict_slow_release.wait();  // let the still-pooled in-flight entry's host_task finish before the process exits
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -634,6 +865,22 @@ int main(int, char ** argv) {
     // direct run of this specific binary should ever set this, never a
     // production process.
     setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
+    // llama.cpp-c6ah: also memoized once per process
+    // (onednn_graph_scratch_zone_floor_bytes(), unified-cache.cpp), so set
+    // BEFORE ggml_backend_sycl_init() below plans the arena, same
+    // once-only-lazy-static reasoning as the cap above. Shrinks the ONEDNN
+    // zone from its natural (no-model) ~256 MB floor down to a few MB --
+    // this codebase's own sanctioned override for exactly this purpose (see
+    // onednn_graph_scratch_zone_floor_bytes()'s comment: "always wins over
+    // the FORMULA when set"). test_in_flight_entry_is_skipped_not_waited()
+    // needs to park the SAME size twice simultaneously while staying under
+    // the 350 MB cap set above, which is impossible at the natural ~256 MB
+    // floor (any size big enough to miss that zone, doubled, exceeds
+    // 350 MB) -- see that test's own header comment for the full argument.
+    // Harmless to every earlier test in this file: none of them depends on
+    // the zone's specific size, only on their own sizes exceeding whatever
+    // it is (all >= 280 MiB, comfortably above this override either way).
+    setenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB", "8", 1);
 
     const int device = 0;  // in-process index after selector filtering
 
@@ -655,6 +902,7 @@ int main(int, char ** argv) {
     test_loud_failure(cache);
     test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
     test_oversized_request_skips_wait_loop(cache, device);
+    test_in_flight_entry_is_skipped_not_waited(cache, device);
 
     ggml_backend_free(backend);
 

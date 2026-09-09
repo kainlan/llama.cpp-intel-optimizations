@@ -110,6 +110,20 @@ def _has_no_blocking_token(body: str) -> bool:
     return not any(token in code for token in BLOCKING_TOKENS)
 
 
+RELEASE_COMPLETE_CALL = "onednn_graph_scratch_pool_entry_release_complete("
+
+
+def _routes_through_release_complete(body: str) -> bool:
+    """llama.cpp-c6ah: true iff `body` calls the single choke point every
+    pool-entry completion check must use, and calls NO bare event_complete()
+    anywhere in its own text -- a positive-presence check alone would still
+    pass if a redundant direct query were added alongside it (the same
+    reasoning _has_no_blocking_token() above already applies one level up,
+    to the wider set of blocking tokens)."""
+    code = strip_literals(body)
+    return RELEASE_COMPLETE_CALL in code and "event_complete(" not in code
+
+
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
@@ -164,6 +178,21 @@ MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine mak
 # sweep, both inside this one function.
 WAIT_HEADROOM_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked("
+)
+# llama.cpp-c6ah: the three functions that actually decide whether a pooled
+# entry's release is done. Extracted separately (not reused from
+# TRY_REUSE_POOL_BODY_CODE/POOL_SIZE_READY_BODY_CODE above, which call
+# onednn_graph_scratch_entry_usable_locked() rather than the completion
+# check itself) so the checks below can assert exactly where the query
+# lives and where it does not.
+ENTRY_USABLE_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "unified_cache::onednn_graph_scratch_entry_fit unified_cache::onednn_graph_scratch_entry_usable_locked("
+)
+EVICT_UNTIL_FITS_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "bool unified_cache::onednn_graph_scratch_evict_pool_until_fits_locked("
+)
+CLEAR_POOL_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
 )
 
 
@@ -355,6 +384,27 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["pool_size_ready_locked() body has no blocking token of its own"] = _has_no_blocking_token(
         POOL_SIZE_READY_BODY_CODE
     )
+    # llama.cpp-c6ah: the single choke point every pool-entry completion
+    # check must route through, instead of a direct event_complete() query
+    # on release_event -- see onednn_graph_scratch_pool_entry_release_complete()'s
+    # own comment for why (event_complete()'s bare command_execution_status
+    # query BLOCKS rather than polls on the profiling-enabled queue
+    # release_event lives on). Three call sites: the shared usability
+    # predicate both try_reuse_pool_locked() and pool_size_ready_locked()
+    # apply (checked above to call the predicate; this asserts what the
+    # PREDICATE ITSELF queries), the eviction sweep, and the pool-clear
+    # reclaim path (checked again, alongside its own retain_handles_until_event()
+    # requirement, below). Reuses _routes_through_release_complete() -- proven
+    # non-vacuous in test_pool_entry_release_complete_is_the_single_choke_point.
+    checks["entry_usable_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(ENTRY_USABLE_BODY_CODE)
+    )
+    checks["evict_pool_until_fits_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(EVICT_UNTIL_FITS_BODY_CODE)
+    )
+    checks["clear_pool_locked() calls the release-complete choke point, not event_complete directly"] = (
+        _routes_through_release_complete(CLEAR_POOL_BODY_CODE)
+    )
     # Bounded per-size depth (lead's constraint 3, ticket follow-up after the
     # pool redesign): without this, a workload that walks many distinct
     # sizes (a pp8192 run touches ~16 distinct ne11-derived shapes) could
@@ -404,13 +454,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # its assertions also hold pre-fix). Tolerant of formatting: matches the
     # two calls' PRESENCE (not their exact argument text), which is what
     # actually survives clang-format re-wrapping or an unrelated rename of
-    # the loop variable.
-    clear_pool_body_code = extract_function_body(
-        CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
-    )
+    # the loop variable. llama.cpp-c6ah: the completion query this body makes
+    # is RELEASE_COMPLETE_CALL, not a direct event_complete() -- see the
+    # dedicated check above (a direct query here would BLOCK, same as it
+    # used to for the other two pool-lookup call sites); this check adds the
+    # retain_handles_until_event() half that one does not cover.
     checks["pool clear defers an incomplete-event entry instead of destructing it unconditionally"] = (
-        "event_complete(" in normalize_ws(clear_pool_body_code)
-        and "retain_handles_until_event(" in normalize_ws(clear_pool_body_code)
+        RELEASE_COMPLETE_CALL in normalize_ws(CLEAR_POOL_BODY_CODE)
+        and "retain_handles_until_event(" in normalize_ws(CLEAR_POOL_BODY_CODE)
     )
     # Scoped to arena_reserve()'s own body, not a same-file coincidence: the
     # reclaim call must be co-located with the KV/RUNTIME reclaim it is meant
@@ -573,4 +624,45 @@ def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
     assert not _has_no_blocking_token(ready_mutated), (
         "mutation witness is broken: the injected event_complete() call was not detected by "
         "_has_no_blocking_token()"
+    )
+
+
+def test_pool_entry_release_complete_is_the_single_choke_point() -> None:
+    """Mutation witness for llama.cpp-c6ah: proves the three
+    "calls RELEASE_COMPLETE_CALL, never a bare event_complete()" checks in
+    the main contract test above would actually catch a reintroduced direct
+    event_complete() query on a pool entry's release_event -- the specific
+    regression this ticket fixes (querying that event directly BLOCKS rather
+    than polls on the profiling-enabled queue it lives on, turning "skip an
+    in-flight entry" back into "wait for it"). Without this witness, a
+    check that always reports the CURRENT (correct) source as passing could
+    just as easily never fire on the mutation it claims to guard against."""
+
+    def assert_catches_direct_event_complete(body: str, label: str, target: str) -> None:
+        assert target in body, f"{label}: mutation target string not found -- update this witness"
+        mutated = body.replace(target, "event_complete(entry.release_event); " + target, 1)
+        assert mutated != body
+        assert _routes_through_release_complete(body), (
+            f"{label}: the real, unmutated body should call {RELEASE_COMPLETE_CALL!r} and nothing named "
+            "event_complete("
+        )
+        assert not _routes_through_release_complete(mutated), (
+            f"{label}: mutation witness is broken -- the injected direct event_complete() call was not "
+            "detected"
+        )
+
+    assert_catches_direct_event_complete(
+        ENTRY_USABLE_BODY_CODE,
+        "onednn_graph_scratch_entry_usable_locked()",
+        "return onednn_graph_scratch_entry_fit::EVENT_PENDING;",
+    )
+    assert_catches_direct_event_complete(
+        EVICT_UNTIL_FITS_BODY_CODE,
+        "onednn_graph_scratch_evict_pool_until_fits_locked()",
+        "for (auto bucket_it = onednn_graph_scratch_reuse_pool_.begin();",
+    )
+    assert_catches_direct_event_complete(
+        CLEAR_POOL_BODY_CODE,
+        "onednn_graph_scratch_clear_pool_locked()",
+        "for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {",
     )
