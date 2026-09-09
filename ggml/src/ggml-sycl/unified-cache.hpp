@@ -1464,6 +1464,15 @@ size_t unified_cache_nonfa_attn_outside_arena_reserve_bytes();
 // fitting).
 bool unified_cache_nonfa_attn_scratch_fits_headroom(size_t demand_bytes, size_t free_bytes);
 
+// The inverse of unified_cache_nonfa_attn_scratch_fits_headroom()'s own
+// comparison: returns (free_bytes - reserve), clamped to 0, i.e. the largest
+// demand that still fits. The two functions must move together -- a caller
+// deriving this capacity by hand (free_bytes > reserve ? free_bytes - reserve
+// : 0) instead of calling this function risks drifting from fits_headroom()
+// if the reserve or the comparison ever changes; this function exists so
+// there is exactly one place that can drift.
+size_t unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(size_t free_bytes);
+
 // True when GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set -- an explicit,
 // deliberate "disable this guard entirely" request, distinct from an unset
 // var (which falls through to the formula) and from any other override

@@ -16707,10 +16707,14 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // reflected honestly, not stale from before the re-plan.
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_sycl_get_device_memory(device, &free_mem, &total_mem);
+    // A failed query does not reach here: ggml_backend_sycl_get_device_memory()
+    // std::exit(1)s on a sycl::exception. total_mem == 0 therefore means a
+    // device that genuinely reports zero total memory -- kept as a sanity
+    // check rather than a query-failure path.
     if (total_mem == 0) {
         GGML_LOG_WARN(
-            "[SYCL-PLAN] non-FA attention scratch guard could not evaluate (device free memory "
-            "unavailable) -- skipping the check for n_ctx=%u n_ubatch=%u\n",
+            "[SYCL-PLAN] non-FA attention scratch guard could not evaluate (device reports zero "
+            "total memory) -- skipping the check for n_ctx=%u n_ubatch=%u\n",
             n_ctx, n_ubatch);
         return true;
     }
@@ -16786,8 +16790,11 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // "headroom-limited": this figure is bounded by THIS device's current
     // live outside-arena headroom (free memory minus the empirical
     // reserve), not a whole-device or zone-only guarantee -- another tenant
-    // on the card or a budget-pct change moves it.
-    const size_t   capacity_bytes = free_mem > reserve ? free_mem - reserve : 0;
+    // on the card or a budget-pct change moves it. Derived through
+    // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), the
+    // inverse of fits_headroom()'s own comparison above, rather than
+    // re-subtracting the reserve by hand here -- the two must not drift.
+    const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_mem);
     const uint32_t fits_headroom_ctx =
         ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_bytes, n_head, n_ubatch);
     GGML_LOG_ERROR(
@@ -17321,14 +17328,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
     // depends on the CURRENT free-memory reading, not whatever was true when
     // the plan this snapshot carries was first published, so a card whose
     // free memory has since dropped (another tenant, a budget-pct change)
-    // is re-evaluated honestly here too. This call also runs strictly LATER
-    // than the full transaction's own read (it fires from
-    // resolve_fused_ops(), after memory init and a probe graph_reserve()),
-    // so it reads a strictly LOWER free figure by construction -- a
-    // boundary shape the full transaction allowed can therefore still be
-    // refused here. That refusal surfaces as the std::runtime_error
-    // sycl_recheck_runtime_context_flash_attn() throws (llama-context.cpp)
-    // when this returns GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
+    // is re-evaluated honestly here too. This call also runs LATER than
+    // the full transaction's own read (it fires from resolve_fused_ops(),
+    // after memory init and a probe graph_reserve()), so it reads a free
+    // figure this process has since drawn down (memory init plus the
+    // probe graph_reserve()), typically lower -- a boundary shape the
+    // full transaction allowed can therefore still be refused here. (Not
+    // guaranteed lower: another tenant releasing VRAM between the two
+    // reads could raise it instead.) That refusal surfaces as the
+    // std::runtime_error sycl_recheck_runtime_context_flash_attn() throws
+    // (llama-context.cpp) when this returns
+    // GGML_SYCL_LIFECYCLE_PLAN_REJECTED.
     const bool ok =
         ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
                                            current->plan->planner_n_head_all_max, flash_attn_enabled,

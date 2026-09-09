@@ -491,13 +491,22 @@ def test_formula_and_inverse_are_declared_and_defined():
     def _has_static_before(text: str, name: str) -> bool:
         return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
 
-    demand_name  = "unified_cache_nonfa_attn_scratch_demand_bytes"
-    inverse_name = "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch"
-
-    assert not _has_static_before(cpp_norm, demand_name), f"{demand_name}() must not be file-static (.cpp)"
-    assert not _has_static_before(hpp_norm, demand_name), f"{demand_name}() must not be declared static (.hpp)"
-    assert not _has_static_before(cpp_norm, inverse_name), f"{inverse_name}() must not be file-static (.cpp)"
-    assert not _has_static_before(hpp_norm, inverse_name), f"{inverse_name}() must not be declared static (.hpp)"
+    # llama.cpp-pvjr: extended from the original (demand_name, inverse_name)
+    # pair to also cover the headroom predicate's own exported surface --
+    # each must be reachable from ggml-sycl.cpp the same way the original
+    # two are, and a file-static regression on any of them would be exactly
+    # as silent (a compile error this text-only test would otherwise miss).
+    checked_names = (
+        "unified_cache_nonfa_attn_scratch_demand_bytes",
+        "unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch",
+        "unified_cache_nonfa_attn_outside_arena_reserve_bytes",
+        "unified_cache_nonfa_attn_scratch_fits_headroom",
+        "unified_cache_nonfa_attn_scratch_guard_disabled",
+        "unified_cache_nonfa_attn_scratch_headroom_capacity_bytes",
+    )
+    for name in checked_names:
+        assert not _has_static_before(cpp_norm, name), f"{name}() must not be file-static (.cpp)"
+        assert not _has_static_before(hpp_norm, name), f"{name}() must not be declared static (.hpp)"
 
 
 def test_auto_flash_attn_resolution_rechecks_the_guard():

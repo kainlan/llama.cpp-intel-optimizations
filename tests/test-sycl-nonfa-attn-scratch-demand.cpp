@@ -1,9 +1,14 @@
-// Host-only gate for llama.cpp-oyfl: the non-flash-attention batched mul_mat
-// scratch demand formula in unified-cache.cpp/hpp
+// Host-only gate for llama.cpp-oyfl + llama.cpp-pvjr: the non-flash-attention
+// batched mul_mat scratch demand formula in unified-cache.cpp/hpp
 // (unified_cache_nonfa_attn_scratch_demand_bytes() and its inverse,
-// unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()).
+// unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()), plus the
+// headroom predicate that replaced the SCRATCH-zone-capacity refusal
+// (unified_cache_nonfa_attn_outside_arena_reserve_bytes(),
+// unified_cache_nonfa_attn_scratch_fits_headroom(),
+// unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(), and
+// unified_cache_nonfa_attn_scratch_guard_disabled()).
 //
-// No SYCL device is needed -- both are pure functions of an env var and a
+// No SYCL device is needed -- all are pure functions of an env var and a
 // few integers. Modeled closely on tests/test-sycl-onednn-graph-floor.cpp,
 // which gates the sibling oneDNN Graph-scratch floor this formula was
 // derived by analogy from -- but this one is NOT gated behind
@@ -44,6 +49,7 @@ using ggml_sycl::unified_cache_nonfa_attn_outside_arena_reserve_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_fits_headroom;
 using ggml_sycl::unified_cache_nonfa_attn_scratch_guard_disabled;
+using ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes;
 
 namespace {
 
@@ -165,7 +171,7 @@ void test_override_zero() {
 }
 
 void test_largest_fitting_n_ctx() {
-    printf("Inverse: largest fitting n_ctx for a SCRATCH zone capacity:\n");
+    printf("Inverse: largest fitting n_ctx for a byte capacity:\n");
 
     // Exact round trip against the B50 repro shape's own demand: a zone
     // sized to exactly hold n_ctx=8192's demand must report 8192 back (it is
@@ -176,10 +182,11 @@ void test_largest_fitting_n_ctx() {
 
     // The default 512 MiB SCRATCH zone (ensure_planned_arena_zones()'s
     // pre-existing floor) at the repro's n_head/n_ubatch fits LESS than
-    // 8192 -- this is the concrete case the runtime-context-update guard
-    // must refuse rather than let ggml_sycl_mul_mat_batched_sycl() abort on.
-    // Exact value: 512 MiB / (32 * 512 * 6) = 5461.33, rounded down to the
-    // nearest 256 = 5376.
+    // 8192 -- the concrete case the RETIRED zone-capacity predicate
+    // (llama.cpp-oyfl round 3) refused. The current headroom guard
+    // (llama.cpp-pvjr) never consults the zone, so this row now pins only
+    // the inverse's own arithmetic. Exact value: 512 MiB / (32 * 512 * 6)
+    // = 5461.33, rounded down to the nearest 256 = 5376.
     const uint32_t fits_default_zone = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(512 * kMiB, 32, 512);
     check(fits_default_zone == 5376,
           "the default 512 MiB SCRATCH zone fits exactly n_ctx=5376 at n_head=32/n_ubatch=512, below the "
@@ -299,21 +306,32 @@ void test_headroom_predicate() {
     check(unified_cache_nonfa_attn_scratch_fits_headroom(0, reserve),
           "free_bytes exactly equal to the reserve fits a zero demand");
 
-    // Largest-fitting n_ctx at capacity = H - R on both cards (the
-    // headroom-limited remediation the runtime refusal reports). Computed
-    // by hand: floor((H - R) / (n_head * n_ubatch * 6)) rounded down to the
-    // nearest multiple of 256.
+    // unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(): the
+    // inverse of fits_headroom()'s own comparison (free - reserve, clamped
+    // to 0). Boundary rows first, independent of any hardware figure.
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(reserve) == 0,
+          "capacity at free == reserve is exactly 0 (nothing above the reserve to spend)");
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(reserve + 1) == 1,
+          "capacity at free == reserve + 1 is exactly 1 byte");
+    check(unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(0) == 0,
+          "capacity at free == 0 is 0, not an underflowed huge value (free <= reserve is clamped)");
+
+    // Largest-fitting n_ctx at capacity = headroom_capacity_bytes(H) on both
+    // cards (the headroom-limited remediation the runtime refusal reports),
+    // now going through the function under test rather than re-subtracting
+    // the reserve by hand. Expected values computed by hand: floor((H - R) /
+    // (n_head * n_ubatch * 6)) rounded down to the nearest multiple of 256.
     //   B50: H=1627.3 MiB, R=928 MiB -> capacity ~= 733,269,196 B
     //        (~699.3 MiB); 733269196 / 98304 = 7459.86..., rounded down to
     //        the nearest multiple of 256 (7459 / 256 = 29.14...) -> 7424.
-    const size_t capacity_b50 = h_b50 - reserve;
+    const size_t capacity_b50 = unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(h_b50);
     check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b50, 32, 512) == 7424,
           "B50 headroom-limited largest fitting n_ctx at R=928 MiB is 7424");
 
     //   B70: H=2045.2 MiB, R=928 MiB -> capacity ~= 1,171,469,107 B
     //        (~1117.2 MiB); 1171469107 / 98304 = 11916.4..., rounded down
     //        to the nearest multiple of 256 (11916 / 256 = 46.5...) -> 11776.
-    const size_t capacity_b70 = h_b70 - reserve;
+    const size_t capacity_b70 = unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(h_b70);
     check(unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_b70, 32, 512) == 11776,
           "B70 headroom-limited largest fitting n_ctx at R=928 MiB is 11776");
 }
