@@ -1819,7 +1819,7 @@ bool unified_cache_nonfa_attn_scratch_fits_headroom(size_t demand_bytes, size_t 
 size_t unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(size_t free_bytes) {
     // The inverse of fits_headroom()'s own comparison: fits_headroom(d, free)
     // is true iff d + reserve <= free, i.e. iff d <= (free - reserve) when
-    // free > reserve, and never (for any d >= 0) when free <= reserve. This
+    // free >= reserve, and never (for any d >= 0) when free < reserve. This
     // function returns that same (free - reserve) capacity, clamped to 0 --
     // a caller who wants "the largest demand still refused/allowed" must
     // derive it from THIS function, not re-subtract the reserve by hand, so

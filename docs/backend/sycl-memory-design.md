@@ -2110,8 +2110,8 @@ still runs for its own INFO logging, but only on the full transaction
 `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`, since the explicit-0 skip returns
 before either the re-plan or the fit/refuse decision. A refusal now
 reports `needs` (= demand + reserve, broken out as `demand`/`reserve`),
-`free`, and `over_by`, plus the largest-fitting `-c` at `capacity = free
-- reserve` (`unified_cache_nonfa_attn_scratch_headroom_capacity_bytes()`,
+`free`, and `over_by`, plus the largest-fitting `-c` at `capacity = free -
+reserve` (`unified_cache_nonfa_attn_scratch_headroom_capacity_bytes()`,
 labeled **"headroom-limited"**, replacing "scratch-limited" — it is
 bounded by this device's own live outside-arena headroom, not a zone or a
 whole-device guarantee). An explicit `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0`

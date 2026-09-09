@@ -488,20 +488,21 @@ def test_formula_and_inverse_are_declared_and_defined():
     # a stronger check, but this test runs without one); in the .hpp a
     # `static` on the DECLARATION would give each translation unit that
     # includes the header its own internal-linkage copy, which is just as
-    # wrong even though it happens to still compile. Checked in both files
-    # for every name in checked_names below (two files x six names), with a
-    # "static ... name(" bridge
-    # that does not name a return type at all -- `\bstatic\b[^;{}]*?\bname\(`
-    # -- so it is not fooled by a return-type spelling change ("static
-    # std::size_t", say) or a storage-class keyword or attribute stacked
-    # between `static` and the type ("static inline", "static
+    # wrong even though it happens to still compile. Checked in both
+    # files for every name in checked_names below (two files x six
+    # names), with a "static ... name(" bridge that does not name
+    # a return type at all -- `\bstatic\b[^;{}]*?\bname\(` -- so
+    # it is not fooled by a return-type spelling change ("static
+    # std::size_t", say) or a storage-class keyword or attribute
+    # stacked between `static` and the type ("static inline", "static
     # __attribute__((used)) size_t"); bounded to `[^;{}]` so it cannot
-    # cross a statement or scope boundary and match some unrelated earlier
-    # `static` against this name's own later, unrelated appearance. Each
-    # match is reduced to a bool BEFORE the assert -- asserting directly on
-    # a `re.search()` result (or on the huge normalized-source string
-    # itself) would make a failing pytest try to render that whole
-    # multi-hundred-KB string as part of the diff.
+    # cross a statement or scope boundary and match some unrelated
+    # earlier `static` against this name's own later, unrelated
+    # appearance. Each match is reduced to a bool BEFORE the assert
+    # -- asserting directly on a `re.search()` result (or on the huge
+    # normalized-source string itself) would make a failing pytest
+    # try to render that whole multi-hundred-KB string as part of
+    # the diff.
     def _has_static_before(text: str, name: str) -> bool:
         return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
 
