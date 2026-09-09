@@ -1464,16 +1464,19 @@ size_t unified_cache_nonfa_attn_outside_arena_reserve_bytes();
 // fitting).
 bool unified_cache_nonfa_attn_scratch_fits_headroom(size_t demand_bytes, size_t free_bytes);
 
-// The inverse of unified_cache_nonfa_attn_scratch_fits_headroom()'s own
-// comparison: returns (free_bytes - reserve), clamped to 0, i.e. the largest
-// demand that still fits when free_bytes >= reserve. Below the reserve the
-// clamp returns 0 even though NOTHING fits, not even a zero-byte demand --
-// read a 0 capacity as "nothing fits", never as "zero fits". The two
-// functions must move together -- a caller deriving this capacity by hand
-// (free_bytes > reserve ? free_bytes - reserve : 0) instead of calling this
-// function risks drifting from fits_headroom() if the reserve or the
-// comparison ever changes; this function exists so there is exactly one
-// place that can drift.
+// The inverse of unified_cache_nonfa_attn_scratch_fits_headroom()'s
+// own comparison: returns (free_bytes - reserve), clamped to 0, i.e.
+// the largest demand that still fits when free_bytes >= reserve. Below
+// the reserve the clamp also returns 0 even though NOTHING fits there,
+// not even a zero-byte demand -- so a 0 capacity means "nothing fits"
+// whenever free_bytes < reserve, and only at free_bytes == reserve
+// does it mean "exactly a zero-byte demand fits" (unreachable from
+// the real formula, whose demand is positive for any n_ctx >= 1). The
+// two functions must move together -- a caller deriving this capacity
+// by hand (free_bytes > reserve ? free_bytes - reserve : 0) instead
+// of calling this function risks drifting from fits_headroom() if the
+// reserve or the comparison ever changes; this function exists so there
+// is exactly one place that can drift.
 size_t unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(size_t free_bytes);
 
 // True when GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set -- an explicit,
