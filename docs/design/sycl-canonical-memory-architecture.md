@@ -413,9 +413,11 @@ anyone.
      Graph-scratch pool's completion-flag slab (`llama.cpp-c6ah`). This site
      needs `CACHE_BACKING` for the same reason the staging buffer does: a
      device marker kernel can still be in flight, holding a raw pointer into
-     the slab, when shutdown runs (see `unified-cache.cpp:18338`'s
-     pre-teardown census), so the slab must survive destructive teardown
-     rather than being refused as a live non-`CACHE_BACKING` control.
+     the slab, when shutdown runs (see `snapshot_allocation_controls(...,
+     preteardown=true)`'s admissibility decision and its
+     "pre-cache-teardown" refusal call site, both in `unified-cache.cpp`),
+     so the slab must survive destructive teardown rather than being
+     refused as a live non-`CACHE_BACKING` control.
      Reviewed and accepted as the second allowlisted mint rather than
      reclassified `EXTERNAL_EXACT`, because `EXTERNAL_EXACT` carries no such
      teardown exemption.

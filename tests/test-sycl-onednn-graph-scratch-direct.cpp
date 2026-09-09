@@ -1729,7 +1729,9 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     // free list at reclaim time) and both pass on the fix, independent of
     // timing.
     const int32_t old_entry_flag_slot = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeReclaimRetire);
-    const size_t  free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    check(old_entry_flag_slot >= 0,
+          "the old entry actually armed a slot -- otherwise the two witnesses below prove nothing");
+    const size_t free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
 
     // Reclaim the pool WHILE ptr_old's marker kernel is still in flight --
     // the exact hazard this test exists to catch. Before the fix,

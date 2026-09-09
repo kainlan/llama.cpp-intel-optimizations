@@ -164,20 +164,41 @@ def _adopt_cache_backing_cohorts(code: str) -> list:
 # watcher/host_task exists" reading (see docstring's "Hardened" note --
 # c6ah's own history, not a hypothetical) must stay HISTORY-framed wherever
 # it is still mentioned in prose, never restated as the current explanation.
-_LIES_WORD_RE = re.compile(r"\blies\b", re.IGNORECASE)
+# Both spellings actually used in this codebase's comments ("LIES" as a
+# claim, "lying" in "there is no lying query") must be caught -- a
+# single-spelling word boundary would leave the other silently unchecked.
+_LIES_WORD_RE = re.compile(r"\bl(?:ies|ying)\b", re.IGNORECASE)
+# A boundary a framing check should not cross: the end of a sentence
+# ("word. " or "word." at end of text) or a blank "//" comment line (a
+# paragraph break). Bounding a match's window at the NEAREST such boundary
+# in each direction -- rather than a fixed character count -- means framing
+# only counts when it is in the same sentence, or at worst the same
+# paragraph if no blank comment line intervenes; a fixed-size window would
+# also credit an unframed sentence merely sitting near an unrelated framed
+# one.
+_SENTENCE_OR_PARAGRAPH_BOUNDARY_RE = re.compile(r"\.(?:\s|$)|\n[ \t]*//[ \t]*\n")
+
+
+def _sentence_bounded_window(text: str, start: int, end: int) -> str:
+    left = 0
+    for m in _SENTENCE_OR_PARAGRAPH_BOUNDARY_RE.finditer(text, 0, start):
+        left = m.end()
+    right_match = _SENTENCE_OR_PARAGRAPH_BOUNDARY_RE.search(text, end)
+    right = right_match.end() if right_match else len(text)
+    return text[left:right]
 
 
 def _withdrawn_lies_phrasing_is_history_framed(raw_text: str) -> bool:
-    """True iff every standalone occurrence of "lies" in raw_text (the RAW,
-    comment-bearing text -- this checks comment PROSE, not code, so it must
-    not run against a comment-stripped copy) sits inside a passage that also
-    says "earlier" or "misdiagnos", within a window generous enough to cover
-    this codebase's multi-line comment style. Vacuously true if the word
-    does not occur at all -- this check exists to catch a REINTRODUCTION of
-    the withdrawn reading without its framing, not to require the mention to
-    exist."""
+    """True iff every standalone occurrence of "lies"/"lying" in raw_text
+    (the RAW, comment-bearing text -- this checks comment PROSE, not code,
+    so it must not run against a comment-stripped copy) sits inside the
+    SAME sentence (or, absent an intervening blank comment line, the same
+    paragraph) as "earlier" or "misdiagnos". Vacuously true if neither
+    spelling occurs at all -- this check exists to catch a REINTRODUCTION
+    of the withdrawn reading without its framing, not to require the
+    mention to exist."""
     for match in _LIES_WORD_RE.finditer(raw_text):
-        window = raw_text[max(0, match.start() - 350):match.end() + 350]
+        window = _sentence_bounded_window(raw_text, match.start(), match.end())
         if not re.search(r"earlier|misdiagnos", window, re.IGNORECASE):
             return False
     return True
@@ -196,8 +217,12 @@ DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER = (
 )
 
 
-def _design_doc_states_measured_facts() -> bool:
-    normalized = normalize_ws(MEMORY_DESIGN_MD)
+def _design_doc_states_measured_facts(doc_text: str = MEMORY_DESIGN_MD) -> bool:
+    # llama.cpp-c6ah: `doc_text` defaults to the real doc but accepts a
+    # substitute so a mutation witness can call this SAME function against
+    # mutated text, rather than re-deriving its own separate check that
+    # could silently drift from what the real check actually does.
+    normalized = normalize_ws(doc_text)
     return (
         normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in normalized
         and normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in normalized
@@ -975,21 +1000,57 @@ def test_withdrawn_lies_phrasing_check_has_a_mutation_witness() -> None:
     assert _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + framed_reintroduction), (
         "the check should not reject a NEW mention that is properly history-framed"
     )
+    # llama.cpp-c6ah: the specific gap a fixed-size character window left --
+    # an UNFRAMED sentence sitting in the same paragraph as, but not the
+    # same sentence as, a genuinely framed one used to inherit that framing
+    # merely by being nearby. Two sentences, same paragraph (no blank
+    # comment line between them): the first is framed and would pass on its
+    # own; the second restates the withdrawn claim with no framing of its
+    # own and must fail even though "misdiagnosis" appears a few words
+    # earlier in the same paragraph.
+    adjacent_unframed_reintroduction = (
+        "\n// An earlier draft mishandled this timing. That was a misdiagnosis of a different effect.\n"
+        "// The bare event query lies about completion once a watcher is attached.\n"
+    )
+    assert not _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + adjacent_unframed_reintroduction), (
+        "mutation witness is broken: an unframed 'lies' sentence merely ADJACENT (same paragraph, different "
+        "sentence) to an unrelated framed one was not detected -- framing must be in the same sentence, not "
+        "merely nearby"
+    )
+    # llama.cpp-c6ah: the OTHER half of this ticket's own regression -- the
+    # "lying" spelling (used in this codebase's own comments: "there was no
+    # lying query") must be caught by the same mechanism, unframed.
+    unframed_lying_reintroduction = "\n// There is no lying query here, this function tells the truth.\n"
+    assert not _withdrawn_lies_phrasing_is_history_framed(CACHE_HPP + unframed_lying_reintroduction), (
+        "mutation witness is broken: an unframed 'lying' mention was not detected -- only the 'lies' "
+        "spelling was being matched"
+    )
 
 
 def test_design_doc_measured_facts_check_has_a_mutation_witness() -> None:
     """Mutation witness for llama.cpp-c6ah: proves the "design
     doc states the two measured completion-check facts" check above would
     catch either fact being edited or removed from
-    docs/backend/sycl-memory-design.md."""
+    docs/backend/sycl-memory-design.md -- by calling
+    _design_doc_states_measured_facts() itself against the mutated text
+    (not a separately re-derived local check that could silently drift
+    from what the real check actually tests)."""
     assert _design_doc_states_measured_facts(), "the real, unmutated design doc should already pass this check"
     mutated_missing_first_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
         normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS), "", 1
     )
     assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) not in mutated_missing_first_fact
     assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) in mutated_missing_first_fact
+    assert not _design_doc_states_measured_facts(mutated_missing_first_fact), (
+        "mutation witness is broken: removing the first measured fact was not detected by the real check "
+        "function"
+    )
     mutated_missing_second_fact = normalize_ws(MEMORY_DESIGN_MD).replace(
         normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER), "", 1
     )
     assert normalize_ws(DESIGN_DOC_MEASURED_FACT_HOST_TASK_BLOCKS_SUBMITTER) not in mutated_missing_second_fact
     assert normalize_ws(DESIGN_DOC_MEASURED_FACT_QUERY_BLOCKS) in mutated_missing_second_fact
+    assert not _design_doc_states_measured_facts(mutated_missing_second_fact), (
+        "mutation witness is broken: removing the second measured fact was not detected by the real check "
+        "function"
+    )

@@ -3717,13 +3717,24 @@ class unified_cache {
     // entirely -- the g_sycl_shutting_down branch and the "SYCL context is
     // already invalid" catch, both reached only when the SYCL runtime
     // itself is already gone (static destruction order, or process exit).
-    // Both are safe without a drain for the same reason: this slab's owning
-    // mem_handle (onednn_graph_scratch_flag_slab_owner_) is never assigned
-    // {} or otherwise released on either path, so it ABANDONS the
-    // allocation rather than calling sycl::free() on it -- the same pattern
-    // every other owner member on those paths follows. No marker kernel can
-    // write through freed memory, because the memory is never freed there;
-    // it is deliberately leaked for the remainder of the process.
+    // Unlike compute_arena_owner_, scratch_pool_owner_,
+    // onednn_weights_scratch_owner_, onednn_activations_scratch_owner_ and
+    // staging_owner_ -- each explicitly reset to {} on both paths -- this
+    // slab's owning mem_handle (onednn_graph_scratch_flag_slab_owner_) is
+    // left untouched there; it destructs later, from ~unified_cache()'s
+    // normal member teardown, the same way the pooled reuse-pool entries'
+    // mem_handles do (see the llama.cpp-0oxf comment on that field's own
+    // handling, just above these two branches in unified-cache.cpp). Both
+    // are safe without a drain for the same reason, and it has nothing to
+    // do with whether {} was assigned: the actual physical release is
+    // shutdown-guarded at its source -- allocation_release_coordinator::retire()
+    // and mem_handle::release_lease_state() (mem-handle.cpp) both check
+    // ggml_sycl_is_shutting_down() and ABANDON the control instead of
+    // releasing it once that flag is set, whether the release was
+    // triggered by an explicit `= {}` or by a destructor running later. No
+    // marker kernel can write through freed memory, because the memory is
+    // never freed on this path at all; it is deliberately leaked for the
+    // remainder of the process.
     //
     // No std::once_flag here (unlike event_watch_queue_ below): every real
     // caller of onednn_graph_scratch_ensure_flag_slab_locked() is already
