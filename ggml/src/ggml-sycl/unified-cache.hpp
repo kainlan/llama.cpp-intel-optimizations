@@ -1368,6 +1368,20 @@ void ggml_sycl_test_onednn_graph_scratch_suppress_abort(bool suppress);
 // which resets it to false (a single-shot latch, like a "consumed" event).
 bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 
+// llama.cpp-c6ah: RED arm inside the GREEN binary. While forced, the reuse
+// pool's completion check (onednn_graph_scratch_pool_entry_release_complete())
+// ignores a pooled entry's host-visible release_done flag and falls back to
+// the pre-fix behaviour -- an event_complete() query directly on
+// release_event, which BLOCKS rather than polls on a profiling-enabled
+// queue (see event_complete()'s comment). A test uses this to demonstrate
+// what the fix replaced: with the hook forced, requesting a size an
+// in-flight entry occupies waits for that entry's release instead of
+// skipping it; with the hook off (the default), it does not. Off by
+// default, like every hook in this block; a no-op unless
+// GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 is set (see
+// onednn_graph_scratch_test_hooks_enabled() in unified-cache.cpp).
+void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
+
 // Host-testable wrapper around onednn_graph_scratch_zone_floor_bytes(), which
 // has internal (file-static) linkage. Pure function, no device/backend state
 // -- reads GGML_SYCL_ONEDNN_GRAPH_ZONE_MB the same way the real call site
@@ -2172,6 +2186,27 @@ class unified_cache {
     // GPUs, keeping H2D memcpy off the CCS (compute) engine so SOA reorder
     // kernels can run concurrently without monopolizing CCS preempt budget.
     sycl::queue & get_bcs_queue();
+
+    // --- Event-watch queue: host_task-only completion watcher (llama.cpp-c6ah) ---
+    // Lazily created on first use and torn down with the cache, same pattern
+    // as get_dma_queue()/get_bcs_queue(). Deliberately OUT-OF-ORDER (NOT
+    // in_order, unlike dma_queue_/bcs_queue_): every submission on this queue
+    // is a host_task depending on exactly one release event and nothing
+    // else, so an in_order queue would needlessly serialise a fast release's
+    // watcher behind a slower one still queued ahead of it -- there is no
+    // ordering relationship between two unrelated watchers to preserve.
+    // Deliberately NON-profiling for the same reason event_complete() cannot
+    // be polled on a profiling-enabled queue (see that function's comment
+    // above): enable_profiling would not affect the host_task itself, but
+    // there is no reason to pay for counter-based events on a queue that
+    // never submits device work, and consistency with "profiling only where
+    // it is actually used" keeps this queue's purpose legible. Never used
+    // for real device work and never waited on for correctness -- the
+    // std::atomic<bool> flag a host_task on this queue sets is what callers
+    // actually read (unified_cache::pool_entry_release_complete()); the
+    // queue only needs to exist long enough to run that one host_task per
+    // pooled entry.
+    sycl::queue & get_event_watch_queue();
 
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
@@ -3551,6 +3586,14 @@ class unified_cache {
     sycl::queue *                compute_queue_ = nullptr;  // Inference compute queue (for deferred free barriers)
     std::unique_ptr<sycl::queue> dma_queue_;                // Separate in-order queue for cache DMA ops (CCS)
     std::unique_ptr<sycl::queue> bcs_queue_;                // Copy-only queue targeting BCS engine (ordinal 1)
+    // Lazily created by get_event_watch_queue() (llama.cpp-c6ah); out-of-order,
+    // non-profiling, host_task-only. Guards first-use construction against
+    // concurrent callers -- onednn_graph_scratch_free() parks entries under
+    // onednn_graph_scratch_mutex_, but this queue is general-purpose
+    // infrastructure and must not assume every future caller already holds
+    // that (or any) lock.
+    std::unique_ptr<sycl::queue> event_watch_queue_;
+    std::once_flag               event_watch_queue_once_;
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -3890,6 +3933,22 @@ class unified_cache {
     struct onednn_graph_scratch_pool_entry {
         mem_handle  owner;
         sycl::event release_event;
+        // llama.cpp-c6ah: host-visible completion flag, armed by a host_task
+        // on get_event_watch_queue() at park time (see
+        // onednn_graph_scratch_free()'s push_back site) once release_event
+        // completes. release_event lives on a profiling-enabled backend
+        // stream, and event_complete()'s own comment documents that the bare
+        // command_execution_status query BLOCKS rather than polls on such a
+        // queue -- so querying release_event directly here would turn "skip
+        // an in-flight entry" into "wait for it", exactly the bug this
+        // ticket closes. Pool lookups must go through
+        // pool_entry_release_complete() rather than event_complete()
+        // directly. nullptr when the host_task could not be armed (queue
+        // creation or submission threw) -- pool_entry_release_complete()
+        // falls back to the old (blocking, but correct) event_complete()
+        // query in that case, so a failed arm degrades to pre-fix behaviour
+        // rather than misreporting readiness.
+        std::shared_ptr<std::atomic<bool>> release_done;
     };
 
     std::unordered_map<size_t, std::vector<onednn_graph_scratch_pool_entry>> onednn_graph_scratch_reuse_pool_;
@@ -3933,6 +3992,27 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_bytes_          = 0;
     size_t onednn_graph_scratch_pool_peak_bytes_     = 0;
 
+    // llama.cpp-c6ah: the ONE place that decides whether a pooled entry's
+    // release is done. Prefers the host-visible `entry.release_done` flag
+    // (set async by a host_task on get_event_watch_queue()) over querying
+    // `entry.release_event` directly, because release_event lives on a
+    // profiling-enabled backend stream and event_complete()'s own comment
+    // documents that the bare command_execution_status query BLOCKS rather
+    // than polls there. Every reader of a pool entry's completion --
+    // onednn_graph_scratch_entry_usable_locked(),
+    // onednn_graph_scratch_evict_pool_until_fits_locked(), and
+    // onednn_graph_scratch_clear_pool_locked() -- must call this instead of
+    // event_complete() directly, so the pool's "skip in-flight entries, do
+    // not wait for them" design is actually non-blocking end to end. Static
+    // (same as event_complete()): needs no instance state beyond the entry
+    // itself. Gated test hook: when GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 and
+    // ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(true) has
+    // been called, this falls back to the old blocking event_complete()
+    // query regardless of release_done -- the RED arm a GPU test uses to
+    // demonstrate what this fix replaced (see the test hook declarations
+    // above).
+    static bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry);
+
     // Outcome of testing one pool entry against a request's `alignment` and
     // `device_id` -- see onednn_graph_scratch_entry_usable_locked() below.
     // Kept as a 4-way enum (not a bool) specifically so a caller can
@@ -3963,13 +4043,15 @@ class unified_cache {
     // that needs the resolved pointer on a USABLE result, or needs to tell
     // RESOLVE_FAILED apart from ALIGNMENT_MISMATCH for its own branching,
     // does not have to resolve() a second time. This single call already
-    // performs the one event_complete() query and (if that passes) the one
-    // resolve() query this entry needs for this request -- a caller must
-    // NOT call event_complete() on the same entry itself first (llama.cpp-c6ah
-    // tracks event_complete()'s own potentially-blocking behaviour on
-    // profiling queues separately; doubling the query here would double
-    // that cost per candidate entry for no benefit, since EVENT_PENDING
-    // already reports exactly that outcome). Callers must hold
+    // performs the one completion query (via
+    // onednn_graph_scratch_pool_entry_release_complete(), llama.cpp-c6ah --
+    // NOT a direct event_complete() query, which blocks rather than polls
+    // on the profiling-enabled queues every backend stream uses) and, if
+    // that passes, the one resolve() query this entry needs for this
+    // request -- a caller must NOT query completion on the same entry
+    // itself first; doubling the query here would double that cost per
+    // candidate entry for no benefit, since EVENT_PENDING already reports
+    // exactly that outcome. Callers must hold
     // onednn_graph_scratch_mutex_.
     onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
         const onednn_graph_scratch_pool_entry & entry,

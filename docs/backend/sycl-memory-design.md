@@ -403,7 +403,8 @@ ticket reproduced on:
   (`onednn_graph_scratch_reuse_pool_`: `size -> {mem_handle, release event}`
   entries) instead of handing it to the shared background drain worker via
   `retain_handles_until_event()`, and `onednn_graph_scratch_alloc()` checks
-  that pool (for a `event_complete()`-true entry of the EXACT requested size)
+  that pool (for a completion-confirmed entry of the EXACT requested size --
+  see the completion-flag bullet below for what "confirmed" means)
   before ever falling to a fresh `unified_alloc()`. This serves the common
   case for free: SDPA calls of a fixed `(n_head, ncols, ne11)` shape repeat
   across `-r N` benchmark reps and across decode steps at a stable KV length.
@@ -442,6 +443,29 @@ ticket reproduced on:
   under any circumstance. `onednn_graph_scratch_direct_wait_count()` and
   `onednn_graph_scratch_pool_hit_count()` report how often a run actually had
   to wait, and how often it was served from the pool instead, respectively.
+- **Pool completion checks go through a host-visible flag, not a direct
+  SYCL event query (llama.cpp-c6ah).** `event_complete()`'s bare
+  `command_execution_status` query BLOCKS rather than polls on any
+  profiling-enabled queue, and every backend stream — including the one
+  oneDNN's free callback supplies `release_event` on — is
+  profiling-enabled (see that function's own comment). Querying
+  `release_event` directly from the reuse pool therefore WAITS for an
+  in-flight SDPA kernel to finish instead of skipping it, defeating the
+  "park and skip in-flight entries" design. `onednn_graph_scratch_free()`
+  now arms a `std::shared_ptr<std::atomic<bool>>` per pooled entry: a
+  `host_task` submitted to a new, lazily-created `get_event_watch_queue()`
+  — out-of-order and non-profiling, unlike every other backend queue —
+  sets the flag once `release_event` completes, and this code never waits
+  on that `host_task` itself. Every reader of a pool entry's
+  completion — `onednn_graph_scratch_entry_usable_locked()`,
+  `onednn_graph_scratch_evict_pool_until_fits_locked()`, and
+  `onednn_graph_scratch_clear_pool_locked()` — goes through
+  `onednn_graph_scratch_pool_entry_release_complete()`, which prefers this
+  flag and falls back to the old (blocking, but correct) `event_complete()`
+  query only when the flag could never be armed (queue creation or
+  submission threw). A test-only hook,
+  `ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()`, forces
+  that fallback so a GPU test can demonstrate the difference directly.
 - **The pool is bounded per size, and reclaimed at every point that could
   otherwise leave it stale.** Nothing but the byte cap bounds how many
   buffers of ONE size the pool could hold, so `onednn_graph_scratch_free()`
