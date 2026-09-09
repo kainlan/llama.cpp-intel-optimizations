@@ -9870,10 +9870,13 @@ bool unified_cache::onednn_graph_scratch_pool_entry_release_complete(
         // default this codebase's other atomic_ref uses all take) because
         // this specific read/write pair crosses the host/device boundary;
         // device scope only orders visibility among threads on the device
-        // itself.
-        sycl::atomic_ref<int32_t, sycl::memory_order::acquire, sycl::memory_scope::system> flag_atomic(
+        // itself. DefaultOrder is `relaxed` (SYCL's atomic_ref only
+        // accepts relaxed/acq_rel/seq_cst as a class-level default -- see
+        // <sycl/atomic_ref.hpp>'s own static_assert); the actual acquire
+        // semantics are supplied explicitly to load() below instead.
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system> flag_atomic(
             onednn_graph_scratch_flag_slab_[entry.flag_slot]);
-        return flag_atomic.load() == static_cast<int32_t>(entry.flag_generation);
+        return flag_atomic.load(sycl::memory_order::acquire) == static_cast<int32_t>(entry.flag_generation);
     }
     // No flag armed -- slab allocation failed, every slot was checked out,
     // the marker-kernel submit threw, or the RED-arm test hook
@@ -9937,7 +9940,7 @@ bool unified_cache::onednn_graph_scratch_ensure_flag_slab_locked() {
             "falling back to blocking completion checks for every pooled entry\n");
         return false;
     }
-    onednn_graph_scratch_flag_slab_ = static_cast<volatile int32_t *>(resolved);
+    onednn_graph_scratch_flag_slab_ = static_cast<int32_t *>(resolved);
     onednn_graph_scratch_flag_slot_free_list_.reserve(kOnednnGraphScratchFlagSlabCapacity);
     for (size_t i = kOnednnGraphScratchFlagSlabCapacity; i > 0; --i) {
         onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(i - 1));
@@ -10879,12 +10882,16 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                                 // codebase's other atomic_ref call sites
                                 // use) is required because this write must
                                 // become visible to a HOST reader, not just
-                                // other device threads.
+                                // other device threads. DefaultOrder is
+                                // `relaxed` (SYCL's atomic_ref only accepts
+                                // relaxed/acq_rel/seq_cst as a class-level
+                                // default); the actual release semantics
+                                // are supplied explicitly to store() below.
                                 h.single_task([flag_ptr, gen]() {
-                                    sycl::atomic_ref<int32_t, sycl::memory_order::release, sycl::memory_scope::system,
+                                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system,
                                                      sycl::access::address_space::global_space>
                                         flag_atomic(*flag_ptr);
-                                    flag_atomic.store(static_cast<int32_t>(gen));
+                                    flag_atomic.store(static_cast<int32_t>(gen), sycl::memory_order::release);
                                 });
                             });
                             // Only remove the slot from the free list AFTER
