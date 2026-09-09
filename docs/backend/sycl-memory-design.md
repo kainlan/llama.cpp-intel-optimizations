@@ -367,6 +367,28 @@ ticket reproduced on:
   clamp below), the formula now gives each class its own effective
   window and takes the max across classes, so gemma4 now computes the
   correct 64 MiB (24 MiB raw, clamped) instead of 192 MiB.
+  ⚠️ **This gemma4 example describes the formula's behavior for the
+  `n_ctx` it is actually given at PLANNING time, which is NOT today's
+  real runtime context by default.** The floor is computed once, at
+  MODEL LOAD (`populate_host_zone_sizing()`), from
+  `plan.planner_n_ctx = kv_info.n_ctx`; at that point `kv_info.n_ctx` is
+  `llama_model_sycl_populate_inventory()`'s conservative
+  `inventory.n_ctx = inventory.n_ubatch` default (both 512) -- not
+  `-c 8192` or whatever a caller eventually requests, since the envelope
+  applies its own `n_ctx` only to `n_ubatch`, never to `n_ctx` itself.
+  `ggml_backend_sycl_set_runtime_context()` later updates
+  `planner_n_ctx` and KV/VRAM accounting for the real context, but does
+  NOT call `unified_cache_set_planned_onednn_graph_scratch_shape()`
+  again, so the ONEDNN Graph-scratch shape (and this floor) stays frozen
+  at its load-time value. So the SWA window term only actually binds
+  (`n_swa < n_ctx`) once a caller threads the real `n_ctx` into the
+  envelope BEFORE planning, not on an ordinary `-c 8192` run today --
+  the 24 MiB/192 MiB comparison above is the formula's behavior at that
+  `n_ctx`, not (yet) what a default run computes. Re-planning the
+  Graph-scratch shape on a runtime context change is tracked separately
+  (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line below prints the
+  `n_ctx` it actually used, which is what makes this gap visible in a
+  real log.
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —

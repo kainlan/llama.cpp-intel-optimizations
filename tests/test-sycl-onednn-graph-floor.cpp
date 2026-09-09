@@ -170,26 +170,33 @@ void test_swa_formula() {
         // predicted at this shape (see test_default_formula()'s Mistral row
         // at the same n_ubatch/n_ctx for that 192 MiB figure).
         { 0,  8,  1024, 512, 8192, 64,
-         "gemma4 (n_head_swa_max=8, n_swa=1024) @ ubatch=512 ctx=8192 -> raw 24 MiB, clamped to 64 MiB"         },
+         "gemma4 (n_head_swa_max=8, n_swa=1024) @ ubatch=512 ctx=8192 -> raw 24 MiB, clamped to 64 MiB"             },
         // n_ctx < n_swa: the window never binds, so the SWA class's
         // effective ne11 must fall back to n_ctx, not the (larger) n_swa --
         // this must equal the non-SWA formula at the identical (n_head,
         // n_ubatch, n_ctx), matched below via the 3-arg overload.
         { 0,  32, 8192, 512, 2048, 192,
-         "n_ctx(2048) < n_swa(8192): SWA class effective window is n_ctx, matching the non-SWA formula"         },
+         "n_ctx(2048) < n_swa(8192): SWA class effective window is n_ctx, matching the non-SWA formula"             },
         // Both classes present; the ctx class dominates (32 heads over the
         // full 8192 ctx beats 8 heads over a 1024 window) -- the floor must
         // take the MAX across classes, not their sum (which would double
         // the Mistral 768 MiB figure this matches).
         { 32, 8,  1024, 512, 8192, 768,
-         "both classes present, ctx class dominates -> matches the ctx-only Mistral figure, not ctx+swa summed" },
-        // Both classes present, SWA class dominates this time (8 heads over
+         "both classes present, ctx class dominates -> matches the ctx-only Mistral figure, not ctx+swa summed"     },
+        // Both classes present, SWA class dominates this time (64 heads over
         // a 1024 window beats 1 head over the full 1024 ctx) -- same MAX
-        // requirement, opposite class winning, so a formula that always
-        // picked the ctx term would silently pass the row above and still
-        // be wrong.
-        { 1,  8,  1024, 512, 1024, 64,
-         "both classes present, swa class dominates -> raw 3 MiB from ctx alone would be wrong; still clamped"  },
+        // requirement, opposite class winning. spec-review round 1, F3: a
+        // prior version of this row used n_head_swa_max=8, which put BOTH
+        // the correct answer (24 MiB raw) and the wrong ctx-only answer
+        // (3 MiB raw) below the 64 MiB clamp -- a VOID positive control,
+        // since either formula produces the identical clamped 64 MiB and
+        // the row could never distinguish them. n_head_swa_max=64 pushes
+        // the correct answer to 192 MiB, well above the clamp, so a
+        // formula that silently picked the ctx term (3 MiB raw, also
+        // clamped to 64 MiB) would visibly diverge from this row's
+        // expectation instead of coincidentally matching it.
+        { 1,  64, 1024, 512, 1024, 192,
+         "both classes present, swa class dominates -> raw 3 MiB from ctx alone would be wrong; correct is 192 MiB" },
     };
     for (const case_t & c : cases) {
         const size_t got = ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes_swa(c.n_head_ctx_max, c.n_head_swa_max,

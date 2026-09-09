@@ -170,6 +170,15 @@ FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_gr
 # llama.cpp-o3a0: the window-aware formula's own body -- see the comment
 # above FLOOR_BODY_CODE for why the two anchors cannot collide.
 FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes_swa(")
+# llama.cpp-o3a0 spec-review round 1 (F5): the WITH-FLOOR getter that
+# actually calls the floor formula with the shape's SWA fields -- scoping
+# the "caller passes the swa fields" check (below) to this one function's
+# body, rather than the whole file, so a partial revert of just this
+# caller (leaving the unrelated DIRECT-allocation-failure error log's own
+# call to the same fields untouched) still fails the check.
+WITH_FLOOR_GETTER_BODY_CODE = extract_function_body(
+    CACHE_CPP_CODE, "size_t unified_cache_get_planned_onednn_scratchpad_bytes(int device_id) {"
+)
 MAKE_ENGINE_BODY_CODE = extract_function_body(COMMON_HPP_CODE, "dnnl::engine make_engine(sycl::queue * q) {")
 # llama.cpp-pqgl: the size>cap early-out's ordering relative to the eviction
 # sweep, both inside this one function.
@@ -487,9 +496,14 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # argument, since normalize_ws would still find SOME five-argument call
     # matching the full string only if every token survives; this check
     # isolates the two fields the full check could not easily localize a
-    # failure to).
+    # failure to). spec-review round 1 (F5): scoped to
+    # WITH_FLOOR_GETTER_BODY_CODE, not the whole file -- the
+    # DIRECT-allocation-failure error log elsewhere in this file passes the
+    # identical field names to a DIFFERENT call, so a file-wide substring
+    # search here would still pass after a partial revert of THIS caller
+    # specifically (the actual bug this check exists to catch).
     checks["graph scratch zone floor caller passes the swa fields"] = (
-        "shape.n_head_swa_max" in CACHE_CPP_CODE and "shape.n_swa" in CACHE_CPP_CODE
+        "shape.n_head_swa_max" in WITH_FLOOR_GETTER_BODY_CODE and "shape.n_swa" in WITH_FLOOR_GETTER_BODY_CODE
     )
     checks["zone floor env var"] = "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB" in CACHE_CPP_CODE
     checks["allocator opt-out env var name"] = "GGML_SYCL_ONEDNN_CACHE_ALLOCATOR" in CACHE_CPP_CODE

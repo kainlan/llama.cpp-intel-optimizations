@@ -15859,12 +15859,12 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes, g_tensor_inventory_pp_moe_onednn_output_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_ring_depth);
 
-    g_model_n_layer                  = inventory->n_layer;
-    g_placement_kv_info.n_layer      = inventory->n_layer;
-    g_placement_kv_info.n_embd_k_gqa = inventory->n_embd_k_gqa;
-    g_placement_kv_info.n_embd_v_gqa = inventory->n_embd_v_gqa;
-    g_placement_kv_info.n_ctx        = inventory->n_ctx;
-    g_placement_kv_info.n_ubatch     = inventory->n_ubatch;
+    g_model_n_layer                    = inventory->n_layer;
+    g_placement_kv_info.n_layer        = inventory->n_layer;
+    g_placement_kv_info.n_embd_k_gqa   = inventory->n_embd_k_gqa;
+    g_placement_kv_info.n_embd_v_gqa   = inventory->n_embd_v_gqa;
+    g_placement_kv_info.n_ctx          = inventory->n_ctx;
+    g_placement_kv_info.n_ubatch       = inventory->n_ubatch;
     g_placement_kv_info.n_swa          = inventory->n_swa;
     g_placement_kv_info.n_swa_layers   = inventory->n_swa_layers;
     g_placement_kv_info.n_head_ctx_max = inventory->n_head_ctx_max;

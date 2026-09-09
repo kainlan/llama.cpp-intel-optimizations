@@ -241,34 +241,63 @@ static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
-// llama.cpp-o3a0: replicates ggml_sycl_flash_attn_ext_onednn_plan()'s D-based
-// eligibility gate (ggml/src/ggml-sycl/fattn-onednn.cpp: the `ne00 > 512`
-// UNSUPPORTED_D reject, and the `ne00 > 256` strict-scale gate) for the sole
-// purpose of the oneDNN Graph-scratch zone floor -- this is a llama-layer
-// file and cannot include the SYCL-only fattn-onednn.cpp/.hpp to share the
-// real predicate directly. D <= 256 is unconditionally eligible: the
-// GENERALIZED scale fix (llama.cpp-p0f5) writes the model's real runtime
-// divisor into the compiled partition instead of assuming sqrt(D), so a
-// pre-scaled-Q model no longer fails the scale check there. D in (256, 512]
-// is eligible only when GGML_SYCL_FA_ONEDNN_D512_SCALE is set, mirroring
-// ggml_sycl_fa_onednn_d512_scale_relaxed()'s own live getenv parse exactly
-// (same env var, same `atoi(e) != 0` truthiness) so the two copies can never
-// silently read the same variable two different ways. D > 512 is never
-// eligible (UNSUPPORTED_D, unconditional -- that gate has no hatch). Kept
-// identical to the SYCL-side predicate by
+// llama.cpp-o3a0 (spec-review round 1 fix F1): replicates
+// ggml_sycl_flash_attn_ext_onednn_plan()'s D-based eligibility gate
+// (ggml/src/ggml-sycl/fattn-onednn.cpp: the `ne00 > 512` UNSUPPORTED_D
+// reject, and the `ne00 > 256` scale-or-hatch gate) for the sole purpose of
+// the oneDNN Graph-scratch zone floor -- this is a llama-layer file and
+// cannot include the SYCL-only fattn-onednn.cpp/.hpp to share the real
+// predicate directly.
+//
+// D <= 256 is unconditionally eligible: the GENERALIZED scale fix
+// (llama.cpp-p0f5) writes the model's real runtime divisor into the
+// compiled partition instead of assuming sqrt(D), so the real gate's only
+// remaining requirement at D<=256 (a finite, nonzero scale) holds for
+// every in-tree model.
+//
+// D in (256, 512] mirrors the real gate's FULL disjunction: eligible when
+// EITHER GGML_SYCL_FA_ONEDNN_D512_SCALE is set (same env var, same live
+// getenv parse -- deliberately NOT cached in a function-local static,
+// matching ggml_sycl_fa_onednn_d512_scale_relaxed()'s own uncached form;
+// this runs once per layer at load, not per dispatch, so there is no hot
+// path to cache for) OR the layer's attention scale is already the
+// canonical 1/sqrt(D) -- the real gate's own
+// `fabs(1/scale - sqrt(D)) < 1e-3` tolerance check. An earlier version of
+// this helper required the hatch unconditionally for D>256, which is
+// STRICTER than the real gate and would silently under-count eligibility
+// (and so under-provision the floor) for any D>256 layer whose scale
+// already happens to be canonical.
+//
+// The layer's scale is derived the way every in-tree build_*.cpp derives
+// kq_scale from hparams.f_attention_scale: 0.0f (the default, meaning "no
+// override was set") means canonical 1/sqrt(D), which trivially satisfies
+// the tolerance check; any other value is used verbatim, matching
+// gemma4/gemma3n/gemma4-assistant's f_attention_scale=1.0f pre-scaled-Q
+// layers, whose D=512 global layers correctly stay ineligible without the
+// hatch. If some future architecture computes kq_scale by a mechanism
+// OTHER than f_attention_scale while leaving that field at its 0.0f
+// default, this reads it as canonical and marks the layer eligible even
+// if the real runtime scale would fail the strict check -- the SAFE
+// direction: a layer this wrongly counts eligible only ever makes the
+// floor bigger than the real oneDNN demand, never smaller, and the real
+// dispatch-time gate in fattn-onednn.cpp is entirely unaffected by this
+// file either way.
+//
+// Kept identical to the SYCL-side predicate by
 // tests/test-sycl-onednn-graph-floor-eligibility-source.py.
-static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim) {
+static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim, float f_attention_scale) {
     if (head_dim > 512) {
         return false;
     }
     if (head_dim <= 256) {
         return true;
     }
-    static const bool d512_scale_relaxed = [] {
-        const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512_SCALE");
-        return env ? (std::atoi(env) != 0) : false;
-    }();
-    return d512_scale_relaxed;
+    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512_SCALE");
+    if (env && std::atoi(env) != 0) {
+        return true;
+    }
+    const float kq_scale = f_attention_scale == 0.0f ? 1.0f / sqrtf(static_cast<float>(head_dim)) : f_attention_scale;
+    return std::fabs(1.0f / kq_scale - sqrtf(static_cast<float>(head_dim))) < 1e-3f;
 }
 
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
@@ -399,7 +428,7 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     uint32_t n_head_ctx_max = 0;
     uint32_t n_head_swa_max = 0;
     for (uint32_t il = 0; il < n_layer; ++il) {
-        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il))) {
+        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), hparams.f_attention_scale)) {
             continue;
         }
         if (hparams.is_swa(il)) {

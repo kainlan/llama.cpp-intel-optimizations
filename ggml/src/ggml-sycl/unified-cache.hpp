@@ -1391,7 +1391,9 @@ bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 // -- reads GGML_SYCL_ONEDNN_GRAPH_ZONE_MB the same way the real call site
 // does, memoized on first call within the process (set the env var before
 // the first call in a test). Backward-compat, no-SWA form: delegates to the
-// _swa wrapper below with an empty SWA class.
+// 3-arg static overload (onednn_graph_scratch_zone_floor_bytes()), which
+// itself delegates into the window-aware _swa formula with an empty SWA
+// class -- not directly to the _swa wrapper below.
 size_t ggml_sycl_test_onednn_graph_scratch_zone_floor_bytes(uint32_t n_head, uint32_t n_ubatch, uint32_t n_ctx);
 // llama.cpp-o3a0: host-testable wrapper around the window-aware
 // onednn_graph_scratch_zone_floor_bytes_swa(), same internal-linkage/

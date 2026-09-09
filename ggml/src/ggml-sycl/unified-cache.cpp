@@ -1680,7 +1680,7 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
     // arithmetic, no rounding surprises near the MiB boundaries the anchor
     // points above were measured at.
     const uint64_t elems    = std::max(ctx_term, swa_term) * static_cast<uint64_t>(n_ubatch);
-    const uint64_t modeled = (elems * kSizeofF32 * 3) / 2;
+    const uint64_t modeled  = (elems * kSizeofF32 * 3) / 2;
     return static_cast<size_t>(std::max<uint64_t>(kFloorMinBytes, modeled));
 }
 
