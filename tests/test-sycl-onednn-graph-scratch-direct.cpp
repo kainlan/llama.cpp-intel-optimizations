@@ -157,6 +157,7 @@ int main() {
 }
 #else
 
+#    include <algorithm>
 #    include <chrono>
 #    include <thread>
 
@@ -341,18 +342,88 @@ slow_release_result submit_slow_release(sycl::queue & q) {
     cal_evt.wait_and_throw();
     long long cal_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cal_start).count();
-    if (cal_ms <= 0) {
-        cal_ms = 1;  // guard against a division by zero on an implausibly fast run
+
+    // llama.cpp-c6ah: an implausible calibration reading means something is
+    // wrong with the hardware/driver/queue state (e.g. GPU thermal
+    // throttling to a crawl, or a stuck queue returning near-instantly
+    // without the kernel actually having run), not with the scaling math
+    // below -- letting it drive that math unchecked has two failure modes,
+    // not one: an implausibly SMALL cal_ms (near zero) scales toward
+    // billions of iterations (~3e9 at cal_ms=1), a multi-MINUTE spin that
+    // blows this test's own 300 s ctest TIMEOUT rather than failing fast;
+    // an implausibly LARGE cal_ms scales toward a near-zero iteration
+    // count, silently producing a "slow release" that is not actually
+    // slow. Fail loudly (via check(), so the rest of this test still runs)
+    // and clamp into the plausible band rather than let either play out
+    // silently. 10-2000 ms: comfortably wider than the 110-122 ms this
+    // fork's own two discrete cards measured for kCalibrationIterations
+    // (test-sycl-event-status-blocking-probe.cpp), without being so wide
+    // that a genuinely broken reading could sneak through as "plausible".
+    constexpr long long kMinPlausibleCalMs = 10;
+    constexpr long long kMaxPlausibleCalMs = 2000;
+    check(cal_ms >= kMinPlausibleCalMs && cal_ms <= kMaxPlausibleCalMs,
+          "calibration kernel duration is within a plausible band (10-2000 ms) -- an implausible value means "
+          "something is wrong with the hardware/driver/queue state, not with the scaling math that follows");
+    if (cal_ms < kMinPlausibleCalMs || cal_ms > kMaxPlausibleCalMs) {
+        printf(
+            "    (submit_slow_release: calibration kernel took %lld ms for %lld iterations -- outside the "
+            "10-2000 ms plausible band, clamping before scaling)\n",
+            cal_ms, kCalibrationIterations);
+        cal_ms = std::max(kMinPlausibleCalMs, std::min(cal_ms, kMaxPlausibleCalMs));
     }
+
     long long scaled_iterations =
         static_cast<long long>((static_cast<double>(kCalibrationIterations) / static_cast<double>(cal_ms)) *
                                static_cast<double>(kSlowReleaseMs));
     if (scaled_iterations < 1) {
         scaled_iterations = 1;
     }
+    // Upper clamp independent of the plausibility band above: even a
+    // plausible calibration rate could scale to an unreasonable iteration
+    // count if kSlowReleaseMs were ever raised far beyond its current
+    // 1500 ms without revisiting this clamp. 64x kCalibrationIterations
+    // -- at the clamped worst case (cal_ms == kMaxPlausibleCalMs, i.e. the
+    // slowest rate this function will still scale from) that bounds the
+    // resulting kernel to at most 64 x kMaxPlausibleCalMs = 128 s, still
+    // comfortably under this test's 300 s ctest TIMEOUT with margin for
+    // everything else this binary does.
+    constexpr long long kMaxScaledIterationsMultiple = 64;
+    const long long     max_scaled_iterations        = kCalibrationIterations * kMaxScaledIterationsMultiple;
+    if (scaled_iterations > max_scaled_iterations) {
+        scaled_iterations = max_scaled_iterations;
+    }
 
     sycl::event evt = submit_spin_kernel(q, cell, scaled_iterations);
     return { evt, kSlowReleaseMs };
+}
+
+// llama.cpp-c6ah: the ACTUAL device-measured duration of an event ALREADY
+// known to be complete (command_end - command_start, both in nanoseconds
+// per SYCL's profiling info), as opposed to submit_slow_release()'s own
+// pre-submission CALIBRATED ESTIMATE (kSlowReleaseMs) -- printed alongside
+// that estimate at every call site where the event's completion is
+// confirmed before printing, so a failing bound is diagnosable as "the
+// query did not block" rather than confusable with "the kernel ran
+// shorter than the estimate" (calibration folds submission overhead into
+// its rate, and the FIRST spin kernel submitted in a process also pays a
+// one-time JIT/compilation cost the calibration run itself absorbs but a
+// caller's own estimate cannot see). Profiling info is only valid once the
+// command has finished -- NEVER call this on a still-pending event (most
+// of this file's own release events are deliberately still pending at
+// their own "elapsed=" print site; this helper is for the OTHER prints,
+// after an explicit wait()). Requires the queue the event was submitted on
+// to be profiling-enabled (every real backend stream in this codebase is,
+// via default_queue_properties()) -- returns -1 if the query itself
+// throws, so a caller can print "n/a" rather than propagate the exception
+// into an unrelated check.
+long long actual_kernel_duration_ms(sycl::event & evt) {
+    try {
+        const auto start_ns = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
+        const auto end_ns   = evt.get_profiling_info<sycl::info::event_profiling::command_end>();
+        return static_cast<long long>((end_ns - start_ns) / 1'000'000ull);
+    } catch (const sycl::exception &) {
+        return -1;
+    }
 }
 
 // llama.cpp-c6ah: onednn_graph_scratch_pool_entry_release_complete()'s
@@ -557,10 +628,18 @@ void test_bounded_eviction(unified_cache * cache) {
     check(cache->onednn_graph_scratch_pool_eviction_count() > eviction_count_before,
           "onednn_graph_scratch_pool_eviction_count() increased -- ptr1's pooled entry was actually released, "
           "not just waited on");
+    // slow_release.release_event is confirmed complete at this point -- the
+    // eviction just asserted above only happens once
+    // onednn_graph_scratch_pool_entry_release_complete() reports it so --
+    // so reading its ACTUAL device-measured duration here (as opposed to
+    // submit_slow_release()'s own pre-submission calibrated ESTIMATE) is
+    // valid; see actual_kernel_duration_ms()'s own comment for why both
+    // numbers are printed rather than just the estimate.
     printf(
-        "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, cap wait count %zu -> %zu, eviction "
-        "count %zu -> %zu)\n",
-        static_cast<long long>(elapsed.count()), slow_release.duration_ms, wait_count_before,
+        "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, actual=%lld ms, cap wait count %zu -> "
+        "%zu, eviction count %zu -> %zu)\n",
+        static_cast<long long>(elapsed.count()), slow_release.duration_ms,
+        actual_kernel_duration_ms(slow_release.release_event), wait_count_before,
         cache->onednn_graph_scratch_direct_wait_count(), eviction_count_before,
         cache->onednn_graph_scratch_pool_eviction_count());
 
@@ -938,9 +1017,9 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
 // event in production is device-kernel-produced (oneDNN's own free
 // callback), so this test's own "slow release" events are too -- see
 // submit_slow_release()'s own comment for the history (this file used a
-// host_task-produced release event through several review rounds, which
-// measured a ~6 ms RED arm below instead of reproducing the block this
-// ticket's fix actually closes).
+// host_task-produced release event until the probe measured otherwise,
+// which measured a ~6 ms RED arm below instead of reproducing the block
+// this ticket's fix actually closes).
 //
 // WHY THIS TEST NEEDS A RAISED CAP, NOT A SHRUNK ZONE. Proving "skipped,
 // not waited" with a wall-clock bound requires a request that does NOT
@@ -986,14 +1065,21 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // earlier test in this file frees its buffers with a nullptr event,
     // which PARKS them (still charged against
     // onednn_graph_scratch_direct_outstanding_bytes_) rather than
-    // releasing them for real, and none of those tests reclaims the pool
-    // again before returning -- so without this test's own leading
-    // reclaim, whatever those tests left parked would still be charged
-    // against the shared 700 MB cap when this test starts, and could by
-    // itself already exceed kSizeSkip's own `kSizeSkip * 2 <= kCapBytes`
-    // headroom static_assert below before this test allocates anything at
-    // all. Two of these must be outstanding at once (this one parked, plus
-    // a fresh same-size request) without engaging the cap.
+    // releasing them for real. In the CURRENT call order in main(), the
+    // immediately preceding test (test_oversized_request_skips_wait_loop)
+    // already reclaims at its own teardown, so this test's leading reclaim
+    // is not strictly needed to reach a clean pool THIS run -- it is
+    // ORDER-INDEPENDENCE INSURANCE against a future reordering of the
+    // main() call sequence, a future test inserted between that one and
+    // this one that does not clean up after itself, or that teardown call
+    // being removed later. Without it, whatever bytes an earlier test left
+    // parked would still be charged against the shared 700 MB cap when
+    // this test starts, and could leave less headroom under the cap than
+    // kSizeSkip's own doubled cost needs -- exactly the headroom its
+    // `kSizeSkip * 2 <= kCapBytes` static_assert below proves is available
+    // in isolation, a proof this reclaim is what actually makes true at
+    // runtime. Two of these must be outstanding at once (this one parked,
+    // plus a fresh same-size request) without engaging the cap.
     constexpr size_t kSizeSkip = 300ull * 1024 * 1024;
     static_assert(kSizeSkip > kZoneFloorBytes, "must exceed the zone floor to take the DIRECT path");
     static_assert(kSizeSkip * 2 <= kCapBytes,
@@ -1104,6 +1190,14 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // to that machinery's own internal 5 s bounded wait, not the "up to 2 s"
     // this function's own message claims.
     slow_release.release_event.wait();
+    // ptr1's release event is confirmed complete by the wait() just above
+    // (unlike at the "immediate re-request" print earlier in this
+    // function, where it was deliberately still pending) -- safe to read
+    // its ACTUAL device-measured duration here, alongside the calibrated
+    // ESTIMATE printed earlier, so a reader can see how close the estimate
+    // actually landed on this run's hardware.
+    printf("    (ptr1's release: calibrated estimate=%lld ms, actual=%lld ms)\n", slow_release.duration_ms,
+           actual_kernel_duration_ms(slow_release.release_event));
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
     const bool   became_hit_reuse  = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
     void *       ptr3              = became_hit_reuse ? ptr1 : nullptr;
@@ -1180,10 +1274,18 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
         check(ptr5 == ptr4,
               "...and the blocking query left the entry USABLE by the time it returned, so this was a pool HIT, "
               "not a fresh allocation -- the opposite of the GREEN-arm outcome above");
+        // slow_release2.release_event is confirmed complete at this point:
+        // ptr5 == ptr4 just above only holds if the blocking query itself
+        // already observed it complete before returning. Reading its
+        // ACTUAL device-measured duration here, alongside the calibrated
+        // ESTIMATE, is what actually distinguishes "the query did not
+        // block" from "the kernel happened to run shorter than the
+        // estimate" if this bound ever fails.
         printf(
-            "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, RED arm / "
+            "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, actual=%lld ms, RED arm / "
             "force_blocking_pool_check)\n",
-            static_cast<long long>(elapsed2.count()), slow_release2.duration_ms);
+            static_cast<long long>(elapsed2.count()), slow_release2.duration_ms,
+            actual_kernel_duration_ms(slow_release2.release_event));
 
         if (ptr5) {
             cache->onednn_graph_scratch_free(ptr5, nullptr);
@@ -1309,6 +1411,11 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
           "outstanding bytes reflect exactly the in-flight entry's size plus the fresh request -- the "
           "completed entry's bytes were removed (evicted), the in-flight entry's were not (still pooled, "
           "untouched)");
+    // Same queue-ordering assumption as the GREEN arm's own bound above
+    // (see the "ASSUMPTION" comment there): this bound also presumes
+    // onednn_graph_scratch_alloc()'s own unified_alloc() call does not
+    // itself submit anything onto `q`, which currently has evict_in_flight's
+    // slow kernel still running on it.
     check(sweep_elapsed.count() < evict_slow_release.duration_ms / 3,
           "the eviction sweep did not wait for the in-flight entry's release event -- evicting the completed "
           "entry alone was enough headroom");
@@ -1337,6 +1444,12 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // would truly release it, and both are more invasive than this
     // residual is worth closing here).
     evict_slow_release.release_event.wait();
+    // Confirmed complete by the wait() just above (unlike at the eviction
+    // sweep's own "elapsed=" print earlier, where it was deliberately
+    // still pending) -- safe to read its ACTUAL device-measured duration
+    // here, alongside the calibrated ESTIMATE printed there.
+    printf("    (evict_in_flight's release: calibrated estimate=%lld ms, actual=%lld ms)\n",
+           evict_slow_release.duration_ms, actual_kernel_duration_ms(evict_slow_release.release_event));
     const bool in_flight_survived = poll_for_pool_hit(cache, q, kSizeEvictInFlight, evict_in_flight);
     check(in_flight_survived,
           "the in-flight entry is still pooled and becomes a hit once its release event "

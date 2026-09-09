@@ -2175,9 +2175,15 @@ class unified_cache {
     // NON-profiling: every backend stream is created with both `in_order` and
     // `enable_profiling` via default_queue_properties(), and on a profiling-enabled
     // queue the bare command_execution_status query in event_complete() BLOCKS
-    // instead of polling. dma_queue_ is in_order only, no profiling -- it is the
-    // one queue where "released only after completion" is actually observable.
-    // Adding enable_profiling here would silently destroy that coverage.
+    // instead of polling -- confirmed on hardware
+    // (tests/test-sycl-event-status-blocking-probe.cpp) to hold specifically
+    // for a DEVICE-KERNEL-produced event; a host_task-produced event on a
+    // profiling queue returned in ~0 ms on both discrete cards this fork
+    // validates against, so a host_task-based reproduction of this claim
+    // would not show it. dma_queue_ is in_order only, no profiling -- it is
+    // the one queue where "released only after completion" is actually
+    // observable. Adding enable_profiling here would silently destroy that
+    // coverage.
     sycl::queue & get_dma_queue();
 
     // --- BCS queue for copy-only H2D transfers (targets copy engine) ---

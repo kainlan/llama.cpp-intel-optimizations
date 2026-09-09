@@ -25,26 +25,28 @@
 //     unified-cache.hpp's own comment claims is the one queue where the
 //     query is actually non-blocking).
 //
-//   - EVENT SOURCE: a host_task (what the pool's release events actually
-//     are in practice -- oneDNN's free callback supplies one) vs. a real
-//     DEVICE KERNEL (a single-work-item spin loop). The hpp comment this
-//     ticket's fix is built on documents driver behaviour that may be
-//     specific to device-kernel events; a host_task might not carry the
-//     same profiling counters at all, which would make it query-cheap
-//     regardless of queue properties -- a distinct explanation for the
-//     RED arm's ~6 ms result that has nothing to do with whether the
-//     ticket's premise holds for the case that actually matters
-//     (oneDNN's own release events, which ARE device-kernel-produced in
-//     production, even though this ticket's own GPU test happens to use
-//     host_task release events for convenience).
+//   - EVENT SOURCE: a host_task (what test-sycl-onednn-graph-scratch-direct.cpp's
+//     own "slow release" events were produced by, for convenience, when its
+//     RED arm measured that ~6 ms result) vs. a real DEVICE KERNEL (a
+//     single-work-item spin loop -- the shape oneDNN's free callback
+//     actually supplies release events as in production). The hypothesis
+//     this axis tested: the hpp comment this ticket's fix is built on
+//     documents driver behaviour that might be specific to device-kernel
+//     events, and a host_task might not carry the same profiling counters
+//     at all, which would make it query-cheap regardless of queue
+//     properties -- a distinct explanation for the RED arm's ~6 ms result
+//     that would have nothing to do with whether the ticket's premise
+//     holds for the case that actually matters in production. See the
+//     MEASURED section below for the answer this probe found.
 //
 // Both axes together give four combinations, each measured once. This test
 // asserts only that no query hangs and every event completes -- it prints
 // the four timings (plus each kernel's own total duration, measured
-// separately via wait(), so a human can see whether the spin loop's
-// iteration count is actually calibrated to ~1 s on the hardware it ran on)
-// and leaves the INTERPRETATION to whoever reads the numbers. Two outcomes
-// were possible in principle:
+// separately via wait(), so a human can see the actual kernel duration
+// GGML_TEST_SPIN_ITERATIONS produced on the hardware it ran on, and compare
+// the query time against THAT measured duration rather than against a
+// fixed target) and leaves the INTERPRETATION to whoever reads the numbers.
+// Two outcomes were possible in principle:
 //
 //   - If all four queries return in a few tens of ms, event_complete()
 //     already polls on this driver regardless of queue properties or event
@@ -219,8 +221,11 @@ int main(int, char ** argv) {
             "Bare command_execution_status query timing (single call, issued immediately\n"
             "after submission, no wait() first):\n");
 
-        // (1) host_task on the PROFILING queue -- the shape every pool
-        // release event in this ticket's own GPU test actually is.
+        // (1) host_task on the PROFILING queue -- the shape
+        // test-sycl-onednn-graph-scratch-direct.cpp's own "slow release"
+        // events used to be produced by, before this probe's own MEASURED
+        // result (above) showed that was not the shape that actually
+        // matters and that file switched to a device-kernel release event.
         {
             sycl::event     evt  = submit_host_task(q_profiling);
             const long long q_ms = measure_query_ms(evt);
@@ -252,10 +257,20 @@ int main(int, char ** argv) {
             evt.wait_and_throw();
             const long long kernel_ms = ms_since(k_start);
             check(true, "device kernel / profiling queue: query returned without hanging");
+            // The default GGML_TEST_SPIN_ITERATIONS (2,000,000) targets
+            // roughly 120 ms on the hardware this fork validates against
+            // (measured range: 110-122 ms across both discrete cards) --
+            // NOT kHostTaskMs (1000 ms), which only bounds the unrelated
+            // host_task combinations above. Compare query= against THIS
+            // line's own measured "kernel total duration", not a fixed
+            // target: what this file's interpretation actually needs is
+            // "did the query take close to the kernel's own duration",
+            // which holds regardless of what that duration numerically is.
             printf(
                 "  kernel,        profiling queue: query=%lld ms  (kernel total duration=%lld ms, "
-                "iterations=%lld -- adjust GGML_TEST_SPIN_ITERATIONS if this is far from %d ms)\n",
-                q_ms, kernel_ms, iterations, kHostTaskMs);
+                "iterations=%lld -- compare query= against this run's OWN measured kernel duration, not a "
+                "fixed target)\n",
+                q_ms, kernel_ms, iterations);
         }
 
         // (4) device kernel on the NON-PROFILING queue.
