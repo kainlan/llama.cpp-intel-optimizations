@@ -194,12 +194,12 @@ EVICT_UNTIL_FITS_BODY_CODE = extract_function_body(
 CLEAR_POOL_BODY_CODE = extract_function_body(
     CACHE_CPP_CODE, "void unified_cache::onednn_graph_scratch_clear_pool_locked("
 )
-# llama.cpp-c6ah (finding 28): the choke point's OWN body, extracted
+# llama.cpp-c6ah: the choke point's OWN body, extracted
 # separately from the three caller bodies above -- those checks assert what
 # the CALLERS query (RELEASE_COMPLETE_CALL, never a bare event_complete());
 # this one asserts what the choke point ITSELF does, specifically that its
 # only remaining event_complete() call is the flag_slot == -1 fallback
-# (finding 31 renamed the armed predicate from a release_done
+# (the armed predicate was renamed from a release_done
 # std::shared_ptr<std::atomic<bool>> to a flag_slot/flag_generation pair
 # into a host-USM slab; the shape of this check -- exactly one call, no
 # hook branch -- is unchanged), not a second call reintroduced by a RED-arm
@@ -576,8 +576,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     )
     checks["free no-cache branch does not call sycl::free"] = "sycl::free(" not in free_fn_code
 
-    # llama.cpp-c6ah (finding 28, kept true under finding 31's redesign): the
-    # choke point itself must call event_complete() exactly once -- the
+    # llama.cpp-c6ah: the choke point itself must call event_complete() exactly once -- the
     # flag_slot == -1 fallback -- and never branch on the RED-arm test hook.
     # A branch there would still be querying a WATCHED event whenever
     # flag_slot was armed, so the RED arm can only be correct if this
@@ -593,7 +592,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
     checks["free() park site consults the RED-arm test hook before arming the flag"] = (
         "g_onednn_graph_scratch_test_force_blocking_pool_check" in FREE_BODY_CODE
     )
-    # llama.cpp-c6ah (finding 31): the pool's completion flag is armed by a
+    # llama.cpp-c6ah: the pool's completion flag is armed by a
     # DEVICE marker kernel, never a host_task -- a host_task whose
     # depends_on() names an event from another queue (which the release
     # event always is here) was measured, both cards, to block the
@@ -639,14 +638,21 @@ def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
     those checks exist to catch (both used to call event_complete() on their
     own ahead of the shared predicate -- llama.cpp-c6ah), rather than only
     ever passing on the current, correct source."""
+    # Whitespace-insensitive (llama.cpp-c6ah): this declaration sits next to
+    # a comment block whose length determines whether clang-format pulls it
+    # into a multi-line alignment group with a sibling declaration further
+    # down, which changes the exact spacing between `mem_handle` and
+    # `owner` -- normalize before matching so an unrelated comment edit
+    # nearby cannot silently break this witness.
     reuse_target = "mem_handle owner = std::move(bucket[i].owner);"
-    assert reuse_target in TRY_REUSE_POOL_BODY_CODE, "mutation target string not found -- update this witness"
-    reuse_mutated = TRY_REUSE_POOL_BODY_CODE.replace(
+    reuse_body_normalized = normalize_ws(TRY_REUSE_POOL_BODY_CODE)
+    assert reuse_target in reuse_body_normalized, "mutation target string not found -- update this witness"
+    reuse_mutated = reuse_body_normalized.replace(
         reuse_target,
         "event_complete(bucket[i].release_event); " + reuse_target,
         1,
     )
-    assert reuse_mutated != TRY_REUSE_POOL_BODY_CODE
+    assert reuse_mutated != reuse_body_normalized
     assert _has_no_blocking_token(TRY_REUSE_POOL_BODY_CODE), (
         "the real, unmutated try_reuse_pool_locked() body should have no blocking token"
     )
@@ -656,13 +662,14 @@ def test_pool_predicate_callers_have_no_blocking_token_witness() -> None:
     )
 
     ready_target = "return true;"
-    assert ready_target in POOL_SIZE_READY_BODY_CODE, "mutation target string not found -- update this witness"
-    ready_mutated = POOL_SIZE_READY_BODY_CODE.replace(
+    ready_body_normalized = normalize_ws(POOL_SIZE_READY_BODY_CODE)
+    assert ready_target in ready_body_normalized, "mutation target string not found -- update this witness"
+    ready_mutated = ready_body_normalized.replace(
         ready_target,
         "event_complete(entry.release_event); " + ready_target,
         1,
     )
-    assert ready_mutated != POOL_SIZE_READY_BODY_CODE
+    assert ready_mutated != ready_body_normalized
     assert _has_no_blocking_token(POOL_SIZE_READY_BODY_CODE), (
         "the real, unmutated pool_size_ready_locked() body should have no blocking token"
     )
@@ -714,16 +721,16 @@ def test_pool_entry_release_complete_is_the_single_choke_point() -> None:
 
 
 def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() -> None:
-    """Mutation witness for llama.cpp-c6ah finding 28 (anchor updated for
-    finding 31's flag_slot/flag_generation redesign, same property):
-    proves the two checks added for it in the main contract test above
-    would actually catch the SPECIFIC regression they exist to prevent -- a
-    RED-arm test hook branch reintroduced inside
+    """Mutation witness for llama.cpp-c6ah (anchor tracks the
+    flag_slot/flag_generation redesign, same property this witness always
+    checked): proves the two checks added for it in the main contract test
+    above would actually catch the SPECIFIC regression they exist to
+    prevent -- a RED-arm test hook branch reintroduced inside
     onednn_graph_scratch_pool_entry_release_complete() itself, querying
     release_event directly whenever the hook is forced, regardless of
     flag_slot. That design was tried and found incorrect (it would still
-    query a WATCHED event, which finding 31 traced a separate hazard to --
-    see the function's own comment), which is why the fix moved the hook to
+    query a WATCHED event, a separate hazard documented in the function's
+    own comment), which is why the fix moved the hook to
     onednn_graph_scratch_free()'s park site instead; this witness proves a
     regression back to the check-time branch would be caught, not merely
     that the current source happens to pass."""
@@ -757,11 +764,11 @@ def test_release_complete_has_no_red_arm_branch_of_its_own_mutation_witness() ->
 
 
 def test_free_body_has_no_host_task_mutation_witness() -> None:
-    """Mutation witness for llama.cpp-c6ah finding 31: proves the "free()
+    """Mutation witness for llama.cpp-c6ah: proves the "free()
     body submits no host_task" check in the main contract test above would
     actually catch the SPECIFIC regression it exists to prevent -- a
     host_task reintroduced into onednn_graph_scratch_free()'s completion-
-    flag arm, the exact design finding 31 replaced after measuring (both
+    flag arm, the exact design this fork replaced after measuring (both
     cards, 2026-09-09) that submitting a host_task with a cross-queue
     dependency blocks the SUBMITTING thread -- i.e. this very function,
     called from oneDNN's free callback -- until that dependency

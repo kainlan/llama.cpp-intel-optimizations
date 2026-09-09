@@ -77,8 +77,8 @@
 // for the full history of why a host_task-produced release event there
 // measured a ~6 ms RED arm instead of reproducing this block at all.
 //
-// RELATED, DISTINCT FINDING (llama.cpp-c6ah, finding 31), not measured by
-// this file: the pool's original fix armed a host_task, on a SEPARATE
+// RELATED, DISTINCT FACT (llama.cpp-c6ah), not measured by this file: the
+// pool's original fix armed a host_task, on a SEPARATE
 // queue, depending on a device-kernel release event via depends_on() --
 // not the bare-query pattern this file measures at all. A follow-up
 // measurement (both cards, 2026-09-09) found that SUBMITTING such a

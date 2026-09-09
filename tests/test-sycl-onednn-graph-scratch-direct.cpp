@@ -349,7 +349,7 @@ struct slow_release_result {
     long long   duration_ms;
 };
 
-// llama.cpp-c6ah (finding 27): the scaled iteration count every
+// llama.cpp-c6ah: the scaled iteration count every
 // submit_slow_release() call in this process uses, computed exactly ONCE
 // by ensure_slow_release_calibrated() below and cached here. 0 means
 // "not yet calibrated" -- submit_slow_release() treats that as a hard
@@ -362,7 +362,7 @@ struct slow_release_result {
 long long g_slow_release_scaled_iterations = 0;
 int *     g_slow_release_cell              = nullptr;
 
-// llama.cpp-c6ah (finding 27): calibrates ONCE per process, against `q`
+// llama.cpp-c6ah: calibrates ONCE per process, against `q`
 // (the cache's own backend queue -- the SAME queue a real oneDNN
 // Graph-scratch release event actually completes on), and caches the
 // resulting scaled iteration count in g_slow_release_scaled_iterations for
@@ -489,14 +489,14 @@ void ensure_slow_release_calibrated(sycl::queue & q) {
 // iterations never dereferences g_slow_release_cell) kernel.
 slow_release_result submit_slow_release(sycl::queue & q) {
     check(g_slow_release_scaled_iterations > 0,
-          "submit_slow_release() called after ensure_slow_release_calibrated() already ran -- if this fails, "
+          "submit_slow_release() was NOT called before ensure_slow_release_calibrated() ran -- if this fails, "
           "main() is missing the explicit calibration call");
 
     sycl::event evt = submit_spin_kernel(q, g_slow_release_cell, g_slow_release_scaled_iterations);
     return { evt, kSlowReleaseMs };
 }
 
-// llama.cpp-c6ah (finding 31): onednn_graph_scratch_pool_entry_release_complete()'s
+// llama.cpp-c6ah: onednn_graph_scratch_pool_entry_release_complete()'s
 // completion flag is armed by a SEPARATE, asynchronous watcher marker
 // kernel (a device kernel, not a host_task -- see
 // onednn_graph_scratch_pool_entry::flag_slot's own comment in
@@ -655,7 +655,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
 
     sycl::queue & q = cache->get_queue();
 
-    // llama.cpp-c6ah (finding 28): leading reclaim -- test_pool_reuse()
+    // llama.cpp-c6ah: leading reclaim -- test_pool_reuse()
     // just above shares kSizeA with this test (deliberately, per its own
     // header comment: the exact-size pool-hit path this test's own comment
     // says to avoid re-testing), and its own poll_for_pool_hit() loop
@@ -676,9 +676,8 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     // slow entry this test means to exercise, which is indistinguishable
     // from the outside (eviction count still increases by exactly one) but
     // proves nothing about waiting for an in-flight release. This is what
-    // actually explained the both-cards failure the c6ah GPU run 9 report
-    // (llama.cpp-c6ah finding 28) attributed to a possible flag-correctness
-    // bug: the flag itself was never wrong (see event_complete()'s and
+    // actually explained a both-cards failure once mistaken for a possible
+    // flag-correctness bug: the flag itself was never wrong (see event_complete()'s and
     // onednn_graph_scratch_pool_entry_release_complete()'s own comments for
     // the runtime fact that WAS real and required its own fix), but this
     // test's setup could hand the eviction sweep an unrelated, genuinely-
@@ -689,7 +688,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     const size_t misses_before_setup = cache->onednn_graph_scratch_pool_miss_count();
     void *       ptr1                = cache->onednn_graph_scratch_alloc(kSizeA, 256, &q);
     check(ptr1 != nullptr, "DIRECT allocation for the eviction setup succeeds");
-    // llama.cpp-c6ah (finding 28): proves the leading reclaim above actually
+    // llama.cpp-c6ah: proves the leading reclaim above actually
     // worked -- without it, this setup allocation could silently be served
     // by a leftover decoy from test_pool_reuse() (a pool HIT), which is
     // exactly the failure mode this reclaim exists to prevent. A regression
@@ -711,10 +710,10 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     // is guaranteed to observe the cap and enter the wait loop, rather than
     // racing a fast release.
     slow_release_result slow_release    = submit_slow_release(q);
-    // llama.cpp-c6ah (finding 31): the free() call itself must return fast
-    // -- this is the exact regression finding 31 caught: the earlier
-    // host_task-based watcher design (finding 28) made SUBMITTING the
-    // watcher block the calling thread until the kernel it depended on
+    // llama.cpp-c6ah: the free() call itself must return fast -- this is
+    // the exact regression this bound catches: the earlier host_task-based
+    // watcher design made SUBMITTING the watcher block the calling thread
+    // until the kernel it depended on
     // completed, so onednn_graph_scratch_free() itself stalled for the
     // parked kernel's whole duration on every single park (measured, both
     // cards, 2026-09-09). A device marker kernel submitted the same way
@@ -729,7 +728,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
            free_call_ms, slow_release.duration_ms);
     check(free_call_ms < slow_release.duration_ms / 3,
           "onednn_graph_scratch_free() itself returned in well under a third of the release delay -- arming the "
-          "completion flag did not block the park call the way the host_task-based watcher design (finding 28) "
+          "completion flag did not block the park call the way the earlier host_task-based watcher design "
           "did");
 
     const size_t wait_count_before     = cache->onednn_graph_scratch_direct_wait_count();
@@ -737,15 +736,15 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeA,
           "onednn_graph_scratch_pool_peak_bytes() reflects ptr1 sitting in the pool");
 
-    // llama.cpp-c6ah (finding 32): the finding-29 t_flag/t_wait diagnostic
-    // that used to live here was moved to its own standalone sub-test,
+    // llama.cpp-c6ah: a t_flag/t_wait timing diagnostic that used to live
+    // here was moved to its own standalone sub-test,
     // test_flag_timing_diagnostic() -- see that function's own comment.
     // Running it here (between the park just above and the timed kSizeB
     // request just below) consumed the ~1500 ms delay this test's own
-    // cap-wait bound depends on measuring: build-c6ah-15 showed the pre-
-    // wait eviction sweep observing ptr1 already complete (the diagnostic
+    // cap-wait bound depends on measuring: the pre-wait eviction sweep
+    // observed ptr1 already complete (the diagnostic
     // had already polled the flag AND waited on the event before the timed
-    // request even started) and evicting it in 3-4 ms with zero cap waits,
+    // request even started) and evicted it in 3-4 ms with zero cap waits,
     // making the bound below vacuous.
 
     // kSizeB, not kSizeA: an exact-size request would be served by the pool
@@ -786,7 +785,7 @@ void test_bounded_eviction(unified_cache * cache, int device) {
         static_cast<long long>(elapsed.count()), slow_release.duration_ms, actual_ms, wait_count_before,
         cache->onednn_graph_scratch_direct_wait_count(), eviction_count_before,
         cache->onednn_graph_scratch_pool_eviction_count());
-    // llama.cpp-c6ah (finding 27): the calibrated ESTIMATE printed above is
+    // llama.cpp-c6ah: the calibrated ESTIMATE printed above is
     // only useful as a timing-bound denominator if the kernel actually ran
     // close to it -- check the ACTUAL measured duration directly, rather
     // than trusting the estimate, so a calibration undershoot (e.g. a
@@ -1355,7 +1354,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     const long long ptr1_actual_ms = actual_kernel_duration_ms(slow_release.release_event);
     printf("    (ptr1's release: calibrated estimate=%lld ms, actual=%lld ms)\n", slow_release.duration_ms,
            ptr1_actual_ms);
-    // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+    // llama.cpp-c6ah: same reasoning as test_bounded_eviction's
     // own actual-vs-calibrated check -- fail on this line, by name, rather
     // than let a calibration undershoot surface as a confusing miss on the
     // GREEN/RED arm bounds below that both depend on slow_release's
@@ -1365,7 +1364,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
           "this test's timing bounds are being checked against a kernel that undershot calibration");
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
 
-    // llama.cpp-c6ah (finding 28): time the poll itself (not just assert its
+    // llama.cpp-c6ah: time the poll itself (not just assert its
     // eventual outcome below) and print when it turned into a hit -- direct
     // evidence for how long the watcher's async dispatch actually took after
     // ptr1's kernel completed, alongside test_bounded_eviction's own flag
@@ -1414,8 +1413,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (RED arm)");
 
     // --- Positive control: the RED arm this GREEN binary can still produce.
-    // llama.cpp-c6ah (finding 28, mechanism updated by finding 31): forcing
-    // this hook makes onednn_graph_scratch_free() SKIP ARMING the
+    // llama.cpp-c6ah: forcing this hook makes onednn_graph_scratch_free() SKIP ARMING the
     // completion flag for ptr4's park below (flag_slot stays -1 for that
     // one entry), rather than -- an earlier version of this hook --
     // making onednn_graph_scratch_pool_entry_release_complete() branch on
@@ -1432,13 +1430,13 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // outcomes just asserted. Must be set BEFORE the free() below that
     // parks ptr4 -- the hook is read at PARK time, not at check time.
     //
-    // llama.cpp-c6ah (finding 31): confirmed real, not the finding-28(b)/29
-    // misdiagnosis this bound's own comment used to describe -- build-c6ah-10
+    // llama.cpp-c6ah: confirmed real on hardware, not the misdiagnosis an
+    // earlier version of this bound's own comment used to describe --
     // measured the forced-fallback bare query blocking for the kernel's
     // full ~1515/1516 ms on both cards, matching this bound. The mechanism
     // this arm relies on (flag_slot == -1 -> a bare query on a genuinely
-    // unwatched event) was never wrong; what was wrong (finding 31) was a
-    // SEPARATE, since-removed design -- arming the flag via a host_task,
+    // unwatched event) was never wrong; what was wrong was a SEPARATE,
+    // since-removed design -- arming the flag via a host_task,
     // which was found to block onednn_graph_scratch_free() itself, not the
     // query this RED arm exercises.
     ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(true);
@@ -1489,7 +1487,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
             "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, actual=%lld ms, RED arm / "
             "force_blocking_pool_check)\n",
             static_cast<long long>(elapsed2.count()), slow_release2.duration_ms, red_actual_ms);
-        // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+        // llama.cpp-c6ah: same reasoning as test_bounded_eviction's
         // own actual-vs-calibrated check -- this is the RED arm's own
         // positive-control bound (elapsed2 >= 80% of duration_ms just
         // above), so a calibration undershoot here would otherwise read as
@@ -1664,7 +1662,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     const long long evict_actual_ms = actual_kernel_duration_ms(evict_slow_release.release_event);
     printf("    (evict_in_flight's release: calibrated estimate=%lld ms, actual=%lld ms)\n",
            evict_slow_release.duration_ms, evict_actual_ms);
-    // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+    // llama.cpp-c6ah: same reasoning as test_bounded_eviction's
     // own actual-vs-calibrated check -- the sweep's own timing bound above
     // (sweep_elapsed < duration_ms / 3) depends on evict_slow_release
     // having actually run close to its calibrated target.
@@ -1682,25 +1680,101 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown");
 }
 
-// llama.cpp-c6ah (finding 32): standalone t_flag/t_wait diagnostic, moved
-// out of test_bounded_eviction() (finding 29's original home for it) after
-// build-c6ah-15 showed running it there consumed the ~1500 ms delay that
-// test's own cap-wait bound depends on measuring -- the pre-wait eviction
-// sweep observed ptr1 already complete (this diagnostic's own poll+wait
-// had already let the kernel finish before the timed request even
-// started) and evicted it in 3-4 ms with zero cap waits, making that
-// bound vacuous. The mechanism itself is confirmed understood
-// (build-c6ah-15, both cards): t_flag lands just after the kernel's own
-// actual duration (B50: t_flag=1533 ms vs actual=1515 ms; B70: 1527 ms vs
-// 1516 ms) and t_wait taken right after t_flag reads ~0 ms, so this
-// function keeps the measurement available as a standing, assertion-free
-// diagnostic (beyond the one bound every slow-release test in this file
-// already applies to its own free() call) rather than dropping it
-// entirely. Deliberately called LAST in main(), after every other test's
-// own teardown reclaim, so nothing it does here can perturb another
-// test's own timing the way its old placement did.
+// llama.cpp-c6ah: a pool entry whose marker kernel is still in flight when
+// the pool is reclaimed must have its flag_slot RETIRED (never returned to
+// the free list), not handed to a later entry. Before this was fixed,
+// onednn_graph_scratch_clear_pool_locked() returned every entry's slot
+// unconditionally, including one whose marker was still pending; since the
+// watch queue is out-of-order, that stale marker could fire AFTER a new
+// occupant's own marker already wrote its generation, overwriting the
+// slot back to the OLD generation and permanently flipping an
+// already-complete entry back to "not complete" -- its bytes then never
+// reclaimed, cap waits on every future request of that size running to
+// their 5 s timeout. This test parks an entry with a slow release,
+// reclaims the pool while it is still in flight (exactly the hazard),
+// parks a fresh same-size entry, confirms the fresh entry becomes complete
+// at its OWN kernel's end, and then -- after finally letting the old,
+// now-retired kernel finish too -- confirms the fresh entry's completion
+// is unaffected by that stale write.
+void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int device) {
+    printf("Reclaim while in flight retires the slot, not the entry it later hands out:\n");
+
+    sycl::queue & q = cache->get_queue();
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (reclaim retirement)");
+
+    constexpr size_t kSizeReclaimRetire = 320ull * 1024 * 1024;
+    static_assert(kSizeReclaimRetire > kZoneFloorBytes,
+                  "must exceed the no-model ONEDNN zone floor to take the DIRECT path");
+    static_assert(kSizeReclaimRetire < kCapBytes, "must fit under the cap alone -- no cap pressure needed here");
+
+    void * ptr_old = cache->onednn_graph_scratch_alloc(kSizeReclaimRetire, 256, &q);
+    check(ptr_old != nullptr, "DIRECT allocation for the old (in-flight-at-reclaim) entry succeeds");
+    if (!ptr_old) {
+        return;
+    }
+    slow_release_result old_release = submit_slow_release(q);
+    cache->onednn_graph_scratch_free(ptr_old, &old_release.release_event);
+
+    // Reclaim the pool WHILE ptr_old's marker kernel is still in flight --
+    // the exact hazard this test exists to catch. Before the fix,
+    // ptr_old's slot returned to the free list here even though its
+    // marker had not fired yet.
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test reclaim (entry still in flight)");
+
+    void * ptr_new = cache->onednn_graph_scratch_alloc(kSizeReclaimRetire, 256, &q);
+    check(ptr_new != nullptr, "DIRECT allocation for the new entry succeeds");
+    if (!ptr_new) {
+        return;
+    }
+    slow_release_result new_release = submit_slow_release(q);
+    cache->onednn_graph_scratch_free(ptr_new, &new_release.release_event);
+
+    // Poll the new entry's own flag directly (no alloc()/free() round trip
+    // that would itself consume/re-park it) until it reads true -- must
+    // happen at ITS OWN kernel's end.
+    const auto flag_poll_start    = std::chrono::steady_clock::now();
+    const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
+    bool       new_entry_complete = false;
+    while (std::chrono::steady_clock::now() < flag_poll_deadline) {
+        if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeReclaimRetire)) {
+            new_entry_complete = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    check(new_entry_complete, "the new entry's own completion flag reads true once its own release event completes");
+
+    // Now let the OLD (retired-slot) kernel finish too. If the fix is
+    // wrong -- if ptr_old's slot had been handed to ptr_new -- this stale,
+    // out-of-order write would flip ptr_new's completion status back to
+    // false right here.
+    old_release.release_event.wait_and_throw();
+    check(cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeReclaimRetire),
+          "the new entry STAYS complete after the old (retired-slot) kernel finally finishes -- proves the "
+          "retired slot was never handed to the new entry");
+
+    unified_cache_reclaim_onednn_graph_scratch_pool(device, "test teardown (reclaim retirement)");
+}
+
+// llama.cpp-c6ah: standalone t_flag/t_wait diagnostic, moved out of
+// test_bounded_eviction() (its original home) after that placement was
+// found to consume the ~1500 ms delay that test's own cap-wait bound
+// depends on measuring -- the pre-wait eviction sweep observed ptr1
+// already complete (this diagnostic's own poll+wait had already let the
+// kernel finish before the timed request even started) and evicted it in
+// 3-4 ms with zero cap waits, making that bound vacuous. The mechanism
+// itself is confirmed understood, both cards: t_flag lands just after the
+// kernel's own actual duration (B50: t_flag=1533 ms vs actual=1515 ms;
+// B70: 1527 ms vs 1516 ms) and t_wait taken right after t_flag reads
+// ~0 ms, so this function keeps the measurement available as a standing,
+// assertion-free diagnostic (beyond the one bound every slow-release test
+// in this file already applies to its own free() call) rather than
+// dropping it entirely. Deliberately called LAST in main(), after every
+// other test's own teardown reclaim, so nothing it does here can perturb
+// another test's own timing the way its old placement did.
 void test_flag_timing_diagnostic(unified_cache * cache, int device) {
-    printf("Flag timing diagnostic (finding 32):\n");
+    printf("Flag timing diagnostic:\n");
 
     sycl::queue & q = cache->get_queue();
 
@@ -1814,7 +1888,7 @@ int main(int, char ** argv) {
         return 1;
     }
 
-    // llama.cpp-c6ah (finding 27): calibrate the slow-release kernel's
+    // llama.cpp-c6ah: calibrate the slow-release kernel's
     // scaled iteration count exactly once, HERE, before any test has a
     // chance to leave an unwaited kernel in flight on the cache's queue --
     // see ensure_slow_release_calibrated()'s own comment for why calling it
@@ -1828,8 +1902,9 @@ int main(int, char ** argv) {
     test_pending_event_reclaim_does_not_destruct_in_flight(cache, device);
     test_oversized_request_skips_wait_loop(cache, device);
     test_in_flight_entry_is_skipped_not_waited(cache, device);
+    test_reclaim_while_in_flight_retires_the_slot(cache, device);
 
-    // llama.cpp-c6ah (finding 32): LAST, deliberately -- see this
+    // llama.cpp-c6ah: LAST, deliberately -- see this
     // function's own comment for why.
     test_flag_timing_diagnostic(cache, device);
 
