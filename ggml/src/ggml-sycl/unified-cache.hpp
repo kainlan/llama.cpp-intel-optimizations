@@ -3900,29 +3900,46 @@ class unified_cache {
     // outlived the drain would fail against an already-destroyed queue
     // rather than write through a freed host pointer.
     //
-    // shutdown_resources() has two early-return paths that skip the drain
-    // entirely -- the g_sycl_shutting_down branch and the "SYCL context is
-    // already invalid" catch, both reached only when the SYCL runtime
-    // itself is already gone (static destruction order, or process exit).
-    // Unlike compute_arena_owner_, scratch_pool_owner_,
+    // llama.cpp-me60 (F1): on the NORMAL path, this slab's owning
+    // mem_handle (onednn_graph_scratch_flag_slab_owner_) is now released
+    // explicitly by shutdown_resources() itself -- right after the
+    // staging_owner_ release block, once that function's own
+    // drain_all_queues_noexcept() call and onednn_graph_scratch_clear_pool_locked()
+    // have both already run, so no marker kernel can still be targeting
+    // the slab. It must be: the slab is adopted into the global
+    // runtime-allocation registry as a bootstrap CACHE_BACKING control,
+    // but unified_cache_shutdown_retryable_postconditions_clean()'s sweep
+    // (shutdown_unified_cache(), after every cache's shutdown_resources()
+    // has run) is CLASS-BLIND -- it accepts a row only via
+    // contains_pinned()/contains_pinned_backing_allocation() against
+    // host_arena_, never consulting allocation_control_class -- so a
+    // still-live slab row (host USM outside the pinned pool) used to fail
+    // that sweep regardless of being CACHE_BACKING, throwing "SYCL unified
+    // cache arena release failed" out of module shutdown once any DIRECT
+    // entry had ever been parked with a real event in the process.
+    //
+    // shutdown_resources() ALSO has two early-return paths that skip the
+    // drain entirely -- the g_sycl_shutting_down branch and the "SYCL
+    // context is already invalid" catch, both reached only when the SYCL
+    // runtime itself is already gone (static destruction order, or
+    // process exit). Those two now ALSO reset this owner to {}, for
+    // symmetry with compute_arena_owner_, scratch_pool_owner_,
     // onednn_weights_scratch_owner_, onednn_activations_scratch_owner_ and
-    // staging_owner_ -- each explicitly reset to {} on both paths -- this
-    // slab's owning mem_handle (onednn_graph_scratch_flag_slab_owner_) is
-    // left untouched there; it destructs later, from ~unified_cache()'s
-    // normal member teardown, the same way the pooled reuse-pool entries'
-    // mem_handles do (see the llama.cpp-0oxf comments on that field's own
-    // handling, at the end of each of those two branches in
-    // unified-cache.cpp). Both are safe without a drain for the same
-    // reason, and it has nothing to do with whether {} was assigned: the
-    // actual physical release is shutdown-guarded at its source --
-    // allocation_release_coordinator::retire() (unified-cache.cpp) and
-    // mem_handle::release_lease_state() (mem-handle.cpp) both check
-    // ggml_sycl_is_shutting_down() and ABANDON the control instead of
-    // releasing it once that flag is set, whether the release was
-    // triggered by an explicit `= {}` or by a destructor running later. No
-    // marker kernel can write through freed memory, because the memory is
-    // never freed on this path at all; it is deliberately leaked for the
-    // remainder of the process.
+    // staging_owner_ (each already reset to {} on both paths) -- but that
+    // reset changes nothing about what actually happens there, because the
+    // physical release on those two paths is shutdown-guarded at its
+    // source regardless of whether {} was assigned explicitly or the
+    // handle destructs later from ~unified_cache()'s normal member
+    // teardown: allocation_release_coordinator::retire()
+    // (unified-cache.cpp) and mem_handle::release_lease_state()
+    // (mem-handle.cpp) both check ggml_sycl_is_shutting_down() and ABANDON
+    // the control instead of releasing it once that flag is set. No
+    // marker kernel can write through freed memory on those two paths,
+    // because the memory is never freed there at all; it is deliberately
+    // leaked for the remainder of the process, the same way the pooled
+    // reuse-pool entries' mem_handles are (see the llama.cpp-0oxf comments
+    // on that field's own handling, at the end of each of those two
+    // branches in unified-cache.cpp).
     //
     // No std::once_flag here (unlike event_watch_queue_ below): every real
     // caller of onednn_graph_scratch_ensure_flag_slab_locked() is already
