@@ -708,6 +708,15 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     // is guaranteed to observe the cap and enter the wait loop, rather than
     // racing a fast release.
     slow_release_result slow_release = submit_slow_release(q);
+    // llama.cpp-c6ah (finding 29): identity check, test side -- prints the
+    // address of slow_release.release_event itself (the object the pointer
+    // handed to onednn_graph_scratch_free() below actually points at), to
+    // compare against the `event` pointer address onednn_graph_scratch_free()
+    // logs on its own side (hooks-gated, same [c6ah-f29] tag) for the SAME
+    // call. The two addresses trivially must match (this is a plain
+    // pointer, not a copy), but this is cheap and rules that class of
+    // confusion out explicitly rather than leaving it assumed.
+    printf("    (identity: &slow_release.release_event=%p)\n", static_cast<void *>(&slow_release.release_event));
     cache->onednn_graph_scratch_free(ptr1, &slow_release.release_event);
 
     const size_t wait_count_before     = cache->onednn_graph_scratch_direct_wait_count();
@@ -715,33 +724,61 @@ void test_bounded_eviction(unified_cache * cache, int device) {
     check(cache->onednn_graph_scratch_pool_peak_bytes() >= kSizeA,
           "onednn_graph_scratch_pool_peak_bytes() reflects ptr1 sitting in the pool");
 
-    // llama.cpp-c6ah (finding 28): instrumentation only, no allocation --
-    // onednn_graph_scratch_pool_entry_flag_true_for_test() reads
-    // ptr1's own release_done flag directly (it is gated the same way as
-    // every other hook, so it is a no-op unless
-    // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1) without an alloc()/free() round
-    // trip that would itself consume or re-park the entry being observed.
-    // Polls up to 2.5 s (comfortably above kSlowReleaseMs's 1500 ms target
-    // plus the watcher's own async dispatch latency) and prints the first
-    // time it reads true next to the kernel's own actual duration -- this
-    // is the direct evidence for "the flag itself did or did not read true
-    // early", which the elapsed-time bound below can only infer indirectly.
+    // llama.cpp-c6ah (finding 28, extended finding 29): instrumentation
+    // only -- onednn_graph_scratch_pool_entry_flag_true_for_test() reads
+    // ptr1's own release_done flag directly (gated the same way as every
+    // other hook, a no-op unless GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1)
+    // without an alloc()/free() round trip that would itself consume or
+    // re-park the entry being observed. Polls up to 2.5 s (comfortably
+    // above kSlowReleaseMs's 1500 ms target plus the watcher's own async
+    // dispatch latency).
+    //
+    // llama.cpp-c6ah (finding 29): at the FIRST true reading (t_flag), this
+    // now ALSO waits on the underlying SYCL event itself and times that
+    // (t_wait), to discriminate the two possible causes of a suspiciously
+    // early t_flag reported by the c6ah GPU run 10 report: t_wait close to
+    // the kernel's target means the watcher host_task genuinely ran ahead
+    // of its own dependency completing (an in-process-only runtime
+    // anomaly a standalone probe using the identical construction could
+    // not reproduce); t_wait close to zero means the event handed to
+    // onednn_graph_scratch_free() was ALREADY complete at park time -- an
+    // identity bug, not a scheduling one (see the [c6ah-f29] identity log
+    // onednn_graph_scratch_free() itself prints, and this test's own
+    // "&slow_release.release_event=" print just above the free() call).
+    // wait_and_throw() here is safe regardless of which outcome holds: if
+    // t_flag is already this early, onednn_graph_scratch_pool_entry_release_complete()
+    // already treats the entry as complete for every OTHER caller too
+    // (including the kSizeB request just below), so this block does not
+    // create a new race -- it only makes an already-occurring outcome
+    // explicit and diagnosable instead of silent. actual_kernel_duration_ms()
+    // is safe to call afterward because wait_and_throw() guarantees the
+    // command has finished by then, regardless of what the flag said.
     {
         const auto flag_poll_start    = std::chrono::steady_clock::now();
         const auto flag_poll_deadline = flag_poll_start + std::chrono::milliseconds(2500);
-        long long  first_true_ms      = -1;
+        long long  t_flag_ms          = -1;
         while (std::chrono::steady_clock::now() < flag_poll_deadline) {
             if (cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeA)) {
-                first_true_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                                      flag_poll_start)
-                                    .count();
+                t_flag_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                                  flag_poll_start)
+                                .count();
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        printf("    (flag poll: first read true at %s, kernel target=%lld ms)\n",
-               first_true_ms >= 0 ? std::to_string(first_true_ms).c_str() : "never (within 2.5s)",
-               slow_release.duration_ms);
+        if (t_flag_ms >= 0) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            slow_release.release_event.wait_and_throw();
+            const long long t_wait_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_start)
+                    .count();
+            printf(
+                "    (flag poll: t_flag=%lld ms, t_wait=%lld ms, actual kernel duration=%lld ms, kernel "
+                "target=%lld ms)\n",
+                t_flag_ms, t_wait_ms, actual_kernel_duration_ms(slow_release.release_event), slow_release.duration_ms);
+        } else {
+            printf("    (flag poll: never read true within 2.5 s, kernel target=%lld ms)\n", slow_release.duration_ms);
+        }
     }
 
     // kSizeB, not kSizeA: an exact-size request would be served by the pool

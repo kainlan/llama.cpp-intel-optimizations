@@ -10094,6 +10094,40 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     const size_t cap  = onednn_graph_scratch_direct_cap_bytes(
         onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.load(std::memory_order_acquire));
 
+    // llama.cpp-c6ah (finding 28, extended finding 29): entry point of this
+    // call, used both to time the poll loop below and as the "elapsed=0"
+    // reference for the PRE-wait sweep just below -- this function can
+    // satisfy a request (and evict a pooled entry) entirely from that
+    // pre-wait sweep, before the poll loop below ever runs even one
+    // iteration, and the per-poll diagnostic used to only cover the loop --
+    // silent on exactly the call that matters when a request is satisfied
+    // this fast. log_pool_state_for_test() is gated behind the test-hooks
+    // env var like every other hook in this file (a no-op, and reads
+    // nothing, when it is not set) and reads
+    // onednn_graph_scratch_pool_entry_release_complete() itself (the same
+    // predicate the sweep/poll actually use), so it can never disagree with
+    // what the real decision was for the same entry on the same call.
+    const auto wait_loop_entry         = std::chrono::steady_clock::now();
+    auto       log_pool_state_for_test = [&](const char * where) {
+        if (!onednn_graph_scratch_test_hooks_enabled()) {
+            return;
+        }
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_loop_entry)
+                .count();
+        for (const auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
+            for (const auto & poll_entry : bucket_kv.second) {
+                const bool poll_complete = onednn_graph_scratch_pool_entry_release_complete(poll_entry);
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] [c6ah-f28] %s elapsed=%lldms requested=%.1fMB bucket=%.1fMB watcher=%s "
+                          "flag=%p complete=%d\n",
+                    where, static_cast<long long>(elapsed_ms), size / (1024.0 * 1024.0),
+                    bucket_kv.first / (1024.0 * 1024.0), poll_entry.release_done ? "armed" : "unwatched",
+                    static_cast<void *>(poll_entry.release_done.get()), poll_complete ? 1 : 0);
+            }
+        }
+    };
+
     // Run the eviction sweep BEFORE the size>cap early-out below, even
     // though a request larger than the cap can never make this call return
     // true: for size > cap it returns false harmlessly, but it is not a
@@ -10103,6 +10137,13 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     // idle pooled VRAM resident right before the fresh unified_alloc()
     // below, which can turn a survivable oversized request into a genuine
     // abort (llama.cpp-pqgl).
+    //
+    // llama.cpp-c6ah (finding 29): log the pool's state BEFORE this sweep
+    // runs -- the c6ah GPU run 10 report showed a request satisfied by
+    // exactly this pre-wait sweep, at ~3 ms elapsed with no cap-wait poll
+    // ever entered, and nothing was printed for it because the diagnostic
+    // used to live only inside the poll loop below.
+    log_pool_state_for_test("pre-wait sweep");
     if (onednn_graph_scratch_evict_pool_until_fits_locked(size, cap)) {
         return true;
     }
@@ -10149,9 +10190,8 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
     }
     ++onednn_graph_scratch_direct_wait_count_;
 
-    const auto wait_loop_entry = std::chrono::steady_clock::now();
-    const auto deadline        = wait_loop_entry + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
-    bool       fits            = false;
+    const auto deadline = wait_loop_entry + std::chrono::milliseconds(kOnednnGraphDirectWaitTotalTimeoutMs);
+    bool       fits     = false;
     do {
         // Drop the lock while waiting: nothing we hold it for makes an
         // in-flight pool entry's SYCL event complete any sooner, and holding
@@ -10164,32 +10204,11 @@ bool unified_cache::onednn_graph_scratch_wait_for_direct_headroom_locked(size_t 
         std::this_thread::sleep_for(std::chrono::milliseconds(kOnednnGraphDirectWaitPollTimeoutMs));
         lock.lock();
 
-        // llama.cpp-c6ah (finding 28): per-poll diagnostic, gated behind
-        // the test-hooks env var like every other hook in this file. Walks
-        // EVERY bucket, not just `size`'s own -- the eviction sweep below
-        // inspects every bucket too, and the entry a caller actually cares
-        // about (e.g. a slow-release setup entry of a DIFFERENT size than
-        // the size being requested) can be evicted or skipped from any of
-        // them. Reads onednn_graph_scratch_pool_entry_release_complete()
-        // itself (the same predicate the sweep uses just below), not a
-        // separate query, so this log can never disagree with what the
-        // sweep actually decided for the same entry on the same poll.
-        if (onednn_graph_scratch_test_hooks_enabled()) {
-            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - wait_loop_entry)
-                                        .count();
-            for (const auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
-                for (const auto & poll_entry : bucket_kv.second) {
-                    const bool poll_complete = onednn_graph_scratch_pool_entry_release_complete(poll_entry);
-                    GGML_LOG_WARN(
-                        "[UNIFIED-CACHE] [c6ah-f28] poll elapsed=%lldms requested=%.1fMB bucket=%.1fMB "
-                        "watcher=%s flag=%p complete=%d\n",
-                        static_cast<long long>(elapsed_ms), size / (1024.0 * 1024.0),
-                        bucket_kv.first / (1024.0 * 1024.0), poll_entry.release_done ? "armed" : "unwatched",
-                        static_cast<void *>(poll_entry.release_done.get()), poll_complete ? 1 : 0);
-                }
-            }
-        }
+        // llama.cpp-c6ah (finding 28): per-poll diagnostic -- see
+        // log_pool_state_for_test()'s own comment above (defined once at
+        // the top of this function, reused for both the pre-wait sweep and
+        // every iteration here) for what it logs and why.
+        log_pool_state_for_test("poll");
 
         // Check the requested size's OWN bucket first: an entry of the
         // exact size this request needs that onednn_graph_scratch_entry_usable_locked()
@@ -10684,6 +10703,14 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             onednn_graph_scratch_test_hooks_enabled() &&
             g_onednn_graph_scratch_test_force_blocking_pool_check.load(std::memory_order_acquire);
 
+        // llama.cpp-c6ah (finding 29): the exact sycl::event COPY that gets
+        // parked below, computed ONCE here rather than re-evaluated again
+        // at push_back() -- so the identity log just below and the entry
+        // actually stored are provably the same object, not two separately
+        // constructed copies of `*event` that a reader could not otherwise
+        // rule out as the source of a discrepancy.
+        sycl::event release_event_copy = event ? *event : sycl::event{};
+
         std::shared_ptr<std::atomic<bool>> release_done;
         if (event && !force_unwatched_for_test) {
             if (sycl::queue * watch_q = get_event_watch_queue()) {
@@ -10694,6 +10721,26 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
                         h.host_task([flag]() { flag->store(true, std::memory_order_release); });
                     });
                     release_done = std::move(flag);
+                    // llama.cpp-c6ah (finding 29): identity check -- print a
+                    // hash of both the caller's own event object (*event,
+                    // what depends_on() above was just given) and
+                    // release_event_copy (the exact copy about to be parked,
+                    // made from that same *event just above), plus whether
+                    // they compare equal. sycl::event's common reference
+                    // semantics guarantee std::hash<sycl::event> and
+                    // operator==() both compare the underlying command
+                    // identity, not the local sycl::event wrapper's address
+                    // -- if this ever prints unequal, the copy stored in the
+                    // pool is NOT the same underlying command the watcher
+                    // was armed against, which would fully explain a flag
+                    // that reads true independently of the running kernel.
+                    if (onednn_graph_scratch_test_hooks_enabled()) {
+                        GGML_LOG_WARN(
+                            "[UNIFIED-CACHE] [c6ah-f29] identity caller_event_hash=%zu parked_copy_hash=%zu "
+                            "equal=%d\n",
+                            std::hash<sycl::event>{}(*event), std::hash<sycl::event>{}(release_event_copy),
+                            (*event == release_event_copy) ? 1 : 0);
+                    }
                 } catch (const sycl::exception & e) {
                     // Leave release_done null: onednn_graph_scratch_pool_entry_release_complete()
                     // falls back to the old (blocking, but correct) event_complete()
@@ -10707,27 +10754,32 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
             }
         }
 
-        // llama.cpp-c6ah (finding 28): park-time diagnostic, gated behind
-        // the same test-hooks env var as every setter above rather than
-        // always-on, so it never reaches a production log -- this exists to
-        // let a GPU test run correlate WHICH entries got a real watcher vs.
-        // which fell back (and why), against the wait-loop's own per-poll
-        // log below. GGML_LOG_WARN (not INFO) so it reaches the log without
-        // needing llama-bench's `-v`/verbosity-threshold plumbing (see
-        // CLAUDE.md's llama-bench traps) -- a test binary calls
-        // ggml_backend_sycl_init() directly and never raises that
+        // llama.cpp-c6ah (finding 28, extended finding 29 with the `event`
+        // pointer address): park-time diagnostic, gated behind the same
+        // test-hooks env var as every setter above rather than always-on,
+        // so it never reaches a production log -- this exists to let a GPU
+        // test run correlate WHICH entries got a real watcher vs. which
+        // fell back (and why), against the wait-loop's own per-poll log
+        // below, and (the pointer) to confirm the SAME `event` this call
+        // was actually given is the one the arm attempt and the identity
+        // log above operated on. GGML_LOG_WARN (not INFO) so it reaches the
+        // log without needing llama-bench's `-v`/verbosity-threshold
+        // plumbing (see CLAUDE.md's llama-bench traps) -- a test binary
+        // calls ggml_backend_sycl_init() directly and never raises that
         // threshold.
         if (onednn_graph_scratch_test_hooks_enabled()) {
-            GGML_LOG_WARN("[UNIFIED-CACHE] [c6ah-f28] park size=%.1fMB watcher=%s flag=%p force_unwatched=%d\n",
-                          freed_size / (1024.0 * 1024.0), release_done ? "armed" : (event ? "fallback" : "no-event"),
-                          static_cast<void *>(release_done.get()), force_unwatched_for_test ? 1 : 0);
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] [c6ah-f28] park size=%.1fMB watcher=%s flag=%p event=%p force_unwatched=%d\n",
+                freed_size / (1024.0 * 1024.0), release_done ? "armed" : (event ? "fallback" : "no-event"),
+                static_cast<void *>(release_done.get()), static_cast<const void *>(event),
+                force_unwatched_for_test ? 1 : 0);
         }
 
         // onednn_graph_scratch_direct_outstanding_bytes_ stays charged for
         // these bytes for as long as they sit in the pool -- see that
         // field's own comment for why (it is still real resident VRAM).
         auto & bucket = onednn_graph_scratch_reuse_pool_[freed_size];
-        bucket.push_back({ std::move(entry.owner), event ? *event : sycl::event{}, std::move(release_done) });
+        bucket.push_back({ std::move(entry.owner), std::move(release_event_copy), std::move(release_done) });
         onednn_graph_scratch_pool_bytes_ += freed_size;
         if (onednn_graph_scratch_pool_bytes_ > onednn_graph_scratch_pool_peak_bytes_) {
             onednn_graph_scratch_pool_peak_bytes_ = onednn_graph_scratch_pool_bytes_;
