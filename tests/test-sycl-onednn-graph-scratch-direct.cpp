@@ -159,6 +159,7 @@ int main() {
 
 #    include <algorithm>
 #    include <chrono>
+#    include <mutex>
 #    include <thread>
 
 using ggml_sycl::get_unified_cache_for_device;
@@ -300,103 +301,6 @@ sycl::event submit_spin_kernel(sycl::queue & q, int * cell, long long iterations
     });
 }
 
-// A submit_slow_release() result: the still-pending release event (never
-// waited on here -- that is the whole point, callers park it in-flight)
-// plus this run's CALIBRATED ESTIMATE of that event's own duration, so
-// callers can bound their own timing checks against reality on whatever
-// hardware ctest actually runs this on, rather than against the
-// kSlowReleaseMs constant directly. The estimate is mathematically
-// kSlowReleaseMs by construction (the iteration count is scaled
-// specifically to hit that target using this run's OWN measured
-// iterations-per-ms rate, not an assumption baked in at compile time) --
-// callers reference `duration_ms` anyway, not the constant, so a future
-// change to how the estimate is derived (e.g. periodic re-calibration
-// across a long-running binary, if GPU clock/thermal drift ever makes
-// that necessary) does not require touching every call site.
-struct slow_release_result {
-    sycl::event release_event;
-    long long   duration_ms;
-};
-
-// Calibrates against `q` (the cache's own backend queue, the SAME queue a
-// real oneDNN Graph-scratch release event actually completes on) by first
-// timing a fixed-iteration kernel, then scaling linearly to target
-// kSlowReleaseMs. The calibration run is fully waited on before the REAL
-// (scaled, returned, never-waited-on) kernel is submitted, so calibration
-// cost is never charged against a caller's own timing measurements. Every
-// call site in this file passes the SAME `q` (this binary drives a single
-// unified_cache instance for one device), so the anti-dead-code-elimination
-// device cell is allocated lazily, once per process, on the first call --
-// its VALUE is never read by any caller, only its role in preventing the
-// spin loop from being folded away matters.
-slow_release_result submit_slow_release(sycl::queue & q) {
-    static int * cell = nullptr;
-    if (!cell) {
-        cell = sycl::malloc_device<int>(1, q);
-        q.memset(cell, 0, sizeof(int)).wait_and_throw();
-    }
-
-    constexpr long long kCalibrationIterations = 2'000'000;
-    const auto          cal_start              = std::chrono::steady_clock::now();
-    sycl::event         cal_evt                = submit_spin_kernel(q, cell, kCalibrationIterations);
-    cal_evt.wait_and_throw();
-    long long cal_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cal_start).count();
-
-    // llama.cpp-c6ah: an implausible calibration reading means something is
-    // wrong with the hardware/driver/queue state (e.g. GPU thermal
-    // throttling to a crawl, or a stuck queue returning near-instantly
-    // without the kernel actually having run), not with the scaling math
-    // below -- letting it drive that math unchecked has two failure modes,
-    // not one: an implausibly SMALL cal_ms (near zero) scales toward
-    // billions of iterations (~3e9 at cal_ms=1), a multi-MINUTE spin that
-    // blows this test's own 300 s ctest TIMEOUT rather than failing fast;
-    // an implausibly LARGE cal_ms scales toward a near-zero iteration
-    // count, silently producing a "slow release" that is not actually
-    // slow. Fail loudly (via check(), so the rest of this test still runs)
-    // and clamp into the plausible band rather than let either play out
-    // silently. 10-2000 ms: comfortably wider than the 110-122 ms this
-    // fork's own two discrete cards measured for kCalibrationIterations
-    // (test-sycl-event-status-blocking-probe.cpp), without being so wide
-    // that a genuinely broken reading could sneak through as "plausible".
-    constexpr long long kMinPlausibleCalMs = 10;
-    constexpr long long kMaxPlausibleCalMs = 2000;
-    check(cal_ms >= kMinPlausibleCalMs && cal_ms <= kMaxPlausibleCalMs,
-          "calibration kernel duration is within a plausible band (10-2000 ms) -- an implausible value means "
-          "something is wrong with the hardware/driver/queue state, not with the scaling math that follows");
-    if (cal_ms < kMinPlausibleCalMs || cal_ms > kMaxPlausibleCalMs) {
-        printf(
-            "    (submit_slow_release: calibration kernel took %lld ms for %lld iterations -- outside the "
-            "10-2000 ms plausible band, clamping before scaling)\n",
-            cal_ms, kCalibrationIterations);
-        cal_ms = std::max(kMinPlausibleCalMs, std::min(cal_ms, kMaxPlausibleCalMs));
-    }
-
-    long long scaled_iterations =
-        static_cast<long long>((static_cast<double>(kCalibrationIterations) / static_cast<double>(cal_ms)) *
-                               static_cast<double>(kSlowReleaseMs));
-    if (scaled_iterations < 1) {
-        scaled_iterations = 1;
-    }
-    // Upper clamp independent of the plausibility band above: even a
-    // plausible calibration rate could scale to an unreasonable iteration
-    // count if kSlowReleaseMs were ever raised far beyond its current
-    // 1500 ms without revisiting this clamp. 64x kCalibrationIterations
-    // -- at the clamped worst case (cal_ms == kMaxPlausibleCalMs, i.e. the
-    // slowest rate this function will still scale from) that bounds the
-    // resulting kernel to at most 64 x kMaxPlausibleCalMs = 128 s, still
-    // comfortably under this test's 300 s ctest TIMEOUT with margin for
-    // everything else this binary does.
-    constexpr long long kMaxScaledIterationsMultiple = 64;
-    const long long     max_scaled_iterations        = kCalibrationIterations * kMaxScaledIterationsMultiple;
-    if (scaled_iterations > max_scaled_iterations) {
-        scaled_iterations = max_scaled_iterations;
-    }
-
-    sycl::event evt = submit_spin_kernel(q, cell, scaled_iterations);
-    return { evt, kSlowReleaseMs };
-}
-
 // llama.cpp-c6ah: the ACTUAL device-measured duration of an event ALREADY
 // known to be complete (command_end - command_start, both in nanoseconds
 // per SYCL's profiling info), as opposed to submit_slow_release()'s own
@@ -415,7 +319,9 @@ slow_release_result submit_slow_release(sycl::queue & q) {
 // to be profiling-enabled (every real backend stream in this codebase is,
 // via default_queue_properties()) -- returns -1 if the query itself
 // throws, so a caller can print "n/a" rather than propagate the exception
-// into an unrelated check.
+// into an unrelated check. Defined here, ahead of
+// ensure_slow_release_calibrated() below, because that function also uses
+// it to print the calibration kernel's own measured duration.
 long long actual_kernel_duration_ms(sycl::event & evt) {
     try {
         const auto start_ns = evt.get_profiling_info<sycl::info::event_profiling::command_start>();
@@ -424,6 +330,170 @@ long long actual_kernel_duration_ms(sycl::event & evt) {
     } catch (const sycl::exception &) {
         return -1;
     }
+}
+
+// A submit_slow_release() result: the still-pending release event (never
+// waited on here -- that is the whole point, callers park it in-flight)
+// plus this run's CALIBRATED ESTIMATE of that event's own duration, so
+// callers can bound their own timing checks against reality on whatever
+// hardware ctest actually runs this on, rather than against the
+// kSlowReleaseMs constant directly. The estimate is mathematically
+// kSlowReleaseMs by construction (the iteration count is scaled
+// specifically to hit that target using this run's OWN measured
+// iterations-per-ms rate, not an assumption baked in at compile time) --
+// callers reference `duration_ms` anyway, not the constant, so a future
+// change to how the estimate is derived does not require touching every
+// call site.
+struct slow_release_result {
+    sycl::event release_event;
+    long long   duration_ms;
+};
+
+// llama.cpp-c6ah (finding 27): the scaled iteration count every
+// submit_slow_release() call in this process uses, computed exactly ONCE
+// by ensure_slow_release_calibrated() below and cached here. 0 means
+// "not yet calibrated" -- submit_slow_release() treats that as a hard
+// failure, not a signal to scale from zero (see its own comment). The
+// device-global cell submit_spin_kernel()'s loop reads/writes every
+// iteration (purely to prevent the compiler folding the loop away; its
+// VALUE is never read by any caller) is allocated once, by
+// ensure_slow_release_calibrated(), before any spin kernel -- calibration
+// or real -- is submitted.
+long long g_slow_release_scaled_iterations = 0;
+int *     g_slow_release_cell              = nullptr;
+
+// llama.cpp-c6ah (finding 27): calibrates ONCE per process, against `q`
+// (the cache's own backend queue -- the SAME queue a real oneDNN
+// Graph-scratch release event actually completes on), and caches the
+// resulting scaled iteration count in g_slow_release_scaled_iterations for
+// every later submit_slow_release() call to reuse. Must be called
+// explicitly from main(), after the cache and its queue exist but BEFORE
+// any test runs -- NOT lazily from the first submit_slow_release() call,
+// which would let whichever test happens to run first (rather than
+// main()) decide the timing context, and a future test-ordering change
+// could make that first call calibrate from behind an in-flight kernel a
+// DIFFERENT test deliberately left unwaited on this same in-order queue.
+//
+// This split (calibrate once vs. reuse per call) exists because the
+// original per-call design silently timed the WRONG thing whenever an
+// earlier test left a slow kernel running on `q`: calibration's own host
+// timer captures everything already queued ahead of it on an in-order
+// queue, not just the calibration kernel, so a calibration run queued
+// behind an earlier sub-test's own unwaited ~1500 ms kernel read ~900 ms
+// for an ~84 ms kernel, and the resulting scale collapsed by roughly that
+// same factor -- reproduced with a standalone probe (both cards): a
+// calibration kernel queued behind a running one measured host=922 ms /
+// profiling=83.9 ms on the B50, host=856 ms / profiling=77.9 ms on the
+// B70, against ~110 ms host / ~90 ms profiling when run on a drained
+// queue. Calibrating once, at the very start of main() before any test has
+// had a chance to leave anything in flight, removes the possibility
+// entirely rather than trying to detect it after the fact.
+//
+// A drain (wait_and_throw()) is issued before timing starts anyway, even
+// though main() calling this first should already guarantee an idle queue
+// -- defensive, not load-bearing, and cheap on an already-idle queue. A
+// full kCalibrationIterations run is submitted and discarded first as a
+// warm-up: the FIRST spin kernel ever submitted in this process pays a
+// one-time JIT/compilation cost that a later real "slow release" kernel
+// does not, so timing the very first submission would systematically
+// undershoot the target (measured: ~25% low on both cards without a
+// warm-up -- still within submit_slow_release()'s own 0.8x floor, but with
+// little margin).
+void ensure_slow_release_calibrated(sycl::queue & q) {
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        q.wait_and_throw();
+
+        if (!g_slow_release_cell) {
+            g_slow_release_cell = sycl::malloc_device<int>(1, q);
+            q.memset(g_slow_release_cell, 0, sizeof(int)).wait_and_throw();
+        }
+
+        constexpr long long kCalibrationIterations = 2'000'000;
+
+        sycl::event warmup_evt = submit_spin_kernel(q, g_slow_release_cell, kCalibrationIterations);
+        warmup_evt.wait_and_throw();
+
+        const auto  cal_start = std::chrono::steady_clock::now();
+        sycl::event cal_evt   = submit_spin_kernel(q, g_slow_release_cell, kCalibrationIterations);
+        cal_evt.wait_and_throw();
+        long long cal_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cal_start).count();
+        const long long cal_profiling_ms = actual_kernel_duration_ms(cal_evt);
+
+        // llama.cpp-c6ah: an implausible calibration reading means something is
+        // wrong with the hardware/driver/queue state (e.g. GPU thermal
+        // throttling to a crawl, or a stuck queue returning near-instantly
+        // without the kernel actually having run), not with the scaling math
+        // below -- letting it drive that math unchecked has two failure modes,
+        // not one: an implausibly SMALL cal_ms (near zero) scales toward
+        // billions of iterations (~3e9 at cal_ms=1), a multi-MINUTE spin that
+        // blows this test's own 300 s ctest TIMEOUT rather than failing fast;
+        // an implausibly LARGE cal_ms scales toward a near-zero iteration
+        // count, silently producing a "slow release" that is not actually
+        // slow. Fail loudly (via check(), so the rest of this test still runs)
+        // and clamp into the plausible band rather than let either play out
+        // silently. 10-2000 ms: comfortably wider than the 110-122 ms this
+        // fork's own two discrete cards measured for kCalibrationIterations
+        // (test-sycl-event-status-blocking-probe.cpp), without being so wide
+        // that a genuinely broken reading could sneak through as "plausible".
+        constexpr long long kMinPlausibleCalMs = 10;
+        constexpr long long kMaxPlausibleCalMs = 2000;
+        check(cal_ms >= kMinPlausibleCalMs && cal_ms <= kMaxPlausibleCalMs,
+              "calibration kernel duration is within a plausible band (10-2000 ms) -- an implausible value means "
+              "something is wrong with the hardware/driver/queue state, not with the scaling math that follows");
+        if (cal_ms < kMinPlausibleCalMs || cal_ms > kMaxPlausibleCalMs) {
+            cal_ms = std::max(kMinPlausibleCalMs, std::min(cal_ms, kMaxPlausibleCalMs));
+        }
+
+        long long scaled_iterations =
+            static_cast<long long>((static_cast<double>(kCalibrationIterations) / static_cast<double>(cal_ms)) *
+                                   static_cast<double>(kSlowReleaseMs));
+        if (scaled_iterations < 1) {
+            scaled_iterations = 1;
+        }
+        // Upper clamp independent of the plausibility band above: even a
+        // plausible calibration rate could scale to an unreasonable iteration
+        // count if kSlowReleaseMs were ever raised far beyond its current
+        // 1500 ms without revisiting this clamp. 64x kCalibrationIterations
+        // -- at the clamped worst case (cal_ms == kMaxPlausibleCalMs, i.e. the
+        // slowest rate this function will still scale from) that bounds the
+        // resulting kernel to at most 64 x kMaxPlausibleCalMs = 128 s, still
+        // comfortably under this test's 300 s ctest TIMEOUT with margin for
+        // everything else this binary does.
+        constexpr long long kMaxScaledIterationsMultiple = 64;
+        const long long     max_scaled_iterations        = kCalibrationIterations * kMaxScaledIterationsMultiple;
+        if (scaled_iterations > max_scaled_iterations) {
+            scaled_iterations = max_scaled_iterations;
+        }
+
+        g_slow_release_scaled_iterations = scaled_iterations;
+
+        printf(
+            "  (ensure_slow_release_calibrated: cal_ms=%lld (profiling=%lld ms) for %lld iterations -> "
+            "scaled_iterations=%lld targeting %d ms)\n",
+            cal_ms, cal_profiling_ms, kCalibrationIterations, g_slow_release_scaled_iterations, kSlowReleaseMs);
+    });
+}
+
+// Submits (never waits on -- callers park it in-flight, that is the whole
+// point) a device-kernel event scaled to hit (a calibrated estimate of)
+// kSlowReleaseMs, using the iteration count ensure_slow_release_calibrated()
+// computed once for this whole process. Requires that function to have
+// already run -- main() calls it explicitly before any test starts (see its
+// own comment for why explicitly, and why not lazily from here) -- so a
+// zero g_slow_release_scaled_iterations here means a caller (or a future
+// test added ahead of main()'s calibration call) skipped that setup, not a
+// legitimately-scaled-to-nothing kernel; check() names the missing call
+// rather than silently submitting a degenerate (but still memory-safe: 0
+// iterations never dereferences g_slow_release_cell) kernel.
+slow_release_result submit_slow_release(sycl::queue & q) {
+    check(g_slow_release_scaled_iterations > 0,
+          "submit_slow_release() called after ensure_slow_release_calibrated() already ran -- if this fails, "
+          "main() is missing the explicit calibration call");
+
+    sycl::event evt = submit_spin_kernel(q, g_slow_release_cell, g_slow_release_scaled_iterations);
+    return { evt, kSlowReleaseMs };
 }
 
 // llama.cpp-c6ah: onednn_graph_scratch_pool_entry_release_complete()'s
@@ -635,13 +705,23 @@ void test_bounded_eviction(unified_cache * cache) {
     // submit_slow_release()'s own pre-submission calibrated ESTIMATE) is
     // valid; see actual_kernel_duration_ms()'s own comment for why both
     // numbers are printed rather than just the estimate.
+    const long long actual_ms = actual_kernel_duration_ms(slow_release.release_event);
     printf(
         "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, actual=%lld ms, cap wait count %zu -> "
         "%zu, eviction count %zu -> %zu)\n",
-        static_cast<long long>(elapsed.count()), slow_release.duration_ms,
-        actual_kernel_duration_ms(slow_release.release_event), wait_count_before,
+        static_cast<long long>(elapsed.count()), slow_release.duration_ms, actual_ms, wait_count_before,
         cache->onednn_graph_scratch_direct_wait_count(), eviction_count_before,
         cache->onednn_graph_scratch_pool_eviction_count());
+    // llama.cpp-c6ah (finding 27): the calibrated ESTIMATE printed above is
+    // only useful as a timing-bound denominator if the kernel actually ran
+    // close to it -- check the ACTUAL measured duration directly, rather
+    // than trusting the estimate, so a calibration undershoot (e.g. a
+    // future test reordering that calibrates behind an in-flight kernel
+    // again) fails on this line by name instead of surfacing as a
+    // confusing miss on the elapsed-time bound above.
+    check(actual_ms >= (slow_release.duration_ms * 8) / 10,
+          "the release kernel's ACTUAL measured duration is at least 80% of its calibrated target -- otherwise "
+          "this test's timing bounds are being checked against a kernel that undershot calibration");
 
     if (ptr2) {
         cache->onednn_graph_scratch_free(ptr2, nullptr);
@@ -1196,8 +1276,17 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // its ACTUAL device-measured duration here, alongside the calibrated
     // ESTIMATE printed earlier, so a reader can see how close the estimate
     // actually landed on this run's hardware.
+    const long long ptr1_actual_ms = actual_kernel_duration_ms(slow_release.release_event);
     printf("    (ptr1's release: calibrated estimate=%lld ms, actual=%lld ms)\n", slow_release.duration_ms,
-           actual_kernel_duration_ms(slow_release.release_event));
+           ptr1_actual_ms);
+    // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+    // own actual-vs-calibrated check -- fail on this line, by name, rather
+    // than let a calibration undershoot surface as a confusing miss on the
+    // GREEN/RED arm bounds below that both depend on slow_release's
+    // duration being close to its target.
+    check(ptr1_actual_ms >= (slow_release.duration_ms * 8) / 10,
+          "ptr1's release kernel ACTUAL measured duration is at least 80% of its calibrated target -- otherwise "
+          "this test's timing bounds are being checked against a kernel that undershot calibration");
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
     const bool   became_hit_reuse  = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
     void *       ptr3              = became_hit_reuse ? ptr1 : nullptr;
@@ -1281,11 +1370,21 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
         // ESTIMATE, is what actually distinguishes "the query did not
         // block" from "the kernel happened to run shorter than the
         // estimate" if this bound ever fails.
+        const long long red_actual_ms = actual_kernel_duration_ms(slow_release2.release_event);
         printf(
             "    (elapsed=%lld ms, release duration (calibrated)=%lld ms, actual=%lld ms, RED arm / "
             "force_blocking_pool_check)\n",
-            static_cast<long long>(elapsed2.count()), slow_release2.duration_ms,
-            actual_kernel_duration_ms(slow_release2.release_event));
+            static_cast<long long>(elapsed2.count()), slow_release2.duration_ms, red_actual_ms);
+        // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+        // own actual-vs-calibrated check -- this is the RED arm's own
+        // positive-control bound (elapsed2 >= 80% of duration_ms just
+        // above), so a calibration undershoot here would otherwise read as
+        // "the blocking premise did not reproduce" rather than what it
+        // actually is: the kernel used for the control finished early.
+        check(red_actual_ms >= (slow_release2.duration_ms * 8) / 10,
+              "the RED-arm release kernel's ACTUAL measured duration is at least 80% of its calibrated target -- "
+              "otherwise this test's positive control is being checked against a kernel that undershot "
+              "calibration");
 
         if (ptr5) {
             cache->onednn_graph_scratch_free(ptr5, nullptr);
@@ -1448,8 +1547,16 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // sweep's own "elapsed=" print earlier, where it was deliberately
     // still pending) -- safe to read its ACTUAL device-measured duration
     // here, alongside the calibrated ESTIMATE printed there.
+    const long long evict_actual_ms = actual_kernel_duration_ms(evict_slow_release.release_event);
     printf("    (evict_in_flight's release: calibrated estimate=%lld ms, actual=%lld ms)\n",
-           evict_slow_release.duration_ms, actual_kernel_duration_ms(evict_slow_release.release_event));
+           evict_slow_release.duration_ms, evict_actual_ms);
+    // llama.cpp-c6ah (finding 27): same reasoning as test_bounded_eviction's
+    // own actual-vs-calibrated check -- the sweep's own timing bound above
+    // (sweep_elapsed < duration_ms / 3) depends on evict_slow_release
+    // having actually run close to its calibrated target.
+    check(evict_actual_ms >= (evict_slow_release.duration_ms * 8) / 10,
+          "evict_in_flight's release kernel ACTUAL measured duration is at least 80% of its calibrated target -- "
+          "otherwise this test's timing bound is being checked against a kernel that undershot calibration");
     const bool in_flight_survived = poll_for_pool_hit(cache, q, kSizeEvictInFlight, evict_in_flight);
     check(in_flight_survived,
           "the in-flight entry is still pooled and becomes a hit once its release event "
@@ -1513,6 +1620,14 @@ int main(int, char ** argv) {
         ggml_backend_free(backend);
         return 1;
     }
+
+    // llama.cpp-c6ah (finding 27): calibrate the slow-release kernel's
+    // scaled iteration count exactly once, HERE, before any test has a
+    // chance to leave an unwaited kernel in flight on the cache's queue --
+    // see ensure_slow_release_calibrated()'s own comment for why calling it
+    // explicitly from main() (rather than lazily from the first
+    // submit_slow_release() call) is load-bearing, not stylistic.
+    ensure_slow_release_calibrated(cache->get_queue());
 
     test_pool_reuse(cache);
     test_bounded_eviction(cache);
