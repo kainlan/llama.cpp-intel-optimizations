@@ -1765,6 +1765,17 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;allocator"
         TIMEOUT 120
     )
+    # llama.cpp-o3a0: keeps src/llama-model.cpp's replicated oneDNN SDPA
+    # head-dim eligibility rule (it cannot include the SYCL-only
+    # fattn-onednn.cpp to share the real predicate) in sync with the rule it
+    # mirrors -- same env var, same parse, same D thresholds.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-onednn-graph-floor-eligibility-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;onednn;eligibility"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-direct-mem-op-extents.py

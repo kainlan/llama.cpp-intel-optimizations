@@ -241,6 +241,75 @@ static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
+// llama.cpp-o3a0: replicates
+// ggml_sycl_flash_attn_ext_onednn_plan()'s D-based eligibility gate
+// (ggml/src/ggml-sycl/fattn-onednn.cpp: the `ne00 > 512` UNSUPPORTED_D
+// reject, and the `ne00 > 256` scale-or-hatch gate) for the sole purpose of
+// the oneDNN Graph-scratch zone floor -- this is a llama-layer file and
+// cannot include the SYCL-only fattn-onednn.cpp/.hpp to share the real
+// predicate directly.
+//
+// D <= 256 is unconditionally eligible: the GENERALIZED scale fix
+// (llama.cpp-p0f5) writes the model's real runtime divisor into the
+// compiled partition instead of assuming sqrt(D), so the real gate's only
+// remaining requirement at D<=256 (a finite, nonzero scale) holds for
+// every in-tree model.
+//
+// D in (256, 512] mirrors the real gate's FULL disjunction: eligible when
+// EITHER GGML_SYCL_FA_ONEDNN_D512_SCALE is set (same env var, same live
+// getenv parse -- deliberately NOT cached in a function-local static,
+// matching ggml_sycl_fa_onednn_d512_scale_relaxed()'s own uncached form;
+// this runs once per layer at load, not per dispatch, so there is no hot
+// path to cache for) OR the layer's attention scale is already the
+// canonical 1/sqrt(D) -- the real gate's own
+// `fabs(1/scale - sqrt(D)) < 1e-3` tolerance check. An earlier version of
+// this helper required the hatch unconditionally for D>256, which is
+// STRICTER than the real gate and would silently under-count eligibility
+// (and so under-provision the floor) for any D>256 layer whose scale
+// already happens to be canonical.
+//
+// The layer's scale is derived the way MOST in-tree build_*.cpp derive
+// kq_scale from hparams.f_attention_scale: 0.0f (the default, meaning "no
+// override was set") means canonical 1/sqrt(D), which trivially satisfies
+// the tolerance check; any other value is used verbatim, matching
+// gemma4/gemma3n/gemma4-assistant's f_attention_scale=1.0f pre-scaled-Q
+// layers, whose D=512 global layers correctly stay ineligible without the
+// hatch. EXCEPTION: gemma2/gemma3/gemma-embedding also pre-scale Q, but
+// pass a LITERAL 1.0f to build_attn (src/models/gemma3.cpp) instead of
+// hparams.f_attention_scale itself, so this derivation OVER-COUNTS
+// eligibility for them at D>256: their nonzero, already-canonical
+// f_attention_scale trivially passes the tolerance check here, while
+// their real runtime scale of 1.0f would not. Currently unreachable --
+// every in-tree instance of this family has D<=256 and is already
+// unconditionally eligible before this branch is ever reached -- but a
+// future D>256 model in this family would be silently over-provisioned
+// (the safe direction) rather than under-provisioned by this gap.
+// Separately, if some future architecture computes kq_scale by a
+// mechanism OTHER than f_attention_scale while leaving that field at its
+// 0.0f default, this reads it as canonical and marks the layer eligible
+// even if the real runtime scale would fail the strict check -- the SAFE
+// direction: a layer this wrongly counts eligible only ever makes the
+// floor bigger than the real oneDNN demand, never smaller, and the real
+// dispatch-time gate in fattn-onednn.cpp is entirely unaffected by this
+// file either way.
+//
+// Kept identical to the SYCL-side predicate by
+// tests/test-sycl-onednn-graph-floor-eligibility-source.py.
+static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim, float f_attention_scale) {
+    if (head_dim > 512) {
+        return false;
+    }
+    if (head_dim <= 256) {
+        return true;
+    }
+    const char * env = std::getenv("GGML_SYCL_FA_ONEDNN_D512_SCALE");
+    if (env && std::atoi(env) != 0) {
+        return true;
+    }
+    const float kq_scale = f_attention_scale == 0.0f ? 1.0f / sqrtf(static_cast<float>(head_dim)) : f_attention_scale;
+    return std::fabs(1.0f / kq_scale - sqrtf(static_cast<float>(head_dim))) < 1e-3f;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
@@ -347,26 +416,60 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
                  inventory.pp_moe_onednn_output_slot_bytes);
         }
     }
-    inventory.n_swa        = hparams.n_swa;
-    inventory.n_swa_layers = 0;
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (hparams.is_swa(il)) {
-            inventory.n_swa_layers++;
-        }
-    }
+    // llama.cpp-o3a0: window-aware refinement of the query-head count that
+    // feeds the oneDNN Graph-scratch zone floor (see the field comment in
+    // ggml-sycl.h), merged into this same loop over [0, n_layer) rather
+    // than a second pass over the identical range. Split the max by
+    // attention window class -- non-SWA (effective KV window == n_ctx) vs
+    // SWA (effective KV window == min(n_ctx, n_swa + n_ubatch); n_swa is
+    // already captured above) -- and restrict to layers eligible for the
+    // oneDNN SDPA route: a layer that can never reach oneDNN must not
+    // inflate a floor sized for oneDNN's own scratch demand. Max rather
+    // than layer 0 alone because a handful of architectures vary head
+    // count (and head dim) by layer. hparams.n_embd_head_k(il) is used
+    // UNCONDITIONALLY, including for MLA architectures (deepseek2,
+    // glm-dsa, kimi-k3, kimi-linear): on the absorbed MLA path Q is built
+    // as ggml_concat(q_nope_absorbed, q_pe, 0) (src/models/deepseek2.cpp),
+    // giving ne0 == kv_lora_rank + n_rot -- exactly the key_length the
+    // conversion scripts already write into n_embd_head_k, and exactly
+    // the ne00 the real oneDNN gate reads (params.ne00 = Q->ne[0],
+    // fattn.cpp). hparams.n_embd_head_k_mla() is the model-global
+    // decompressed KEY head size (qk_nope + qk_rope, the key_length_mla
+    // the conversion scripts write) that only the non-absorbed MHA path
+    // would use; on the absorbed path K stays at kv_lora_rank + n_rot and
+    // only V is decompressed, by v_mla AFTER the attention op returns
+    // (llama-graph.cpp) -- so it is a size the flash-attention op itself
+    // never sees, and branching on it here would screen the wrong
+    // dimension and wrongly accept layers oneDNN will never serve
+    // (DeepSeek-V3: n_embd_head_k_mla()=192, <=256 and so eligible, vs.
+    // the real ne00=576, >512 and so correctly ineligible at
+    // fattn-onednn.cpp).
+    // f_attention_scale is model-global too, so hoisted out of the loop
+    // once rather than re-derived per layer.
+    inventory.n_swa                = hparams.n_swa;
+    inventory.n_swa_layers         = 0;
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
 
-    // llama.cpp-0oxf: max query-head count across all layers, for the
-    // oneDNN Graph-scratch zone floor (proportional to n_head x n_ubatch x
-    // n_ctx -- see unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes()).
-    // Max rather than hparams.n_head() (layer 0 only) because a handful of
-    // architectures vary head count by layer.
-    uint32_t n_head_max = 0;
+    uint32_t    n_head_ctx_max        = 0;
+    uint32_t    n_head_swa_max        = 0;
+    const float model_attention_scale = hparams.f_attention_scale;
     for (uint32_t il = 0; il < n_layer; ++il) {
-        n_head_max = std::max(n_head_max, hparams.n_head(il));
+        const bool is_swa_layer = hparams.is_swa(il);
+        if (is_swa_layer) {
+            inventory.n_swa_layers++;
+        }
+        if (!llama_model_sycl_onednn_head_dim_eligible(hparams.n_embd_head_k(il), model_attention_scale)) {
+            continue;
+        }
+        if (is_swa_layer) {
+            n_head_swa_max = std::max(n_head_swa_max, hparams.n_head(il));
+        } else {
+            n_head_ctx_max = std::max(n_head_ctx_max, hparams.n_head(il));
+        }
     }
-    inventory.n_head_max = n_head_max;
+    inventory.n_head_ctx_max = n_head_ctx_max;
+    inventory.n_head_swa_max = n_head_swa_max;
 }
 
 static void llama_model_sycl_apply_inventory(const ggml_sycl_tensor_inventory &   inventory,
