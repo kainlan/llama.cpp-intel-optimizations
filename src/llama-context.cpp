@@ -328,13 +328,24 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
     return reinterpret_cast<decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_recheck_runtime_context_flash_attn"));
 }
+#endif
 
 // llama.cpp-oyfl: name the specific ggml_sycl_lifecycle_result the narrow
 // re-check can return, so a thrown exception distinguishes the guard's own
 // PLAN_REJECTED (whose arithmetic and remediation are already printed by
 // ggml_sycl_check_nonfa_attn_scratch() to the [SYCL-PLAN] log) from every
 // other result, which are argument-validation/identity failures this call
-// should not normally see at all.
+// should not normally see at all. Guarded by the SAME broad condition as
+// the block just above (GGML_USE_SYCL || GGML_BACKEND_DL), not the
+// narrower GGML_BACKEND_DL-without-GGML_USE_SYCL condition the proc-lookup
+// helpers below need -- this only needs the enum ggml-sycl.h declares
+// under that broader condition (see the #include near the top of this
+// file), and its caller (sycl_recheck_runtime_context_flash_attn(), far
+// below) is reachable in a direct GGML_USE_SYCL build too, where the
+// narrower block never compiles at all. (Previously defined inside that
+// narrower block by mistake, which left it undeclared in a direct
+// GGML_USE_SYCL build -- build-oyfl-6 caught this.)
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_result rc) {
     switch (rc) {
         case GGML_SYCL_LIFECYCLE_OK:
@@ -355,6 +366,7 @@ static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_resul
     }
 }
 #endif
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
