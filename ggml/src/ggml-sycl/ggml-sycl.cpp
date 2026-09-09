@@ -16640,10 +16640,160 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
     return true;
 }
 
+// llama.cpp-oyfl: the non-FA attention scratch check, extracted so it is
+// shared by the full runtime-context transaction
+// (ggml_backend_sycl_set_runtime_context()) and the narrow re-check
+// (ggml_backend_sycl_recheck_runtime_context_flash_attn()) below -- the two
+// must not drift on this arithmetic. See the derivation comment at the
+// first call site for why this predicate is EMPIRICAL (llama.cpp-k1ev),
+// not a modeled worst case. Returns true when the shape fits (or flash
+// attention is on, or the guard could not evaluate), false when refused
+// (the refusal's own arithmetic and remediation are logged before
+// returning).
+//
+// `allow_replan` separates the two callers' very different rights over the
+// plan-time SCRATCH-zone shape: the full transaction (allow_replan=true)
+// keeps the original record/ensure/restore-on-refusal behavior below,
+// because it already holds g_tensor_inventory_mutex and owns republishing
+// the plan. The narrow re-check (allow_replan=false) must NOT record a
+// shape, call unified_cache_ensure_planned_arena_zones() (whose own
+// contract requires g_tensor_inventory_mutex, which resolve_fused_ops()'s
+// caller does not hold when it merely wants to know whether an
+// already-published shape still fits), or restore anything on refusal --
+// it only asks whether the ALREADY-PUBLISHED shape fits the CURRENT
+// SCRATCH capacity.
+static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
+                                               uint32_t n_ctx,
+                                               uint32_t n_ubatch,
+                                               uint32_t n_head,
+                                               bool     flash_attn_enabled,
+                                               bool     allow_replan) {
+    if (flash_attn_enabled) {
+        return true;
+    }
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache || !cache->arena_active()) {
+        return true;
+    }
+    if (n_head == 0) {
+        // Name the reason the guard is silently skipping rather than
+        // leaving no trace at all -- planner_n_head is only 0 before the
+        // model's own hyperparameters have been threaded into the plan,
+        // which should not happen for a real runtime-context call, so this
+        // is worth a WARN if it ever does.
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] non-FA attention scratch guard could not evaluate (n_head=0, unknown query-head "
+            "count) -- skipping the check for n_ctx=%u n_ubatch=%u\n",
+            n_ctx, n_ubatch);
+        return true;
+    }
+
+    ggml_sycl::nonfa_attn_scratch_planned_shape prev_shape{};
+    size_t                                      scratch_capacity;
+    if (allow_replan) {
+        // Remember the previously recorded triplet so a refused shape (see
+        // below) can be undone -- the recording just below stays
+        // unconditional (the source gate pins that), only its effect on
+        // FUTURE plan-time SCRATCH-zone sizing is rolled back when this
+        // shape does not fit.
+        prev_shape = ggml_sycl::unified_cache_get_planned_nonfa_attn_scratch_shape(device);
+
+        // Opportunistic re-plan: record the REAL runtime shape (not the
+        // load-time conservative default populate_host_zone_sizing() saw)
+        // and ask the arena to re-check its planned zones. This succeeds
+        // only in the same "rare case where the arena is still empty"
+        // reserve_onednn_scratch()'s own comment already documents (no
+        // live weight leases yet) -- for the standard model-load flow it
+        // is a no-op, because llama_model_sycl_make_placement_envelope()
+        // (llama-model.cpp) hardcodes envelope.n_ctx = 0, so the SCRATCH
+        // zone was never sized for this shape to begin with.
+        const size_t scratch_capacity_before = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+        ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, n_head, n_ubatch, n_ctx);
+        (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device);
+        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+        if (scratch_capacity > scratch_capacity_before) {
+            // "(observed)": this is the guard's own re-plan attempt seeing
+            // the zone grow, not the plan-time raise
+            // ensure_planned_arena_zones() logs from its own call site
+            // ("(planned)") -- kept distinguishable so a log reader can
+            // tell which of the two code paths actually grew the zone.
+            GGML_LOG_INFO(
+                "[UNIFIED-CACHE] SCRATCH zone raised to %.1f MB (observed) from non-FA attention scratch "
+                "estimate (n_head=%u n_ubatch=%u n_ctx=%u)\n",
+                scratch_capacity / (1024.0 * 1024.0), n_head, n_ubatch, n_ctx);
+        } else {
+            // State only what was actually observed (capacity unchanged).
+            // ensure_planned_arena_zones()'s return value is discarded
+            // above (this call is opportunistic/best-effort by design), so
+            // the cause is not something this code checked -- it may be
+            // live weight leases, or simply that the estimate did not
+            // exceed the zone's existing capacity. Naming a specific
+            // unverified cause here would be a claim this code cannot
+            // back.
+            GGML_LOG_INFO(
+                "[UNIFIED-CACHE] non-FA attention re-plan did not raise the SCRATCH zone (%.1f MB unchanged)\n",
+                scratch_capacity / (1024.0 * 1024.0));
+        }
+    } else {
+        // Narrow re-check: no record, no re-plan attempt, no
+        // restore-on-refusal -- only ask whether the shape the caller
+        // already published still fits the CURRENT SCRATCH capacity.
+        scratch_capacity = cache->zone_capacity(ggml_sycl::vram_zone_id::SCRATCH);
+    }
+
+    const size_t nonfa_demand = ggml_sycl::unified_cache_nonfa_attn_scratch_demand_bytes(n_head, n_ubatch, n_ctx);
+    if (nonfa_demand <= scratch_capacity) {
+        return true;
+    }
+
+    const double   mb = 1024.0 * 1024.0;
+    // "scratch-limited": this figure is the SCRATCH zone's own capacity
+    // limit, not a whole-device worst case -- the real limit
+    // (llama.cpp-k1ev's unexplained outside-arena consumer) is smaller and
+    // currently unmeasured, so a context at or below this figure is not
+    // guaranteed to run, only known not to be refused by this specific
+    // check.
+    const uint32_t fits_scratch =
+        ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(scratch_capacity, n_head, n_ubatch);
+    GGML_LOG_ERROR(
+        "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the reserved "
+        "SCRATCH zone -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB zone=%.1f MB over_by=%.1f MB\n",
+        n_ctx, n_ubatch, n_head, nonfa_demand / mb, scratch_capacity / mb, (nonfa_demand - scratch_capacity) / mb);
+    // GGML_SYCL_NONFA_ATTN_SCRATCH_MB is NOT offered as a remediation here:
+    // a hardware sweep (768 MiB, 1536 MiB, plus raised arena headroom to
+    // 3-4 GB) still aborted on both cards (llama.cpp-k1ev) -- it is an
+    // experimentation knob for that investigation, not a fix a user should
+    // reach for. Flash attention or a smaller context are the only
+    // remediations with hardware support.
+    GGML_LOG_ERROR(
+        "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention path does not "
+        "fit the device budget at this length; pass -fa 1/auto to use flash attention, or reduce -c/-p%s\n",
+        fits_scratch >= 256 ? "" : " (no non-FA context at this shape is known to fit this device)");
+    if (fits_scratch >= 256) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] the largest non-FA context estimated to fit the SCRATCH zone is about -c %u "
+            "(scratch-limited; not a guarantee against llama.cpp-k1ev's unexplained outside-arena "
+            "consumption)\n",
+            fits_scratch);
+    }
+
+    if (allow_replan) {
+        // This shape was refused -- restore the previously recorded
+        // triplet so a rejected runtime shape does not permanently change
+        // what a FUTURE model load's plan-time SCRATCH-zone raise reads.
+        // The narrow re-check never recorded anything above, so it has
+        // nothing to restore.
+        ggml_sycl::unified_cache_set_planned_nonfa_attn_scratch_shape(device, prev_shape.n_head, prev_shape.n_ubatch,
+                                                                      prev_shape.n_ctx);
+    }
+    return false;
+}
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
-                                           uint32_t       n_seq_max) {
+                                           uint32_t       n_seq_max,
+                                           bool           flash_attn_enabled) {
     if (!backend || n_ctx == 0) {
         return;
     }
@@ -16807,6 +16957,42 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         }
         return;
     }
+
+    // llama.cpp-oyfl: the KV/MMID replan above fits the device budget, but a
+    // fitting KV shape says nothing about the non-flash-attention batched
+    // mul_mat path's own scratch demand -- that consumer never went through
+    // replan_moe_mmid_workspaces_for_runtime() at all. When flash attention
+    // is off, check it separately against the SCRATCH zone the arena
+    // already reserved. See ggml-sycl.cpp's ggml_sycl_mul_mat_batched_sycl()
+    // abort site ("batched F16 mul_mat failed -- no recovery path
+    // available") for what this exists to prevent: that abort fires
+    // mid-prefill, after weights and KV are already committed, with no
+    // arithmetic printed.
+    //
+    // THIS PREDICATE IS EMPIRICAL, NOT A MODELED WORST CASE. An earlier
+    // revision of this check attempted to model exactly what can spill
+    // outside the fixed arena (this zone's own overflow, the oneDNN
+    // scratchpad's fragmentation-driven overflow, and the SYCL scheduler's
+    // compute buffer regrowing to the real n_kv) and compare it against live
+    // free VRAM outside the arena. Hardware measurement falsified that
+    // model: a non-FA prefill at this shape was measured consuming
+    // ~2-4 GB OUTSIDE the fixed arena on BOTH discrete cards (B50 and B70),
+    // roughly double to triple what the model predicted, and no zone size,
+    // arena budget percentage, or external-headroom override closed the
+    // gap on either card -- see llama.cpp-k1ev, filed for that unexplained
+    // consumer. Until k1ev is closed, "does the demand exceed the SCRATCH
+    // zone" is the only check with real hardware support: it refuses on
+    // every measured case that actually aborts, and (this is what makes it
+    // usable despite not being a true worst-case model) nothing measured so
+    // far runs with a demand above the zone, on either card, at any zone
+    // size or headroom setting tried. Do not reintroduce a live-free-VRAM
+    // or compute-buffer-regrowth term without new hardware evidence that
+    // k1ev's consumer is understood and bounded.
+    if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head,
+                                            flash_attn_enabled, /*allow_replan=*/true)) {
+        return;
+    }
+
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
     next->kv_info       = next_kv_info;
@@ -16868,7 +17054,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            ggml_sycl_model_token model,
                                                                            uint32_t              n_ctx,
                                                                            uint32_t              n_ubatch,
-                                                                           uint32_t              n_seq_max) {
+                                                                           uint32_t              n_seq_max,
+                                                                           bool                  flash_attn_enabled) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
     if (!backend || !backend->context || n_ctx == 0) {
@@ -16982,7 +17169,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     g_runtime_external_lease     = true;
     g_runtime_update_succeeded   = false;
     try {
-        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max);
+        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, flash_attn_enabled);
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -17018,8 +17205,80 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     return inner_ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
+// llama.cpp-oyfl: a NARROW re-evaluation of the non-FA attention scratch
+// guard only, against the currently PUBLISHED plan's shape -- deliberately
+// not a call into ggml_backend_sycl_set_runtime_context_for_model() above.
+// That full transaction re-runs the KV replan, the MoE MMID
+// reaccount/materialize pass, a plan republish, and (via the caller's own
+// retry loop) a BUSY backoff -- none of which a mere flash_attn_type
+// resolution has any business touching, since n_ctx/n_ubatch have not
+// changed. NOT read-only: it takes sycl_module_mutation_guard (so it
+// cannot run past a module shutdown) and g_tensor_inventory_mutex -- the
+// same mutex the full transaction above serializes its own mutating work
+// under -- then confirms the plan snapshot read before the lock is still
+// the live one. This is a read-then-confirm-under-lock construction of
+// its own, guarding against acting on a plan a concurrent model
+// load/unload or runtime-context call has already superseded; it is NOT a
+// claim that some specific accessor this then reads (zone_capacity(), an
+// unsynchronized array read with no lock contract of its own) requires
+// the lock. resolve_fused_ops() holds no SYCL lock of its own, so there is
+// no deadlock. Called with allow_replan=false: no record, re-plan
+// attempt, or restore-on-refusal (see that function). Used by
+// llama_context::sycl_recheck_runtime_context_flash_attn() for the
+// AUTO-resolution re-check; the constructor's own initial call still goes
+// through the full transaction above, since establishing n_ctx/n_ubatch for
+// the first time is exactly what that transaction is for.
+ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(ggml_backend_t        backend,
+                                                                                ggml_sycl_model_token model,
+                                                                                bool flash_attn_enabled) {
+    if (!backend || !backend->context) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
+    }
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        return GGML_SYCL_LIFECYCLE_BUSY;
+    }
+
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (!current || !current->plan) {
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+    if (current->model_id != model.model_id || current->load_txn_id != model.load_txn_id ||
+        current->slot != model.slot || current->slot_generation != model.slot_generation) {
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+
+    // Confirm under the lock that the snapshot read above is still the
+    // live one -- it may have changed between the lock-free read of
+    // `current` and acquiring the lock (a concurrent model load/unload
+    // or another runtime-context call).
+    std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
+    if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+
+    const bool ok =
+        ggml_sycl_check_nonfa_attn_scratch(ctx->device, current->plan->planner_n_ctx, current->plan->planner_n_ubatch,
+                                           current->plan->planner_n_head, flash_attn_enabled,
+                                           /*allow_replan=*/false);
+    return ok ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+}
+
 void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx) {
-    ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1);
+    // llama.cpp-oyfl: this entry point has no way to learn the caller's real
+    // flash-attention resolution, so pass false (assume it may be off) rather
+    // than true -- the non-FA scratch guard added to
+    // ggml_backend_sycl_set_runtime_context() only adds a cheap check when
+    // flash attention actually is off; defaulting to "skip the check" here
+    // would silently reopen exactly the abort this ticket exists to prevent
+    // for any caller of this legacy entry point.
+    ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1, /*flash_attn_enabled=*/false);
 }
 
 void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const size_t * sizes, int n_sizes) {
@@ -48248,7 +48507,18 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
             // oneDNN handles strided data and does not need overhead of get_to_fp16_nc_sycl.
             const int64_t ne_src1 = src1->nb[last_str] * src1->ne[last_dim] / type_size_src1;
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
-                throw std::runtime_error("batched F16 src1 staging allocation failed");
+                // llama.cpp-oyfl: name the actual size that failed to allocate.
+                // This staging buffer's demand at long context is exactly what
+                // ggml_backend_sycl_set_runtime_context()'s non-FA attention
+                // scratch guard is meant to catch before this call ever runs --
+                // reaching this throw with flash attention off means either
+                // that guard was bypassed (a caller other than llama-context.cpp)
+                // or its formula under-estimated this shape.
+                char msg[192];
+                std::snprintf(msg, sizeof(msg),
+                              "batched F16 src1 staging allocation failed (%.1f MB requested, oneDNN-strided path)",
+                              static_cast<double>(ne_src1) * sizeof(sycl::half) / (1024.0 * 1024.0));
+                throw std::runtime_error(msg);
             }
             const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type, dst);
             GGML_ASSERT(to_fp16_sycl != nullptr);
@@ -48258,7 +48528,13 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx,
         {
             const int64_t ne_src1 = ggml_nelements(src1);
             if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ne_src1), "batched_f16_src1_stage")) {
-                throw std::runtime_error("batched F16 src1 staging allocation failed");
+                // llama.cpp-oyfl: see the sibling throw above -- same guard,
+                // same size-attribution reasoning, oneMath/non-contiguous path.
+                char msg[192];
+                std::snprintf(msg, sizeof(msg),
+                              "batched F16 src1 staging allocation failed (%.1f MB requested, oneMath path)",
+                              static_cast<double>(ne_src1) * sizeof(sycl::half) / (1024.0 * 1024.0));
+                throw std::runtime_error(msg);
             }
             const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
             GGML_ASSERT(to_fp16_nc_sycl != nullptr);
@@ -48617,7 +48893,14 @@ static bool ggml_sycl_mul_mat_batched_f16_fallback(ggml_backend_sycl_context & c
         (void) ne_src1;
         if (!src1_f16_alloc.alloc(*queue, ctx.device, static_cast<size_t>(ggml_nelements(src1)),
                                   "batched_f16_scalar_src1_stage")) {
-            throw std::runtime_error("batched F16 scalar fallback src1 staging allocation failed");
+            // llama.cpp-oyfl: last rung of the fallback ladder -- see the
+            // primary batched-mul_mat throw sites above for the guard this
+            // failure means either bypassed or under-estimated this shape.
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                          "batched F16 scalar fallback src1 staging allocation failed (%.1f MB requested)",
+                          static_cast<double>(ggml_nelements(src1)) * sizeof(sycl::half) / (1024.0 * 1024.0));
+            throw std::runtime_error(msg);
         }
         const to_fp16_nc_sycl_t to_fp16_nc_sycl = ggml_get_to_fp16_nc_sycl(src1->type);
         GGML_ASSERT(to_fp16_nc_sycl != nullptr);
@@ -62543,14 +62826,26 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
                         if (ggml_sycl_try_dispatch_resource_exhaustion_fallback(ctx, dst, e)) {
                             return;
                         }
-                        // Last resort diagnostics.
+                        // Last resort diagnostics. llama.cpp-oyfl: this is the
+                        // abort ggml_backend_sycl_set_runtime_context()'s non-FA
+                        // attention scratch guard exists to preempt with size
+                        // arithmetic at context-creation time instead -- reaching
+                        // it means either flash attention was on (a different,
+                        // unaddressed cause) or the guard's formula, the
+                        // reserved SCRATCH zone, or a caller bypassing
+                        // llama-context.cpp's cparams.flash_attn threading did
+                        // not catch this shape. `e` (logged above) carries the
+                        // requested byte count from the throw site.
                         size_t free_vram = 0, total_vram = 0;
                         ggml_backend_sycl_get_device_memory(ctx.device, &free_vram, &total_vram);
                         fprintf(stderr,
                                 "[SYCL] VRAM exhaustion diagnostic: "
-                                "free=%.1f MB total=%.1f MB\n",
-                                free_vram / (1024.0 * 1024.0), total_vram / (1024.0 * 1024.0));
-                        GGML_ABORT("[SYCL] batched F16 mul_mat failed — no recovery path available.");
+                                "free=%.1f MB total=%.1f MB (last failure: %s)\n",
+                                free_vram / (1024.0 * 1024.0), total_vram / (1024.0 * 1024.0), e.what());
+                        GGML_ABORT(
+                            "[SYCL] batched F16 mul_mat failed — no recovery path available. This should have "
+                            "been refused earlier by ggml_backend_sycl_set_runtime_context()'s non-FA attention "
+                            "scratch guard (llama.cpp-oyfl) if flash attention was off for this context.");
                     }
                 }
             }
@@ -105555,6 +105850,9 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_set_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_set_runtime_context_for_model;
+    }
+    if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
+        return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

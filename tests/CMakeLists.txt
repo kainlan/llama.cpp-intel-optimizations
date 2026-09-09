@@ -1785,6 +1785,13 @@ if (NOT WIN32)
     )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-nonfa-attn-scratch-guard-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-supports-op-foreign-buffer-source.py
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         LABEL "sycl;python;source-assert;placement"
@@ -2320,6 +2327,58 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-onednn-graph-floor-override PROPERTIES
         LABELS "sycl;onednn"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_ONEDNN_GRAPH_ZONE_MB=99"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+
+    # Host-only gate for llama.cpp-oyfl: the non-flash-attention batched
+    # mul_mat scratch demand formula (unified_cache_nonfa_attn_scratch_demand_bytes()
+    # and its inverse) -- the sibling of the oneDNN Graph-scratch floor gate
+    # immediately above, but NOT gated behind GGML_SYCL_DNNL (the path it
+    # sizes for is the native SYCL/oneMath batched-mul_mat route, not a
+    # oneDNN one). Same multi-registration shape for the same reason: the
+    # formula's env-var read is memoized once per process, so "default",
+    # "override", and "override-zero" cannot share one invocation.
+    llama_build(test-sycl-nonfa-attn-scratch-demand.cpp)
+    target_include_directories(test-sycl-nonfa-attn-scratch-demand PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-nonfa-attn-scratch-demand PRIVATE ggml-sycl)
+    target_compile_definitions(test-sycl-nonfa-attn-scratch-demand PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-nonfa-attn-scratch-demand PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-nonfa-attn-scratch-demand PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-nonfa-attn-scratch-demand PRIVATE "-fsycl")
+        target_link_options(test-sycl-nonfa-attn-scratch-demand PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-nonfa-attn-scratch-demand ARGS --mode=default)
+    # ENVIRONMENT: LD_LIBRARY_PATH per every sibling SYCL gate (see the
+    # onednn-graph-floor registration's comment above for why);
+    # GGML_SYCL_NONFA_ATTN_SCRATCH_MB= (empty, explicitly cleared) forces
+    # --mode=default to exercise the FORMULA rather than silently inheriting
+    # whatever the launching shell happens to have set.
+    set_tests_properties(test-sycl-nonfa-attn-scratch-demand PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_NONFA_ATTN_SCRATCH_MB="
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+    llama_test(test-sycl-nonfa-attn-scratch-demand NAME test-sycl-nonfa-attn-scratch-demand-override ARGS --mode=override)
+    set_tests_properties(test-sycl-nonfa-attn-scratch-demand-override PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+    # Third registration: GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a DISTINCT
+    # override value from both "unset" (--mode=default above) and "77"
+    # (--mode=override above) -- env_mb_override()'s memoized read means all
+    # three must run as separate processes, same reasoning as the two
+    # registrations above.
+    llama_test(test-sycl-nonfa-attn-scratch-demand NAME test-sycl-nonfa-attn-scratch-demand-override-zero ARGS --mode=override-zero)
+    set_tests_properties(test-sycl-nonfa-attn-scratch-demand-override-zero PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )

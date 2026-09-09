@@ -1886,6 +1886,151 @@ case to `ggml/src/ggml-sycl/tests/test-zone-sizing.cpp`. **Do not raise the
 estimate back to `any_tensor` to silence it** — persistent growth is worse than
 the original over-provision, but so is reinstating it.
 
+### A non-tensor consumer: the non-FA batched mul_mat scratch floor
+
+Every consumer above sizes from a maximum over the *tensor inventory* —
+`zone_scoped_maxima()`'s classifier groups tensors by `(type, ne)`. The
+non-flash-attention batched mul_mat scratch demand
+(`unified_cache_nonfa_attn_scratch_demand_bytes()`, llama.cpp-oyfl) is
+**not** that kind of consumer: nothing it needs is a weight tensor. When
+flash attention is off, each layer's attention runs through
+`ggml_sycl_mul_mat_batched_sycl()` (`ggml-sycl.cpp`) twice — KQ =
+`mul_mat(K, Q)`, then KQV = `mul_mat(V, softmax(KQ))` — and both calls
+stage their non-f16 operand into an f16 buffer via
+`scoped_unified_queue_temp`, whose shape comes from
+`ggml_sycl_transient_device_intent()` (`common.hpp`): on the calling
+thread's COMPUTE path — not recording a command graph, the common case
+for this dispatch — that sets `prefer_vram_zone = SCRATCH`; while
+recording, it takes the GRAPH_TMP shape instead and does not name SCRATCH
+at all. This formula models the COMPUTE-path demand. The
+KQV call's staged operand is `kq_soft_max`, shaped
+`[n_kv, n_ubatch, n_head]` — at long context this dwarfs the KQ call's
+staged Q operand — so the formula keeps only that term:
+
+```
+demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3
+```
+
+**Rule for adding a consumer, extended:** when the demand scales with
+*runtime shape* rather than any tensor's byte size, do not force it through
+`zone_tensor_desc`/`zone_scoped_maxima` — follow the pattern this consumer's
+sibling, `onednn_graph_scratch_zone_floor_bytes()`, already established: a
+free function taking the shape directly (`n_head`, `n_ubatch`, `n_ctx`),
+fed by a `unified_cache_set_planned_*_shape()`/`get_planned_*_shape()` pair
+of atomics (one triplet per consumer — the non-FA one is **not** a reuse of
+the oneDNN triplet, because it is unconditional while the oneDNN one is
+gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
+right where `plan.planner_n_head/n_ubatch/n_ctx` are already known.
+
+**The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro
+log, not carried over by analogy.** An earlier version of this formula
+copied the oneDNN floor's c=1.5 by analogy, and it under-covered the
+repro: the log (session scratchpad `oyfl/fa_off-2026-09-07.log`) shows the
+SCRATCH zone at 460.0 MB of its 512 MB capacity immediately before the
+failing request, whose own raw (no concurrency factor) demand at that
+shape (n_head=32, n_ubatch=512, n_ctx=8192) is exactly 256 MiB — so the
+real pressure was `460 + 256 = 716` MiB against a 256 MiB single-shot
+request, a ratio of ~2.8x. c=3 clears that with a small margin. The
+concurrency is not "one buffer plus headroom": `scoped_unified_queue_temp
+::release()` (`ggml-sycl.cpp`) submits a marker event and keeps the handle
+alive until it completes rather than freeing synchronously, and a
+16-ubatch pp8192 run submits GPU work faster than each ubatch's release
+event resolves, so several of the immediately preceding (smaller but
+still substantial) ubatches' requests are typically still occupying the
+zone when the largest one arrives. This is inferred from **one** repro's
+zone-state snapshot, not fit to several independent hardware measurements
+the way the oneDNN c=1.5 was (five captures, llama.cpp-0oxf comment
+c-xcop).
+
+**Two opposing pressures on this constant, both real.** Raise it only on
+new hardware evidence (a real multi-point capture tracing SCRATCH_ZONE
+occupancy across a whole pp8192 run) — never lower it without such
+evidence, because lowering trades away the margin this check exists to
+keep ahead of the abort it prevents. But raising it is not free either:
+this is a SCRATCH-zone-capacity check, not a true worst-case model, so a
+larger `c` also refuses **more** contexts that would actually have run —
+trading false refusals for margin, on the same unvalidated single
+snapshot. Neither direction is free; do not move this value without a
+multi-point capture backing the move. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB`
+overrides the formula outright, so applying a future measurement needs no
+code change.
+
+**Where this can and cannot help, and why the automatic case is
+llama.cpp-fkpg's scope, not this one's.** Like every zone above, the
+SCRATCH zone is sized once, before the arena's single physical chunk is
+allocated at model load — raising it later cannot resize that chunk.
+`ensure_planned_arena_zones()` raises `scratch_zone` from this formula the
+same way it raises `onednn_zone` and `runtime_zone` from theirs (bounded to
+a quarter of the available budget, same reasoning as the oneDNN clamp), but
+for the standard model-load flow this can never fire with the real shape:
+`llama_model_sycl_make_placement_envelope()` (`llama-model.cpp`) hardcodes
+`envelope.n_ctx = 0` unconditionally, so no caller's real `-c`/`-p` reaches
+`plan.planner_n_ctx` before weights stream into the arena. Piping the real
+context size back into pre-load sizing is llama.cpp-fkpg's scope — this
+raise only takes effect automatically once that lands. `ggml_backend_sycl
+_set_runtime_context()` also makes one opportunistic re-plan attempt with
+the real runtime shape (`unified_cache_ensure_planned_arena_zones()`, the
+same call `reserve_onednn_scratch()`'s own comment already documents as
+succeeding only in "the rare case where the arena is still empty") —
+cheap and harmless, but not expected to succeed once weights hold live
+leases; its own log line only claims "raised" when the zone's capacity
+actually grew, and otherwise reports only what was observed ("did not
+raise the SCRATCH zone (... unchanged)") rather than naming a specific
+cause this code never actually checked.
+
+**The check is EMPIRICAL, not a modeled worst case — read this before
+tightening or loosening it.** A first draft of this predicate (llama.cpp
+-oyfl round 2) reasoned from first principles that a SCRATCH-zone-capacity
+comparison alone was insufficient: a zone overflow does not fail outright
+(`unified_alloc()`, `unified-cache.cpp`, falls through to a raw device
+allocation OUTSIDE the fixed arena when a preferred zone is full), and
+that same outside-arena headroom is what the SYCL scheduler's own compute
+buffer draws on when it regrows to the context's real `n_kv`
+(`llama_context::graph_reserve()` reserves it at the KV cache's own
+reserve-time `n_kv`, `llama_kv_cache::get_n_kv()`, sized from
+currently-used cells — 0 at construction — not the real `n_ctx`; a
+deliberate upstream design for graph-shape stability, not something to
+change here). That draft modeled and summed every such term (compute
+-buffer regrowth, SCRATCH overflow, oneDNN scratchpad) and compared the
+sum against live free VRAM outside the arena, predicting the repro would
+run once `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` (the exact `c=3` demand)
+eliminated the SCRATCH term (predicted available ~1334 MiB vs. ~1200 MiB
+needed).
+
+**Hardware measurement falsified that model.** On the B50, the same
+`-fa 0 -p 8192` repro with `GGML_SYCL_NONFA_ATTN_SCRATCH_MB=768` still
+aborted (rc=134, staging-allocation failures, a VRAM-exhaustion line) — a
+sweep across `768`/`1536` MiB zone sizes, `GGML_SYCL_VRAM_BUDGET_PCT=85`
+(shrinking the arena to grow outside-arena headroom to ~4.0 GB), and an
+explicit `GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB=3072` override all
+still aborted, each time with tens of MB free rather than the modeled
+headroom. The B70 (default ~2 GB outside its arena, and again with
+headroom raised to ~4.0 GB) aborted identically. So the non-FA `-p 8192`
+prefill consumes roughly 2–4 GB **outside the fixed arena on both discrete
+cards**, far beyond anything the compute-buffer/SCRATCH/oneDNN model
+above accounts for, and no zone size or headroom override recovers it —
+filed as **llama.cpp-k1ev**, an unidentified outside-arena consumer
+specific to the non-FA path. This also falsifies the model's original
+motivating concern (a card with more outside-arena headroom, e.g. the
+B70, would wrongly refuse a shape that actually runs): both cards abort
+at the same shape, so the zone-only check is not observed to be more
+conservative than reality on either card measured so far.
+
+**The refusal is therefore left as the empirical SCRATCH-zone-capacity
+check**, unchanged in shape from before round 2: refuse when `nonfa_demand
+> zone_capacity(SCRATCH)`, reporting `needs`/`zone`/`over_by` and the
+zone's own largest-fitting `-c` (labeled **"scratch-limited"**, since it
+is a limit on this one zone, not a whole-device guarantee against k1ev's
+consumer). The refusal names `-fa 1`/`auto` or a smaller `-c` as the only
+remediations with hardware support — it deliberately does **not** suggest
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB`, since the sweep above shows setting it
+does not reliably fix anything; treat that variable as an experimentation
+knob for investigating k1ev, not a user-facing fix. Do not reintroduce a
+live-free-VRAM or compute-buffer-regrowth predicate without new hardware
+evidence that k1ev's consumer is understood and bounded — the reasoning
+that motivated one was sound in isolation and still wrong in practice,
+which is the whole lesson of this subsection.
+
 ### Known limits (load-bearing — read before changing any of this)
 
 1. **The ONEDNN scratchpad's two halves are in different units, deliberately.**
