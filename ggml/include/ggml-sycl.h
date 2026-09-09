@@ -319,10 +319,20 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // inference context. This does not retroactively re-place already loaded
 // weights, but it lets KV/runtime consumers size cache/control allocations from
 // the active context instead of the model's training context.
+//
+// llama.cpp-oyfl: flash_attn_enabled is the caller's RESOLVED
+// cparams.flash_attn (AUTO already settled to true/false by this point --
+// see llama_context::llama_context in llama-context.cpp), not the raw
+// llama_flash_attn_type. When false, this also checks whether the
+// non-flash-attention batched mul_mat path's worst-case scratch demand at
+// (n_ctx, n_ubatch) fits the SCRATCH zone the arena already reserved, and
+// refuses the update (logging the size arithmetic, same style as the KV
+// budget refusal) instead of leaving a shape that would abort mid-prefill.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                                             uint32_t       n_ctx,
                                                             uint32_t       n_ubatch,
-                                                            uint32_t       n_seq_max);
+                                                            uint32_t       n_seq_max,
+                                                            bool           flash_attn_enabled);
 
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
@@ -973,12 +983,16 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
     struct ggml_sycl_model_token model);
 // Foundation model-bound runtime update. Context/graph code will call this
 // automatically in 1q72; callers currently bind explicitly.
+//
+// llama.cpp-oyfl: flash_attn_enabled forwards to
+// ggml_backend_sycl_set_runtime_context() -- see that declaration's comment.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
-    uint32_t                     n_seq_max);
+    uint32_t                     n_seq_max,
+    bool                         flash_attn_enabled);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
