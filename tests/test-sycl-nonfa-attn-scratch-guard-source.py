@@ -746,3 +746,7 @@ def test_explicit_zero_warn_has_a_mutation_witness() -> None:
     assert "turns the runtime-context non-FA attention scratch guard off" not in mutated_body_norm, (
         "mutation witness is broken: the reverted (pre-fix) text still trips the positive check above"
     )
+    assert "GGML_SYCL_NONFA_ATTN_SCRATCH_MB" not in mutated_body_norm, (
+        "mutation witness is broken: the reverted (pre-fix) text still trips the check's second "
+        "assertion (that the WARN names GGML_SYCL_NONFA_ATTN_SCRATCH_MB specifically)"
+    )

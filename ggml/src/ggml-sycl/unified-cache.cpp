@@ -1617,8 +1617,9 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // replacing each site's own std::atol()-based copy. atol() cannot report a
 // parse failure -- atol("abc") and atol("0") are both 0 -- so the old copies
 // silently treated a typo'd, non-numeric override exactly like an explicit
-// "use 0 bytes", which is a real behavior difference (0 disables the
-// consumer's own floor) a user would not notice from the log alone.
+// "use 0 bytes", which is a real behavior difference (0 is an explicit
+// disable, which for GGML_SYCL_NONFA_ATTN_SCRATCH_MB turns the whole
+// runtime-context guard off) a user would not notice from the log alone.
 //
 // Returns -1 when the variable is unset or empty: the caller falls through
 // to its own formula, silently -- this is the ordinary "no override" case
@@ -1637,7 +1638,7 @@ nonfa_attn_scratch_planned_shape unified_cache_get_planned_nonfa_attn_scratch_sh
 // The two file-scope wrapper functions below memoize the result in their
 // own `static const long`, so each variable is parsed -- and WARNed about,
 // if invalid -- at most once per process no matter how many of this
-// formula's call sites ask for it (there are four today: the demand
+// formula's consumers ask for it (there are four today: the demand
 // formula itself, its plan-time raise counterpart in
 // ensure_planned_arena_zones(), the oneDNN Graph-scratch floor, and the
 // guard's explicit-0 disable check
