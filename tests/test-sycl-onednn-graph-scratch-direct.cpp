@@ -1716,11 +1716,36 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     slow_release_result old_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr_old, &old_release.release_event);
 
+    // Diagnostic only: the free list's size right before the reclaim, read
+    // via the hooks-gated accessor -- lets a failing run distinguish "the
+    // reclaim retired more slots than the one it should have" from every
+    // other explanation.
+    const size_t free_list_size_before_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+
     // Reclaim the pool WHILE ptr_old's marker kernel is still in flight --
     // the exact hazard this test exists to catch. Before the fix,
     // ptr_old's slot returned to the free list here even though its
     // marker had not fired yet.
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test reclaim (entry still in flight)");
+
+    const size_t free_list_size_after_reclaim = cache->onednn_graph_scratch_flag_slot_free_list_size_for_test();
+    printf(
+        "    (free list size: before reclaim=%zu, after reclaim=%zu -- ptr_old's own slot must be "
+        "PERMANENTLY retired, not returned)\n",
+        free_list_size_before_reclaim, free_list_size_after_reclaim);
+
+    // q is a single IN-ORDER queue and old_release's kernel was never waited
+    // on above, so without this wait, new_release's kernel (submitted next,
+    // on the same queue) would queue BEHIND old_release's still-running one
+    // and could not itself complete until old_release's kernel also did --
+    // long enough to blow the poll deadline below for a reason that has
+    // nothing to do with the retirement logic under test. The reclaim call
+    // above already exercised the hazard this test checks (the slot
+    // decision is made at reclaim time, while old_release's marker is still
+    // in flight); waiting here only serializes the two kernels so the poll
+    // below measures new_release's own completion, not queue backpressure
+    // from old_release.
+    old_release.release_event.wait_and_throw();
 
     void * ptr_new = cache->onednn_graph_scratch_alloc(kSizeReclaimRetire, 256, &q);
     check(ptr_new != nullptr, "DIRECT allocation for the new entry succeeds");
@@ -1729,6 +1754,13 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     }
     slow_release_result new_release = submit_slow_release(q);
     cache->onednn_graph_scratch_free(ptr_new, &new_release.release_event);
+
+    const int32_t  new_entry_flag_slot = cache->onednn_graph_scratch_pool_entry_flag_slot_for_test(kSizeReclaimRetire);
+    const uint32_t new_entry_flag_generation =
+        cache->onednn_graph_scratch_pool_entry_flag_generation_for_test(kSizeReclaimRetire);
+    printf("    (new entry parked: flag_slot=%d (%s), flag_generation=%u)\n", new_entry_flag_slot,
+           new_entry_flag_slot >= 0 ? "armed" : "unwatched -- falls back to the bare blocking query",
+           new_entry_flag_generation);
 
     // Poll the new entry's own flag directly (no alloc()/free() round trip
     // that would itself consume/re-park it) until it reads true -- must
@@ -1745,10 +1777,11 @@ void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int de
     }
     check(new_entry_complete, "the new entry's own completion flag reads true once its own release event completes");
 
-    // Now let the OLD (retired-slot) kernel finish too. If the fix is
-    // wrong -- if ptr_old's slot had been handed to ptr_new -- this stale,
-    // out-of-order write would flip ptr_new's completion status back to
-    // false right here.
+    // old_release's kernel already finished (waited above, to keep it off
+    // new_release's in-order queue); this re-confirms that. If the fix is
+    // wrong -- if ptr_old's slot had been handed to ptr_new -- old_release's
+    // marker write, landing in that same (wrongly shared) slot, would have
+    // already flipped ptr_new's completion status back to false by now.
     old_release.release_event.wait_and_throw();
     check(cache->onednn_graph_scratch_pool_entry_flag_true_for_test(kSizeReclaimRetire),
           "the new entry STAYS complete after the old (retired-slot) kernel finally finishes -- proves the "

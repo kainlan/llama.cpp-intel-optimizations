@@ -3159,6 +3159,23 @@ class unified_cache {
     // gate every other hook in this file uses.
     bool onednn_graph_scratch_pool_entry_flag_true_for_test(size_t size);
 
+    // llama.cpp-c6ah: test-only diagnostic accessors, gated the same way as
+    // every other hook in this file -- return a sentinel (-1 / 0 / 0) when
+    // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is not set. Each returns the FIRST
+    // entry found in the `size` bucket's flag_slot/flag_generation, or -1/0
+    // if that bucket is empty or does not exist -- exist so a test can
+    // observe WHETHER a park was armed (flag_slot >= 0) and WHICH
+    // generation it holds, without inferring it indirectly from timing.
+    // Locks onednn_graph_scratch_mutex_ itself, same as
+    // onednn_graph_scratch_pool_entry_flag_true_for_test() above.
+    int32_t  onednn_graph_scratch_pool_entry_flag_slot_for_test(size_t size);
+    uint32_t onednn_graph_scratch_pool_entry_flag_generation_for_test(size_t size);
+    // The completion-flag slab's current free-list size -- lets a test
+    // confirm exactly how many slots a reclaim call returned (or did not
+    // return) to the free list, rather than inferring it from whether a
+    // later park happened to get armed.
+    size_t   onednn_graph_scratch_flag_slot_free_list_size_for_test();
+
     // Public, self-locking entry point: releases (for real) every pooled
     // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
     // before log, same order as the body below and for the same reason

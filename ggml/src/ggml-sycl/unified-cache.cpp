@@ -9972,6 +9972,39 @@ bool unified_cache::onednn_graph_scratch_pool_entry_flag_true_for_test(size_t si
     return false;
 }
 
+// llama.cpp-c6ah: see the declaration's comment in unified-cache.hpp.
+int32_t unified_cache::onednn_graph_scratch_pool_entry_flag_slot_for_test(size_t size) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+    auto                        bucket_it = onednn_graph_scratch_reuse_pool_.find(size);
+    if (bucket_it == onednn_graph_scratch_reuse_pool_.end() || bucket_it->second.empty()) {
+        return -1;
+    }
+    return bucket_it->second.front().flag_slot;
+}
+
+uint32_t unified_cache::onednn_graph_scratch_pool_entry_flag_generation_for_test(size_t size) {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+    auto                        bucket_it = onednn_graph_scratch_reuse_pool_.find(size);
+    if (bucket_it == onednn_graph_scratch_reuse_pool_.end() || bucket_it->second.empty()) {
+        return 0;
+    }
+    return bucket_it->second.front().flag_generation;
+}
+
+size_t unified_cache::onednn_graph_scratch_flag_slot_free_list_size_for_test() {
+    if (!onednn_graph_scratch_test_hooks_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+    return onednn_graph_scratch_flag_slot_free_list_.size();
+}
+
 // Consumed once per DIRECT alloc attempt: returns true (and decrements the
 // counter) if a test asked this specific attempt to fail without touching
 // the GPU. A CAS loop rather than fetch_sub because fetch_sub on an
