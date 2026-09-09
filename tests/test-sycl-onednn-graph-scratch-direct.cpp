@@ -866,11 +866,14 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     sycl::queue & q = cache->get_queue();
 
     // 300 MiB: exceeds the no-model ONEDNN zone floor (see kCapMiB's own
-    // comment), and DISTINCT from every other size used elsewhere in this
-    // file, so this test's pool state cannot alias theirs even without
-    // today's leading reclaim call. Two of these must be outstanding at
-    // once (this one parked, plus a fresh same-size request) without
-    // engaging the cap.
+    // comment), and distinct from every OTHER FUNCTION's size constants in
+    // this file, so this test's own leading reclaim call above is what
+    // keeps its pool state from aliasing theirs (not the numeric value
+    // alone -- kSizeEvictInFlight and kSizeEvictRequest below, in this
+    // SAME function's later eviction sub-test, are also 300 MiB; that
+    // sub-test's own reclaim call is what separates the two from each
+    // other in turn). Two of these must be outstanding at once (this one
+    // parked, plus a fresh same-size request) without engaging the cap.
     constexpr size_t kSizeSkip = 300ull * 1024 * 1024;
     static_assert(kSizeSkip > kZoneFloorBytes, "must exceed the zone floor to take the DIRECT path");
     static_assert(kSizeSkip * 2 <= kCapBytes,
@@ -932,6 +935,13 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
           "release event to complete");
     printf("    (elapsed=%lld ms, immediate re-request)\n", static_cast<long long>(elapsed.count()));
 
+    // llama.cpp-c6ah: free ptr2 HERE, before polling for ptr1 below, not
+    // after -- see the poll's own comment for why the ORDER matters, not
+    // just that it eventually happens.
+    if (ptr2) {
+        cache->onednn_graph_scratch_free(ptr2, nullptr);
+    }
+
     // Now let ptr1's release actually complete, and confirm a THIRD
     // same-size request is a genuine pool HIT -- the in-flight entry was
     // skipped above, not lost.
@@ -941,6 +951,29 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // that arms the completion flag has already run (see
     // poll_for_pool_hit()'s own comment) -- poll rather than asserting on
     // the very first call.
+    //
+    // llama.cpp-c6ah: freeing ptr2 BEFORE this poll (immediately above,
+    // not after it) is load-bearing, not cosmetic. ptr2's free re-parks it
+    // as an unconditionally-complete (nullptr-event) decoy in the SAME
+    // kSizeSkip bucket ptr1 sits in, so onednn_graph_scratch_try_pool_locked()'s
+    // exact-size lookup -- which every onednn_graph_scratch_alloc() call
+    // checks FIRST, unconditionally -- always finds a usable entry in this
+    // bucket (ptr2's decoy, whenever ptr1 itself is not yet ready) and
+    // NEVER falls through to onednn_graph_scratch_alloc_direct_locked()'s
+    // cap-headroom machinery at all, for any poll iteration. Outstanding
+    // at this point is ptr1 alone (kSizeSkip, still parked) -- ptr2 has
+    // already been freed, not merely still checked out -- so even in the
+    // hypothetical case of an empty bucket, a fresh retry would stay under
+    // the cap (kSizeSkip's own `kSizeSkip * 2 <= kCapBytes` static_assert
+    // above already proves that). Freeing ptr2 AFTER this poll instead
+    // (the ordering this replaced) left it checked out and NOT parked, so
+    // outstanding was kSizeSkip x 2 = 600 MiB with ptr2 uncounted as
+    // poolable, a miss retry's fresh 300 MiB request was 900 MiB > the
+    // 700 MB cap, and EVERY retry fell through to the cap machinery --
+    // engaging the exact residual race poll_for_pool_hit() documents
+    // (undocumented at this specific site) and risking each retry taking
+    // up to that machinery's own internal 5 s bounded wait, not the "up to
+    // 2 s" this function's own message claims.
     slow_release.wait();
     const size_t hits_before_reuse = cache->onednn_graph_scratch_pool_hit_count();
     const bool   became_hit_reuse  = poll_for_pool_hit(cache, q, kSizeSkip, ptr1);
@@ -959,9 +992,6 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     check(cache->onednn_graph_scratch_pool_hit_count() > hits_before_reuse,
           "onednn_graph_scratch_pool_hit_count() increased -- this time it really was a pool hit");
 
-    if (ptr2) {
-        cache->onednn_graph_scratch_free(ptr2, nullptr);
-    }
     if (ptr3) {
         cache->onednn_graph_scratch_free(ptr3, nullptr);
     }
@@ -1077,8 +1107,23 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // falls through to the general cap-eviction path exactly like a
     // different-sized request would.
 
-    void * evict_complete = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
+    // llama.cpp-c6ah: kSizeEvictComplete (260 MiB) has the thinnest margin
+    // over kZoneFloorBytes (256 MiB) of any size in this file, so this
+    // allocation gets its own explicit zone-miss self-check, matching the
+    // pattern kSizeSkip/kSizeParked already use elsewhere -- without it, a
+    // regression that shrank the effective zone floor enough to zone-serve
+    // this specific size would surface as a confusing poll_for_pool_hit()
+    // failure below rather than naming the actual cause: a zone-served
+    // allocation for a fixed size returns the SAME address on every
+    // request (unlike a DIRECT allocation), so it could even satisfy
+    // `ptr == target` on the very first poll call and mask the regression
+    // entirely rather than timing out.
+    const size_t evict_complete_misses_before = cache->onednn_graph_scratch_pool_miss_count();
+    void *       evict_complete               = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
     check(evict_complete != nullptr, "eviction-sweep completed-entry setup allocation succeeds");
+    check(cache->onednn_graph_scratch_pool_miss_count() == evict_complete_misses_before + 1,
+          "the completed-entry setup allocation was a DIRECT-path pool miss, not served from the ONEDNN "
+          "zone -- proves this setup actually parks a poolable entry rather than silently zone-serving it");
     if (evict_complete) {
         sycl::event complete_release = submit_slow_release(q);
         cache->onednn_graph_scratch_free(evict_complete, &complete_release);
