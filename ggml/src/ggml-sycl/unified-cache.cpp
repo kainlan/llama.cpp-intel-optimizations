@@ -1614,11 +1614,16 @@ onednn_graph_scratch_planned_shape unified_cache_get_planned_onednn_graph_scratc
 // min(n_ctx, n_swa). Non-SWA and SWA layers can both be oneDNN-eligible in
 // the same model, so the true peak is whichever CLASS demands more, not
 // their sum -- the compiled partitions for each class are not concurrently
-// outstanding for the same request. gemma4 E4B (n_head_swa_max=8, n_swa=1024;
-// its D=512 global layers are not oneDNN-eligible by default, so
-// n_head_ctx_max=0) now computes 24 MiB at n_ctx=8192 exactly, instead of
-// the 192 MiB the old flat formula predicted -- see the 3-arg overload's own
-// comment below, kept for history.
+// outstanding for the same request. A hypothetical n_swa=1024 SWA shape
+// (n_head_swa_max=8, n_head_ctx_max=0) now computes 24 MiB at n_ctx=8192
+// exactly, instead of the 192 MiB the old flat formula predicted -- see
+// the 3-arg overload's own comment below, kept for history. ⚠️ gemma4 E4B's
+// REAL GGUF attention.sliding_window is 512, not 1024 (GPU-verified on the
+// B50 via the "[SYCL-PLAN] oneDNN Graph-scratch zone floor:" log line):
+// at that value this same shape (D=512 global
+// layers still ineligible by default, so n_head_ctx_max=0) computes 12 MiB
+// raw, clamped to 64 MiB -- see test_swa_formula()'s gemma4 row,
+// tests/test-sycl-onednn-graph-floor.cpp.
 static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
                                                         uint32_t n_head_swa_max,
                                                         uint32_t n_swa,
@@ -1665,13 +1670,24 @@ static size_t onednn_graph_scratch_zone_floor_bytes_swa(uint32_t n_head_ctx_max,
     // (n_head=32, no SWA so ne11 == n_ctx): 48 MB @ (n_ubatch=512, n_ctx=512),
     // 192 MB @ (512, 2048), 768 MB @ (512, 8192), 96 MB @ (256, 2048),
     // 48 MB @ (128, 2048) -- all five match this formula to the exact byte.
-    // gemma4 (n_head=8) measured 24 MB @ (512, 8192): its oneDNN-served
-    // layers are sliding-window with window=1024, so their real ne11 is
-    // min(n_ctx, n_swa), not n_ctx, and 1.5 x 8 x 512 x 1024 x 4 B == the
-    // measured 24 MB exactly (llama.cpp-o3a0 -- an earlier version of this
-    // fix used planner_n_ctx as ne11 for every layer regardless of class,
-    // which over-provisioned this SWA model 8x -- safely, bounded by the 25%
-    // budget clamp below, but wasting VRAM the model never needed).
+    // gemma4 (n_head=8) measured 24 MB @ (512, 8192): the original o3a0
+    // hypothesis was that its oneDNN-served layers are sliding-window with
+    // window=1024 (matching 1.5 x 8 x 512 x 1024 x 4 B == the measured
+    // 24 MB exactly), which is what motivated min(n_ctx, n_swa) rather than
+    // n_ctx as the correct ne11 for SWA layers. ⚠️ THAT WINDOW VALUE WAS
+    // WRONG (GPU-verified on the B50 via the "[SYCL-PLAN] oneDNN
+    // Graph-scratch zone floor:" log line): gemma4
+    // E4B's real GGUF attention.sliding_window is 512, at which this
+    // formula predicts 12 MiB raw (clamped to 64 MiB), not the historically
+    // measured 24 MB -- the gap between that 24 MB measurement and the
+    // 12 MiB this formula predicts at the REAL window is NOT resolved by
+    // this ticket. The qualitative fix stands regardless of that gap: the
+    // flat n_ctx-for-every-layer formula predicts 192 MB independent of the
+    // window value, so a window-aware ne11 is a large improvement either
+    // way. An earlier version of this fix used planner_n_ctx as ne11 for
+    // every layer regardless of class, which over-provisions this SWA model
+    // 16x at the real n_swa=512 -- safely, bounded by the 25% budget clamp
+    // below, but wasting VRAM the model never needed.
     static constexpr uint64_t kFloorMinBytes = 64ull * 1024ull * 1024ull;
     static constexpr uint64_t kSizeofF32     = 4;
     const uint64_t            ctx_term       = static_cast<uint64_t>(n_head_ctx_max) * static_cast<uint64_t>(n_ctx);
@@ -25660,7 +25676,8 @@ static void populate_host_zone_sizing(placement_plan &                          
         // (not only inside the exceptional DIRECT-allocation-failure path
         // further below) so a normal run's log alone answers "did the window
         // narrowing apply here" -- e.g. gemma4 should show n_head_ctx_max=0
-        // n_head_swa_max=8 n_swa=1024 and a 64 MiB floor, not 192 MB.
+        // n_head_swa_max=8 n_swa=512 (its real GGUF attention.sliding_window;
+        // GPU-verified on the B50) and a 64 MiB floor, not 192 MB.
         GGML_LOG_INFO(
             "[SYCL-PLAN] oneDNN Graph-scratch zone floor: %.1f MB (n_head_ctx_max=%u n_head_swa_max=%u n_swa=%u "
             "n_ubatch=%u n_ctx=%u)\n",

@@ -170,7 +170,7 @@ FLOOR_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_gr
 # llama.cpp-o3a0: the window-aware formula's own body -- see the comment
 # above FLOOR_BODY_CODE for why the two anchors cannot collide.
 FLOOR_SWA_BODY_CODE = extract_function_body(CACHE_CPP_CODE, "static size_t onednn_graph_scratch_zone_floor_bytes_swa(")
-# llama.cpp-o3a0 spec-review round 1 (F5): the WITH-FLOOR getter that
+# llama.cpp-o3a0: the WITH-FLOOR getter that
 # actually calls the floor formula with the shape's SWA fields -- scoping
 # the "caller passes the swa fields" check (below) to this one function's
 # body, rather than the whole file, so a partial revert of just this
@@ -496,8 +496,8 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # argument, since normalize_ws would still find SOME five-argument call
     # matching the full string only if every token survives; this check
     # isolates the two fields the full check could not easily localize a
-    # failure to). spec-review round 1 (F5): scoped to
-    # WITH_FLOOR_GETTER_BODY_CODE, not the whole file -- the
+    # failure to). Scoped to WITH_FLOOR_GETTER_BODY_CODE, not the whole
+    # file -- the
     # DIRECT-allocation-failure error log elsewhere in this file passes the
     # identical field names to a DIFFERENT call, so a file-wide substring
     # search here would still pass after a partial revert of THIS caller

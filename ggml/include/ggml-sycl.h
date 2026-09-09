@@ -259,8 +259,10 @@ struct ggml_sycl_tensor_inventory {
     // (unified-cache.cpp's onednn_graph_scratch_zone_floor_bytes_swa()),
     // replacing the single n_head_max (llama.cpp-0oxf) that assumed every
     // oneDNN-served layer's window was n_ctx -- wrong for SWA models (gemma4
-    // E4B measured 24 MB vs. the 192 MB the flat formula predicted at
-    // n_ctx=8192, window=1024). "Eligible" mirrors
+    // E4B's real GGUF attention.sliding_window is 512: 12 MiB raw vs. the
+    // 192 MB the flat formula predicted at n_ctx=8192; the 1024 figure this
+    // ticket originally used to explain an earlier 24 MB measurement was
+    // wrong, GPU-verified on the B50). "Eligible" mirrors
     // ggml_sycl_flash_attn_ext_onednn_plan()'s D-based gate
     // (fattn-onednn.cpp) as closely as a llama-layer file can: see
     // llama_model_sycl_onednn_head_dim_eligible() in llama-model.cpp, which

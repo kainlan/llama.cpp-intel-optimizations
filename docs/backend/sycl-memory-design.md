@@ -356,17 +356,24 @@ ticket reproduced on:
   measurements spanning two independent axes (48/192/768 MB at ubatch
   512 and n_ctx 512/2048/8192; 96/48 MB at n_ctx 2048 and ubatch
   256/128) — all five still match to the exact byte; a sixth gemma4
-  (n_head_swa_max=8, n_swa=1024) point did not match the FLAT formula
-  this replaced (predicted 192 MB, measured 24 MB), but was explained
-  rather than anomalous: gemma4's oneDNN-served attention layers are
-  sliding-window, so their real `ne11` is `min(n_ctx, n_swa)`, and
-  `1.5 x 8 x 512 x 1024 x 4 B` matches the measured 24 MB exactly.
+  point (n_head_swa_max=8) did not match the FLAT formula this replaced
+  (predicted 192 MB, measured 24 MB), but was explained rather than
+  anomalous: gemma4's oneDNN-served attention layers are sliding-window,
+  so their real `ne11` is `min(n_ctx, n_swa)`, not `n_ctx`.
   llama.cpp-o3a0 closed that gap: instead of using `n_ctx` as `ne11` for
-  every layer regardless of class (safe but wasteful — it
-  over-provisioned this SWA model 8x, bounded only by the 25% budget
-  clamp below), the formula now gives each class its own effective
-  window and takes the max across classes, so gemma4 now computes the
-  correct 64 MiB (24 MiB raw, clamped) instead of 192 MiB.
+  every layer regardless of class (safe but wasteful), the formula now
+  gives each class its own effective window and takes the max across
+  classes. ⚠️ **The `n_swa=1024` used to explain the 24 MB measurement
+  was WRONG** (GPU-verified on the B50 via the `[SYCL-PLAN]`
+  floor log line): gemma4 E4B's real GGUF `attention.sliding_window`
+  is 512, at which this formula predicts 12 MiB raw (clamped to the
+  64 MiB minimum), not 24 MiB — the gap between the historical 24 MB
+  measurement and the 12 MiB this formula predicts at the real window
+  is NOT resolved here. The qualitative point stands regardless: the
+  flat formula predicts 192 MB independent of the window value, so
+  gemma4 (at its real `n_swa=512`) now computes 64 MiB (12 MiB raw,
+  clamped) instead of 192 MiB — over-provisioned 16x by the flat
+  formula, not the 8x an `n_swa=1024` assumption would suggest.
   ⚠️ **This gemma4 example describes the formula's behavior for the
   `n_ctx` it is actually given at PLANNING time, which is NOT today's
   real runtime context by default.** The floor is computed once, at
@@ -374,21 +381,27 @@ ticket reproduced on:
   `plan.planner_n_ctx = kv_info.n_ctx`; at that point `kv_info.n_ctx` is
   `llama_model_sycl_populate_inventory()`'s conservative
   `inventory.n_ctx = inventory.n_ubatch` default (both 512) -- not
-  `-c 8192` or whatever a caller eventually requests, since the envelope
-  applies its own `n_ctx` only to `n_ubatch`, never to `n_ctx` itself.
+  `-c 8192` or whatever a caller eventually requests. The placement
+  envelope carries its own `n_ctx` field, but it is set to 0 at load
+  (`llama_model_sycl_make_placement_envelope()`) and its only reader
+  anywhere is a diagnostic log line
+  (`compute_placement_plan()`'s "[PLACEMENT] envelope..." print) --
+  unlike `n_ubatch`, which the envelope DOES feed into
+  `planner_n_ubatch` when set (`envelope->n_ubatch`, a separate field),
+  nothing today threads a real `n_ctx` into `planner_n_ctx` at all.
   `ggml_backend_sycl_set_runtime_context()` later updates
   `planner_n_ctx` and KV/VRAM accounting for the real context, but does
   NOT call `unified_cache_set_planned_onednn_graph_scratch_shape()`
   again, so the ONEDNN Graph-scratch shape (and this floor) stays frozen
-  at its load-time value. So the SWA window term only actually binds
-  (`n_swa < n_ctx`) once a caller threads the real `n_ctx` into the
-  envelope BEFORE planning, not on an ordinary `-c 8192` run today --
-  the 24 MiB/192 MiB comparison above is the formula's behavior at that
-  `n_ctx`, not (yet) what a default run computes. Re-planning the
-  Graph-scratch shape on a runtime context change is tracked separately
-  (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line below prints the
-  `n_ctx` it actually used, which is what makes this gap visible in a
-  real log.
+  at its load-time value regardless. So the SWA window term only
+  actually narrows (`n_swa < n_ctx`) once the Graph-scratch shape is
+  re-planned against the real context, which no code path does today --
+  the 12 MiB/192 MiB comparison above is the formula's behavior at
+  whatever `n_ctx` it is given, not what a default run computes today.
+  Re-planning the Graph-scratch shape on a runtime context change is
+  tracked separately (llama.cpp-fkpg); the `[SYCL-PLAN]` floor log line
+  below prints the `n_ctx` it actually used, which is what makes this
+  gap visible in a real log.
   `GGML_SYCL_ONEDNN_GRAPH_ZONE_MB` still always
   overrides the formula, unchanged from before. The planned zone (pair +
   floor) is further clamped to 25% of the device's available budget —

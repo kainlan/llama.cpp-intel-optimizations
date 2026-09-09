@@ -241,7 +241,7 @@ static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
     return ((value + alignment - 1) / alignment) * alignment;
 }
 
-// llama.cpp-o3a0 (spec-review round 1 fix F1): replicates
+// llama.cpp-o3a0: replicates
 // ggml_sycl_flash_attn_ext_onednn_plan()'s D-based eligibility gate
 // (ggml/src/ggml-sycl/fattn-onednn.cpp: the `ne00 > 512` UNSUPPORTED_D
 // reject, and the `ne00 > 256` scale-or-hatch gate) for the sole purpose of
@@ -268,16 +268,26 @@ static size_t llama_model_sycl_align_up(size_t value, size_t alignment) {
 // (and so under-provision the floor) for any D>256 layer whose scale
 // already happens to be canonical.
 //
-// The layer's scale is derived the way every in-tree build_*.cpp derives
+// The layer's scale is derived the way MOST in-tree build_*.cpp derive
 // kq_scale from hparams.f_attention_scale: 0.0f (the default, meaning "no
 // override was set") means canonical 1/sqrt(D), which trivially satisfies
 // the tolerance check; any other value is used verbatim, matching
 // gemma4/gemma3n/gemma4-assistant's f_attention_scale=1.0f pre-scaled-Q
 // layers, whose D=512 global layers correctly stay ineligible without the
-// hatch. If some future architecture computes kq_scale by a mechanism
-// OTHER than f_attention_scale while leaving that field at its 0.0f
-// default, this reads it as canonical and marks the layer eligible even
-// if the real runtime scale would fail the strict check -- the SAFE
+// hatch. EXCEPTION: gemma2/gemma3/gemma-embedding also pre-scale Q, but
+// pass a LITERAL 1.0f to build_attn (src/models/gemma3.cpp) instead of
+// hparams.f_attention_scale itself, so this derivation OVER-COUNTS
+// eligibility for them at D>256: their nonzero, already-canonical
+// f_attention_scale trivially passes the tolerance check here, while
+// their real runtime scale of 1.0f would not. Currently unreachable --
+// every in-tree instance of this family has D<=256 and is already
+// unconditionally eligible before this branch is ever reached -- but a
+// future D>256 model in this family would be silently over-provisioned
+// (the safe direction) rather than under-provisioned by this gap.
+// Separately, if some future architecture computes kq_scale by a
+// mechanism OTHER than f_attention_scale while leaving that field at its
+// 0.0f default, this reads it as canonical and marks the layer eligible
+// even if the real runtime scale would fail the strict check -- the SAFE
 // direction: a layer this wrongly counts eligible only ever makes the
 // floor bigger than the real oneDNN demand, never smaller, and the real
 // dispatch-time gate in fattn-onednn.cpp is entirely unaffected by this

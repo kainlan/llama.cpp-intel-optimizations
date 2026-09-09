@@ -28,10 +28,16 @@
 // llama.cpp-o3a0 THEN SPLIT ne11 BY ATTENTION CLASS. A second revision
 // (0oxf) still used n_ctx as ne11 for every oneDNN-served layer, which
 // over-provisions a sliding-window (SWA) model: a SWA layer's real ne11 is
-// min(n_ctx, n_swa), not n_ctx. gemma4 E4B measured 24 MB at n_ctx=8192,
-// window=1024, where the flat n_ctx formula predicted 192 MB. The swa suite
-// below (test_swa_formula()) exercises the two-class max(ctx_term, swa_term)
-// formula this ticket introduced.
+// min(n_ctx, n_swa), not n_ctx. The original hypothesis was gemma4 E4B
+// measured 24 MB at n_ctx=8192 because its window was 1024, against the
+// flat n_ctx formula's 192 MB prediction -- ⚠️ THAT WINDOW VALUE WAS WRONG
+// (GPU-verified on the B50): gemma4 E4B's real GGUF
+// attention.sliding_window is 512, at which this formula predicts 12 MiB
+// (see test_swa_formula()'s "gemma4 E4B (real)" row below). The swa suite
+// (test_swa_formula()) exercises the two-class max(ctx_term, swa_term)
+// formula this ticket introduced using both the real gemma4 shape and
+// several n_swa=1024 shapes kept purely as formula/arithmetic tests (not
+// gemma4's actual value).
 //
 // TWO PROCESSES, NOT TWO MODES IN ONE. onednn_graph_scratch_zone_floor_bytes_swa()
 // memoizes GGML_SYCL_ONEDNN_GRAPH_ZONE_MB via a function-local `static const`
@@ -161,16 +167,30 @@ void test_swa_formula() {
     };
 
     const case_t cases[] = {
-        // gemma4 E4B (task llama.cpp-o3a0): D=512 global layers are not
-        // oneDNN-eligible by default (n_head_ctx_max=0), D=1024-window SWA
-        // layers are (n_head_swa_max=8, n_swa=1024). Raw:
-        // 1.5 x 8 x 512 x min(8192, 1024) x 4 B == 24 MiB exactly, BELOW the
-        // 64 MiB minimum -- the whole point of this ticket is that this
-        // clamps to 64 MiB, not the 192 MiB the pre-o3a0 flat n_ctx formula
-        // predicted at this shape (see test_default_formula()'s Mistral row
-        // at the same n_ubatch/n_ctx for that 192 MiB figure).
+        // gemma4 E4B (REAL shape, GPU-verified on the B50): D=512
+        // global layers are not oneDNN-eligible by default
+        // (n_head_ctx_max=0); its SWA layers have n_head_swa_max=8 and the
+        // model's actual GGUF attention.sliding_window is 512 (NOT the
+        // 1024 this ticket originally assumed -- see the row below, kept
+        // as a formula/arithmetic test under its honest hypothetical
+        // label, and the corrected history in
+        // onednn_graph_scratch_zone_floor_bytes_swa()'s own comment,
+        // unified-cache.cpp). Raw:
+        // 1.5 x 8 x 512 x min(8192, 512) x 4 B == 12 MiB exactly, BELOW
+        // the 64 MiB minimum -- clamps to 64 MiB, not the 192 MiB the
+        // pre-o3a0 flat n_ctx formula predicted at this shape (see
+        // test_default_formula()'s Mistral row at the same n_ubatch/n_ctx
+        // for that 192 MiB figure).
+        { 0,  8,  512,  512, 8192, 64,
+         "gemma4 E4B (real: n_head_swa_max=8, n_swa=512) @ ubatch=512 ctx=8192 -> raw 12 MiB, clamped to 64 MiB"    },
+        // A HYPOTHETICAL n_swa=1024 shape -- NOT gemma4's actual value
+        // (see the row above and the ⚠️ correction in this file's header
+        // comment) -- kept as a formula/arithmetic test: it independently
+        // exercises the same min(n_ctx, n_swa) clamp-vs-window arithmetic
+        // at a different n_swa, still below the 64 MiB minimum.
+        // 1.5 x 8 x 512 x min(8192, 1024) x 4 B == 24 MiB exactly.
         { 0,  8,  1024, 512, 8192, 64,
-         "gemma4 (n_head_swa_max=8, n_swa=1024) @ ubatch=512 ctx=8192 -> raw 24 MiB, clamped to 64 MiB"             },
+         "hypothetical (n_head_swa_max=8, n_swa=1024, NOT gemma4's real value) -> raw 24 MiB, clamped to 64 MiB"    },
         // n_ctx < n_swa: the window never binds, so the SWA class's
         // effective ne11 must fall back to n_ctx, not the (larger) n_swa --
         // this must equal the non-SWA formula at the identical (n_head,
@@ -185,8 +205,8 @@ void test_swa_formula() {
          "both classes present, ctx class dominates -> matches the ctx-only Mistral figure, not ctx+swa summed"     },
         // Both classes present, SWA class dominates this time (64 heads over
         // a 1024 window beats 1 head over the full 1024 ctx) -- same MAX
-        // requirement, opposite class winning. spec-review round 1, F3: a
-        // prior version of this row used n_head_swa_max=8, which put BOTH
+        // requirement, opposite class winning. An earlier version of this
+        // row used n_head_swa_max=8, which put BOTH
         // the correct answer (24 MiB raw) and the wrong ctx-only answer
         // (3 MiB raw) below the 64 MiB clamp -- a VOID positive control,
         // since either formula produces the identical clamped 64 MiB and

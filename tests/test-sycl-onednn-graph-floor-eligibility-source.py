@@ -19,7 +19,7 @@ Scope: this only checks the two copies stay IN SYNC with each other, not that
 either is independently "correct" -- that is what the two source files' own
 review and tests are for.
 
-spec-review round 1 (F1) hardening: the real gate's D>256 branch is a
+Hardening note: the real gate's D>256 branch is a
 DISJUNCTION -- eligible when the D512 hatch is set OR the layer's own
 attention scale is already canonical (1/sqrt(D)) -- not the hatch alone. An
 earlier revision of the replicated rule required the hatch unconditionally,
@@ -150,11 +150,11 @@ def test_eligibility_mirrors_the_full_scale_or_hatch_disjunction() -> None:
 
 
 def test_removing_the_scale_clause_is_caught() -> None:
-    """Mutation witness (spec-review round 1, F1): delete the final
-    tolerance-check return statement -- the clause this fix added on top of
-    the hatch-only check -- and confirm the disjunction check above
-    specifically goes false for THAT clause, proving it is not vacuously
-    true regardless of whether the scale clause is present."""
+    """Mutation witness: delete the final tolerance-check return statement
+    -- the clause added on top of the hatch-only check -- and confirm the
+    disjunction check above specifically goes false for THAT clause,
+    proving it is not vacuously true regardless of whether the scale
+    clause is present."""
     mutated = LLAMA_MODEL_ELIGIBLE_BODY.replace(
         "return std::fabs(1.0f / kq_scale - sqrtf(static_cast<float>(head_dim))) < 1e-3f;",
         "return false;",
@@ -177,3 +177,38 @@ def test_removing_the_scale_clause_is_caught() -> None:
     assert not still_failed, "unrelated checks broke on this mutation, entangled with the wrong clause: " + ", ".join(
         still_failed
     )
+
+
+def test_both_copies_use_the_same_tolerance_constant() -> None:
+    # The disjunction check above already pins LLAMA_MODEL_ELIGIBLE_BODY's
+    # own `< 1e-3f`; this pins the SYCL-side gate's own tolerance
+    # expression too, so a tolerance change on either side alone is
+    # caught, not just a change to llama-model.cpp's copy.
+    assert re.search(r"1\.0f\s*/\s*kq_scale\s*-\s*sqrtf\(.*?\)\s*<\s*1e-3f", LLAMA_MODEL_ELIGIBLE_BODY), (
+        "llama_model_sycl_onednn_head_dim_eligible() must compare against the 1e-3f tolerance"
+    )
+    assert re.search(
+        r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", FATTN_ONEDNN_CPP
+    ), "fattn-onednn.cpp's own scale-tolerance check must compare against 1e-3f"
+
+
+def test_changing_the_tolerance_constant_is_caught_on_either_side() -> None:
+    """Mutation witness for test_both_copies_use_the_same_tolerance_constant():
+    change 1e-3f to 1e-4f on EACH side independently and confirm that
+    side's own check goes false, proving neither half of that check is
+    vacuously true."""
+    mutated_llama = LLAMA_MODEL_ELIGIBLE_BODY.replace(
+        "sqrtf(static_cast<float>(head_dim))) < 1e-3f", "sqrtf(static_cast<float>(head_dim))) < 1e-4f"
+    )
+    assert mutated_llama != LLAMA_MODEL_ELIGIBLE_BODY, "the llama-model.cpp tolerance text was not found to mutate"
+    assert not re.search(
+        r"1\.0f\s*/\s*kq_scale\s*-\s*sqrtf\(.*?\)\s*<\s*1e-3f", mutated_llama
+    ), "the llama-model.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
+
+    mutated_fattn = FATTN_ONEDNN_CPP.replace(
+        "sqrtf(static_cast<float>(params.ne00))) >= 1e-3f", "sqrtf(static_cast<float>(params.ne00))) >= 1e-4f"
+    )
+    assert mutated_fattn != FATTN_ONEDNN_CPP, "the fattn-onednn.cpp tolerance text was not found to mutate"
+    assert not re.search(
+        r"1\.0f\s*/\s*params\.scale\s*-\s*sqrtf\(.*?\)\)\s*>=\s*1e-3f", mutated_fattn
+    ), "the fattn-onednn.cpp tolerance check still passes after changing 1e-3f to 1e-4f"
