@@ -4523,6 +4523,12 @@ bool unified_cache::shutdown_resources() {
         // field's own declaration comment in unified-cache.hpp), so
         // resetting the owner here is harmless and keeps this branch's
         // handling consistent with every other *_owner_ member reset above.
+        // Also null the raw pointer and clear the free list here, matching
+        // the normal path's release below: a raw pointer must not outlive
+        // its owning handle on ANY path, abandon included, even though
+        // nothing on this path can dereference it before the process exits.
+        onednn_graph_scratch_flag_slab_ = nullptr;
+        onednn_graph_scratch_flag_slot_free_list_.clear();
         onednn_graph_scratch_flag_slab_owner_ = {};
 #endif
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
@@ -4572,6 +4578,8 @@ bool unified_cache::shutdown_resources() {
 #if GGML_SYCL_DNNL
         // llama.cpp-me60: same reasoning as the g_sycl_shutting_down branch
         // above -- see that occurrence's own comment.
+        onednn_graph_scratch_flag_slab_ = nullptr;
+        onednn_graph_scratch_flag_slot_free_list_.clear();
         onednn_graph_scratch_flag_slab_owner_ = {};
 #endif
         // Leak host_arena_ to avoid sycl::free on an invalid context.
@@ -10336,15 +10344,16 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
 
 static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
 static constexpr uint32_t kOnednnGraphDirectWaitPollTimeoutMs     = 200;
-// llama.cpp-me60: this 5 s budget is measured from wait_loop_entry --
-// this function's own ENTRY, captured before the pre-loop eviction sweep
-// and the oversized-request early-out below both run -- not from the
-// first iteration of the poll loop itself. So whatever real time the
-// eviction sweep spends already counts against this budget by the time
-// the poll loop's own deadline is computed from that same timestamp; the
-// oversized early-out returns before a deadline is ever computed at all,
-// but shares the same entry timestamp for consistency with the path that
-// does.
+// llama.cpp-me60: this 5 s budget is measured from wait_loop_entry,
+// captured near the top of
+// onednn_graph_scratch_wait_for_direct_headroom_locked() -- before that
+// function's own pre-loop eviction sweep runs, not from the first
+// iteration of the poll loop itself. So whatever real time the eviction
+// sweep spends already counts against this budget by the time the poll
+// loop's own deadline is computed from that same timestamp. The
+// oversized-request early-out (also in that function, after the sweep)
+// returns before any deadline is ever computed at all, so it does not
+// read wait_loop_entry and is not bounded by this constant.
 static constexpr uint32_t kOnednnGraphDirectWaitTotalTimeoutMs    = 5000;
 
 // llama.cpp-0oxf: how many idle (event-complete-or-not) entries the reuse

@@ -556,15 +556,16 @@ ticket reproduced on:
   process that eventually checks out every slot this way degrades to the
   blocking `event_complete()` fallback with a once-only WARN, the same
   fallback path an individual arming failure already uses. Every reader
-  of a pool entry's
-  completion — `onednn_graph_scratch_entry_usable_locked()`,
+  of a pool entry's completion —
+  `onednn_graph_scratch_entry_usable_locked()`,
   `onednn_graph_scratch_evict_pool_until_fits_locked()`, and
   `onednn_graph_scratch_clear_pool_locked()` — goes through
   `onednn_graph_scratch_pool_entry_release_complete()`, which prefers this
-  flag and falls back to the bare `event_complete()` query only when no
-  flag could be armed for that entry (slab allocation failed, every slot
-  was checked out, the marker-kernel submit threw, `get_event_watch_queue()`
-  returned `nullptr`, or the entry's own release event was null). A test-only hook,
+  flag and falls back to the bare `event_complete()` query only when no flag
+  could be armed for that entry (slab allocation failed, every slot was
+  checked out, the marker-kernel submit threw, `get_event_watch_queue()`
+  returned `nullptr`, or the entry's own release event was null). A
+  test-only hook,
   `ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check()`, makes
   the park site skip arming the flag so a GPU test can demonstrate that
   fallback directly. Confirmed on hardware, both discrete cards this fork
@@ -589,33 +590,40 @@ ticket reproduced on:
   for real via the shared event-gated drain path instead of parking it.
   Because the pool is a `unified_cache` member (survives across contexts and
   models), it is reclaimed (real release of every entry,
-  `onednn_graph_scratch_reclaim_pool()`) at three points: cache teardown
-  (`shutdown_resources()`), the point `arena_reserve()` reclaims the
-  KV/RUNTIME zones for a new context, and — the one point that does NOT go
-  through `arena_reserve()` at all —
-  `ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`) on every
-  successful runtime `n_ctx`/`n_ubatch` update, via the free-function
-  wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without that
-  third site a pooled buffer sized for one context's shapes could sit on a
-  16 GB card holding up to the cap's worth of idle VRAM while the next model
-  loads (`llama-bench` with several `-m`, a server switching models) or
-  while the SAME model's context is resized to a different `n_ctx`. The
-  three sites do NOT log in the same order relative to the clear (the
-  context-reclaim and runtime-update sites share `reclaim_pool()`, which
-  clears the pool and only then logs the summary; teardown instead logs the
-  summary early, well before it actually clears the pool) — see
-  `docs/backend/sycl-env-vars.md`'s `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB`
-  row for the exact per-site ordering. Either way the line logged is
+  `onednn_graph_scratch_reclaim_pool()`) at four points: cache teardown
+  (`shutdown_resources()`); the point `arena_reserve()` reclaims the
+  KV/RUNTIME zones for a new context; `ggml_backend_sycl_set_runtime_context()`
+  (`ggml-sycl.cpp`) on every successful runtime `n_ctx`/`n_ubatch` update —
+  the one of these three that does NOT go through `arena_reserve()` at all;
+  and, llama.cpp-me60, `shutdown_unified_cache()`'s own pre-teardown pass,
+  once per live cache, BEFORE that function's pre-teardown census: a parked
+  DIRECT buffer keeps its own `EXTERNAL_EXACT` allocation control alive
+  until reclaimed, and that census refuses shutdown while any such control
+  survives, so this pass runs ahead of it rather than relying on
+  `shutdown_resources()`'s own, later reclaim. All non-teardown sites go
+  through the free-function wrapper
+  `unified_cache_reclaim_onednn_graph_scratch_pool()`. Without the
+  runtime-context-update site a pooled buffer sized for one context's shapes
+  could sit on a 16 GB card holding up to the cap's worth of idle VRAM while
+  the next model loads (`llama-bench` with several `-m`, a server switching
+  models) or while the SAME model's context is resized to a different
+  `n_ctx`. The four sites do NOT all log in the same order relative to the
+  clear: the context-reclaim, runtime-update, and pre-census sites share
+  `reclaim_pool()`, which clears the pool and only then logs the summary;
+  teardown instead logs the summary early, well before it actually clears
+  the pool — see `docs/backend/sycl-env-vars.md`'s
+  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site
+  ordering. Either way the line logged is
   `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
   misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB
   retired_flag_slots=%zu (cumulative for this process, not just this
   reclaim)` (silent if the pool was never used),
-  where `%s` is `"teardown"`, `"context reclaim"`, or `"runtime context
-  update"`. Only the teardown call logs at `GGML_LOG_LEVEL_WARN`; the
-  context-reclaim and runtime-context-update calls log at
+  where `%s` is `"teardown"`, `"context reclaim"`, `"runtime context
+  update"`, or `"module shutdown (pre-census)"`. Only the teardown call
+  logs at `GGML_LOG_LEVEL_WARN`; the other three calls all log at
   `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity in every tool
-  (see CLAUDE.md's "llama-bench traps" section) — so those two summaries are
-  invisible in a normal run unless verbosity is raised. The summary call
+  (see CLAUDE.md's "llama-bench traps" section) — so those three summaries
+  are invisible in a normal run unless verbosity is raised. The summary call
   passes the enum `GGML_LOG_LEVEL_WARN` directly to `ggml_log_internal()`
   because its level is a runtime choice — WARN at teardown, INFO otherwise —
   which the level-baking `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot
