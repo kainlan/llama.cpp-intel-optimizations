@@ -19,21 +19,37 @@
 //   1. The token below, for the pinned pool's backing chunks. Enforced by the
 //      compiler: the constructor is private to pinned_chunk_pool, so an
 //      unauthorised caller cannot even name a valid argument.
-//   2. A plain bool parameter on unified_cache_adopt_raw_host_allocation(), for
-//      the cache's own staging buffer. That adopt runs during unified_cache
-//      construction and cannot route through the coordinator without a circular
-//      dependency, so it stays a bootstrap mint. Enforced instead by the helper
-//      being TU-static in unified-cache.cpp — unreachable from any other
-//      translation unit — plus a source gate pinning it to a single call site.
+//   2. A plain bool parameter on unified_cache_adopt_raw_host_allocation().
+//      That adopt runs during unified_cache construction (or, for the second
+//      site below, lazily under the cache's own mutex) and cannot route
+//      through the coordinator without a circular dependency, so it stays a
+//      bootstrap mint. Enforced instead by the helper being TU-static in
+//      unified-cache.cpp — unreachable from any other translation unit —
+//      plus a source gate pinning it to a two-site ALLOWLIST, one cohort tag
+//      per site:
+//        - "unified_cache:staging" — the cache's own staging buffer.
+//        - "unified_cache:onednn_graph_scratch_flag_slab" — the oneDNN
+//          Graph-scratch pool's completion-flag slab (llama.cpp-c6ah). Needs
+//          CACHE_BACKING for the same reason the staging buffer does: a
+//          marker kernel can still be in flight, holding a raw pointer into
+//          the slab, when shutdown runs, so the slab must survive
+//          destructive teardown rather than being refused by the
+//          pre-teardown census as a live non-cache-backing control.
+//      A third call site passing cache_backing=true fails the gate.
 //
 // Mechanism 2 is not weaker in reach, only in the kind of proof: staticness and
 // the gate are checked by the build and the test, not by the type system. Do not
-// describe this file as the only mint path.
+// describe this file as the only mint path, and do not describe it as a
+// single-site mint path — it is a two-site allowlist.
 //
 // Do NOT include this header outside unified-cache.cpp and pinned-pool.cpp.
-// tests/test-sycl-owner-allocation-migration.py enforces that restriction, the
-// absence of cache_backing from the public request structs, and mechanism 2's
-// staticness and single call site. Mechanism 1 is enforced by the compiler.
+// tests/test-sycl-owner-allocation-migration.py enforces that restriction,
+// the absence of cache_backing from the public request structs, and
+// mechanism 2's staticness and two-site allowlist; the registered gate
+// tests/test-sycl-onednn-graph-allocator-source.py enforces the same
+// two-site allowlist independently, from unified-cache.cpp's call sites --
+// the two gates must agree, since they check the same allowlist from
+// different files. Mechanism 1 is enforced by the compiler.
 
 #include "unified-cache.hpp"
 

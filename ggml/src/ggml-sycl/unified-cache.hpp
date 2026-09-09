@@ -1544,6 +1544,31 @@ void ggml_sycl_test_onednn_graph_scratch_suppress_abort(bool suppress);
 // which resets it to false (a single-shot latch, like a "consumed" event).
 bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 
+// llama.cpp-c6ah: RED arm inside the GREEN binary. While forced,
+// onednn_graph_scratch_free()'s park site SKIPS ARMING the marker-kernel
+// completion flag for any entry parked while this is set (flag_slot stays
+// -1), so onednn_graph_scratch_pool_entry_release_complete()'s
+// flag_slot == -1 fallback runs its query against a genuinely UNWATCHED
+// event -- which behaves like the real pre-fix code path: it blocks for
+// real (a bare command_execution_status query on an unwatched
+// device-kernel event blocks on a profiling-enabled queue, confirmed on
+// hardware, both cards; see event_complete()'s own comment). An earlier
+// version of this hook instead short-circuited the completion CHECK to
+// query release_event directly regardless of whether a flag had been
+// armed; that design was abandoned because it queried a WATCHED event,
+// and a later measurement traced the anomaly that made this hook's own
+// evidence look contradictory back to the host_task-based watcher design
+// itself, not to the bare query -- see onednn_graph_scratch_pool_entry::flag_slot's
+// own comment for the full history. A test uses this hook to demonstrate
+// what the fix replaced: with the hook forced (set before the park, i.e.
+// before the onednn_graph_scratch_free() call that would otherwise arm
+// the flag), requesting a size an in-flight entry occupies waits for that
+// entry's release instead of skipping it; with the hook off (the
+// default), it does not. Off by default, like every hook in this block; a
+// no-op unless GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS=1 is set (see
+// onednn_graph_scratch_test_hooks_enabled() in unified-cache.cpp).
+void ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check(bool force);
+
 // Host-testable wrapper around onednn_graph_scratch_zone_floor_bytes(), which
 // has internal (file-static) linkage. Pure function, no device/backend state
 // -- reads GGML_SYCL_ONEDNN_GRAPH_ZONE_MB the same way the real call site
@@ -2348,9 +2373,15 @@ class unified_cache {
     // NON-profiling: every backend stream is created with both `in_order` and
     // `enable_profiling` via default_queue_properties(), and on a profiling-enabled
     // queue the bare command_execution_status query in event_complete() BLOCKS
-    // instead of polling. dma_queue_ is in_order only, no profiling -- it is the
-    // one queue where "released only after completion" is actually observable.
-    // Adding enable_profiling here would silently destroy that coverage.
+    // instead of polling -- confirmed on hardware
+    // (tests/test-sycl-event-status-blocking-probe.cpp) to hold specifically
+    // for a DEVICE-KERNEL-produced event; a host_task-produced event on a
+    // profiling queue returned in ~0 ms on both discrete cards this fork
+    // validates against, so a host_task-based reproduction of this claim
+    // would not show it. dma_queue_ is in_order only, no profiling -- it is
+    // the one queue where "released only after completion" is actually
+    // observable. Adding enable_profiling here would silently destroy that
+    // coverage.
     sycl::queue & get_dma_queue();
 
     // --- BCS queue for copy-only H2D transfers (targets copy engine) ---
@@ -2359,6 +2390,55 @@ class unified_cache {
     // GPUs, keeping H2D memcpy off the CCS (compute) engine so SOA reorder
     // kernels can run concurrently without monopolizing CCS preempt budget.
     sycl::queue & get_bcs_queue();
+
+    // --- Event-watch queue: device-marker-kernel completion watcher (llama.cpp-c6ah) ---
+    // Lazily created ON FIRST USE, torn down with the cache the same way
+    // dma_queue_/bcs_queue_ are (default member destruction in
+    // ~unified_cache()) -- but unlike those two, which are constructed
+    // EAGERLY in the constructor (unified-cache.cpp, ~ctor body), this
+    // queue is not needed at all until the first DIRECT pool entry is
+    // parked, and most processes never touch that path. Deliberately
+    // OUT-OF-ORDER (NOT in_order, unlike dma_queue_/bcs_queue_): every
+    // submission on this queue is a single-task marker kernel depending on
+    // exactly one release event and nothing else, so an in_order queue
+    // would needlessly serialise a fast release's marker behind a slower
+    // one still queued ahead of it -- there is no ordering relationship
+    // between two unrelated markers to preserve. Deliberately NON-profiling
+    // for the same reason event_complete() cannot be polled on a
+    // profiling-enabled queue (see that function's comment above):
+    // enable_profiling would not affect the marker kernel's own submission
+    // cost meaningfully, but there is no reason to pay for counter-based
+    // events on a queue whose device work is a one-instruction write, and
+    // consistency with "profiling only where it is actually used" keeps
+    // this queue's purpose legible. Never waited on for correctness -- the
+    // host-USM flag_slot a marker kernel on this queue writes is what
+    // callers actually read (unified_cache::onednn_graph_scratch_pool_entry_release_complete());
+    // the queue only needs to exist long enough to run that one marker
+    // kernel per pooled entry.
+    //
+    // llama.cpp-c6ah: a host_task was used here first and replaced after
+    // being measured (both cards, 2026-09-09) to block the SUBMITTING
+    // thread -- i.e. onednn_graph_scratch_free() itself, called from
+    // oneDNN's free callback -- until the dependency
+    // named by depends_on() completes, whenever that dependency comes from
+    // ANOTHER queue (which the release event, submitted on the cache's own
+    // compute queue, always is here). A host_task must never be submitted
+    // on this queue again; see onednn_graph_scratch_pool_entry::flag_slot's
+    // own comment for the full incident history.
+    //
+    // Returns nullptr if construction failed (logged once, at that point).
+    // llama.cpp-c6ah: there is deliberately NO fallback to
+    // another queue here. Falling back to queue_ (the main compute stream,
+    // in_order) would inject this marker kernel into the SAME in-order
+    // sequence as real GPU kernel submissions on that device, serialising
+    // them behind it -- exactly the kind of allocation-path-into-compute-
+    // path coupling this whole fix exists to avoid, not a harmless
+    // degradation. A caller that gets nullptr must leave flag_slot at -1
+    // rather than substitute a different queue;
+    // onednn_graph_scratch_pool_entry_release_complete() then falls back to
+    // the pre-fix (blocking, but correct for an unwatched event)
+    // event_complete() query for that one entry.
+    sycl::queue * get_event_watch_queue();
 
     // Ensure a weight is cached, loading from src_ptr if needed
     // Returns device pointer, or nullptr if cache is full and eviction failed
@@ -3248,6 +3328,57 @@ class unified_cache {
 
     size_t onednn_graph_scratch_pool_peak_bytes() const { return onednn_graph_scratch_pool_peak_bytes_; }
 
+    // llama.cpp-c6ah: how many completion-flag slab slots have been
+    // PERMANENTLY retired -- never returned to the free list -- because
+    // onednn_graph_scratch_clear_pool_locked() removed their owning entry
+    // while its marker kernel was still in flight (see that function's own
+    // comment for why the slot cannot be reused). Monotonically
+    // non-decreasing for the life of the process; a value approaching the
+    // slab's fixed capacity (256) means parks are silently degrading to the
+    // blocking event_complete() fallback one slot at a time, with only a
+    // once-only WARN at full exhaustion to notice it by -- exposed here, and
+    // in the DIRECT pool summary log line, so a long-running process does
+    // not need to wait for that WARN to see it coming. Same unlocked-read
+    // convention as the other counters on this page.
+    size_t onednn_graph_scratch_flag_slot_retired_count() const {
+        return onednn_graph_scratch_flag_slot_retired_count_;
+    }
+
+    // llama.cpp-c6ah: test-only instrumentation accessor -- true if ANY
+    // entry currently parked in the
+    // `size` bucket is release-complete per
+    // onednn_graph_scratch_pool_entry_release_complete() (the same choke
+    // point every real reader uses -- flag_slot's generation-tagged slab
+    // read when armed, the event_complete() fallback otherwise; not the
+    // pool's resolve/usability check, which also requires the entry to be
+    // device-resident and correctly aligned). Locks onednn_graph_scratch_mutex_
+    // itself (unlike the advisory unlocked counters above) because it walks
+    // the live pool map rather than reading one already-atomic-adjacent
+    // counter. Exists so a test can POLL a parked entry's completion
+    // without itself allocating -- an allocation attempt would consume/
+    // reuse the very entry being inspected, changing the thing it is
+    // trying to observe. Returns false unconditionally (never touches the
+    // pool) when GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is not set, the same
+    // gate every other hook in this file uses.
+    bool onednn_graph_scratch_pool_entry_flag_true_for_test(size_t size);
+
+    // llama.cpp-c6ah: test-only diagnostic accessors, gated the same way as
+    // every other hook in this file -- return a sentinel (-1 / 0 / 0) when
+    // GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS is not set. Each returns the FIRST
+    // entry found in the `size` bucket's flag_slot/flag_generation, or -1/0
+    // if that bucket is empty or does not exist -- exist so a test can
+    // observe WHETHER a park was armed (flag_slot >= 0) and WHICH
+    // generation it holds, without inferring it indirectly from timing.
+    // Locks onednn_graph_scratch_mutex_ itself, same as
+    // onednn_graph_scratch_pool_entry_flag_true_for_test() above.
+    int32_t  onednn_graph_scratch_pool_entry_flag_slot_for_test(size_t size);
+    uint32_t onednn_graph_scratch_pool_entry_flag_generation_for_test(size_t size);
+    // The completion-flag slab's current free-list size -- lets a test
+    // confirm exactly how many slots a reclaim call returned (or did not
+    // return) to the free list, rather than inferring it from whether a
+    // later park happened to get armed.
+    size_t   onednn_graph_scratch_flag_slot_free_list_size_for_test();
+
     // Public, self-locking entry point: releases (for real) every pooled
     // DIRECT Graph-scratch buffer, then logs the pool summary -- clear
     // before log, same order as the body below and for the same reason
@@ -3700,6 +3831,13 @@ class unified_cache {
                                      size_t                           size,
                                      const std::vector<sycl::event> & deps,
                                      sycl::queue *                    override_q = nullptr);
+    // See this function's own comment at its definition in unified-cache.cpp
+    // for the full BLOCKS-not-polls hazard on a profiling-enabled queue,
+    // and (llama.cpp-c6ah) a related but SEPARATE hazard in anything that
+    // submits a host_task depending on one of these events:
+    // that submit call itself blocks its calling thread until the event
+    // completes, whenever the dependency comes from another queue
+    // (measured on hardware, both cards).
     static bool event_complete(const sycl::event & evt);
     sycl::event submit_barrier(const std::vector<sycl::event> & deps);
     sycl::event submit_barrier_all();
@@ -3738,6 +3876,84 @@ class unified_cache {
     sycl::queue *                compute_queue_ = nullptr;  // Inference compute queue (for deferred free barriers)
     std::unique_ptr<sycl::queue> dma_queue_;                // Separate in-order queue for cache DMA ops (CCS)
     std::unique_ptr<sycl::queue> bcs_queue_;                // Copy-only queue targeting BCS engine (ordinal 1)
+    // llama.cpp-c6ah: host-USM slab backing every pooled entry's completion
+    // flag_slot -- see onednn_graph_scratch_pool_entry::flag_slot's own
+    // comment for the mechanism and onednn_graph_scratch_ensure_flag_slab_locked()'s
+    // comment (unified-cache.cpp) for the allocation path and why this
+    // slab is fixed-capacity and never reallocated. onednn_graph_scratch_flag_slab_owner_
+    // is the sanctioned ownership handle (unified_cache_malloc_host_tracked()
+    // + unified_cache_adopt_raw_host_allocation(), the same path
+    // staging_'s own bootstrap allocation uses -- never a bare
+    // sycl::malloc_host); onednn_graph_scratch_flag_slab_ is the resolved
+    // raw pointer every park/read actually touches.
+    //
+    // Declared BEFORE event_watch_queue_ below so that member destruction
+    // -- which runs in REVERSE declaration order -- destroys the QUEUE
+    // first and this SLAB second. drain_all_queues_noexcept() (called
+    // explicitly, before any member destructor runs, from
+    // shutdown_resources()) is the guarantee that actually matters on the
+    // NORMAL teardown path: it waits for every in-flight marker kernel,
+    // including any still targeting this slab, before teardown proceeds --
+    // see that function's own comment. This declaration order is
+    // defense-in-depth on top of that drain, not a substitute for it: with
+    // the queue destroyed first regardless, a marker kernel that somehow
+    // outlived the drain would fail against an already-destroyed queue
+    // rather than write through a freed host pointer.
+    //
+    // shutdown_resources() has two early-return paths that skip the drain
+    // entirely -- the g_sycl_shutting_down branch and the "SYCL context is
+    // already invalid" catch, both reached only when the SYCL runtime
+    // itself is already gone (static destruction order, or process exit).
+    // Unlike compute_arena_owner_, scratch_pool_owner_,
+    // onednn_weights_scratch_owner_, onednn_activations_scratch_owner_ and
+    // staging_owner_ -- each explicitly reset to {} on both paths -- this
+    // slab's owning mem_handle (onednn_graph_scratch_flag_slab_owner_) is
+    // left untouched there; it destructs later, from ~unified_cache()'s
+    // normal member teardown, the same way the pooled reuse-pool entries'
+    // mem_handles do (see the llama.cpp-0oxf comments on that field's own
+    // handling, at the end of each of those two branches in
+    // unified-cache.cpp). Both are safe without a drain for the same
+    // reason, and it has nothing to do with whether {} was assigned: the
+    // actual physical release is shutdown-guarded at its source --
+    // allocation_release_coordinator::retire() (unified-cache.cpp) and
+    // mem_handle::release_lease_state() (mem-handle.cpp) both check
+    // ggml_sycl_is_shutting_down() and ABANDON the control instead of
+    // releasing it once that flag is set, whether the release was
+    // triggered by an explicit `= {}` or by a destructor running later. No
+    // marker kernel can write through freed memory, because the memory is
+    // never freed on this path at all; it is deliberately leaked for the
+    // remainder of the process.
+    //
+    // No std::once_flag here (unlike event_watch_queue_ below): every real
+    // caller of onednn_graph_scratch_ensure_flag_slab_locked() is already
+    // inside onednn_graph_scratch_free()'s DIRECT branch, which holds
+    // onednn_graph_scratch_mutex_ for its whole body, so a plain
+    // already-allocated check is sufficient -- see that method's own
+    // declaration comment. onednn_graph_scratch_flag_slot_free_list_ and
+    // onednn_graph_scratch_flag_generation_counter_ are likewise accessed
+    // only under that same lock, so neither needs to be atomic on its own.
+    // The slab VALUES themselves are accessed through sycl::atomic_ref at
+    // the actual read/write sites (system-scope, release on the device
+    // write, acquire on the host read), not through these bookkeeping
+    // members. The per-park generation tag does NOT provide atomicity on
+    // its own -- it provides ABA safety: a slot handed to a different
+    // entry after its previous occupant's marker already fired cannot be
+    // misread as that later entry's own completion, because each park
+    // compares against its OWN generation value, not a bare true/false.
+    mem_handle                   onednn_graph_scratch_flag_slab_owner_;
+    int32_t *                    onednn_graph_scratch_flag_slab_ = nullptr;
+    std::vector<uint32_t>        onednn_graph_scratch_flag_slot_free_list_;
+    uint32_t                     onednn_graph_scratch_flag_generation_counter_     = 0;
+    bool                         onednn_graph_scratch_flag_slab_alloc_warned_      = false;
+    bool                         onednn_graph_scratch_flag_slots_exhausted_warned_ = false;
+    // llama.cpp-c6ah: see the public accessor's own comment above.
+    // Incremented only in onednn_graph_scratch_clear_pool_locked(), the one
+    // removal site that can retire an armed-but-incomplete entry's slot.
+    size_t                       onednn_graph_scratch_flag_slot_retired_count_     = 0;
+    // Device marker kernel only, never a host_task -- see
+    // get_event_watch_queue().
+    std::unique_ptr<sycl::queue> event_watch_queue_;
+    std::once_flag               event_watch_queue_once_;
     size_t                       budget_;                   // Total GPU memory budget (after reservations)
     size_t                       base_budget_;              // Raw cache budget before reservations
     size_t                       reserved_;                 // Runtime reservation applied to budget_
@@ -4083,6 +4299,62 @@ class unified_cache {
     struct onednn_graph_scratch_pool_entry {
         mem_handle  owner;
         sycl::event release_event;
+        // llama.cpp-c6ah: host-visible completion flag, written by a
+        // DEVICE MARKER KERNEL (not a host_task -- see this struct's own
+        // history below for why) submitted on get_event_watch_queue() at
+        // park time, depending on release_event, once release_event
+        // completes. release_event lives on a profiling-enabled backend
+        // stream, and event_complete()'s own comment documents that the
+        // bare command_execution_status query BLOCKS rather than polls on
+        // such a queue -- so querying release_event directly here would
+        // turn "skip an in-flight entry" into "wait for it", exactly the
+        // bug this ticket closes. Pool lookups must go through
+        // pool_entry_release_complete() rather than event_complete()
+        // directly. flag_slot is -1 when no flag could be armed (the slab
+        // failed to allocate, every slot was in use, the marker-kernel
+        // submit threw, or the RED-arm test hook deliberately skipped
+        // arming it; see onednn_graph_scratch_free()'s own comment) --
+        // pool_entry_release_complete() falls back to the old (blocking,
+        // but correct FOR AN UNWATCHED EVENT) event_complete() query in
+        // that case, so a failed or skipped arm degrades to pre-fix
+        // behaviour rather than misreporting readiness.
+        //
+        // Slot index into onednn_graph_scratch_flag_slab_, paired with
+        // flag_generation so a slot COULD safely be handed to a different
+        // entry even if that entry's own marker kernel were somehow still
+        // pending when reused: the marker kernel writes flag_generation's
+        // own value (not a bare 1/true) into the slot, and
+        // pool_entry_release_complete() compares the slab's CURRENT value
+        // against THIS entry's own generation, so a stale write carrying
+        // an older generation cannot be misread as a newer entry's
+        // completion. In the current design a slot is only ever returned
+        // to the free list once its own marker kernel has ALREADY fired
+        // (see onednn_graph_scratch_try_reuse_pool_locked(),
+        // onednn_graph_scratch_evict_pool_until_fits_locked(), and
+        // onednn_graph_scratch_clear_pool_locked(), which retires an
+        // incomplete entry's slot permanently rather than returning it),
+        // so this pairing is defense-in-depth against a future change to
+        // that invariant, not something normal operation exercises today.
+        //
+        // History: an earlier version of this design armed a
+        // std::shared_ptr<std::atomic<bool>> flag via a host_task instead.
+        // That was found (measured, both cards, 2026-09-09) to have a
+        // fatal flaw invisible to every test that ran against it:
+        // SUBMITTING a host_task whose depends_on() names an event from
+        // ANOTHER queue blocks the submitting thread until that event
+        // completes -- so onednn_graph_scratch_free() itself stalled for
+        // the parked SDPA kernel's full duration on every single park,
+        // worse than the blocking-query bug this ticket set out to fix.
+        // An earlier "the bare query lies once a watcher exists" theory
+        // was a misdiagnosis of this same effect: by the time submit()
+        // returned, the kernel really was done, so the query, wait(), and
+        // the flag all correctly reported complete -- there was no lying
+        // query. A device kernel submitted the same way (depends_on()
+        // naming a cross-queue event) does NOT block its submitting
+        // thread (measured, both cards), which is why this design uses
+        // one instead of a host_task.
+        int32_t     flag_slot       = -1;
+        uint32_t    flag_generation = 0;
     };
 
     std::unordered_map<size_t, std::vector<onednn_graph_scratch_pool_entry>> onednn_graph_scratch_reuse_pool_;
@@ -4126,6 +4398,63 @@ class unified_cache {
     size_t onednn_graph_scratch_pool_bytes_          = 0;
     size_t onednn_graph_scratch_pool_peak_bytes_     = 0;
 
+    // llama.cpp-c6ah: the ONE place that decides whether a pooled entry's
+    // release is done, and the ONLY place in this class that may call
+    // event_complete(entry.release_event) -- enforced by a source-gate test
+    // (tests/test-sycl-onednn-graph-allocator-source.py). Prefers the
+    // host-visible flag at entry.flag_slot (written by a device marker
+    // kernel armed at park time -- see onednn_graph_scratch_pool_entry::flag_slot's
+    // own comment for the full mechanism and history) over querying
+    // entry.release_event directly, because release_event lives on a
+    // profiling-enabled backend stream and event_complete()'s own comment
+    // documents that a bare query BLOCKS instead of polling there for an
+    // UNWATCHED device-kernel event -- so entry.flag_slot, once armed
+    // (>= 0), is the predicate this entry's completion is actually checked
+    // through; this function only falls through to
+    // event_complete(entry.release_event) when flag_slot is -1, i.e. no
+    // flag could be armed for this entry, the one case where a direct
+    // query is both correct and (still) blocking. Not `static`: reading
+    // the slab requires instance state (onednn_graph_scratch_flag_slab_).
+    // Every reader of a pool entry's completion --
+    // onednn_graph_scratch_entry_usable_locked(),
+    // onednn_graph_scratch_evict_pool_until_fits_locked(), and
+    // onednn_graph_scratch_clear_pool_locked() -- must call this instead of
+    // event_complete() directly, so the pool's "skip in-flight entries, do
+    // not wait for them" design is actually non-blocking end to end. The
+    // RED-arm test hook
+    // (ggml_sycl_test_onednn_graph_scratch_force_blocking_pool_check) does
+    // not branch inside this function at all -- it instead makes
+    // onednn_graph_scratch_free()'s park site skip arming flag_slot in the
+    // first place (see that hook's own declaration comment for why a
+    // branch here is the wrong place). This function's flag_slot == -1
+    // fallback is what the RED arm actually exercises. `const`: it only
+    // READS onednn_graph_scratch_flag_slab_ through the entry's own
+    // flag_slot/flag_generation and calls the static event_complete() --
+    // both const-compatible -- and several callers (e.g.
+    // onednn_graph_scratch_entry_usable_locked()) are themselves const
+    // member functions, which cannot call a non-const one on `this`.
+    bool onednn_graph_scratch_pool_entry_release_complete(const onednn_graph_scratch_pool_entry & entry) const;
+
+    // llama.cpp-c6ah: lazily allocates
+    // onednn_graph_scratch_flag_slab_ (a plain already-allocated check, NOT
+    // std::call_once like get_event_watch_queue()'s own lazy pattern --
+    // see this class's own onednn_graph_scratch_flag_slab_ member comment
+    // for why that is sufficient here) via the sanctioned
+    // unified_cache_malloc_host_tracked()/unified_cache_adopt_raw_host_allocation()
+    // path -- the same one staging_'s own bootstrap allocation uses --
+    // never a bare sycl::malloc_host. Fixed capacity, never reallocated: a
+    // marker kernel already in flight can hold a raw pointer into a
+    // specific slot's address, and growing the slab (freeing the old
+    // buffer) while that kernel is still pending would leave it writing
+    // through a dangling host pointer. Returns whether the slab is usable
+    // (already allocated, or successfully allocated just now) -- callers
+    // must still check onednn_graph_scratch_flag_slot_free_list_ is
+    // non-empty before claiming a slot, since a usable slab can still be
+    // fully checked out. Must be called with onednn_graph_scratch_mutex_
+    // already held (every real caller is inside onednn_graph_scratch_free()'s
+    // DIRECT branch, which takes that lock for its whole body).
+    bool onednn_graph_scratch_ensure_flag_slab_locked();
+
     // Outcome of testing one pool entry against a request's `alignment` and
     // `device_id` -- see onednn_graph_scratch_entry_usable_locked() below.
     // Kept as a 4-way enum (not a bool) specifically so a caller can
@@ -4156,13 +4485,15 @@ class unified_cache {
     // that needs the resolved pointer on a USABLE result, or needs to tell
     // RESOLVE_FAILED apart from ALIGNMENT_MISMATCH for its own branching,
     // does not have to resolve() a second time. This single call already
-    // performs the one event_complete() query and (if that passes) the one
-    // resolve() query this entry needs for this request -- a caller must
-    // NOT call event_complete() on the same entry itself first (llama.cpp-c6ah
-    // tracks event_complete()'s own potentially-blocking behaviour on
-    // profiling queues separately; doubling the query here would double
-    // that cost per candidate entry for no benefit, since EVENT_PENDING
-    // already reports exactly that outcome). Callers must hold
+    // performs the one completion query (via
+    // onednn_graph_scratch_pool_entry_release_complete(), llama.cpp-c6ah --
+    // NOT a direct event_complete() query, which blocks rather than polls
+    // on the profiling-enabled queues every backend stream uses) and, if
+    // that passes, the one resolve() query this entry needs for this
+    // request -- a caller must NOT query completion on the same entry
+    // itself first; doubling the query here would double that cost per
+    // candidate entry for no benefit, since EVENT_PENDING already reports
+    // exactly that outcome. Callers must hold
     // onednn_graph_scratch_mutex_.
     onednn_graph_scratch_entry_fit onednn_graph_scratch_entry_usable_locked(
         const onednn_graph_scratch_pool_entry & entry,
@@ -4242,8 +4573,9 @@ class unified_cache {
                                                     int                            device_id,
                                                     std::unique_lock<std::mutex> & lock);
 
-    // Evict completed (event_complete() true) reuse-pool entries -- real
-    // release, destructing the owned mem_handle -- stopping as soon as
+    // Evict completed (onednn_graph_scratch_pool_entry_release_complete()
+    // true) reuse-pool entries -- real release, destructing the owned
+    // mem_handle -- stopping as soon as
     // outstanding DIRECT bytes + `size` fits under `cap`, so as much of the
     // pool survives as possible. A size bucket that empties out during
     // eviction is erased from onednn_graph_scratch_reuse_pool_ entirely
