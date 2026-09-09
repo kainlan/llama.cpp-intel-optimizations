@@ -208,15 +208,52 @@ bool contains(const std::string & haystack, const char * needle) {
     return haystack.find(needle) != std::string::npos;
 }
 
-// Two sizes that never fit any realistic ONEDNN zone (the zone defaults to
-// 256 MB and this repository's own comments record requests up to 144 MB as
-// the largest measured), so both deterministically take the DIRECT path
-// regardless of what a live model's planning left the zone sized to. They
-// are deliberately DIFFERENT from each other so a request for kSizeB cannot
-// be silently served by a pool entry parked for kSizeA -- that would let
-// pool reuse mask the eviction/wait path this file also needs to exercise.
-constexpr size_t kSizeA = 300ull * 1024 * 1024;
-constexpr size_t kSizeB = 320ull * 1024 * 1024;
+// llama.cpp-c6ah: the process-wide DIRECT-path cap every size constant in
+// this file is chosen relative to, and the natural (no-model) ONEDNN zone
+// floor every DIRECT-triggering size in this file must exceed. Defined
+// once here so each size's own static_assert (immediately next to its
+// definition, throughout this file) can check its relation to both by
+// name instead of by a hand-copied number -- a future edit that breaks the
+// arithmetic then fails the BUILD, not just a hardware run.
+//
+// 700, not the historical 350: this file previously set the cap to 350 MB
+// and shrank the zone via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB so sizes could
+// stay small. That zone override does NOT take effect for the no-model
+// arena this test binary plans -- measured on hardware, the process still
+// reports `[VRAM-ARENA] Reserved single chunk: ... oneDNN=256.0` regardless
+// of the override -- so every DIRECT-triggering size here, old or new,
+// must clear that ~256 MB floor the same way the pre-existing tests
+// already did, and the override cannot shrink sizes below it instead.
+// test_in_flight_entry_is_skipped_not_waited() needs TWO such sizes
+// outstanding simultaneously without engaging the cap machinery, which is
+// impossible at a 350 MB cap (2 x 257 MB already exceeds it); raising the
+// cap to 700 MB is what actually makes that possible, not shrinking the
+// zone. main() sets GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB from kCapMiB
+// directly so the two can never drift apart.
+constexpr size_t kCapMiB         = 700;
+constexpr size_t kCapBytes       = kCapMiB * 1024ull * 1024ull;
+// Measured on hardware (see kCapMiB's own comment above); NOT
+// configurable via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB for the no-model case
+// this binary plans against, so it is a fact this file's sizes must
+// respect, not a value this file can tune.
+constexpr size_t kZoneFloorBytes = 256ull * 1024 * 1024;
+
+// Two sizes that exceed the natural ONEDNN zone floor (this repository's
+// own comments separately record requests up to 144 MB as the largest
+// measured from a real model), so both deterministically take the DIRECT
+// path regardless of what a live model's planning left the zone sized to.
+// They are deliberately DIFFERENT from each other so a request for kSizeB
+// cannot be silently served by a pool entry parked for kSizeA -- that would
+// let pool reuse mask the eviction/wait path this file also needs to
+// exercise.
+constexpr size_t kSizeA = 360ull * 1024 * 1024;
+constexpr size_t kSizeB = 380ull * 1024 * 1024;
+static_assert(kSizeA > kZoneFloorBytes && kSizeB > kZoneFloorBytes,
+              "kSizeA/kSizeB must exceed the no-model ONEDNN zone floor to take the DIRECT path");
+static_assert(kSizeA < kCapBytes && kSizeB < kCapBytes,
+              "each size alone must still fit under the cap, so parking either one alone applies no cap pressure");
+static_assert(kSizeA + kSizeB > kCapBytes,
+              "test_bounded_eviction needs kSizeA (pooled) + kSizeB (requested) together to exceed the cap");
 
 // A release event that only completes after this many milliseconds -- long
 // enough to be unambiguously distinguishable from "the wait didn't really
@@ -267,7 +304,7 @@ sycl::event submit_slow_release(sycl::queue & q) {
 //
 // RESIDUAL RACE (documented, not fully closed): at a call site where
 // `target`'s own size plus current outstanding DIRECT bytes exceeds the
-// 350 MB cap main() sets, a MISS retry's fresh allocation attempt engages
+// cap main() sets (kCapBytes), a MISS retry's fresh allocation attempt engages
 // the cap's eviction sweep (onednn_graph_scratch_evict_pool_until_fits_locked()),
 // which walks every bucket including `target`'s own. If the watcher arms
 // `target`'s flag in the narrow window between this function's own
@@ -350,14 +387,15 @@ void test_pool_reuse(unified_cache * cache) {
     //
     // RESIDUAL RACE, documented rather than closed (see
     // poll_for_pool_hit()'s own "RESIDUAL RACE" paragraph for the
-    // mechanism): kSizeA is 300 MiB, so a MISS retry's fresh allocation
-    // (300 MiB new + 300 MiB already parked = 600 MiB) exceeds the 350 MB
-    // cap main() sets and engages the cap's eviction sweep, which could in
-    // principle evict ptr1 for real in the same narrow window this file's
-    // other affected sites describe. Unlike kSizeParked in
-    // test_oversized_request_skips_wait_loop(), kSizeA is shared with
-    // test_bounded_eviction()'s own cap-triggering logic below and is not
-    // free to shrink to make this site cap-safe.
+    // mechanism): kSizeA is 360 MiB, so a MISS retry's fresh allocation
+    // (360 MiB new + 360 MiB already parked = 720 MiB) exceeds the 700 MB
+    // cap main() sets (via kCapBytes) and engages the cap's eviction sweep,
+    // which could in principle evict ptr1 for real in the same narrow
+    // window this file's other affected sites describe. Unlike kSizeParked
+    // in test_oversized_request_skips_wait_loop(), kSizeA is shared with
+    // test_bounded_eviction()'s own cap-triggering logic below (see
+    // kSizeA's own static_assert) and is not free to shrink to make this
+    // site cap-safe.
     const size_t hits_before = cache->onednn_graph_scratch_pool_hit_count();
     const bool   became_hit  = poll_for_pool_hit(cache, q, kSizeA, ptr1);
     void *       ptr2        = became_hit ? ptr1 : nullptr;
@@ -408,9 +446,9 @@ void test_bounded_eviction(unified_cache * cache) {
     // kSizeB, not kSizeA: an exact-size request would be served by the pool
     // reuse path tested above WITHOUT ever reaching the cap check at all,
     // which would prove nothing about eviction/waiting. kSizeA (pooled,
-    // pending) + kSizeB (requested) together exceed the 350 MB cap set in
-    // main(), so this can only succeed by evicting ptr1's pooled entry once
-    // its event completes.
+    // pending) + kSizeB (requested) together exceed the 700 MB cap set in
+    // main() (see their shared static_assert), so this can only succeed by
+    // evicting ptr1's pooled entry once its event completes.
     const auto start = std::chrono::steady_clock::now();
     void *     ptr2  = cache->onednn_graph_scratch_alloc(kSizeB, 256, &q);
     const auto elapsed =
@@ -455,8 +493,13 @@ void test_loud_failure(unified_cache * cache) {
     // before the forced-fail path is even reached.
     ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(2);
 
-    constexpr size_t kSizeC = 340ull * 1024 * 1024;
-    void *           ptr    = cache->onednn_graph_scratch_alloc(kSizeC, 256, &q);
+    constexpr size_t kSizeC = 400ull * 1024 * 1024;
+    static_assert(kSizeC > kZoneFloorBytes && kSizeC < kCapBytes,
+                  "kSizeC must exceed the zone floor and fit under the cap alone -- distinctness from the "
+                  "other size constants in this file (all integer literals, so distinctness is verifiable by "
+                  "inspection rather than a static_assert) is what actually avoids aliasing a pooled entry "
+                  "from another test, not any relation to the cap or zone");
+    void * ptr = cache->onednn_graph_scratch_alloc(kSizeC, 256, &q);
 
     ggml_sycl_test_onednn_graph_scratch_suppress_abort(false);
     ggml_log_set(nullptr, nullptr);
@@ -482,15 +525,16 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
 
     sycl::queue & q = cache->get_queue();
 
-    // 310 MiB, not 360: this must stay UNDER the 350 MB cap main() sets via
+    // 370 MiB: comfortably under the 700 MB cap main() sets via
     // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB, so both allocations below take
     // the NORMAL pool path this test actually exercises (reclaim/pending-
     // event handling) rather than the size>cap early-out
     // (onednn_graph_scratch_wait_for_direct_headroom_locked(), llama.cpp-pqgl)
     // -- that early-out has its own dedicated test below,
-    // test_oversized_request_skips_wait_loop(). Still distinct from
-    // kSizeA/kSizeB/kSizeC (300/320/340 MiB) above.
-    constexpr size_t kSizeD = 310ull * 1024 * 1024;
+    // test_oversized_request_skips_wait_loop(). Distinct from
+    // kSizeA/kSizeB/kSizeC (360/380/400 MiB) above.
+    constexpr size_t kSizeD = 370ull * 1024 * 1024;
+    static_assert(kSizeD > kZoneFloorBytes && kSizeD < kCapBytes, "see the prose above");
 
     void * ptr = cache->onednn_graph_scratch_alloc(kSizeD, 256, &q);
     check(ptr != nullptr, "DIRECT allocation for the pending-event reclaim setup succeeds");
@@ -506,8 +550,8 @@ void test_pending_event_reclaim_does_not_destruct_in_flight(unified_cache * cach
     // Not asserted here: onednn_graph_scratch_pool_peak_bytes() is a
     // cumulative process-lifetime high-water mark that never resets, so a
     // "peak >= kSizeD" check right after this free() would be vacuous once
-    // an earlier test (test_bounded_eviction, kSizeA/kSizeB = 300/320 MiB)
-    // has already pushed the peak above kSizeD (310 MiB) -- it would hold
+    // an earlier test (test_bounded_eviction, kSizeA/kSizeB = 360/380 MiB)
+    // has already pushed the peak above kSizeD (370 MiB) -- it would hold
     // whether or not THIS entry ever made it into the pool. The eviction-
     // count delta asserted below is the real proof, and it is attributable
     // to exactly THIS entry (not, say, test_bounded_eviction's kSizeB
@@ -586,37 +630,37 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // from "the sweep never ran at all" -- both pass identically on an
     // empty pool.
     //
-    // 120 MiB: comfortably above the ONEDNN zone -- which main() now
-    // shrinks to a few MB via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB (see
-    // test_in_flight_entry_is_skipped_not_waited()'s own header comment for
-    // why), so every size in this file trivially takes the DIRECT path
-    // regardless of the zone's exact value now. Distinct from
-    // kSizeA/kSizeB/kSizeC/kSizeD (300/320/340/310 MiB) elsewhere in this
-    // file, and comfortably under the 350 MB cap main() sets so it can be
-    // parked and later evicted without itself engaging the cap machinery
-    // this test isn't exercising. Deliberately small enough that DOUBLING
-    // it (this entry parked plus a same-size probe requested while polling
-    // for it to become ready, below) still fits under the cap on its own
-    // -- unlike this constant's own earlier value (280 MiB, before this
-    // test polled for `parked` to become ready), which would make a probe
-    // retry engage the cap's eviction sweep and risk evicting THIS entry
-    // for real before the poll ever sees it as a hit (see
-    // poll_for_pool_hit()'s own "RESIDUAL RACE" comment). Unlike kSizeA
-    // (300 MiB, shared with test_bounded_eviction's own cap-triggering
-    // logic and not free to shrink), this constant is scoped to this
-    // function alone, so it was cheap to close that race outright here
-    // rather than merely document it, the way the other two affected call
-    // sites in this file must (see their own comments). The miss-count assertion
-    // right after the allocation below is this setup's own self-check
-    // against silently regressing back to a zone-served size, whichever
-    // floor is in effect; this value historically also had to clear this
-    // process's own ~256 MB NATURAL (no-model, no-override) zone floor
-    // before the override above existed -- 200 MiB measured FAIL on
-    // hardware there, zone-served rather than pooled.
-    constexpr size_t kSizeParked             = 120ull * 1024 * 1024;
-    const size_t     misses_before_park      = cache->onednn_graph_scratch_pool_miss_count();
-    const size_t     outstanding_before_park = cache->onednn_graph_scratch_direct_outstanding_bytes();
-    void *           parked                  = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
+    // 280 MiB: exceeds the ~256 MB no-model ONEDNN zone floor this process
+    // reserves (measured on hardware: `[VRAM-ARENA] Reserved single chunk:
+    // ... oneDNN=256.0` -- see kCapMiB's own comment for why that floor is
+    // not configurable away for this no-model case) -- 200 MiB measured
+    // FAIL there, zone-served rather than pooled, which is why this test
+    // still checks a miss below rather than trusting the size by
+    // inspection. Distinct from kSizeA/kSizeB/kSizeC/kSizeD
+    // (360/380/400/370 MiB) elsewhere in this file, and comfortably under
+    // the 700 MB cap main() sets so it can be parked and later evicted
+    // without itself engaging the cap machinery this test isn't
+    // exercising. Also small enough that DOUBLING it (this entry parked
+    // plus a same-size probe requested while polling for it to become
+    // ready, below) still fits under the cap on its own (280 x 2 = 560 <=
+    // 700), so that poll cannot engage the eviction sweep and risk evicting
+    // THIS entry for real before the poll ever sees it as a hit (see
+    // poll_for_pool_hit()'s own "RESIDUAL RACE" comment) -- unlike kSizeA
+    // (shared with test_bounded_eviction's own cap-triggering logic and not
+    // free to shrink), this constant is scoped to this function alone, so
+    // it costs nothing to keep it cap-safe here, unlike the other two
+    // affected call sites in this file, which must document the residual
+    // race instead (see their own comments). The miss-count assertion right
+    // after the allocation below is this setup's own self-check against
+    // silently regressing back to a zone-served size.
+    constexpr size_t kSizeParked = 280ull * 1024 * 1024;
+    static_assert(kSizeParked > kZoneFloorBytes, "see the prose above");
+    static_assert(kSizeParked * 2 <= kCapBytes,
+                  "kSizeParked parked plus a same-size retry probe must fit under the cap without engaging the "
+                  "eviction sweep -- closes the residual race documented in poll_for_pool_hit()");
+    const size_t misses_before_park      = cache->onednn_graph_scratch_pool_miss_count();
+    const size_t outstanding_before_park = cache->onednn_graph_scratch_direct_outstanding_bytes();
+    void *       parked                  = cache->onednn_graph_scratch_alloc(kSizeParked, 256, &q);
     check(parked != nullptr, "the parked-entry setup allocation succeeds");
     check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_park + 1,
           "the parked allocation was a DIRECT-path pool miss, not served from the ONEDNN zone -- proves this "
@@ -639,11 +683,11 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     // By the time this test runs, main() has already run the three earlier
     // tests that actually complete an allocation (pool_reuse,
     // bounded_eviction, pending_event_reclaim); test_loud_failure's kSizeC
-    // (340 MiB) request is deliberately forced to fail
+    // (400 MiB) request is deliberately forced to fail
     // (ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail(2),
     // asserted via ptr == nullptr) and returns before ever reaching this
     // counter's write site, so it contributes nothing. kSizeA/kSizeB/kSizeD
-    // (300/320/310 MiB) already push the high-water past kSizeParked (120
+    // (360/380/370 MiB) already push the high-water past kSizeParked (280
     // MiB) on their own -- so the check below cannot isolate the parked
     // allocation's own contribution to that floor; it only proves the
     // accessor is not inert (it would read 0 if the write site above never
@@ -702,11 +746,12 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
     const size_t evictions_before  = cache->onednn_graph_scratch_pool_eviction_count();
     const size_t wait_count_before = cache->onednn_graph_scratch_direct_wait_count();
 
-    // main() sets the cap to 350 MB via GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB.
-    // 366 MiB is comfortably over that ON ITS OWN -- no amount of eviction
-    // or waiting could ever bring outstanding+size under the cap for this
-    // request.
-    constexpr size_t kSizeOversized = 366ull * 1024 * 1024;
+    // main() sets the cap to kCapMiB (700) MB via
+    // GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB. 720 MiB is comfortably over
+    // that ON ITS OWN -- no amount of eviction or waiting could ever bring
+    // outstanding+size under the cap for this request.
+    constexpr size_t kSizeOversized = 720ull * 1024 * 1024;
+    static_assert(kSizeOversized > kCapBytes, "must exceed the cap on its own to take the size>cap early-out");
 
     g_captured_log.clear();
     ggml_log_set(capture_log, nullptr);
@@ -789,29 +834,30 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
 // host-visible std::atomic<bool> flag (armed by a host_task on a new,
 // dedicated, non-profiling watcher queue) over querying the event.
 //
-// WHY THIS TEST USES A SHRUNK ONEDNN ZONE. Proving "skipped, not waited"
-// with a wall-clock bound requires a request that does NOT need the
-// DIRECT-path cap machinery to engage at all -- otherwise a genuine,
-// unavoidable physical wait for the SAME in-flight entry's completion is
-// indistinguishable from the bug this fix closes (both take about
-// kSlowReleaseMs either way; only WHICH mechanism produces that wait
+// WHY THIS TEST NEEDS A RAISED CAP, NOT A SHRUNK ZONE. Proving "skipped,
+// not waited" with a wall-clock bound requires a request that does NOT
+// need the DIRECT-path cap machinery to engage at all -- otherwise a
+// genuine, unavoidable physical wait for the SAME in-flight entry's
+// completion is indistinguishable from the bug this fix closes (both take
+// about kSlowReleaseMs either way; only WHICH mechanism produces that wait
 // differs, and this file has no way to observe that internal difference
 // through the public API alone). That requires parking the SAME size twice
-// simultaneously while staying under the DIRECT_CAP_MB=350 cap main() sets
-// -- but the ONEDNN zone's natural (no-model) floor is measured elsewhere
-// in this file at ~256 MB (see kSizeParked's own comment above), and no
-// size can simultaneously exceed that floor (to reach the DIRECT path at
-// all) AND have its DOUBLED cost fit under a 350 MB cap (2 x 257 MB always
-// exceeds 350 MB). GGML_SYCL_ONEDNN_GRAPH_ZONE_MB is this codebase's own
-// sanctioned escape hatch for exactly this shape of problem ("always wins
-// over the FORMULA when set" -- see onednn_graph_scratch_zone_floor_bytes()'s
-// comment) -- main() sets it to a few MB, safely below EVERY size used
-// anywhere in this file (this test's own two-digit-MiB sizes included, and
-// every existing three-digit-MiB size above by a wide margin), so nothing
-// in this file becomes zone-served that was not already. This does not
-// change what any earlier test in this file measures -- every one of them
-// already relies on its own size exceeding whatever the zone floor is, not
-// on the floor's specific value.
+// simultaneously while staying under the cap main() sets, and every
+// DIRECT-triggering size in this file (this test's own included) must
+// exceed the ~256 MB no-model ONEDNN zone floor this process reserves --
+// see kCapMiB's own comment for the measurement, and for why
+// GGML_SYCL_ONEDNN_GRAPH_ZONE_MB, despite being this codebase's documented
+// escape hatch for exactly this shape of problem, does NOT actually shrink
+// that floor for this no-model case (an earlier version of this test tried
+// exactly that override and it measured inert on hardware -- the arena
+// still reported `oneDNN=256.0` -- so kSizeSkip below WAS being served from
+// the zone, not the DIRECT path, and every downstream assertion in this
+// function was vacuous). kCapMiB is 700, not the historical 350, precisely
+// so that two zone-exceeding sizes CAN be outstanding together (kSizeSkip
+// below is chosen with its own static_assert proving exactly that). This
+// does not change what any earlier test in this file measures -- every one
+// of them already relies on its own size exceeding the zone floor, which
+// is unaffected by the cap's value.
 void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int device) {
     printf("DIRECT path in-flight pooled entry is skipped, not waited on:\n");
 
@@ -819,17 +865,24 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
 
     sycl::queue & q = cache->get_queue();
 
-    // Small (relative to the shrunk zone) and DISTINCT from every size used
-    // elsewhere in this file, so this test's pool state cannot alias theirs
-    // even without today's leading reclaim call.
-    constexpr size_t kSizeSkip = 32ull * 1024 * 1024;
+    // 300 MiB: exceeds the no-model ONEDNN zone floor (see kCapMiB's own
+    // comment), and DISTINCT from every other size used elsewhere in this
+    // file, so this test's pool state cannot alias theirs even without
+    // today's leading reclaim call. Two of these must be outstanding at
+    // once (this one parked, plus a fresh same-size request) without
+    // engaging the cap.
+    constexpr size_t kSizeSkip = 300ull * 1024 * 1024;
+    static_assert(kSizeSkip > kZoneFloorBytes, "must exceed the zone floor to take the DIRECT path");
+    static_assert(kSizeSkip * 2 <= kCapBytes,
+                  "two outstanding at once must not themselves engage the cap machinery this test isn't "
+                  "exercising in its GREEN-arm scenario");
 
     const size_t misses_before_setup = cache->onednn_graph_scratch_pool_miss_count();
     void *       ptr1                = cache->onednn_graph_scratch_alloc(kSizeSkip, 256, &q);
     check(ptr1 != nullptr, "DIRECT allocation for the skip-not-wait setup succeeds");
     check(cache->onednn_graph_scratch_pool_miss_count() == misses_before_setup + 1,
-          "the setup allocation was a DIRECT-path pool miss, not served from the (shrunk) ONEDNN zone -- proves "
-          "GGML_SYCL_ONEDNN_GRAPH_ZONE_MB actually took effect for this size");
+          "the setup allocation was a DIRECT-path pool miss, not served from the ONEDNN zone -- proves this "
+          "setup actually parks a poolable entry rather than silently zone-serving it");
     if (!ptr1) {
         return;
     }
@@ -994,19 +1047,35 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     // stop them).
     unified_cache_reclaim_onednn_graph_scratch_pool(device, "test setup (eviction sweep)");
 
-    constexpr size_t kSizeEvictInFlight = 200ull * 1024 * 1024;
-    constexpr size_t kSizeEvictComplete = 100ull * 1024 * 1024;
-    constexpr size_t kSizeEvictRequest  = 90ull * 1024 * 1024;
-    // kSizeEvictInFlight + kSizeEvictComplete (300 MiB) fits under the
-    // 350 MB cap on its own -- parking both must not itself force anything;
-    // + kSizeEvictRequest (390 MiB) does not, so satisfying this request
-    // needs SOME eviction, and kSizeEvictInFlight + kSizeEvictRequest alone
-    // (290 MiB) fits -- so evicting kSizeEvictComplete is both necessary and
-    // SUFFICIENT; the in-flight entry never needs to be touched to succeed.
-    // Deliberately DIFFERENT sizes (not just distinct from each other for
-    // bucket separation): it lets onednn_graph_scratch_direct_outstanding_bytes()
-    // alone distinguish WHICH entry the sweep evicted below, without a
-    // third probe allocation that would itself need headroom.
+    constexpr size_t kSizeEvictInFlight = 300ull * 1024 * 1024;
+    constexpr size_t kSizeEvictComplete = 260ull * 1024 * 1024;
+    constexpr size_t kSizeEvictRequest  = 300ull * 1024 * 1024;
+    static_assert(kSizeEvictInFlight > kZoneFloorBytes && kSizeEvictComplete > kZoneFloorBytes &&
+                      kSizeEvictRequest > kZoneFloorBytes,
+                  "every size here must exceed the zone floor to take the DIRECT path");
+    static_assert(kSizeEvictInFlight + kSizeEvictComplete <= kCapBytes, "parking both must not itself force anything");
+    static_assert(kSizeEvictInFlight + kSizeEvictComplete + kSizeEvictRequest > kCapBytes,
+                  "satisfying the request needs SOME eviction");
+    static_assert(kSizeEvictInFlight + kSizeEvictRequest <= kCapBytes,
+                  "evicting kSizeEvictComplete alone must be sufficient -- the in-flight entry never needs to "
+                  "be touched to succeed");
+    // kSizeEvictInFlight + kSizeEvictComplete (560 MiB) fits under the
+    // 700 MB cap on its own; + kSizeEvictRequest (860 MiB) does not, so
+    // satisfying this request needs SOME eviction, and kSizeEvictInFlight +
+    // kSizeEvictRequest alone (600 MiB) fits -- so evicting
+    // kSizeEvictComplete is both necessary and SUFFICIENT (see the three
+    // static_asserts above, which are the actual proof; these numbers are
+    // restated here only for a reader scanning prose, not code). Deliberately
+    // DIFFERENT sizes for in-flight vs. completed (not just distinct from
+    // each other for bucket separation): it lets
+    // onednn_graph_scratch_direct_outstanding_bytes() alone distinguish
+    // WHICH entry the sweep evicted below, without a third probe allocation
+    // that would itself need headroom. kSizeEvictRequest deliberately equal
+    // to kSizeEvictInFlight is fine and not a bug: a same-size request still
+    // correctly skips a NOT-YET-USABLE entry in its own exact-size bucket
+    // (EVENT_PENDING is checked regardless of which caller asked), so it
+    // falls through to the general cap-eviction path exactly like a
+    // different-sized request would.
 
     void * evict_complete = cache->onednn_graph_scratch_alloc(kSizeEvictComplete, 256, &q);
     check(evict_complete != nullptr, "eviction-sweep completed-entry setup allocation succeeds");
@@ -1073,16 +1142,17 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
     //
     // RESIDUAL RACE, documented rather than closed (see
     // poll_for_pool_hit()'s own "RESIDUAL RACE" paragraph): outstanding
-    // bytes here are kSizeEvictInFlight (200 MiB, still parked) plus
-    // evict_ptr's own re-parked 90 MiB = 290 MiB, so a MISS retry's fresh
-    // 200 MiB allocation (290 + 200 = 490 MiB) exceeds the 350 MB cap and
-    // engages the eviction sweep. Shrinking kSizeEvictInFlight would not
-    // close this the way kSizeParked's own shrink did elsewhere in this
-    // file: evict_ptr's 90 MiB is itself already charged and outstanding
-    // with no cheap way to release it for real before this check (a
-    // nullptr free only re-parks it; only a genuine reclaim or driving its
-    // bucket to the per-size depth limit would truly release it, and both
-    // are more invasive than this residual is worth closing here).
+    // bytes here are kSizeEvictInFlight (300 MiB, still parked) plus
+    // evict_ptr's own re-parked 300 MiB (kSizeEvictRequest) = 600 MiB, so a
+    // MISS retry's fresh 300 MiB allocation (600 + 300 = 900 MiB) exceeds
+    // the 700 MB cap and engages the eviction sweep. Adjusting the sizes
+    // here would not close this the way kSizeParked was chosen to be
+    // cap-safe elsewhere in this file: evict_ptr's 300 MiB is itself
+    // already charged and outstanding with no cheap way to release it for
+    // real before this check (a nullptr free only re-parks it; only a
+    // genuine reclaim or driving its bucket to the per-size depth limit
+    // would truly release it, and both are more invasive than this
+    // residual is worth closing here).
     evict_slow_release.wait();
     const bool in_flight_survived = poll_for_pool_hit(cache, q, kSizeEvictInFlight, evict_in_flight);
     check(in_flight_survived,
@@ -1104,13 +1174,22 @@ int main(int, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:1");
 
     // Set BEFORE any onednn_graph_scratch_* call in this process:
-    // onednn_graph_scratch_direct_cap_bytes() memoizes this env var on its
-    // first read (matching the sibling zone-floor override's own once-only
-    // lazy-static pattern), so setting it later in the process would be a
-    // silent no-op. 350 MB sits strictly between one and two of
-    // {kSizeA, kSizeB} (300/320 MB), so kSizeA (pooled) + kSizeB (requested)
-    // together exceed it while either alone fits comfortably.
-    setenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", "350", 1);
+    // onednn_graph_scratch_direct_cap_bytes() memoizes this env var in a
+    // function-local static on its first read, so setting it later in the
+    // process would be a silent no-op; nothing before this point in main()
+    // allocates, so that first read cannot have happened yet. kCapMiB (700)
+    // is the single source of truth for this value -- see its own comment
+    // at the top of this file for why 700, not the historical 350: an
+    // earlier version of this test tried to reach the same goal (two
+    // same-size DIRECT allocations outstanding at once) by shrinking the
+    // ONEDNN zone via GGML_SYCL_ONEDNN_GRAPH_ZONE_MB instead of raising this
+    // cap, and that override measured INERT on hardware for this no-model
+    // arena (the process still reserved the natural ~256 MB zone
+    // regardless), silently zone-serving what was meant to be a DIRECT-path
+    // test and voiding every assertion downstream of it. Built as a string
+    // (not a string literal) so it can never drift from kCapMiB.
+    const std::string cap_mb_str = std::to_string(kCapMiB);
+    setenv("GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB", cap_mb_str.c_str(), 1);
     // Also memoized once per process (onednn_graph_scratch_test_hooks_enabled(),
     // unified-cache.cpp), so it must be set here too, not only via ctest's
     // ENVIRONMENT: a bare (non-ctest) invocation of this binary would
@@ -1123,22 +1202,6 @@ int main(int, char ** argv) {
     // direct run of this specific binary should ever set this, never a
     // production process.
     setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
-    // llama.cpp-c6ah: also memoized once per process
-    // (onednn_graph_scratch_zone_floor_bytes(), unified-cache.cpp), so set
-    // BEFORE ggml_backend_sycl_init() below plans the arena, same
-    // once-only-lazy-static reasoning as the cap above. Shrinks the ONEDNN
-    // zone from its natural (no-model) ~256 MB floor down to a few MB --
-    // this codebase's own sanctioned override for exactly this purpose (see
-    // onednn_graph_scratch_zone_floor_bytes()'s comment: "always wins over
-    // the FORMULA when set"). test_in_flight_entry_is_skipped_not_waited()
-    // needs to park the SAME size twice simultaneously while staying under
-    // the 350 MB cap set above, which is impossible at the natural ~256 MB
-    // floor (any size big enough to miss that zone, doubled, exceeds
-    // 350 MB) -- see that test's own header comment for the full argument.
-    // Harmless to every earlier test in this file: none of them depends on
-    // the zone's specific size, only on their own sizes exceeding whatever
-    // it is (all >= 280 MiB, comfortably above this override either way).
-    setenv("GGML_SYCL_ONEDNN_GRAPH_ZONE_MB", "8", 1);
 
     const int device = 0;  // in-process index after selector filtering
 
