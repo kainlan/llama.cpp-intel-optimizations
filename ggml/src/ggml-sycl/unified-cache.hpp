@@ -3932,6 +3932,12 @@ class unified_cache {
     std::atomic<bool> onednn_graph_scratch_zone_miss_warned_{ false };
     std::atomic<bool> onednn_graph_scratch_invalid_request_warned_{ false };
     std::atomic<bool> onednn_zone_clamp_warned_{ false };
+    // llama.cpp-oyfl: same per-instance "log once" shape as
+    // onednn_zone_clamp_warned_ above and for the identical
+    // reason -- ensure_planned_arena_zones() is a per-device member
+    // function, so a function-local static here would again share one
+    // latch across every device's unified_cache instance in the process.
+    std::atomic<bool> nonfa_attn_scratch_clamp_warned_{ false };
 
     // llama.cpp-0oxf: sizes that have already had
     // their FIRST pool-hit debug line printed. The old gate

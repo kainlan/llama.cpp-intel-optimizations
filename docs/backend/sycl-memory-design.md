@@ -1900,7 +1900,9 @@ same call `reserve_onednn_scratch()`'s own comment already documents as
 succeeding only in "the rare case where the arena is still empty") —
 cheap and harmless, but not expected to succeed once weights hold live
 leases; its own log line only claims "raised" when the zone's capacity
-actually grew, and says "re-plan skipped: arena has live leases" otherwise.
+actually grew, and otherwise reports only what was observed ("did not
+raise the SCRATCH zone (... unchanged)") rather than naming a specific
+cause this code never actually checked.
 
 **The check is EMPIRICAL, not a modeled worst case — read this before
 tightening or loosening it.** A first draft of this predicate (llama.cpp

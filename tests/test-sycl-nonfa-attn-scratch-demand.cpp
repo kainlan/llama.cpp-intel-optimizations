@@ -104,6 +104,19 @@ void test_default_formula() {
     const size_t demand_h8  = unified_cache_nonfa_attn_scratch_demand_bytes(8, 512, 2048);
     const size_t demand_h32 = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 2048);
     check(demand_h8 < demand_h32, "demand increases with n_head at fixed n_ubatch/n_ctx");
+
+    // A shape chosen so that n_head * n_ubatch alone (4294967296) exceeds
+    // UINT32_MAX (4294967295) by 1 -- a 32-bit intermediate product would
+    // silently wrap to 0 here, not merely produce a large-but-wrong number,
+    // which is exactly the kind of bug a "the formula is monotonic" check
+    // above cannot catch (0 is not obviously wrong on its own; it just looks
+    // like a tiny shape). The implementation promotes every operand to
+    // uint64_t before multiplying (unified-cache.cpp), so this must compute
+    // the exact product, not silently wrap.
+    const size_t demand_huge = unified_cache_nonfa_attn_scratch_demand_bytes(65536, 65536, 1);
+    check(demand_huge == 24576ull * kMiB,
+          "demand(65536, 65536, 1) is exactly 24576 MiB, not truncated by a 32-bit intermediate "
+          "(n_head * n_ubatch alone overflows uint32_t)");
 }
 
 void test_override() {
@@ -117,6 +130,28 @@ void test_override() {
     const size_t demand_large = unified_cache_nonfa_attn_scratch_demand_bytes(128, 4096, 1u << 20);
     check(demand_small == 77 * kMiB, "override wins at an all-zero shape");
     check(demand_large == 77 * kMiB, "override wins at a huge shape too (the formula is bypassed entirely)");
+}
+
+void test_override_zero() {
+    printf("GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 (explicit-disable, not \"unset\"):\n");
+
+    // env_mb_override() (unified-cache.cpp) treats "0" as a genuine parsed
+    // value (env_mb == 0), distinct from an unset/empty var (env_mb == -1,
+    // which falls through to the formula). A caller with this override set
+    // gets EXACTLY 0 bytes back -- the 16 MiB kFloorMinBytes clamp is part
+    // of the FORMULA branch only and is bypassed entirely once an override
+    // (any non-negative value, including 0) is in effect, the same way a
+    // 77 MiB override above is not itself clamped to 16 MiB.
+    const char * env = std::getenv("GGML_SYCL_NONFA_ATTN_SCRATCH_MB");
+    check(env != nullptr && std::strcmp(env, "0") == 0,
+          "GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is set (ctest ENVIRONMENT) before the first call");
+
+    const size_t demand_zero_shape = unified_cache_nonfa_attn_scratch_demand_bytes(0, 0, 0);
+    const size_t demand_real_shape = unified_cache_nonfa_attn_scratch_demand_bytes(32, 512, 8192);
+    check(demand_zero_shape == 0, "override=0 returns exactly 0 bytes at an all-zero shape (not the 16 MiB floor)");
+    check(demand_real_shape == 0,
+          "override=0 returns exactly 0 bytes even at the B50 repro shape "
+          "(the override bypasses the formula and its floor entirely)");
 }
 
 void test_largest_fitting_n_ctx() {
@@ -161,6 +196,32 @@ void test_largest_fitting_n_ctx() {
     // convention the KV-side ggml_sycl_largest_fitting_n_ctx() uses).
     const uint32_t fits_odd = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(300 * kMiB, 32, 512);
     check(fits_odd % 256 == 0, "the largest fitting n_ctx is rounded down to a multiple of 256");
+
+    // Floor-vs-inverse interaction, scored to the outcome the inverse
+    // function's own comment documents: the inverse IGNORES
+    // kFloorMinBytes, so for a zone capacity small enough that the raw
+    // (unfloored) formula at the reported n_ctx is still below the 16 MiB
+    // floor, the inverse's own "fits" answer is optimistic -- feeding it
+    // back into the forward formula (which DOES apply the floor) reports a
+    // demand larger than the zone capacity the inverse was asked about.
+    // n_head=1, n_ubatch=1 keeps the per-context-cell cost tiny (6 bytes),
+    // so a capacity of just 2000 bytes still rounds up to a non-zero,
+    // 256-aligned n_ctx rather than degenerating to the n_ctx=0 corner case
+    // the dedicated zero-capacity check above already covers.
+    constexpr size_t kTinyZoneBytes = 2000;
+    const uint32_t   fits_tiny_zone = unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(kTinyZoneBytes, 1, 1);
+    check(fits_tiny_zone == 256,
+          "a 2000-byte zone at n_head=1/n_ubatch=1 reports n_ctx=256 (the raw formula's "
+          "own floor-free arithmetic), not the degenerate n_ctx=0 case");
+    const size_t demand_at_fits_tiny_zone = unified_cache_nonfa_attn_scratch_demand_bytes(1, 1, fits_tiny_zone);
+    check(demand_at_fits_tiny_zone == 16 * kMiB,
+          "the forward formula's 16 MiB floor dominates at that reported n_ctx (raw modeled demand there is "
+          "only 1536 bytes)");
+    check(demand_at_fits_tiny_zone > kTinyZoneBytes,
+          "the inverse's own \"fits\" answer does not actually fit once the forward formula's floor is applied "
+          "-- exactly the caveat unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch()'s comment "
+          "documents (it ignores kFloorMinBytes), so a caller must not treat its result as exact for a zone "
+          "this small");
 }
 
 }  // namespace
@@ -177,11 +238,14 @@ int main(int argc, char ** argv) {
 
     if (std::strcmp(mode, "override") == 0) {
         test_override();
+    } else if (std::strcmp(mode, "override-zero") == 0) {
+        test_override_zero();
     } else if (std::strcmp(mode, "default") == 0) {
         test_default_formula();
         test_largest_fitting_n_ctx();
     } else {
-        std::fprintf(stderr, "usage: %s [--mode=default|--mode=override] (got --mode=%s)\n", argv[0], mode);
+        std::fprintf(stderr, "usage: %s [--mode=default|--mode=override|--mode=override-zero] (got --mode=%s)\n",
+                     argv[0], mode);
         return 2;
     }
 

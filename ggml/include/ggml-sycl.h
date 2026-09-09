@@ -320,12 +320,21 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // weights, but it lets KV/runtime consumers size cache/control allocations from
 // the active context instead of the model's training context.
 //
-// llama.cpp-oyfl: flash_attn_enabled is the caller's RESOLVED
-// cparams.flash_attn (AUTO already settled to true/false by this point --
-// see llama_context::llama_context in llama-context.cpp), not the raw
-// llama_flash_attn_type. When false, this also checks whether the
-// non-flash-attention batched mul_mat path's worst-case scratch demand at
-// (n_ctx, n_ubatch) fits the SCRATCH zone the arena already reserved, and
+// llama.cpp-oyfl: flash_attn_enabled is the caller's cparams.flash_attn,
+// not the raw llama_flash_attn_type -- but at the constructor's own call
+// (llama_context::llama_context, llama-context.cpp) an AUTO
+// llama_flash_attn_type has not been resolved yet and cparams.flash_attn
+// reads an optimistic `true` (see its init, same file): "not yet known to
+// be off" and "known to be on" are indistinguishable at that point, and
+// the guard is written to skip on true, so this call correctly does
+// nothing for an AUTO context until it resolves. That resolution and the
+// narrow re-check that follows it (ggml_backend_sycl_recheck_runtime
+// _context_flash_attn() below) are what actually evaluate an AUTO context
+// that turns out to resolve OFF. When flash_attn_enabled is false here (a
+// context whose flash attention is definitely off already), this also
+// checks whether the non-flash-attention batched mul_mat path's worst-case
+// scratch demand at (n_ctx, n_ubatch) fits the SCRATCH zone the arena
+// already reserved, and
 // refuses the update (logging the size arithmetic, same style as the KV
 // budget refusal) instead of leaving a shape that would abort mid-prefill.
 // This predicate is EMPIRICAL, not a modeled worst case: measured on both
@@ -999,6 +1008,24 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max,
+    bool                         flash_attn_enabled);
+
+// llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
+// against the CURRENTLY PUBLISHED plan's shape --
+// no KV replan, no MoE MMID reaccount/materialize, no plan republish, no
+// BUSY retry. For a caller whose n_ctx/n_ubatch have not changed and only
+// flash_attn_enabled has (an AUTO llama_flash_attn_type resolving after
+// ggml_backend_sycl_set_runtime_context_for_model()'s own initial call
+// above already ran with an unresolved, optimistic `true`): re-running the
+// full transaction would touch KV/MMID state that has no reason to change
+// and would retry the same deterministic decision under BUSY backoff for
+// no benefit. GGML_SYCL_LIFECYCLE_STALE_IDENTITY if the model token does
+// not match the currently published plan; GGML_SYCL_LIFECYCLE_PLAN_REJECTED
+// if the guard refuses (same message and arithmetic as the full
+// transaction's own check).
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn(
+    ggml_backend_t               backend,
+    struct ggml_sycl_model_token model,
     bool                         flash_attn_enabled);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.

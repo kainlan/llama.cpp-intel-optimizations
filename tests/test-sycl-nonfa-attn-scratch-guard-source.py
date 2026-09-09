@@ -121,29 +121,31 @@ def test_llama_context_threads_real_flash_attn_state():
 
 
 def test_guard_consults_the_demand_formula():
-    """ggml_backend_sycl_set_runtime_context() (ggml-sycl.cpp) must actually
-    call the exported demand formula and gate it on flash_attn_enabled --
-    declaring the parameter without consulting it would be a guard that
-    never fires."""
-    func_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
-    assert func_start != -1, "ggml_backend_sycl_set_runtime_context() definition not found in ggml-sycl.cpp"
+    """ggml_sycl_check_nonfa_attn_scratch() (ggml-sycl.cpp) -- the shared
+    helper both ggml_backend_sycl_set_runtime_context() and the narrow
+    ggml_backend_sycl_recheck_runtime_context_flash_attn() re-check funnel
+    into -- must actually call the exported demand formula and gate it on
+    flash_attn_enabled -- declaring the parameter without consulting it
+    would be a guard that never fires."""
+    func_start = GGML_SYCL_CPP_CODE.find("static bool ggml_sycl_check_nonfa_attn_scratch(")
+    assert func_start != -1, "ggml_sycl_check_nonfa_attn_scratch() definition not found in ggml-sycl.cpp"
     # Bound the search to this function's body: from the definition to the
     # next top-level function definition after it
-    # (ggml_backend_sycl_set_runtime_context_for_model), so a match cannot
-    # come from some unrelated later call site.
+    # (ggml_backend_sycl_set_runtime_context, the first of its two callers),
+    # so a match cannot come from some unrelated later call site.
     next_func = GGML_SYCL_CPP_CODE.find(
-        "ggml_backend_sycl_set_runtime_context_for_model(", func_start + 1
+        "void ggml_backend_sycl_set_runtime_context(", func_start + 1
     )
-    assert next_func != -1, "could not bound ggml_backend_sycl_set_runtime_context()'s body"
+    assert next_func != -1, "could not bound ggml_sycl_check_nonfa_attn_scratch()'s body"
     body = GGML_SYCL_CPP_CODE[func_start:next_func]
     body_norm = _normalize_ws(body)
 
-    assert "!flash_attn_enabled" in body_norm, (
-        "ggml_backend_sycl_set_runtime_context() must gate the non-FA scratch guard on "
+    assert "if (flash_attn_enabled) { return true; }" in body_norm, (
+        "ggml_sycl_check_nonfa_attn_scratch() must gate the non-FA scratch guard on "
         "flash_attn_enabled being false"
     )
     assert "unified_cache_nonfa_attn_scratch_demand_bytes(" in body_norm, (
-        "ggml_backend_sycl_set_runtime_context() must call "
+        "ggml_sycl_check_nonfa_attn_scratch() must call "
         "unified_cache_nonfa_attn_scratch_demand_bytes() to size the guard"
     )
     assert "zone_capacity(" in body_norm and "vram_zone_id::SCRATCH" in body_norm, (
@@ -154,9 +156,10 @@ def test_guard_consults_the_demand_formula():
         "a refusal must report the largest fitting n_ctx (same style as the KV budget refusal's "
         "ggml_sycl_largest_fitting_n_ctx()), not just an error with no remediation"
     )
-    assert "runtime context rejected" in body_norm, (
-        "this guard's own refusals must say \"runtime context rejected\", not reuse the pre-existing "
-        "KV budget refusal's \"runtime KV update rejected\" wording -- they are different checks"
+    assert "runtime context update rejected" in body_norm, (
+        "this guard's own refusals must say \"runtime context update rejected\", matching the "
+        "pre-existing KV budget refusal's \"runtime KV update rejected\" family of wording (both are "
+        "runtime-context-update refusals, just for different checks)"
     )
     assert "GGML_SYCL_NONFA_ATTN_SCRATCH_MB" not in body_norm, (
         "the runtime refusal must NOT advertise GGML_SYCL_NONFA_ATTN_SCRATCH_MB as a remediation -- "
@@ -180,6 +183,47 @@ def test_guard_consults_the_demand_formula():
         "\"raised\" when unified_cache_ensure_planned_arena_zones() could not rebuild (live weight "
         "leases) would misreport a no-op as a success"
     )
+
+
+def test_both_callers_wire_into_the_shared_guard():
+    """Both ggml_backend_sycl_set_runtime_context() (the full transaction)
+    and ggml_backend_sycl_recheck_runtime_context_flash_attn() (the narrow
+    re-check) must actually call the shared ggml_sycl_check_nonfa_attn_scratch()
+    helper -- a helper that exists and is correct but is never called by one
+    of its two intended entry points would leave that path's contexts
+    unguarded."""
+    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    assert full_start != -1, "ggml_backend_sycl_set_runtime_context() definition not found"
+    full_next = GGML_SYCL_CPP_CODE.find(
+        "ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1
+    )
+    assert full_next != -1, "could not bound ggml_backend_sycl_set_runtime_context()'s body"
+    full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
+    assert "ggml_sycl_check_nonfa_attn_scratch(" in full_body_norm, (
+        "ggml_backend_sycl_set_runtime_context() must call the shared guard helper"
+    )
+
+    recheck_start = GGML_SYCL_CPP_CODE.find(
+        "ggml_sycl_lifecycle_result ggml_backend_sycl_recheck_runtime_context_flash_attn("
+    )
+    assert recheck_start != -1, "ggml_backend_sycl_recheck_runtime_context_flash_attn() definition not found"
+    recheck_next = GGML_SYCL_CPP_CODE.find(
+        "void ggml_backend_sycl_set_runtime_n_ctx(", recheck_start + 1
+    )
+    assert recheck_next != -1, "could not bound ggml_backend_sycl_recheck_runtime_context_flash_attn()'s body"
+    recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
+    assert "ggml_sycl_check_nonfa_attn_scratch(" in recheck_body_norm, (
+        "ggml_backend_sycl_recheck_runtime_context_flash_attn() must call the shared guard helper -- "
+        "this is the entry point resolve_fused_ops() uses for an AUTO context resolving to non-FA, "
+        "so a missing call here would leave that specific context unguarded"
+    )
+
+    # The header declaration for the narrow re-check entry point must also
+    # exist, so llama-context.cpp compiles against a real exported symbol.
+    header_norm = _normalize_ws(GGML_SYCL_H_CODE)
+    assert (
+        "ggml_backend_sycl_recheck_runtime_context_flash_attn(" in header_norm
+    ), "ggml_backend_sycl_recheck_runtime_context_flash_attn() must be declared in ggml-sycl.h"
 
 
 def test_for_model_forwards_flash_attn_enabled():
@@ -211,41 +255,117 @@ def test_formula_and_inverse_are_declared_and_defined():
     # Neither may be declared `static` in the .cpp -- that would make them
     # unreachable from ggml-sycl.cpp, silently turning the guard above into
     # a compile error this text-only test cannot otherwise catch (a build is
-    # a stronger check, but this test runs without one).
+    # a stronger check, but this test runs without one). Checked as a
+    # negative pattern anchored to the definition's OWN signature (not an
+    # arbitrary N-character lookback window, which can miss "static" sitting
+    # further back than the window, or false-positive on an unrelated
+    # "static" from a prior statement that happens to fall inside it).
+    assert "static size_t unified_cache_nonfa_attn_scratch_demand_bytes(" not in cpp_norm, (
+        "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
+    )
     demand_def = cpp_norm.find("size_t unified_cache_nonfa_attn_scratch_demand_bytes(")
-    assert demand_def != -1
-    preceding = cpp_norm[max(0, demand_def - 40) : demand_def]
-    assert "static" not in preceding, "unified_cache_nonfa_attn_scratch_demand_bytes() must not be file-static"
+    assert demand_def != -1, "unified_cache_nonfa_attn_scratch_demand_bytes() definition not found in ggml-sycl/unified-cache.cpp"
 
 
 def test_auto_flash_attn_resolution_rechecks_the_guard():
     """cparams.flash_attn defaults true for AUTO before resolve_fused_ops()
     resolves it (llama-context.cpp's cparams init runs before the
     constructor's runtime-context call), so an AUTO context that resolves
-    to OFF must re-trigger the SYCL runtime-context call with the
-    now-resolved value, or the guard above never sees it for that context."""
+    to OFF must re-trigger a SYCL guard re-check with the now-resolved
+    value, or the guard above never sees it for that context.
+
+    Two DIFFERENT methods are involved, not one shared between both call
+    sites: sycl_resync_runtime_context_flash_attn() (the FULL
+    runtime-context transaction: KV replan, MoE MMID reaccount/materialize,
+    plan republish) is the constructor's OWN initial call, made before any
+    AUTO resolution; sycl_recheck_runtime_context_flash_attn() (a NARROW
+    re-check of only the non-FA attention scratch guard) is what
+    resolve_fused_ops() calls once AUTO actually resolves. Re-running the
+    full transaction from resolve_fused_ops() would needlessly redo KV/MMID
+    work that has no reason to change just because flash_attn_enabled did."""
     ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
     assert "void llama_context::sycl_resync_runtime_context_flash_attn()" in ctx_norm, (
-        "expected a shared helper re-running the runtime-context call, callable from both the "
-        "constructor and resolve_fused_ops()"
+        "expected the constructor's full-transaction helper to still exist"
+    )
+    assert "void llama_context::sycl_recheck_runtime_context_flash_attn()" in ctx_norm, (
+        "expected a separate narrow re-check helper for resolve_fused_ops() to call"
     )
 
+    # The constructor calls the FULL-transaction helper, not the narrow one.
+    # Bounded to the destructor that immediately follows it (not all the way
+    # to resolve_fused_ops(), which would also swallow the two helper
+    # methods' own definitions sitting in between and make this check
+    # imprecise about what "the constructor" actually means).
+    ctor_start = ctx_norm.find("llama_context::llama_context(")
+    assert ctor_start != -1, "llama_context::llama_context() definition not found"
+    dtor_start = ctx_norm.find("llama_context::~llama_context(", ctor_start + 1)
+    assert dtor_start != -1, "~llama_context() definition not found"
     resolve_start = ctx_norm.find("void llama_context::resolve_fused_ops(")
     assert resolve_start != -1, "resolve_fused_ops() definition not found"
+    assert ctor_start < dtor_start < resolve_start, (
+        "expected the constructor, then the destructor, then resolve_fused_ops(), in that order"
+    )
+    ctor_body = ctx_norm[ctor_start:dtor_start]
+    assert "sycl_resync_runtime_context_flash_attn();" in ctor_body, (
+        "the constructor must call the FULL-transaction sycl_resync_runtime_context_flash_attn() -- "
+        "it is where n_ctx/n_ubatch are established for the first time"
+    )
+    assert "sycl_recheck_runtime_context_flash_attn();" not in ctor_body, (
+        "the constructor must NOT call the narrow re-check -- that would skip the KV replan/MMID "
+        "reaccount a first-time call needs"
+    )
+
+    # resolve_fused_ops() calls the NARROW re-check, inside the same
+    # if (cparams.auto_fa) block that resolves flash_attn, so it fires
+    # exactly once, right when the real value becomes known -- and must NOT
+    # call the full-transaction helper (that would needlessly re-run KV/MMID
+    # work resolve_fused_ops() has no reason to touch).
     resolve_body = ctx_norm[resolve_start : resolve_start + 4000]
     assert re.search(r"if \(cparams\.auto_fa\) \{[^}]*resolve\([^;]*flash_attn[^;]*;[^}]*"
-                      r"sycl_resync_runtime_context_flash_attn\(\);", resolve_body), (
-        "resolve_fused_ops() must call sycl_resync_runtime_context_flash_attn() inside the same "
+                      r"sycl_recheck_runtime_context_flash_attn\(\);", resolve_body), (
+        "resolve_fused_ops() must call sycl_recheck_runtime_context_flash_attn() inside the same "
         "if (cparams.auto_fa) block that resolves flash_attn, so it fires exactly once, right when "
         "the real value becomes known"
     )
+    assert "sycl_resync_runtime_context_flash_attn();" not in resolve_body, (
+        "resolve_fused_ops() must NOT call the full-transaction helper -- only the narrow re-check"
+    )
 
-    # The helper's own header declaration exists too, so both callers compile
-    # against a real class member, not an undeclared symbol this test alone
-    # would not catch.
+    # Both helpers' own header declarations exist too, so both callers
+    # compile against real class members, not undeclared symbols this test
+    # alone would not catch.
     ctx_h = (ROOT / "src/llama-context.h").read_text()
     ctx_h_norm = _normalize_ws(strip_comments(ctx_h))
     assert "void sycl_resync_runtime_context_flash_attn();" in ctx_h_norm
+    assert "void sycl_recheck_runtime_context_flash_attn();" in ctx_h_norm
+
+
+_PREPROC_OPEN_RE = re.compile(r"^\s*#\s*(if|ifdef|ifndef)\b")
+_PREPROC_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
+_PREPROC_DNNL_IF_RE = re.compile(r"^\s*#\s*if\s+GGML_SYCL_DNNL\b")
+
+
+def _is_inside_if_dnnl(raw: str, position: int) -> bool:
+    """True if `position` falls lexically inside an #if GGML_SYCL_DNNL /
+    #endif block, tracking full nesting depth rather than the nearest
+    preceding #if/#endif tokens -- a last-match scan gives the wrong answer
+    as soon as an unrelated nested #if/#endif (or #ifdef/#ifndef) sits
+    between the #if GGML_SYCL_DNNL and the position being checked, because
+    the innermost #endif it finds may close that unrelated nested block
+    rather than the GGML_SYCL_DNNL one."""
+    depth = 0
+    dnnl_depth = None
+    for line in raw[:position].splitlines():
+        stripped = line.strip()
+        if _PREPROC_OPEN_RE.match(stripped):
+            depth += 1
+            if dnnl_depth is None and _PREPROC_DNNL_IF_RE.match(stripped):
+                dnnl_depth = depth
+        elif _PREPROC_ENDIF_RE.match(stripped):
+            if dnnl_depth is not None and depth == dnnl_depth:
+                dnnl_depth = None
+            depth = max(0, depth - 1)
+    return dnnl_depth is not None
 
 
 def test_plan_time_shape_is_recorded_unconditionally():
@@ -258,17 +378,13 @@ def test_plan_time_shape_is_recorded_unconditionally():
     # Comment-stripped text drops "#if GGML_SYCL_DNNL" lines too (they are
     # preprocessor directives, not comments -- re-check against the RAW,
     # comment-bearing source): the call site must not sit inside that guard.
+    # Tracked by nesting depth (see _is_inside_if_dnnl above), not by a
+    # nearest-preceding-token scan, which can misjudge across an unrelated
+    # nested #if/#endif sitting between the guard and the call site.
     raw = CACHE_CPP
     call_idx = raw.find("unified_cache_set_planned_nonfa_attn_scratch_shape(plan.device_id")
     assert call_idx != -1
-    # Find the nearest enclosing #if/#endif pair by scanning backward for the
-    # last #if GGML_SYCL_DNNL and the last #endif before the call; if the
-    # #endif comes after the #if (i.e. no #endif closed it before our call),
-    # the call is still inside that block.
-    before = raw[:call_idx]
-    last_if = before.rfind("#if GGML_SYCL_DNNL")
-    last_endif = before.rfind("#endif")
-    assert not (last_if != -1 and last_if > last_endif), (
+    assert not _is_inside_if_dnnl(raw, call_idx), (
         "unified_cache_set_planned_nonfa_attn_scratch_shape() call site must not be inside "
         "an #if GGML_SYCL_DNNL block"
     )

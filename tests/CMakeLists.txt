@@ -2325,9 +2325,9 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     # and its inverse) -- the sibling of the oneDNN Graph-scratch floor gate
     # immediately above, but NOT gated behind GGML_SYCL_DNNL (the path it
     # sizes for is the native SYCL/oneMath batched-mul_mat route, not a
-    # oneDNN one). Same two-registration shape for the same reason: the
-    # formula's env-var read is memoized once per process, so "default" and
-    # "override" cannot both run in one invocation.
+    # oneDNN one). Same multi-registration shape for the same reason: the
+    # formula's env-var read is memoized once per process, so "default",
+    # "override", and "override-zero" cannot share one invocation.
     llama_build(test-sycl-nonfa-attn-scratch-demand.cpp)
     target_include_directories(test-sycl-nonfa-attn-scratch-demand PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
     target_link_libraries(test-sycl-nonfa-attn-scratch-demand PRIVATE ggml-sycl)
@@ -2356,6 +2356,18 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-nonfa-attn-scratch-demand-override PROPERTIES
         LABELS "sycl"
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_NONFA_ATTN_SCRATCH_MB=77"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+    # Third registration: GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0 is a DISTINCT
+    # override value from both "unset" (--mode=default above) and "77"
+    # (--mode=override above) -- env_mb_override()'s memoized read means all
+    # three must run as separate processes, same reasoning as the two
+    # registrations above.
+    llama_test(test-sycl-nonfa-attn-scratch-demand NAME test-sycl-nonfa-attn-scratch-demand-override-zero ARGS --mode=override-zero)
+    set_tests_properties(test-sycl-nonfa-attn-scratch-demand-override-zero PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};GGML_SYCL_NONFA_ATTN_SCRATCH_MB=0"
         SKIP_RETURN_CODE 77
         TIMEOUT 60
     )

@@ -310,6 +310,24 @@ static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_
     return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
 }
+
+// llama.cpp-oyfl: lookup for the NARROW flash-attn-only re-check,
+// mirroring llama_context_sycl_runtime_proc() above but for
+// ggml_backend_sycl_recheck_runtime_context_flash_attn() (see that
+// declaration's comment, ggml-sycl.h, for why it is a separate entry point
+// rather than a second call into the full transaction).
+static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_context_sycl_recheck_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_recheck_runtime_context_flash_attn"));
+}
 #endif
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
@@ -918,11 +936,15 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-// llama.cpp-oyfl: shared by the constructor (right after model activation,
-// before any auto flash_attn_type is resolved) and resolve_fused_ops() (once
-// resolve_fused_ops() actually resolves an AUTO cparams.flash_attn) -- see
-// both call sites and the declaration in llama-context.h. Extracted rather
-// than duplicated so the two callers cannot drift on the lookup/retry logic.
+// llama.cpp-oyfl: the constructor's own call, right after model activation,
+// before any auto flash_attn_type is resolved -- the FULL runtime-context
+// transaction (KV replan, MoE MMID reaccount/materialize, plan republish),
+// since this is where n_ctx/n_ubatch are established for the context in the
+// first place. See the declaration in llama-context.h. resolve_fused_ops()
+// does NOT call this: once an AUTO flash_attn_type resolves, only
+// flash_attn_enabled has changed, so it calls the narrow
+// sycl_recheck_runtime_context_flash_attn() below instead, rather than
+// re-running this whole transaction for no reason.
 void llama_context::sycl_resync_runtime_context_flash_attn() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
@@ -954,6 +976,42 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             }
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
+            }
+        }
+    }
+#endif
+}
+
+// llama.cpp-oyfl: the narrow re-check, called ONLY by resolve_fused_ops()
+// once an AUTO flash_attn_type resolves. Calls
+// ggml_backend_sycl_recheck_runtime_context_flash_attn() (see its own
+// comment for why this is a separate, minimal entry point rather than a
+// second call into the full transaction above) -- no BUSY retry: that
+// transaction's own backoff exists for lock contention this read-only
+// re-check does not create.
+void llama_context::sycl_recheck_runtime_context_flash_attn() {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+#    ifdef GGML_USE_SYCL
+        auto recheck_fn =
+            llama_context_dev_is_sycl(dev) ? &ggml_backend_sycl_recheck_runtime_context_flash_attn : nullptr;
+#    else
+        auto recheck_fn = llama_context_sycl_recheck_proc(dev);
+#    endif
+        if (recheck_fn) {
+            const auto & owner = model.get_sycl_model_token();
+            if (owner.model_id == 0 || owner.load_txn_id == 0) {
+                continue;
+            }
+            const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
+                                                  owner.slot_generation };
+            const auto                  rc    = recheck_fn(backend.get(), token, cparams.flash_attn);
+            if (rc != GGML_SYCL_LIFECYCLE_OK) {
+                throw std::runtime_error(
+                    format("non-FA attention scratch guard rejected the resolved "
+                           "flash-attention state: result=%d",
+                           (int) rc));
             }
         }
     }
@@ -1046,11 +1104,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         // real, hardware-resolved value. The SYCL non-FA attention scratch
         // guard threaded through the constructor's runtime-context call saw
         // the pre-resolution value and would have skipped the check for an
-        // AUTO context that just resolved to OFF. Re-run it now that the
+        // AUTO context that just resolved to OFF. Re-check it now that the
         // real value is known -- still inside sched_reserve(), called from
         // the constructor, so a refusal here is still a clean exception,
-        // not a mid-prefill abort.
-        sycl_resync_runtime_context_flash_attn();
+        // not a mid-prefill abort. Narrow re-check only: n_ctx/n_ubatch
+        // have not changed, only flash_attn_enabled has, so this does not
+        // need the full runtime-context transaction.
+        sycl_recheck_runtime_context_flash_attn();
     }
 
     if (cparams.auto_fgdn) {

@@ -267,17 +267,27 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
-    // llama.cpp-oyfl: re-run the SYCL runtime-context call (the same one the
-    // constructor makes right after model activation) with the now-resolved
-    // cparams.flash_attn, for every SYCL backend. The constructor's own call
-    // runs before an AUTO flash_attn_type is resolved (resolve_fused_ops(),
-    // called from sched_reserve(), runs later in the same construction
-    // sequence), so an AUTO context that resolves to OFF would otherwise
-    // never have its non-FA attention scratch guard checked. Called once,
-    // from resolve_fused_ops() itself, only when it just performed that
-    // resolution -- still inside context construction/reservation, before
-    // any inference, so a refusal here is still a clean exception.
+    // llama.cpp-oyfl: the SYCL runtime-context call the constructor makes
+    // right after model activation, for every SYCL backend -- the FULL
+    // transaction (KV replan, MoE MMID reaccount/materialize, plan
+    // republish). One caller, the constructor itself: resolve_fused_ops()
+    // does NOT call this -- it calls the narrow
+    // sycl_recheck_runtime_context_flash_attn() below instead, since by
+    // then only flash_attn_enabled has changed, not n_ctx/n_ubatch.
     void sycl_resync_runtime_context_flash_attn();
+
+    // llama.cpp-oyfl: a NARROW re-check of only the non-FA attention
+    // scratch guard, called once from resolve_fused_ops()
+    // when an AUTO flash_attn_type actually resolves -- the constructor's
+    // own call above runs before that resolution and sees an optimistic
+    // `true`, so an AUTO context that resolves to OFF would otherwise never
+    // have this guard evaluated. Calls
+    // ggml_backend_sycl_recheck_runtime_context_flash_attn() (ggml-sycl.h),
+    // not the full transaction above: n_ctx/n_ubatch have not changed, only
+    // flash_attn_enabled has, so no KV replan, MMID reaccount, or BUSY
+    // retry is needed. Still inside context construction/reservation,
+    // before any inference, so a refusal here is still a clean exception.
+    void sycl_recheck_runtime_context_flash_attn();
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
