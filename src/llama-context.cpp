@@ -918,12 +918,24 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-// llama.cpp-oyfl: shared by the constructor (right after model activation,
-// before any auto flash_attn_type is resolved) and resolve_fused_ops() (once
-// resolve_fused_ops() actually resolves an AUTO cparams.flash_attn) -- see
-// both call sites and the declaration in llama-context.h. Extracted rather
-// than duplicated so the two callers cannot drift on the lookup/retry logic.
-void llama_context::sycl_resync_runtime_context_flash_attn() {
+// llama.cpp-oyfl: shared by three callers -- the constructor (right after
+// model activation, before any auto flash_attn_type is resolved), resolve
+// _fused_ops() (once it actually resolves an AUTO cparams.flash_attn), and
+// sched_reserve() (once its graph-reserve passes complete and the SYCL
+// backend's real compute-buffer size is known) -- see all three call sites
+// and the declaration in llama-context.h. Extracted rather than duplicated
+// so the callers cannot drift on the lookup/retry logic.
+//
+// query_reserved_compute_buffer is false for the first two callers, which
+// necessarily run before sched_reserve()'s graph-reserve passes have
+// allocated anything -- the guard then receives 0 for
+// reserved_compute_buffer_bytes, which only makes its check MORE
+// conservative (it omits crediting the guard with a compute buffer that
+// does not exist yet), never less. Only sched_reserve()'s own call passes
+// true, so the per-backend size is queried right here, inside the loop --
+// correct per-device even with multiple SYCL backends (multi-GPU), unlike
+// passing one externally-computed value in.
+void llama_context::sycl_resync_runtime_context_flash_attn(bool query_reserved_compute_buffer) {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     for (auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -940,8 +952,10 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             }
             const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                   owner.slot_generation };
+            const size_t                reserved_compute_buffer_bytes =
+                query_reserved_compute_buffer ? ggml_backend_sched_get_buffer_size(sched.get(), backend.get()) : 0;
             auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                         cparams.flash_attn);
+                                         cparams.flash_attn, reserved_compute_buffer_bytes);
             // Context construction may overlap enough live updates to
             // exhaust the model's finite ticket pool transiently. Wait
             // with bounded exponential backoff instead of spinning three
@@ -950,7 +964,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                        cparams.flash_attn);
+                                        cparams.flash_attn, reserved_compute_buffer_bytes);
             }
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
@@ -1186,6 +1200,18 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
     }
+
+    // llama.cpp-oyfl: the authoritative non-FA attention scratch guard
+    // check. graph_reserve() above reserved the compute buffer at the KV
+    // cache's own (small, padded) reserve-time n_kv -- llama_kv_cache::
+    // get_n_kv() (llama-kv-cache.cpp) sizes it from currently-used cells,
+    // which is 0 this early, not the full cparams.n_ctx -- so the buffer
+    // WILL regrow, outside the SYCL arena, once a real ubatch reaches this
+    // context's actual n_kv. Re-run the runtime-context call now that the
+    // real reserved size is known, still inside construction/reservation,
+    // so a refusal here is still a clean exception rather than the abort
+    // that regrowth can otherwise trigger mid-prefill.
+    sycl_resync_runtime_context_flash_attn(/*query_reserved_compute_buffer=*/true);
 
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);

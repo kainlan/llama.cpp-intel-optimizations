@@ -132,7 +132,9 @@ struct lifecycle_fixture {
         // test-q1-nvfp4-admitted-device.cpp; this test does not exercise the
         // non-FA attention scratch guard.
         require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1,
-                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                                                                /*flash_attn_enabled=*/true,
+                                                                /*reserved_compute_buffer_bytes=*/0) ==
+                    GGML_SYCL_LIFECYCLE_OK,
                 "execution context/model bind failed");
         ggml_sycl_execution_snapshot state{};
         require(ggml_backend_sycl_execution_context_extract(context, &state) == GGML_SYCL_EXECUTION_OK &&
