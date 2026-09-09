@@ -2313,6 +2313,39 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
         TIMEOUT 60
     )
 
+    # Decisive-experiment probe for llama.cpp-c6ah's own premise (see the
+    # file's own header comment): does the bare
+    # evt.get_info<command_execution_status>() query actually block on a
+    # profiling-enabled queue, for both a host_task-produced event and a
+    # device-kernel-produced one. Pure raw SYCL -- does not touch
+    # onednn_graph_scratch_*, unified_cache, or any other ggml-sycl symbol,
+    # so unlike the two registrations above it needs neither
+    # target_link_libraries(... ggml-sycl) nor the matching
+    # COMPILE_DEFINITIONS propagation.
+    #
+    # Labelled `sycl` only (no `cache`/`mem-handle`) since it allocates one
+    # small device buffer, not the pool/arena machinery those labels exist
+    # to flag for the throttled full-suite sweep.
+    llama_build(test-sycl-event-status-blocking-probe.cpp)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-event-status-blocking-probe PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-event-status-blocking-probe PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-event-status-blocking-probe PRIVATE "-fsycl")
+        target_link_options(test-sycl-event-status-blocking-probe PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-event-status-blocking-probe)
+    # ENVIRONMENT: same LD_LIBRARY_PATH/selector reasoning as every sibling
+    # SYCL gate above. GGML_TEST_SPIN_ITERATIONS is deliberately NOT set
+    # here -- the binary's own built-in default is what ctest exercises;
+    # override it by hand for a bare (non-ctest) re-calibration run.
+    set_tests_properties(test-sycl-event-status-blocking-probe PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+
     # Runtime gate for the SYCL settings self-report (llama.cpp-5bd8). Drives a
     # real registry -> ggml_backend_dev_init -> ggml_check_sycl() init and
     # asserts the report reaches the log callback. A source assertion would not
