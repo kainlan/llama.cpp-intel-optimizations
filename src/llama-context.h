@@ -268,26 +268,16 @@ private:
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // llama.cpp-oyfl: re-run the SYCL runtime-context call (the same one the
-    // constructor makes right after model activation), for every SYCL
-    // backend. Three callers: the constructor's own initial call; resolve
-    // _fused_ops(), once an AUTO flash_attn_type actually resolves (the
-    // constructor's own call runs before that resolution, so an AUTO
-    // context that resolves to OFF would otherwise never have its non-FA
-    // attention scratch guard checked); and sched_reserve(), once its
-    // graph-reserve passes complete and the SYCL backend's real compute
-    // -buffer size is known (see reserved_compute_buffer_bytes below) --
-    // this last call is the guard's authoritative one. All three run still
-    // inside context construction/reservation, before any inference, so a
-    // refusal from any of them is still a clean exception, never a
-    // mid-prefill abort.
-    //
-    // query_reserved_compute_buffer: true only for sched_reserve()'s own
-    // call, made after its graph-reserve passes complete -- queries
-    // ggml_backend_sched_get_buffer_size() per SYCL backend and forwards it
-    // as reserved_compute_buffer_bytes. False (the default, used by the
-    // constructor and resolve_fused_ops()) forwards 0, which only makes
-    // that call's check MORE conservative, never less.
-    void sycl_resync_runtime_context_flash_attn(bool query_reserved_compute_buffer = false);
+    // constructor makes right after model activation) with the now-resolved
+    // cparams.flash_attn, for every SYCL backend. The constructor's own call
+    // runs before an AUTO flash_attn_type is resolved (resolve_fused_ops(),
+    // called from sched_reserve(), runs later in the same construction
+    // sequence), so an AUTO context that resolves to OFF would otherwise
+    // never have its non-FA attention scratch guard checked. Called once,
+    // from resolve_fused_ops() itself, only when it just performed that
+    // resolution -- still inside context construction/reservation, before
+    // any inference, so a refusal here is still a clean exception.
+    void sycl_resync_runtime_context_flash_attn();
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

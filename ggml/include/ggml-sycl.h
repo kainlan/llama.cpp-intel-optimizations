@@ -324,27 +324,22 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // cparams.flash_attn (AUTO already settled to true/false by this point --
 // see llama_context::llama_context in llama-context.cpp), not the raw
 // llama_flash_attn_type. When false, this also checks whether the
-// non-flash-attention batched mul_mat path can run without exhausting the
-// VRAM outside the fixed arena (the SCRATCH zone's own overflow, the oneDNN
-// scratchpad's fragmentation-driven overflow, and the scheduler's own
-// compute buffer regrowing to the real n_kv -- see the derivation comment on
-// this function's definition, ggml-sycl.cpp), and refuses the update
-// (logging the size arithmetic, same style as the KV budget refusal)
-// instead of leaving a shape that would abort mid-prefill.
-//
-// reserved_compute_buffer_bytes is ggml_backend_sched_get_buffer_size() for
-// this SYCL backend, read AFTER llama_context::sched_reserve()'s graph
-// -reserve passes complete -- 0 for any call made before that point (the
-// constructor's initial call and the one made when an AUTO flash_attn_type
-// resolves both necessarily run earlier and pass 0, which only makes their
-// check MORE conservative, never less; the post-reserve call is the
-// authoritative one).
+// non-flash-attention batched mul_mat path's worst-case scratch demand at
+// (n_ctx, n_ubatch) fits the SCRATCH zone the arena already reserved, and
+// refuses the update (logging the size arithmetic, same style as the KV
+// budget refusal) instead of leaving a shape that would abort mid-prefill.
+// This predicate is EMPIRICAL, not a modeled worst case: measured on both
+// discrete cards, any demand above the zone aborts regardless of how much
+// VRAM is free outside the fixed arena (a ~2-4 GB outside-arena consumer
+// specific to this path is unexplained and tracked separately,
+// llama.cpp-k1ev) -- an earlier revision of this comment described a
+// live-free-VRAM predicate that hardware measurement falsified; do not
+// reintroduce it without first closing k1ev.
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                                             uint32_t       n_ctx,
                                                             uint32_t       n_ubatch,
                                                             uint32_t       n_seq_max,
-                                                            bool           flash_attn_enabled,
-                                                            size_t         reserved_compute_buffer_bytes);
+                                                            bool           flash_attn_enabled);
 
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
@@ -996,17 +991,15 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
 // Foundation model-bound runtime update. Context/graph code will call this
 // automatically in 1q72; callers currently bind explicitly.
 //
-// llama.cpp-oyfl: flash_attn_enabled and reserved_compute_buffer_bytes
-// forward to ggml_backend_sycl_set_runtime_context() -- see that
-// declaration's comment.
+// llama.cpp-oyfl: flash_attn_enabled forwards to
+// ggml_backend_sycl_set_runtime_context() -- see that declaration's comment.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max,
-    bool                         flash_attn_enabled,
-    size_t                       reserved_compute_buffer_bytes);
+    bool                         flash_attn_enabled);
 
 // Execution-lifecycle context identity is separate from the model lifecycle.
 // One ContextId is allocated per llama_context and then bound to each SYCL
