@@ -1832,16 +1832,20 @@ non-flash-attention batched mul_mat scratch demand
 **not** that kind of consumer: nothing it needs is a weight tensor. When
 flash attention is off, each layer's attention runs through
 `ggml_sycl_mul_mat_batched_sycl()` (`ggml-sycl.cpp`) twice — KQ =
-`mul_mat(K, Q)`, then KQV = `mul_mat(V, softmax(KQ))` — and both calls stage
-their non-f16 operand into an f16 buffer via `scoped_unified_queue_temp`, a
-COMPUTE-role transient that *prefers* the SCRATCH zone
-(`ggml_sycl_transient_device_intent()`, `common.hpp`). The KQV call's staged
-operand is `kq_soft_max`, shaped `[n_kv, n_ubatch, n_head]` — at long context
-this dwarfs the KQ call's staged Q operand — so the formula keeps only that
-term:
+`mul_mat(K, Q)`, then KQV = `mul_mat(V, softmax(KQ))` — and both calls
+stage their non-f16 operand into an f16 buffer via
+`scoped_unified_queue_temp`, whose shape comes from
+`ggml_sycl_transient_device_intent()` (`common.hpp`): on the calling
+thread's COMPUTE path — not recording a command graph, the common case
+for this dispatch — that sets `prefer_vram_zone = SCRATCH`; while
+recording, it takes the GRAPH_TMP shape instead and does not name SCRATCH
+at all. This formula models the COMPUTE-path demand. The
+KQV call's staged operand is `kq_soft_max`, shaped
+`[n_kv, n_ubatch, n_head]` — at long context this dwarfs the KQ call's
+staged Q operand — so the formula keeps only that term:
 
 ```
-demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3 / 2
+demand = n_head * n_ubatch * n_ctx * sizeof(f16) * 3
 ```
 
 **Rule for adding a consumer, extended:** when the demand scales with
@@ -1855,40 +1859,96 @@ the oneDNN triplet, because it is unconditional while the oneDNN one is
 gated behind `GGML_SYCL_DNNL`), called from `populate_host_zone_sizing()`
 right where `plan.planner_n_head/n_ubatch/n_ctx` are already known.
 
-**The c=3/2 concurrency factor is carried over by analogy, not
-independently measured.** The oneDNN floor's own c=1.5 came from five real
-captures (llama.cpp-0oxf, comment c-xcop) showing ~5 SDPA scratch buffers
-concurrently in flight even on an idle host, because
-`scoped_unified_queue_temp::release()` submits a marker event and retains
-the handle until it completes rather than freeing synchronously. The non-FA
-consumer shares that exact release mechanism, so a nonzero concurrency
-factor is the right shape of correction — but no GPU access was available
-when this was authored, so treat
-`unified_cache_nonfa_attn_scratch_demand_bytes()` as a starting floor to
-tighten from a real capture, not a validated constant, the same caveat the
-oneDNN floor's own doc comment carries for its window-aware refinement
-(gemma4, tracked llama.cpp-o3a0).
+**The c=3 concurrency factor is MEASURED from the llama.cpp-oyfl repro
+log, not carried over by analogy.** An earlier version of this formula
+copied the oneDNN floor's c=1.5 by analogy, and it under-covered the
+repro: the log (session scratchpad `oyfl/fa_off-2026-09-07.log`) shows the
+SCRATCH zone at 460.0 MB of its 512 MB capacity immediately before the
+failing request, whose own raw (no concurrency factor) demand at that
+shape (n_head=32, n_ubatch=512, n_ctx=8192) is exactly 256 MiB — so the
+real pressure was `460 + 256 = 716` MiB against a 256 MiB single-shot
+request, a ratio of ~2.8x. c=3 clears that with a small margin. The
+concurrency is not "one buffer plus headroom": `scoped_unified_queue_temp
+::release()` (`ggml-sycl.cpp`) submits a marker event and keeps the handle
+alive until it completes rather than freeing synchronously, and a
+16-ubatch pp8192 run submits GPU work faster than each ubatch's release
+event resolves, so several of the immediately preceding (smaller but
+still substantial) ubatches' requests are typically still occupying the
+zone when the largest one arrives. This is inferred from **one** repro's
+zone-state snapshot, not fit to several independent hardware measurements
+the way the oneDNN c=1.5 was (five captures, llama.cpp-0oxf comment
+c-xcop) — treat it as a floor to tighten from a real multi-point capture,
+not a validated constant. `GGML_SYCL_NONFA_ATTN_SCRATCH_MB` overrides the
+formula outright, so a future measurement needs no code change.
 
-**Where this can and cannot help.** Like every zone above, the SCRATCH zone
-is sized once, before the arena's single physical chunk is allocated at
-model load — raising it later cannot resize that chunk.
+**Where this can and cannot help, and why the automatic case is
+llama.cpp-fkpg's scope, not this one's.** Like every zone above, the
+SCRATCH zone is sized once, before the arena's single physical chunk is
+allocated at model load — raising it later cannot resize that chunk.
 `ensure_planned_arena_zones()` raises `scratch_zone` from this formula the
-same way it raises `onednn_zone` and `runtime_zone` from theirs, but at
-model-load time the envelope's
-`flash_attn_type` is always `AUTO` (`llama-model.cpp` hardcodes it) and
-`plan.planner_n_ctx` is the load-time conservative default, not the context
-a later `llama_new_context_with_model()` will actually request
-(llama.cpp-fkpg) — so this plan-time raise is defense in depth, not the
-fix. The authoritative check is in
-`ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`), which runs once
-the REAL `n_ctx`/`n_ubatch` and the caller's resolved `flash_attn_enabled`
-(threaded from `llama-context.cpp`'s `cparams.flash_attn`) are known: it
-compares the demand against `zone_capacity(vram_zone_id::SCRATCH)` — the
-zone's actual reserved size, fixed since arena reservation — and refuses the
-context update (same style, same call site, as the pre-existing KV budget
-refusal) rather than let `ggml_sycl_mul_mat_batched_sycl()`'s fallback ladder
-abort mid-prefill with `GGML_ABORT("batched F16 mul_mat failed — no
-recovery path available.")`.
+same way it raises `onednn_zone` and `runtime_zone` from theirs (bounded to
+a quarter of the available budget, same reasoning as the oneDNN clamp), but
+for the standard model-load flow this can never fire with the real shape:
+`llama_model_sycl_make_placement_envelope()` (`llama-model.cpp`) hardcodes
+`envelope.n_ctx = 0` unconditionally, so no caller's real `-c`/`-p` reaches
+`plan.planner_n_ctx` before weights stream into the arena. Piping the real
+context size back into pre-load sizing is llama.cpp-fkpg's scope — this
+raise only takes effect automatically once that lands, or manually today by
+setting `GGML_SYCL_NONFA_ATTN_SCRATCH_MB` as a process environment variable
+before the model loads (read at the same first-reservation call as the
+pre-existing `GGML_SYCL_COMPUTE_ARENA_MB`, so a value the operator already
+knows sidesteps the gap entirely). `ggml_backend_sycl_set_runtime_context()`
+also makes one opportunistic re-plan attempt with the real runtime shape
+(`unified_cache_ensure_planned_arena_zones()`, the same call
+`reserve_onednn_scratch()`'s own comment already documents as succeeding
+only in "the rare case where the arena is still empty") — cheap and
+harmless, but not expected to succeed once weights hold live leases.
+
+The authoritative, always-effective check is in
+`ggml_backend_sycl_set_runtime_context()` (`ggml-sycl.cpp`), which runs
+once the REAL `n_ctx`/`n_ubatch` and the caller's resolved
+`flash_attn_enabled` (threaded from `llama-context.cpp`'s
+`cparams.flash_attn`) are known: it compares the demand against
+`zone_capacity(vram_zone_id::SCRATCH)` — the zone's actual reserved size,
+fixed since arena reservation — and refuses the context update (same
+style, same call site, as the pre-existing KV budget refusal) rather than
+let `ggml_sycl_mul_mat_batched_sycl()`'s fallback ladder abort mid-prefill
+with `GGML_ABORT("batched F16 mul_mat failed — no recovery path
+available.")`. The refusal names the exact
+`GGML_SYCL_NONFA_ATTN_SCRATCH_MB` value that would let this specific shape
+proceed, so a refused run always carries its own remediation.
+
+**Why capacity, not live free space, is the right comparison here.** A
+context-creation-time guard cannot read `zone_used(SCRATCH)` and compare
+against the remainder: at that point no prefill has run yet, so the zone
+reads near-empty regardless of what a later, real pp8192 run would push
+into it (the 460 MB occupancy the c=3 derivation above cites is a
+mid-prefill snapshot, not something visible before the first token is
+processed). The only number available this early that bounds the WORST
+CASE the zone will ever need to hold is its own fixed capacity, so that is
+what this check compares against — a live-usage comparison would read
+"empty, proceed" on every context and never catch anything.
+
+**A second, complementary check** compares a coarser whole-plan estimate —
+`next_plan.vram_bytes` (weights + KV, the same total the KV budget refusal
+already tracks) plus this consumer's own transient demand (the KQ/KQV f32
+scheduler buffer, counted ONCE — see below — plus the f16 staging demand
+above) — against `next_plan.vram_budget`. This is NOT what explains or
+catches the Mistral 7B Q4_0 repro: at that shape weights+KV is only ~4.9 GB
+against a 14.6 GB budget, so this check does not fire there even with the
+transient terms added; the SCRATCH-zone-capacity check above is what fires
+and explains the repro. This second check exists for a different, larger
+regime this repro does not exercise — a model whose weights+KV footprint
+already sits close to the device budget, where the SCRATCH zone might still
+have nominal capacity but the whole plan would not actually fit once the
+non-FA transient is added. The KQ (before softmax) and `kq_soft_max` (after)
+tensors are counted as **one** f32 buffer, not two: `ggml_gallocr_allocate
+_node()` (`ggml-alloc.c`) reuses a parent's buffer in place when the op
+supports it (`ggml_op_can_inplace()` includes `GGML_OP_SOFT_MAX`), the
+parent has exactly one consumer, and the layouts match — all three hold for
+`llama-graph.cpp`'s `kq = ggml_soft_max_ext(ctx0, kq, ...)`, which reassigns
+`kq` to the softmax result with the pre-softmax `kq` having no other
+consumer.
 
 ### Known limits (load-bearing — read before changing any of this)
 
