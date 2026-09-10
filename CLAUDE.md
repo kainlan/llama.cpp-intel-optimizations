@@ -396,8 +396,10 @@ Allocation **provenance** is an authority, not a hint: an owner's
 things, what survives destructive teardown. `CACHE_BACKING` must never become
 requestable through a public field — it is mintable only via the private
 `cache_backing_token` (pinned pool, compiler-enforced) or the TU-static bootstrap
-adopt for the cache's own staging buffer (gate-enforced); see the canonical
-contract §3.1.
+adopt, whose two allowlisted sites are the cache's own staging buffer
+(`unified_cache:staging`) and the oneDNN Graph-scratch pool's completion-flag slab
+(`unified_cache:onednn_graph_scratch_flag_slab`); a third site fails the gate. See
+the canonical contract §3.1.
 
 `mem_handle` is the ownership and lifetime token. Code that uses an allocation
 must hold a `mem_handle` (or an object that owns one) until the CPU thread,

@@ -143,6 +143,7 @@
 #include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
+#include "sycl-spin-kernel.hpp"
 #include "test-skip.h"
 
 #include <cstdio>
@@ -281,25 +282,11 @@ constexpr int kSlowReleaseMs = 1500;
 // instead of the predicted ~1500 ms and a dedicated probe traced the
 // discrepancy to exactly this event-source difference.
 //
-// One work-item spin kernel, reading and writing a device-global cell
-// every iteration so the loop cannot be folded away at compile time (each
-// iteration's value depends on the PREVIOUS iteration's write to device
-// memory, which the compiler cannot know ahead of time) -- deliberately
-// serial, not parallel: the point is wall-clock duration on one device
-// compute unit, matching test-sycl-event-status-blocking-probe.cpp's own
-// kernel shape exactly, so this file's timings are comparable to that
-// probe's.
-sycl::event submit_spin_kernel(sycl::queue & q, int * cell, long long iterations) {
-    return q.submit([&](sycl::handler & h) {
-        h.single_task([=]() {
-            int acc = 0;
-            for (long long i = 0; i < iterations; ++i) {
-                acc   = acc + *cell + 1;
-                *cell = acc;
-            }
-        });
-    });
-}
+// submit_spin_kernel() now lives in the shared tests/sycl-spin-kernel.hpp
+// (llama.cpp-me60 F7, included above) -- the same definition
+// test-sycl-event-status-blocking-probe.cpp uses, so this file's timings
+// stay comparable to that probe's by construction rather than by an
+// unenforced "matches exactly" comment.
 
 // llama.cpp-c6ah: the ACTUAL device-measured duration of an event ALREADY
 // known to be complete (command_end - command_start, both in nanoseconds

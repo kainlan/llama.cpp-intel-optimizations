@@ -4517,6 +4517,20 @@ bool unified_cache::shutdown_resources() {
         onednn_activations_scratch_owner_ = {};
         staging_                          = nullptr;
         staging_owner_                    = {};
+#if GGML_SYCL_DNNL
+        // llama.cpp-me60: symmetry with staging_owner_ above -- the actual
+        // physical release is shutdown-guarded at its source (see this
+        // field's own declaration comment in unified-cache.hpp), so
+        // resetting the owner here is harmless and keeps this branch's
+        // handling consistent with every other *_owner_ member reset above.
+        // Also null the raw pointer and clear the free list here, matching
+        // the normal path's release below: a raw pointer must not outlive
+        // its owning handle on ANY path, abandon included, even though
+        // nothing on this path can dereference it before the process exits.
+        onednn_graph_scratch_flag_slab_ = nullptr;
+        onednn_graph_scratch_flag_slot_free_list_.clear();
+        onednn_graph_scratch_flag_slab_owner_ = {};
+#endif
         // Leak host_arena_ to prevent pinned_chunk_pool destructor calling sycl::free
         // on an invalid SYCL context (safe shutdown pattern).
         (void) host_arena_.release();
@@ -4561,6 +4575,13 @@ bool unified_cache::shutdown_resources() {
         onednn_activations_scratch_owner_ = {};
         staging_                          = nullptr;
         staging_owner_                    = {};
+#if GGML_SYCL_DNNL
+        // llama.cpp-me60: same reasoning as the g_sycl_shutting_down branch
+        // above -- see that occurrence's own comment.
+        onednn_graph_scratch_flag_slab_ = nullptr;
+        onednn_graph_scratch_flag_slot_free_list_.clear();
+        onednn_graph_scratch_flag_slab_owner_ = {};
+#endif
         // Leak host_arena_ to avoid sycl::free on an invalid context.
         (void) host_arena_.release();
         // llama.cpp-0oxf: same reasoning as the
@@ -4858,6 +4879,41 @@ bool unified_cache::shutdown_resources() {
     staging_       = nullptr;
     staging_size_  = 0;
     staging_owner_ = {};
+
+#if GGML_SYCL_DNNL
+    // llama.cpp-me60 (F1): release the oneDNN Graph-scratch pool's
+    // completion-flag slab here, on the NORMAL shutdown path -- it must not
+    // be left to ~unified_cache() member destruction. The slab is adopted
+    // into the global runtime-allocation registry as a bootstrap
+    // CACHE_BACKING control (onednn_graph_scratch_ensure_flag_slab_locked()),
+    // but unified_cache_shutdown_retryable_postconditions_clean()'s sweep
+    // (called by shutdown_unified_cache(), after every cache's
+    // shutdown_resources() has already run) is CLASS-BLIND: it classifies a
+    // registry row only via contains_pinned()/contains_pinned_backing_allocation()
+    // against host_arena_, never consulting allocation_control_class, so a
+    // still-live slab row -- host USM outside the pinned pool -- fails that
+    // sweep regardless of being CACHE_BACKING. Every OTHER bootstrap
+    // allocation this function owns is already released explicitly above
+    // (staging_owner_ just above; dma_staging_allocs_ next) for exactly
+    // this reason; the slab was the one exception.
+    //
+    // Placed here, after this function's own drain_all_queues_noexcept()
+    // call and onednn_graph_scratch_clear_pool_locked() (both earlier in
+    // this function) have already run: the drain synced every queue, and
+    // the pool clear ran after it, so no marker kernel can still be
+    // targeting this slab by this point -- releasing it now cannot race a
+    // device write through it. Locked, even though nothing else can be
+    // touching the slab at this point in a normal teardown, for
+    // consistency with every other access to these members
+    // (onednn_graph_scratch_mutex_ guards them everywhere else in this
+    // class).
+    {
+        std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
+        onednn_graph_scratch_flag_slab_ = nullptr;
+        onednn_graph_scratch_flag_slot_free_list_.clear();
+        onednn_graph_scratch_flag_slab_owner_ = {};
+    }
+#endif
 
     // Free DMA staging buffers
     for (size_t i = 0; i < dma_staging_buffers_.size(); ++i) {
@@ -10288,6 +10344,16 @@ static size_t onednn_graph_scratch_direct_cap_bytes(size_t plan_time_available_b
 
 static constexpr uint32_t kOnednnGraphDirectFailureDrainTimeoutMs = 2000;
 static constexpr uint32_t kOnednnGraphDirectWaitPollTimeoutMs     = 200;
+// llama.cpp-me60: this 5 s budget is measured from wait_loop_entry,
+// captured near the top of
+// onednn_graph_scratch_wait_for_direct_headroom_locked() -- before that
+// function's own pre-loop eviction sweep runs, not from the first
+// iteration of the poll loop itself. So whatever real time the eviction
+// sweep spends already counts against this budget by the time the poll
+// loop's own deadline is computed from that same timestamp. The
+// oversized-request early-out (also in that function, after the sweep)
+// returns before any deadline is ever computed at all, so it does not
+// read wait_loop_entry and is not bounded by this constant.
 static constexpr uint32_t kOnednnGraphDirectWaitTotalTimeoutMs    = 5000;
 
 // llama.cpp-0oxf: how many idle (event-complete-or-not) entries the reuse
@@ -15468,7 +15534,8 @@ allocation_result unified_allocate_owner_backing(const alloc_request & req, cach
     // Reaching this overload required constructing a cache_backing_token, which
     // only pinned_chunk_pool can do. The token is the whole authority; nothing
     // about req is trusted to establish it. This is the pinned pool's mint path;
-    // the cache's own staging buffer bootstraps separately through the TU-static
+    // the cache's own staging buffer and the oneDNN Graph-scratch completion-flag
+    // slab bootstrap separately through the TU-static
     // unified_cache_adopt_raw_host_allocation() (see allocation-provenance.hpp).
     return unified_allocate_owner_impl(req, true);
 }
@@ -18833,6 +18900,98 @@ bool shutdown_unified_cache() {
             release_coordinators.push_back(item.second);
         }
     }
+    // Explicit module shutdown runs while SYCL is still valid. Detach the map
+    // under its lock, then destroy caches without the registry lock held so
+    // mem_handle release callbacks cannot deadlock on cache lookup.
+    //
+    // llama.cpp-me60: this capture -- and owner_snapshot right beside it,
+    // which is just g_device_caches's own contents in a different container
+    // (compare capture_runtime_allocation_owner_snapshot()'s body to this
+    // block) -- moved ahead of the pre-teardown census below, specifically
+    // so the drain-and-reclaim pass just after it can run before that
+    // census. Module mutation admission is closed. Retain a stable owner
+    // snapshot, then drop the map lock before callbacks/free paths that may
+    // re-enter cache lookup or allocation bookkeeping.
+    std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
+    runtime_allocation_owner_snapshot                      owner_snapshot;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
+        caches = g_device_caches;
+        owner_snapshot = capture_runtime_allocation_owner_snapshot();
+    }
+
+#if GGML_SYCL_DNNL
+    // llama.cpp-me60: drain and reclaim every cache's oneDNN Graph-scratch
+    // DIRECT reuse pool BEFORE the pre-teardown census below -- a defect
+    // that predates this ticket (traced to llama.cpp-0oxf; unrelated to
+    // F1's flag-slab release, which is a separate fix in shutdown_resources()
+    // further down). onednn_graph_scratch_free()'s DIRECT branch moves
+    // (never releases) a parked buffer's own EXTERNAL_EXACT allocation
+    // control into the pool, and the census below refuses shutdown while
+    // ANY live non-CACHE_BACKING allocation control survives -- that is
+    // the whole point of the census (a caller can safely retry once
+    // whatever holds a live external owner lets go; see
+    // retained_pinned_suballocation_refuses_preteardown() in
+    // test-unified-runtime-alloc.cpp, which exercises exactly that for a
+    // real external owner). EXTERNAL_EXACT is the CORRECT classification
+    // for a DIRECT Graph-scratch buffer -- a genuine, individually
+    // mem_handle-owned allocation from unified_alloc(), not cache bootstrap
+    // backing memory -- so the fix is not to teach the census to tolerate
+    // it (that would weaken a check whose entire job is catching a live
+    // external owner); it is to make sure the pool is not STILL holding
+    // one when the census runs. This mirrors exactly what
+    // shutdown_resources() already does safely further down
+    // (drain_all_queues_noexcept() then
+    // onednn_graph_scratch_clear_pool_locked(), proven correct there:
+    // every queue is synced first, so every pooled entry's release event
+    // is complete by construction and the pool's clear becomes an
+    // unconditional real release, not a hand-off to the background drain
+    // worker) -- just run once per cache, ahead of the census, through the
+    // already-public onednn_graph_scratch_reclaim_pool() wrapper (the same
+    // entry point ggml_backend_sycl_set_runtime_context() already uses in
+    // production).
+    //
+    // Runs unconditionally, even for a cache whose OWN shutdown_resources()
+    // will drain and clear the (by-then-already-empty) pool again further
+    // down in the loop below -- draining an already-drained queue is a
+    // no-op (drain_all_queues_noexcept() waits on each queue's own
+    // in-flight work, and there is none left the second time), and
+    // reclaiming an already-empty pool is likewise inert
+    // (onednn_graph_scratch_clear_pool_locked() iterates
+    // onednn_graph_scratch_reuse_pool_, which this pass already emptied).
+    // The double drain costs nothing measurable here and keeps
+    // shutdown_resources() itself simple and correct on its own terms
+    // (it has other callers too, e.g. a retry after this function returns
+    // false) rather than threading a "was this already done" flag through
+    // it for one caller's benefit.
+    //
+    // Does not disturb process_deferred_frees_public() or the
+    // has_pending_legacy_promotion_cleanup() check that run inside
+    // shutdown_resources() right after ITS OWN pool clear: both operate on
+    // entirely different state (embedded legacy-promotion registry rows on
+    // unified_cache_entry objects, and per-cache pending-cleanup flags)
+    // that this earlier pass does not touch at all -- draining a queue and
+    // clearing the (unrelated) Graph-scratch pool ahead of the census
+    // changes nothing about what either of those two checks finds when
+    // shutdown_resources() reaches them afterward.
+    for (auto & item : caches) {
+        if (!item.second) {
+            continue;
+        }
+        // Result discarded deliberately: a drain failure here is not fatal
+        // to this early pass -- shutdown_resources() drains again, later in
+        // this same shutdown_unified_cache() call, and its own
+        // drain_all_queues_noexcept() return value is what actually gates
+        // teardown (its caller returns false on failure). Reclaiming the
+        // pool here with a possibly-incomplete drain is still safe:
+        // onednn_graph_scratch_clear_pool_locked() itself only destructs an
+        // entry it finds release-complete, handing an incomplete one to
+        // the background drain worker instead (see its own comment).
+        (void) item.second->drain_all_queues_noexcept();
+        item.second->onednn_graph_scratch_reclaim_pool("module shutdown (pre-census)");
+    }
+#endif
+
     // Cache backing owners are released by pinned_chunk_pool destruction. Any
     // suballocation or external exact control must be released first: refusing
     // here leaves both the cache map and pinned pool fully intact for retry.
@@ -18841,19 +19000,6 @@ bool shutdown_unified_cache() {
         return false;
     }
 
-    // Explicit module shutdown runs while SYCL is still valid. Detach the map
-    // under its lock, then destroy caches without the registry lock held so
-    // mem_handle release callbacks cannot deadlock on cache lookup.
-    std::unordered_map<int, std::shared_ptr<unified_cache>> caches;
-    runtime_allocation_owner_snapshot                      owner_snapshot;
-    {
-        // Module mutation admission is closed. Retain a stable owner snapshot,
-        // then drop the map lock before callbacks/free paths that may re-enter
-        // cache lookup or allocation bookkeeping.
-        std::shared_lock<std::shared_mutex> lock(g_cache_rw_mutex);
-        caches = g_device_caches;
-        owner_snapshot = capture_runtime_allocation_owner_snapshot();
-    }
     for (auto & item : caches) {
         if (item.second && !item.second->shutdown_resources()) {
             GGML_LOG_ERROR("[UNIFIED-CACHE] arena release failed; retaining cache owner for unload retry\n");

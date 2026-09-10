@@ -263,6 +263,50 @@ def _routes_through_release_complete(body: str) -> bool:
     return RELEASE_COMPLETE_CALL in code and "event_complete(" not in code
 
 
+FLAG_SLAB_OWNER_RESET_STMT = "onednn_graph_scratch_flag_slab_owner_ = {};"
+DRAIN_CALL = "drain_all_queues_noexcept()"
+
+
+def _flag_slab_owner_released_after_drain(shutdown_resources_body: str) -> bool:
+    """llama.cpp-me60: true iff shutdown_resources()'s own body resets
+    onednn_graph_scratch_flag_slab_owner_ to {} strictly AFTER its own
+    drain_all_queues_noexcept() call -- the slab must be released on the
+    NORMAL teardown path (not left to ~unified_cache() member destruction,
+    which runs after shutdown_unified_cache()'s registry sweep and used to
+    make that sweep refuse), and only once every queue has been drained, so
+    no marker kernel can still be targeting the slab when it is released.
+    This body also resets the same field on its two early-return
+    (SYCL-already-gone) branches, both of which sit BEFORE the drain call --
+    scoping the search to text AFTER the drain call's own (unique) position
+    is what keeps those two irrelevant to this specific property."""
+    drain_idx = shutdown_resources_body.find(DRAIN_CALL)
+    if drain_idx == -1:
+        return False
+    return FLAG_SLAB_OWNER_RESET_STMT in normalize_ws(shutdown_resources_body[drain_idx:])
+
+
+PRETEARDOWN_CENSUS_CALL = 'snapshot_allocation_controls("pre-cache-teardown"'
+POOL_RECLAIM_CALL = "onednn_graph_scratch_reclaim_pool("
+
+
+def _pool_reclaimed_before_preteardown_census(shutdown_unified_cache_body: str) -> bool:
+    """llama.cpp-me60: true iff shutdown_unified_cache()'s own body calls
+    onednn_graph_scratch_reclaim_pool() (on each live cache) BEFORE its
+    census call snapshot_allocation_controls(..., preteardown=true) --
+    predating this ticket (traced to llama.cpp-0oxf), a DIRECT Graph-scratch
+    buffer parked in the reuse pool keeps its own EXTERNAL_EXACT allocation
+    control alive, and that census refuses shutdown on ANY live
+    non-CACHE_BACKING control still standing when it runs. Uses the FIRST
+    occurrence of each anchor (via str.find(), not a mere "one occurs
+    somewhere before the other" scan) so a later, correctly-ordered pair
+    cannot mask an earlier, wrongly-ordered one -- see this check's own
+    mutation witness below, which exercises exactly that."""
+    normalized = normalize_ws(shutdown_unified_cache_body)
+    reclaim_idx = normalized.find(POOL_RECLAIM_CALL)
+    census_idx = normalized.find(PRETEARDOWN_CENSUS_CALL)
+    return reclaim_idx != -1 and census_idx != -1 and reclaim_idx < census_idx
+
+
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
@@ -833,6 +877,29 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # withdrawn wording.
     checks["design doc states the two measured completion-check facts"] = _design_doc_states_measured_facts()
 
+    # llama.cpp-me60 (F1): the completion-flag slab is a bootstrap
+    # CACHE_BACKING control (see ADOPT_CACHE_BACKING_ALLOWLIST above), but
+    # shutdown_unified_cache()'s LATER registry sweep is class-blind -- it
+    # never consults allocation_control_class, only pinned-pool
+    # containment -- so the slab must be released explicitly here, on the
+    # normal teardown path, not left to member destruction after that sweep
+    # has already run. shutdown_resources_body_code was already extracted
+    # above, for the teardown pool-clear check above.
+    checks["oneDNN Graph-scratch flag slab owner is released inside shutdown_resources(), after the drain call"] = (
+        _flag_slab_owner_released_after_drain(shutdown_resources_body_code)
+    )
+
+    # llama.cpp-me60: a SEPARATE, earlier defect than F1 (predates this
+    # ticket -- traced to llama.cpp-0oxf) -- a parked DIRECT Graph-scratch
+    # buffer's own EXTERNAL_EXACT allocation control must already be
+    # reclaimed by the time shutdown_unified_cache()'s pre-teardown census
+    # runs, or that census refuses shutdown on every process that ever
+    # parked one.
+    shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
+    checks["oneDNN Graph-scratch pool is reclaimed before the pre-teardown census in shutdown_unified_cache()"] = (
+        _pool_reclaimed_before_preteardown_census(shutdown_unified_cache_body_code)
+    )
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
 
@@ -1132,4 +1199,60 @@ def test_design_doc_measured_facts_check_has_a_mutation_witness() -> None:
     assert not _design_doc_states_measured_facts(mutated_missing_second_fact), (
         "mutation witness is broken: removing the second measured fact was not detected by the real check "
         "function"
+    )
+
+
+def test_flag_slab_owner_release_after_drain_check_has_a_mutation_witness() -> None:
+    """llama.cpp-me60 (F1): proves _flag_slab_owner_released_after_drain()
+    is a real positional check, not a same-body coincidence -- the same
+    reset statement also appears TWICE earlier in shutdown_resources()'s
+    body (its two early-return branches, both before the drain call), so a
+    naive "does this string appear anywhere in the body" check would pass
+    even with the normal-path release entirely absent. Removes exactly the
+    POST-drain occurrence (the last one in the body -- both early-return
+    occurrences sit before the drain call, so this is unambiguous) and
+    confirms the real check function then reports it missing."""
+    shutdown_resources_body_code = extract_function_body(CACHE_CPP_CODE, "bool unified_cache::shutdown_resources(")
+    assert _flag_slab_owner_released_after_drain(shutdown_resources_body_code), (
+        "the real, unmutated shutdown_resources() body should already pass this check"
+    )
+    normalized = normalize_ws(shutdown_resources_body_code)
+    drain_idx = normalized.find(DRAIN_CALL)
+    assert drain_idx != -1, "the real, unmutated body should call drain_all_queues_noexcept()"
+    post_drain_reset_idx = normalized.rfind(FLAG_SLAB_OWNER_RESET_STMT)
+    assert post_drain_reset_idx != -1 and post_drain_reset_idx > drain_idx, (
+        "the real, unmutated body's LAST flag-slab-owner reset should be the post-drain one this check targets"
+    )
+    mutated = (
+        normalized[:post_drain_reset_idx]
+        + normalized[post_drain_reset_idx + len(FLAG_SLAB_OWNER_RESET_STMT) :]
+    )
+    assert mutated != normalized
+    assert not _flag_slab_owner_released_after_drain(mutated), (
+        "mutation witness is broken: removing the post-drain flag-slab-owner reset was not detected -- the "
+        "check may be matching one of the two earlier, pre-drain occurrences instead"
+    )
+
+
+def test_pool_reclaimed_before_census_check_has_a_mutation_witness() -> None:
+    """llama.cpp-me60: proves _pool_reclaimed_before_preteardown_census()
+    checks the FIRST occurrence of each anchor (str.find(), not merely "the
+    reclaim call occurs somewhere before A census call") -- injects an
+    EARLIER copy of the census anchor ahead of the real reclaim call
+    (approximating the historical ordering bug, where the census ran before
+    any reclaim pass existed at all) and confirms the real check function
+    then reports the ordering as wrong, even though the real (later) pair
+    of calls is still present and still correctly ordered."""
+    shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
+    assert _pool_reclaimed_before_preteardown_census(shutdown_unified_cache_body_code), (
+        "the real, unmutated shutdown_unified_cache() body should already pass this check"
+    )
+    normalized = normalize_ws(shutdown_unified_cache_body_code)
+    reclaim_idx = normalized.find(POOL_RECLAIM_CALL)
+    census_idx = normalized.find(PRETEARDOWN_CENSUS_CALL)
+    assert reclaim_idx != -1 and census_idx != -1 and reclaim_idx < census_idx
+    mutated = normalized[:reclaim_idx] + PRETEARDOWN_CENSUS_CALL + " " + normalized[reclaim_idx:]
+    assert mutated != normalized
+    assert not _pool_reclaimed_before_preteardown_census(mutated), (
+        "mutation witness is broken: an earlier census call injected ahead of the reclaim call was not detected"
     )

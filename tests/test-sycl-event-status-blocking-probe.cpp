@@ -98,6 +98,7 @@
 // Exits 77 (ctest SKIP_RETURN_CODE) when no SYCL GPU device is present.
 
 #include "sycl-selector-fallback.hpp"
+#include "sycl-spin-kernel.hpp"
 #include "test-skip.h"
 
 #include <chrono>
@@ -133,24 +134,9 @@ sycl::event submit_host_task(sycl::queue & q) {
     });
 }
 
-// Single-work-item spin loop reading and writing a device-global cell every
-// iteration (so the loop cannot be folded away at compile time: `acc` and
-// `*cell` each iteration's value depends on the PREVIOUS iteration's write
-// to device memory, which the compiler cannot know ahead of time) --
-// deliberately serial, matching the property this file's own header comment
-// describes ("a single work-item loop"), not a parallel kernel: the point is
-// wall-clock duration on one device compute unit, not throughput.
-sycl::event submit_spin_kernel(sycl::queue & q, int * cell, long long iterations) {
-    return q.submit([&](sycl::handler & h) {
-        h.single_task([=]() {
-            int acc = 0;
-            for (long long i = 0; i < iterations; ++i) {
-                acc   = acc + *cell + 1;
-                *cell = acc;
-            }
-        });
-    });
-}
+// submit_spin_kernel() (matching the property this file's own header
+// comment describes, "a single work-item loop") now lives in the shared
+// tests/sycl-spin-kernel.hpp (llama.cpp-me60 F7) -- included above.
 
 // The one measurement this whole file exists to take: how long does a
 // SINGLE bare status query take, issued immediately after submission with

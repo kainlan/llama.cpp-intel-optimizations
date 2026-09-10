@@ -2255,6 +2255,12 @@ target_include_directories(test-sycl-runtime-alloc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    # llama.cpp-me60 (F7): the top-level tests/ directory, so
+    # tests/test-unified-runtime-alloc.cpp can #include the shared
+    # tests/sycl-spin-kernel.hpp (also used by
+    # tests/test-sycl-event-status-blocking-probe.cpp and
+    # tests/test-sycl-onednn-graph-scratch-direct.cpp).
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests
 )
 target_compile_options(test-sycl-runtime-alloc PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
 target_link_options(test-sycl-runtime-alloc PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
@@ -2275,6 +2281,39 @@ set_tests_properties(sycl-runtime-alloc PROPERTIES
     TIMEOUT 180
     # Exits 77 when no SYCL device is available; without SKIP_RETURN_CODE
     # ctest renders that as FAILED rather than Skipped (llama.cpp-ivin).
+    SKIP_RETURN_CODE 77
+)
+
+# llama.cpp-me60: two of test-sycl-runtime-alloc's own cases each end by
+# calling shutdown_unified_cache() and REQUIRE it to succeed. A refusal in
+# one poisons the process for the other -- measured to leave the cache
+# partially torn down, unsafe for anything that runs afterward in the SAME
+# process (see either case's own comment in
+# tests/test-unified-runtime-alloc.cpp for the two independent hardware
+# findings this covers) -- which is exactly why they are registered
+# separately rather than sharing a process with each other or with any
+# other case in this binary. The plain sycl-runtime-alloc registration
+# above does not run either of them at all (see the "(skipping ...)" line
+# in main()'s default path) for that same reason. These two entries invoke
+# the SAME already-built binary with `--case <name>` so each runs alone, in
+# its own process, with the same ENVIRONMENT/LABELS/TIMEOUT/SKIP_RETURN_CODE
+# as the registration above.
+add_test(NAME sycl-runtime-alloc-flag-slab-survives-after-pool-reclaim
+    COMMAND test-sycl-runtime-alloc --case onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_reclaim
+)
+set_tests_properties(sycl-runtime-alloc-flag-slab-survives-after-pool-reclaim PROPERTIES
+    LABELS "sycl;allocator;runtime;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
+    SKIP_RETURN_CODE 77
+)
+add_test(NAME sycl-runtime-alloc-flag-slab-released-at-shutdown
+    COMMAND test-sycl-runtime-alloc --case onednn_graph_scratch_flag_slab_released_at_module_shutdown
+)
+set_tests_properties(sycl-runtime-alloc-flag-slab-released-at-shutdown PROPERTIES
+    LABELS "sycl;allocator;runtime;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}:/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 180
     SKIP_RETURN_CODE 77
 )
 endif() # direct-source static SYCL fixture
