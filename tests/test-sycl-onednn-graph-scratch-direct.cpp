@@ -40,11 +40,11 @@
 // onednn_graph_scratch_pool_depth_per_size() entries (default 8,
 // env-overridable) so a workload walking many distinct sizes cannot grow the
 // pool without limit even while every individual size stays under the byte
-// cap; and the pool is cleared (real release) at cache teardown and at the
-// same point arena_reserve() reclaims the KV/RUNTIME zones for a new
-// context, so a pooled buffer cannot outlive the context it belongs to.
+// cap; and the pool is cleared (real release) at the four production reclaim
+// sites item (d) below enumerates, so a pooled buffer cannot outlive the
+// context it belongs to.
 //
-// This test asserts six properties:
+// This test asserts seven properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -123,18 +123,34 @@
 //       binary. Added by llama.cpp-c6ah, not part of the original 0oxf
 //       RED-FIRST set below.
 //
-// RED-FIRST NOTE. Three of these six properties, (a)-(c), are RED against
+//   (g) IN-FLIGHT RECLAIM RETIRES THE SLOT, NOT THE ENTRY: reclaiming the
+//       pool while a pooled entry's completion marker is still in flight
+//       must RETIRE that entry's flag_slot rather than return it to the
+//       free list -- returning it lets a later occupant's own marker be
+//       overwritten by the stale, still-in-flight one once it finally fires
+//       (the watch queue is out-of-order), permanently flipping an
+//       already-complete entry back to "not complete" and stalling every
+//       future request of that size on cap-wait timeouts. Exercised by
+//       parking a slow-release entry, reclaiming the pool while it is still
+//       in flight, parking a fresh same-size entry, and confirming the
+//       fresh entry's completion is unaffected once the old, now-retired
+//       kernel finally finishes too. Added by llama.cpp-c6ah, not part of
+//       the original 0oxf RED-FIRST set below.
+//
+// RED-FIRST NOTE. Three of these seven properties, (a)-(c), are RED against
 // the pre-0oxf code: (a) and (b) have no pool, cap, or wait at all (every
 // DIRECT allocation is a fresh unified_alloc() with no bound), and (c) had
 // no abort hook to suppress -- the pre-fix function simply returned nullptr
 // with `req.suppress_failure_log = true`, so the log capture in this test
 // would find nothing and the "abort triggered" latch would not exist. (d),
-// (e) and (f) above were added by later tickets (llama.cpp-0oxf's own
+// (e), (f), and (g) above were added by later tickets (llama.cpp-0oxf's own
 // reclaim-safety finding, llama.cpp-pqgl's review, and llama.cpp-c6ah's
-// blocking-query finding, respectively) and are not part of this original
-// RED-FIRST set -- (f) is RED against the pre-c6ah code specifically (its
-// own force_blocking_pool_check hook reproduces that RED behaviour on
-// demand within this GREEN binary, since the pre-fix source is no longer
+// blocking-query and flag-slot-retirement findings, respectively) and are not
+// part of this original RED-FIRST set -- (f) and (g) are both RED against the
+// pre-c6ah code specifically ((f)'s own force_blocking_pool_check hook
+// reproduces that RED behaviour on demand within this GREEN binary, and (g) is
+// RED because the pre-fix onednn_graph_scratch_clear_pool_locked() returned
+// every entry's slot unconditionally), since the pre-fix source is no longer
 // buildable standalone once this fix has landed).
 //
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
