@@ -27,9 +27,13 @@
 #      (throttled/tenant/Shmem-elevated card, or a SUSPECT postflight
 #      stamp -- a run invalidated by a kernel GPU fault or timeout kill is
 #      "could not measure", never "passed"), the wrapped bench exited
-#      non-zero, or its output table could not be parsed. Kept distinct
-#      from 0/1 on purpose -- a silent 0 here would misreport "the gate
-#      passed" for a pair that was never actually measured.
+#      non-zero, its output table could not be parsed (ERROR:parse-failed),
+#      or the table's header declared an n_ubatch column whose pp512 cell
+#      is blank (ERROR:ub-cell-blank -- a malformed/unexpected table shape,
+#      reported the same way as any other unmeasured pair, never a
+#      script-ending exit that would bypass this precedence rule). Kept
+#      distinct from 0/1 on purpose -- a silent 0 here would misreport "the
+#      gate passed" for a pair that was never actually measured.
 #   2  usage error: an --only token that names no such pair, no pair ended
 #      up selected at all, bench-guard.sh/--guard override not found, or a
 #      selected model's file (validated once per model, before any
@@ -108,6 +112,35 @@
 # instead of running all of them. MODEL in {mistral,gptoss,gemma4}, CARD in
 # {b70,b50}. Validated against the fixed six-pair matrix at parse time --
 # an unknown MODEL,CARD is a usage error (exit 2), never a silent no-op.
+#
+# --ubatch N|auto / env SYCL_PREFILL_SCALING_UBATCH: forwarded as `-ub VALUE`
+# on the wrapped bench invocation ONLY when given (default: unset -- nothing
+# is added, so llama-bench picks its own default exactly as before this flag
+# existed). --ubatch (if given) wins over the env var, mirroring
+# --bench/--models-dir above. An explicit --ubatch "" (like --models-dir "")
+# is a loud usage error naming the flag, never silently treated as unset --
+# the env var keeps its existing meaning (empty/unset both mean "not
+# given"), only the FLAG is rejected when given empty. The value is passed
+# through unvalidated ("N" or the literal "auto") -- llama-bench itself is
+# the authority on what -ub accepts; this script does not second-guess it.
+#
+# The table gains a `ub` column, right after `card`, populated from
+# llama-bench's OWN markdown output by COLUMN POSITION (the header row's
+# `n_ubatch` cell index, never a regex over the number -- see
+# find_header_index/parse_ub_cell below): "-" when the table carries no
+# n_ubatch column at all, the reported value when it does. llama-bench's OWN
+# condition for emitting that column (tools/llama-bench/llama-bench.cpp,
+# markdown_printer) is `n_ubatch.size() > 1 || n_ubatch != cmd_params_defaults.n_ubatch`
+# (default `{512}`) -- i.e. the column appears whenever -ub is swept OR
+# given a single value other than the built-in default 512, so `--ubatch
+# 512` still shows "-" while `--ubatch 1024` shows the column. (Task 4a of
+# this plan changes llama-bench's own SYCL default to "auto", which moves
+# this boundary -- re-check this paragraph once that lands.) The column is
+# REPORT-ONLY and read ONLY from what llama-bench itself printed -- NEVER
+# echoed back from --ubatch/UBATCH when the column is absent, even though
+# this script knows what it asked for: the ratio1024 verdict and this
+# script's exit code are computed exactly as before this flag existed, from
+# pp128/pp512/pp1024/pp2048 alone.
 set -euo pipefail
 export LC_NUMERIC=C
 
@@ -117,12 +150,21 @@ GUARD="$SCRIPT_DIR/bench-guard.sh"
 
 BENCH="${SYCL_PREFILL_SCALING_BENCH:-$ROOT_DIR/build/bin/llama-bench}"
 MODELS_DIR="${SYCL_PREFILL_SCALING_MODELS_DIR:-/models}"
+UBATCH="${SYCL_PREFILL_SCALING_UBATCH:-}"
+# UBATCH_GIVEN: distinguishes "the --ubatch FLAG was passed" from "UBATCH
+# ended up non-empty" -- the env var must keep meaning "not given" when
+# empty/unset (mirroring MODELS_DIR's own default), but an explicit
+# `--ubatch ""` flag is a usage error, not silently equivalent to omitting
+# the flag. Set only in the flag's own case arm below, never from the env
+# var default above.
+UBATCH_GIVEN=0
 declare -a ONLY=()
 SYSFS_CARD="" MEMINFO="" PGREP_CMD="" DF_CMD="" JOURNALCTL_CMD="" MAX_WAIT="" BUDGET=""
 
 while [ $# -gt 0 ]; do case "$1" in
     --bench)           BENCH="$2";          shift 2;;
     --models-dir)      MODELS_DIR="$2";     shift 2;;
+    --ubatch)          UBATCH="$2"; UBATCH_GIVEN=1; shift 2;;
     --guard)           GUARD="$2";          shift 2;;
     --only)            ONLY+=("$2");        shift 2;;
     --sysfs-card)      SYSFS_CARD="$2";     shift 2;;
@@ -141,6 +183,13 @@ esac; done
 # this, an empty flag value would silently strip down to the filesystem
 # root below instead of failing loudly (llama.cpp-5iba quality review).
 [ -n "$MODELS_DIR" ] || { echo "sycl-prefill-scaling: --models-dir requires a non-empty value" >&2; exit 2; }
+
+# --ubatch "" (an explicit empty flag value): rejected outright, exactly
+# like --models-dir "" above -- but gated on UBATCH_GIVEN, not on `-n
+# "$UBATCH"` alone, because UBATCH's OWN default (unset/empty means "add no
+# -ub flag") is legitimately empty when --ubatch was never passed at all.
+# Only an explicit empty FLAG value is a usage error.
+[ "$UBATCH_GIVEN" -eq 0 ] || [ -n "$UBATCH" ] || { echo "sycl-prefill-scaling: --ubatch requires a non-empty value" >&2; exit 2; }
 
 # Strip ALL trailing slashes (--models-dir /foo/, /foo///, or an env var
 # carrying any of these; a bare "/" reduces all the way to "") so the paths
@@ -246,21 +295,24 @@ for model_entry in "${MODELS[@]}"; do
     }
 done
 
-# parse_cell: extracts the numeric t/s value (first token, spread stripped)
-# for the markdown table row whose `test` cell equals $2 exactly -- never a
-# substring match, so "pp128" cannot accidentally match a hypothetical
-# "pp1280" row or a non-data line that merely contains the string "pp128"
-# (scripts/sycl-decode-mode-capture.sh's parse_tg128 hit exactly this trap
-# via bench-guard's own echoed command line and fixed it by anchoring to a
-# markdown row; anchoring to an EXACT cell match here is the stronger form
-# of the same fix -- tests/test-sycl-prefill-scaling.sh pins this with a
-# decoy row whose test cell would trip a substring-based mutant). Prints ""
-# (not an error) when the row or its value is missing or not a plain
-# decimal -- the caller decides what that means.
-parse_cell() {
-    local log="$1" want="$2" line value
-    [ -r "$log" ] || { echo ""; return 0; }
-    line="$(awk -F'|' -v want="$want" '
+# find_row: the LAST markdown table row of $1 whose `test` cell equals $2
+# exactly -- never a substring match, so "pp128" cannot accidentally match
+# a hypothetical "pp1280" row or a non-data line that merely contains the
+# string "pp128" (scripts/sycl-decode-mode-capture.sh's parse_tg128 hit
+# exactly this trap via bench-guard's own echoed command line and fixed it
+# by anchoring to a markdown row; anchoring to an EXACT cell match here is
+# the stronger form of the same fix -- tests/test-sycl-prefill-scaling.sh
+# pins this with a decoy row whose test cell would trip a substring-based
+# mutant). `tail -1` in case of duplicate rows. Echoes nothing when no row
+# matches -- not an error; what that means is the caller's job to decide
+# (parse_cell prints "", parse_ub_cell prints "-"). Shared by parse_cell
+# ($2 = the caller's own `want`) and parse_ub_cell ($2 = the fixed "pp512")
+# -- previously duplicated byte-for-byte between the two except for that
+# one `-v want=` value (llama.cpp-s0um quality review round 1, Q4), which
+# meant a fix to one copy could silently drift from the other.
+find_row() {
+    local log="$1" want="$2"
+    awk -F'|' -v want="$want" '
         /^\|/ {
             hit=0
             for (i=1; i<=NF; i++) {
@@ -269,7 +321,17 @@ parse_cell() {
             }
             if (hit) print
         }
-    ' "$log" | tail -1)"
+    ' "$log" | tail -1
+}
+
+# parse_cell: extracts the numeric t/s value (first token, spread stripped)
+# from the row find_row returns for the `test` cell $2. Prints "" (not an
+# error) when the row or its value is missing or not a plain decimal -- the
+# caller decides what that means.
+parse_cell() {
+    local log="$1" want="$2" line value
+    [ -r "$log" ] || { echo ""; return 0; }
+    line="$(find_row "$log" "$want")"
     [ -n "$line" ] || { echo ""; return 0; }
     # Here-string, not `printf ... | awk '{... exit}'` -- this awk program
     # exits after its first non-empty field, and under `set -o pipefail`
@@ -300,13 +362,88 @@ parse_cell() {
     echo "$value"
 }
 
-# row: the nine-column table format, named once (llama.cpp-y3z0 quality
+# find_header_index: the 1-based awk field index of the column literally
+# named $2 in the markdown table HEADER row of $1 -- the row whose OWN
+# cells are column NAMES, not data. Anchored on the header carrying a
+# literal "test" cell: every llama-bench markdown table names one of its
+# own columns "test" (llama-bench's own markdown_printer), and no DATA
+# row's `test` cell ever holds that literal word (a data row's test cell
+# holds a value like "pp128"), so the same "exact cell match" idiom
+# parse_cell already uses to find a DATA row by value doubles here to find
+# the HEADER row by name, without a second, different mechanism. Echoes
+# the index, or "" when the log is unreadable, no header row is found, or
+# that header has no column named $2 -- llama-bench omits the n_ubatch
+# column outright unless -ub was swept or given a single value other than
+# its own built-in default (see the file header's --ubatch paragraph for
+# the exact condition and its `--ubatch 512` corner case); this is how
+# that legitimate case is told apart from a malformed table below.
+find_header_index() {
+    local log="$1" col="$2"
+    [ -r "$log" ] || { echo ""; return 0; }
+    awk -F'|' -v col="$col" '
+        /^\|/ {
+            has_test = 0
+            for (i=1; i<=NF; i++) {
+                s=$i; gsub(/^[ \t]+|[ \t]+$/, "", s)
+                if (s == "test") has_test = 1
+            }
+            if (has_test) {
+                for (i=1; i<=NF; i++) {
+                    s=$i; gsub(/^[ \t]+|[ \t]+$/, "", s)
+                    if (s == col) { print i; exit }
+                }
+                exit
+            }
+        }
+    ' "$log"
+}
+
+# parse_ub_cell: the `ub` column value for one pair's table, read from
+# llama-bench's own `n_ubatch` column BY COLUMN POSITION (never a regex on
+# the number -- a bare integer/word cell elsewhere in the same row cannot
+# be told apart from an n_ubatch value by pattern alone, only by which
+# column it sits in). llama-bench reports the same n_ubatch value on every
+# row of a single invocation (this script never sweeps -ub itself), so the
+# pp512 row -- already required to be present for the ratio1024 verdict --
+# is read as the one canonical source.
+#
+# Echoes "-" (never an error) in TWO distinct cases, deliberately not told
+# apart by the caller:
+#   - the header has no n_ubatch column at all (legitimate: see
+#     find_header_index above);
+#   - the header DOES carry an n_ubatch column, but the pp512 ROW itself
+#     cannot be found at all (a truncated/malformed table missing that
+#     test entirely). This function must NOT diagnose that case -- the
+#     pre-existing ERROR:parse-failed path below (driven by parse_cell/
+#     pp512 returning "") already handles a missing pp512 row, and this
+#     function pre-empting it with a different label would both duplicate
+#     that diagnosis and misname it ("row is blank" when the row is
+#     actually ABSENT).
+#
+# Returns 1, echoing nothing, ONLY when the header carries an n_ubatch
+# column AND the pp512 row IS found, BUT its CELL at that column position
+# is blank -- a malformed/unexpected table shape the caller must refuse
+# loudly, never silently as "-" (which would read, indistinguishably, as
+# "no n_ubatch axis in this table" and hide the defect).
+parse_ub_cell() {
+    local log="$1" idx line value
+    [ -r "$log" ] || { echo "-"; return 0; }
+    idx="$(find_header_index "$log" "n_ubatch")"
+    [ -n "$idx" ] || { echo "-"; return 0; }
+    line="$(find_row "$log" "pp512")"
+    [ -n "$line" ] || { echo "-"; return 0; }
+    value="$(awk -F'|' -v idx="$idx" '{ s=$idx; gsub(/^[ \t]+|[ \t]+$/, "", s); print s }' <<< "$line")"
+    [ -n "$value" ] || return 1
+    echo "$value"
+}
+
+# row: the ten-column table format, named once (llama.cpp-y3z0 quality
 # review round 1, nit 4 -- this printf used to be duplicated verbatim six
 # times, so a column change had to be made in six places in lockstep, and
 # a header/row drift would not have been caught by any assertion).
-row() { printf '%-20s %-6s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
+row() { printf '%-20s %-6s %6s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
 
-row "model" "card" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
+row "model" "card" "ub" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
 
 # any_fail / any_error / any_selected decide the FINAL exit code only after
 # every requested pair has been attempted -- never derived incrementally
@@ -361,12 +498,20 @@ for model_entry in "${MODELS[@]}"; do
 
         logfile="$(mktemp)"
 
+        BENCH_ARGS=(-m "$m_path" -p "$PP_VALUES" -n 0 -r "$REPEATS")
+        # -ub is forwarded only when --ubatch/SYCL_PREFILL_SCALING_UBATCH
+        # was given -- see the file header for why an unset UBATCH must
+        # never add a flag at all (an invented default here would silently
+        # pin llama-bench away from whatever it would otherwise have
+        # chosen on its own).
+        [ -n "$UBATCH" ] && BENCH_ARGS+=(-ub "$UBATCH")
+
         # ONEAPI_DEVICE_SELECTOR is a prefix-assignment on the GUARD
         # invocation, not the wrapped bench -- see the file header comment
         # for why this is load-bearing, not cosmetic.
         rc=0
         ONEAPI_DEVICE_SELECTOR="$c_selector" "$GUARD" "${GUARD_ARGS[@]}" --log "$logfile" -- \
-            "$BENCH" -m "$m_path" -p "$PP_VALUES" -n 0 -r "$REPEATS" \
+            "$BENCH" "${BENCH_ARGS[@]}" \
             || rc=$?
 
         if [ "$rc" -eq 3 ]; then
@@ -384,9 +529,9 @@ for model_entry in "${MODELS[@]}"; do
             # the same "which layer flagged this" mislabel finding N4 fixed
             # for the rc!=0/SUSPECT paths below). Distinguish by content.
             if [ -s "$logfile" ]; then
-                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=3"
+                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=3"
             else
-                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-guard-refused"
+                row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:bench-guard-refused"
             fi
             any_error=1
             rm -f "$logfile"
@@ -411,7 +556,7 @@ for model_entry in "${MODELS[@]}"; do
         header_line="$(head -1 "$logfile" 2>/dev/null || true)"
 
         if [ "$rc" -ne 0 ]; then
-            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=$rc"
+            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:bench-rc=$rc"
             any_error=1
             rm -f "$logfile"
             continue
@@ -426,7 +571,7 @@ for model_entry in "${MODELS[@]}"; do
         # another word character.
         valid_re='^# bench-guard: VALID($|[[:space:]])'
         if ! [[ "$header_line" =~ $valid_re ]]; then
-            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "ERROR:guard-not-valid(header=${header_line:0:80})"
+            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:guard-not-valid(header=${header_line:0:80})"
             any_error=1
             rm -f "$logfile"
             continue
@@ -436,10 +581,29 @@ for model_entry in "${MODELS[@]}"; do
         pp512="$(parse_cell "$logfile" pp512)"
         pp1024="$(parse_cell "$logfile" pp1024)"
         pp2048="$(parse_cell "$logfile" pp2048)"
+        # A malformed table -- the header carries an n_ubatch column but
+        # the pp512 row's own CELL under it is blank (parse_ub_cell
+        # returns 1 ONLY in that specific case -- see its own docstring)
+        # -- is reported as an unmeasured ERROR for THIS PAIR, exactly
+        # like the bench-rc=3/bench-rc=$rc/guard-not-valid branches above:
+        # print the message, print an ERROR row, mark any_error, and
+        # CONTINUE to the next pair. This must never be a script-ending
+        # `exit` -- doing so here would bypass this file's own exit-code
+        # contract (see the header comment above: a genuine ratio<0.9 FAIL
+        # on a later pair must still outrank this unrelated measurement
+        # gap, and that precedence is decided only once every requested
+        # pair has been attempted, at the bottom of this script).
+        if ! ub="$(parse_ub_cell "$logfile")"; then
+            echo "sycl-prefill-scaling: $m_label/$c_label: n_ubatch column is present in the table header but its pp512 cell is blank -- refusing to print a blank ub value (malformed/unexpected llama-bench table shape)" >&2
+            row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:ub-cell-blank"
+            any_error=1
+            rm -f "$logfile"
+            continue
+        fi
         rm -f "$logfile"
 
         if [ -z "$pp128" ] || [ -z "$pp512" ] || [ -z "$pp1024" ] || [ -z "$pp2048" ]; then
-            row "$m_label" "$c_label" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
+            row "$m_label" "$c_label" "$ub" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
             any_error=1
             continue
         fi
@@ -464,7 +628,7 @@ for model_entry in "${MODELS[@]}"; do
             status="PASS"
         fi
 
-        row "$m_label" "$c_label" "$pp128" "$pp512" "$pp1024" "$pp2048" \
+        row "$m_label" "$c_label" "$ub" "$pp128" "$pp512" "$pp1024" "$pp2048" \
             "ratio1024=$ratio1024" "intercept_ms=$intercept_ms" "$status"
     done
 done
