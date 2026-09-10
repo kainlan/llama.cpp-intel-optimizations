@@ -10392,9 +10392,10 @@ static std::atomic<bool>     g_onednn_graph_scratch_test_force_blocking_pool_che
 // llama.cpp-0oxf: always-compiled is not the same as always-callable. The
 // two setters below no-op unless this env var is set,
 // so a production process cannot have its own DIRECT-allocation behavior
-// altered by anything that happens to call these exported symbols. Only the
-// GPU test's ctest registration sets it, via ENVIRONMENT
-// (tests/CMakeLists.txt).
+// altered by anything that happens to call these exported symbols. Two
+// tests set it: test-sycl-onednn-graph-scratch-direct's ctest
+// registration, via ENVIRONMENT (tests/CMakeLists.txt), and
+// test-unified-runtime-alloc.cpp, directly in main() (llama.cpp-me60).
 static bool onednn_graph_scratch_test_hooks_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS");
@@ -10909,12 +10910,13 @@ void unified_cache::onednn_graph_scratch_clear_pool_locked() {
     // the bucket/map are cleared below) -- the common case, and the only
     // case at the teardown call site (shutdown_resources() calls this only
     // after drain_all_queues_noexcept() has already synced every queue, so
-    // every entry's event is complete there by construction). The other two
-    // call sites -- arena_reserve()'s context-reclaim branch and
-    // ggml_backend_sycl_set_runtime_context()'s runtime-update reclaim --
-    // do NOT drain first, so this function must handle an incomplete event
+    // every entry's event is complete there by construction). There are
+    // three other call sites: arena_reserve()'s context-reclaim branch and
+    // ggml_backend_sycl_set_runtime_context()'s runtime-update reclaim do
+    // NOT drain first, so this function must handle an incomplete event
     // correctly on its own rather than relying on the caller to have
-    // already synced.
+    // already synced; shutdown_unified_cache()'s pre-census pass
+    // (llama.cpp-me60) DOES drain first, same as the teardown call site.
     for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
         const size_t bucket_bytes = bucket_kv.first * bucket_kv.second.size();
         onednn_graph_scratch_direct_outstanding_bytes_ -=
@@ -10947,12 +10949,14 @@ void unified_cache::onednn_graph_scratch_clear_pool_locked() {
             // slot instead: never return it to the free list. This shrinks
             // the slab's effective capacity by one entry per reclaim that
             // catches something genuinely in flight (arena_reserve()'s
-            // context-reclaim branch, the runtime-update reclaim, and the
-            // public reclaim all call this without draining first) -- rare
-            // in practice, and the once-only exhaustion WARN at the park
-            // site degrades to the safe (blocking-query) fallback if the
-            // slab is ever fully retired, the same way a failed allocation
-            // or submit already does.
+            // context-reclaim branch and
+            // ggml_backend_sycl_set_runtime_context()'s runtime-update reclaim
+            // call this without draining first -- shutdown_unified_cache()'s
+            // pre-census pass does drain first, so it does not) -- rare in
+            // practice, and the once-only exhaustion WARN at the park site
+            // degrades to the safe (blocking-query) fallback if the slab is
+            // ever fully retired, the same way a failed allocation or submit
+            // already does.
             if (entry_complete && entry.flag_slot >= 0) {
                 onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(entry.flag_slot));
             } else if (entry.flag_slot >= 0) {
