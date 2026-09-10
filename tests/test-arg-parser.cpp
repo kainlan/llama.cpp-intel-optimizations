@@ -192,6 +192,34 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    // llama.cpp-nphx Task 4a: -ub / --ubatch-size plumbing for n_ubatch_auto
+    {
+        common_params ubatch_params;
+        argv = {"binary_name", "--ubatch-size", "777"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(ubatch_params.n_ubatch == 777);
+        assert(ubatch_params.n_ubatch_auto == false);
+    }
+    {
+        // no -ub at all: the default is SYCL-only, both to record the
+        // fork-local #ifdef and so this test fails loudly if the default
+        // ever flips without the plumbing changing with it.
+        common_params ubatch_params;
+        argv = {"binary_name"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+#ifdef GGML_USE_SYCL
+        assert(ubatch_params.n_ubatch_auto == true);
+#else
+        assert(ubatch_params.n_ubatch_auto == false);
+#endif
+    }
+    {
+        common_params ubatch_params;
+        argv = {"binary_name", "-ub", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(ubatch_params.n_ubatch_auto == true);
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

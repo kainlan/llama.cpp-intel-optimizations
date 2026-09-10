@@ -399,6 +399,13 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // fork-local (llama.cpp-nphx): when true and n_ubatch was not set explicitly,
+        // the SYCL backend tries an ascending ladder of micro-batch sizes at context
+        // creation and keeps the largest that fits; ignored on every other backend and
+        // ignored entirely until llama.cpp-nphx Task 4b wires the trial (this field is
+        // plumbing only -- see docs/merge/briefs/llama-common.md for the merge note).
+        bool n_ubatch_auto;
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
