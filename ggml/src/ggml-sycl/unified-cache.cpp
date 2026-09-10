@@ -10956,10 +10956,9 @@ void unified_cache::onednn_graph_scratch_clear_pool_locked() {
             // reclaim call this without draining first --
             // shutdown_unified_cache()'s pre-census pass does drain first,
             // so it does not) -- rare in practice, and the once-only
-            // exhaustion WARN at the park site
-            // degrades to the safe (blocking-query) fallback if the slab is
-            // ever fully retired, the same way a failed allocation or submit
-            // already does.
+            // exhaustion WARN at the park site degrades to the safe
+            // (blocking-query) fallback if the slab is ever fully retired,
+            // the same way a failed allocation or submit already does.
             if (entry_complete && entry.flag_slot >= 0) {
                 onednn_graph_scratch_flag_slot_free_list_.push_back(static_cast<uint32_t>(entry.flag_slot));
             } else if (entry.flag_slot >= 0) {
@@ -18990,11 +18989,13 @@ bool shutdown_unified_cache() {
     // (its own g_sycl_shutting_down branch below), so there is nothing
     // here left to reclaim, and this pass has no validity probe of its own
     // to protect a drain/reclaim call against an already-torn-down
-    // context. A true flag on entry also means g_device_caches was
-    // already cleared by a previously completed shutdown (which re-arms
-    // this flag only after that clear, and well before the pre-teardown
-    // census below runs ahead of shutdown_resources()), so the loop here
-    // would iterate zero caches anyway.
+    // context. A true flag on entry comes from one of three writers: the
+    // previously completed shutdown_unified_cache() (which cleared
+    // g_device_caches before storing the flag, so this loop would be
+    // empty), the atexit handler, or a reactivation rollback; on the
+    // last two, caches can still be live, and their shutdown_resources()
+    // abandons rather than releases on this path, so there is nothing
+    // this pass could reclaim safely either.
     if (!ggml_sycl_is_shutting_down()) {
         for (auto & item : caches) {
             if (!item.second) {
