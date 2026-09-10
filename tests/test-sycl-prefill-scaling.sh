@@ -70,7 +70,10 @@
 #     falls through to the pre-existing ERROR:parse-failed path with ub
 #     "-", never misdiagnosed as a blank cell (case 24); --ubatch "" (an
 #     explicit empty flag value) is a loud usage error naming the flag,
-#     exactly like --models-dir "" (case 25).
+#     exactly like --models-dir "" (case 25); (spec review round 2) an
+#     EMPTY SYCL_PREFILL_SCALING_UBATCH env var, with no --ubatch flag, is
+#     the opposite of case 25 and must NOT be rejected -- it collapses to
+#     "not given", exactly like an unset env var (case 26).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -1171,11 +1174,27 @@ out="$("$SCALING" --bench "$BENCH2" --ubatch "" --only mistral,b70 "${GUARD_HOOK
 $out"; fail=1; }
 echo "$out" | grep -qF -- "--ubatch" || { echo "FAIL: expected the refusal to name the --ubatch flag (got: $out)"; fail=1; }
 
+cases=$((cases+1))
+# --- Case 26 (llama.cpp-s0um, spec review round 2 F5): an EMPTY
+# SYCL_PREFILL_SCALING_UBATCH ENV VAR -- as opposed to case 25's explicit
+# --ubatch "" FLAG immediately above -- must collapse to "not given"
+# exactly like an unset env var, never trip the F3 usage-error refusal.
+# UBATCH_GIVEN is set ONLY in the --ubatch flag's own case arm, never from
+# the env var default (`UBATCH="${SYCL_PREFILL_SCALING_UBATCH:-}"`), so an
+# empty (but exported, not unset) env var must sail straight through to a
+# normal run with no -ub forwarded -- paired directly with case 25 so a
+# reader sees flag-empty rejected right next to env-empty accepted.
+out="$(SYCL_PREFILL_SCALING_UBATCH="" "$SCALING" --bench "$BENCH2" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: an empty SYCL_PREFILL_SCALING_UBATCH env var (no --ubatch flag) must NOT be rejected -- expected exit 0, got $rc. Output:
+$out"; fail=1; }
+echo "$out" | grep -qF -- "--ubatch requires a non-empty value" && { echo "FAIL: an empty env var must never trip the --ubatch usage-error refusal -- that refusal is for the explicit FLAG only (got: $out)"; fail=1; }
+echo "$out" | grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' || { echo "FAIL: expected the ub column to show '-' (no --ubatch given, so no -ub forwarded, and BENCH2's table has no n_ubatch column) (got: $out)"; fail=1; }
+
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above. Without this, a case
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 32 ] || { echo "FAIL: expected 32 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 33 ] || { echo "FAIL: expected 33 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict ($cases cases)" || exit 1

@@ -589,9 +589,7 @@ for model_entry in "${MODELS[@]}"; do
         # on a later pair must still outrank this unrelated measurement
         # gap, and that precedence is decided only once every requested
         # pair has been attempted, at the bottom of this script).
-        if ub="$(parse_ub_cell "$logfile")"; then
-            :
-        else
+        if ! ub="$(parse_ub_cell "$logfile")"; then
             echo "sycl-prefill-scaling: $m_label/$c_label: n_ubatch column is present in the table header but its pp512 cell is blank -- refusing to print a blank ub value (malformed/unexpected llama-bench table shape)" >&2
             row "$m_label" "$c_label" "-" "-" "-" "-" "-" "-" "-" "ERROR:ub-cell-blank"
             any_error=1
