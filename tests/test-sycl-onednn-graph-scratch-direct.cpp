@@ -85,15 +85,15 @@
 //       return that VRAM to the general unified_alloc() pool while a queued
 //       SDPA kernel might still be reading it, the exact fault class this
 //       whole ticket exists to close. Two of the four production reclaim
-//       call sites do NOT drain the queue first (only cache teardown and the
-//       shutdown pre-census pass do), so this property must hold on its own.
-//       Exercised by parking an entry with a
-//       real, unwaited slow-release event, reclaiming while it is still
-//       incomplete, and observing (a) the process stays healthy, (b) the
-//       reclaim counted it as an eviction, and (c) a fresh request of the
-//       same size misses the pool -- see the test's own comment for why
-//       this behavioral proxy is the strongest property observable without
-//       adding test-only introspection into mem-handle.cpp's drain worker.
+//       call sites do NOT drain the queue first (only cache teardown and
+//       the shutdown pre-census pass do), so this property must hold on its
+//       own. Exercised by parking an entry with a real, unwaited
+//       slow-release event, reclaiming while it is still incomplete, and
+//       observing (a) the process stays healthy, (b) the reclaim counted it
+//       as an eviction, and (c) a fresh request of the same size misses the
+//       pool -- see the test's own comment for why this behavioral proxy is
+//       the strongest property observable without adding test-only
+//       introspection into mem-handle.cpp's drain worker.
 //
 //   (e) OVERSIZED REQUEST EARLY-OUT: a single request larger than the whole
 //       DIRECT cap must skip the bounded poll-loop wait entirely --
