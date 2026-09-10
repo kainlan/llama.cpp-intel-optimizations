@@ -348,6 +348,17 @@ static std::vector<int> parse_ubatch_range(const std::string & s) {
     std::string       tok;
     std::stringstream ss(s);
     while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) {
+            // llama.cpp-y8xv spec round 2, F7: a leading or doubled comma
+            // (e.g. ",256" or "256,,512") yields an empty token here; base's
+            // single parse_int_range() call over the whole string rejected
+            // both the same way it rejects any other malformed input, so
+            // reject it here too rather than silently dropping it. A
+            // trailing comma ("512,") never reaches this branch: getline
+            // stops returning tokens once the stream is exhausted, so it
+            // still produces exactly one token, matching base's accept.
+            throw std::invalid_argument("invalid range format");
+        }
         if (tok == "auto") {
             result.push_back(-1);
             continue;
