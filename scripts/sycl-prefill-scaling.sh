@@ -295,21 +295,23 @@ for model_entry in "${MODELS[@]}"; do
     }
 done
 
-# parse_cell: extracts the numeric t/s value (first token, spread stripped)
-# for the markdown table row whose `test` cell equals $2 exactly -- never a
-# substring match, so "pp128" cannot accidentally match a hypothetical
-# "pp1280" row or a non-data line that merely contains the string "pp128"
-# (scripts/sycl-decode-mode-capture.sh's parse_tg128 hit exactly this trap
-# via bench-guard's own echoed command line and fixed it by anchoring to a
-# markdown row; anchoring to an EXACT cell match here is the stronger form
-# of the same fix -- tests/test-sycl-prefill-scaling.sh pins this with a
-# decoy row whose test cell would trip a substring-based mutant). Prints ""
-# (not an error) when the row or its value is missing or not a plain
-# decimal -- the caller decides what that means.
-parse_cell() {
-    local log="$1" want="$2" line value
-    [ -r "$log" ] || { echo ""; return 0; }
-    line="$(awk -F'|' -v want="$want" '
+# find_row: the LAST markdown table row of $1 whose `test` cell equals $2
+# exactly -- never a substring match, so "pp128" cannot accidentally match
+# a hypothetical "pp1280" row or a non-data line that merely contains the
+# string "pp128" (scripts/sycl-decode-mode-capture.sh's parse_tg128 hit
+# exactly this trap via bench-guard's own echoed command line and fixed it
+# by anchoring to a markdown row; anchoring to an EXACT cell match here is
+# the stronger form of the same fix -- tests/test-sycl-prefill-scaling.sh
+# pins this with a decoy row whose test cell would trip a substring-based
+# mutant). `tail -1` in case of duplicate rows. Echoes nothing (not the
+# caller's job to interpret that) when no row matches. Shared by parse_cell
+# ($2 = the caller's own `want`) and parse_ub_cell ($2 = the fixed "pp512")
+# -- previously duplicated byte-for-byte between the two except for that
+# one `-v want=` value (llama.cpp-s0um quality review round 1, Q4), which
+# meant a fix to one copy could silently drift from the other.
+find_row() {
+    local log="$1" want="$2"
+    awk -F'|' -v want="$want" '
         /^\|/ {
             hit=0
             for (i=1; i<=NF; i++) {
@@ -318,7 +320,17 @@ parse_cell() {
             }
             if (hit) print
         }
-    ' "$log" | tail -1)"
+    ' "$log" | tail -1
+}
+
+# parse_cell: extracts the numeric t/s value (first token, spread stripped)
+# from the row find_row returns for the `test` cell $2. Prints "" (not an
+# error) when the row or its value is missing or not a plain decimal -- the
+# caller decides what that means.
+parse_cell() {
+    local log="$1" want="$2" line value
+    [ -r "$log" ] || { echo ""; return 0; }
+    line="$(find_row "$log" "$want")"
     [ -n "$line" ] || { echo ""; return 0; }
     # Here-string, not `printf ... | awk '{... exit}'` -- this awk program
     # exits after its first non-empty field, and under `set -o pipefail`
@@ -417,16 +429,7 @@ parse_ub_cell() {
     [ -r "$log" ] || { echo "-"; return 0; }
     idx="$(find_header_index "$log" "n_ubatch")"
     [ -n "$idx" ] || { echo "-"; return 0; }
-    line="$(awk -F'|' -v want="pp512" '
-        /^\|/ {
-            hit=0
-            for (i=1; i<=NF; i++) {
-                s=$i; gsub(/^[ \t]+|[ \t]+$/, "", s)
-                if (s == want) hit=1
-            }
-            if (hit) print
-        }
-    ' "$log" | tail -1)"
+    line="$(find_row "$log" "pp512")"
     [ -n "$line" ] || { echo "-"; return 0; }
     value="$(awk -F'|' -v idx="$idx" '{ s=$idx; gsub(/^[ \t]+|[ \t]+$/, "", s); print s }' <<< "$line")"
     [ -n "$value" ] || return 1
@@ -599,7 +602,7 @@ for model_entry in "${MODELS[@]}"; do
         rm -f "$logfile"
 
         if [ -z "$pp128" ] || [ -z "$pp512" ] || [ -z "$pp1024" ] || [ -z "$pp2048" ]; then
-            row "$m_label" "$c_label" "${ub:--}" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
+            row "$m_label" "$c_label" "$ub" "${pp128:--}" "${pp512:--}" "${pp1024:--}" "${pp2048:--}" "-" "-" "ERROR:parse-failed"
             any_error=1
             continue
         fi
