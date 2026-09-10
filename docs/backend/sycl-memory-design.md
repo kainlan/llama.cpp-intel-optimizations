@@ -624,13 +624,13 @@ ticket reproduced on:
   shutdown (pre-census)"`. Only the teardown call logs at
   `GGML_LOG_LEVEL_WARN`; the other three calls all log at
   `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity in every tool
-  (see CLAUDE.md's "llama-bench traps" section) — so those three summaries
-  are invisible in a normal run unless verbosity is raised. The summary call
-  passes the enum `GGML_LOG_LEVEL_WARN` directly to `ggml_log_internal()`
-  because its level is a runtime choice — WARN at teardown, INFO otherwise —
-  which the level-baking `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot
-  express. The high-water line above it has a single fixed level and uses
-  the `GGML_LOG_WARN` macro instead.
+  (see CLAUDE.md's "llama-bench traps" section) — so those three summaries are
+  invisible in a normal run unless verbosity is raised. The summary call passes
+  the enum `GGML_LOG_LEVEL_WARN` directly to `ggml_log_internal()` because its
+  level is a runtime choice — WARN at teardown, INFO otherwise — which the
+  level-baking `GGML_LOG_WARN`/`GGML_LOG_INFO` macros cannot express. The
+  high-water line above it has a single fixed level and uses the
+  `GGML_LOG_WARN` macro instead.
 
 Two ALWAYS-compiled (not gated behind a `_TESTING` object-library variant —
 see `ggml_sycl_test_onednn_graph_scratch_force_direct_alloc_fail()`/
