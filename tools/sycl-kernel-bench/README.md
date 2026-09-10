@@ -52,9 +52,9 @@ Compare kernels using actual GGUF weight shapes and emit a summary JSON:
   --output=jsonl
 ```
 
-The dispatch-tuning loader no longer reads any `--emit-json` output path
-automatically (llama.cpp-o65k) — writing `--emit-json=<path>` above is not by
-itself enough to have it picked up. Point the backend at `<path>` explicitly
+The dispatch-tuning loader no longer reads any path automatically
+(llama.cpp-o65k) — writing `--emit-json=<path>` above is not by itself
+enough to have it picked up. Point the backend at `<path>` explicitly
 with `GGML_SYCL_DISPATCH_TUNING_JSON=<path>` (see
 `docs/backend/sycl-env-vars.md`) before running `llama-cli`/`llama-bench`/etc.
 Its lookup key has no device or driver identity, so only apply a summary JSON
