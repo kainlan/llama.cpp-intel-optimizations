@@ -1435,7 +1435,18 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     without the catch body's own continue, the probe would still record the
     flag but the invalid cache would then fall through to
     drain_all_queues_noexcept() and the reclaim call instead of being
-    skipped, which is exactly what the flag store exists to prevent."""
+    skipped, which is exactly what the flag store exists to prevent.
+
+    A fourth mutant proves the continue anchor is scoped to the catch's own
+    braces, not merely positional between the store and the drain call: it
+    starts from the third mutant's body (the catch's own continue already
+    removed) and inserts an unrelated `if (x) { continue; }` immediately
+    before drain_all_queues_noexcept() -- a continue that has nothing to do
+    with the probe, sitting outside the catch entirely. A check that only
+    asks "is there a continue somewhere between the store and the drain"
+    would be fooled by this: it reports the probe as present even though
+    the catch clause itself no longer contains a continue and this cache's
+    own drain+reclaim would no longer be skipped."""
     shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
     assert _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code), (
         "the real, fixed shutdown_unified_cache() body should already pass this check (llama.cpp-3lgu F2)"
@@ -1474,4 +1485,24 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "the loop's earlier `if (!item.second) { continue; }`, which this mutant must leave untouched) was not "
         "detected -- without it, the probe would still record the flag but the invalid cache would then fall "
         "through to drain_all_queues_noexcept() and the reclaim call instead of being skipped"
+    )
+
+    drain_idx_raw = mutated_continue.find(DRAIN_CALL)
+    assert drain_idx_raw != -1, "sanity: the third mutant's body must still contain the drain call"
+    fail_open_mutant = (
+        mutated_continue[:drain_idx_raw] + "if (x) { continue; } " + mutated_continue[drain_idx_raw:]
+    )
+    assert fail_open_mutant != mutated_continue
+    assert QUEUE_CONTEXT_PROBE_CALL in fail_open_mutant, "sanity: this mutant must leave get_context() untouched"
+    assert store_stmt in fail_open_mutant, "sanity: this mutant must leave the store statement untouched"
+    assert DRAIN_CALL in fail_open_mutant, "sanity: this mutant must leave the drain call untouched"
+    assert CATCH_CONTINUE_STMT not in extract_function_body(fail_open_mutant, CATCH_ALL_STMT), (
+        "sanity: this mutant's own catch braces must no longer contain a continue; -- the inserted "
+        "`if (x) { continue; }` must land after the catch closes, immediately before the drain call"
+    )
+    assert not _preteardown_loop_probes_queue_validity_before_drain(fail_open_mutant), (
+        "mutation witness is broken: the continue anchor is purely positional -- an unrelated "
+        "`if (x) { continue; }` inserted immediately before drain_all_queues_noexcept() (after removing the "
+        "catch body's own continue;) satisfies a check that only looks for *some* continue; between the store "
+        "and the drain, even though the catch clause itself no longer contains one"
     )
