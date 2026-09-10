@@ -18943,9 +18943,8 @@ bool shutdown_unified_cache() {
     // backing memory -- so the fix is not to teach the census to tolerate
     // it (that would weaken a check whose entire job is catching a live
     // external owner); it is to make sure the pool is not STILL holding
-    // one when the census runs. This mirrors exactly what
-    // shutdown_resources() already does safely further down
-    // (drain_all_queues_noexcept() then
+    // one when the census runs. This mirrors what shutdown_resources()
+    // already does safely further down (drain_all_queues_noexcept() then
     // onednn_graph_scratch_clear_pool_locked(), proven correct there:
     // every queue is synced first, so every pooled entry's release event
     // is complete by construction and the pool's clear becomes an
@@ -18953,7 +18952,10 @@ bool shutdown_unified_cache() {
     // worker) -- just run once per cache, ahead of the census, through the
     // already-public onednn_graph_scratch_reclaim_pool() wrapper (the same
     // entry point ggml_backend_sycl_set_runtime_context() already uses in
-    // production).
+    // production) -- but without shutdown_resources()'s own two
+    // shutdown-order guards (the g_sycl_shutting_down early return and the
+    // queue-context validity probe); see the ggml_sycl_is_shutting_down()
+    // skip below for how this pass covers that same case instead.
     //
     // Runs unconditionally, even for a cache whose OWN shutdown_resources()
     // will drain and clear the (by-then-already-empty) pool again further
@@ -18978,21 +18980,29 @@ bool shutdown_unified_cache() {
     // clearing the (unrelated) Graph-scratch pool ahead of the census
     // changes nothing about what either of those two checks finds when
     // shutdown_resources() reaches them afterward.
-    for (auto & item : caches) {
-        if (!item.second) {
-            continue;
+    // llama.cpp-5ot1: skip this whole pass once SYCL is already shutting
+    // down -- shutdown_resources() abandons cleanup on that path anyway
+    // (its own g_sycl_shutting_down branch below), so there is nothing
+    // here left to reclaim, and this pass has no validity probe of its own
+    // to protect a drain/reclaim call against an already-torn-down context.
+    if (!ggml_sycl_is_shutting_down()) {
+        for (auto & item : caches) {
+            if (!item.second) {
+                continue;
+            }
+            // Result discarded deliberately: a drain failure here is not
+            // fatal to this early pass -- shutdown_resources() drains again,
+            // later in this same shutdown_unified_cache() call, and its own
+            // drain_all_queues_noexcept() return value is what actually
+            // gates teardown (its caller returns false on failure).
+            // Reclaiming the pool here with a possibly-incomplete drain is
+            // still safe: onednn_graph_scratch_clear_pool_locked() itself
+            // only destructs an entry it finds release-complete, handing an
+            // incomplete one to the background drain worker instead (see
+            // its own comment).
+            (void) item.second->drain_all_queues_noexcept();
+            item.second->onednn_graph_scratch_reclaim_pool("module shutdown (pre-census)");
         }
-        // Result discarded deliberately: a drain failure here is not fatal
-        // to this early pass -- shutdown_resources() drains again, later in
-        // this same shutdown_unified_cache() call, and its own
-        // drain_all_queues_noexcept() return value is what actually gates
-        // teardown (its caller returns false on failure). Reclaiming the
-        // pool here with a possibly-incomplete drain is still safe:
-        // onednn_graph_scratch_clear_pool_locked() itself only destructs an
-        // entry it finds release-complete, handing an incomplete one to
-        // the background drain worker instead (see its own comment).
-        (void) item.second->drain_all_queues_noexcept();
-        item.second->onednn_graph_scratch_reclaim_pool("module shutdown (pre-census)");
     }
 #endif
 
