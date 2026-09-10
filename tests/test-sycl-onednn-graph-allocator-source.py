@@ -346,28 +346,38 @@ QUEUE_CONTEXT_PROBE_CALL = "get_context()"
 TRY_STMT = "try {"
 CATCH_ALL_STMT = "catch (...)"
 SHUTTING_DOWN_STORE_TRUE = "g_sycl_shutting_down.store(true"
+CATCH_CONTINUE_STMT = "continue;"
 
 
 def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body: str) -> bool:
     """llama.cpp-3lgu (F2): true iff, inside the pre-census drain+reclaim
     loop (see _preteardown_pool_loop_guard_block()), each cache's own
     queue-context validity is probed -- a `try { ... get_context(); } catch
-    (...) { ... g_sycl_shutting_down.store(true, ...); ... }` guard, mirroring
-    shutdown_resources()'s own probe (unified-cache.cpp ~4557) -- and that
-    probe's try/get_context()/catch/store sequence appears strictly BEFORE
-    the loop's own drain_all_queues_noexcept() call. The store is the
-    load-bearing half of the catch body, not decoration: a catch clause that
-    only swallows the exception (no try/catch shape check alone can tell the
-    difference) would let this cache's own later shutdown_resources() call
-    (in the teardown loop further down) see a still-false flag and proceed
-    as if the context were valid. Without the whole probe, a context torn
-    down while g_sycl_shutting_down is still false reaches
-    drain_all_queues_noexcept() (which swallows the throw) and then this
-    cache's pool reclaim, whose mem_handle releases would attempt a real
-    free against an already-invalid context. Uses the FIRST occurrence of
-    each anchor within the loop body via str.find() so a later,
-    correctly-ordered probe cannot mask an earlier, missing one -- see this
-    check's own mutation witness below."""
+    (...) { ... g_sycl_shutting_down.store(true, ...); continue; ... }`
+    guard, mirroring shutdown_resources()'s own probe (unified-cache.cpp
+    ~4557) -- and that probe's try/get_context()/catch/store/continue
+    sequence appears strictly BEFORE the loop's own
+    drain_all_queues_noexcept() call. The store and the continue are both
+    load-bearing halves of the catch body, not decoration: a catch clause
+    that only swallows the exception (no try/catch shape check alone can
+    tell the difference) would let this cache's own later
+    shutdown_resources() call (in the teardown loop further down) see a
+    still-false flag and proceed as if the context were valid, and a catch
+    clause that stores the flag but does not then `continue` would still
+    fall through to drain_all_queues_noexcept() and the reclaim call for
+    THIS cache against its own already-invalid context -- the flag only
+    protects every cache probed *after* this one in the loop, not this one,
+    unless the continue actually skips its own drain+reclaim. Without the
+    whole probe, a context torn down while g_sycl_shutting_down is still
+    false reaches drain_all_queues_noexcept() (which swallows the throw)
+    and then this cache's pool reclaim, whose mem_handle releases would
+    attempt a real free against an already-invalid context. Uses the FIRST
+    occurrence of each anchor within the loop body via str.find() so a
+    later, correctly-ordered probe cannot mask an earlier, missing one --
+    see this check's own mutation witness below. The continue is searched
+    for starting from the store, not from the loop head, because the loop
+    also has its own earlier, unrelated `if (!item.second) { continue; }`
+    that must not be mistaken for this one."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     loop_idx = guard_block.find(CACHES_LOOP_STMT)
     if loop_idx == -1:
@@ -382,7 +392,10 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     if not (try_idx < probe_idx < catch_idx < drain_idx):
         return False
     store_idx = loop_body.find(SHUTTING_DOWN_STORE_TRUE, catch_idx)
-    return store_idx != -1 and store_idx < drain_idx
+    if store_idx == -1 or not store_idx < drain_idx:
+        return False
+    cont_idx = loop_body.find(CATCH_CONTINUE_STMT, store_idx)
+    return cont_idx != -1 and cont_idx < drain_idx
 
 
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
