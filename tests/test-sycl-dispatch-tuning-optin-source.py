@@ -7,12 +7,14 @@ Before this fix, `tuning_path()` fell back to the literal
 "/tmp/onednn_unified_bench.json" whenever the env var was unset, and
 `ensure_model_loaded()` always called `load_dispatch_tuning_from_file()`
 against whatever `tuning_path()` returned. On a machine without that file
-(essentially every run -- the WARN dominates the committed bench logs, per
-`plan-research/tuning-cache.md` §3), this meant a per-model-load filesystem
-touch plus a scary-looking WARN that nobody could act on -- the mechanism
-this file wants (`/tmp/onednn_unified_bench.json`, produced by
-`sycl-kernel-bench --emit-json`) has no device or driver identity in its key
-anyway, so applying it unconditionally across cards was never safe.
+(essentially every run -- the WARN appears throughout the tracked bench logs
+under `artifacts/perf-6ae16115c-longprompt/*.log`, self-verifying with
+`grep -c 'dispatch tuning: failed to load' artifacts/perf-6ae16115c-longprompt/*.log`),
+this meant a per-model-load filesystem touch plus a scary-looking WARN that
+nobody could act on -- the mechanism this file wants
+(`/tmp/onednn_unified_bench.json`, produced by `sycl-kernel-bench
+--emit-json`) has no device or driver identity in its key anyway, so
+applying it unconditionally across cards was never safe.
 
 After this fix: unset/empty GGML_SYCL_DISPATCH_TUNING_JSON means "nothing to
 load" -- no path returned, no file opened, no log line. A path that is set
