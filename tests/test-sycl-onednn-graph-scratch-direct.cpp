@@ -44,7 +44,7 @@
 // same point arena_reserve() reclaims the KV/RUNTIME zones for a new
 // context, so a pooled buffer cannot outlive the context it belongs to.
 //
-// This test asserts five properties:
+// This test asserts six properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
