@@ -44,7 +44,7 @@
 // same point arena_reserve() reclaims the KV/RUNTIME zones for a new
 // context, so a pooled buffer cannot outlive the context it belongs to.
 //
-// This test asserts five properties:
+// This test asserts six properties:
 //
 //   (a) POOL REUSE: freeing a DIRECT buffer and immediately requesting the
 //       SAME size again must be served from the pool -- no fresh
@@ -77,17 +77,20 @@
 //       GGML_ABORT() into a latched flag plus a nullptr return. This test
 //       asserts the ERROR log line, the latch, and the nullptr return.
 //
-//   (d) RECLAIM SAFETY (BLOCKING): reclaiming the
-//       pool (onednn_graph_scratch_reclaim_pool(), reached from cache
-//       teardown, arena_reserve()'s context-reclaim branch, and
-//       ggml_backend_sycl_set_runtime_context()) must not destruct a pooled
-//       entry whose release event has not yet completed -- doing so would
-//       return that VRAM to the general unified_alloc() pool while a queued
-//       SDPA kernel might still be reading it, the exact fault class this
-//       whole ticket exists to close. Two of the three reclaim call sites do
-//       NOT drain the queue first (only cache teardown does), so this
-//       property must hold on its own. Exercised by parking an entry with a
-//       real, unwaited slow-release event, reclaiming while it is still
+//   (d) RECLAIM SAFETY (BLOCKING): reclaiming the pool
+//       (onednn_graph_scratch_clear_pool_locked(), reached directly from
+//       cache teardown and through onednn_graph_scratch_reclaim_pool() from
+//       arena_reserve()'s context-reclaim branch,
+//       ggml_backend_sycl_set_runtime_context(), and
+//       shutdown_unified_cache()'s pre-census pass) must not destruct a
+//       pooled entry whose release event has not yet completed -- doing so
+//       would return that VRAM to the general unified_alloc() pool while a
+//       queued SDPA kernel might still be reading it, the exact fault class
+//       this whole ticket exists to close. Two of the four production
+//       reclaim call sites do NOT drain the queue first (only cache
+//       teardown and the shutdown pre-census pass do), so this property
+//       must hold on its own. Exercised by parking an entry with a real,
+//       unwaited slow-release event, reclaiming while it is still
 //       incomplete, and observing (a) the process stays healthy, (b) the
 //       reclaim counted it as an eviction, and (c) a fresh request of the
 //       same size misses the pool -- see the test's own comment for why

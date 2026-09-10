@@ -827,21 +827,23 @@ static bool explicit_global_cache_shutdown_is_clean() {
 }
 
 #if GGML_SYCL_DNNL
-// llama.cpp-me60 STEP A (isolation case; still no fix): while investigating
-// why the RED test below failed with an unpredicted message, a SEPARATE,
-// earlier defect was found: onednn_graph_scratch_free()'s DIRECT branch
-// moves (does not release) the parked buffer's own EXTERNAL_EXACT
-// allocation control into onednn_graph_scratch_reuse_pool_, and
-// snapshot_allocation_controls(..., preteardown=true) runs at the very
-// start of shutdown_unified_cache() -- strictly before any cache's
+// llama.cpp-me60 STEP A (isolation case): while investigating why the RED
+// test below failed with an unpredicted message, a SEPARATE, earlier
+// defect was found: onednn_graph_scratch_free()'s DIRECT branch moves
+// (does not release) the parked buffer's own EXTERNAL_EXACT allocation
+// control into onednn_graph_scratch_reuse_pool_, and
+// snapshot_allocation_controls(..., preteardown=true) USED TO run at the
+// very start of shutdown_unified_cache() -- strictly before any cache's
 // shutdown_resources() (and therefore before
-// onednn_graph_scratch_clear_pool_locked() ever runs). That pre-teardown
-// census refuses on any live non-CACHE_BACKING control, so the parked
-// buffer itself trips it before the LATER registry sweep F1 targets is
-// ever reached. Traced (by direct code read, not built) to predate
-// llama.cpp-c6ah entirely -- the same structure and ordering already
-// existed at 0ef69a3d3 (pre-c6ah master); it is from llama.cpp-0oxf, which
-// introduced the DIRECT reuse pool.
+// onednn_graph_scratch_clear_pool_locked() ever ran) -- before the
+// pre-census pool drain+reclaim pass was inserted ahead of it
+// (llama.cpp-me60's pre-census pass, this case's own STEP A defect).
+// That pre-teardown census refused on any live non-CACHE_BACKING control,
+// so the parked buffer itself tripped it before the LATER registry sweep
+// F1 targets was ever reached. Traced (by direct code read, not built) to
+// predate llama.cpp-c6ah entirely -- the same structure and ordering
+// already existed at 0ef69a3d3 (pre-c6ah master); it is from
+// llama.cpp-0oxf, which introduced the DIRECT reuse pool.
 //
 // This case isolates the two: reclaim the pool explicitly, through the
 // same public entry point ggml_backend_sycl_set_runtime_context() already
@@ -986,23 +988,22 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
     return true;
 }
 
-// llama.cpp-me60 F1, STEP 0 (RED test only -- no fix in this commit): the
-// oneDNN Graph-scratch completion-flag slab
-// (onednn_graph_scratch_flag_slab_owner_, allocated lazily by
+// llama.cpp-me60 F1, STEP 0: the oneDNN Graph-scratch completion-flag
+// slab (onednn_graph_scratch_flag_slab_owner_, allocated lazily by
 // onednn_graph_scratch_ensure_flag_slab_locked() the first time a DIRECT
 // entry is parked with a real release event) is adopted into the global
-// runtime-allocation registry as a bootstrap CACHE_BACKING control, but
-// shutdown_resources() never releases it on the normal path -- it is left
-// to ~unified_cache() member destruction, which runs AFTER
+// runtime-allocation registry as a bootstrap CACHE_BACKING control. Before
+// F1's fix, shutdown_resources() never released it on the normal path --
+// it was left to ~unified_cache() member destruction, which ran AFTER
 // unified_cache_shutdown_retryable_postconditions_clean()'s sweep. That
 // sweep (see runtime_allocation_owned_by_cache_snapshot()) accepts only
 // rows classified via contains_pinned()/contains_pinned_backing_allocation()
 // against host_arena_ -- it never consults allocation_control_class -- so
-// the slab's row, host USM allocated OUTSIDE the pinned pool, fails it
-// regardless of being CACHE_BACKING. shutdown_unified_cache() then returns
-// false with "[UNIFIED-CACHE] runtime allocation registry still populated
-// at shutdown boundary" once any DIRECT entry has ever been parked with a
-// real event in this process.
+// the slab's row, host USM allocated OUTSIDE the pinned pool, failed it
+// regardless of being CACHE_BACKING. shutdown_unified_cache() then
+// returned false with "[UNIFIED-CACHE] runtime allocation registry still
+// populated at shutdown boundary" once any DIRECT entry had ever been
+// parked with a real event in this process.
 //
 // This case targets exactly that sweep: park one DIRECT Graph-scratch
 // entry with a device-kernel release event (so the slab is allocated and
@@ -1013,11 +1014,11 @@ static bool onednn_graph_scratch_flag_slab_survives_module_shutdown_after_pool_r
 // already asserts succeeds.
 //
 // EXPECTED ON UNFIXED CODE (pre-llama.cpp-me60): FAILS with the registry
-// message above. Once F1 lands (the fix releases the slab under
-// onednn_graph_scratch_mutex_ inside shutdown_resources()'s normal path),
-// this case passes -- but ONLY when it is the first thing in the process
-// to ever call shutdown_unified_cache() (see below); it is not a general
-// property of a fixed build.
+// message above. F1's fix releases the slab under
+// onednn_graph_scratch_mutex_ inside shutdown_resources()'s normal path,
+// so this case passes -- but ONLY when it is the first thing in the
+// process to ever call shutdown_unified_cache() (see below); it is not a
+// general property of a fixed build.
 //
 // RUNS ONLY VIA ITS OWN ctest REGISTRATION
 // (sycl-runtime-alloc-flag-slab-released-at-shutdown, `--case <name>`), in

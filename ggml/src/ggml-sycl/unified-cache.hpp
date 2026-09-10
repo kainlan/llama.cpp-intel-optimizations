@@ -4406,11 +4406,12 @@ class unified_cache {
     // own RESOLVE_FAILED branch (an entry whose event completed but whose
     // pointer could not be re-resolved -- should not happen for a still-
     // owned handle, but is a real release when it does), or released in
-    // bulk by onednn_graph_scratch_clear_pool_locked() at one of its three
-    // reclaim points (cache teardown, arena_reserve()'s context-reclaim
-    // branch, and ggml_backend_sycl_set_runtime_context()'s runtime-update
-    // reclaim), which counts every entry it clears as an eviction
-    // regardless of the reason the pool is being reclaimed.
+    // bulk by onednn_graph_scratch_clear_pool_locked() at one of its four
+    // production reclaim points (cache teardown, arena_reserve()'s
+    // context-reclaim branch, ggml_backend_sycl_set_runtime_context()'s
+    // runtime-update reclaim, and shutdown_unified_cache()'s pre-census
+    // pass), which counts every entry it clears as an eviction regardless
+    // of the reason the pool is being reclaimed.
     size_t onednn_graph_scratch_pool_eviction_count_ = 0;
     // Running total of bytes currently sitting in the pool (across every
     // size bucket, reused or not yet), and its high-water mark. Distinct

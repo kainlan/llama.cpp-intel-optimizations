@@ -590,8 +590,8 @@ ticket reproduced on:
   for real via the shared event-gated drain path instead of parking it.
   Because the pool is a `unified_cache` member (survives across contexts and
   models), it is reclaimed (real release of every entry,
-  `onednn_graph_scratch_reclaim_pool()`) at four points: cache teardown
-  (`shutdown_resources()`); the point `arena_reserve()` reclaims the
+  `onednn_graph_scratch_reclaim_pool()`) at four production points: cache
+  teardown (`shutdown_resources()`); the point `arena_reserve()` reclaims the
   KV/RUNTIME zones for a new context; `ggml_backend_sycl_set_runtime_context()`
   (`ggml-sycl.cpp`) on every successful runtime `n_ctx`/`n_ubatch` update —
   unlike the context-reclaim site above, this one does not go through
@@ -609,8 +609,8 @@ ticket reproduced on:
   could sit on a 16 GB card holding up to the cap's worth of idle VRAM while
   the next model loads (`llama-bench` with several `-m`, a server switching
   models) or while the SAME model's context is resized to a different
-  `n_ctx`. The four sites do NOT all log in the same order relative to the
-  clear: the context-reclaim, runtime-update, and pre-census sites share
+  `n_ctx`. The four production sites do NOT all log in the same order relative
+  to the clear: the context-reclaim, runtime-update, and pre-census sites share
   `reclaim_pool()`, which clears the pool and only then logs the summary;
   teardown instead logs the summary early, well before it actually clears
   the pool — see `docs/backend/sycl-env-vars.md`'s

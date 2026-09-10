@@ -362,7 +362,7 @@ from pointer containment, because by then the caches may already have changed.
 
 | class | meaning | who gets it |
 |---|---|---|
-| `CACHE_BACKING` | The allocation **is** physical backing owned by a cache or pool — not a slice of anything else. This is an authority, not a hint: the pre-teardown census (`unified-cache.cpp:15919-15921`) treats a live control of this class as admissible and every other live control as a refusal | Only the two mint mechanisms below |
+| `CACHE_BACKING` | The allocation **is** physical backing owned by a cache or pool — not a slice of anything else. This is an authority, not a hint: the pre-teardown census (`snapshot_allocation_controls(..., preteardown=true)` in `unified-cache.cpp`) treats a live control of this class as admissible and every other live control as a refusal | Only the two mint mechanisms below |
 | `CACHE_SUBALLOCATION` | An interior slice of storage the cache already owns — pinned-pool suballocation, a VRAM zone allocation, or a KV-role request (`unified-cache.cpp:12615-12618`) | Requests carrying `use_pinned_pool` / `must_host_pinned` / a `prefer_vram_zone` / `alloc_role::KV`, *except* a standalone host-USM base |
 | `EXTERNAL_EXACT` | Default. An exact, independently released allocation the cache did not carve out of its own storage | Everything else — including **every public standalone host-USM request** |
 
