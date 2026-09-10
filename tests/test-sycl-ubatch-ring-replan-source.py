@@ -447,9 +447,24 @@ def test_transaction_rolls_back_the_ring_on_a_later_failure():
     publication_idx = body_norm.find("publication ID exhausted")
     mmid_fail_idx = body_norm.find("MMID workspace materialization failed")
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
-    assert publication_idx != -1 and mmid_fail_idx != -1 and cas_idx != -1
-    assert publication_idx < mmid_fail_idx < cas_idx, (
-        "could not establish the expected source order of the three failure sites"
+    # llama.cpp-ibj0 spec round 3 F12: bound the CAS-path rollback ABOVE by
+    # the success-path publish call, symmetric with how the first two
+    # anchors are already bounded on both sides. Without this upper bound, a
+    # mutant that moves the CAS-path rollback line out of its
+    # `if (!lifecycle_replace_placement_plan(...))` block to one line AFTER
+    # ggml_sycl_publish_prepared_plan_locked(...) -- so the CAS FAILURE path
+    # no longer rolls back and the SUCCESS path wrongly undoes the ring
+    # instead -- still passed `any(idx > cas_idx for idx in rollback_calls)`
+    # (a rollback call sitting just after the publish satisfies "idx >
+    # cas_idx" just as well as one sitting inside the CAS failure block).
+    # ggml_sycl_publish_prepared_plan_locked(prepared_publication) occurs
+    # exactly once inside this bounded body (a second, unrelated call site
+    # exists elsewhere in the file, in a different function, outside this
+    # slice), so this is unambiguous.
+    publish_idx = body_norm.find("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
+    assert publication_idx != -1 and mmid_fail_idx != -1 and cas_idx != -1 and publish_idx != -1
+    assert publication_idx < mmid_fail_idx < cas_idx < publish_idx, (
+        "could not establish the expected source order of the three failure sites and the success-path publish"
     )
     assert any(publication_idx < idx < mmid_fail_idx for idx in rollback_calls), (
         "the publication-ID-exhaustion failure path must roll back before its own return"
@@ -458,9 +473,83 @@ def test_transaction_rolls_back_the_ring_on_a_later_failure():
         "the MMID-materialization-failure path must roll back before its own return, and before the CAS "
         "call site (not attributable to the third rollback)"
     )
-    assert any(idx > cas_idx for idx in rollback_calls), (
-        "the lifecycle_replace_placement_plan CAS failure path must roll back before its own return "
-        "(llama.cpp-ibj0 spec round 2 F10)"
+    assert any(cas_idx < idx < publish_idx for idx in rollback_calls), (
+        "the lifecycle_replace_placement_plan CAS failure path must roll back before its own return, and "
+        "BEFORE the success-path publish call -- a rollback sitting after the publish would actually be "
+        "undoing a SUCCESSFUL transaction's ring, not the CAS failure's (llama.cpp-ibj0 spec round 2 F10, "
+        "bound tightened round 3 F12)"
+    )
+
+
+def test_cas_rollback_upper_bound_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-ibj0 spec round 3 F12: proves the
+    upper-bound check above (the CAS-path rollback must precede the
+    success-path publish call) would actually catch the reviewer's mutant --
+    moving the CAS-path rollback line out of its
+    `if (!lifecycle_replace_placement_plan(...))` block to one line AFTER
+    ggml_sycl_publish_prepared_plan_locked(...), so the CAS FAILURE path no
+    longer rolls back and the SUCCESS path wrongly undoes the ring instead.
+
+    Before F12 this exact mutant PASSED the (then only lower-bounded)
+    rollback-count check: `any(idx > cas_idx for idx in rollback_calls)` is
+    still true for a rollback call sitting just after the publish, so the
+    unbounded-above form could not tell a moved rollback from a correctly
+    placed one."""
+    raw = GGML_SYCL_CPP
+    # Unique block: the CAS-failure comment's last line, its rollback call,
+    # the return/close-brace, and the publish call immediately after --
+    # unique because the identical rollback-call text appears twice more
+    # elsewhere in this function (the other two failure paths), but only
+    # THIS occurrence is immediately preceded by "as the two earlier failure
+    # paths above." and immediately followed by the publish call.
+    old_block = (
+        "        // as the two earlier failure paths above.\n"
+        "        (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);\n"
+        "        return;\n"
+        "    }\n"
+        "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
+    )
+    assert old_block in raw, "mutation target block not found -- update this witness to match the real source"
+    new_block = (
+        "        // as the two earlier failure paths above.\n"
+        "        return;\n"
+        "    }\n"
+        "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
+        "    (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);\n"
+    )
+    mutated_raw = raw.replace(old_block, new_block, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "void ggml_backend_sycl_set_runtime_context(",
+            "ggml_backend_sycl_set_runtime_context_for_model(",
+        )
+    )
+    mutated_rollback_calls = [
+        m.start()
+        for m in re.finditer(
+            r"ggml_sycl_replan_pp_moe_onednn_ring\(ctx->device,\s*pre_replan_pp_moe_ring_n_ubatch\)",
+            mutated_body_norm,
+        )
+    ]
+    mutated_cas_idx = mutated_body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    mutated_publish_idx = mutated_body_norm.find("ggml_sycl_publish_prepared_plan_locked(prepared_publication)")
+    assert mutated_cas_idx != -1 and mutated_publish_idx != -1
+
+    # The OLD (round-2) predicate the review found wrongly passing on this
+    # mutant: still true, since the rollback call still sits somewhere after
+    # cas_idx (just after the publish, not inside the CAS-failure block).
+    assert any(idx > mutated_cas_idx for idx in mutated_rollback_calls), (
+        "mutation witness is broken: the pre-F12 (unbounded-above) predicate should still wrongly pass on "
+        "this mutant, or this is not reproducing the reviewer's failure mode"
+    )
+    # The F12 (fixed, upper-bounded) predicate: must now correctly FAIL,
+    # proving the bound actually catches the mutant.
+    assert not any(mutated_cas_idx < idx < mutated_publish_idx for idx in mutated_rollback_calls), (
+        "mutation witness is broken: the F12 upper-bounded predicate should FAIL on this mutant (no rollback "
+        "call between the CAS check and the publish), but it did not"
     )
 
 
