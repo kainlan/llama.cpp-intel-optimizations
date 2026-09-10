@@ -256,7 +256,12 @@ def test_master_switch_ordering_has_a_mutation_witness():
     mutated_raw = mutated_raw.replace(
         path_read_statement, path_read_statement + guard_statement, 1
     )
-    assert mutated_raw != DISPATCH_TUNING_CPP
+    assert mutated_raw != DISPATCH_TUNING_CPP, (
+        "mutation witness is a no-op: the guard already follows the path read in the "
+        "source under test, so removing it and reinserting it right after the path read "
+        "reproduced the input byte-for-byte -- the positive ordering check above is the "
+        "one that should be reporting the real defect, not this witness"
+    )
 
     mutated_body = _ensure_model_loaded_body(strip_comments(mutated_raw))
     mutated_tuning_enabled_idx = mutated_body.find("tuning_enabled()")
