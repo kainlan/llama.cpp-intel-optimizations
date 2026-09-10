@@ -1459,12 +1459,10 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "the catch body actually does"
     )
 
-    continue_stmt = "continue;"
     store_idx_raw = shutdown_unified_cache_body_code.find(store_stmt)
-    assert store_idx_raw != -1, "sanity: the real store statement text must be present"
     after_store_text = shutdown_unified_cache_body_code[store_idx_raw:]
-    assert continue_stmt in after_store_text, "sanity: the catch body's own continue; must follow the store"
-    mutated_after_store = after_store_text.replace(continue_stmt, "", 1)
+    assert CATCH_CONTINUE_STMT in after_store_text, "sanity: the catch body's own continue; must follow the store"
+    mutated_after_store = after_store_text.replace(CATCH_CONTINUE_STMT, "", 1)
     assert mutated_after_store != after_store_text
     mutated_continue = shutdown_unified_cache_body_code[:store_idx_raw] + mutated_after_store
     assert mutated_continue != shutdown_unified_cache_body_code
