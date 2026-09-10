@@ -7,9 +7,8 @@ Before this fix, `tuning_path()` fell back to the literal
 "/tmp/onednn_unified_bench.json" whenever the env var was unset, and
 `ensure_model_loaded()` always called `load_dispatch_tuning_from_file()`
 against whatever `tuning_path()` returned. On a machine without that file
-(essentially every run: `plan-research/tuning-cache.md` §3 counted 197
-occurrences of the resulting "failed to load ... (unable to open file)"
-GGML_LOG_WARN across committed logs), this meant a per-model-load filesystem
+(essentially every run -- the WARN dominates the committed bench logs, per
+`plan-research/tuning-cache.md` §3), this meant a per-model-load filesystem
 touch plus a scary-looking WARN that nobody could act on -- the mechanism
 this file wants (`/tmp/onednn_unified_bench.json`, produced by
 `sycl-kernel-bench --emit-json`) has no device or driver identity in its key
@@ -136,9 +135,16 @@ def test_tuning_path_returns_empty_when_unset():
     assert "GGML_SYCL_DISPATCH_TUNING_JSON" in body, (
         "tuning_path() must still read GGML_SYCL_DISPATCH_TUNING_JSON"
     )
-    assert re.search(r'return\s+std::string\(\s*\)\s*;\s*}\s*$', body) or body.rstrip().endswith(
-        'return "";}'
-    ), (
+    # llama.cpp-o65k quality round 1 (rev-o65k-qual-1, Q1): the previous
+    # two-armed check's second arm (body.rstrip().endswith('return "";}'))
+    # could never fire -- _normalize_ws() collapses the whitespace run
+    # between `;` and `}` down to a single space, so a genuine `return "";`
+    # implementation normalizes to `return ""; }` (single space before the
+    # brace), not the no-space `"";}` the old arm looked for, and would fail
+    # this gate despite being an accepted spelling the docstring promises.
+    # One regex that actually accepts both spellings, whitespace-tolerant
+    # throughout.
+    assert re.search(r'return\s+(?:std::string\(\s*\)|"")\s*;\s*}\s*$', body), (
         "tuning_path()'s fallback return (env unset or empty) must be an empty string "
         "(std::string() or \"\"), not the removed default path"
     )
@@ -284,6 +290,19 @@ def test_docs_have_both_env_var_rows():
     ), (
         "the GGML_SYCL_DISPATCH_TUNING_JSON row must state the whitespace-only-value "
         "behaviour in these words, so the doc cannot silently drop it on a later edit"
+    )
+    # llama.cpp-o65k quality round 1 (rev-o65k-qual-1, Q4): the row's "one
+    # WARN per model" claims are only true while GGML_SYCL_DISPATCH_TUNING
+    # is on -- with the master switch off, ensure_model_loaded() returns
+    # before tuning_path() is even consulted, so neither WARN appears and no
+    # load is attempted. Pin that qualifier so the doc cannot silently drop
+    # it on a later edit.
+    assert (
+        "The path is only consulted while `GGML_SYCL_DISPATCH_TUNING` is on; with the "
+        "master switch off no load is attempted and neither WARN appears." in SYCL_ENV_VARS_MD
+    ), (
+        "the GGML_SYCL_DISPATCH_TUNING_JSON row must state that the path is only "
+        "consulted while GGML_SYCL_DISPATCH_TUNING is on"
     )
 
 

@@ -268,11 +268,7 @@ bool tuning_enabled() {
 }
 
 std::string tuning_path() {
-    // llama.cpp-o65k: opt-in only. There is no default path -- an unset or
-    // empty GGML_SYCL_DISPATCH_TUNING_JSON means "nothing to load", not
-    // "try a well-known location", so an empty return here must reach
-    // ensure_model_loaded() as a signal to skip the load entirely rather
-    // than as a path that then fails to open.
+    // llama.cpp-o65k: opt-in only. There is no default path.
     const char * env = std::getenv("GGML_SYCL_DISPATCH_TUNING_JSON");
     // llama.cpp-o65k round 1 (rev-o65k-spec-1, F2): whitespace is a path,
     // not unset -- env[0] is non-NUL for e.g. a lone " ", so that value is
