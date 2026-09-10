@@ -10913,12 +10913,13 @@ void unified_cache::onednn_graph_scratch_clear_pool_locked() {
     // case at the teardown call site (shutdown_resources() calls this only
     // after drain_all_queues_noexcept() has already synced every queue, so
     // every entry's event is complete there by construction). There are
-    // three other call sites: arena_reserve()'s context-reclaim branch and
-    // ggml_backend_sycl_set_runtime_context()'s runtime-update reclaim do
-    // NOT drain first, so this function must handle an incomplete event
-    // correctly on its own rather than relying on the caller to have
-    // already synced; shutdown_unified_cache()'s pre-census pass
-    // (llama.cpp-me60) DOES drain first, same as the teardown call site.
+    // three other production call sites: arena_reserve()'s context-reclaim
+    // branch and ggml_backend_sycl_set_runtime_context()'s runtime-update
+    // reclaim do NOT drain first, so this function must handle an
+    // incomplete event correctly on its own rather than relying on the
+    // caller to have already synced; shutdown_unified_cache()'s pre-census
+    // pass (llama.cpp-me60) DOES drain first, same as the teardown call
+    // site.
     for (auto & bucket_kv : onednn_graph_scratch_reuse_pool_) {
         const size_t bucket_bytes = bucket_kv.first * bucket_kv.second.size();
         onednn_graph_scratch_direct_outstanding_bytes_ -=
