@@ -214,6 +214,14 @@ void test_largest_fitting_inverts_the_capacity_formula() {
     // UINT32_MAX, forcing the clamp path.
     const uint32_t saturating = unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(1ull << 62, 0, 1, 0, 1);
     check(saturating % 32 == 0, "a saturating capacity still rounds to a multiple of 32 (clamp precedes round)");
+    // llama.cpp-ibj0 quality round 2 note B: the modulo check alone would
+    // also be satisfied by a degenerate regression that returns 0 (0 % 32
+    // == 0 too) -- pin the actual expected value as well, the same figure
+    // the standalone RED harness (scratchpad ibj0-q1-red/q1-red-harness.cpp)
+    // proved for this exact input: (UINT32_MAX / 32) * 32 = 4294967264.
+    check(saturating == 4294967264u,
+          "the saturating capacity's largest-fitting value is exactly 4294967264 "
+          "((UINT32_MAX / 32) * 32), not 0 or some other multiple of 32");
 }
 
 }  // namespace

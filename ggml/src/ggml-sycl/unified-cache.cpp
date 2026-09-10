@@ -4891,9 +4891,10 @@ bool unified_cache::shutdown_resources() {
     // same reset of the three size-tracking members and ring_depth_, same
     // "release the mem_handles outside any lock" ordering. Two safety facts
     // make this substitution behavior-preserving at this specific call
-    // site: (1) no OTHER lock is held here -- the compute-arena and
-    // scratch-pool teardown immediately above this point each take and
-    // release their own mutex before reaching here, so
+    // site: (1) no OTHER lock is held here -- the scratch-pool teardown
+    // immediately above this point takes and releases its own mutex
+    // (scratch_pool_mutex_) before reaching here, and the compute-arena
+    // teardown just before that takes no mutex at all, so
     // release_pp_moe_onednn_scratch_ring() taking pp_moe_onednn_scratch_mutex_
     // internally cannot double-lock or deadlock against an outer holder;
     // (2) this runs BEFORE arena_destroy(), so arena_active() is still true
