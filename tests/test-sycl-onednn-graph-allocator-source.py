@@ -318,10 +318,14 @@ def _preteardown_pool_loop_guard_block(shutdown_unified_cache_body: str) -> str:
     drain+reclaim pass -- or "" if that guard is missing entirely. Reused by
     both the F7 check below (does the drain+reclaim loop sit inside it) and
     the F2 check further down (does the loop's own queue-validity probe sit
-    inside it too)."""
-    if PRETEARDOWN_SHUTTING_DOWN_GUARD not in shutdown_unified_cache_body:
+    inside it too). Normalizes whitespace first, like the sibling
+    positional helper _pool_reclaimed_before_preteardown_census() above, so
+    a clang-format re-wrap of the guard's own line cannot break the
+    match."""
+    normalized = normalize_ws(shutdown_unified_cache_body)
+    if PRETEARDOWN_SHUTTING_DOWN_GUARD not in normalized:
         return ""
-    return extract_function_body(shutdown_unified_cache_body, PRETEARDOWN_SHUTTING_DOWN_GUARD)
+    return extract_function_body(normalized, PRETEARDOWN_SHUTTING_DOWN_GUARD)
 
 
 def _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_body: str) -> bool:
@@ -1351,18 +1355,34 @@ def test_pool_reclaimed_before_census_check_has_a_mutation_witness() -> None:
 
 def test_preteardown_pool_loop_shutdown_guard_check_has_a_mutation_witness() -> None:
     """llama.cpp-3lgu (F7): proves _preteardown_pool_loop_skipped_once_shutting_down()
-    is a real structural check -- the guard text and the drain+reclaim loop
-    text both occur exactly once in shutdown_unified_cache(), so a naive
-    "does the loop text occur anywhere in the body" check could not tell a
-    guarded loop from an unguarded one sitting right after an unrelated
-    guard. Removes the guard's own `if (!ggml_sycl_is_shutting_down())` text
-    (leaving its block body and braces in place, exactly as an accidental
-    de-guarding would) and confirms the real check function then reports the
-    loop as unguarded."""
+    is a real structural check -- the guard text occurs exactly once in
+    shutdown_unified_cache() and the drain+reclaim loop text is the FIRST of
+    its two occurrences, so a naive "does the loop text occur anywhere in
+    the body" check could not tell a guarded loop from an unguarded one
+    sitting right after an unrelated guard. Removes the guard's own
+    `if (!ggml_sycl_is_shutting_down())` text (leaving its block body and
+    braces in place, exactly as an accidental de-guarding would) and
+    confirms the real check function then reports the loop as unguarded."""
     shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
     assert _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_body_code), (
         "the real, unmutated shutdown_unified_cache() body should already pass this check"
     )
+
+    # A first mutant that DE-NESTS without deleting anything: closes the
+    # guard block immediately (empty `{ }` body), leaving the loop text
+    # fully present in the function body but no longer inside the guard's
+    # braces. This is the property the deletion mutant below cannot prove --
+    # that check alone only shows the guard text must be PRESENT somewhere,
+    # not that the loop must be NESTED inside it.
+    denested = shutdown_unified_cache_body_code.replace(
+        PRETEARDOWN_SHUTTING_DOWN_GUARD + " {", PRETEARDOWN_SHUTTING_DOWN_GUARD + " { }", 1
+    )
+    assert denested != shutdown_unified_cache_body_code
+    assert CACHES_LOOP_STMT in denested, "sanity: this mutant must leave the loop text in place"
+    assert not _preteardown_pool_loop_skipped_once_shutting_down(denested), (
+        "mutation witness is broken: closing the guard block early, leaving the loop outside it, was not detected"
+    )
+
     assert PRETEARDOWN_SHUTTING_DOWN_GUARD in shutdown_unified_cache_body_code
     mutated = shutdown_unified_cache_body_code.replace(PRETEARDOWN_SHUTTING_DOWN_GUARD, "", 1)
     assert mutated != shutdown_unified_cache_body_code
