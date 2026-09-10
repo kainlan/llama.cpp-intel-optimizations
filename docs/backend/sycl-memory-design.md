@@ -596,12 +596,14 @@ ticket reproduced on:
   (`ggml-sycl.cpp`) on every successful runtime `n_ctx`/`n_ubatch` update —
   unlike the context-reclaim site above, this one does not go through
   `arena_reserve()` at all; and, llama.cpp-me60,
-  `shutdown_unified_cache()`'s own pre-teardown pass, once per live cache,
-  BEFORE that function's pre-teardown census: a parked DIRECT buffer keeps
-  its own `EXTERNAL_EXACT` allocation control alive until reclaimed, and
-  that census refuses shutdown while any such control survives, so this pass
-  runs ahead of it rather than relying on `shutdown_resources()`'s own,
-  later reclaim. The runtime-context-update site reaches it through the
+  `shutdown_unified_cache()`'s own pre-teardown pass, once per live cache
+  unless SYCL is already shutting down or that cache's queue context is already
+  invalid (llama.cpp-3lgu), BEFORE that function's pre-teardown census: a
+  parked DIRECT buffer keeps its own `EXTERNAL_EXACT` allocation control alive
+  until reclaimed, and that census refuses shutdown while any such control
+  survives, so this pass runs ahead of it rather than relying on
+  `shutdown_resources()`'s own, later reclaim. The runtime-context-update site
+  reaches it through the
   free-function wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`;
   the context-reclaim and pre-census sites call the
   `onednn_graph_scratch_reclaim_pool()` member directly. Without the
