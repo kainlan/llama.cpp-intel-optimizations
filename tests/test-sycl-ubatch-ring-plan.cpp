@@ -86,8 +86,20 @@ void test_slots_reproduce_loader_formula() {
         unified_cache_pp_moe_onednn_slots_for_ubatch(kDevice, 2048, &act, &out) && act == 377487360 && out == 754974720,
         "slots at 2048 double again (360.0 MB activation, 720.0 MB output)");
 
+    // llama.cpp-ibj0 spec round 1 F9: this PURE FUNCTION deliberately accepts
+    // n_ubatch=0 (0 rows is not an overflow, so returning slots of exactly 0
+    // bytes is the correct answer for the question this function actually
+    // answers -- "what size do 0 rows need"). n_ubatch=0 is not itself a
+    // valid RUNTIME micro-batch, but that is a caller-level policy decision,
+    // not something this sizing function should encode: the actual guard
+    // against ever calling this with n_ubatch=0 from a real runtime-context
+    // transaction lives in ggml_sycl_replan_pp_moe_onednn_ring() (ggml-sycl.cpp),
+    // which cannot be exercised host-only (it needs a live unified_cache and
+    // SYCL device queue) -- pinned instead by
+    // test_replan_guards_n_ubatch_zero() in test-sycl-ubatch-ring-replan-source.py.
     check(unified_cache_pp_moe_onednn_slots_for_ubatch(kDevice, 0, &act, &out) && act == 0 && out == 0,
-          "n_ubatch=0 -> both slots exactly 0 (0 rows, not a refusal: the per-row bytes are still planned)");
+          "n_ubatch=0 -> both slots exactly 0 (0 rows, not a refusal: the SIZING function's own correct "
+          "answer -- the n_ubatch==0 GUARD itself is caller-level and source-gated, not tested here)");
 }
 
 void test_slots_shrink_correctly_after_a_grow() {

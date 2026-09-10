@@ -147,7 +147,13 @@ def test_transaction_refuses_when_replan_fails():
 def test_replan_call_has_a_mutation_witness():
     """Mutation witness for the two checks above: proves they would actually
     catch the re-plan call being removed, rather than only ever passing on
-    the current, correct source."""
+    the current, correct source.
+
+    Counts occurrences rather than asserting total absence: since spec round
+    1 F8, ggml_sycl_replan_pp_moe_onednn_ring() is legitimately called THREE
+    times in this function (the original re-plan, plus two later rollback
+    call sites) -- deleting the original call site must drop the count by
+    exactly one, to two, not zero."""
     raw = GGML_SYCL_CPP
     call_block = (
         "    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch)) {\n"
@@ -158,17 +164,25 @@ def test_replan_call_has_a_mutation_witness():
     mutated_raw = raw.replace(call_block, "", 1)
     assert mutated_raw != raw
 
-    mutated_code = strip_comments(mutated_raw)
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            mutated_code,
-            "void ggml_backend_sycl_set_runtime_context(",
-            "ggml_backend_sycl_set_runtime_context_for_model(",
+    def _call_count(code: str) -> int:
+        body_norm = _normalize_ws(
+            _bounded_body(
+                code,
+                "void ggml_backend_sycl_set_runtime_context(",
+                "ggml_backend_sycl_set_runtime_context_for_model(",
+            )
         )
+        return len(re.findall(r"ggml_sycl_replan_pp_moe_onednn_ring\(", body_norm))
+
+    original_count = _call_count(strip_comments(raw))
+    mutated_count = _call_count(strip_comments(mutated_raw))
+    assert original_count == 3, (
+        f"expected exactly three calls in the unmutated source (the re-plan itself plus two rollback call "
+        f"sites) -- found {original_count}; update this witness to match the real source"
     )
-    assert "ggml_sycl_replan_pp_moe_onednn_ring(" not in mutated_body_norm, (
-        "mutation witness is broken: deleting the call site left a reference to "
-        "ggml_sycl_replan_pp_moe_onednn_ring() behind"
+    assert mutated_count == original_count - 1, (
+        "mutation witness is broken: deleting the call site must drop the count by exactly one -- found "
+        f"{mutated_count} (expected {original_count - 1})"
     )
 
 
@@ -260,38 +274,181 @@ def test_replan_is_idempotent_and_skips_dense_models():
     )
 
 
-def test_replan_is_bidirectional_and_releases_the_ring_on_shrink():
-    """llama.cpp-nphx Task 3 spike (comment c-wgxn): a SHRINK -- the runtime
-    n_ubatch smaller than the ring's currently-planned one -- must release
-    the physical ring BEFORE reserving the smaller size, or
-    reserve_pp_moe_onednn_scratch()'s own 'already sufficient, reuse without
-    reallocating' fast path silently keeps the larger, discarded ring (and
-    the RUNTIME zone's charge for it) forever. This matters because Task 4b's
-    ascending-ladder trial can settle on a smaller n_ubatch than the largest
-    one it tried."""
+def test_replan_always_releases_the_ring_before_reserving():
+    """llama.cpp-ibj0 spec round 1 F1/F2/F4 (supersedes the pre-round-1
+    shrink-only release): the re-plan must release the CURRENT physical ring
+    UNCONDITIONALLY -- both a grow and a shrink -- before reserving the new
+    size, and that release must precede both the ceiling write and the
+    reserve attempt.
+
+    Why unconditional, not shrink-only (llama.cpp-nphx Task 3 spike comment
+    c-wgxn, and the round-1 review that found the shrink-only version's own
+    capacity math was wrong for grow): reserve_pp_moe_onednn_scratch()'s
+    'already sufficient, reuse without reallocating' fast path would
+    otherwise silently keep a larger, discarded ring (and the RUNTIME zone's
+    charge for it) forever after a settle-smaller; and on a GROW,
+    reserve_pp_moe_onednn_scratch()'s own allocate-new-then-retire-old path
+    holds the OLD ring's bytes outstanding while attempting the NEW one, so
+    a refusal's capacity figure that assumed those bytes were already free
+    named an -ub that would also fail. Releasing first makes every re-plan
+    attempt, either direction, measure the exact same thing: real capacity
+    with nothing from this ring outstanding."""
     body_norm = _normalize_ws(_replan_ring_fn_body())
 
     assert "release_pp_moe_onednn_scratch_ring(" in body_norm, (
-        "the re-plan must call release_pp_moe_onednn_scratch_ring() somewhere -- the shrink path has no "
-        "other way to force reserve_pp_moe_onednn_scratch() to actually shrink the physical ring"
+        "the re-plan must call release_pp_moe_onednn_scratch_ring()"
     )
-    release_match = re.search(
-        r"if\s*\(\s*n_ubatch\s*<\s*old_n_ubatch\s*&&\s*!\s*cache->release_pp_moe_onednn_scratch_ring\(\)\s*\)",
-        body_norm,
-    )
+    release_match = re.search(r"if\s*\(\s*!\s*cache->release_pp_moe_onednn_scratch_ring\(\)\s*\)", body_norm)
     assert release_match is not None, (
-        "the release call must be gated on n_ubatch < old_n_ubatch (a SHRINK only -- a grow does not need "
-        "it, reserve_pp_moe_onednn_scratch()'s own allocate-new-then-retire-old path already frees a "
-        "smaller predecessor correctly)"
+        "the release call must be UNCONDITIONAL -- gated on neither n_ubatch < old_n_ubatch nor any other "
+        "direction check (see F1/F4)"
     )
 
     set_first_idx = body_norm.find("unified_cache_set_planned_pp_moe_onednn_scratch(")
     reserve_idx = body_norm.find("reserve_pp_moe_onednn_scratch(")
     assert set_first_idx != -1 and reserve_idx != -1
     assert release_match.start() < set_first_idx < reserve_idx, (
-        "the release call must precede BOTH the ceiling raise/lower and the reserve attempt -- releasing "
-        "after either would either shrink a ring the new (still-old) ceiling claims is bigger, or race "
+        "the release call must precede BOTH the ceiling write and the reserve attempt -- releasing after "
+        "either would either publish a ceiling the physical ring does not yet back, or race "
         "reserve_pp_moe_onednn_scratch()'s own fast path"
+    )
+
+
+def test_refusal_capacity_measures_the_path_that_actually_reserves():
+    """llama.cpp-ibj0 spec round 1 F1/F2: the capacity figure in the refusal
+    must come from the SAME accessor reserve_pp_moe_onednn_scratch() itself
+    draws from on the CURRENT route -- zone_available(RUNTIME) when
+    arena-backed, available() (budget_ minus used_) on the direct-device
+    path -- branching on the identical arena_active() predicate
+    reserve_pp_moe_onednn_scratch()'s own 'reserved from %s' log already uses
+    to name the two routes. Must NOT add back any of the ring's own bytes:
+    a grow's allocator holds the OLD ring outstanding while attempting the
+    NEW one (transiently two full rings), so those bytes are never actually
+    available to that attempt -- the pre-round-1 add-back named a
+    largest-fitting -ub that would also fail."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+
+    assert "cache->arena_active()" in body_norm, (
+        "must branch on the SAME arena_active() predicate reserve_pp_moe_onednn_scratch() uses to pick its "
+        "own capacity source"
+    )
+    assert "cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME)" in body_norm, (
+        "the arena-backed route must read zone_available(RUNTIME)"
+    )
+    assert "cache->available()" in body_norm, "the direct-device route must read available() (budget_ - used_)"
+
+    assert not re.search(r"capacity_bytes\s*=[^;]*old_activation_slot_bytes", body_norm), (
+        "the capacity figure must not add back the old ring's bytes -- see this test's docstring"
+    )
+    assert '"but the RUNTIME zone has' not in body_norm, (
+        "the refusal must not hardcode \"RUNTIME\" in the format string -- name the real route the "
+        "reservation actually decided against (the dynamic zone_name variable)"
+    )
+    assert "zone_name" in body_norm, "the refusal must print the dynamic zone_name variable, not a fixed string"
+
+    reserve_indices = [m.start() for m in re.finditer(r"cache->reserve_pp_moe_onednn_scratch\(", body_norm)]
+    assert len(reserve_indices) == 2, (
+        "expected exactly two reserve_pp_moe_onednn_scratch() calls (the failed NEW-size attempt, and the "
+        f"OLD-size restore attempt on failure) -- found {len(reserve_indices)}"
+    )
+    capacity_idx = body_norm.find("capacity_bytes =")
+    assert capacity_idx != -1 and reserve_indices[0] < capacity_idx < reserve_indices[1], (
+        "capacity_bytes must be measured AFTER the failed NEW-size reserve attempt but BEFORE the OLD-size "
+        "restore reserve attempt -- restoring first would consume back some of the capacity being reported, "
+        "making the printed figure describe a state the failed attempt never actually saw"
+    )
+
+
+def test_replan_reserves_the_old_ring_on_a_failed_new_reserve():
+    """llama.cpp-ibj0 spec round 1 F1: on a failed NEW-size reserve, the OLD
+    ring must be RE-RESERVED, not merely have its ceiling relabeled -- the
+    unconditional release earlier in this function already tore the old ring
+    down physically, so restoring only the ceiling would claim a ring that
+    no longer exists. A failure of the restore attempt itself must be
+    reported, not silently swallowed."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+    reserve_indices = [m.start() for m in re.finditer(r"cache->reserve_pp_moe_onednn_scratch\(", body_norm)]
+    assert len(reserve_indices) == 2
+    restore_call_and_after = body_norm[reserve_indices[1] : reserve_indices[1] + 200]
+    assert "old_activation_slot_bytes" in restore_call_and_after and "old_output_slot_bytes" in restore_call_and_after, (
+        "the second reserve_pp_moe_onednn_scratch() call must request the OLD sizes -- actually restoring "
+        "the physical ring, not just relabeling the ceiling"
+    )
+    assert "restore FAILED" in body_norm, "a failed restore attempt must be logged at ERROR, not silently ignored"
+
+
+def test_refusal_is_a_single_combined_line_not_two_calls():
+    """llama.cpp-ibj0 spec round 1 F3: the refusal must be ONE GGML_LOG_ERROR
+    call, with the largest-fitting clause appended to the SAME line (omitted
+    when the figure is < 32) -- not a second, separate GGML_LOG_ERROR call
+    just for the remediation, which was the pre-round-1 shape."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+    assert 'GGML_LOG_ERROR("[SYCL-PLAN] the largest -ub that fits is about %u\\n"' not in body_norm, (
+        "the largest-fitting remediation must not be its own separate GGML_LOG_ERROR call"
+    )
+    assert 'available%s\\n"' in body_norm, (
+        "the main refusal's format string must end \"...available%s\\n\" -- a %s slot for the "
+        "conditionally-omitted largest-fitting clause, on the SAME line as the rest of the message"
+    )
+
+
+def test_replan_guards_n_ubatch_zero():
+    """llama.cpp-ibj0 spec round 1 F9: n_ubatch == 0 is not a valid runtime
+    micro-batch (unified_cache_pp_moe_onednn_slots_for_ubatch() itself
+    accepts it and computes a valid-looking zero-sized ring -- 0 rows is not
+    an overflow -- so the SIZING function's leniency cannot be relied on as
+    the guard). The re-plan must guard it explicitly with a WARN and never
+    publish a zero ceiling."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+    guard_match = re.search(r"if\s*\(\s*n_ubatch\s*==\s*0\s*\)\s*\{", body_norm)
+    assert guard_match is not None, "the re-plan must explicitly guard n_ubatch == 0"
+
+    idempotence_idx = body_norm.find(
+        "if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device))", guard_match.start()
+    )
+    assert idempotence_idx != -1 and idempotence_idx > guard_match.start(), (
+        "could not bound the n_ubatch==0 guard's own if-block (looked for the idempotence check just after it)"
+    )
+    guard_block = body_norm[guard_match.start() : idempotence_idx]
+    assert "GGML_LOG_WARN(" in guard_block, "the n_ubatch==0 guard must WARN, not silently return"
+    assert "return true" in guard_block, "the n_ubatch==0 guard must skip the re-plan (return true), not proceed"
+    assert "unified_cache_set_planned_pp_moe_onednn_scratch(" not in guard_block, (
+        "the n_ubatch==0 guard must never publish a zero ceiling"
+    )
+
+
+def test_transaction_rolls_back_the_ring_on_a_later_failure():
+    """llama.cpp-ibj0 spec round 1 F8: a successful ring re-plan can still be
+    undone by a LATER, unrelated transaction failure (publication-ID
+    exhaustion, MMID workspace materialization) -- both later `return;`
+    sites must roll the ring back to the pre-transaction n_ubatch (by
+    re-invoking the same, direction-symmetric re-plan function), or a
+    refused transaction leaves a changed ring behind even though nothing
+    about the ring itself was ever refused."""
+    body_norm = _normalize_ws(_runtime_context_body())
+    assert "pre_replan_pp_moe_ring_n_ubatch" in body_norm, (
+        "the pre-transaction ring n_ubatch must be captured BEFORE the re-plan call, so later failure paths "
+        "can roll back to it"
+    )
+    rollback_calls = [
+        m.start()
+        for m in re.finditer(
+            r"ggml_sycl_replan_pp_moe_onednn_ring\(ctx->device,\s*pre_replan_pp_moe_ring_n_ubatch\)", body_norm
+        )
+    ]
+    assert len(rollback_calls) >= 2, (
+        "expected at least two rollback calls (publication-ID exhaustion, MMID materialization failure), "
+        f"found {len(rollback_calls)}"
+    )
+
+    publication_idx = body_norm.find("publication ID exhausted")
+    mmid_fail_idx = body_norm.find("MMID workspace materialization failed")
+    assert publication_idx != -1 and mmid_fail_idx != -1
+    assert any(publication_idx < idx < mmid_fail_idx for idx in rollback_calls), (
+        "the publication-ID-exhaustion failure path must roll back before its own return"
+    )
+    assert any(idx > mmid_fail_idx for idx in rollback_calls), (
+        "the MMID-materialization-failure path must roll back before its own return"
     )
 
 
