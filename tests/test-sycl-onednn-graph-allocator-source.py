@@ -1409,7 +1409,19 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     and confirms the real check function reports it missing -- a catch
     clause that merely swallows the exception without recording the flag
     would otherwise pass this check even though this cache's own later
-    shutdown_resources() call would then see a still-false flag."""
+    shutdown_resources() call would then see a still-false flag.
+
+    A third mutant proves the catch body's own `continue;` is checked too,
+    not just the store: removes ONLY the `continue;` that follows the store
+    (leaving get_context(), the store statement, the try {}/catch (...) {}
+    skeleton, and the drain call all untouched and still correctly ordered)
+    and confirms the real check function reports it missing. This is
+    distinct from the loop's earlier `if (!item.second) { continue; }`,
+    which sits before the try and must stay untouched by this mutant --
+    without the catch body's own continue, the probe would still record the
+    flag but the invalid cache would then fall through to
+    drain_all_queues_noexcept() and the reclaim call instead of being
+    skipped, which is exactly what the flag store exists to prevent."""
     shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
     assert _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code), (
         "the real, fixed shutdown_unified_cache() body should already pass this check (llama.cpp-3lgu F2)"
@@ -1431,4 +1443,23 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "mutation witness is broken: removing only the g_sycl_shutting_down.store(true, ...) statement from the "
         "catch body was not detected -- the check may be validating the try/catch shape without checking what "
         "the catch body actually does"
+    )
+
+    continue_stmt = "continue;"
+    store_idx_raw = shutdown_unified_cache_body_code.find(store_stmt)
+    assert store_idx_raw != -1, "sanity: the real store statement text must be present"
+    after_store_text = shutdown_unified_cache_body_code[store_idx_raw:]
+    assert continue_stmt in after_store_text, "sanity: the catch body's own continue; must follow the store"
+    mutated_after_store = after_store_text.replace(continue_stmt, "", 1)
+    assert mutated_after_store != after_store_text
+    mutated_continue = shutdown_unified_cache_body_code[:store_idx_raw] + mutated_after_store
+    assert mutated_continue != shutdown_unified_cache_body_code
+    assert QUEUE_CONTEXT_PROBE_CALL in mutated_continue, "sanity: this mutant must leave get_context() untouched"
+    assert store_stmt in mutated_continue, "sanity: this mutant must leave the store statement untouched"
+    assert DRAIN_CALL in mutated_continue, "sanity: this mutant must leave the drain call untouched"
+    assert not _preteardown_loop_probes_queue_validity_before_drain(mutated_continue), (
+        "mutation witness is broken: removing only the catch body's own continue; (the one after the store, not "
+        "the loop's earlier `if (!item.second) { continue; }`, which this mutant must leave untouched) was not "
+        "detected -- without it, the probe would still record the flag but the invalid cache would then fall "
+        "through to drain_all_queues_noexcept() and the reclaim call instead of being skipped"
     )
