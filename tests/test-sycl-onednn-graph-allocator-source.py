@@ -307,6 +307,70 @@ def _pool_reclaimed_before_preteardown_census(shutdown_unified_cache_body: str) 
     return reclaim_idx != -1 and census_idx != -1 and reclaim_idx < census_idx
 
 
+PRETEARDOWN_SHUTTING_DOWN_GUARD = "if (!ggml_sycl_is_shutting_down())"
+CACHES_LOOP_STMT = "for (auto & item : caches)"
+
+
+def _preteardown_pool_loop_guard_block(shutdown_unified_cache_body: str) -> str:
+    """llama.cpp-3lgu (F7): return the brace-balanced block of the FIRST (and
+    only) `if (!ggml_sycl_is_shutting_down())` guard in
+    shutdown_unified_cache() -- the pre-census oneDNN Graph-scratch
+    drain+reclaim pass -- or "" if that guard is missing entirely. Reused by
+    both the F7 check below (does the drain+reclaim loop sit inside it) and
+    the F2 check further down (does the loop's own queue-validity probe sit
+    inside it too)."""
+    if PRETEARDOWN_SHUTTING_DOWN_GUARD not in shutdown_unified_cache_body:
+        return ""
+    return extract_function_body(shutdown_unified_cache_body, PRETEARDOWN_SHUTTING_DOWN_GUARD)
+
+
+def _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_body: str) -> bool:
+    """llama.cpp-3lgu (F7): true iff the pre-census drain+reclaim loop (the
+    FIRST `for (auto & item : caches)` in shutdown_unified_cache() -- the
+    second, further down, is the later per-cache shutdown_resources()
+    teardown loop, which has its own separate guarding) is nested inside
+    `if (!ggml_sycl_is_shutting_down())`, not bare. A true flag on entry
+    means shutdown_resources() will abandon cleanup on every live cache's
+    own equivalent branch anyway, so this earlier pass has nothing left to
+    reclaim and no validity probe of its own (see F2) to protect a
+    drain/reclaim call against an already-torn-down context."""
+    guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
+    return CACHES_LOOP_STMT in guard_block
+
+
+QUEUE_CONTEXT_PROBE_CALL = "get_context()"
+TRY_STMT = "try {"
+CATCH_ALL_STMT = "catch (...)"
+
+
+def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body: str) -> bool:
+    """llama.cpp-3lgu (F2): true iff, inside the pre-census drain+reclaim
+    loop (see _preteardown_pool_loop_guard_block()), each cache's own
+    queue-context validity is probed -- a `try { ... get_context(); } catch
+    (...) { ... }` guard, mirroring shutdown_resources()'s own probe
+    (unified-cache.cpp ~4557) -- and that probe's try/get_context()/catch
+    sequence appears strictly BEFORE the loop's own
+    drain_all_queues_noexcept() call. Without it, a context torn down while
+    g_sycl_shutting_down is still false reaches drain_all_queues_noexcept()
+    (which swallows the throw) and then this cache's pool reclaim, whose
+    mem_handle releases would attempt a real free against an already-invalid
+    context. Uses the FIRST occurrence of each anchor within the loop body
+    via str.find() so a later, correctly-ordered probe cannot mask an
+    earlier, missing one -- see this check's own mutation witness below."""
+    guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
+    loop_idx = guard_block.find(CACHES_LOOP_STMT)
+    if loop_idx == -1:
+        return False
+    loop_body = normalize_ws(guard_block[loop_idx:])
+    try_idx = loop_body.find(TRY_STMT)
+    probe_idx = loop_body.find(QUEUE_CONTEXT_PROBE_CALL)
+    catch_idx = loop_body.find(CATCH_ALL_STMT)
+    drain_idx = loop_body.find(DRAIN_CALL)
+    if -1 in (try_idx, probe_idx, catch_idx, drain_idx):
+        return False
+    return try_idx < probe_idx < catch_idx < drain_idx
+
+
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
 CACHE_HPP_CODE = strip_comments(CACHE_HPP)
 CACHE_CPP_CODE = strip_comments(CACHE_CPP)
@@ -900,6 +964,23 @@ def test_onednn_graph_allocator_source_contract() -> None:
         _pool_reclaimed_before_preteardown_census(shutdown_unified_cache_body_code)
     )
 
+    # llama.cpp-3lgu (F7): nothing previously gated the guard that skips the
+    # whole pre-census drain+reclaim pass once SYCL is already shutting
+    # down -- add source coverage for it directly.
+    checks["pre-census drain/reclaim loop is skipped once SYCL is already shutting down"] = (
+        _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_body_code)
+    )
+
+    # llama.cpp-3lgu (F2): the pre-census pass had no queue-context validity
+    # probe of its own -- a context torn down while g_sycl_shutting_down is
+    # still false used to reach drain_all_queues_noexcept() (swallows the
+    # throw) and then clear_pool_locked(), whose mem_handle destructors read
+    # the same false flag and attempt real frees against an already-invalid
+    # context.
+    checks["pre-census drain/reclaim loop probes queue validity before its drain call"] = (
+        _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code)
+    )
+
     failed = [name for name, ok in checks.items() if not ok]
     assert not failed, "onednn graph allocator source contract failed: " + ", ".join(failed)
 
@@ -1255,4 +1336,47 @@ def test_pool_reclaimed_before_census_check_has_a_mutation_witness() -> None:
     assert mutated != normalized
     assert not _pool_reclaimed_before_preteardown_census(mutated), (
         "mutation witness is broken: an earlier census call injected ahead of the reclaim call was not detected"
+    )
+
+
+def test_preteardown_pool_loop_shutdown_guard_check_has_a_mutation_witness() -> None:
+    """llama.cpp-3lgu (F7): proves _preteardown_pool_loop_skipped_once_shutting_down()
+    is a real structural check -- the guard text and the drain+reclaim loop
+    text both occur exactly once in shutdown_unified_cache(), so a naive
+    "does the loop text occur anywhere in the body" check could not tell a
+    guarded loop from an unguarded one sitting right after an unrelated
+    guard. Removes the guard's own `if (!ggml_sycl_is_shutting_down())` text
+    (leaving its block body and braces in place, exactly as an accidental
+    de-guarding would) and confirms the real check function then reports the
+    loop as unguarded."""
+    shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
+    assert _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_body_code), (
+        "the real, unmutated shutdown_unified_cache() body should already pass this check"
+    )
+    assert PRETEARDOWN_SHUTTING_DOWN_GUARD in shutdown_unified_cache_body_code
+    mutated = shutdown_unified_cache_body_code.replace(PRETEARDOWN_SHUTTING_DOWN_GUARD, "", 1)
+    assert mutated != shutdown_unified_cache_body_code
+    assert not _preteardown_pool_loop_skipped_once_shutting_down(mutated), (
+        "mutation witness is broken: removing the shutting-down guard was not detected -- the check may be "
+        "matching the drain+reclaim loop's text unconditionally instead of requiring it inside the guard block"
+    )
+
+
+def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
+    """llama.cpp-3lgu (F2): proves _preteardown_loop_probes_queue_validity_before_drain()
+    is a real positional check on the probe's own get_context() call, not a
+    same-body coincidence -- removes exactly that call from the real, fixed
+    loop body (leaving its surrounding try {} catch (...) {} skeleton and
+    the drain call untouched) and confirms the real check function then
+    reports the probe as missing, even though the try/catch structure and
+    the drain call are both still present and still correctly ordered."""
+    shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
+    assert _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code), (
+        "the real, fixed shutdown_unified_cache() body should already pass this check (llama.cpp-3lgu F2)"
+    )
+    assert QUEUE_CONTEXT_PROBE_CALL in shutdown_unified_cache_body_code
+    mutated = shutdown_unified_cache_body_code.replace(QUEUE_CONTEXT_PROBE_CALL, "", 1)
+    assert mutated != shutdown_unified_cache_body_code
+    assert not _preteardown_loop_probes_queue_validity_before_drain(mutated), (
+        "mutation witness is broken: removing the queue-context probe call was not detected"
     )
