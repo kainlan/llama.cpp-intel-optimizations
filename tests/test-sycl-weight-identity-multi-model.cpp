@@ -67,7 +67,7 @@
 //      g_sycl_weight_identities_unowned, g_sycl_gguf_file_ids),
 //      registry.acquire_load_effect()/bound_candidate() (layer 1, above),
 //      ggml_sycl::dispatch_tuning::ensure_model_loaded() (env-var gated
-//      local-file read, no device access -- dispatch-tuning.cpp:356), and
+//      local-file read, no device access -- dispatch-tuning.cpp), and
 //      sycl_module_mutation_guard (a plain mutex/counter in ggml-sycl.cpp;
 //      `cat ggml/src/ggml-sycl/ggml-sycl.cpp | grep -n 'class
 //      sycl_module_mutation_guard'` locates it).

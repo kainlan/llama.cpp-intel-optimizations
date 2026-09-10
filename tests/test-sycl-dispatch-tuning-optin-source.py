@@ -187,6 +187,24 @@ def test_ensure_model_loaded_early_returns_on_empty_path_before_load():
         "prevent the filesystem touch and the log line the acceptance criterion forbids"
     )
 
+    # llama.cpp-i3x2 R3: the checks above pin the path.empty() guard's own
+    # position but never establish that the !tuning_enabled() master-switch
+    # check (top of the function) runs BEFORE tuning_path() is even called.
+    # A reorder that read the path first and checked tuning_enabled() second
+    # would satisfy every assertion above while still touching the
+    # filesystem with the master switch off -- falsifying the
+    # sycl-env-vars.md sentence pinned by test_docs_have_both_env_var_rows
+    # below ("The path is only consulted while `GGML_SYCL_DISPATCH_TUNING`
+    # is on; with the master switch off no load is attempted and neither
+    # WARN appears.").
+    tuning_enabled_idx = body.find("tuning_enabled()")
+    assert tuning_enabled_idx != -1, "ensure_model_loaded() must still consult tuning_enabled()"
+    assert tuning_enabled_idx < path_idx, (
+        "the !tuning_enabled() master-switch check must be consulted BEFORE tuning_path() "
+        "is read -- otherwise the master switch does not prevent the filesystem touch the "
+        "sycl-env-vars.md doc promises it does"
+    )
+
 
 def test_early_return_guard_has_a_mutation_witness():
     """Mutation witness for the check above: proves it would actually catch
@@ -210,6 +228,56 @@ def test_early_return_guard_has_a_mutation_witness():
     assert empty_check is None, (
         "mutation witness is broken: the reverted (guard-deleted) source still trips the "
         "positive check above"
+    )
+
+
+def test_master_switch_ordering_has_a_mutation_witness():
+    """Mutation witness for the tuning_enabled()-before-tuning_path() check
+    above: proves it would actually catch a reorder that moved the
+    master-switch check to AFTER the path read, rather than only ever
+    passing on the current, correct source. Mutates the RAW source (moving
+    the exact guard statement from the top of the function to immediately
+    after the path read) and re-derives the bounded body through the same
+    _ensure_model_loaded_body() accessor the positive check uses, rather
+    than hand-building the already-normalized text."""
+    guard_statement = "    if (!tuning_enabled() || model_id == 0) {\n        return;\n    }\n\n"
+    path_read_statement = "    const std::string path = tuning_path();\n"
+    assert guard_statement in DISPATCH_TUNING_CPP, (
+        "mutation target not found verbatim -- update this witness to match the current "
+        "guard's exact formatting"
+    )
+    assert path_read_statement in DISPATCH_TUNING_CPP, (
+        "mutation target not found verbatim -- update this witness to match the current "
+        "path-read statement's exact formatting"
+    )
+
+    mutated_raw = DISPATCH_TUNING_CPP.replace(guard_statement, "", 1)
+    assert mutated_raw != DISPATCH_TUNING_CPP
+    mutated_raw = mutated_raw.replace(
+        path_read_statement, path_read_statement + guard_statement, 1
+    )
+    assert mutated_raw != DISPATCH_TUNING_CPP, (
+        "mutation witness is a no-op: the guard already follows the path read in the "
+        "source under test, so removing it and reinserting it right after the path read "
+        "reproduced the input byte-for-byte -- the positive ordering check above is the "
+        "one that should be reporting the real defect, not this witness"
+    )
+
+    mutated_body = _ensure_model_loaded_body(strip_comments(mutated_raw))
+    mutated_tuning_enabled_idx = mutated_body.find("tuning_enabled()")
+    mutated_path_idx = mutated_body.find("tuning_path()")
+    assert mutated_tuning_enabled_idx != -1, (
+        "mutation witness is broken: ensure_model_loaded() no longer consults "
+        "tuning_enabled() after the mutation"
+    )
+    assert mutated_path_idx != -1, (
+        "mutation witness is broken: ensure_model_loaded() no longer calls tuning_path() "
+        "after the mutation"
+    )
+    assert mutated_tuning_enabled_idx > mutated_path_idx, (
+        "mutation witness is broken: moving the guard after the path read did not actually "
+        "reorder tuning_enabled() after tuning_path() in the bounded body -- the positive "
+        "check above would not catch this reversion"
     )
 
 
