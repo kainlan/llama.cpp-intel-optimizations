@@ -334,22 +334,28 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
 // llama.cpp-nphx: -ub/--ubatch-size accepts the literal token "auto" (any
 // number of times, comma-separated with ordinary integers) as a stand-in for
 // the sentinel -1, which cmd_params_instance::to_llama_cparams() below turns
-// into n_ubatch_auto=true. parse_int_range() itself stays untouched (it is
-// shared with several other flags that have no "auto" spelling) -- this just
-// rewrites the "auto" tokens before handing the string to it.
+// into n_ubatch_auto=true. Only the exact token "auto" maps to that sentinel;
+// every other comma-separated token is parsed by the UNMODIFIED, non-negative
+// parse_int_range() (the same call the base -ub handler used), so a literal
+// negative number (e.g. "-256", or "-1" typed directly rather than via
+// "auto") is rejected with the identical "invalid range format" base already
+// throws -- allow_negative is never turned on here, which is what keeps that
+// rejection intact; passing allow_negative=true through to a comma-joined
+// string would have let ANY negative token silently through as if it were
+// "auto" (llama.cpp-y8xv spec round 1, F3).
 static std::vector<int> parse_ubatch_range(const std::string & s) {
-    std::string       sanitized;
+    std::vector<int>  result;
     std::string       tok;
     std::stringstream ss(s);
-    bool              first = true;
     while (std::getline(ss, tok, ',')) {
-        if (!first) {
-            sanitized += ',';
+        if (tok == "auto") {
+            result.push_back(-1);
+            continue;
         }
-        sanitized += (tok == "auto") ? "-1" : tok;
-        first = false;
+        auto p = parse_int_range(tok);
+        result.insert(result.end(), p.begin(), p.end());
     }
-    return parse_int_range(sanitized, /*allow_negative=*/true);
+    return result;
 }
 
 struct cmd_params {
@@ -1542,7 +1548,7 @@ struct test {
         // library default) or -1 (the "-ub auto" sentinel) -- neither is
         // ever what actually ran, and llama_n_ubatch(ctx) is always valid
         // once the context exists.
-        n_ubatch              = llama_n_ubatch(ctx);
+        n_ubatch       = llama_n_ubatch(ctx);
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;

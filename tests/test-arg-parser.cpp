@@ -200,7 +200,8 @@ static void test(void) {
     {
         common_params ubatch_params;
         argv = {"binary_name", "-m", "model_file.gguf", "--ubatch-size", "777"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
         assert(ubatch_params.n_ubatch == 777);
         assert(ubatch_params.n_ubatch_auto == false);
     }
@@ -210,7 +211,8 @@ static void test(void) {
         // ever flips without the plumbing changing with it.
         common_params ubatch_params;
         argv = {"binary_name", "-m", "model_file.gguf"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
 #ifdef GGML_USE_SYCL
         assert(ubatch_params.n_ubatch_auto == true);
 #else
@@ -220,7 +222,8 @@ static void test(void) {
     {
         common_params ubatch_params;
         argv = {"binary_name", "-m", "model_file.gguf", "-ub", "auto"};
-        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
         assert(ubatch_params.n_ubatch_auto == true);
     }
 

@@ -1671,7 +1671,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_BATCH"));
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
-        string_format("physical maximum batch size (default: %d)", params.n_ubatch),
+        string_format("physical maximum batch size, or \"auto\" (default: %d)", params.n_ubatch),
         [](common_params & params, const std::string & value) {
             // llama.cpp-nphx: "auto" lets the SYCL backend pick n_ubatch at context
             // creation (n_ubatch itself is left untouched -- 0 already means "use

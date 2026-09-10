@@ -111,8 +111,8 @@ hunks merge with **no conflict markers** — but `common/fit.cpp` is the one "cl
 group that is not actually safe; see its own entry below for why.
 
 **New fork-local addition (2026-09-10, llama.cpp-nphx Task 4a, not one of the four behaviors
-above — recorded here because it is the same shape as (a), not because it extends that count.**
-`struct llama_context_params` gains a new trailing boolean, `n_ubatch_auto` (declared at
+above — recorded here because it is the same shape as (a), not because it extends that count).**
+`struct llama_context_params` gains a new boolean, `n_ubatch_auto` (declared at
 `include/llama.h`, grouped with the struct's other booleans right after `kv_unified`; default
 `false` in `llama_context_default_params()`, `src/llama-context.cpp`). `common_params` gains the
 mirror field `n_ubatch_auto` at `common/common.h`, immediately after `n_ubatch`, using the exact
