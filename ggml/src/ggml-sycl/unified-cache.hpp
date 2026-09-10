@@ -1598,6 +1598,54 @@ size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 
+// llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
+// carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
+// so the runtime-context transaction can re-plan the ring for the REAL
+// runtime n_ubatch -- the load-time plan above is always sized for the
+// loader's own inventory.n_ubatch (512 today), not whatever n_ubatch the
+// context is actually created with. 0 = no MoE PP ring planned (dense model).
+void   unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
+                                                         size_t activation_bytes_per_row,
+                                                         size_t output_bytes_per_row);
+size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
+size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+
+// The n_ubatch the CURRENTLY PLANNED activation/output slots above were sized
+// for -- distinct from the loader's inventory.n_ubatch (always 512 today):
+// this one tracks whatever the runtime-context transaction last re-planned
+// the ring for, so a repeated transaction at the same n_ubatch can tell
+// "already planned for this" from "must re-plan", making the re-plan
+// idempotent.
+void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
+
+// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
+// align256(n_ubatch * per_row) for both activation and output, through the
+// same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
+// the ring's own admission uses, so the two cannot round or overflow-check
+// differently. Returns false (leaving the output params untouched) when the
+// per-row bytes are 0 (dense model, no ring planned) or the multiply/align
+// would overflow.
+bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
+                                                  uint32_t n_ubatch,
+                                                  size_t * activation_slot_bytes,
+                                                  size_t * output_slot_bytes);
+
+// Inverse of the sizing above: the largest n_ubatch whose re-planned
+// activation+output slots -- plus the constant weight slot, both times
+// ring_depth -- fit within capacity_bytes, rounded DOWN to a multiple of 32
+// (llama's BLAS minimum; llama_context applies no 256-padding to n_ubatch).
+// Returns 0 when nothing fits (capacity_bytes does not clear the weight
+// slots' own total) or the inputs are degenerate (ring_depth == 0, or both
+// per-row terms 0). Same "hold the constant terms, divide the remainder by
+// the per-unit cost, round to the allocator granularity" method as
+// ggml_sycl_largest_fitting_n_ctx (ggml-sycl.cpp).
+uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
+                                                                  size_t   weight_slot_bytes,
+                                                                  size_t   activation_bytes_per_row,
+                                                                  size_t   output_bytes_per_row,
+                                                                  uint32_t ring_depth);
+
 // These four figures are a HARD CAP, not a starting size. Before asking the
 // cache for scratch, run the request through `pp_moe_onednn_admit_scratch`
 // (moe-scratch-admission.hpp) and refuse on rejection; never pass

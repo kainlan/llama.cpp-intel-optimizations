@@ -15858,6 +15858,19 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         ctx->device, g_tensor_inventory_pp_moe_onednn_weight_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_activation_slot_bytes, g_tensor_inventory_pp_moe_onednn_output_slot_bytes,
         g_tensor_inventory_pp_moe_onednn_ring_depth);
+    // llama.cpp-ibj0: carry the per-row bytes behind the two slot sizes above
+    // into the backend, so the runtime-context transaction can re-plan the
+    // ring for the REAL runtime n_ubatch (ggml_sycl_replan_pp_moe_onednn_ring())
+    // instead of leaving it fixed at whatever n_ubatch this load-time plan
+    // used. The load-time plan's own micro-batch (inventory->n_ubatch, 512
+    // today) is recorded as the ring's initially-planned n_ubatch, matching
+    // the slot sizes just published above -- the re-plan's "already planned
+    // for this n_ubatch" idempotence check (unified_cache_get_planned_pp_moe_onednn_n_ubatch())
+    // would otherwise start every fresh model load believing nothing was
+    // planned yet.
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_row_bytes(
+        ctx->device, inventory->pp_moe_onednn_activation_bytes_per_row, inventory->pp_moe_onednn_output_bytes_per_row);
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(ctx->device, inventory->n_ubatch);
 
     g_model_n_layer                    = inventory->n_layer;
     g_placement_kv_info.n_layer        = inventory->n_layer;
@@ -16830,6 +16843,126 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     return false;
 }
 
+// llama.cpp-ibj0: the PP MoE oneDNN scratch ring is sized at model load
+// (src/llama-model.cpp) for the loader's own inventory.n_ubatch (512 today),
+// not whatever n_ubatch the context is actually created with -- a larger
+// runtime n_ubatch must re-plan the ring HERE, in the same transaction that
+// re-plans KV, or the first prefill hits the ring's own admission refusal
+// (moe-scratch-admission.hpp's "activation-cap"/"output-cap") and
+// llama_decode returns -3 with nothing printed at default verbosity (see the
+// repro in this task's ticket).
+//
+// Mirrors ggml_sycl_check_nonfa_attn_scratch()'s record/attempt/restore-on-
+// refusal shape immediately above, for the same reason: the planned slot
+// sizes are a HARD CEILING enforced by reserve_pp_moe_onednn_scratch()'s own
+// preflight (moe-scratch-admission.hpp), which compares its REQUESTED shape
+// against the CURRENTLY PLANNED one and refuses anything larger -- the exact
+// admission the executor's over-plan requests hit in the repro this fixes.
+// So growing the ring means raising the ceiling FIRST (via
+// unified_cache_set_planned_pp_moe_onednn_scratch()) and only THEN reserving
+// exactly that new ceiling: moe-scratch-admission.hpp's own contract states
+// "admit(planned, planned) is ALLOWED for every non-degenerate plan", so
+// setting planned == requested makes the preflight trivially pass and lets
+// reserve_pp_moe_onednn_scratch()'s allocator (not its admission check)
+// decide whether the grow actually fits. On any failure the ceiling is
+// restored to what it was -- reserve_pp_moe_onednn_scratch() does not touch
+// the existing physical ring on a failed grow (it only releases the new
+// slots it attempted), so the restored ceiling matches what is still
+// actually allocated, and the plan can never claim a ring larger than what
+// backs it.
+static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
+    const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
+    if (weight_slot_bytes == 0) {
+        return true;  // dense model: no MoE PP ring was ever planned
+    }
+    if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device)) {
+        return true;  // already planned for this n_ubatch -- idempotent
+    }
+
+    size_t new_activation_slot_bytes = 0;
+    size_t new_output_slot_bytes     = 0;
+    if (!ggml_sycl::unified_cache_pp_moe_onednn_slots_for_ubatch(device, n_ubatch, &new_activation_slot_bytes,
+                                                                 &new_output_slot_bytes)) {
+        // Per-row bytes are 0 (should not happen: weight_slot_bytes != 0
+        // above already implies a ring was planned) or the multiply/align
+        // overflowed -- refuse rather than reserve a wrapped, small-looking
+        // size.
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring slot sizing for n_ubatch=%u "
+            "overflowed (device=%d)\n",
+            n_ubatch, device);
+        return false;
+    }
+
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
+    if (!cache) {
+        return true;  // no cache yet -- should not happen once weight_slot_bytes != 0 above
+    }
+
+    const uint32_t ring_depth = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
+    // Record the OLD ceiling so a refused re-plan can be restored, exactly
+    // as ggml_sycl_check_nonfa_attn_scratch() records prev_shape above.
+    const size_t   old_activation_slot_bytes =
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device);
+    const size_t   old_output_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
+    const uint32_t old_n_ubatch          = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
+
+    // Raise the ceiling first (see the function comment for why this must
+    // precede the reserve call, not follow it).
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, new_activation_slot_bytes,
+                                                               new_output_slot_bytes, ring_depth);
+
+    if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes, new_output_slot_bytes,
+                                             ring_depth)) {
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, n_ubatch);
+        GGML_LOG_WARN(
+            "[SYCL-PLAN] PP MoE oneDNN scratch ring re-planned for n_ubatch=%u: activation %.1f MB, output %.1f MB, "
+            "weights %.1f MB, depth %u\n",
+            n_ubatch, new_activation_slot_bytes / (1024.0 * 1024.0), new_output_slot_bytes / (1024.0 * 1024.0),
+            weight_slot_bytes / (1024.0 * 1024.0), ring_depth);
+        return true;
+    }
+
+    // Reservation failed -- restore the ceiling to what it was (old_n_ubatch
+    // is the same value already latched, restored here only for symmetry/
+    // readability with the two slot-byte restores; the setter is a no-op
+    // when the value is unchanged).
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, old_activation_slot_bytes,
+                                                               old_output_slot_bytes, ring_depth);
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, old_n_ubatch);
+
+    const double mb = 1024.0 * 1024.0;
+    // The pool a hypothetical FULL rebuild of the ring could draw from: the
+    // RUNTIME zone's currently-free bytes plus the OLD ring's own total
+    // (weight+activation+output, times ring_depth) -- reserve_pp_moe_onednn_scratch()'s
+    // grow path tears down and reallocates all three slots together (not just
+    // the two that changed), so all three become available to a fresh
+    // reservation, not only the activation/output delta. weight_slot_bytes is
+    // unchanged by n_ubatch, so this is the same "hold the constant term,
+    // solve for the variable one" figure unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn()
+    // itself computes -- see zone_available()'s own contract (unified-cache.hpp)
+    // for why the ring's own live allocation must be added back rather than
+    // read as unavailable.
+    const size_t capacity_bytes =
+        cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) +
+        static_cast<size_t>(ring_depth) * (weight_slot_bytes + old_activation_slot_bytes + old_output_slot_bytes);
+    const uint32_t fits = ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
+        capacity_bytes, weight_slot_bytes,
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
+    GGML_LOG_ERROR(
+        "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB "
+        "(weights %.1f + activation %.1f + output %.1f, ring depth %u) but the RUNTIME zone has %.1f MB available\n",
+        n_ubatch,
+        static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes) / mb,
+        weight_slot_bytes / mb, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, ring_depth,
+        capacity_bytes / mb);
+    if (fits >= 32) {
+        GGML_LOG_ERROR("[SYCL-PLAN] the largest -ub that fits is about %u\n", fits);
+    }
+    return false;
+}
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
@@ -17050,6 +17183,16 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                             flash_attn_enabled,
                                             /*allow_replan=*/true)) {
         return;
+    }
+
+    // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
+    // for the loader's own inventory.n_ubatch (512, src/llama-model.cpp); a
+    // larger runtime n_ubatch must re-plan it here, in the same transaction
+    // that re-plans KV and the non-FA attention scratch above, or the first
+    // prefill refuses the under-sized ring and llama_decode returns -3 with
+    // nothing printed at default verbosity.
+    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch)) {
+        return;  // refusal already logged with the largest fitting -ub
     }
 
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);

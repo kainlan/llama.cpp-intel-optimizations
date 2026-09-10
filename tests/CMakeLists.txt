@@ -3126,3 +3126,50 @@ endif()
 # ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
 # ctest name differs from the executable target name). Do not register it
 # here too.
+
+# llama.cpp-ibj0: host-only gate for the pure functions behind re-planning the
+# PP MoE oneDNN scratch ring for the RUNTIME n_ubatch (the loader always plans
+# for its own hardcoded n_ubatch=512, src/llama-model.cpp). No SYCL device is
+# touched -- every function under test is a pure function of integers, same
+# reasoning as test-sycl-nonfa-attn-scratch-demand.cpp. ONE arm (no env-var
+# axis: unlike that sibling, nothing here reads an environment override).
+if (GGML_SYCL)
+    llama_build(test-sycl-ubatch-ring-plan.cpp)
+    target_include_directories(test-sycl-ubatch-ring-plan PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-ubatch-ring-plan PRIVATE ggml-sycl)
+    target_compile_definitions(test-sycl-ubatch-ring-plan PRIVATE
+        $<TARGET_PROPERTY:ggml-sycl,COMPILE_DEFINITIONS>)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-ubatch-ring-plan PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-ubatch-ring-plan PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-ubatch-ring-plan PRIVATE "-fsycl")
+        target_link_options(test-sycl-ubatch-ring-plan PRIVATE "-fsycl")
+    endif()
+    llama_test(test-sycl-ubatch-ring-plan)
+    # ENVIRONMENT: LD_LIBRARY_PATH per every sibling SYCL gate (see the
+    # nonfa-attn-scratch-demand registration's comment for why -- a SYCL test
+    # binary run without it prints "SKIP: no SYCL GPU devices available" and
+    # exits 0, which is NOT what happens here since this test never enumerates
+    # a device, but the library link still needs it to load at all).
+    set_tests_properties(test-sycl-ubatch-ring-plan PROPERTIES
+        LABELS "sycl"
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 60
+    )
+endif()
+
+# llama.cpp-ibj0: source gate -- ggml_backend_sycl_set_runtime_context() must
+# re-plan the PP MoE oneDNN scratch ring for the runtime n_ubatch (after the
+# non-FA attention scratch check, before the plan is published), refuse with
+# the largest-fitting -ub when it cannot, and the loader must store both
+# per-row fields. Host-only, reads the sources as text. Same registration
+# shape as test-sycl-resolve-tensor-owner-source.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-ubatch-ring-replan-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-ubatch-ring-replan-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()

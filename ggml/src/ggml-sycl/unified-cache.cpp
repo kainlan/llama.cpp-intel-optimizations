@@ -751,6 +751,13 @@ static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_slot_bytes[GGML_
 static std::atomic<size_t>   g_planned_pp_moe_onednn_output_slot_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<size_t>   g_planned_pp_moe_onednn_scratch_bytes[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<uint32_t> g_planned_pp_moe_onednn_ring_depth[GGML_SYCL_MAX_DEVICES]{};
+// llama.cpp-ibj0: per-row bytes (loader-supplied) and the n_ubatch the
+// CURRENTLY PLANNED activation/output slots above were sized for -- see the
+// declarations' comments in unified-cache.hpp for why these are distinct
+// from the load-time inventory.n_ubatch.
+static std::atomic<size_t>   g_planned_pp_moe_onednn_activation_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<size_t>   g_planned_pp_moe_onednn_output_bytes_per_row[GGML_SYCL_MAX_DEVICES]{};
+static std::atomic<uint32_t> g_planned_pp_moe_onednn_n_ubatch[GGML_SYCL_MAX_DEVICES]{};
 static std::atomic<bool>     g_atexit_registered{ false };  // Ensure atexit handler registered once
 static std::atomic<int>      g_cache_assert_enabled{ -1 };
 static std::atomic<int>      g_copy_trace_enabled{ -1 };
@@ -2143,6 +2150,110 @@ uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id) {
         return 0;
     }
     return g_planned_pp_moe_onednn_ring_depth[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
+                                                       size_t activation_bytes_per_row,
+                                                       size_t output_bytes_per_row) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_pp_moe_onednn_activation_bytes_per_row[device_id].store(activation_bytes_per_row,
+                                                                      std::memory_order_release);
+    g_planned_pp_moe_onednn_output_bytes_per_row[device_id].store(output_bytes_per_row, std::memory_order_release);
+}
+
+size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_moe_onednn_activation_bytes_per_row[device_id].load(std::memory_order_acquire);
+}
+
+size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_moe_onednn_output_bytes_per_row[device_id].load(std::memory_order_acquire);
+}
+
+void unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    g_planned_pp_moe_onednn_n_ubatch[device_id].store(n_ubatch, std::memory_order_release);
+}
+
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id) {
+    if (device_id < 0 || device_id >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_planned_pp_moe_onednn_n_ubatch[device_id].load(std::memory_order_acquire);
+}
+
+bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
+                                                  uint32_t n_ubatch,
+                                                  size_t * activation_slot_bytes,
+                                                  size_t * output_slot_bytes) {
+    const size_t act_per_row = unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device_id);
+    const size_t out_per_row = unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device_id);
+    if (act_per_row == 0 || out_per_row == 0) {
+        return false;  // dense model: no MoE PP ring planned
+    }
+    if (n_ubatch != 0 && (act_per_row > std::numeric_limits<size_t>::max() / n_ubatch ||
+                          out_per_row > std::numeric_limits<size_t>::max() / n_ubatch)) {
+        return false;  // n_ubatch * per_row would overflow
+    }
+    const size_t act_raw     = static_cast<size_t>(n_ubatch) * act_per_row;
+    const size_t out_raw     = static_cast<size_t>(n_ubatch) * out_per_row;
+    size_t       act_aligned = 0;
+    size_t       out_aligned = 0;
+    if (!pp_moe_onednn_checked_align_slot_bytes(act_raw, &act_aligned) ||
+        !pp_moe_onednn_checked_align_slot_bytes(out_raw, &out_aligned)) {
+        return false;  // align256() would overflow
+    }
+    if (activation_slot_bytes != nullptr) {
+        *activation_slot_bytes = act_aligned;
+    }
+    if (output_slot_bytes != nullptr) {
+        *output_slot_bytes = out_aligned;
+    }
+    return true;
+}
+
+uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
+                                                                  size_t   weight_slot_bytes,
+                                                                  size_t   activation_bytes_per_row,
+                                                                  size_t   output_bytes_per_row,
+                                                                  uint32_t ring_depth) {
+    if (ring_depth == 0 || (activation_bytes_per_row == 0 && output_bytes_per_row == 0)) {
+        return 0;
+    }
+    // Constant term: the weight slot(s), times ring_depth -- does not scale
+    // with n_ubatch. Checked (unlike pp_moe_onednn_planned_scratch_bytes()
+    // above, which multiplies unchecked): this function's whole job is to
+    // hand back a trustworthy figure from caller-controlled capacity_bytes.
+    if (weight_slot_bytes != 0 && weight_slot_bytes > std::numeric_limits<size_t>::max() / ring_depth) {
+        return 0;
+    }
+    const size_t weight_total = weight_slot_bytes * static_cast<size_t>(ring_depth);
+    if (capacity_bytes <= weight_total) {
+        return 0;
+    }
+    const size_t remainder = capacity_bytes - weight_total;
+    // Per-unit cost: one activation row + one output row, times ring_depth.
+    const size_t per_row   = activation_bytes_per_row + output_bytes_per_row;
+    if (per_row == 0 || per_row > std::numeric_limits<size_t>::max() / ring_depth) {
+        return 0;
+    }
+    const size_t per_row_total = per_row * static_cast<size_t>(ring_depth);
+    const size_t n_ubatch      = remainder / per_row_total;
+    // Round DOWN to a multiple of 32 (llama's BLAS minimum; llama_context
+    // applies no 256-padding to n_ubatch itself -- the 256-alignment above is
+    // the RING's own slot granularity, a separate concern).
+    const size_t rounded       = (n_ubatch / 32) * 32;
+    return rounded > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() :
+                                                            static_cast<uint32_t>(rounded);
 }
 
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp{ 0 };
