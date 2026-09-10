@@ -1681,9 +1681,10 @@ static long nonfa_attn_scratch_mb_override() {
 // llama.cpp-nphx: memoized, WARN-at-most-once-per-process accessor for
 // GGML_SYCL_AUTO_UBATCH. Default ON (unset or "1" leaves the Task 4b auto
 // micro-batch trial enabled); "0" disables it, falling back to the library
-// default 512; any other value is treated as enabled, with one WARN, rather
-// than silently picking a side (same shape as env_mb_override() above, but
-// for a boolean instead of a byte count). This task (4a) only defines the
+// default 512; any other NON-EMPTY value is treated as enabled, with one
+// WARN. An empty value is treated the same as unset, silently -- matching
+// env_mb_override()'s own convention above, not a gap in the WARN coverage
+// (llama.cpp-y8xv quality round 3, Q12/Q9). This task (4a) only defines the
 // accessor -- llama_context does not call it until Task 4b.
 bool unified_cache_auto_ubatch_enabled() {
     static const bool value = [] {

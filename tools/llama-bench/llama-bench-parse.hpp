@@ -96,8 +96,10 @@ static std::vector<int> parse_ubatch_range(const std::string & s) {
     return result;
 }
 
-// llama.cpp-y8xv quality round 2, R1: whether the markdown/CSV/JSON printer
-// should show the n_ubatch column. The base condition (differs from the
+// llama.cpp-y8xv quality round 2, R1: whether the markdown printer should
+// show the n_ubatch column (only markdown_printer::print_header consults
+// this -- csv/json/sql printers use test::get_fields(), which always
+// carries n_ubatch). The base condition (differs from the
 // tool's own default, or more than one value was requested) is not enough
 // on its own: under GGML_USE_SYCL cmd_params_defaults.n_ubatch is {-1} (the
 // auto sentinel), so a bare run or an explicit "-ub auto" has

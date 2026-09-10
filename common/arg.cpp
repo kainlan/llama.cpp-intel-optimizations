@@ -3460,6 +3460,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.embedding = true;
             params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+            // llama.cpp-y8xv quality round 3, Q10: reranking is also
+            // non-causal (same n_ubatch == n_batch requirement as
+            // --embedding/--embeddings above), so the auto trial must be
+            // off here too.
+            params.n_ubatch_auto = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANKING"));
     add_opt(common_arg(

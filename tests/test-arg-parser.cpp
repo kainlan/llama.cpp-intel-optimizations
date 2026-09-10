@@ -260,6 +260,18 @@ static void test(void) {
         assert(embed_params.embedding == true);
         assert(embed_params.n_ubatch_auto == false);
     }
+    {
+        // llama.cpp-y8xv quality round 3, Q10: --rerank/--reranking is a
+        // second handler that sets params.embedding=true (same non-causal
+        // n_ubatch == n_batch requirement as --embedding/--embeddings) and
+        // must clear n_ubatch_auto the same way.
+        common_params rerank_params;
+        argv = {"binary_name", "--rerank"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), rerank_params, LLAMA_EXAMPLE_SERVER));
+        assert(rerank_params.embedding == true);
+        assert(rerank_params.n_ubatch_auto == false);
+    }
 
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
