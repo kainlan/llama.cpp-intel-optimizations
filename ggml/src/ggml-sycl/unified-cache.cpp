@@ -19019,14 +19019,14 @@ bool shutdown_unified_cache() {
             // shutdown_resources() (called from this function's teardown loop
             // below, defined at ~4429), which checks g_sycl_shutting_down on
             // entry AND probes its own queue's context validity before
-            // touching anything. A context
-            // torn down while the flag is still false must not reach
-            // drain_all_queues_noexcept() (which swallows the throw) or the
-            // reclaim call below it, whose mem_handle releases would then
-            // attempt a real free against an already-invalid context.
-            // Mirror shutdown_resources()'s probe (~4557) per cache: a live
-            // queue can still answer get_context(); one that cannot is
-            // signalling SYCL is already gone for this cache.
+            // touching anything. A context torn down while the flag is still
+            // false must not reach drain_all_queues_noexcept() (which
+            // swallows the throw) or the reclaim call below it, whose
+            // mem_handle releases would then attempt a real free against an
+            // already-invalid context. Mirror shutdown_resources()'s probe
+            // (~4557) per cache: a live queue can still answer get_context();
+            // one that cannot is signalling SYCL is already gone for this
+            // cache.
             try {
                 (void) item.second->get_queue().get_context();
             } catch (...) {
