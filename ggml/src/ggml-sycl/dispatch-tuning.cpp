@@ -268,11 +268,16 @@ bool tuning_enabled() {
 }
 
 std::string tuning_path() {
+    // llama.cpp-o65k: opt-in only. There is no default path -- an unset or
+    // empty GGML_SYCL_DISPATCH_TUNING_JSON means "nothing to load", not
+    // "try a well-known location", so an empty return here must reach
+    // ensure_model_loaded() as a signal to skip the load entirely rather
+    // than as a path that then fails to open.
     const char * env = std::getenv("GGML_SYCL_DISPATCH_TUNING_JSON");
     if (env && env[0]) {
         return std::string(env);
     }
-    return "/tmp/onednn_unified_bench.json";
+    return std::string();
 }
 
 struct ModelCache {
@@ -376,8 +381,17 @@ void ensure_model_loaded(uint64_t model_id) {
         entry.cache = std::make_unique<DispatchTuningCache>();
     }
 
-    std::string error;
+    // llama.cpp-o65k: opt-in. GGML_SYCL_DISPATCH_TUNING_JSON unset/empty means
+    // there is nothing to load -- keep the `loaded` latch above (so this is
+    // not retried on the next call for this model_id) but touch no file and
+    // log nothing, rather than trying a hardcoded default path that is
+    // absent on essentially every run and WARNing about it every time.
     const std::string path = tuning_path();
+    if (path.empty()) {
+        return;
+    }
+
+    std::string error;
     if (!load_dispatch_tuning_from_file(path, *entry.cache, &error)) {
         if (error.empty()) {
             GGML_LOG_WARN("[SYCL] dispatch tuning: no entries loaded from %s\n", path.c_str());
@@ -386,10 +400,11 @@ void ensure_model_loaded(uint64_t model_id) {
         }
         return;
     }
-    GGML_LOG_INFO("[SYCL] dispatch tuning: loaded %zu entries from %s for model=%llu\n",
-                  entry.cache->size(),
-                  path.c_str(),
-                  static_cast<unsigned long long>(model_id));
+    // Promoted from GGML_LOG_INFO (llama.cpp-o65k): INFO is dropped at
+    // default verbosity in every tool, so a successful load -- which is now
+    // an explicit opt-in the caller asked for -- must stay visible.
+    GGML_LOG_WARN("[SYCL] dispatch tuning: loaded %zu entries from %s for model=%llu\n", entry.cache->size(),
+                  path.c_str(), static_cast<unsigned long long>(model_id));
 }
 
 std::optional<ggml_sycl_mul_mat_kernel> lookup_kernel(uint64_t model_id,
