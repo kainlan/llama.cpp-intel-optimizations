@@ -48,14 +48,14 @@ Compare kernels using actual GGUF weight shapes and emit a summary JSON:
   --model=/models/mistral-7b-v0.1.Q4_0.gguf \
   --batch=1,16,64 --sample-strategy=both \
   --limit-shapes=10 \
-  --emit-json=/tmp/onednn_unified_bench.json \
+  --emit-json=./dispatch-tuning.json \
   --output=jsonl
 ```
 
-The dispatch-tuning loader no longer reads `/tmp/onednn_unified_bench.json` (or
-any other path) automatically (llama.cpp-o65k) — writing `--emit-json` to that
-path is not by itself enough to have it picked up. Point the backend at the
-file explicitly with `GGML_SYCL_DISPATCH_TUNING_JSON=<path>` (see
+The dispatch-tuning loader no longer reads any `--emit-json` output path
+automatically (llama.cpp-o65k) — writing `--emit-json=<path>` above is not by
+itself enough to have it picked up. Point the backend at `<path>` explicitly
+with `GGML_SYCL_DISPATCH_TUNING_JSON=<path>` (see
 `docs/backend/sycl-env-vars.md`) before running `llama-cli`/`llama-bench`/etc.
 Its lookup key has no device or driver identity, so only apply a summary JSON
 measured on the same card and driver you are running it against.
