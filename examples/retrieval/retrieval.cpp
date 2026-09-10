@@ -125,6 +125,7 @@ int main(int argc, char ** argv) {
 
     // For BERT models, batch size must be equal to ubatch size
     params.n_ubatch = params.n_batch;
+    params.n_ubatch_auto = false;
     params.embedding = true;
 
     if (params.chunk_size <= 0) {

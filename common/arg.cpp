@@ -4485,6 +4485,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "embeddinggemma-300M-qat-Q4_0.gguf";
             params.port = 8011;
             params.n_ubatch = 2048;
+            params.n_ubatch_auto  = false;
             params.n_batch = 2048;
             params.n_parallel = 32;
             params.n_ctx = 2048*params.n_parallel;
@@ -4501,6 +4502,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "qwen2.5-coder-1.5b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4515,6 +4517,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "qwen2.5-coder-3b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4529,6 +4532,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "qwen2.5-coder-7b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4545,6 +4549,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto                     = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4561,6 +4566,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto                     = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4575,6 +4581,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "qwen3-coder-30b-a3b-instruct-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4589,6 +4596,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "gpt-oss-20b-mxfp4.gguf";
             params.port = 8013;
             params.n_ubatch = 2048;
+            params.n_ubatch_auto  = false;
             params.n_batch = 32768;
             params.n_parallel = 2;
             params.n_ctx = 131072*params.n_parallel;
@@ -4607,6 +4615,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_repo = "ggml-org/gpt-oss-120b-GGUF";
             params.port = 8013;
             params.n_ubatch = 2048;
+            params.n_ubatch_auto  = false;
             params.n_batch = 32768;
             params.n_parallel = 2;
             params.n_ctx = 131072*params.n_parallel;

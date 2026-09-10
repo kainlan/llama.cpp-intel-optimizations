@@ -226,6 +226,23 @@ static void test(void) {
                common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
         assert(ubatch_params.n_ubatch_auto == true);
     }
+    {
+        // llama.cpp-y8xv quality round 1, Q1: every OTHER writer of
+        // params.n_ubatch must also clear n_ubatch_auto, or a preset's
+        // deliberately chosen n_ubatch still arrives auto=true under SYCL
+        // (default true) and Task 4b's trial can override it. Use
+        // LLAMA_EXAMPLE_SERVER so common_params_parse() skips both the
+        // model download and the "--model is required" check for this
+        // preset (common/arg.cpp: "server will call
+        // common_params_handle_models() later, so we skip it here") --
+        // no network access, no -m needed.
+        common_params preset_params;
+        argv = {"binary_name", "--embd-gemma-default"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), preset_params, LLAMA_EXAMPLE_SERVER));
+        assert(preset_params.n_ubatch == 2048);
+        assert(preset_params.n_ubatch_auto == false);
+    }
 
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
