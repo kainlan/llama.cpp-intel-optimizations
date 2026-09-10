@@ -2248,12 +2248,18 @@ uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capac
     }
     const size_t per_row_total = per_row * static_cast<size_t>(ring_depth);
     const size_t n_ubatch      = remainder / per_row_total;
+    // Clamp BEFORE rounding, not after -- std::numeric_limits<uint32_t>::max()
+    // (4294967295) is not itself a multiple of 32 (4294967295 % 32 == 31),
+    // so rounding first and clamping second could return a value that
+    // breaks the "always a multiple of 32" invariant the caller (and this
+    // function's own test) relies on, for a raw value large enough to need
+    // clamping at all. Same trap, same fix, as the sibling inverse
+    // unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch() above.
+    const size_t clamped       = std::min<size_t>(n_ubatch, std::numeric_limits<uint32_t>::max());
     // Round DOWN to a multiple of 32 (llama's BLAS minimum; llama_context
     // applies no 256-padding to n_ubatch itself -- the 256-alignment above is
     // the RING's own slot granularity, a separate concern).
-    const size_t rounded       = (n_ubatch / 32) * 32;
-    return rounded > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max() :
-                                                            static_cast<uint32_t>(rounded);
+    return static_cast<uint32_t>((clamped / 32) * 32);
 }
 
 static std::atomic<uint64_t> g_offload_transfer_bytes_h2d_pp{ 0 };
@@ -4878,22 +4884,27 @@ bool unified_cache::shutdown_resources() {
 
     // PP oneDNN slots are cache-owned RUNTIME allocations. Refuse to tear
     // down beneath a caller that still owns a claimed generation.
-    std::vector<pp_moe_onednn_scratch_slot> shutdown_pp_slots;
-    std::vector<pp_moe_onednn_scratch_slot> shutdown_pp_retired;
-    {
-        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
-        for (const auto & slot : pp_moe_onednn_scratch_slots_) if (slot.refcount != 0) return false;
-        for (const auto & slot : pp_moe_onednn_retired_slots_) if (slot.refcount != 0) return false;
-        shutdown_pp_slots.swap(pp_moe_onednn_scratch_slots_);
-        shutdown_pp_retired.swap(pp_moe_onednn_retired_slots_);
-        pp_moe_onednn_weight_slot_size_ = pp_moe_onednn_activation_slot_size_ =
-            pp_moe_onednn_output_slot_size_ = 0;
-        pp_moe_onednn_ring_depth_ = 0;
+    //
+    // llama.cpp-ibj0 quality round 1 Q2: reuses release_pp_moe_onednn_scratch_ring()
+    // (added for the runtime-context ring re-plan) instead of duplicating
+    // its own copy of this teardown -- same refuse-if-still-claimed check,
+    // same reset of the three size-tracking members and ring_depth_, same
+    // "release the mem_handles outside any lock" ordering. Two safety facts
+    // make this substitution behavior-preserving at this specific call
+    // site: (1) no OTHER lock is held here -- the compute-arena and
+    // scratch-pool teardown immediately above this point each take and
+    // release their own mutex before reaching here, so
+    // release_pp_moe_onednn_scratch_ring() taking pp_moe_onednn_scratch_mutex_
+    // internally cannot double-lock or deadlock against an outer holder;
+    // (2) this runs BEFORE arena_destroy(), so arena_active() is still true
+    // for the normal arena-backed shutdown path -- release_pp_moe_onednn_scratch_ring()'s
+    // non-arena `saturating_sub_used()` branch (added for the runtime-context
+    // caller, which the original inline block here never had) is a no-op in
+    // that path, the direct accounting term is zero, and behavior is
+    // unchanged from the inline block this replaces.
+    if (!release_pp_moe_onednn_scratch_ring()) {
+        return false;
     }
-    // mem_handle destruction invokes unified_free/zone_free; never do that
-    // while holding the PP publication mutex.
-    shutdown_pp_slots.clear();
-    shutdown_pp_retired.clear();
 
     // Free persistent scratch buffers BEFORE arena destroy.
     for (auto & pair : persistent_scratches_) {

@@ -74,6 +74,15 @@ def _normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _has_static_before(text: str, name: str) -> bool:
+    """True if `name(` is preceded, within the same statement/scope
+    ([^;{}] bounded), by a `static` keyword -- i.e. `name` would have
+    internal linkage rather than being exported. llama.cpp-ibj0 quality
+    round 1 Q4: hoisted here from two identical local copies (one per
+    check that used it) so the two cannot drift apart."""
+    return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
+
+
 def _bounded_body(code: str, start_marker: str, end_marker: str, *, after: int = 0) -> str:
     """Slice `code` from `start_marker` to the next `end_marker` after it,
     raising a clear assertion if either is not found -- shared by every check
@@ -569,9 +578,6 @@ def test_release_ring_function_is_exported_and_refuses_when_busy():
         "the free-function wrapper must be declared in unified-cache.hpp"
     )
 
-    def _has_static_before(text: str, name: str) -> bool:
-        return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
-
     assert not _has_static_before(cpp_norm, "unified_cache_release_pp_moe_onednn_scratch_ring"), (
         "the free-function wrapper must not be file-static"
     )
@@ -674,9 +680,6 @@ def test_new_functions_are_not_file_static_in_the_shared_header():
     a different translation unit and must be able to call them directly."""
     hpp_norm = _normalize_ws(CACHE_HPP_CODE)
     cpp_norm = _normalize_ws(CACHE_CPP_CODE)
-
-    def _has_static_before(text: str, name: str) -> bool:
-        return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
 
     checked_names = (
         "unified_cache_set_planned_pp_moe_onednn_row_bytes",

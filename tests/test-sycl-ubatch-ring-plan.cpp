@@ -26,8 +26,6 @@
 #include "test-skip.h"
 
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <limits>
 
 #if !defined(GGML_USE_SYCL)
@@ -205,6 +203,17 @@ void test_largest_fitting_inverts_the_capacity_formula() {
         capacity_512 - 1, kWeightSlotBytes, kActPerRow, kOutPerRow, 1);
     check(largest_short_one == 480,
           "one byte short of capacity(512) rounds DOWN to 480 (the next-lower multiple of 32), not up");
+
+    // llama.cpp-ibj0 quality round 1 Q1: a SATURATING capacity must still
+    // round to a multiple of 32 -- clamping to std::numeric_limits<uint32_t>::max()
+    // (4294967295) AFTER rounding, instead of before, can return
+    // 4294967295 itself, which is NOT a multiple of 32 (4294967295 % 32 ==
+    // 31), breaking the invariant every other case above pins. weight=0,
+    // act_per_row=1, out_per_row=0, depth=1 with a huge capacity (1ull<<62)
+    // makes the raw (pre-clamp) n_ubatch astronomically larger than
+    // UINT32_MAX, forcing the clamp path.
+    const uint32_t saturating = unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(1ull << 62, 0, 1, 0, 1);
+    check(saturating % 32 == 0, "a saturating capacity still rounds to a multiple of 32 (clamp precedes round)");
 }
 
 }  // namespace

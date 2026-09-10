@@ -16953,6 +16953,10 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device);
     const size_t   old_output_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
     const uint32_t old_n_ubatch          = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
+    // llama.cpp-ibj0 quality round 1 Q5: declared once, used by both the
+    // success WARN below and the failure-path ERROR further down, instead
+    // of each repeating the literal (1024.0 * 1024.0).
+    const double   mb                    = 1024.0 * 1024.0;
 
     // Step 1: release the current physical ring UNCONDITIONALLY (both
     // directions -- see the function comment for why grow must release too,
@@ -16980,8 +16984,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         GGML_LOG_WARN(
             "[SYCL-PLAN] PP MoE oneDNN scratch ring re-planned for n_ubatch=%u: activation %.1f MB, output %.1f MB, "
             "weights %.1f MB, depth %u\n",
-            n_ubatch, new_activation_slot_bytes / (1024.0 * 1024.0), new_output_slot_bytes / (1024.0 * 1024.0),
-            weight_slot_bytes / (1024.0 * 1024.0), ring_depth);
+            n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb, ring_depth);
         return true;
     }
 
@@ -17015,7 +17018,6 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     }
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, old_n_ubatch);
 
-    const double mb = 1024.0 * 1024.0;
     const size_t needed_total =
         static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes);
     char fits_clause[64] = "";
