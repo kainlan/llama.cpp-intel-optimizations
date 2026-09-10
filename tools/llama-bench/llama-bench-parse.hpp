@@ -9,6 +9,7 @@
 // itself. Neither function depends on anything outside the standard
 // library.
 
+#include <algorithm>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -93,4 +94,22 @@ static std::vector<int> parse_ubatch_range(const std::string & s) {
         result.insert(result.end(), p.begin(), p.end());
     }
     return result;
+}
+
+// llama.cpp-y8xv quality round 2, R1: whether the markdown/CSV/JSON printer
+// should show the n_ubatch column. The base condition (differs from the
+// tool's own default, or more than one value was requested) is not enough
+// on its own: under GGML_USE_SYCL cmd_params_defaults.n_ubatch is {-1} (the
+// auto sentinel), so a bare run or an explicit "-ub auto" has
+// requested_n_ubatch == defaults_n_ubatch and the base condition alone would
+// never show the column -- exactly the case whose RESOLVED value (see the
+// GGML_SYCL_AUTO_UBATCH doc row) is the whole point of printing it. Off
+// SYCL, defaults_n_ubatch never contains -1, so this predicate reduces to
+// the base condition and nothing changes there.
+static bool bench_prints_n_ubatch_column(const std::vector<int> & requested_n_ubatch,
+                                         const std::vector<int> & defaults_n_ubatch) {
+    if (requested_n_ubatch.size() > 1 || requested_n_ubatch != defaults_n_ubatch) {
+        return true;
+    }
+    return std::find(requested_n_ubatch.begin(), requested_n_ubatch.end(), -1) != requested_n_ubatch.end();
 }

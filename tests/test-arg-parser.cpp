@@ -243,6 +243,23 @@ static void test(void) {
         assert(preset_params.n_ubatch == 2048);
         assert(preset_params.n_ubatch_auto == false);
     }
+    {
+        // llama.cpp-y8xv quality round 2, Q8: --embedding/--embeddings is a
+        // TWELFTH site that had to clear n_ubatch_auto -- it does not itself
+        // write params.n_ubatch (a "writers of params.n_ubatch" search does
+        // not find it), but setting params.embedding=true makes the
+        // non-causal path apply (src/llama-context.cpp's
+        // GGML_ASSERT(causal_attn || n_ubatch >= n_tokens_all) requires
+        // n_ubatch == n_batch for it), so the auto trial must be off from
+        // the same handler, not just wherever n_ubatch happens to be
+        // assigned.
+        common_params embed_params;
+        argv = {"binary_name", "--embeddings"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), embed_params, LLAMA_EXAMPLE_SERVER));
+        assert(embed_params.embedding == true);
+        assert(embed_params.n_ubatch_auto == false);
+    }
 
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};

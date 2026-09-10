@@ -96,6 +96,28 @@ static void test(void) {
         assert(p == expect);
     }
 
+    // llama.cpp-y8xv quality round 2, R1: bench_prints_n_ubatch_column().
+    {
+        // The auto sentinel alone must always show the column, even when it
+        // is (trivially) equal to a one-element default of {-1} -- this is
+        // the SYCL bare-run / "-ub auto" case the base condition missed.
+        assert(bench_prints_n_ubatch_column({ -1 }, { -1 }) == true);
+    }
+    {
+        // Matches the tool's own (non-SYCL) default exactly, no -1 present:
+        // no reason to show the column.
+        assert(bench_prints_n_ubatch_column({ 512 }, { 512 }) == false);
+    }
+    {
+        // More than one requested value: always show it, regardless of
+        // whether it happens to equal the default.
+        assert(bench_prints_n_ubatch_column({ 512, 1024 }, { 512 }) == true);
+    }
+    {
+        // Differs from the default outright (base condition, unaffected).
+        assert(bench_prints_n_ubatch_column({ 1024 }, { 512 }) == true);
+    }
+
     printf("test-llama-bench-parse: all tests OK\n\n");
 }
 

@@ -3445,6 +3445,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled"),
         [](common_params & params) {
             params.embedding = true;
+            // llama.cpp-y8xv quality round 2, Q8: embeddings are non-causal
+            // (src/llama-context.cpp's GGML_ASSERT(causal_attn || n_ubatch
+            // >= n_tokens_all) requires n_ubatch == n_batch for them,
+            // tools/server/server.cpp:146-150 enforces this by lowering
+            // n_batch, not raising n_ubatch), so the auto micro-batch trial
+            // must never apply here regardless of backend.
+            params.n_ubatch_auto = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_EMBEDDINGS"));
     add_opt(common_arg(

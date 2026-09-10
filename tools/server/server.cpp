@@ -147,6 +147,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_WRN("embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", params.n_batch, params.n_ubatch);
             SRV_WRN("setting n_batch = n_ubatch = %d to avoid assertion failure\n", params.n_ubatch);
             params.n_batch = params.n_ubatch;
+            // llama.cpp-y8xv quality round 2, Q8: belt for the
+            // --embedding/--embeddings handler's own n_ubatch_auto=false
+            // (common/arg.cpp) -- this site is reached even if params.embedding
+            // was set some other way (e.g. a preset), so it must not rely on
+            // that handler alone.
+            params.n_ubatch_auto = false;
         }
 
         if (params.n_parallel < 0) {

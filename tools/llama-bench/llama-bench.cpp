@@ -1937,7 +1937,13 @@ struct markdown_printer : public printer {
         if (params.n_batch.size() > 1 || params.n_batch != cmd_params_defaults.n_batch) {
             fields.emplace_back("n_batch");
         }
-        if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
+        // llama.cpp-y8xv quality round 2, R1: under SYCL cmd_params_defaults.n_ubatch
+        // is {-1} (the auto sentinel), so a bare run (or an explicit "-ub auto")
+        // has params.n_ubatch == cmd_params_defaults.n_ubatch and this condition
+        // alone would never add the column -- exactly the case whose RESOLVED
+        // value (Q2-Q4's doc row) is the whole point of printing it. Also show
+        // the column whenever any requested n_ubatch is the auto sentinel.
+        if (bench_prints_n_ubatch_column(params.n_ubatch, cmd_params_defaults.n_ubatch)) {
             fields.emplace_back("n_ubatch");
         }
         if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {
