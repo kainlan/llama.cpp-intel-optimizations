@@ -19037,11 +19037,16 @@ bool shutdown_unified_cache() {
                 // touching invalid queue/context state. The flag is
                 // process-global: every cache after this one in the loop is
                 // still probed and, if valid, drained and reclaimed, but its
-                // pooled mem_handle releases now abandon rather than free, so
-                // the pre-teardown census below can refuse exactly as
-                // described for a true flag on entry; that refusal is
-                // retryable-safe, and every cache's shutdown_resources() then
-                // takes its abandon branch, not only this one's.
+                // pooled mem_handle releases now abandon rather than free --
+                // abandon_control() unregisters and deletes the control, so
+                // those caches leave nothing behind for the census. THIS
+                // cache's pool is the one that keeps its parked
+                // EXTERNAL_EXACT controls, because the continue below skips
+                // its drain and reclaim, so the pre-teardown census can
+                // refuse exactly as described for a true flag on entry; that
+                // refusal is retryable-safe, and every cache's
+                // shutdown_resources() then takes its abandon branch, not
+                // only this one's.
                 g_sycl_shutting_down.store(true, std::memory_order_release);
                 continue;
             }
