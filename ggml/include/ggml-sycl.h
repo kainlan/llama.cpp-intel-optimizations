@@ -379,6 +379,11 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
                                                             uint32_t       n_seq_max,
                                                             bool           flash_attn_enabled);
 
+// llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
+// (llama_context, Task 4b) is enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
+// Task 4a wires this query; llama_context does not call it until Task 4b.
+GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
+
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
 // heterogeneous attention (for example non-SWA and SWA layers); the SYCL

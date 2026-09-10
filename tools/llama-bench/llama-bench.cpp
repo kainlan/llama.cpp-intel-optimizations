@@ -99,6 +99,12 @@ template <typename T, typename F> static std::vector<std::string> transform_to_s
     return str_values;
 }
 
+// llama.cpp-nphx: render the -ub sentinel (-1) back to the "auto" spelling
+// users type, for help text and any other display of cmd_params.n_ubatch.
+static std::string n_ubatch_display_str(int n_ubatch) {
+    return n_ubatch < 0 ? "auto" : std::to_string(n_ubatch);
+}
+
 template <typename T> static T avg(const std::vector<T> & v) {
     if (v.empty()) {
         return 0;
@@ -325,6 +331,27 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+// llama.cpp-nphx: -ub/--ubatch-size accepts the literal token "auto" (any
+// number of times, comma-separated with ordinary integers) as a stand-in for
+// the sentinel -1, which cmd_params_instance::to_llama_cparams() below turns
+// into n_ubatch_auto=true. parse_int_range() itself stays untouched (it is
+// shared with several other flags that have no "auto" spelling) -- this just
+// rewrites the "auto" tokens before handing the string to it.
+static std::vector<int> parse_ubatch_range(const std::string & s) {
+    std::string       sanitized;
+    std::string       tok;
+    std::stringstream ss(s);
+    bool              first = true;
+    while (std::getline(ss, tok, ',')) {
+        if (!first) {
+            sanitized += ',';
+        }
+        sanitized += (tok == "auto") ? "-1" : tok;
+        first = false;
+    }
+    return parse_int_range(sanitized, /*allow_negative=*/true);
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -380,7 +407,11 @@ static const cmd_params cmd_params_defaults = {
     /* n_pg                 */ {},
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
+#ifdef GGML_USE_SYCL
+    /* n_ubatch             */ { -1 },  // llama.cpp-nphx: sentinel for "auto" (SYCL default)
+#else
     /* n_ubatch             */ { 512 },
+#endif
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -451,7 +482,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
-    printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -ub, --ubatch-size <n>                            (default: %s; SYCL also accepts \"auto\")\n", join(transform_to_str(cmd_params_defaults.n_ubatch, n_ubatch_display_str), ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -615,7 +646,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = parse_int_range(argv[i]);
+                auto p = parse_ubatch_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
@@ -1289,7 +1320,19 @@ struct cmd_params_instance {
 
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
-        cparams.n_ubatch        = n_ubatch;
+        // llama.cpp-nphx: n_ubatch < 0 is the "-ub auto" sentinel. Leave
+        // cparams.n_ubatch at whatever llama_context_default_params() just
+        // set it to (512, a few lines up) instead of overwriting it -- that
+        // is bit-for-bit the value the old fixed {512} default used to pass
+        // explicitly, so every existing gate stays byte-identical until Task
+        // 4b's trial reads n_ubatch_auto and actually picks something.
+        // Reusing 0 here would NOT be byte-identical: 0 means "clamp to
+        // n_batch" (src/llama-context.cpp), which only coincides with 512
+        // when n_batch itself is <= 512.
+        cparams.n_ubatch_auto   = n_ubatch < 0;
+        if (n_ubatch >= 0) {
+            cparams.n_ubatch = n_ubatch;
+        }
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1494,7 +1537,12 @@ struct test {
         model_size     = llama_model_size(lmodel);
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
-        n_ubatch       = inst.n_ubatch;
+        // llama.cpp-nphx: read the RESOLVED value back from the context
+        // rather than inst.n_ubatch, which can be 0 ("use n_batch", the
+        // library default) or -1 (the "-ub auto" sentinel) -- neither is
+        // ever what actually ran, and llama_n_ubatch(ctx) is always valid
+        // once the context exists.
+        n_ubatch              = llama_n_ubatch(ctx);
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;

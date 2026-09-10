@@ -1678,6 +1678,33 @@ static long nonfa_attn_scratch_mb_override() {
     return value;
 }
 
+// llama.cpp-nphx: memoized, WARN-at-most-once-per-process accessor for
+// GGML_SYCL_AUTO_UBATCH. Default ON (unset or "1" leaves the Task 4b auto
+// micro-batch trial enabled); "0" disables it, falling back to the library
+// default 512; any other value is treated as enabled, with one WARN, rather
+// than silently picking a side (same shape as env_mb_override() above, but
+// for a boolean instead of a byte count). This task (4a) only defines the
+// accessor -- llama_context does not call it until Task 4b.
+bool unified_cache_auto_ubatch_enabled() {
+    static const bool value = [] {
+        const char * env = std::getenv("GGML_SYCL_AUTO_UBATCH");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        if (std::strcmp(env, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(env, "1") != 0) {
+            GGML_LOG_WARN(
+                "[UNIFIED-CACHE] GGML_SYCL_AUTO_UBATCH=\"%s\" is not \"0\" or \"1\" -- ignoring it "
+                "and leaving the auto micro-batch trial enabled\n",
+                env);
+        }
+        return true;
+    }();
+    return value;
+}
+
 // The non-FA batched mul_mat scratch demand formula's own floor (see
 // unified_cache_nonfa_attn_scratch_demand_bytes() below for the reasoning
 // on its size) -- hoisted to file scope, rather than kept as a

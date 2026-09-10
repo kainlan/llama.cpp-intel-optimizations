@@ -57,6 +57,14 @@ bool unified_cache_is_graph_compute_active();
 // Check if VRAM arena mode is enabled (GGML_SYCL_VRAM_ARENA=1).
 bool vram_arena_enabled();
 
+// llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
+// (llama_context, Task 4b) is enabled. Default ON: unset or "1" leaves it
+// enabled; "0" disables it. Memoized, WARN-at-most-once-per-process -- see
+// the definition next to nonfa_attn_scratch_mb_override() for why callers
+// must go through this rather than reading the env var themselves. This
+// task (4a) only wires the accessor; nothing calls it until Task 4b.
+bool unified_cache_auto_ubatch_enabled();
+
 // === VRAM Arena: zone-based sub-allocator for a single pre-allocated VRAM block ===
 //
 // Layout (within arena):
