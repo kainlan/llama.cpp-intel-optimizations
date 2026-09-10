@@ -17309,6 +17309,14 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
             (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
                 { current->model_id, current->load_txn_id, current->slot_generation }, immutable->version);
         }
+        // llama.cpp-ibj0 spec round 2 F10: this CAS failure means a
+        // CONCURRENT transaction already replaced the plan out from under
+        // this one -- that winning plan may describe a different n_ubatch
+        // than the one this transaction's ring re-plan just committed to,
+        // so the leftover ring is not provably harmless the way a comment
+        // alone could claim. Roll back to the pre-transaction n_ubatch, same
+        // as the two earlier failure paths above.
+        (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
         return;
     }
     ggml_sycl_publish_prepared_plan_locked(prepared_publication);

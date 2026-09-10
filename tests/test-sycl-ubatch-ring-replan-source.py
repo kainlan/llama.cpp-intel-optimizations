@@ -150,10 +150,10 @@ def test_replan_call_has_a_mutation_witness():
     the current, correct source.
 
     Counts occurrences rather than asserting total absence: since spec round
-    1 F8, ggml_sycl_replan_pp_moe_onednn_ring() is legitimately called THREE
-    times in this function (the original re-plan, plus two later rollback
-    call sites) -- deleting the original call site must drop the count by
-    exactly one, to two, not zero."""
+    1 F8 and round 2 F10, ggml_sycl_replan_pp_moe_onednn_ring() is
+    legitimately called FOUR times in this function (the original re-plan,
+    plus three later rollback call sites) -- deleting the original call site
+    must drop the count by exactly one, to three, not zero."""
     raw = GGML_SYCL_CPP
     call_block = (
         "    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch)) {\n"
@@ -176,8 +176,8 @@ def test_replan_call_has_a_mutation_witness():
 
     original_count = _call_count(strip_comments(raw))
     mutated_count = _call_count(strip_comments(mutated_raw))
-    assert original_count == 3, (
-        f"expected exactly three calls in the unmutated source (the re-plan itself plus two rollback call "
+    assert original_count == 4, (
+        f"expected exactly four calls in the unmutated source (the re-plan itself plus three rollback call "
         f"sites) -- found {original_count}; update this witness to match the real source"
     )
     assert mutated_count == original_count - 1, (
@@ -418,9 +418,12 @@ def test_replan_guards_n_ubatch_zero():
 
 
 def test_transaction_rolls_back_the_ring_on_a_later_failure():
-    """llama.cpp-ibj0 spec round 1 F8: a successful ring re-plan can still be
-    undone by a LATER, unrelated transaction failure (publication-ID
-    exhaustion, MMID workspace materialization) -- both later `return;`
+    """llama.cpp-ibj0 spec round 1 F8 + round 2 F10: a successful ring
+    re-plan can still be undone by a LATER, unrelated transaction failure --
+    publication-ID exhaustion, MMID workspace materialization, or the
+    lifecycle_replace_placement_plan CAS losing to a concurrent transaction
+    (F10: the winning plan may describe a different n_ubatch, so the
+    leftover ring is not provably harmless) -- all THREE later `return;`
     sites must roll the ring back to the pre-transaction n_ubatch (by
     re-invoking the same, direction-symmetric re-plan function), or a
     refused transaction leaves a changed ring behind even though nothing
@@ -436,19 +439,28 @@ def test_transaction_rolls_back_the_ring_on_a_later_failure():
             r"ggml_sycl_replan_pp_moe_onednn_ring\(ctx->device,\s*pre_replan_pp_moe_ring_n_ubatch\)", body_norm
         )
     ]
-    assert len(rollback_calls) >= 2, (
-        "expected at least two rollback calls (publication-ID exhaustion, MMID materialization failure), "
-        f"found {len(rollback_calls)}"
+    assert len(rollback_calls) == 3, (
+        "expected exactly three rollback calls (publication-ID exhaustion, MMID materialization failure, "
+        f"the CAS failure) -- found {len(rollback_calls)}"
     )
 
     publication_idx = body_norm.find("publication ID exhausted")
     mmid_fail_idx = body_norm.find("MMID workspace materialization failed")
-    assert publication_idx != -1 and mmid_fail_idx != -1
+    cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert publication_idx != -1 and mmid_fail_idx != -1 and cas_idx != -1
+    assert publication_idx < mmid_fail_idx < cas_idx, (
+        "could not establish the expected source order of the three failure sites"
+    )
     assert any(publication_idx < idx < mmid_fail_idx for idx in rollback_calls), (
         "the publication-ID-exhaustion failure path must roll back before its own return"
     )
-    assert any(idx > mmid_fail_idx for idx in rollback_calls), (
-        "the MMID-materialization-failure path must roll back before its own return"
+    assert any(mmid_fail_idx < idx < cas_idx for idx in rollback_calls), (
+        "the MMID-materialization-failure path must roll back before its own return, and before the CAS "
+        "call site (not attributable to the third rollback)"
+    )
+    assert any(idx > cas_idx for idx in rollback_calls), (
+        "the lifecycle_replace_placement_plan CAS failure path must roll back before its own return "
+        "(llama.cpp-ibj0 spec round 2 F10)"
     )
 
 
