@@ -378,7 +378,17 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     see this check's own mutation witness below. The continue is searched
     for starting from the store, not from the loop head, because the loop
     also has its own earlier, unrelated `if (!item.second) { continue; }`
-    that must not be mistaken for this one."""
+    that must not be mistaken for this one. Finding *some* continue;
+    between the store and the drain call is necessary but not sufficient
+    -- an unrelated continue placed just before drain_all_queues_noexcept()
+    (in an `if`, say) would satisfy a purely positional check while
+    leaving the catch itself unable to skip this cache's own
+    drain+reclaim. Both continue checks are kept. Containment alone
+    would accept a reordered catch body -- `{ continue;
+    g_sycl_shutting_down.store(...); }`, whose store is dead code --
+    because the continue is still inside the braces; the positional
+    search from the store is what requires the continue to FOLLOW the
+    store."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     loop_idx = guard_block.find(CACHES_LOOP_STMT)
     if loop_idx == -1:
@@ -396,7 +406,9 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     if store_idx == -1 or not store_idx < drain_idx:
         return False
     cont_idx = loop_body.find(CATCH_CONTINUE_STMT, store_idx)
-    return cont_idx != -1 and cont_idx < drain_idx
+    if cont_idx == -1 or not cont_idx < drain_idx:
+        return False
+    return CATCH_CONTINUE_STMT in extract_function_body(loop_body, CATCH_ALL_STMT)
 
 
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
@@ -1435,7 +1447,32 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     without the catch body's own continue, the probe would still record the
     flag but the invalid cache would then fall through to
     drain_all_queues_noexcept() and the reclaim call instead of being
-    skipped, which is exactly what the flag store exists to prevent."""
+    skipped, which is exactly what the continue exists to prevent -- the
+    store alone protects only the caches probed after this one.
+
+    A fourth mutant proves the continue anchor is scoped to the catch's own
+    braces, not merely positional between the store and the drain call: it
+    starts from the third mutant's body (the catch's own continue already
+    removed) and inserts an unrelated `if (x) { continue; }` immediately
+    before drain_all_queues_noexcept() -- a continue that has nothing to do
+    with the probe, sitting outside the catch entirely. A check that only
+    asks "is there a continue somewhere between the store and the drain"
+    would be fooled by this: it reports the probe as present even though
+    the catch clause itself no longer contains a continue and this cache's
+    own drain+reclaim would no longer be skipped.
+
+    A fifth mutant proves the check's OTHER half -- the positional search
+    from the store -- is still load-bearing even with containment in
+    place: it reorders the two statements inside the real catch body to
+    `{ continue; g_sycl_shutting_down.store(...); }`, leaving get_context(),
+    the try {}/catch (...) {} skeleton, and the drain call all untouched
+    and still correctly ordered. The continue is still inside the catch's
+    own braces, so containment alone would accept it; but the continue no
+    longer follows the store, so the reordered catch's store is
+    unreachable -- the continue exits the loop iteration before it can
+    ever run -- and this cache's own probe no longer actually sets the
+    flag before skipping. The real check function must still report this
+    mutant as missing."""
     shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
     assert _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code), (
         "the real, fixed shutdown_unified_cache() body should already pass this check (llama.cpp-3lgu F2)"
@@ -1465,7 +1502,6 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     mutated_after_store = after_store_text.replace(CATCH_CONTINUE_STMT, "", 1)
     assert mutated_after_store != after_store_text
     mutated_continue = shutdown_unified_cache_body_code[:store_idx_raw] + mutated_after_store
-    assert mutated_continue != shutdown_unified_cache_body_code
     assert QUEUE_CONTEXT_PROBE_CALL in mutated_continue, "sanity: this mutant must leave get_context() untouched"
     assert store_stmt in mutated_continue, "sanity: this mutant must leave the store statement untouched"
     assert DRAIN_CALL in mutated_continue, "sanity: this mutant must leave the drain call untouched"
@@ -1474,4 +1510,47 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "the loop's earlier `if (!item.second) { continue; }`, which this mutant must leave untouched) was not "
         "detected -- without it, the probe would still record the flag but the invalid cache would then fall "
         "through to drain_all_queues_noexcept() and the reclaim call instead of being skipped"
+    )
+
+    drain_idx_raw = mutated_continue.find(DRAIN_CALL)
+    assert drain_idx_raw != -1, "sanity: the third mutant's body must still contain the drain call"
+    fail_open_mutant = (
+        mutated_continue[:drain_idx_raw] + "if (x) { continue; } " + mutated_continue[drain_idx_raw:]
+    )
+    assert QUEUE_CONTEXT_PROBE_CALL in fail_open_mutant, "sanity: this mutant must leave get_context() untouched"
+    assert store_stmt in fail_open_mutant, "sanity: this mutant must leave the store statement untouched"
+    assert DRAIN_CALL in fail_open_mutant, "sanity: this mutant must leave the drain call untouched"
+    assert fail_open_mutant.count(CATCH_ALL_STMT) == 1, "sanity: the catch-scope assert below assumes one catch in the body"
+    assert CATCH_CONTINUE_STMT not in extract_function_body(fail_open_mutant, CATCH_ALL_STMT), (
+        "sanity: this mutant's own catch braces must no longer contain a continue; -- the inserted "
+        "`if (x) { continue; }` must land after the catch closes, immediately before the drain call"
+    )
+    assert not _preteardown_loop_probes_queue_validity_before_drain(fail_open_mutant), (
+        "mutation witness is broken: the continue anchor is purely positional -- an unrelated "
+        "`if (x) { continue; }` inserted immediately before drain_all_queues_noexcept() (after removing the "
+        "catch body's own continue;) satisfies a check that only looks for *some* continue; between the store "
+        "and the drain, even though the catch clause itself no longer contains one"
+    )
+
+    continue_idx_after_store = after_store_text.find(CATCH_CONTINUE_STMT)
+    reordered_after_store = (
+        CATCH_CONTINUE_STMT
+        + after_store_text[len(store_stmt):continue_idx_after_store]
+        + store_stmt
+        + after_store_text[continue_idx_after_store + len(CATCH_CONTINUE_STMT):]
+    )
+    reordered_mutant = shutdown_unified_cache_body_code[:store_idx_raw] + reordered_after_store
+    assert QUEUE_CONTEXT_PROBE_CALL in reordered_mutant, "sanity: this mutant must leave get_context() untouched"
+    assert store_stmt in reordered_mutant, "sanity: this mutant must leave the store statement untouched"
+    assert DRAIN_CALL in reordered_mutant, "sanity: this mutant must leave the drain call untouched"
+    assert reordered_mutant.count(CATCH_ALL_STMT) == 1, "sanity: the catch-scope assert below assumes one catch in the body"
+    assert CATCH_CONTINUE_STMT in extract_function_body(reordered_mutant, CATCH_ALL_STMT), (
+        "sanity: the reordered catch body must still contain the continue; -- containment alone would accept "
+        "this mutant, which is exactly what this mutant is meant to prove is not enough on its own"
+    )
+    assert not _preteardown_loop_probes_queue_validity_before_drain(reordered_mutant), (
+        "mutation witness is broken: containment alone would accept this reordered catch body -- "
+        "`{ continue; g_sycl_shutting_down.store(...); }`, whose store is now unreachable after the continue -- "
+        "because the continue is still inside the catch's own braces; the positional search from the store is "
+        "what requires the continue to FOLLOW the store, and it is what actually catches this mutant"
     )
