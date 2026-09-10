@@ -224,6 +224,11 @@ pair, guard-VALID, no kernel faults; full output in
 | gemma4 E4B Q8_0 | B70 | 1354.63 | 3250.24 | 2867.69 | 2635.89 | 0.882 | 73.5 | FAIL (< 0.9) |
 | gemma4 E4B Q8_0 | B50 | 674.11 | 1636.45 | 1534.87 | 1448.94 | 0.938 | 148.9 | PASS |
 
+Table produced by `scripts/sycl-prefill-scaling.sh@d7bf48a19` (see
+`artifacts/perf-6ae16115c-longprompt/l3-prefill-gate.txt:1`), before the
+`ub` column landed in `532766c9b` -- a current run of the gate prints an
+`ub` column between `card` and `pp128` that this nine-column table lacks.
+
 The collapse in the snapshot below (pp1024/pp512 of 0.30-0.69) is gone after L2/L2b
 (llama.cpp-dfo0 steps 1-2, llama.cpp-h9uv): five of six pairs are at or above the 0.9
 floor. gemma4 on the B70 is reproducibly 0.875-0.896 (three runs), 0.4-2.5 points under it,
