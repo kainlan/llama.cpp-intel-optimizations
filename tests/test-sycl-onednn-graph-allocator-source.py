@@ -336,7 +336,8 @@ def _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_bod
     `if (!ggml_sycl_is_shutting_down())`, not bare. A true flag on entry
     means shutdown_resources() will abandon cleanup on every live cache's
     own equivalent branch anyway, so this earlier pass has nothing left to
-    reclaim and no validity probe of its own (see F2) to protect a
+    reclaim, and this whole-pass skip has no validity probe of its own --
+    the per-cache probe F2 added is inside the loop to protect a
     drain/reclaim call against an already-torn-down context."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     return CACHES_LOOP_STMT in guard_block
