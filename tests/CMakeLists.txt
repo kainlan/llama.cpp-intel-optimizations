@@ -1790,6 +1790,16 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120
     )
+    # llama.cpp-o65k: dispatch-tuning JSON becomes opt-in via
+    # GGML_SYCL_DISPATCH_TUNING_JSON (no more unconditional /tmp default and
+    # per-start WARN).
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-dispatch-tuning-optin-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-supports-op-foreign-buffer-source.py
