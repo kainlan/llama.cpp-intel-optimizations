@@ -17797,6 +17797,62 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
     return true;
 }
 
+// llama.cpp-ibj0: explicit whole-ring release. Needed because the "already
+// sufficient" fast path just above (the block right after the admission
+// preflight) intentionally never shrinks -- it exists so a PP MoE dispatch
+// (which calls reserve_pp_moe_onednn_scratch() with the PLANNED sizes on
+// every dispatch, not just the first) does not reallocate on every call. A
+// runtime re-plan to a SMALLER n_ubatch (e.g. llama.cpp-nphx Task 4b's
+// ascending-ladder trial settling on a smaller candidate than the largest it
+// tried) would otherwise leave the RUNTIME zone permanently charged for the
+// largest ring ever built, never shrinking back down. Calling this first
+// forces the next reserve_pp_moe_onednn_scratch() to allocate fresh at
+// whatever (possibly smaller) size is then requested.
+//
+// Mirrors shutdown_resources()'s own PP-slot teardown (same refuse-if-still-
+// claimed safety -- neither may run underneath a live dispatch -- same reset
+// of the three size-tracking members and ring_depth), but is a standalone
+// operation, not a step of full-backend shutdown, and additionally applies
+// the same non-arena "direct" accounting release_pp_moe_onednn_scratch's own
+// release_slots() lambda does (shutdown_resources() does not, because by the
+// time it runs the cache is always arena-backed in practice).
+bool unified_cache::release_pp_moe_onednn_scratch_ring() {
+    std::vector<pp_moe_onednn_scratch_slot> released_slots;
+    std::vector<pp_moe_onednn_scratch_slot> released_retired;
+    size_t                                  released_direct = 0;
+    {
+        std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
+        for (const auto & slot : pp_moe_onednn_scratch_slots_) {
+            if (slot.refcount != 0) {
+                return false;  // still claimed by an in-flight dispatch -- refuse, ring untouched
+            }
+        }
+        for (const auto & slot : pp_moe_onednn_retired_slots_) {
+            if (slot.refcount != 0) {
+                return false;
+            }
+        }
+        if (!arena_active()) {
+            for (const auto & slot : pp_moe_onednn_scratch_slots_) {
+                released_direct += slot.weight_size + slot.activation_size + slot.output_size;
+            }
+        }
+        released_slots.swap(pp_moe_onednn_scratch_slots_);
+        released_retired.swap(pp_moe_onednn_retired_slots_);
+        pp_moe_onednn_weight_slot_size_ = pp_moe_onednn_activation_slot_size_ = pp_moe_onednn_output_slot_size_ = 0;
+        pp_moe_onednn_ring_depth_                                                                               = 0;
+    }
+    // mem_handle destruction invokes unified_free/zone_free; never do that
+    // while holding pp_moe_onednn_scratch_mutex_ (same hazard
+    // shutdown_resources() documents for its own identical teardown).
+    released_slots.clear();
+    released_retired.clear();
+    if (released_direct > 0) {
+        saturating_sub_used(released_direct);
+    }
+    return true;
+}
+
 bool unified_cache::claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out) {
     std::lock_guard<std::mutex> lock(pp_moe_onednn_scratch_mutex_);
     if (slot >= pp_moe_onednn_scratch_slots_.size()) {
@@ -17947,6 +18003,14 @@ bool unified_cache_reserve_pp_moe_onednn_scratch(int      device_id,
     }
     return cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, activation_slot_bytes, output_slot_bytes,
                                                 ring_depth);
+}
+
+bool unified_cache_release_pp_moe_onednn_scratch_ring(int device_id) {
+    unified_cache * cache = get_unified_cache_for_device(device_id);
+    if (!cache) {
+        return false;
+    }
+    return cache->release_pp_moe_onednn_scratch_ring();
 }
 
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot) {

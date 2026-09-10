@@ -3480,6 +3480,15 @@ class unified_cache {
                                        size_t   activation_slot_bytes,
                                        size_t   output_slot_bytes,
                                        uint32_t ring_depth);
+    // llama.cpp-ibj0: explicit whole-ring release, distinct from
+    // release_pp_moe_onednn_scratch_slot() below (which releases one CLAIMED
+    // dispatch's lease, not the ring itself). reserve_pp_moe_onednn_scratch()'s
+    // own "already sufficient, reuse without reallocating" fast path never
+    // shrinks the physical ring, so a caller that needs the RUNTIME zone's
+    // accounting to track a SMALLER re-plan exactly must release first. Fails
+    // (returns false, ring left untouched) if any slot -- claimed or retired
+    // -- is still in use; see the .cpp definition for the full contract.
+    bool release_pp_moe_onednn_scratch_ring();
     bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
@@ -6032,6 +6041,10 @@ bool                         unified_cache_reserve_pp_moe_onednn_scratch(int    
                                                                          size_t   activation_slot_bytes,
                                                                          size_t   output_slot_bytes,
                                                                          uint32_t ring_depth);
+// llama.cpp-ibj0: free-function wrapper for unified_cache::release_pp_moe_onednn_scratch_ring(),
+// matching the reserve wrapper immediately above. False (no-op) when the
+// device has no cache yet, or the ring is still in use.
+bool                         unified_cache_release_pp_moe_onednn_scratch_ring(int device_id);
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
 
 // Get scratch buffers for oneDNN FP16 path. Returns pointers plus a logical

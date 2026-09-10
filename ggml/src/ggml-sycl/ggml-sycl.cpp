@@ -16870,6 +16870,21 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // slots it attempted), so the restored ceiling matches what is still
 // actually allocated, and the plan can never claim a ring larger than what
 // backs it.
+//
+// BIDIRECTIONAL (llama.cpp-nphx Task 3 spike, comment c-wgxn): a SHRINK
+// (n_ubatch < the ring's currently-planned one) must re-plan too, not just a
+// grow -- Task 4b's ascending-ladder trial (512 -> 1024 -> 2048 -> settle on
+// the last candidate that fit) can settle on a SMALLER n_ubatch than the
+// largest it tried, and reserve_pp_moe_onednn_scratch()'s "already
+// sufficient, reuse without reallocating" fast path (its own comment: exists
+// so a dispatch does not reallocate on every call) would otherwise silently
+// keep the physical ring -- and the RUNTIME zone's charge for it -- at the
+// larger, discarded size forever. So a shrink explicitly releases the ring
+// first (release_pp_moe_onednn_scratch_ring()), forcing the reserve below to
+// allocate fresh at the smaller size; a grow does not need this; the
+// existing "allocate new, then retire old" path inside
+// reserve_pp_moe_onednn_scratch() already frees the smaller predecessor
+// correctly.
 static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     if (weight_slot_bytes == 0) {
@@ -16907,8 +16922,22 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     const size_t   old_output_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(device);
     const uint32_t old_n_ubatch          = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device);
 
-    // Raise the ceiling first (see the function comment for why this must
-    // precede the reserve call, not follow it).
+    // SHRINK: release the physical ring first, so the reserve below cannot
+    // take reserve_pp_moe_onednn_scratch()'s "already sufficient" fast path
+    // and silently keep the larger, discarded allocation (see the function
+    // comment's BIDIRECTIONAL section). A release refusal (still claimed by
+    // an in-flight dispatch) is treated as a re-plan failure -- the ceiling
+    // has not been touched yet at this point, so nothing needs restoring.
+    if (n_ubatch < old_n_ubatch && !cache->release_pp_moe_onednn_scratch_ring()) {
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring shrink for n_ubatch=%u could "
+            "not release the existing ring (still claimed by an in-flight dispatch); device=%d\n",
+            n_ubatch, device);
+        return false;
+    }
+
+    // Raise (or lower) the ceiling first (see the function comment for why
+    // this must precede the reserve call, not follow it).
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, new_activation_slot_bytes,
                                                                new_output_slot_bytes, ring_depth);
 

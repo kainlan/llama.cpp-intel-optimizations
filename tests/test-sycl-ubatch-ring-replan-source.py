@@ -260,6 +260,74 @@ def test_replan_is_idempotent_and_skips_dense_models():
     )
 
 
+def test_replan_is_bidirectional_and_releases_the_ring_on_shrink():
+    """llama.cpp-nphx Task 3 spike (comment c-wgxn): a SHRINK -- the runtime
+    n_ubatch smaller than the ring's currently-planned one -- must release
+    the physical ring BEFORE reserving the smaller size, or
+    reserve_pp_moe_onednn_scratch()'s own 'already sufficient, reuse without
+    reallocating' fast path silently keeps the larger, discarded ring (and
+    the RUNTIME zone's charge for it) forever. This matters because Task 4b's
+    ascending-ladder trial can settle on a smaller n_ubatch than the largest
+    one it tried."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+
+    assert "release_pp_moe_onednn_scratch_ring(" in body_norm, (
+        "the re-plan must call release_pp_moe_onednn_scratch_ring() somewhere -- the shrink path has no "
+        "other way to force reserve_pp_moe_onednn_scratch() to actually shrink the physical ring"
+    )
+    release_match = re.search(
+        r"if\s*\(\s*n_ubatch\s*<\s*old_n_ubatch\s*&&\s*!\s*cache->release_pp_moe_onednn_scratch_ring\(\)\s*\)",
+        body_norm,
+    )
+    assert release_match is not None, (
+        "the release call must be gated on n_ubatch < old_n_ubatch (a SHRINK only -- a grow does not need "
+        "it, reserve_pp_moe_onednn_scratch()'s own allocate-new-then-retire-old path already frees a "
+        "smaller predecessor correctly)"
+    )
+
+    set_first_idx = body_norm.find("unified_cache_set_planned_pp_moe_onednn_scratch(")
+    reserve_idx = body_norm.find("reserve_pp_moe_onednn_scratch(")
+    assert set_first_idx != -1 and reserve_idx != -1
+    assert release_match.start() < set_first_idx < reserve_idx, (
+        "the release call must precede BOTH the ceiling raise/lower and the reserve attempt -- releasing "
+        "after either would either shrink a ring the new (still-old) ceiling claims is bigger, or race "
+        "reserve_pp_moe_onednn_scratch()'s own fast path"
+    )
+
+
+def test_release_ring_function_is_exported_and_refuses_when_busy():
+    """unified_cache::release_pp_moe_onednn_scratch_ring() (and its
+    free-function wrapper) must exist, be exported (not file-static), and
+    refuse (return false, ring untouched) when any slot is still claimed --
+    mirroring shutdown_resources()'s own identical safety for the same
+    resource."""
+    hpp_norm = _normalize_ws(CACHE_HPP_CODE)
+    cpp_norm = _normalize_ws(CACHE_CPP_CODE)
+
+    assert "bool release_pp_moe_onednn_scratch_ring();" in hpp_norm, (
+        "unified_cache::release_pp_moe_onednn_scratch_ring() must be declared in the class"
+    )
+    assert "bool unified_cache_release_pp_moe_onednn_scratch_ring(int device_id);" in hpp_norm, (
+        "the free-function wrapper must be declared in unified-cache.hpp"
+    )
+
+    def _has_static_before(text: str, name: str) -> bool:
+        return bool(re.search(r"\bstatic\b[^;{}]*?\b" + re.escape(name) + r"\s*\(", text))
+
+    assert not _has_static_before(cpp_norm, "unified_cache_release_pp_moe_onednn_scratch_ring"), (
+        "the free-function wrapper must not be file-static"
+    )
+
+    body = _bounded_body(
+        CACHE_CPP_CODE, "bool unified_cache::release_pp_moe_onednn_scratch_ring()", "bool unified_cache::claim_pp_moe_onednn_scratch_slot("
+    )
+    body_norm = _normalize_ws(body)
+    assert re.search(r"if\s*\(\s*slot\.refcount\s*!=\s*0\s*\)\s*\{\s*return\s+false\s*;", body_norm), (
+        "must refuse (return false) when a currently-held slot is still claimed (refcount != 0), before "
+        "touching the ring"
+    )
+
+
 def test_stale_batched_refusal_is_warn_not_info():
     """llama.cpp-ibj0 acceptance criterion: the once-per-process refusal at
     the batched PP MoE oneDNN executor's own admission check must be

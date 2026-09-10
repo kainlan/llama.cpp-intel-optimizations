@@ -90,6 +90,31 @@ void test_slots_reproduce_loader_formula() {
           "n_ubatch=0 -> both slots exactly 0 (0 rows, not a refusal: the per-row bytes are still planned)");
 }
 
+void test_slots_shrink_correctly_after_a_grow() {
+    printf("Shrinking after a grow (llama.cpp-nphx c-wgxn: the ladder trial can settle smaller):\n");
+
+    // Direction independence at the SIZE-COMPUTATION layer: querying 2048
+    // then 1024 then 512 (descending) must produce the exact same numbers as
+    // querying them ascending above -- unified_cache_pp_moe_onednn_slots_for_ubatch()
+    // is a pure function of (device's planned per-row bytes, n_ubatch), with
+    // no memory of prior calls. The ACTUAL ring release+reserve sequence
+    // (ggml_sycl_replan_pp_moe_onednn_ring() in ggml-sycl.cpp, calling
+    // unified_cache::release_pp_moe_onednn_scratch_ring() then
+    // reserve_pp_moe_onednn_scratch()) touches a live SYCL device queue and
+    // cannot be exercised host-only; this test covers the sizing half of the
+    // shrink path, the half that IS a pure function.
+    size_t act = 0, out = 0;
+    check(
+        unified_cache_pp_moe_onednn_slots_for_ubatch(kDevice, 2048, &act, &out) && act == 377487360 && out == 754974720,
+        "descending: 2048 first (360.0 MB activation, 720.0 MB output)");
+    check(
+        unified_cache_pp_moe_onednn_slots_for_ubatch(kDevice, 1024, &act, &out) && act == 188743680 && out == 377487360,
+        "descending: then 1024 -- shrinks to exactly what an ascending 512->1024 call produced above, not a "
+        "stale/latched larger value");
+    check(unified_cache_pp_moe_onednn_slots_for_ubatch(kDevice, 512, &act, &out) && act == 94371840 && out == 188743680,
+          "descending: then 512 -- shrinks all the way back to the loader's own 90.0/180.0 MB plan");
+}
+
 void test_dense_model_returns_false() {
     printf("Dense model (per-row bytes 0):\n");
 
@@ -174,6 +199,7 @@ void test_largest_fitting_inverts_the_capacity_formula() {
 
 int main() {
     test_slots_reproduce_loader_formula();
+    test_slots_shrink_correctly_after_a_grow();
     test_dense_model_returns_false();
     test_slots_overflow_returns_false();
     test_n_ubatch_round_trips_through_setter_getter();
