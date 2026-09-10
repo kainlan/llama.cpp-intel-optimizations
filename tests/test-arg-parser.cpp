@@ -192,10 +192,14 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
-    // llama.cpp-nphx Task 4a: -ub / --ubatch-size plumbing for n_ubatch_auto
+    // llama.cpp-nphx Task 4a: -ub / --ubatch-size plumbing for n_ubatch_auto.
+    // LLAMA_EXAMPLE_COMMON requires -m/--model (common/arg.cpp: "error:
+    // --model is required" unless params.usage/completion/server_base is
+    // set), so every case below carries one even though this test cares
+    // only about n_ubatch/n_ubatch_auto.
     {
         common_params ubatch_params;
-        argv = {"binary_name", "--ubatch-size", "777"};
+        argv = {"binary_name", "-m", "model_file.gguf", "--ubatch-size", "777"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
         assert(ubatch_params.n_ubatch == 777);
         assert(ubatch_params.n_ubatch_auto == false);
@@ -205,7 +209,7 @@ static void test(void) {
         // fork-local #ifdef and so this test fails loudly if the default
         // ever flips without the plumbing changing with it.
         common_params ubatch_params;
-        argv = {"binary_name"};
+        argv = {"binary_name", "-m", "model_file.gguf"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
 #ifdef GGML_USE_SYCL
         assert(ubatch_params.n_ubatch_auto == true);
@@ -215,7 +219,7 @@ static void test(void) {
     }
     {
         common_params ubatch_params;
-        argv = {"binary_name", "-ub", "auto"};
+        argv = {"binary_name", "-m", "model_file.gguf", "-ub", "auto"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
         assert(ubatch_params.n_ubatch_auto == true);
     }
