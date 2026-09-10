@@ -274,6 +274,11 @@ std::string tuning_path() {
     // ensure_model_loaded() as a signal to skip the load entirely rather
     // than as a path that then fails to open.
     const char * env = std::getenv("GGML_SYCL_DISPATCH_TUNING_JSON");
+    // llama.cpp-o65k round 1 (rev-o65k-spec-1, F2): whitespace is a path,
+    // not unset -- env[0] is non-NUL for e.g. a lone " ", so that value is
+    // returned as-is and later fails to open, WARNing once per model. This
+    // is deliberate (a whitespace-only value is user error, and the WARN
+    // already names the offending path); it is not treated as "unset".
     if (env && env[0]) {
         return std::string(env);
     }

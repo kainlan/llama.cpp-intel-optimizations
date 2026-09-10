@@ -256,8 +256,15 @@ def test_docs_have_both_env_var_rows():
     JSON-path row must state the caveat that its lookup key carries no
     device or driver identity -- a JSON measured on one card is applied to
     every card."""
-    assert "`GGML_SYCL_DISPATCH_TUNING" in SYCL_ENV_VARS_MD, (
-        "docs/backend/sycl-env-vars.md must document GGML_SYCL_DISPATCH_TUNING"
+    # llama.cpp-o65k round 1 (rev-o65k-spec-1, finding F1): the bare prefix
+    # "`GGML_SYCL_DISPATCH_TUNING" is also a substring of the JSON row's own
+    # name ("`GGML_SYCL_DISPATCH_TUNING_JSON=<path>`"), so that needle alone
+    # is satisfied by the JSON row even with the master-switch row entirely
+    # deleted -- pin the leading "| `...=0`" table-row prefix instead, which
+    # only the master-switch row can produce.
+    assert "| `GGML_SYCL_DISPATCH_TUNING=0`" in SYCL_ENV_VARS_MD, (
+        "docs/backend/sycl-env-vars.md must document GGML_SYCL_DISPATCH_TUNING as its own "
+        "table row"
     )
     assert "`GGML_SYCL_DISPATCH_TUNING_JSON" in SYCL_ENV_VARS_MD, (
         "docs/backend/sycl-env-vars.md must document GGML_SYCL_DISPATCH_TUNING_JSON"
@@ -265,6 +272,18 @@ def test_docs_have_both_env_var_rows():
     assert "a JSON measured on one card is applied to every card" in SYCL_ENV_VARS_MD, (
         "the GGML_SYCL_DISPATCH_TUNING_JSON row must state the no-device/driver-identity "
         "caveat in these exact words, so the doc cannot silently drop it on a later edit"
+    )
+    # llama.cpp-o65k round 1 (rev-o65k-spec-1, finding F2): the JSON-path
+    # row must also document that a whitespace-only value is NOT treated as
+    # unset -- it is a real path that fails to open, WARNing once per model
+    # (dispatch-tuning.cpp's `if (env && env[0])` guard sees a lone " " as
+    # non-empty).
+    assert (
+        "An empty value is unset; a whitespace-only value is treated as a path and fails "
+        "to open with one WARN per model." in SYCL_ENV_VARS_MD
+    ), (
+        "the GGML_SYCL_DISPATCH_TUNING_JSON row must state the whitespace-only-value "
+        "behaviour in these words, so the doc cannot silently drop it on a later edit"
     )
 
 
