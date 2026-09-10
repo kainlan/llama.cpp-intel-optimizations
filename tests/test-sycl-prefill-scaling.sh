@@ -1026,10 +1026,9 @@ cases=$((cases+1))
 # mk_fake_bench_ub, not by actually sweeping -ub, so its 512 here does NOT
 # mean a real run at -ub 512 would show this column) populates the `ub`
 # column from the table's OWN reported value -- no --ubatch flag is given
-# here, so this
-# proves the column is read from llama-bench's OWN OUTPUT, never echoed
-# back from something this script passed in (there is nothing to echo:
-# -ub was never given).
+# here, so this proves the column is read from llama-bench's OWN OUTPUT,
+# never echoed back from something this script passed in (there is
+# nothing to echo: -ub was never given).
 UB_AUDIT_DEFAULT="$T/bench-argv-ub-default.log"
 : > "$UB_AUDIT_DEFAULT"
 BENCH_UB_DEFAULT="$T/fake-bench-ub-default.sh"

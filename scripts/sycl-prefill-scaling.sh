@@ -303,8 +303,9 @@ done
 # by anchoring to a markdown row; anchoring to an EXACT cell match here is
 # the stronger form of the same fix -- tests/test-sycl-prefill-scaling.sh
 # pins this with a decoy row whose test cell would trip a substring-based
-# mutant). `tail -1` in case of duplicate rows. Echoes nothing (not the
-# caller's job to interpret that) when no row matches. Shared by parse_cell
+# mutant). `tail -1` in case of duplicate rows. Echoes nothing when no row
+# matches -- not an error; what that means is the caller's job to decide
+# (parse_cell prints "", parse_ub_cell prints "-"). Shared by parse_cell
 # ($2 = the caller's own `want`) and parse_ub_cell ($2 = the fixed "pp512")
 # -- previously duplicated byte-for-byte between the two except for that
 # one `-v want=` value (llama.cpp-s0um quality review round 1, Q4), which
