@@ -603,28 +603,26 @@ ticket reproduced on:
   until reclaimed, and that census refuses shutdown while any such control
   survives, so this pass runs ahead of it rather than relying on
   `shutdown_resources()`'s own, later reclaim. The runtime-context-update site
-  reaches it through the
-  free-function wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`;
-  the context-reclaim and pre-census sites call the
-  `onednn_graph_scratch_reclaim_pool()` member directly. Without the
-  runtime-context-update site a pooled buffer sized for one context's shapes
-  could sit on a 16 GB card holding up to the cap's worth of idle VRAM while
-  the next model loads (`llama-bench` with several `-m`, a server switching
-  models) or while the SAME model's context is resized to a different
-  `n_ctx`. The four production sites do NOT all log in the same order relative
-  to the clear: the context-reclaim, runtime-update, and pre-census sites share
-  `reclaim_pool()`, which clears the pool and only then logs the summary;
-  teardown instead logs the summary early, well before it actually clears
-  the pool — see `docs/backend/sycl-env-vars.md`'s
-  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site
-  ordering. Either way the line logged is
-  `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT pool summary (%s): hits=%zu
-  misses=%zu evictions=%zu waits=%zu peak_pooled=%.1f MB
-  retired_flag_slots=%zu (cumulative for this process, not just this
-  reclaim)` (silent if the pool was never used),
-  where `%s` is `"teardown"`, `"context reclaim"`, `"runtime context
-  update"`, or `"module shutdown (pre-census)"`. Only the teardown call
-  logs at `GGML_LOG_LEVEL_WARN`; the other three calls all log at
+  reaches it through the free-function wrapper
+  `unified_cache_reclaim_onednn_graph_scratch_pool()`; the context-reclaim and
+  pre-census sites call the `onednn_graph_scratch_reclaim_pool()` member
+  directly. Without the runtime-context-update site a pooled buffer sized for
+  one context's shapes could sit on a 16 GB card holding up to the cap's worth
+  of idle VRAM while the next model loads (`llama-bench` with several `-m`, a
+  server switching models) or while the SAME model's context is resized to a
+  different `n_ctx`. The four production sites do NOT all log in the same order
+  relative to the clear: the context-reclaim, runtime-update, and pre-census
+  sites share `reclaim_pool()`, which clears the pool and only then logs the
+  summary; teardown instead logs the summary early, well before it actually
+  clears the pool — see `docs/backend/sycl-env-vars.md`'s
+  `GGML_SYCL_ONEDNN_GRAPH_DIRECT_CAP_MB` row for the exact per-site ordering.
+  Either way the line logged is `[UNIFIED-CACHE] oneDNN Graph scratch DIRECT
+  pool summary (%s): hits=%zu misses=%zu evictions=%zu waits=%zu
+  peak_pooled=%.1f MB retired_flag_slots=%zu (cumulative for this process, not
+  just this reclaim)` (silent if the pool was never used), where `%s` is
+  `"teardown"`, `"context reclaim"`, `"runtime context update"`, or `"module
+  shutdown (pre-census)"`. Only the teardown call logs at
+  `GGML_LOG_LEVEL_WARN`; the other three calls all log at
   `GGML_LOG_LEVEL_INFO`, which is dropped at default verbosity in every tool
   (see CLAUDE.md's "llama-bench traps" section) — so those three summaries
   are invisible in a normal run unless verbosity is raised. The summary call

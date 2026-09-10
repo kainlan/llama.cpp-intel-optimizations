@@ -336,7 +336,8 @@ def _preteardown_pool_loop_skipped_once_shutting_down(shutdown_unified_cache_bod
     `if (!ggml_sycl_is_shutting_down())`, not bare. A true flag on entry
     means shutdown_resources() will abandon cleanup on every live cache's
     own equivalent branch anyway, so this earlier pass has nothing left to
-    reclaim and no validity probe of its own (see F2) to protect a
+    reclaim, and this whole-pass skip has no validity probe of its own --
+    the per-cache probe F2 added is inside the loop to protect a
     drain/reclaim call against an already-torn-down context."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     return CACHES_LOOP_STMT in guard_block
@@ -346,28 +347,38 @@ QUEUE_CONTEXT_PROBE_CALL = "get_context()"
 TRY_STMT = "try {"
 CATCH_ALL_STMT = "catch (...)"
 SHUTTING_DOWN_STORE_TRUE = "g_sycl_shutting_down.store(true"
+CATCH_CONTINUE_STMT = "continue;"
 
 
 def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body: str) -> bool:
     """llama.cpp-3lgu (F2): true iff, inside the pre-census drain+reclaim
     loop (see _preteardown_pool_loop_guard_block()), each cache's own
     queue-context validity is probed -- a `try { ... get_context(); } catch
-    (...) { ... g_sycl_shutting_down.store(true, ...); ... }` guard, mirroring
-    shutdown_resources()'s own probe (unified-cache.cpp ~4557) -- and that
-    probe's try/get_context()/catch/store sequence appears strictly BEFORE
-    the loop's own drain_all_queues_noexcept() call. The store is the
-    load-bearing half of the catch body, not decoration: a catch clause that
-    only swallows the exception (no try/catch shape check alone can tell the
-    difference) would let this cache's own later shutdown_resources() call
-    (in the teardown loop further down) see a still-false flag and proceed
-    as if the context were valid. Without the whole probe, a context torn
-    down while g_sycl_shutting_down is still false reaches
-    drain_all_queues_noexcept() (which swallows the throw) and then this
-    cache's pool reclaim, whose mem_handle releases would attempt a real
-    free against an already-invalid context. Uses the FIRST occurrence of
-    each anchor within the loop body via str.find() so a later,
-    correctly-ordered probe cannot mask an earlier, missing one -- see this
-    check's own mutation witness below."""
+    (...) { ... g_sycl_shutting_down.store(true, ...); continue; ... }`
+    guard, mirroring shutdown_resources()'s own probe (unified-cache.cpp
+    ~4557) -- and that probe's try/get_context()/catch/store/continue
+    sequence appears strictly BEFORE the loop's own
+    drain_all_queues_noexcept() call. The store and the continue are both
+    load-bearing halves of the catch body, not decoration: a catch clause
+    that only swallows the exception (no try/catch shape check alone can
+    tell the difference) would let this cache's own later
+    shutdown_resources() call (in the teardown loop further down) see a
+    still-false flag and proceed as if the context were valid, and a catch
+    clause that stores the flag but does not then `continue` would still
+    fall through to drain_all_queues_noexcept() and the reclaim call for
+    THIS cache against its own already-invalid context -- the flag only
+    protects every cache probed *after* this one in the loop, not this one,
+    unless the continue actually skips its own drain+reclaim. Without the
+    whole probe, a context torn down while g_sycl_shutting_down is still
+    false reaches drain_all_queues_noexcept() (which swallows the throw)
+    and then this cache's pool reclaim, whose mem_handle releases would
+    attempt a real free against an already-invalid context. Uses the FIRST
+    occurrence of each anchor within the loop body via str.find() so a
+    later, correctly-ordered probe cannot mask an earlier, missing one --
+    see this check's own mutation witness below. The continue is searched
+    for starting from the store, not from the loop head, because the loop
+    also has its own earlier, unrelated `if (!item.second) { continue; }`
+    that must not be mistaken for this one."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     loop_idx = guard_block.find(CACHES_LOOP_STMT)
     if loop_idx == -1:
@@ -382,7 +393,10 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     if not (try_idx < probe_idx < catch_idx < drain_idx):
         return False
     store_idx = loop_body.find(SHUTTING_DOWN_STORE_TRUE, catch_idx)
-    return store_idx != -1 and store_idx < drain_idx
+    if store_idx == -1 or not store_idx < drain_idx:
+        return False
+    cont_idx = loop_body.find(CATCH_CONTINUE_STMT, store_idx)
+    return cont_idx != -1 and cont_idx < drain_idx
 
 
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
@@ -1409,7 +1423,19 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     and confirms the real check function reports it missing -- a catch
     clause that merely swallows the exception without recording the flag
     would otherwise pass this check even though this cache's own later
-    shutdown_resources() call would then see a still-false flag."""
+    shutdown_resources() call would then see a still-false flag.
+
+    A third mutant proves the catch body's own `continue;` is checked too,
+    not just the store: removes ONLY the `continue;` that follows the store
+    (leaving get_context(), the store statement, the try {}/catch (...) {}
+    skeleton, and the drain call all untouched and still correctly ordered)
+    and confirms the real check function reports it missing. This is
+    distinct from the loop's earlier `if (!item.second) { continue; }`,
+    which sits before the try and must stay untouched by this mutant --
+    without the catch body's own continue, the probe would still record the
+    flag but the invalid cache would then fall through to
+    drain_all_queues_noexcept() and the reclaim call instead of being
+    skipped, which is exactly what the flag store exists to prevent."""
     shutdown_unified_cache_body_code = extract_function_body(CACHE_CPP_CODE, "bool shutdown_unified_cache(")
     assert _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_body_code), (
         "the real, fixed shutdown_unified_cache() body should already pass this check (llama.cpp-3lgu F2)"
@@ -1431,4 +1457,21 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
         "mutation witness is broken: removing only the g_sycl_shutting_down.store(true, ...) statement from the "
         "catch body was not detected -- the check may be validating the try/catch shape without checking what "
         "the catch body actually does"
+    )
+
+    store_idx_raw = shutdown_unified_cache_body_code.find(store_stmt)
+    after_store_text = shutdown_unified_cache_body_code[store_idx_raw:]
+    assert CATCH_CONTINUE_STMT in after_store_text, "sanity: the catch body's own continue; must follow the store"
+    mutated_after_store = after_store_text.replace(CATCH_CONTINUE_STMT, "", 1)
+    assert mutated_after_store != after_store_text
+    mutated_continue = shutdown_unified_cache_body_code[:store_idx_raw] + mutated_after_store
+    assert mutated_continue != shutdown_unified_cache_body_code
+    assert QUEUE_CONTEXT_PROBE_CALL in mutated_continue, "sanity: this mutant must leave get_context() untouched"
+    assert store_stmt in mutated_continue, "sanity: this mutant must leave the store statement untouched"
+    assert DRAIN_CALL in mutated_continue, "sanity: this mutant must leave the drain call untouched"
+    assert not _preteardown_loop_probes_queue_validity_before_drain(mutated_continue), (
+        "mutation witness is broken: removing only the catch body's own continue; (the one after the store, not "
+        "the loop's earlier `if (!item.second) { continue; }`, which this mutant must leave untouched) was not "
+        "detected -- without it, the probe would still record the flag but the invalid cache would then fall "
+        "through to drain_all_queues_noexcept() and the reclaim call instead of being skipped"
     )
