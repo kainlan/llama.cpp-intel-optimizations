@@ -663,7 +663,7 @@ def test_onednn_graph_allocator_source_contract() -> None:
 
     # BLOCKING: clear_pool_locked() must not destruct an entry whose release
     # event has not completed -- it must hand that one to
-    # retain_handles_until_event() instead, since two of the three reclaim
+    # retain_handles_until_event() instead, since two of the four reclaim
     # call sites (arena_reserve()'s context-reclaim branch,
     # ggml_backend_sycl_set_runtime_context()) do not drain the queue first.
     # Structural regression guard alongside the GPU test's own behavioral

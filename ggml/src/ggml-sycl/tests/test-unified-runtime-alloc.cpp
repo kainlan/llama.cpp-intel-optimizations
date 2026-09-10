@@ -836,7 +836,8 @@ static bool explicit_global_cache_shutdown_is_clean() {
 // very start of shutdown_unified_cache() -- strictly before any cache's
 // shutdown_resources() (and therefore before
 // onednn_graph_scratch_clear_pool_locked() ever ran) -- before the
-// pre-census pool drain+reclaim pass was inserted ahead of it (F1's fix).
+// pre-census pool drain+reclaim pass was inserted ahead of it
+// (llama.cpp-me60's pre-census pass, this case's own STEP A defect).
 // That pre-teardown census refused on any live non-CACHE_BACKING control,
 // so the parked buffer itself tripped it before the LATER registry sweep
 // F1 targets was ever reached. Traced (by direct code read, not built) to
