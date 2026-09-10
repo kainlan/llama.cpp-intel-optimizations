@@ -378,7 +378,16 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     see this check's own mutation witness below. The continue is searched
     for starting from the store, not from the loop head, because the loop
     also has its own earlier, unrelated `if (!item.second) { continue; }`
-    that must not be mistaken for this one."""
+    that must not be mistaken for this one. Finding *some* continue;
+    between the store and the drain call is necessary but not sufficient:
+    the continue must sit inside the catch's own braces, not merely
+    somewhere between the store and the drain -- an unrelated continue
+    placed just before drain_all_queues_noexcept() (in an `if`, say)
+    would satisfy a purely positional check while leaving the catch
+    itself unable to skip this cache's own drain+reclaim. The final
+    check re-extracts the catch's own brace-balanced body via
+    extract_function_body() and requires the continue to appear inside
+    it."""
     guard_block = _preteardown_pool_loop_guard_block(shutdown_unified_cache_body)
     loop_idx = guard_block.find(CACHES_LOOP_STMT)
     if loop_idx == -1:
@@ -396,7 +405,9 @@ def _preteardown_loop_probes_queue_validity_before_drain(shutdown_unified_cache_
     if store_idx == -1 or not store_idx < drain_idx:
         return False
     cont_idx = loop_body.find(CATCH_CONTINUE_STMT, store_idx)
-    return cont_idx != -1 and cont_idx < drain_idx
+    if cont_idx == -1 or not cont_idx < drain_idx:
+        return False
+    return CATCH_CONTINUE_STMT in extract_function_body(loop_body, CATCH_ALL_STMT)
 
 
 COMMON_HPP_CODE = strip_comments(COMMON_HPP)
