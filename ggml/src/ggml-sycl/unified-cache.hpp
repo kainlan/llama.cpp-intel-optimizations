@@ -3393,15 +3393,15 @@ class unified_cache {
     // survive a full context/model teardown, since the shape it was sized
     // for may no longer be requested again -- and, as of llama.cpp-me60,
     // from shutdown_unified_cache() itself, once per live cache unless SYCL
-    // is already shutting down or that cache's queue context is already
-    // invalid, BEFORE its pre-teardown census (a parked DIRECT entry's own
-    // EXTERNAL_EXACT allocation control would otherwise refuse that
-    // census). Genuine cache teardown ALSO still routes through
-    // shutdown_resources() further down (which logs its own teardown
-    // summary ahead of its own early-return paths and clears the pool again
-    // -- a no-op by then): the pre-census call above runs first and does
-    // the real work; the later call in shutdown_resources() finds nothing
-    // left to reclaim.
+    // is already shutting down (llama.cpp-5ot1) or that cache's queue
+    // context is already invalid (llama.cpp-3lgu), BEFORE its pre-teardown
+    // census (a parked DIRECT entry's own EXTERNAL_EXACT allocation control
+    // would otherwise refuse that census). Genuine cache teardown ALSO
+    // still routes through shutdown_resources() further down (which logs
+    // its own teardown summary ahead of its own early-return paths and
+    // clears the pool again -- a no-op by then): the pre-census call above
+    // runs first and does the real work; the later call in
+    // shutdown_resources() finds nothing left to reclaim.
     void onednn_graph_scratch_reclaim_pool(const char * context) {
         std::lock_guard<std::mutex> lock(onednn_graph_scratch_mutex_);
         // Clear BEFORE logging, not after: logging first would under-report

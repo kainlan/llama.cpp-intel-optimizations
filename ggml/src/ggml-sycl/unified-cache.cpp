@@ -18957,9 +18957,9 @@ bool shutdown_unified_cache() {
     // entry point ggml_backend_sycl_set_runtime_context() already uses in
     // production) -- but without shutdown_resources()'s own top-level
     // g_sycl_shutting_down early return; see the ggml_sycl_is_shutting_down()
-    // skip below for how this pass covers that case instead, and each
-    // cache's own get_context() probe inside the loop below (llama.cpp-3lgu
-    // F2) for how this pass covers shutdown_resources()'s other guard, its
+    // skip below for how this pass covers that case instead, and each cache's
+    // own get_context() probe inside the loop below (llama.cpp-3lgu F2) for
+    // how this pass covers shutdown_resources()'s other guard, its
     // queue-context validity probe, per cache rather than once on entry.
     //
     // Runs for every live cache (subject only to the shutting-down skip
@@ -18987,28 +18987,27 @@ bool shutdown_unified_cache() {
     // changes nothing about what either of those two checks finds when
     // shutdown_resources() reaches them afterward.
     //
-    // llama.cpp-5ot1: skip this whole pass once SYCL is already shutting
-    // down -- shutdown_resources() abandons cleanup on that path anyway
-    // (its own g_sycl_shutting_down branch, reached later in this
-    // function's teardown loop), so there is nothing here left to
-    // reclaim. This whole-pass skip has no validity probe of its own -- it
-    // relies solely on the flag already being true -- but llama.cpp-3lgu
-    // (F2) added a per-cache get_context() probe inside the loop below, so
-    // a context torn down while the flag is still false is now caught per
-    // cache instead of reaching drain_all_queues_noexcept() or the pool
-    // reclaim unguarded. A true flag on entry means an earlier writer already
-    // committed to abandonment: either the previously completed
-    // shutdown_unified_cache() (which cleared g_device_caches before storing
-    // the flag, so this loop would be empty), or one of the other writers --
-    // the atexit handler, a reactivation rollback, shutdown_resources()'s
-    // invalid-context path, or this function's own per-cache probe below from
-    // an earlier call whose census then refused -- on which caches can still
-    // be live and their shutdown_resources() abandons rather than releases, so
-    // there is nothing this pass could reclaim safely either. When the flag is
-    // true and caches are still live, the pool keeps its parked EXTERNAL_EXACT
-    // controls, so the pre-teardown census just below can refuse shutdown
-    // where this pass would previously have cleared them; that refusal is
-    // retryable-safe, and preferable to draining an already-invalid context.
+    // llama.cpp-5ot1: skip this whole pass once SYCL is already shutting down
+    // -- shutdown_resources() abandons cleanup on that path anyway (its own
+    // g_sycl_shutting_down branch, reached later in this function's teardown
+    // loop), so there is nothing here left to reclaim. This whole-pass skip
+    // has no validity probe of its own -- it relies solely on the flag
+    // already being true; the per-cache get_context() probe llama.cpp-3lgu
+    // (F2) added inside the loop below covers a context torn down while the
+    // flag is still false (see its own comment there). A true flag on entry
+    // means an earlier writer already committed to abandonment: either the
+    // previously completed shutdown_unified_cache() (which cleared
+    // g_device_caches before storing the flag, so this loop would be empty),
+    // or one of the other writers -- the atexit handler, a reactivation
+    // rollback, shutdown_resources()'s invalid-context path, or this
+    // function's own per-cache probe below from an earlier call whose census
+    // then refused -- on which caches can still be live and their
+    // shutdown_resources() abandons rather than releases, so there is nothing
+    // this pass could reclaim safely either. When the flag is true and caches
+    // are still live, the pool keeps its parked EXTERNAL_EXACT controls, so
+    // the pre-teardown census just below can refuse shutdown where this pass
+    // would previously have cleared them; that refusal is retryable-safe, and
+    // preferable to draining an already-invalid context.
     if (!ggml_sycl_is_shutting_down()) {
         for (auto & item : caches) {
             if (!item.second) {
@@ -19045,8 +19044,8 @@ bool shutdown_unified_cache() {
                 // its drain and reclaim, so the pre-teardown census can
                 // refuse exactly as described for a true flag on entry; that
                 // refusal is retryable-safe, and every cache's
-                // shutdown_resources() then takes its abandon branch, not
-                // only this one's.
+                // shutdown_resources() takes its abandon branch whenever it
+                // next runs, not only this one's.
                 g_sycl_shutting_down.store(true, std::memory_order_release);
                 continue;
             }
