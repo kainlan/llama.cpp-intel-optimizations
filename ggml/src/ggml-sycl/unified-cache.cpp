@@ -18955,10 +18955,12 @@ bool shutdown_unified_cache() {
     // worker) -- just run once per cache, ahead of the census, through the
     // already-public onednn_graph_scratch_reclaim_pool() wrapper (the same
     // entry point ggml_backend_sycl_set_runtime_context() already uses in
-    // production) -- but without shutdown_resources()'s own two
-    // shutdown-order guards (the g_sycl_shutting_down early return and the
-    // queue-context validity probe); see the ggml_sycl_is_shutting_down()
-    // skip below for how this pass covers that same case instead.
+    // production) -- but without shutdown_resources()'s own top-level
+    // g_sycl_shutting_down early return; see the ggml_sycl_is_shutting_down()
+    // skip below for how this pass covers that case instead, and each
+    // cache's own get_context() probe inside the loop below (llama.cpp-3lgu
+    // F2) for how this pass covers shutdown_resources()'s other guard, its
+    // queue-context validity probe, per cache rather than once on entry.
     //
     // Runs for every live cache (subject only to the shutting-down skip
     // below), even for a cache whose OWN shutdown_resources() will drain
@@ -18987,20 +18989,52 @@ bool shutdown_unified_cache() {
     //
     // llama.cpp-5ot1: skip this whole pass once SYCL is already shutting
     // down -- shutdown_resources() abandons cleanup on that path anyway
-    // (its own g_sycl_shutting_down branch below), so there is nothing
-    // here left to reclaim, and this pass has no validity probe of its own
-    // to protect a drain/reclaim call against an already-torn-down
-    // context. A true flag on entry means an earlier writer already
-    // committed to abandonment: either the previously completed
+    // (its own g_sycl_shutting_down branch, reached later in this
+    // function's teardown loop), so there is nothing here left to
+    // reclaim. This whole-pass skip has no validity probe of its own -- it
+    // relies solely on the flag already being true -- but llama.cpp-3lgu
+    // (F2) added a per-cache get_context() probe inside the loop below, so
+    // a context torn down while the flag is still false is now caught per
+    // cache instead of reaching drain_all_queues_noexcept() or the pool
+    // reclaim unguarded. A true flag on entry means an earlier writer
+    // already committed to abandonment: either the previously completed
     // shutdown_unified_cache() (which cleared g_device_caches before
     // storing the flag, so this loop would be empty), or one of the other
     // writers -- the atexit handler, a reactivation rollback, or
     // shutdown_resources()'s invalid-context path -- on which caches can
     // still be live and their shutdown_resources() abandons rather than
-    // releases, so there is nothing this pass could reclaim safely either.
+    // releases, so there is nothing this pass could reclaim safely
+    // either. When the flag is true and caches are still live, the pool
+    // keeps its parked EXTERNAL_EXACT controls, so the pre-teardown census
+    // just below can refuse shutdown where this pass would previously have
+    // cleared them; that refusal is retryable-safe, and preferable to
+    // draining an already-invalid context.
     if (!ggml_sycl_is_shutting_down()) {
         for (auto & item : caches) {
             if (!item.second) {
+                continue;
+            }
+            // llama.cpp-3lgu (F2): before this probe, this pass had no
+            // per-cache validity check of its own -- unlike
+            // shutdown_resources() further down, which checks
+            // g_sycl_shutting_down on entry AND probes its own queue's
+            // context validity before touching anything. A context
+            // torn down while the flag is still false must not reach
+            // drain_all_queues_noexcept() (which swallows the throw) or the
+            // reclaim call below it, whose mem_handle releases would then
+            // attempt a real free against an already-invalid context.
+            // Mirror shutdown_resources()'s probe (~4557) per cache: a live
+            // queue can still answer get_context(); one that cannot is
+            // signalling SYCL is already gone for this cache.
+            try {
+                (void) item.second->get_queue().get_context();
+            } catch (...) {
+                // Set the flag exactly as shutdown_resources() does on its
+                // own equivalent probe, so this cache's own
+                // shutdown_resources() call -- later in this function's
+                // teardown loop -- takes its abandon branch instead of
+                // touching invalid queue/context state.
+                g_sycl_shutting_down.store(true, std::memory_order_release);
                 continue;
             }
             // Result discarded deliberately: a drain failure here is not
