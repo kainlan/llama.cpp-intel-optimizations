@@ -602,8 +602,8 @@ ticket reproduced on:
   parked DIRECT buffer keeps its own `EXTERNAL_EXACT` allocation control alive
   until reclaimed, and that census refuses shutdown while any such control
   survives, so this pass runs ahead of it rather than relying on
-  `shutdown_resources()`'s own, later reclaim.
-  The runtime-context-update site reaches it through the
+  `shutdown_resources()`'s own, later reclaim. The runtime-context-update site
+  reaches it through the
   free-function wrapper `unified_cache_reclaim_onednn_graph_scratch_pool()`;
   the context-reclaim and pre-census sites call the
   `onednn_graph_scratch_reclaim_pool()` member directly. Without the

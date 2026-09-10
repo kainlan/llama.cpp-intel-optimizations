@@ -18996,19 +18996,19 @@ bool shutdown_unified_cache() {
     // (F2) added a per-cache get_context() probe inside the loop below, so
     // a context torn down while the flag is still false is now caught per
     // cache instead of reaching drain_all_queues_noexcept() or the pool
-    // reclaim unguarded. A true flag on entry means an earlier writer
-    // already committed to abandonment: either the previously completed
-    // shutdown_unified_cache() (which cleared g_device_caches before
-    // storing the flag, so this loop would be empty), or one of the other
-    // writers -- the atexit handler, a reactivation rollback, or
-    // shutdown_resources()'s invalid-context path -- on which caches can
-    // still be live and their shutdown_resources() abandons rather than
-    // releases, so there is nothing this pass could reclaim safely
-    // either. When the flag is true and caches are still live, the pool
-    // keeps its parked EXTERNAL_EXACT controls, so the pre-teardown census
-    // just below can refuse shutdown where this pass would previously have
-    // cleared them; that refusal is retryable-safe, and preferable to
-    // draining an already-invalid context.
+    // reclaim unguarded. A true flag on entry means an earlier writer already
+    // committed to abandonment: either the previously completed
+    // shutdown_unified_cache() (which cleared g_device_caches before storing
+    // the flag, so this loop would be empty), or one of the other writers --
+    // the atexit handler, a reactivation rollback, shutdown_resources()'s
+    // invalid-context path, or this function's own per-cache probe below from
+    // an earlier call whose census then refused -- on which caches can still
+    // be live and their shutdown_resources() abandons rather than releases, so
+    // there is nothing this pass could reclaim safely either. When the flag is
+    // true and caches are still live, the pool keeps its parked EXTERNAL_EXACT
+    // controls, so the pre-teardown census just below can refuse shutdown
+    // where this pass would previously have cleared them; that refusal is
+    // retryable-safe, and preferable to draining an already-invalid context.
     if (!ggml_sycl_is_shutting_down()) {
         for (auto & item : caches) {
             if (!item.second) {
@@ -19016,9 +19016,10 @@ bool shutdown_unified_cache() {
             }
             // llama.cpp-3lgu (F2): before this probe, this pass had no
             // per-cache validity check of its own -- unlike
-            // shutdown_resources() further down, which checks
-            // g_sycl_shutting_down on entry AND probes its own queue's
-            // context validity before touching anything. A context
+            // shutdown_resources() (called from this function's teardown loop
+            // below, defined at ~4429), which checks g_sycl_shutting_down on
+            // entry AND probes its own queue's context validity before
+            // touching anything. A context
             // torn down while the flag is still false must not reach
             // drain_all_queues_noexcept() (which swallows the throw) or the
             // reclaim call below it, whose mem_handle releases would then
@@ -19033,7 +19034,14 @@ bool shutdown_unified_cache() {
                 // own equivalent probe, so this cache's own
                 // shutdown_resources() call -- later in this function's
                 // teardown loop -- takes its abandon branch instead of
-                // touching invalid queue/context state.
+                // touching invalid queue/context state. The flag is
+                // process-global: every cache after this one in the loop is
+                // still probed and, if valid, drained and reclaimed, but its
+                // pooled mem_handle releases now abandon rather than free, so
+                // the pre-teardown census below can refuse exactly as
+                // described for a true flag on entry; that refusal is
+                // retryable-safe, and every cache's shutdown_resources() then
+                // takes its abandon branch, not only this one's.
                 g_sycl_shutting_down.store(true, std::memory_order_release);
                 continue;
             }

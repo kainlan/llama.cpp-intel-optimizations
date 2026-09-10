@@ -143,15 +143,16 @@
 // no abort hook to suppress -- the pre-fix function simply returned nullptr
 // with `req.suppress_failure_log = true`, so the log capture in this test
 // would find nothing and the "abort triggered" latch would not exist. (d),
-// (e), (f), and (g) above were added by later tickets (llama.cpp-0oxf's own
-// reclaim-safety finding, llama.cpp-pqgl's review, and llama.cpp-c6ah's
-// blocking-query and flag-slot-retirement findings, respectively) and are not
-// part of this original RED-FIRST set -- (f) and (g) are both RED against the
-// pre-c6ah code specifically ((f)'s own force_blocking_pool_check hook
-// reproduces that RED behaviour on demand within this GREEN binary, and (g) is
-// RED because the pre-fix onednn_graph_scratch_clear_pool_locked() returned
-// every entry's slot unconditionally), since the pre-fix source is no longer
-// buildable standalone once this fix has landed).
+// (e), (f), and (g) above were added by later tickets: (d) by llama.cpp-0oxf's
+// own reclaim-safety finding, (e) by llama.cpp-pqgl's review, and (f) and (g)
+// by llama.cpp-c6ah's blocking-query and flag-slot-retirement findings. None
+// of them is part of this original RED-FIRST set. (f) and (g) are both RED
+// against the pre-c6ah code specifically: (f)'s own force_blocking_pool_check
+// hook reproduces that RED behaviour on demand within this GREEN binary, since
+// the pre-fix source is no longer buildable standalone once this fix has
+// landed, and (g) is RED because the pre-fix
+// onednn_graph_scratch_clear_pool_locked() returned every entry's slot
+// unconditionally.
 //
 // SKIPS (77, ctest SKIP_RETURN_CODE): no SYCL device, or GGML_SYCL_DNNL not
 // compiled in (the whole onednn_graph_scratch_* subsystem is `#if
