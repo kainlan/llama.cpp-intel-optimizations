@@ -1374,10 +1374,11 @@ def test_preteardown_pool_loop_shutdown_guard_check_has_a_mutation_witness() -> 
     # braces. This is the property the deletion mutant below cannot prove --
     # that check alone only shows the guard text must be PRESENT somewhere,
     # not that the loop must be NESTED inside it.
-    denested = shutdown_unified_cache_body_code.replace(
+    normalized_body = normalize_ws(shutdown_unified_cache_body_code)
+    denested = normalized_body.replace(
         PRETEARDOWN_SHUTTING_DOWN_GUARD + " {", PRETEARDOWN_SHUTTING_DOWN_GUARD + " { }", 1
     )
-    assert denested != shutdown_unified_cache_body_code
+    assert denested != normalized_body
     assert CACHES_LOOP_STMT in denested, "sanity: this mutant must leave the loop text in place"
     assert not _preteardown_pool_loop_skipped_once_shutting_down(denested), (
         "mutation witness is broken: closing the guard block early, leaving the loop outside it, was not detected"
