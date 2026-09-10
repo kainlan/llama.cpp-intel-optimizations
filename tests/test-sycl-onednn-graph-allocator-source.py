@@ -1446,7 +1446,8 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     without the catch body's own continue, the probe would still record the
     flag but the invalid cache would then fall through to
     drain_all_queues_noexcept() and the reclaim call instead of being
-    skipped, which is exactly what the flag store exists to prevent.
+    skipped, which is exactly what the continue exists to prevent -- the
+    store alone protects only the caches probed after this one.
 
     A fourth mutant proves the continue anchor is scoped to the catch's own
     braces, not merely positional between the store and the drain call: it
@@ -1487,7 +1488,6 @@ def test_preteardown_loop_queue_probe_check_has_a_mutation_witness() -> None:
     mutated_after_store = after_store_text.replace(CATCH_CONTINUE_STMT, "", 1)
     assert mutated_after_store != after_store_text
     mutated_continue = shutdown_unified_cache_body_code[:store_idx_raw] + mutated_after_store
-    assert mutated_continue != shutdown_unified_cache_body_code
     assert QUEUE_CONTEXT_PROBE_CALL in mutated_continue, "sanity: this mutant must leave get_context() untouched"
     assert store_stmt in mutated_continue, "sanity: this mutant must leave the store statement untouched"
     assert DRAIN_CALL in mutated_continue, "sanity: this mutant must leave the drain call untouched"
