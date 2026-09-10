@@ -1710,22 +1710,21 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
 // --- (g) reclaim while in flight retires the slot, not the entry it
 //         later hands out (llama.cpp-c6ah) -----------------------------------
 //
-// llama.cpp-c6ah: a pool entry whose marker kernel is still in flight when
-// the pool is reclaimed must have its flag_slot RETIRED (never returned to
-// the free list), not handed to a later entry. Before this was fixed,
+// A pool entry whose marker kernel is still in flight when the pool is
+// reclaimed must have its flag_slot RETIRED (never returned to the free list),
+// not handed to a later entry. Before this was fixed,
 // onednn_graph_scratch_clear_pool_locked() returned every entry's slot
 // unconditionally, including one whose marker was still pending; since the
 // watch queue is out-of-order, that stale marker could fire AFTER a new
-// occupant's own marker already wrote its generation, overwriting the
-// slot back to the OLD generation and permanently flipping an
-// already-complete entry back to "not complete" -- its bytes then never
-// reclaimed, cap waits on every future request of that size running to
-// their 5 s timeout. This test parks an entry with a slow release,
-// reclaims the pool while it is still in flight (exactly the hazard),
-// parks a fresh same-size entry, confirms the fresh entry becomes complete
-// at its OWN kernel's end, and then -- after finally letting the old,
-// now-retired kernel finish too -- confirms the fresh entry's completion
-// is unaffected by that stale write.
+// occupant's own marker already wrote its generation, overwriting the slot
+// back to the OLD generation and permanently flipping an already-complete
+// entry back to "not complete" -- its bytes then never reclaimed, cap waits on
+// every future request of that size running to their 5 s timeout. This test
+// parks an entry with a slow release, reclaims the pool while it is still in
+// flight (exactly the hazard), parks a fresh same-size entry, confirms the
+// fresh entry becomes complete at its OWN kernel's end, and then -- after
+// finally letting the old, now-retired kernel finish too -- confirms the fresh
+// entry's completion is unaffected by that stale write.
 void test_reclaim_while_in_flight_retires_the_slot(unified_cache * cache, int device) {
     printf("Reclaim while in flight retires the slot, not the entry it later hands out:\n");
 
