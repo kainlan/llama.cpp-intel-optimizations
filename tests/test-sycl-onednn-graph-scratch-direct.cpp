@@ -1708,7 +1708,7 @@ void test_in_flight_entry_is_skipped_not_waited(unified_cache * cache, int devic
 }
 
 // --- (g) reclaim while in flight retires the slot, not the entry it
-//         later hands out (llama.cpp-c6ah)
+//         later hands out (llama.cpp-c6ah) -----------------------------------
 //
 // llama.cpp-c6ah: a pool entry whose marker kernel is still in flight when
 // the pool is reclaimed must have its flag_slot RETIRED (never returned to
