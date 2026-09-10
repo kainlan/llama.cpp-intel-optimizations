@@ -325,7 +325,7 @@ find_row() {
 }
 
 # parse_cell: extracts the numeric t/s value (first token, spread stripped)
-# from the row find_row returns for the `test` cell $2. Prints "" (not an
+# from the row find_row returns for the `test`-cell value $2. Prints "" (not an
 # error) when the row or its value is missing or not a plain decimal -- the
 # caller decides what that means.
 parse_cell() {
