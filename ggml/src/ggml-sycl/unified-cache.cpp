@@ -18989,13 +18989,14 @@ bool shutdown_unified_cache() {
     // (its own g_sycl_shutting_down branch below), so there is nothing
     // here left to reclaim, and this pass has no validity probe of its own
     // to protect a drain/reclaim call against an already-torn-down
-    // context. A true flag on entry comes from one of three writers: the
-    // previously completed shutdown_unified_cache() (which cleared
-    // g_device_caches before storing the flag, so this loop would be
-    // empty), the atexit handler, or a reactivation rollback; on the
-    // last two, caches can still be live, and their shutdown_resources()
-    // abandons rather than releases on this path, so there is nothing
-    // this pass could reclaim safely either.
+    // context. A true flag on entry means an earlier writer already
+    // committed to abandonment: either the previously completed
+    // shutdown_unified_cache() (which cleared g_device_caches before
+    // storing the flag, so this loop would be empty), or one of the other
+    // writers -- the atexit handler, a reactivation rollback, or
+    // shutdown_resources()'s invalid-context path -- on which caches can
+    // still be live and their shutdown_resources() abandons rather than
+    // releases, so there is nothing this pass could reclaim safely either.
     if (!ggml_sycl_is_shutting_down()) {
         for (auto & item : caches) {
             if (!item.second) {
