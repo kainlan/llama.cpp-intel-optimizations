@@ -16969,9 +16969,10 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 //
 // ATOMICITY ACROSS THE WHOLE TRANSACTION: a successful re-plan here can
 // still be undone by a LATER failure in the same transaction (publication-ID
-// exhaustion, MMID workspace materialization) -- see the two call sites in
-// ggml_backend_sycl_set_runtime_context() that re-invoke this function with
-// the pre-transaction n_ubatch to roll the ring back symmetrically.
+// exhaustion, MMID workspace materialization, or a lost CAS against a
+// concurrent transaction) -- see the three call sites in
+// ggml_sycl_run_runtime_context_transaction() that re-invoke this function
+// with the pre-transaction n_ubatch to roll the ring back symmetrically.
 //
 // THE RING MUST NEVER SPILL PAST THE RUNTIME ZONE (llama.cpp-ibj0 spec
 // round 5 F13): a merge-gate B50 GPT-OSS sweep found that a ring too big
@@ -17449,10 +17450,11 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
     // transaction that re-plans KV and the non-FA attention scratch above,
     // or the first prefill refuses the under-sized ring and llama_decode
     // returns -3 with nothing printed at default verbosity. Recorded BEFORE
-    // the re-plan so the two later failure paths below (publication-ID
-    // exhaustion, MMID materialization) can roll the ring back to what it
-    // was if THEY abort the transaction after the ring has already changed
-    // (spec round 1 F8 -- an atomicity gap the pre-round-1 code left open).
+    // the re-plan so the three later failure paths below (publication-ID
+    // exhaustion, MMID materialization, and a lost CAS against a concurrent
+    // transaction) can roll the ring back to what it was if THEY abort the
+    // transaction after the ring has already changed (spec round 1 F8 -- an
+    // atomicity gap the pre-round-1 code left open).
     // llama.cpp-tsfl: also read/used by the probe_mode branch immediately
     // below to roll ITS OWN ring re-plan back before returning.
     const uint32_t pre_replan_pp_moe_ring_n_ubatch =
