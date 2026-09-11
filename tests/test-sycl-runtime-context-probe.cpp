@@ -53,8 +53,35 @@ void log_everything(enum ggml_log_level level, const char * text, void * /*user_
     // ggml_log_callback directly (llama_log_set -> ggml_log_set) -- nothing
     // in this program goes through common/log.cpp's separate verbosity
     // threshold, which only gates common_log_add()/LOG_INF()-style callers.
-    (void) level;
-    fputs(text, stderr);
+    //
+    // llama.cpp-tsfl round 2 F-lead-2: prefix every line with a level
+    // letter so the lead's acceptance script can grep `^E ` between
+    // PROBE_BEGIN/PROBE_END and score "prints no ERROR" -- without this an
+    // ERROR line was indistinguishable from an INFO one in the log. ggml
+    // log text already carries its own trailing newline, so the prefix is
+    // prepended, not appended.
+    char letter = '?';
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR:
+            letter = 'E';
+            break;
+        case GGML_LOG_LEVEL_WARN:
+            letter = 'W';
+            break;
+        case GGML_LOG_LEVEL_INFO:
+            letter = 'I';
+            break;
+        case GGML_LOG_LEVEL_DEBUG:
+            letter = 'D';
+            break;
+        case GGML_LOG_LEVEL_CONT:
+            letter = 'C';
+            break;
+        default:
+            letter = '?';
+            break;
+    }
+    fprintf(stderr, "%c %s", letter, text);
 }
 
 }  // namespace
@@ -65,11 +92,17 @@ int main(int argc, char ** argv) {
         model_path = std::getenv("LLAMACPP_TEST_MODELFILE");
     }
     if (!model_path || !model_path[0]) {
+        // llama.cpp-tsfl round 2 G6: print SKIP: first -- test_skip_no_model()
+        // (test-skip.h) prints its own "WARNING: No model file provided..."
+        // and exits 77 itself, but does not spell the literal "SKIP: " the
+        // spec requires callers be able to grep for.
+        fprintf(stderr, "SKIP: no model file provided\n");
         test_skip_no_model();
     }
     {
         FILE * f = std::fopen(model_path, "rb");
         if (!f) {
+            fprintf(stderr, "SKIP: model file not readable: %s\n", model_path);
             fprintf(stderr, "[PROBE-HARNESS] model file not readable: %s\n", model_path);
             test_skip_no_model();
         }
@@ -81,6 +114,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     if (!llama_supports_gpu_offload()) {
+        fprintf(stderr, "SKIP: no GPU backend registered\n");
         fprintf(stderr, "[PROBE-HARNESS] no GPU backend registered; this test proves nothing on CPU\n");
         llama_backend_free();
         return LLAMA_TEST_EXIT_SKIP;
@@ -149,9 +183,12 @@ int main(int argc, char ** argv) {
     const auto & owner = model->get_sycl_model_token();
     if (owner.model_id == 0 || owner.load_txn_id == 0) {
         fprintf(stderr, "[PROBE-HARNESS] FAIL: no sycl model token\n");
-        ggml_backend_free(backend);
+        // llama.cpp-tsfl round 2 G4: llama_free(ctx)/llama_model_free(model)
+        // BEFORE ggml_backend_free(backend) -- see the final cleanup's own
+        // comment for why the order matters.
         llama_free(ctx);
         llama_model_free(model);
+        ggml_backend_free(backend);
         llama_backend_free();
         return 1;
     }
@@ -166,10 +203,14 @@ int main(int argc, char ** argv) {
 
     // No public accessor exposes llama_context's RESOLVED flash-attention
     // state (llama_flash_attn_type only names the requested policy, e.g.
-    // AUTO, not what it resolved to) -- pass true, matching this shared
-    // body's own AUTO-context comment (ggml-sycl.cpp: "an AUTO
-    // llama_flash_attn_type has not been resolved yet ... reads an
-    // optimistic `true`").
+    // AUTO, not what it resolved to) -- pass true. Cite corrected round 2
+    // G5: cparams.flash_attn = params.flash_attn_type !=
+    // LLAMA_FLASH_ATTN_TYPE_DISABLED (src/llama-context.cpp:542) is the
+    // resolution this would ideally read; llama_context's own
+    // sycl_resync_runtime_context_flash_attn()/narrow-recheck comment
+    // (src/llama-context.h:279-284) is where the "constructor's own call
+    // ... sees an optimistic `true`" reasoning this line paraphrases
+    // actually lives, not ggml-sycl.cpp.
     const bool flash_attn_enabled = true;
 
     ggml_sycl_runtime_context_probe  out512{};
@@ -193,20 +234,28 @@ int main(int argc, char ** argv) {
     fflush(stdout);
     fflush(stderr);
 
-    // Step 10. Device index 0: with the registration's single-GPU selector
-    // pin, at most one SYCL device is enumerated in-process (see the
-    // sycl_dev search above), and ggml_backend_sycl_compute_buffer_host_
-    // fallbacks() indexes SYCL's own in-process device numbering, not the
-    // ggml backend-device registry index used above.
+    // Step 10. Device index 0 here is SYCL's OWN in-process device index
+    // after ONEAPI_DEVICE_SELECTOR filtering -- not the ggml backend-device
+    // registry index used by the sycl_dev search above, a different
+    // numbering entirely. This registration pins ONEAPI_DEVICE_SELECTOR=
+    // level_zero:1, so exactly one GPU is enumerated in-process and it is
+    // unambiguously index 0. Running this binary UNPINNED (directly, not
+    // via ctest) makes 0 whichever GPU the driver enumerates first (the
+    // B70, per CLAUDE.md's device-topology table) while the context may
+    // have been placed on a different device entirely -- reviewer's ruling,
+    // round 2: do not read this figure from a direct/unpinned invocation.
     printf("HOST_FALLBACKS_AFTER=%llu\n", (unsigned long long) ggml_backend_sycl_compute_buffer_host_fallbacks(0));
     fflush(stdout);
 
     // Step 11: prove the published state (at n_ctx=4096, n_ubatch=512 --
     // its ORIGINAL size, unaffected by either probe above) is still usable.
-    const llama_vocab * vocab   = llama_model_get_vocab(model);
-    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+    // llama.cpp-tsfl round 2 G3: 60 repetitions (was 40, ~400-450 tokens --
+    // too few to ever cross the n_ubatch=512 boundary, so the two-ubatch
+    // split this step exists to exercise was never actually reached). 60
+    // reps measures ~600-660 tokens on this sentence, comfortably over 512.
+    const llama_vocab * vocab = llama_model_get_vocab(model);
     std::string         sentence;
-    for (int i = 0; i < 40; ++i) {
+    for (int i = 0; i < 60; ++i) {
         sentence += "The quick brown fox jumps over the lazy dog. ";
     }
     std::vector<llama_token> tokens(sentence.size() + 32);
@@ -215,6 +264,17 @@ int main(int argc, char ** argv) {
                        /*add_special=*/true, /*parse_special=*/false);
     if (n_tok <= 0) {
         fprintf(stderr, "[PROBE-HARNESS] FAIL: tokenize returned %d\n", n_tok);
+        ok = false;
+    }
+    // llama.cpp-tsfl round 2 G3: harness-side assertion that the prompt
+    // actually crosses n_ubatch=512 -- a silent drop back to a single-
+    // ubatch prompt (e.g. a future edit that shortens the repeated
+    // sentence) would otherwise pass this step vacuously again.
+    if (ok && n_tok <= 512) {
+        fprintf(stderr,
+                "[PROBE-HARNESS] FAIL: prompt is only %d tokens, must exceed 512 (n_ubatch) to actually "
+                "exercise the two-ubatch split\n",
+                n_tok);
         ok = false;
     }
     int decode_rc = -1;
@@ -241,9 +301,18 @@ int main(int argc, char ** argv) {
         ok = false;
     }
 
-    ggml_backend_free(backend);
+    // llama.cpp-tsfl round 2 G4: llama_free(ctx) and llama_model_free(model)
+    // -- which tear down the CONTEXT's own SYCL backend -- must run BEFORE
+    // ggml_backend_free(backend) frees this harness's auxiliary one.
+    // ggml_backend_sycl_free() (ggml-sycl.cpp:82018-82198) tears down
+    // PROCESS-GLOBAL state (the prestage thread, pipeline copy queues,
+    // tp_free, the pinned-owner shutdown GGML_ASSERT, the FP16 cache, split
+    // rings) regardless of which ggml_backend_t instance triggers it, so
+    // freeing the auxiliary backend FIRST would tear that global state down
+    // while the context's own SYCL backend is still live.
     llama_free(ctx);
     llama_model_free(model);
+    ggml_backend_free(backend);
     llama_backend_free();
 
     return ok ? 0 : 1;

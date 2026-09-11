@@ -244,8 +244,71 @@ def test_both_fallback_sites_increment_the_counter():
     assert any(idx < warn1_idx for idx in increments), (
         "the oversize-request fallback must increment the counter at or before its own WARN log"
     )
-    assert any(idx < warn2_idx for idx in increments), (
-        "the failed-alloc-retry fallback must increment the counter at or before its own WARN log"
+
+    # llama.cpp-tsfl round 2 G1: the retry-path increment sits AFTER its own
+    # WARN (which only announces the retry attempt, before the outcome is
+    # known), inside the unified_alloc() success branch, immediately before
+    # `goto alloc_succeeded` -- round 1 F10 moved it there deliberately so
+    # only a retry that actually succeeds is counted, not merely attempted.
+    # The PREVIOUS version of this check asserted the opposite (`idx <
+    # warn2_idx`) and passed anyway, vacuously, on the OTHER increment (the
+    # oversize-request one, which legitimately precedes warn1_idx and thus
+    # also precedes warn2_idx).
+    goto_idx = body_norm.find("goto alloc_succeeded", warn2_idx)
+    assert goto_idx != -1, "could not find the `goto alloc_succeeded` that follows the retry WARN"
+    assert any(warn2_idx < idx < goto_idx for idx in increments), (
+        "the failed-alloc-retry fallback must increment the counter AFTER its own WARN log and BEFORE "
+        "`goto alloc_succeeded` -- counted only once the retry itself succeeds, not merely attempted"
+    )
+
+
+def test_retry_increment_after_warn_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-tsfl round 2 G1: proves the fixed
+    ordering check above (increment AFTER its own WARN, inside the retry's
+    success branch, BEFORE `goto alloc_succeeded`) would actually catch the
+    increment moving back to BEFORE the WARN -- exactly the shape round 1
+    F10 fixed, and exactly what the PREVIOUS (round 1) version of this file's
+    check required (`idx < warn2_idx`) rather than forbade, passing only
+    because it was satisfied by the OTHER (oversize-request) increment."""
+    raw = GGML_SYCL_CPP
+    original_block = (
+        '            GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\\n", '
+        "size / (1024 * 1024));\n"
+        "            req.intent.constraints.must_device      = false;\n"
+        "            req.intent.constraints.must_host_pinned = true;\n"
+        "            if (ggml_sycl::unified_alloc(req, &main_alloc) && main_alloc.ptr != nullptr) {\n"
+        "                g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+        "                goto alloc_succeeded;\n"
+        "            }\n"
+    )
+    assert original_block in raw, "mutation target block not found -- update this witness to match the real source"
+    mutated_block = (
+        "            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+        '            GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\\n", '
+        "size / (1024 * 1024));\n"
+        "            req.intent.constraints.must_device      = false;\n"
+        "            req.intent.constraints.must_host_pinned = true;\n"
+        "            if (ggml_sycl::unified_alloc(req, &main_alloc) && main_alloc.ptr != nullptr) {\n"
+        "                goto alloc_succeeded;\n"
+        "            }\n"
+    )
+    mutated_raw = raw.replace(original_block, mutated_block, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _ALLOC_BUFFER_START, _ALLOC_BUFFER_END)
+    mutated_increments = [
+        m.start()
+        for m in re.finditer(
+            r"g_compute_buffer_host_fallbacks\[buft_ctx->device\]\.fetch_add\(\s*1", mutated_body_norm
+        )
+    ]
+    mutated_warn2_idx = mutated_body_norm.find('"SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback')
+    mutated_goto_idx = mutated_body_norm.find("goto alloc_succeeded", mutated_warn2_idx)
+    assert mutated_warn2_idx != -1 and mutated_goto_idx != -1
+
+    assert not any(mutated_warn2_idx < idx < mutated_goto_idx for idx in mutated_increments), (
+        "mutation witness is broken: the mutated (pre-F10-shape, increment-before-WARN) source should FAIL "
+        "the 'increment after WARN, before goto' check, but it did not"
     )
 
 
@@ -253,10 +316,20 @@ def test_increment_sites_have_a_mutation_witness():
     """Mutation witness for the increment-count check above: proves it would
     actually catch one of the two increments being deleted."""
     raw = GGML_SYCL_CPP
-    increment_line = "            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+    # llama.cpp-tsfl round 2 (companion to G1, same root cause, not itself
+    # named in the finding): the two increment lines have DIFFERENT
+    # indentation after round 1 F10 (12 spaces for the oversize site, 16 for
+    # the retry site, now nested one level deeper inside the retry's own
+    # success branch) -- an unanchored 12-space literal also matches as a
+    # trailing substring of the 16-space line (its last 12 spaces + the rest
+    # coincide), so `raw.count()` reported 2 for the wrong reason (one true
+    # match plus one substring-of-a-different-line match). Anchoring with a
+    # leading "\n" restricts the match to a line that starts with EXACTLY
+    # this indentation.
+    increment_line = "\n            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
     count = raw.count(increment_line)
-    assert count == 2, f"expected exactly two identical increment lines -- found {count}"
-    mutated_raw = raw.replace(increment_line, "", 1)
+    assert count == 1, f"expected exactly one line at this exact indentation (the oversize site) -- found {count}"
+    mutated_raw = raw.replace(increment_line, "\n", 1)
     assert mutated_raw != raw
 
     def _increment_count(raw_source: str) -> int:
