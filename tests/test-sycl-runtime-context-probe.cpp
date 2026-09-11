@@ -256,7 +256,11 @@ int main(int argc, char ** argv) {
     // merely printed and ignored. An unpinned direct invocation cannot
     // attribute index 0 to any particular device (see the reviewer's ruling
     // above), so it prints the value only, unscored.
-    const bool     selector_pinned      = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
+    // llama.cpp-tsfl round 6 S2: "pinned" means ONE device -- a multi-device
+    // selector (level_zero:0,1) sets the variable but leaves index 0 just as
+    // unattributable, so only a comma-free value scores the figure.
+    const char *   selector             = std::getenv("ONEAPI_DEVICE_SELECTOR");
+    const bool     selector_pinned      = selector != nullptr && std::strchr(selector, ',') == nullptr;
     const uint64_t host_fallbacks_after = ggml_backend_sycl_compute_buffer_host_fallbacks(0);
     printf("HOST_FALLBACKS_AFTER=%llu\n", (unsigned long long) host_fallbacks_after);
     if (selector_pinned && host_fallbacks_after != 0) {

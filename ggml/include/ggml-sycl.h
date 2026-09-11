@@ -389,8 +389,9 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 
 // llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
 // SUCCESSFUL host-pinned fallbacks for any of the buffer types whose
-// alloc_buffer is ggml_backend_sycl_buffer_type_alloc_buffer()
-// (ggml-sycl.cpp) -- the name is kept from the plan's own Task 4b read,
+// alloc_buffer is, or delegates to,
+// ggml_backend_sycl_buffer_type_alloc_buffer() (ggml-sycl.cpp) -- the name
+// is kept from the plan's own Task 4b read,
 // which cares specifically about compute buffers, but is not limited to
 // them. Exactly two sites increment it, both only once a
 // SUCCESSFUL host-pinned landing is confirmed, never merely attempted: (1)
