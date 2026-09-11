@@ -259,21 +259,27 @@ def test_guard_consults_the_headroom_predicate():
 
 
 def test_both_callers_wire_into_the_shared_guard():
-    """Both ggml_backend_sycl_set_runtime_context() (the full transaction)
-    and ggml_backend_sycl_recheck_runtime_context_flash_attn() (the narrow
-    re-check) must actually call the shared ggml_sycl_check_nonfa_attn_scratch()
-    helper -- a helper that exists and is correct but is never called by one
-    of its two intended entry points would leave that path's contexts
-    unguarded."""
-    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
-    assert full_start != -1, "ggml_backend_sycl_set_runtime_context() definition not found"
-    full_next = GGML_SYCL_CPP_CODE.find(
-        "ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1
+    """Both ggml_sycl_run_runtime_context_transaction() (the shared body
+    behind the full transaction -- llama.cpp-tsfl split
+    ggml_backend_sycl_set_runtime_context() into a thin wrapper that
+    forwards into this shared body, which the new probe entry point also
+    calls) and ggml_backend_sycl_recheck_runtime_context_flash_attn() (the
+    narrow re-check) must actually call the shared
+    ggml_sycl_check_nonfa_attn_scratch() helper -- a helper that exists and
+    is correct but is never called by one of its two intended entry points
+    would leave that path's contexts unguarded."""
+    full_start = GGML_SYCL_CPP_CODE.find(
+        "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
     )
-    assert full_next != -1, "could not bound ggml_backend_sycl_set_runtime_context()'s body"
+    assert full_start != -1, "ggml_sycl_run_runtime_context_transaction() definition not found"
+    full_next = GGML_SYCL_CPP_CODE.find(
+        "void ggml_backend_sycl_set_runtime_context(", full_start + 1
+    )
+    assert full_next != -1, "could not bound ggml_sycl_run_runtime_context_transaction()'s body"
+    assert full_start < full_next, "ggml_sycl_run_runtime_context_transaction() must precede its wrapper"
     full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
     assert "ggml_sycl_check_nonfa_attn_scratch(" in full_body_norm, (
-        "ggml_backend_sycl_set_runtime_context() must call the shared guard helper"
+        "ggml_sycl_run_runtime_context_transaction() (the shared body) must call the shared guard helper"
     )
 
     recheck_start = GGML_SYCL_CPP_CODE.find(
@@ -300,9 +306,10 @@ def test_both_callers_wire_into_the_shared_guard():
 
 
 def test_callers_pass_the_all_layers_head_count():
-    """llama.cpp-rqak: both guard call sites -- the full transaction's
-    next_plan and the narrow re-check's current->plan -- must pass the
-    ALL-LAYERS head-count field into ggml_sycl_check_nonfa_attn_scratch().
+    """llama.cpp-rqak: both guard call sites -- the shared body's
+    (ggml_sycl_run_runtime_context_transaction(), behind the full
+    transaction) next_plan and the narrow re-check's current->plan -- must
+    pass the ALL-LAYERS head-count field into ggml_sycl_check_nonfa_attn_scratch().
     The non-FA attention path runs on EVERY attention layer, so its demand
     model (max(16 MiB, n_head x n_ubatch x n_ctx x 2 B x 3)) needs the
     maximum query-head count over all layers -- not llama.cpp-o3a0's
@@ -315,12 +322,15 @@ def test_callers_pass_the_all_layers_head_count():
     maxima) with llama.cpp-oyfl (this guard, developed against the
     pre-o3a0 single field) left the guard referencing a member that no
     longer exists."""
-    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    full_start = GGML_SYCL_CPP_CODE.find(
+        "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+    )
     assert full_start != -1
     full_next = GGML_SYCL_CPP_CODE.find(
-        "ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1
+        "void ggml_backend_sycl_set_runtime_context(", full_start + 1
     )
     assert full_next != -1
+    assert full_start < full_next
     full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
 
     recheck_start = GGML_SYCL_CPP_CODE.find(
@@ -332,7 +342,7 @@ def test_callers_pass_the_all_layers_head_count():
     recheck_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[recheck_start:recheck_next])
 
     for caller_name, body in (
-        ("the full transaction (ggml_backend_sycl_set_runtime_context)", full_body_norm),
+        ("the shared body (ggml_sycl_run_runtime_context_transaction)", full_body_norm),
         ("the narrow re-check (ggml_backend_sycl_recheck_runtime_context_flash_attn)", recheck_body_norm),
     ):
         assert "planner_n_head_all_max" in body, (
@@ -405,20 +415,59 @@ def test_narrow_recheck_forbids_replan_and_takes_the_lock():
     shape it does not own), and must take the same module-admission guard
     and tensor-inventory lock the full transaction serializes its own
     mutating work under, confirming under that lock that the plan snapshot
-    read before the lock is still the live one."""
-    full_start = GGML_SYCL_CPP_CODE.find("void ggml_backend_sycl_set_runtime_context(")
+    read before the lock is still the live one.
+
+    llama.cpp-tsfl: the publish path's allow_replan=true is no longer a
+    literal at the call site -- ggml_sycl_run_runtime_context_transaction()
+    (the shared body) now derives it from its own probe_mode parameter
+    (allow_replan=!probe_mode, so replanning is allowed on the publish path
+    and forbidden for a probe, matching the probe's own no-side-effects
+    contract) and its thin wrapper, ggml_backend_sycl_set_runtime_context(),
+    is what pins probe_mode=false for the publish path. Both halves are
+    checked, on their own separately-bounded bodies, so a mutation to
+    either the shared body's derivation or the wrapper's own argument is
+    caught."""
+    full_start = GGML_SYCL_CPP_CODE.find(
+        "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
+    )
     assert full_start != -1
-    full_next = GGML_SYCL_CPP_CODE.find("ggml_backend_sycl_set_runtime_context_for_model(", full_start + 1)
+    full_next = GGML_SYCL_CPP_CODE.find(
+        "void ggml_backend_sycl_set_runtime_context(", full_start + 1
+    )
     assert full_next != -1
+    assert full_start < full_next
     full_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[full_start:full_next])
-    # allow_replan is passed positionally as the call's 6th (final) argument
-    # -- matched by position, not by the inline `/*allow_replan=*/` comment
-    # naming it, because that comment is exactly the kind of text
-    # strip_comments() (deliberately) removes before this check ever sees
-    # the source.
-    assert re.search(r"ggml_sycl_check_nonfa_attn_scratch\([^()]*flash_attn_enabled,\s*true\)", full_body_norm), (
-        "the full transaction must call the shared guard with allow_replan=true (the final positional "
-        "argument, after flash_attn_enabled)"
+    # allow_replan is passed positionally as the call's 6th argument -- matched
+    # by position, not by the inline `/*allow_replan=*/` comment naming it,
+    # because that comment is exactly the kind of text strip_comments()
+    # (deliberately) removes before this check ever sees the source. The
+    # optional `/*allow_replan=*/` group tolerates a future caller of this
+    # helper reading from non-comment-stripped text; it never matches here.
+    # No trailing `)` anchor -- the shared body's call also passes the
+    # (7th, defaulted) probe_mode argument after allow_replan, unlike the
+    # narrow re-check's call below, which relies on that parameter's default.
+    assert re.search(
+        r"ggml_sycl_check_nonfa_attn_scratch\([^()]*flash_attn_enabled,\s*(/\*allow_replan=\*/\s*)?!probe_mode\b",
+        full_body_norm,
+    ), (
+        "the shared body must call the shared guard with allow_replan=!probe_mode (the 6th positional "
+        "argument, after flash_attn_enabled) -- true for the publish path (probe_mode=false), false for "
+        "a probe"
+    )
+
+    wrapper_start = full_next
+    wrapper_next = GGML_SYCL_CPP_CODE.find(
+        "ggml_backend_sycl_probe_runtime_context_for_model(", wrapper_start + 1
+    )
+    assert wrapper_next != -1, "could not bound ggml_backend_sycl_set_runtime_context()'s (wrapper) body"
+    assert wrapper_start < wrapper_next
+    wrapper_body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[wrapper_start:wrapper_next])
+    assert re.search(
+        r"ggml_sycl_run_runtime_context_transaction\([^()]*flash_attn_enabled,\s*(/\*probe_mode=\*/\s*)?false",
+        wrapper_body_norm,
+    ), (
+        "ggml_backend_sycl_set_runtime_context() (the wrapper) must pass probe_mode=false into the "
+        "shared body, so allow_replan=!probe_mode is still true on the publish path"
     )
 
     recheck_start = GGML_SYCL_CPP_CODE.find(

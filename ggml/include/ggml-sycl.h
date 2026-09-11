@@ -387,6 +387,31 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
                                                             uint32_t       n_seq_max,
                                                             bool           flash_attn_enabled);
 
+// llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
+// SUCCESSFUL host-pinned fallbacks for any of the buffer types whose
+// alloc_buffer is, or delegates to,
+// ggml_backend_sycl_buffer_type_alloc_buffer() (ggml-sycl.cpp) -- the name
+// is kept from the plan's own Task 4b read,
+// which cares specifically about compute buffers, but is not limited to
+// them. Exactly two sites increment it, both only once a
+// SUCCESSFUL host-pinned landing is confirmed, never merely attempted: (1)
+// a single allocation exceeding the safe device-alloc limit, forced
+// host-pinned and counted once that forced attempt lands; and (2) a device
+// allocation that failed and was RETRIED host-pinned, counted only once
+// that retry itself succeeds -- in both cases, an attempt that also fails
+// falls through to the allocation-failure ERROR and is not a "fallback".
+// NOT counted: the !vram_arena_enabled() < 512 MB headroom branch (dead in
+// this fork's default arena-on configuration), or the silent
+// must_device=false routing that lets the unified cache choose VRAM or
+// host-pinned on its own -- neither logs nor increments this counter, so a
+// zero reading does not prove every compute buffer actually stayed on the
+// device. This is a DELTA, not a lifetime total: the runtime-context
+// transaction resets it to 0 on its own successful completion (after the
+// plan has been published), so a caller reading it sees "fallbacks since
+// the last successful runtime-context transaction". Returns 0 for an
+// out-of-range device.
+GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device);
+
 // llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
 // (llama_context, Task 4b) is enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
 // Task 4a wires this query; llama_context does not call it until Task 4b.
@@ -1051,6 +1076,61 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max,
     bool                         flash_attn_enabled);
+
+// llama.cpp-tsfl (nphx comment c-wgxn): result of
+// ggml_backend_sycl_probe_runtime_context_for_model() below -- a
+// NON-PUBLISHING dry run of the same admission logic
+// ggml_backend_sycl_set_runtime_context_for_model() uses to decide whether a
+// candidate (n_ctx, n_ubatch, n_seq_max, flash_attn_enabled) fits, without
+// publishing a new plan or materializing MoE MMID workspaces. `reason` is
+// always a static string literal (a moe_mmid_runtime_reason name, or one of
+// the probe's own refusal tags) -- never owned by the caller, and never
+// NULL.
+//
+// llama.cpp-tsfl (round 1 F1): the "leaves no planned zone/ring changed"
+// guarantee holds whenever `accepted` is true, OR whenever `reason` names a
+// CANDIDATE refusal (the fit-or-not decision itself, unmet by this n_ctx/
+// n_ubatch) -- both cases roll their own transient PP MoE oneDNN scratch
+// ring re-plan back before returning. The one exception is
+// reason=="probe rollback failed: ring left at candidate size": that
+// rollback attempt itself failed, and the ring is left changed. That
+// outcome also logs an unconditional GGML_LOG_WARN naming both the
+// candidate and the pre-transaction n_ubatch it could not be restored to.
+struct ggml_sycl_runtime_context_probe {
+    bool         accepted;
+    bool         would_demote_kv;
+    size_t       host_kv_bytes;
+    const char * reason;
+};
+
+// See ggml_sycl_runtime_context_probe above. `out` must not be NULL; it is
+// zero-initialized on entry. Candidate refusals log at GGML_LOG_INFO, not
+// the publishing path's GGML_LOG_ERROR, because a probe exists to be tried
+// repeatedly and rejected quietly (Task 4b's ascending micro-batch trial).
+// Refuses with GGML_SYCL_LIFECYCLE_STALE_IDENTITY when `model` does not
+// identify the CURRENTLY PUBLISHED plan AT THIS FUNCTION'S OWN ENTRY CHECK
+// -- unlike ggml_backend_sycl_set_runtime_context_for_model(), this probe
+// does not itself select or publish a different model's plan; it only
+// evaluates candidates against whichever plan is already current. The SAME
+// condition, detected instead under the transaction's own lock (a race
+// between this entry check and that in-lock re-check), returns
+// GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
+// retry can resolve, unlike the entry check's own refusal.
+// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
+// retry: a live-update lease could not be acquired, the plan changed while
+// acquiring the transaction lock, the module mutation guard refused, or the
+// published plan's identity changed between this probe's entry check and
+// the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
+// above). It is distinct from GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which
+// callers must NOT retry (see that enum value's own comment).
+GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
+    ggml_backend_t                           backend,
+    struct ggml_sycl_model_token             model,
+    uint32_t                                 n_ctx,
+    uint32_t                                 n_ubatch,
+    uint32_t                                 n_seq_max,
+    bool                                     flash_attn_enabled,
+    struct ggml_sycl_runtime_context_probe * out);
 
 // llama.cpp-oyfl: re-evaluates ONLY the non-FA attention scratch guard,
 // against the CURRENTLY PUBLISHED plan's shape --

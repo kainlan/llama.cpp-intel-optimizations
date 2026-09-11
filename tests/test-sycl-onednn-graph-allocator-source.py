@@ -798,14 +798,18 @@ def test_onednn_graph_allocator_source_contract() -> None:
     # the check above cannot cover it -- read ggml-sycl.cpp directly (plain
     # file I/O, not the codescout index, which is documented as blind inside
     # this specific file) and scope to
-    # ggml_backend_sycl_set_runtime_context()'s own body. Comments are
-    # already stripped in GGML_SYCL_CPP_CODE (module scope, same "strip
-    # first, extract second" rule as every other extraction in this file --
-    # extracting from raw GGML_SYCL_CPP first and stripping the result after
-    # would let a stray brace inside a comment desync extract_function_body()'s
-    # naive brace count before strip_comments() ever ran).
+    # ggml_sycl_run_runtime_context_transaction()'s own body -- llama.cpp-tsfl
+    # split ggml_backend_sycl_set_runtime_context() into a thin wrapper that
+    # forwards into this shared body (also called by the new probe entry
+    # point), and the reclaim call lives in the shared body, not the
+    # wrapper. Comments are already stripped in GGML_SYCL_CPP_CODE (module
+    # scope, same "strip first, extract second" rule as every other
+    # extraction in this file -- extracting from raw GGML_SYCL_CPP first and
+    # stripping the result after would let a stray brace inside a comment
+    # desync extract_function_body()'s naive brace count before
+    # strip_comments() ever ran).
     runtime_context_body = extract_function_body(
-        GGML_SYCL_CPP_CODE, "void ggml_backend_sycl_set_runtime_context("
+        GGML_SYCL_CPP_CODE, "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
     )
     checks["pool reclaimed at runtime context update"] = (
         'unified_cache_reclaim_onednn_graph_scratch_pool(ctx->device, "runtime context update")'
