@@ -5620,9 +5620,32 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
         cache->pre_allocate_runtime_chunks(runtime_bytes);
     }
     if (plan.pp_moe_onednn_scratch_bytes > 0) {
-        cache->reserve_pp_moe_onednn_scratch(plan.pp_moe_onednn_weight_slot_bytes,
-                                             plan.pp_moe_onednn_activation_slot_bytes,
-                                             plan.pp_moe_onednn_output_slot_bytes, plan.pp_moe_onednn_ring_depth);
+        // llama.cpp-ibj0 spec round 5 F16: the plan-time reserve of the
+        // PP MoE oneDNN scratch ring at its LOAD-TIME size (this function
+        // runs once per model load, before any runtime-context re-plan).
+        // Discarding the result is deliberate and tolerable, not an
+        // oversight: this function is void and runs too early to refuse a
+        // context the caller has not even created yet, so there is no
+        // meaningful failure path to propagate to here. If this reserve
+        // fails -- e.g. after F13/F14, a load-time plan whose ring cannot
+        // fit the RUNTIME zone (arena route) now correctly FAILS instead of
+        // silently spilling outside the arena, where previously it could
+        // have "succeeded" by escaping the zone's own budget -- the ring
+        // simply does not exist yet. Both PP MoE dispatch admission sites
+        // (ggml-sycl.cpp, the batched and staging routes) call
+        // reserve_pp_moe_onednn_scratch() directly with the SAME planned
+        // sizes at dispatch time; if the ring still is not there, that
+        // later call fails too and each site's own admission gate handles
+        // it -- reject_batched("planned-scratch-unavailable") falls back to
+        // the serialized MoE route (batched) or transient per-dispatch
+        // staging (staging), neither a crash. On the direct-device route (no
+        // arena), forbid_vram_zone_spill never engages (F14 nests it inside
+        // the arena-active branch), so this call's behavior there is
+        // unchanged by this task -- any failure is the pre-existing
+        // DEVICE_VRAM-tier overcommit guard, handled the same way.
+        (void) cache->reserve_pp_moe_onednn_scratch(
+            plan.pp_moe_onednn_weight_slot_bytes, plan.pp_moe_onednn_activation_slot_bytes,
+            plan.pp_moe_onednn_output_slot_bytes, plan.pp_moe_onednn_ring_depth);
     }
 
     if (cache->host_zones_configured()) {

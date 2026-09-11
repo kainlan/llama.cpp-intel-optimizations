@@ -203,7 +203,19 @@ def test_replan_reads_before_writing_and_restores_on_failure():
     ceiling and refuses anything larger, so growing the ring means raising
     the ceiling first (unified_cache_set_planned_pp_moe_onednn_scratch())
     and only then reserving; a refused grow that left the ceiling raised
-    would claim a ring larger than what is physically allocated."""
+    would claim a ring larger than what is physically allocated.
+
+    llama.cpp-ibj0 spec round 5 F15: identifies the Step 2 (ceiling raise
+    for the NEW size) and Step 3 (reserve for the NEW size) calls by the
+    slot-byte variables they pass, NOT by first-occurrence position. The
+    round-5a refuse_and_restore() closure (F13) DEFINES a set/reserve pair
+    using the OLD sizes textually BEFORE Step 2/3 even though it only RUNS
+    on failure -- so `.find()`'s first match, and `set_indices[0]`, point
+    at the closure's own internal restore pair, not at Step 2/3 at all.
+    That fail-open let a mutant moving the real Step 2 ceiling-raise to
+    AFTER the real Step 3 reserve -- the exact ordering mistake this check
+    exists to catch -- pass 27/27 unmodified (see the mutation witness
+    immediately below, which reproduces exactly that mutant)."""
     body_norm = _normalize_ws(_replan_ring_fn_body())
 
     assert "unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(device)" in body_norm, (
@@ -213,24 +225,91 @@ def test_replan_reads_before_writing_and_restores_on_failure():
         "must read the OLD planned output slot bytes before overwriting them"
     )
 
-    set_indices = [
-        m.start() for m in re.finditer(r"unified_cache_set_planned_pp_moe_onednn_scratch\(", body_norm)
-    ]
-    assert len(set_indices) >= 2, (
-        "expected at least two unified_cache_set_planned_pp_moe_onednn_scratch() calls -- one to raise "
-        "the ceiling before reserving, one to restore it on a failed reserve"
+    step2_set_match = re.search(
+        r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device,\s*weight_slot_bytes,\s*"
+        r"new_activation_slot_bytes",
+        body_norm,
+    )
+    step3_reserve_match = re.search(
+        r"reserve_pp_moe_onednn_scratch\(\s*weight_slot_bytes,\s*new_activation_slot_bytes", body_norm
+    )
+    assert step2_set_match is not None, "could not find the Step 2 ceiling-raise call for the NEW size"
+    assert step3_reserve_match is not None, "could not find the Step 3 reserve call for the NEW size"
+    assert step2_set_match.start() < step3_reserve_match.start(), (
+        "the planned ceiling must be raised for the NEW size BEFORE reserve_pp_moe_onednn_scratch() is "
+        "called for the NEW size -- its own admission preflight compares REQUESTED against the CURRENTLY "
+        "PLANNED shape and refuses a request larger than a ceiling that has not yet been raised"
     )
 
-    reserve_idx = body_norm.find("reserve_pp_moe_onednn_scratch(")
-    assert reserve_idx != -1, "must call reserve_pp_moe_onednn_scratch()"
-    assert set_indices[0] < reserve_idx, (
-        "the planned ceiling must be raised BEFORE calling reserve_pp_moe_onednn_scratch() -- its own "
-        "admission preflight compares REQUESTED against the CURRENTLY PLANNED shape and refuses a "
-        "request larger than a ceiling that has not yet been raised"
+    assert re.search(
+        r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device,\s*weight_slot_bytes,\s*"
+        r"old_activation_slot_bytes",
+        body_norm,
+    ), (
+        "must call unified_cache_set_planned_pp_moe_onednn_scratch() with the OLD sizes somewhere, to "
+        "restore the ceiling on failure (the restore pair's exact placement and content is covered by "
+        "test_replan_reserves_the_old_ring_on_a_failed_new_reserve)"
     )
-    assert any(idx > reserve_idx for idx in set_indices), (
-        "must call unified_cache_set_planned_pp_moe_onednn_scratch() again AFTER the reserve attempt, "
-        "to restore the old ceiling on failure"
+
+
+def test_step2_before_step3_has_a_mutation_witness():
+    """Mutation witness for the check above (llama.cpp-ibj0 spec round 5
+    F15): proves it would actually catch the round-1 defect it exists to
+    catch -- the Step 2 ceiling-raise for the NEW size moved to AFTER the
+    Step 3 reserve for the NEW size succeeds, instead of before it. This
+    is exactly the ordering mistake reserve_pp_moe_onednn_scratch()'s own
+    admission preflight is supposed to prevent shipping (requesting the
+    new size while the ceiling still says the old one)."""
+    raw = GGML_SYCL_CPP
+    original_block = (
+        "    // Step 2: raise (or lower) the ceiling BEFORE reserving (see the\n"
+        "    // function comment for why this order is required).\n"
+        "    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, "
+        "new_activation_slot_bytes,\n"
+        "                                                               new_output_slot_bytes, ring_depth);\n"
+        "\n"
+        "    // Step 3: reserve the NEW size, now that nothing of this ring's own is\n"
+        "    // outstanding.\n"
+        "    if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes, "
+        "new_output_slot_bytes,\n"
+        "                                             ring_depth)) {\n"
+    )
+    assert original_block in raw, "mutation target block not found -- update this witness to match the real source"
+    mutated_block = (
+        "    // Step 3: reserve the NEW size, now that nothing of this ring's own is\n"
+        "    // outstanding.\n"
+        "    if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes, "
+        "new_output_slot_bytes,\n"
+        "                                             ring_depth)) {\n"
+        "        // Step 2 (MUTATED, moved here): raise the ceiling AFTER reserving.\n"
+        "        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, "
+        "new_activation_slot_bytes,\n"
+        "                                                                   new_output_slot_bytes, ring_depth);\n"
+    )
+    mutated_raw = raw.replace(original_block, mutated_block, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
+            "void ggml_backend_sycl_set_runtime_context(",
+        )
+    )
+    step2_set_match = re.search(
+        r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device,\s*weight_slot_bytes,\s*"
+        r"new_activation_slot_bytes",
+        mutated_body_norm,
+    )
+    step3_reserve_match = re.search(
+        r"reserve_pp_moe_onednn_scratch\(\s*weight_slot_bytes,\s*new_activation_slot_bytes", mutated_body_norm
+    )
+    assert step2_set_match is not None and step3_reserve_match is not None, (
+        "mutation witness is broken: could not find both calls in the mutated source"
+    )
+    assert not (step2_set_match.start() < step3_reserve_match.start()), (
+        "mutation witness is broken: the mutated (ceiling-after-reserve) source still satisfies "
+        "'Step 2 before Step 3' -- it should not"
     )
 
 
@@ -313,12 +392,26 @@ def test_replan_always_releases_the_ring_before_reserving():
         "direction check (see F1/F4)"
     )
 
-    set_first_idx = body_norm.find("unified_cache_set_planned_pp_moe_onednn_scratch(")
-    reserve_idx = body_norm.find("reserve_pp_moe_onednn_scratch(")
-    assert set_first_idx != -1 and reserve_idx != -1
-    assert release_match.start() < set_first_idx < reserve_idx, (
-        "the release call must precede BOTH the ceiling write and the reserve attempt -- releasing after "
-        "either would either publish a ceiling the physical ring does not yet back, or race "
+    # llama.cpp-ibj0 spec round 5 F15: anchor on the NEW-size Step 2/Step 3
+    # calls specifically (identified by the slot-byte variables they pass),
+    # not on the first occurrence of either function name -- the
+    # refuse_and_restore() closure (F13) defines its OWN internal
+    # old-size set/reserve pair, in that same relative order, textually
+    # between the release call and the real Step 2/3 calls, which would
+    # satisfy a position-only "first set precedes first reserve" check
+    # regardless of where the REAL Step 2/3 calls end up.
+    step2_set_match = re.search(
+        r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device,\s*weight_slot_bytes,\s*"
+        r"new_activation_slot_bytes",
+        body_norm,
+    )
+    step3_reserve_match = re.search(
+        r"reserve_pp_moe_onednn_scratch\(\s*weight_slot_bytes,\s*new_activation_slot_bytes", body_norm
+    )
+    assert step2_set_match is not None and step3_reserve_match is not None
+    assert release_match.start() < step2_set_match.start() < step3_reserve_match.start(), (
+        "the release call must precede BOTH the ceiling write and the reserve attempt for the NEW size -- "
+        "releasing after either would either publish a ceiling the physical ring does not yet back, or race "
         "reserve_pp_moe_onednn_scratch()'s own fast path"
     )
 
@@ -748,15 +841,47 @@ def test_unified_alloc_enforces_forbid_vram_zone_spill():
         "the raw device malloc fallthrough it exists to intercept"
     )
 
+    # llama.cpp-ibj0 spec round 5 F14: the guard must be NESTED INSIDE the
+    # `cache && cache->arena_active()` block, not merely textually between
+    # the zone-attempt and the raw-malloc fallthrough -- `ptr` is
+    # nullptr-initialized and nothing else assigns it whenever no zone
+    # attempt actually ran (the arena disabled via GGML_SYCL_VRAM_ARENA=0,
+    # or no cache yet), so a guard sitting immediately AFTER this whole
+    # block closes (as the round-5a version did) would satisfy a pure
+    # ordering check ("between zone-attempt and raw-malloc") while still
+    # firing on "ptr still null for an unrelated reason", refusing every
+    # direct-device-route allocation from a caller that sets the flag, not
+    # just an actual zone-full case. A pure text-order check cannot tell
+    # "inside" from "immediately after" apart -- both place the guard
+    # between the same two anchors -- so this counts closing braces
+    # instead: the guard's own if-block adds one, and being nested inside
+    # BOTH `if (prefer_vram_zone != COUNT && vram_arena_enabled())` and
+    # `if (cache && cache->arena_active())` requires two more before the
+    # KV-role fallback that follows -- three total. The round-5a version
+    # (guard outside both) had only one (its own).
+    kv_fallback_idx = body_norm.find("!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()")
+    assert kv_fallback_idx != -1, "could not find the KV-role fallback condition to bound the prefer_vram_zone block"
+    assert guard_match.start() < kv_fallback_idx, (
+        "the forbid_vram_zone_spill guard must run before the KV-role fallback that follows the "
+        "prefer_vram_zone block"
+    )
+    closing_braces_after_guard = body_norm[guard_match.start() : kv_fallback_idx].count("}")
+    assert closing_braces_after_guard == 3, (
+        "the forbid_vram_zone_spill guard must be nested inside BOTH the outer prefer_vram_zone check and "
+        "the `cache && cache->arena_active()` check (three closing braces between the guard and the "
+        f"KV-role fallback: the guard's own, then arena_active()'s, then prefer_vram_zone's) -- found "
+        f"{closing_braces_after_guard}"
+    )
+
 
 def test_unified_alloc_spill_guard_has_a_mutation_witness():
     """Mutation witness for the check above: proves it would actually catch
     unified_alloc()'s forbid_vram_zone_spill enforcement being deleted."""
     raw = CACHE_CPP
     guard_block = (
-        "        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
-        "            return false;\n"
-        "        }\n"
+        "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "                    return false;\n"
+        "                }\n"
     )
     assert guard_block in raw, "mutation target block not found -- update this witness to match the real source"
     mutated_raw = raw.replace(guard_block, "", 1)
@@ -771,6 +896,57 @@ def test_unified_alloc_spill_guard_has_a_mutation_witness():
     )
     assert not re.search(r"forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;", mutated_body_norm), (
         "mutation witness is broken: deleting the enforcement left a reference to it behind"
+    )
+
+
+def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-ibj0 spec round 5 F14 itself: proves
+    the brace-count nesting check in test_unified_alloc_enforces_forbid_vram_zone_spill()
+    would actually catch the round-5a regression -- the guard moved OUT of
+    the `cache && cache->arena_active()` block to sit immediately after it
+    closes, changing nothing about its text ORDER relative to the
+    zone-attempt and the KV-role fallback (both position-only checks would
+    still pass) but changing what it actually guards: `ptr` reaching that
+    point still null no longer means the zone attempt failed, it can also
+    mean no zone attempt was ever made."""
+    raw = CACHE_CPP
+    nested_guard = (
+        "                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "                    return false;\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+    )
+    assert nested_guard in raw, "mutation target block not found -- update this witness to match the real source"
+    flattened_guard = (
+        "            }\n"
+        "        }\n"
+        "        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "            return false;\n"
+        "        }\n"
+    )
+    mutated_raw = raw.replace(nested_guard, flattened_guard, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
+            "bool acquire_offload_buffer(",
+        )
+    )
+    guard_match = re.search(
+        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
+        mutated_body_norm,
+    )
+    kv_fallback_idx = mutated_body_norm.find("!ptr && req.intent.role == alloc_role::KV && vram_arena_enabled()")
+    assert guard_match is not None and kv_fallback_idx != -1, (
+        "mutation witness is broken: could not find the guard or the KV-role fallback in the mutated source"
+    )
+    closing_braces_after_guard = mutated_body_norm[guard_match.start() : kv_fallback_idx].count("}")
+    assert closing_braces_after_guard != 3, (
+        "mutation witness is broken: the flattened (round-5a-style) guard should have a DIFFERENT "
+        f"closing-brace count than the correctly-nested one (found 3, same as nested, expected != 3)"
     )
 
 

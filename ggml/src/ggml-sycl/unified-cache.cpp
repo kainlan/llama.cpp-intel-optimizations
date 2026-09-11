@@ -14784,17 +14784,29 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
                 // If zone is full, fall through to raw device malloc below --
                 // unless the caller forbids that spill (llama.cpp-ibj0 spec
-                // round 5 F13, immediately below).
+                // round 5 F13/F14, immediately below).
+                //
+                // llama.cpp-ibj0 spec round 5 F14: this check MUST live
+                // INSIDE this `cache && cache->arena_active()` scope, not
+                // after it. `ptr` is nullptr-initialized above and nothing
+                // else assigns it before this point, so a caller can reach
+                // "ptr is still null" for a reason that has NOTHING to do
+                // with a failed zone attempt -- the arena disabled
+                // (GGML_SYCL_VRAM_ARENA=0, vram_arena_enabled() false) or no
+                // cache yet -- in which case no zone attempt was ever made.
+                // The round-5a version of this check sat AFTER the whole
+                // enclosing `if` block and fired on that same "still null"
+                // regardless of cause, which refused EVERY direct-device-
+                // route allocation from a caller that sets
+                // forbid_vram_zone_spill, not just an actual zone-full
+                // case -- silently breaking the direct-device route's
+                // documented fallback to unified_alloc()'s own
+                // DEVICE_VRAM-tier overcommit guard as its only budget
+                // check.
+                if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
+                    return false;
+                }
             }
-        }
-        // llama.cpp-ibj0 spec round 5 F13: the zone attempt above just
-        // failed (ptr is still null) and the caller set forbid_vram_zone_spill
-        // -- fail the whole allocation here rather than letting it fall
-        // through to a raw device malloc outside the arena, which would
-        // silently consume VRAM the zone's own fixed budget was never meant
-        // to give this request.
-        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
-            return false;
         }
         // P5: Route KV allocations through the arena's KV zone when active.
         // This co-locates KV cache with weights in the same pre-allocated VRAM block,
