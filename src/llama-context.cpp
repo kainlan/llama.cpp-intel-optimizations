@@ -1431,12 +1431,28 @@ void llama_context::sycl_select_auto_ubatch() {
         // another live update). sycl_resync_runtime_context_flash_attn()
         // throws on that refusal; for a CANDIDATE publish (unlike the
         // settle publish below) that must be treated as an ordinary
-        // "transaction refused" stop, not an escaped exception.
+        // "transaction refused" stop, not an escaped exception. This
+        // publish also runs strictly BEFORE the sched_reserve() call right
+        // below, so the narrow flash-attn re-check
+        // (sycl_recheck_runtime_context_flash_attn(), invoked from
+        // resolve_fused_ops() inside sched_reserve()) evaluates this
+        // candidate's own just-published plan, not a stale one. On a
+        // caught refusal below: sycl_resync_runtime_context_flash_attn()
+        // walks every SYCL backend this context has in order and can
+        // throw partway through (e.g. device 0 published this losing
+        // candidate before device 1 refused), so the published plan can
+        // no longer be trusted to describe last_good on ANY device --
+        // marking sched_matches_last_good false forces the settle step
+        // below to unconditionally re-publish last_good on every device,
+        // not just the one that refused. Nothing new is logged here at
+        // WARN or above -- the transaction's own publish path already
+        // logged its ERROR for the refusal.
         try {
             sycl_resync_runtime_context_flash_attn();
         } catch (const std::exception &) {
-            stop           = "transaction refused";
-            candidate_lost = true;
+            stop                    = "transaction refused";
+            candidate_lost          = true;
+            sched_matches_last_good = false;
         }
         if (candidate_lost) {
             break;

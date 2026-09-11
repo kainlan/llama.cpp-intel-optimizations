@@ -395,8 +395,9 @@ def test_publish_reserve_order_has_a_mutation_witness():
         "        try {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
         "        } catch (const std::exception &) {\n"
-        '            stop           = "transaction refused";\n'
-        "            candidate_lost = true;\n"
+        '            stop                    = "transaction refused";\n'
+        "            candidate_lost          = true;\n"
+        "            sched_matches_last_good = false;\n"
         "        }\n"
         "        if (candidate_lost) {\n"
         "            break;\n"
@@ -437,6 +438,26 @@ def test_host_fallback_query_is_consulted_after_reserve():
     assert reserve_idx < fallback_idx < last_good_idx, (
         "the host-fallback query must run strictly between the in-loop sched_reserve() call and the "
         "last_good = c assignment"
+    )
+
+
+def test_fallback_fn_is_bound_to_the_real_accessor():
+    """fallback_fn must be bound to ggml_backend_sycl_compute_buffer_host_
+    fallbacks in BOTH branches -- the direct GGML_USE_SYCL address-of and
+    the GGML_BACKEND_DL-without-SYCL proc-address lookup -- not merely
+    called as fallback_fn(...) with the binding itself unpinned (a rename
+    or a swap to the wrong accessor would otherwise still satisfy every
+    other check in this file, since they all match on the local name
+    fallback_fn, not the real symbol it resolves to)."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"auto\s+fallback_fn\s*=\s*&ggml_backend_sycl_compute_buffer_host_fallbacks\s*;", body_norm
+    ), "the direct GGML_USE_SYCL branch must bind fallback_fn = &ggml_backend_sycl_compute_buffer_host_fallbacks"
+    assert re.search(
+        r"auto\s+fallback_fn\s*=\s*llama_context_sycl_fallbacks_proc\s*\(\s*first_dev\s*\)\s*;", body_norm
+    ), (
+        "the GGML_BACKEND_DL-without-SYCL branch must bind fallback_fn via "
+        "llama_context_sycl_fallbacks_proc(first_dev)"
     )
 
 
@@ -487,10 +508,13 @@ def test_exactly_one_sycl_plan_auto_warn_in_the_body():
 
 
 def test_all_seven_stop_reasons_are_present():
-    """The trial's stop-reason vocabulary must be exactly the seven
-    strings the task spec names."""
+    """The trial's stop-reason vocabulary must be EXACTLY the seven
+    strings the task spec names -- every `stop = "..."` literal in the
+    body (including the initial `const char * stop = "...";`
+    declaration) must be drawn from this set, with none missing and none
+    extra."""
     body_norm = _normalize_ws(_trial_body())
-    for reason in (
+    seven = {
         "ladder exhausted",
         "MoE GPU routing ceiling",
         "transaction refused",
@@ -498,8 +522,15 @@ def test_all_seven_stop_reasons_are_present():
         "not the published model",
         "KV would be demoted",
         "compute buffer fell back to host",
-    ):
+    }
+    for reason in seven:
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
+
+    # Presence alone (the loop above) would pass even if an eighth string
+    # had silently slipped in as a `stop = "..."` assignment somewhere --
+    # this closes that gap by requiring the extracted SET to match exactly.
+    found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm))
+    assert found == seven, f"stop-reason literal set does not match exactly -- found {found}"
 
 
 # ---------------------------------------------------------------------------
@@ -514,13 +545,22 @@ def test_candidate_publish_is_wrapped_in_try_catch():
     """The CANDIDATE publish inside the loop must be wrapped in
     try/catch(const std::exception&) -- sycl_resync_runtime_context_flash_
     attn() throws on a refusal, and an accepted probe does not guarantee
-    the publish itself still succeeds."""
+    the publish itself still succeeds. The catch must also mark
+    sched_matches_last_good false (spec round 1 F1): the publish loop can
+    throw partway through the SYCL backends it walks, so the published
+    plan can no longer be trusted to describe last_good on any device,
+    and only sched_matches_last_good=false forces the settle step to
+    unconditionally re-publish last_good everywhere."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
         r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*\}',
+        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*'
+        r"sched_matches_last_good\s*=\s*false\s*;\s*\}",
         body_norm,
-    ), "the candidate publish must be wrapped in try { ... } catch (const std::exception &) { stop = \"transaction refused\"; candidate_lost = true; }"
+    ), (
+        "the candidate publish must be wrapped in try { ... } catch (const std::exception &) { "
+        'stop = "transaction refused"; candidate_lost = true; sched_matches_last_good = false; }'
+    )
 
 
 def test_candidate_lost_is_checked_immediately_after_the_try_catch():
@@ -549,8 +589,9 @@ def test_candidate_publish_try_catch_has_a_mutation_witness():
         "        try {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
         "        } catch (const std::exception &) {\n"
-        '            stop           = "transaction refused";\n'
-        "            candidate_lost = true;\n"
+        '            stop                    = "transaction refused";\n'
+        "            candidate_lost          = true;\n"
+        "            sched_matches_last_good = false;\n"
         "        }\n"
         "        if (candidate_lost) {\n"
         "            break;\n"
@@ -563,7 +604,8 @@ def test_candidate_publish_try_catch_has_a_mutation_witness():
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert not re.search(
         r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*\}',
+        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*'
+        r"sched_matches_last_good\s*=\s*false\s*;\s*\}",
         mutated_body_norm,
     ), "mutation witness is broken: deleting the try/catch should make the wrapped-publish check fail"
 
