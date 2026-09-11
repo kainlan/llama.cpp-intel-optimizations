@@ -162,6 +162,11 @@ int main(int argc, char ** argv) {
     ggml_backend_dev_t sycl_dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) {
+            // raced-null safety (fork 51d116467): enumeration can return null
+            // slots while backends register; skip rather than deref.
+            continue;
+        }
         if (ggml_backend_dev_backend_reg(dev) == ggml_backend_sycl_reg() &&
             ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             sycl_dev = dev;

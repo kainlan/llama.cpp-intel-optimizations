@@ -28,6 +28,10 @@ EXPECTED_BY_FILE = {
     "tests/test-planner-canary-cpy-visibility.cpp": 2,
     "tests/test-sycl-lifecycle-gpu-sequential.cpp": 1,
     "tests/test-sycl-lifecycle-runtime-wrapper.cpp": 8,
+    # llama.cpp-tsfl: the probe harness's SYCL-device registry walk (finds
+    # the single pinned GPU device to call
+    # ggml_backend_sycl_probe_runtime_context_for_model() against).
+    "tests/test-sycl-runtime-context-probe.cpp": 1,
     "tests/test-thread-safety.cpp": 1,
     "tools/llama-bench/llama-bench.cpp": 4,
     "tools/rpc/rpc-server.cpp": 2,
@@ -114,13 +118,15 @@ if unsafe:
     fail("unsafe consumers remain:\n" + "\n".join(unsafe))
 
 expected_classes = Counter({
-    "null-checked-consumer": 26,
+    # llama.cpp-tsfl: the harness's own null check (see EXPECTED_BY_FILE
+    # above) is a 27th null-checked-consumer.
+    "null-checked-consumer": 27,
     "comparison-only": 9,
 })
 if classified != expected_classes:
     fail(f"classification drifted: {dict(classified)}")
-if sum(classified.values()) != 35:
-    fail(f"expected 35 classified calls, found {sum(classified.values())}")
+if sum(classified.values()) != 36:
+    fail(f"expected 36 classified calls, found {sum(classified.values())}")
 if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
     relative
     for relative, text, match, line in calls
@@ -130,5 +136,5 @@ if Counter({path: count for path, count in COMPARISON_ONLY.items()}) != Counter(
 
 print(
     "backend count/get census: PASS "
-    "(35/35 classified: 26 null-checked, 9 comparison-only; unsafe 0)"
+    "(36/36 classified: 27 null-checked, 9 comparison-only; unsafe 0)"
 )
