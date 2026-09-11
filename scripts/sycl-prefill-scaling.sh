@@ -147,11 +147,21 @@
 # via the sentinel clause on a bare run or `-ub auto`, and via the `!=
 # defaults` clause for any explicit value or sweep. Its value is also no
 # longer one fixed number per invocation: llama-bench prints
-# llama_n_ubatch(ctx), RESOLVED per pp-row instance (see parse_ub_cell),
-# so a bare default SYCL run shows 128/512/512/512 across this script's
-# own pp128/pp512/pp1024/pp2048 rows and an explicit `-ub 1024` run
-# shows 128/512/1024/1024; this column reads only the pp512 row's own
-# cell, 512 in both examples above.
+# llama_n_ubatch(ctx), RESOLVED per pp-row instance (see parse_ub_cell).
+# Since llama.cpp-xojq (Task 4b) landed the auto micro-batch trial, a bare
+# default SYCL run no longer resolves to a flat 512 on every row: each
+# row's n_ctx (= n_prompt + n_gen [+ n_depth]) caps the trial's own ladder
+# {512, 1024, 2048, 4096}, so a case where the whole ladder fits (e.g. the
+# B70 Mistral case) resolves per row to its own row size -- e.g.
+# 128/512/1024/2048 across this script's own pp128/pp512/pp1024/pp2048
+# rows -- while a case where a larger candidate refuses (GPU MoE routing
+# ceiling, ring budget, ...) stops at the last accepted size instead. An
+# explicit `-ub 1024` run still shows 128/512/1024/1024 (the trial never
+# runs when -ub is pinned); this column reads only the pp512 row's own
+# cell, which stays 512 in both examples above -- the pp512 row's own
+# n_ctx (~512) caps BOTH the trial's ladder and the explicit value's
+# n_batch clamp to the same 512, so the two cases agree at this one row
+# even though they now diverge at pp1024/pp2048.
 # The column is REPORT-ONLY and read ONLY from what llama-bench itself
 # printed -- NEVER echoed back from --ubatch/UBATCH when the column is
 # absent, even though this script knows what it asked for: the
@@ -437,9 +447,15 @@ find_header_index() {
 # + n_depth; n_depth = 0 here, this gate never passes -d), and n_ubatch =
 # min(n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch).
 # So one `-ub 1024` invocation yields 128 / 512 / 1024 / 1024 across this
-# script's own pp128/pp512/pp1024/pp2048 rows, and a bare default SYCL
-# run (built-in default is the auto sentinel) yields 128/512/512/512 --
-# not one uniform value in either case.
+# script's own pp128/pp512/pp1024/pp2048 rows -- not one uniform value.
+# Since llama.cpp-xojq (Task 4b) landed the SYCL auto micro-batch trial, a
+# bare default SYCL run (built-in default is the auto sentinel) is no
+# longer flat either: each row's own n_ctx caps the trial's ascending
+# ladder {512, 1024, 2048, 4096}, so a case where the whole ladder is
+# accepted resolves e.g. 128/512/1024/2048, while a case where a larger
+# candidate refuses (GPU MoE routing ceiling, ring budget, a probe
+# refusal, ...) stops at the last accepted size for every row from that
+# point on instead.
 #
 # Echoes "-" (never an error) in TWO distinct cases, deliberately not told
 # apart by the caller:

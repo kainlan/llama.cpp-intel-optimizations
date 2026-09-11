@@ -3229,3 +3229,21 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
+
+# llama.cpp-xojq: source gate for nphx Task 4b -- the SYCL auto micro-batch
+# selection trial (llama_context::sycl_select_auto_ubatch()) and its one
+# call site in the llama_context constructor. Pins the four-condition gate
+# (n_ubatch_auto, a SYCL backend, GGML_SYCL_AUTO_UBATCH, causal_attn), the
+# {512, 1024, 2048, 4096} ladder and its n_batch/n_ctx/MoE-ceiling caps, the
+# per-candidate probe (BUSY backoff, STALE_IDENTITY, would_demote_kv),
+# publish-before-reserve ordering, the host-fallback query consulted after
+# reserve, the settle step, the seven stop-reason strings, and exactly one
+# [SYCL-PLAN] auto n_ubatch= WARN. Host-only, reads the sources as text.
+# Same registration shape as test-sycl-compute-buffer-fallback-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-auto-ubatch-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-auto-ubatch-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
