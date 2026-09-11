@@ -16903,6 +16903,25 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // exhaustion, MMID workspace materialization) -- see the two call sites in
 // ggml_backend_sycl_set_runtime_context() that re-invoke this function with
 // the pre-transaction n_ubatch to roll the ring back symmetrically.
+//
+// THE RING MUST NEVER SPILL PAST THE RUNTIME ZONE (llama.cpp-ibj0 spec
+// round 5 F13): a merge-gate B50 GPT-OSS sweep found that a ring too big
+// for the fixed-size RUNTIME zone (674.5 MB ring vs. a 512 MB zone)
+// "succeeded" anyway -- unified_alloc()'s default behavior, when its
+// preferred zone is full, is to fall through to a raw sycl::malloc_device
+// OUTSIDE the arena, so reserve_pp_moe_onednn_scratch() reported success
+// while quietly consuming ~1.6 GB of the OUTSIDE-arena headroom the oneMath
+// gemm path also needs. The result was not this function's own refusal
+// template: it was a mid-prefill `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the
+// gemm call itself (ibj0-master-ubsweep-b1-a1.log), i.e. exactly the
+// "res=-3 with nothing printed" failure mode Task 1 exists to close, just
+// reached by a different door. Two layers now close it: (1) the allocation
+// requests reserve_pp_moe_onednn_scratch() makes set
+// forbid_vram_zone_spill (unified-cache.cpp), so the fallthrough itself now
+// fails the allocation instead of spilling; (2) this function separately
+// refuses BEFORE even attempting Step 3 when the new ring cannot fit
+// zone_available(RUNTIME) on the arena route, reproducing the exact same
+// refusal template without depending on the allocator-level behavior alone.
 static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     if (weight_slot_bytes == 0) {
@@ -16971,6 +16990,75 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         return false;
     }
 
+    // Capacity/fits are computed ONCE, right after the release above and
+    // BEFORE any reserve attempt, on whichever route reserve_pp_moe_onednn_scratch()
+    // itself draws from: zone_available(RUNTIME) when arena-backed,
+    // available() (budget_ - used_) on the direct-device path (mirrors the
+    // identical arena_active() predicate reserve_pp_moe_onednn_scratch()'s
+    // own "reserved from %s" log uses to name the same two routes). Valid
+    // for BOTH use sites below: the F13 pre-check (before Step 3 ever
+    // runs), and the post-Step-3-failure report -- a failed
+    // reserve_pp_moe_onednn_scratch() call cleans up any partially
+    // allocated slot before returning (its own release_slots() on the `!ok`
+    // path), so capacity right after release equals capacity right after a
+    // failed attempt.
+    const bool   arena           = cache->arena_active();
+    const size_t capacity_bytes  = arena ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : cache->available();
+    const char * const zone_name = arena ? "RUNTIME" : "direct-device";
+    const size_t       needed_total =
+        static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes);
+    const uint32_t fits = ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
+        capacity_bytes, weight_slot_bytes,
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
+
+    // Shared refusal path: restore the OLD ring (re-reserve it -- see the
+    // function comment for why this cannot plausibly fail, and what it
+    // means when handled anyway), then log the one-line refusal. Used by
+    // both the F13 pre-check below (never attempted Step 3 at all) and the
+    // post-Step-3-failure path (Step 3 was attempted and failed).
+    auto refuse_and_restore = [&]() -> bool {
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, old_activation_slot_bytes,
+                                                                   old_output_slot_bytes, ring_depth);
+        if (!cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, old_activation_slot_bytes, old_output_slot_bytes,
+                                                  ring_depth)) {
+            GGML_LOG_ERROR(
+                "[SYCL-PLAN] PP MoE oneDNN scratch ring restore FAILED after a refused re-plan for n_ubatch=%u: "
+                "the previous ring (n_ubatch=%u) could not be re-reserved either; the plan now claims a ceiling "
+                "with no physical backing until a future re-plan succeeds (device=%d)\n",
+                n_ubatch, old_n_ubatch, device);
+        }
+        ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, old_n_ubatch);
+
+        char fits_clause[64] = "";
+        if (fits >= 32) {
+            std::snprintf(fits_clause, sizeof(fits_clause), "; the largest -ub that fits is about %u", fits);
+        }
+        GGML_LOG_ERROR(
+            "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB "
+            "(weights %.1f + activation %.1f + output %.1f, ring depth %u) but the %s zone has %.1f MB "
+            "available%s\n",
+            n_ubatch, needed_total / mb, weight_slot_bytes / mb, new_activation_slot_bytes / mb,
+            new_output_slot_bytes / mb, ring_depth, zone_name, capacity_bytes / mb, fits_clause);
+        return false;
+    };
+
+    // llama.cpp-ibj0 spec round 5 F13: on the arena route, refuse BEFORE
+    // ever attempting Step 3 when the new ring's total exceeds the RUNTIME
+    // zone's available capacity. reserve_pp_moe_onednn_scratch()'s own
+    // allocation requests now forbid the raw-device spill that let this
+    // exact shape "succeed" outside the arena (forbid_vram_zone_spill,
+    // unified-cache.cpp), so Step 3 would fail anyway -- this gate produces
+    // the identical refusal without depending on that allocator-level
+    // behavior alone, and without burning a real allocation attempt for a
+    // request that plainly cannot fit. The direct-device route has no
+    // fixed-size RUNTIME zone to overflow; it keeps its own existing
+    // VRAM-overcommit guard (unified_alloc()'s DEVICE_VRAM tier check) as
+    // its only budget check.
+    if (arena && needed_total > capacity_bytes) {
+        return refuse_and_restore();
+    }
+
     // Step 2: raise (or lower) the ceiling BEFORE reserving (see the
     // function comment for why this order is required).
     ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, new_activation_slot_bytes,
@@ -16988,48 +17076,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         return true;
     }
 
-    // Reservation of the NEW size failed. Measure capacity NOW, before the
-    // restore attempt below consumes some of it back -- this is the real
-    // figure the failed reservation actually saw, on whichever route
-    // reserve_pp_moe_onednn_scratch() itself draws from: zone_available(RUNTIME)
-    // when arena-backed, available() (budget_ - used_) on the direct-device
-    // path (reserve_pp_moe_onednn_scratch()'s own "reserved from %s" log
-    // uses the identical arena_active() predicate to name the same two
-    // routes).
-    const bool   arena           = cache->arena_active();
-    const size_t capacity_bytes  = arena ? cache->zone_available(ggml_sycl::vram_zone_id::RUNTIME) : cache->available();
-    const char * const zone_name = arena ? "RUNTIME" : "direct-device";
-    const uint32_t     fits      = ggml_sycl::unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(
-        capacity_bytes, weight_slot_bytes,
-        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(device),
-        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(device), ring_depth);
-
-    // Restore: re-reserve the OLD size (see the function comment for why
-    // this cannot plausibly fail, and what it means when handled anyway).
-    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, old_activation_slot_bytes,
-                                                               old_output_slot_bytes, ring_depth);
-    if (!cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, old_activation_slot_bytes, old_output_slot_bytes,
-                                              ring_depth)) {
-        GGML_LOG_ERROR(
-            "[SYCL-PLAN] PP MoE oneDNN scratch ring restore FAILED after a refused re-plan for n_ubatch=%u: the "
-            "previous ring (n_ubatch=%u) could not be re-reserved either; the plan now claims a ceiling with no "
-            "physical backing until a future re-plan succeeds (device=%d)\n",
-            n_ubatch, old_n_ubatch, device);
-    }
-    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, old_n_ubatch);
-
-    const size_t needed_total =
-        static_cast<size_t>(ring_depth) * (weight_slot_bytes + new_activation_slot_bytes + new_output_slot_bytes);
-    char fits_clause[64] = "";
-    if (fits >= 32) {
-        std::snprintf(fits_clause, sizeof(fits_clause), "; the largest -ub that fits is about %u", fits);
-    }
-    GGML_LOG_ERROR(
-        "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB "
-        "(weights %.1f + activation %.1f + output %.1f, ring depth %u) but the %s zone has %.1f MB available%s\n",
-        n_ubatch, needed_total / mb, weight_slot_bytes / mb, new_activation_slot_bytes / mb, new_output_slot_bytes / mb,
-        ring_depth, zone_name, capacity_bytes / mb, fits_clause);
-    return false;
+    return refuse_and_restore();
 }
 
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,

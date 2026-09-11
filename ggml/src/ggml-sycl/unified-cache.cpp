@@ -14782,8 +14782,19 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                     GGML_SYCL_DEBUG("[UNIFIED-ALLOC] zone alloc: dev=%d zone=%d size=%.1f MB ptr=%p\n", req.device,
                                     static_cast<int>(zid), alloc_size / (1024.0 * 1024.0), ptr);
                 }
-                // If zone is full, fall through to raw device malloc below.
+                // If zone is full, fall through to raw device malloc below --
+                // unless the caller forbids that spill (llama.cpp-ibj0 spec
+                // round 5 F13, immediately below).
             }
+        }
+        // llama.cpp-ibj0 spec round 5 F13: the zone attempt above just
+        // failed (ptr is still null) and the caller set forbid_vram_zone_spill
+        // -- fail the whole allocation here rather than letting it fall
+        // through to a raw device malloc outside the arena, which would
+        // silently consume VRAM the zone's own fixed budget was never meant
+        // to give this request.
+        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
+            return false;
         }
         // P5: Route KV allocations through the arena's KV zone when active.
         // This co-locates KV cache with weights in the same pre-allocated VRAM block,
@@ -17722,6 +17733,14 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         req.intent.cohort_id                    = label;
         req.intent.constraints.must_device      = true;
         req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+        // llama.cpp-ibj0 spec round 5 F13: a ring too big for the RUNTIME
+        // zone must FAIL this allocation, not silently escape into raw
+        // device memory outside the arena -- the caller (this function's
+        // own admission preflight above, and ggml_sycl_replan_pp_moe_onednn_ring()'s
+        // pre-check, ggml-sycl.cpp) sizes its refusal arithmetic against the
+        // zone's own budget, so a spill here would consume VRAM headroom
+        // other paths need without that arithmetic ever knowing.
+        req.intent.constraints.forbid_vram_zone_spill = true;
         owner                                   = {};
         alloc_handle handle{};
         if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {

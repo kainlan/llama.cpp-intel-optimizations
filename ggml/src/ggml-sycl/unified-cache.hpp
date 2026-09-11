@@ -5244,6 +5244,20 @@ struct alloc_constraints {
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
     vram_zone_id prefer_vram_zone           = vram_zone_id::COUNT;
+    // llama.cpp-ibj0 spec round 5 F13: paired with prefer_vram_zone. When
+    // the preferred zone cannot satisfy the request, unified_alloc's
+    // default behavior is to fall through to a raw sycl::malloc_device
+    // OUTSIDE the arena -- fine for a caller with no fixed budget, but
+    // silent VRAM overcommit for one whose sizing (and refusal arithmetic)
+    // assumes the request stays inside the zone. Setting this makes that
+    // fallthrough FAIL the allocation instead of spilling: the PP MoE
+    // oneDNN scratch ring's reservations (unified-cache.cpp,
+    // reserve_pp_moe_onednn_scratch()) set it, because a ring too big for
+    // the RUNTIME zone "succeeding" by escaping into raw device memory
+    // consumed the outside-arena headroom the oneMath gemm path needs and
+    // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
+    // refusing at context init.
+    bool         forbid_vram_zone_spill     = false;
 };
 
 struct alloc_intent {

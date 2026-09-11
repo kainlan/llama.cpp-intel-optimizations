@@ -357,14 +357,24 @@ def test_refusal_capacity_measures_the_path_that_actually_reserves():
 
     reserve_indices = [m.start() for m in re.finditer(r"cache->reserve_pp_moe_onednn_scratch\(", body_norm)]
     assert len(reserve_indices) == 2, (
-        "expected exactly two reserve_pp_moe_onednn_scratch() calls (the failed NEW-size attempt, and the "
-        f"OLD-size restore attempt on failure) -- found {len(reserve_indices)}"
+        "expected exactly two reserve_pp_moe_onednn_scratch() calls (the NEW-size attempt, and the OLD-size "
+        f"restore attempt used on any failure) -- found {len(reserve_indices)}"
     )
+    # llama.cpp-ibj0 spec round 5 F13 refactor: capacity_bytes is now
+    # computed ONCE, right after the ring release and BEFORE either the
+    # restore-reserve helper closure is even DEFINED or the NEW-size Step 3
+    # reserve is attempted -- valid for both the F13 pre-check (which never
+    # reaches either reserve call when it refuses) and the post-Step-3
+    # failure path. The restore closure's own body (with the OLD-size
+    # reserve call inside it) is DEFINED textually before Step 3 even
+    # though it only runs later, so reserve_indices[0]/[1] no longer
+    # reliably distinguish "attempted first" from "attempted second" --
+    # identify each call by which slot-byte variables it requests instead.
     capacity_idx = body_norm.find("capacity_bytes =")
-    assert capacity_idx != -1 and reserve_indices[0] < capacity_idx < reserve_indices[1], (
-        "capacity_bytes must be measured AFTER the failed NEW-size reserve attempt but BEFORE the OLD-size "
-        "restore reserve attempt -- restoring first would consume back some of the capacity being reported, "
-        "making the printed figure describe a state the failed attempt never actually saw"
+    assert capacity_idx != -1 and capacity_idx < min(reserve_indices), (
+        "capacity_bytes must be measured BEFORE either reserve_pp_moe_onednn_scratch() call is attempted -- "
+        "it must describe the state right after release, which is unaffected by either subsequent attempt "
+        "(a failed reserve cleans up fully; the restore attempt runs only after capacity is already reported)"
     )
 
 
@@ -378,10 +388,18 @@ def test_replan_reserves_the_old_ring_on_a_failed_new_reserve():
     body_norm = _normalize_ws(_replan_ring_fn_body())
     reserve_indices = [m.start() for m in re.finditer(r"cache->reserve_pp_moe_onednn_scratch\(", body_norm)]
     assert len(reserve_indices) == 2
-    restore_call_and_after = body_norm[reserve_indices[1] : reserve_indices[1] + 200]
-    assert "old_activation_slot_bytes" in restore_call_and_after and "old_output_slot_bytes" in restore_call_and_after, (
-        "the second reserve_pp_moe_onednn_scratch() call must request the OLD sizes -- actually restoring "
-        "the physical ring, not just relabeling the ceiling"
+    # Identify the restore-reserve call by the OLD-size variables it
+    # requests, rather than by position -- see the ordering note in the
+    # test above for why position alone is no longer a reliable anchor.
+    restore_call = next(
+        (idx for idx in reserve_indices if "old_activation_slot_bytes" in body_norm[idx : idx + 120]), None
+    )
+    assert restore_call is not None, (
+        "expected one of the two reserve_pp_moe_onednn_scratch() calls to request old_activation_slot_bytes "
+        "-- actually restoring the physical ring, not just relabeling the ceiling"
+    )
+    assert "old_output_slot_bytes" in body_norm[restore_call : restore_call + 120], (
+        "the restore-reserve call must request old_output_slot_bytes too"
     )
     assert "restore FAILED" in body_norm, "a failed restore attempt must be logged at ERROR, not silently ignored"
 
@@ -589,6 +607,180 @@ def test_release_ring_function_is_exported_and_refuses_when_busy():
     assert re.search(r"if\s*\(\s*slot\.refcount\s*!=\s*0\s*\)\s*\{\s*return\s+false\s*;", body_norm), (
         "must refuse (return false) when a currently-held slot is still claimed (refcount != 0), before "
         "touching the ring"
+    )
+
+
+def test_replan_refuses_before_reserving_when_ring_exceeds_runtime_zone():
+    """llama.cpp-ibj0 spec round 5 F13: on the arena route, the re-plan must
+    refuse BEFORE ever attempting Step 3 (reserve) when the new ring's total
+    would exceed zone_available(RUNTIME) -- a merge-gate B50 GPT-OSS sweep
+    found a 674.5 MB ring "succeed" against a 512 MB RUNTIME zone by
+    silently spilling into raw device memory outside the arena, consuming
+    outside-arena headroom another path (the oneMath gemm scratch) then
+    crashed for lack of (UR_RESULT_ERROR_OUT_OF_RESOURCES, not this
+    function's own refusal). The gate is a source-level proxy for a GPU
+    behavior no host-only check can exercise directly: it pins that the
+    checking code exists and runs in the right place, not that the
+    allocator actually refuses on real hardware (that is the lead's GPU
+    acceptance)."""
+    body_norm = _normalize_ws(_replan_ring_fn_body())
+
+    guard_match = re.search(r"if\s*\(\s*arena\s*&&\s*needed_total\s*>\s*capacity_bytes\s*\)\s*\{", body_norm)
+    assert guard_match is not None, (
+        "the re-plan must have a guard refusing when the new ring's needed_total exceeds capacity_bytes on "
+        "the arena route (`if (arena && needed_total > capacity_bytes)`)"
+    )
+
+    release_idx = body_norm.find("cache->release_pp_moe_onednn_scratch_ring()")
+    # The ceiling write for the NEW size (Step 2) is the marker for
+    # "the pre-check did NOT run before this point" -- it is immediately
+    # followed by the reserve call for the NEW size (Step 3), so finding
+    # its SECOND occurrence in the whole function (the first is inside the
+    # refuse_and_restore() closure, restoring the OLD size) would be a
+    # different, more fragile anchor; instead anchor on the reserve call
+    # for the NEW activation/output bytes specifically.
+    step3_reserve_idx = body_norm.find(
+        "cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes, new_output_slot_bytes"
+    )
+    assert release_idx != -1 and step3_reserve_idx != -1
+    assert release_idx < guard_match.start() < step3_reserve_idx, (
+        "the F13 guard must run AFTER the ring release and BEFORE the Step 3 reserve attempt for the new "
+        "size -- checking after Step 3 has already run would waste the attempt this gate exists to skip"
+    )
+
+
+def test_replan_guard_has_a_mutation_witness():
+    """Mutation witness for the F13 guard above: proves it would actually
+    catch the guard being deleted, rather than only ever passing on the
+    current, correct source."""
+    raw = GGML_SYCL_CPP
+    guard_block = (
+        "    if (arena && needed_total > capacity_bytes) {\n"
+        "        return refuse_and_restore();\n"
+        "    }\n\n"
+    )
+    assert guard_block in raw, "mutation target block not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(guard_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
+            "void ggml_backend_sycl_set_runtime_context(",
+        )
+    )
+    assert not re.search(r"if\s*\(\s*arena\s*&&\s*needed_total\s*>\s*capacity_bytes\s*\)", mutated_body_norm), (
+        "mutation witness is broken: deleting the guard left a reference to it behind"
+    )
+
+
+def test_reserve_pp_moe_onednn_scratch_forbids_vram_zone_spill():
+    """llama.cpp-ibj0 spec round 5 F13: the PP MoE oneDNN scratch ring's own
+    allocation requests (reserve_pp_moe_onednn_scratch()'s allocate_buffer
+    lambda) must set forbid_vram_zone_spill, so that a request too big for
+    the preferred zone FAILS the allocation instead of unified_alloc()
+    silently falling through to a raw sycl::malloc_device outside the
+    arena."""
+    body = _bounded_body(
+        CACHE_CPP_CODE,
+        "bool unified_cache::reserve_pp_moe_onednn_scratch(",
+        "bool unified_cache::release_pp_moe_onednn_scratch_ring(",
+    )
+    body_norm = _normalize_ws(body)
+    assert "req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;" in body_norm, (
+        "expected the existing prefer_vram_zone = RUNTIME line -- update this test if that call site moved"
+    )
+    assert "req.intent.constraints.forbid_vram_zone_spill = true;" in body_norm, (
+        "reserve_pp_moe_onednn_scratch()'s own allocate_buffer lambda must set "
+        "req.intent.constraints.forbid_vram_zone_spill = true"
+    )
+
+
+def test_reserve_pp_moe_onednn_scratch_spill_flag_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually catch
+    the forbid_vram_zone_spill assignment being removed."""
+    raw = CACHE_CPP
+    line = "        req.intent.constraints.forbid_vram_zone_spill = true;\n"
+    assert raw.count(line) == 1, f"expected exactly one occurrence, found {raw.count(line)}"
+    mutated_raw = raw.replace(line, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "bool unified_cache::reserve_pp_moe_onednn_scratch(",
+            "bool unified_cache::release_pp_moe_onednn_scratch_ring(",
+        )
+    )
+    assert "req.intent.constraints.forbid_vram_zone_spill = true;" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the assignment left a reference to it behind"
+    )
+
+
+def test_unified_alloc_enforces_forbid_vram_zone_spill():
+    """llama.cpp-ibj0 spec round 5 F13: unified_alloc()'s own fallthrough --
+    'if the preferred zone is full, fall through to a raw device malloc' --
+    must check forbid_vram_zone_spill and fail the allocation instead, for
+    ANY caller that sets it (not just the PP MoE oneDNN ring), so the
+    constraint is a real, enforced contract rather than a flag callers set
+    that nothing reads."""
+    body = _bounded_body(
+        CACHE_CPP_CODE,
+        "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
+        "bool acquire_offload_buffer(",
+    )
+    body_norm = _normalize_ws(body)
+    guard_match = re.search(
+        r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
+        body_norm,
+    )
+    assert guard_match is not None, (
+        "unified_alloc() must refuse (return false) when the preferred-zone allocation failed (!ptr) and "
+        "the caller set forbid_vram_zone_spill"
+    )
+
+    zone_attempt_idx = body_norm.find("prefer_vram_zone != vram_zone_id::COUNT")
+    raw_malloc_idx = body_norm.find('unified_cache_malloc_device_tracked(alloc_size, *req.queue, "unified_alloc:device")')
+    assert zone_attempt_idx != -1 and raw_malloc_idx != -1
+    assert zone_attempt_idx < guard_match.start() < raw_malloc_idx, (
+        "the forbid_vram_zone_spill check must run AFTER the preferred-zone allocation attempt and BEFORE "
+        "the raw device malloc fallthrough it exists to intercept"
+    )
+
+
+def test_unified_alloc_spill_guard_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually catch
+    unified_alloc()'s forbid_vram_zone_spill enforcement being deleted."""
+    raw = CACHE_CPP
+    guard_block = (
+        "        if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {\n"
+        "            return false;\n"
+        "        }\n"
+    )
+    assert guard_block in raw, "mutation target block not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(guard_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _normalize_ws(
+        _bounded_body(
+            strip_comments(mutated_raw),
+            "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
+            "bool acquire_offload_buffer(",
+        )
+    )
+    assert not re.search(r"forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;", mutated_body_norm), (
+        "mutation witness is broken: deleting the enforcement left a reference to it behind"
+    )
+
+
+def test_alloc_constraints_declares_forbid_vram_zone_spill():
+    """The new constraint field must actually be declared in alloc_constraints
+    (unified-cache.hpp) -- without it, none of the call/check sites above
+    would compile."""
+    hpp_norm = _normalize_ws(CACHE_HPP_CODE)
+    assert re.search(r"struct\s+alloc_constraints\s*\{[^}]*\bforbid_vram_zone_spill\b[^}]*\}", hpp_norm), (
+        "alloc_constraints must declare forbid_vram_zone_spill"
     )
 
 
