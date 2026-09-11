@@ -225,11 +225,12 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
 # what to put in it, so a given case can build whichever table shape it
 # needs regardless of what a real sweep would produce -- including
 # shapes a real SYCL run can no longer produce: cases 18, 21, and 26
-# below (which use mk_fake_bench_rc, not this helper, to build a
-# column-absent table, and assert the report's ub@pp512 cell reads "-")
-# now model the OFF-SYCL / old-log shape, never something a SYCL run
-# emits post-4a. (Case 24's own "-" is unrelated: a column-PRESENT table
-# whose pp512 row is entirely missing, a truncated/malformed-table shape
+# below (which build a column-absent table without this helper --
+# mk_fake_bench_rc for 18 and 21, mk_fake_bench for 26 -- and assert
+# the report's ub@pp512 cell reads "-") now model the OFF-SYCL /
+# old-log shape, never something a SYCL run emits post-4a. (Case 24's
+# own "-" is unrelated: a column-PRESENT table whose pp512 row is
+# entirely missing, a truncated/malformed-table shape
 # that is not SYCL/off-SYCL specific at all.) Every row's n_ubatch cell
 # is set to $6. $6="" is a legal, deliberately-used value: it builds a
 # table whose HEADER declares the n_ubatch column but whose DATA rows
@@ -239,25 +240,7 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
 # below prove `-ub VALUE` actually reached the wrapped bench,
 # independent of what $6 puts in the table.
 mk_fake_bench_ub() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048 $6=ub $7=audit
-    local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5" ub="$6" audit="${7:-}"
-    {
-        printf '%s\n' '#!/usr/bin/env bash'
-        [ -n "$audit" ] && printf '%s\n' "printf '%s\n' \"\$*\" >> \"$audit\""
-        cat <<EOF
-cat <<'TABLE'
-| model                          |       size |     params | backend    | ngl | n_ubatch |             test |                  t/s |
-| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | ----------------: | -------------------: |
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |             pp128 |      ${pp128} |
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |             pp512 |      ${pp512} |
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |            pp1024 |     ${pp1024} |
-| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |            pp2048 |     ${pp2048} |
-
-build: df51c5130 (7412)
-TABLE
-exit 0
-EOF
-    } > "$path"
-    chmod +x "$path"
+    mk_fake_bench_ub_rows "$1" "$2" "$3" "$4" "$5" "$6" "$6" "$6" "$6" "${7:-}"
 }
 
 # mk_fake_bench_ub_rows (llama.cpp-e7ls, post-Task-4a): like
@@ -1127,7 +1110,7 @@ out="$("$SCALING" --bench "$BENCH_UB_AUTO" --ubatch auto --only mistral,b70 "${G
 [ "$rc" -eq 0 ] || { echo "FAIL: --ubatch auto case must PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
 grep -qF -- "-ub auto" "$UB_AUDIT_AUTO" || { echo "FAIL: expected -ub auto to reach the wrapped bench's argv (audit: $(cat "$UB_AUDIT_AUTO"))"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: ub must stay '-' when the table has no n_ubatch column, even though --ubatch auto was requested (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: the ub@pp512 column must stay '-' when the table has no n_ubatch column, even though --ubatch auto was requested (got: $out)"; fail=1; }
 
 cases=$((cases+1))
 # --- Case 22 (llama.cpp-s0um; spec review round 1 F1: reworded from "must
