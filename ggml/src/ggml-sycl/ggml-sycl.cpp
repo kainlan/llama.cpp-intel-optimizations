@@ -17228,15 +17228,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         return ggml_sycl_txn_result::REFUSED;
     };
     // llama.cpp-tsfl (round 1 F6): same field-fill as refuse() above, but for
-    // the two transient sites below -- a caller (the probe) MAY retry a BUSY
-    // outcome; it must never retry a REFUSED one.
+    // the transient sites below -- a caller (the probe) MAY retry a BUSY
+    // outcome; it must never retry a REFUSED one. llama.cpp-tsfl round 4 Q5:
+    // reuses refuse()'s own fill rather than duplicating it -- only the
+    // returned enum value differs.
     auto busy = [&](const char * reason) -> ggml_sycl_txn_result {
-        if (out) {
-            out->accepted        = false;
-            out->would_demote_kv = false;
-            out->host_kv_bytes   = 0;
-            out->reason          = reason;
-        }
+        (void) refuse(reason);
         return ggml_sycl_txn_result::BUSY;
     };
 
@@ -17257,7 +17254,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
                                          current->load_txn_id != g_runtime_expected_model.load_txn_id ||
                                          current->slot != g_runtime_expected_model.slot ||
                                          current->slot_generation != g_runtime_expected_model.slot_generation)) {
-        return refuse("stale identity (published plan changed underneath this call)");
+        // llama.cpp-tsfl round 4 Q3: transient, like the two busy() sites
+        // just below (lease acquisition, plan-changed-while-locking) -- this
+        // fires only when the published plan changed between the probe's
+        // own up-front identity check and this in-lock re-check, a race a
+        // later retry can resolve. A refuse() here would map to
+        // GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry
+        // (see that enum value's own comment) -- wrong for a transient race.
+        return busy("stale identity (published plan changed underneath this call)");
     }
     const ggml_sycl::lifecycle::ModelToken current_token{
         { current->model_id },
@@ -17674,12 +17678,12 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // runtime-context transaction"; resetting before those three could-still-
     // fail steps broke that promise for every one of their refusal paths.
     g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);
-    if (out) {
-        out->accepted        = true;
-        out->would_demote_kv = kv_was_demoted;
-        out->host_kv_bytes   = kv_demoted_host_bytes;
-        out->reason          = "OK";
-    }
+    // llama.cpp-tsfl round 4 Q4: no `if (out) { ... }` fill here -- this is
+    // the PUBLISH path's own success tail, reached only when probe_mode is
+    // false, and the publishing wrapper always passes out=nullptr. Every
+    // probe_mode path returns at the probe exit branch above, before `auto
+    // next = ...` even runs, so this point is never reached with a non-NULL
+    // out.
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
@@ -36479,6 +36483,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
     req.intent.category                     = alloc_cat;
     req.intent.constraints.use_pinned_pool  = buft_ctx->use_pinned_pool;
     req.intent.constraints.must_host_pinned = (effective_mem_type == GGML_SYCL_MEM_HOST);
+    // llama.cpp-tsfl round 4 Q1: the oversize branch below forces
+    // must_host_pinned=true and falls through to the SAME allocation
+    // attempt the retry site below guards with its own success check --
+    // set here, consumed at the alloc_succeeded: label, so both counted
+    // sites count a SUCCESSFUL host-pinned landing, not a merely-attempted
+    // one (an oversize request whose forced host-pinned attempt ALSO fails
+    // never reaches alloc_succeeded: at all -- see the ERROR/return path
+    // just below the retry block).
+    bool forced_host_fallback               = false;
 
     if (effective_mem_type == GGML_SYCL_MEM_DEVICE) {
         const size_t safe_alloc = ggml_sycl_get_safe_max_alloc_size(buft_ctx->device);
@@ -36491,7 +36504,14 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // landing in host memory looks identical to a healthy run at
             // default verbosity (GGML_LOG_INFO is dropped there); counted
             // in g_compute_buffer_host_fallbacks for Task 4b's trial.
-            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
+            //
+            // llama.cpp-tsfl round 4 Q1: NOT counted here -- this only
+            // records the intent to force host-pinned; the actual
+            // allocation attempt (and its success/failure) happens once,
+            // uniformly, at the unified_alloc() call below. Counted at
+            // alloc_succeeded: instead, so this site matches the retry
+            // site's own "count a landing, not an attempt" contract.
+            forced_host_fallback = true;
             GGML_LOG_WARN("SYCL: Large buffer (%zu MB) exceeds safe alloc (%zu MB), using host-pinned fallback\n",
                           size / (1024 * 1024), safe_alloc / (1024 * 1024));
             req.intent.constraints.must_host_pinned = true;
@@ -36549,6 +36569,15 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         return nullptr;
     }
 alloc_succeeded:
+    // llama.cpp-tsfl round 4 Q1: the oversize site's landing is counted
+    // HERE, not where must_host_pinned was forced -- see that site's own
+    // comment. Reaching this label at all already proves the allocation
+    // succeeded (every failure path above returns nullptr instead of
+    // falling through), so this is unconditionally "a successful landing"
+    // for whichever site set the flag.
+    if (forced_host_fallback) {
+        g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
+    }
     dev_ptr              = main_alloc.ptr;
     // In TP mode, use the shared-context queue for the buffer context
     queue_ptr ctx_stream = buft_ctx->stream;
@@ -106636,6 +106665,18 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_recheck_runtime_context_flash_attn") == 0) {
         return (void *) ggml_backend_sycl_recheck_runtime_context_flash_attn;
+    }
+    // llama.cpp-tsfl round 4 Q2: without these two arms, a GGML_BACKEND_DL
+    // build's llama-context lookup of either symbol gets nullptr -- same gap
+    // their sibling registrations just above exist to close for
+    // set_runtime_context_for_model/recheck_runtime_context_flash_attn.
+    // (ggml_backend_sycl_auto_ubatch_enabled has the same gap; that one is
+    // Task 4b's own, tracked on its ticket -- not added here.)
+    if (strcmp(name, "ggml_backend_sycl_probe_runtime_context_for_model") == 0) {
+        return (void *) ggml_backend_sycl_probe_runtime_context_for_model;
+    }
+    if (strcmp(name, "ggml_backend_sycl_compute_buffer_host_fallbacks") == 0) {
+        return (void *) ggml_backend_sycl_compute_buffer_host_fallbacks;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

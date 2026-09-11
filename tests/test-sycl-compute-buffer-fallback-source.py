@@ -225,11 +225,15 @@ def test_fallback_counter_declared_as_per_device_atomic():
 
 def test_both_fallback_sites_increment_the_counter():
     """Both host-pinned fallback paths inside
-    ggml_backend_sycl_buffer_type_alloc_buffer()'s bounded body must
-    fetch_add(1, ...) the per-device counter -- the function is a
-    function-try-block (catches sycl::exception at its close), so the
-    increment must sit in the ordinary control flow before any return, not
-    after one."""
+    ggml_backend_sycl_buffer_type_alloc_buffer()'s bounded body must land on
+    a fetch_add(1, ...) of the per-device counter, each only once a
+    SUCCESSFUL host-pinned allocation is confirmed. llama.cpp-tsfl round 4
+    Q1: the oversize site no longer counts inline, at the point it merely
+    DECIDES to force host-pinned (before the allocation attempt that
+    decides success or failure has even run) -- it sets forced_host_
+    fallback there instead, and is counted, guarded by that flag, at the
+    shared alloc_succeeded: label, the same success point the retry site's
+    own fetch_add already used (round 1 F10 / round 2 G1)."""
     body_norm = _normalize_ws(_alloc_buffer_body())
     increments = [
         m.start() for m in re.finditer(r"g_compute_buffer_host_fallbacks\[buft_ctx->device\]\.fetch_add\(\s*1", body_norm)
@@ -241,8 +245,21 @@ def test_both_fallback_sites_increment_the_counter():
     warn1_idx = body_norm.find('"SYCL: Large buffer (%zu MB) exceeds safe alloc')
     warn2_idx = body_norm.find('"SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback')
     assert warn1_idx != -1 and warn2_idx != -1
-    assert any(idx < warn1_idx for idx in increments), (
-        "the oversize-request fallback must increment the counter at or before its own WARN log"
+
+    forced_flag_idx = body_norm.find("forced_host_fallback = true")
+    assert forced_flag_idx != -1 and forced_flag_idx < warn1_idx, (
+        "the oversize branch must set forced_host_fallback = true, at or before its own WARN log"
+    )
+
+    alloc_succeeded_idx = body_norm.find("alloc_succeeded:")
+    assert alloc_succeeded_idx != -1, "could not find the alloc_succeeded: label"
+    guard_idx = body_norm.find("if (forced_host_fallback)", alloc_succeeded_idx)
+    assert guard_idx != -1, "could not find the forced_host_fallback guard after alloc_succeeded:"
+    dev_ptr_idx = body_norm.find("dev_ptr = main_alloc.ptr", alloc_succeeded_idx)
+    assert dev_ptr_idx != -1, "could not bound the forced_host_fallback guard block"
+    assert any(guard_idx < idx < dev_ptr_idx for idx in increments), (
+        "the oversize-request fallback must increment the counter AFTER the alloc_succeeded: label, INSIDE "
+        "the forced_host_fallback guard -- not inline in the oversize branch itself"
     )
 
     # llama.cpp-tsfl round 2 G1: the retry-path increment sits AFTER its own
@@ -312,21 +329,74 @@ def test_retry_increment_after_warn_has_a_mutation_witness():
     )
 
 
+def test_oversize_increment_after_alloc_succeeded_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-tsfl round 4 Q1: proves the fixed
+    check above (oversize site's landing counted at alloc_succeeded:, inside
+    the forced_host_fallback guard) would actually catch the increment
+    moving back to inline in the oversize branch -- exactly the pre-Q1
+    shape, where the counter was bumped before the allocation attempt that
+    decides success or failure had even run."""
+    raw = GGML_SYCL_CPP
+    guarded_increment = (
+        "    if (forced_host_fallback) {\n"
+        "        g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+        "    }\n"
+    )
+    assert guarded_increment in raw, "mutation target (guarded increment) not found -- update this witness"
+    oversize_flag_set = "            forced_host_fallback = true;\n"
+    assert raw.count(oversize_flag_set) == 1, (
+        f"mutation target (oversize flag-set) not unique -- found {raw.count(oversize_flag_set)}"
+    )
+
+    mutated_raw = raw.replace(guarded_increment, "", 1)
+    mutated_raw = mutated_raw.replace(
+        oversize_flag_set,
+        oversize_flag_set
+        + "            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n",
+        1,
+    )
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _ALLOC_BUFFER_START, _ALLOC_BUFFER_END)
+    mutated_increments = [
+        m.start()
+        for m in re.finditer(
+            r"g_compute_buffer_host_fallbacks\[buft_ctx->device\]\.fetch_add\(\s*1", mutated_body_norm
+        )
+    ]
+    mutated_alloc_succeeded_idx = mutated_body_norm.find("alloc_succeeded:")
+    mutated_guard_idx = mutated_body_norm.find("if (forced_host_fallback)", mutated_alloc_succeeded_idx)
+    mutated_dev_ptr_idx = mutated_body_norm.find("dev_ptr = main_alloc.ptr", mutated_alloc_succeeded_idx)
+    assert mutated_alloc_succeeded_idx != -1 and mutated_dev_ptr_idx != -1
+
+    # The REAL (fixed) check requires an increment strictly between
+    # guard_idx and dev_ptr_idx (i.e. inside the forced_host_fallback
+    # guard block, after alloc_succeeded:); on this reverted mutant that
+    # must now be FALSE -- the guard block itself is gone, and the
+    # remaining increment sits back in the oversize branch, well before
+    # alloc_succeeded: is ever reached.
+    guard_bound_start = mutated_guard_idx if mutated_guard_idx != -1 else mutated_dev_ptr_idx
+    assert not any(guard_bound_start < idx < mutated_dev_ptr_idx for idx in mutated_increments), (
+        "mutation witness is broken: the mutated (pre-Q1, increment-inline-in-oversize-branch) source should "
+        "FAIL the 'increment after alloc_succeeded:, inside the guard' check, but it did not"
+    )
+
+
 def test_increment_sites_have_a_mutation_witness():
     """Mutation witness for the increment-count check above: proves it would
     actually catch one of the two increments being deleted."""
     raw = GGML_SYCL_CPP
-    # llama.cpp-tsfl round 2 (companion to G1, same root cause, not itself
-    # named in the finding): the two increment lines have DIFFERENT
-    # indentation after round 1 F10 (12 spaces for the oversize site, 16 for
-    # the retry site, now nested one level deeper inside the retry's own
-    # success branch) -- an unanchored 12-space literal also matches as a
-    # trailing substring of the 16-space line (its last 12 spaces + the rest
-    # coincide), so `raw.count()` reported 2 for the wrong reason (one true
-    # match plus one substring-of-a-different-line match). Anchoring with a
-    # leading "\n" restricts the match to a line that starts with EXACTLY
-    # this indentation.
-    increment_line = "\n            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+    # llama.cpp-tsfl round 2 (companion to G1) / round 4 Q1 (indentation
+    # shifted again by Q1's move of the oversize site's increment to the
+    # alloc_succeeded: label): the two increment lines have DIFFERENT
+    # indentation -- 16 spaces for the retry site (nested inside its own
+    # success branch), 8 spaces for the oversize site (nested inside the
+    # `if (forced_host_fallback)` guard at alloc_succeeded:, round 4 Q1). An
+    # unanchored 8-space literal would also match as a trailing substring of
+    # the 16-space line (its last 8 spaces + the rest coincide), so this
+    # anchors with a leading "\n" to restrict the match to a line that
+    # starts with EXACTLY this indentation -- the oversize site.
+    increment_line = "\n        g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
     count = raw.count(increment_line)
     assert count == 1, f"expected exactly one line at this exact indentation (the oversize site) -- found {count}"
     mutated_raw = raw.replace(increment_line, "\n", 1)

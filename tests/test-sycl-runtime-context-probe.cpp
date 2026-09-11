@@ -103,7 +103,6 @@ int main(int argc, char ** argv) {
         FILE * f = std::fopen(model_path, "rb");
         if (!f) {
             fprintf(stderr, "SKIP: model file not readable: %s\n", model_path);
-            fprintf(stderr, "[PROBE-HARNESS] model file not readable: %s\n", model_path);
             test_skip_no_model();
         }
         std::fclose(f);
@@ -273,14 +272,17 @@ int main(int argc, char ** argv) {
         ok = false;
     }
     // llama.cpp-tsfl round 2 G3: harness-side assertion that the prompt
-    // actually crosses n_ubatch=512 -- a silent drop back to a single-
-    // ubatch prompt (e.g. a future edit that shortens the repeated
-    // sentence) would otherwise pass this step vacuously again.
-    if (ok && n_tok <= 512) {
+    // actually crosses n_ubatch -- a silent drop back to a single-ubatch
+    // prompt (e.g. a future edit that shortens the repeated sentence, or
+    // changes cparams.n_ubatch above) would otherwise pass this step
+    // vacuously again. llama.cpp-tsfl round 4 Q7: compares against the
+    // ACTUAL cparams.n_ubatch, not a hardcoded 512, so the check tracks
+    // the real value if that ever changes too.
+    if (ok && n_tok <= (int32_t) cparams.n_ubatch) {
         fprintf(stderr,
-                "[PROBE-HARNESS] FAIL: prompt is only %d tokens, must exceed 512 (n_ubatch) to actually "
+                "[PROBE-HARNESS] FAIL: prompt is only %d tokens, must exceed n_ubatch=%d to actually "
                 "exercise the two-ubatch split\n",
-                n_tok);
+                n_tok, (int32_t) cparams.n_ubatch);
         ok = false;
     }
     int decode_rc = -1;

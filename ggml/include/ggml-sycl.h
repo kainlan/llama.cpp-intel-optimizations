@@ -387,15 +387,16 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
                                                             uint32_t       n_seq_max,
                                                             bool           flash_attn_enabled);
 
-// llama.cpp-tsfl (round 1 F10): per-device count of SUCCESSFUL host-pinned
-// fallbacks for ANY buffer allocated through
-// ggml_backend_sycl_buffer_type_alloc_buffer() -- the name is kept from the
-// plan's own Task 4b read, which cares specifically about compute buffers,
-// but every buffer routed through this buffer type is counted, not only
-// compute buffers. Exactly two sites increment it: (1) a single allocation
-// exceeding the safe device-alloc limit (forced host-pinned immediately),
-// and (2) a device allocation that failed and was RETRIED host-pinned,
-// counted only once that retry itself succeeds -- a retry that also fails
+// llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
+// SUCCESSFUL host-pinned fallbacks for any of the buffer types whose
+// alloc_buffer is this function -- the name is kept from the plan's own
+// Task 4b read, which cares specifically about compute buffers, but is not
+// limited to them. Exactly two sites increment it, both only once a
+// SUCCESSFUL host-pinned landing is confirmed, never merely attempted: (1)
+// a single allocation exceeding the safe device-alloc limit, forced
+// host-pinned and counted once that forced attempt lands; and (2) a device
+// allocation that failed and was RETRIED host-pinned, counted only once
+// that retry itself succeeds -- in both cases, an attempt that also fails
 // falls through to the allocation-failure ERROR and is not a "fallback".
 // NOT counted: the !vram_arena_enabled() < 512 MB headroom branch (dead in
 // this fork's default arena-on configuration), or the silent
