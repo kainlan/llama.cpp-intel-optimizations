@@ -405,10 +405,30 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             // n_expert -- which can exceed n_ubatch * n_expert_used by up to
             // n_expert / n_expert_used (8x for GPT-OSS 20B, 32/4). Size for that.
             const size_t max_rows = static_cast<size_t>(inventory.n_ubatch) * static_cast<size_t>(hparams.n_expert);
+            // llama.cpp-ibj0: per-row bytes behind the two slot formulas below
+            // -- max_rows already factors out to inventory.n_ubatch * per_row
+            // (max_rows = n_ubatch * n_expert, and each per-row term below is
+            // n_expert * max_{k,n} * sizeof(...)), so the backend can later
+            // reproduce align256(runtime_n_ubatch * per_row) for a DIFFERENT
+            // n_ubatch than the load-time 512 this loader always plans for.
+            // The asserts right after tie the two formulas together at the one
+            // n_ubatch this loader itself computes, so they cannot drift.
+            inventory.pp_moe_onednn_activation_bytes_per_row =
+                static_cast<size_t>(hparams.n_expert) * max_k * sizeof(ggml_fp16_t);
+            inventory.pp_moe_onednn_output_bytes_per_row =
+                static_cast<size_t>(hparams.n_expert) * max_n * sizeof(float);
             inventory.pp_moe_onednn_activation_slot_bytes =
                 llama_model_sycl_align_up(max_rows * max_k * sizeof(ggml_fp16_t), 256);
             inventory.pp_moe_onednn_output_slot_bytes =
                 llama_model_sycl_align_up(max_rows * max_n * sizeof(float), 256);
+            GGML_ASSERT(
+                inventory.pp_moe_onednn_activation_slot_bytes ==
+                llama_model_sycl_align_up(
+                    static_cast<size_t>(inventory.n_ubatch) * inventory.pp_moe_onednn_activation_bytes_per_row, 256));
+            GGML_ASSERT(
+                inventory.pp_moe_onednn_output_slot_bytes ==
+                llama_model_sycl_align_up(
+                    static_cast<size_t>(inventory.n_ubatch) * inventory.pp_moe_onednn_output_bytes_per_row, 256));
             inventory.pp_moe_onednn_ring_depth = pp_moe_onednn_ring_depth;
             inventory.pp_moe_onednn_scratch_bytes =
                 static_cast<size_t>(pp_moe_onednn_ring_depth) *

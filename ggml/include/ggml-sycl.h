@@ -238,6 +238,14 @@ struct ggml_sycl_tensor_inventory {
     size_t                         pp_moe_onednn_activation_slot_bytes;
     size_t                         pp_moe_onednn_output_slot_bytes;
     size_t                         pp_moe_onednn_scratch_bytes;
+    // llama.cpp-ibj0: per-row bytes behind the two slot sizes above (activation
+    // slot = align256(n_ubatch * pp_moe_onednn_activation_bytes_per_row), output
+    // slot analogous) -- carried into the backend so the runtime-context
+    // transaction can re-plan the ring for the REAL runtime n_ubatch instead of
+    // the load-time default this struct's n_ubatch field below is fixed to (512).
+    // 0 for a dense model (no MoE PP ring).
+    size_t                         pp_moe_onednn_activation_bytes_per_row;
+    size_t                         pp_moe_onednn_output_bytes_per_row;
     uint32_t                       pp_moe_onednn_ring_depth;
     int                            n_expert;       // Total experts per layer (0 for dense models)
     int                            n_expert_used;  // Experts activated per token (0 for dense models)

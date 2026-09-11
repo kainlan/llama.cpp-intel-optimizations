@@ -1606,6 +1606,54 @@ size_t   unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(int device_id
 size_t   unified_cache_get_planned_pp_moe_onednn_scratch_bytes(int device_id);
 uint32_t unified_cache_get_planned_pp_moe_onednn_ring_depth(int device_id);
 
+// llama.cpp-ibj0: per-row bytes behind the two ubatch-scaled slots above,
+// carried from the loader (src/llama-model.cpp's ggml_sycl_tensor_inventory)
+// so the runtime-context transaction can re-plan the ring for the REAL
+// runtime n_ubatch -- the load-time plan above is always sized for the
+// loader's own inventory.n_ubatch (512 today), not whatever n_ubatch the
+// context is actually created with. 0 = no MoE PP ring planned (dense model).
+void   unified_cache_set_planned_pp_moe_onednn_row_bytes(int    device_id,
+                                                         size_t activation_bytes_per_row,
+                                                         size_t output_bytes_per_row);
+size_t unified_cache_get_planned_pp_moe_onednn_activation_bytes_per_row(int device_id);
+size_t unified_cache_get_planned_pp_moe_onednn_output_bytes_per_row(int device_id);
+
+// The n_ubatch the CURRENTLY PLANNED activation/output slots above were sized
+// for -- distinct from the loader's inventory.n_ubatch (always 512 today):
+// this one tracks whatever the runtime-context transaction last re-planned
+// the ring for, so a repeated transaction at the same n_ubatch can tell
+// "already planned for this" from "must re-plan", making the re-plan
+// idempotent.
+void     unified_cache_set_planned_pp_moe_onednn_n_ubatch(int device_id, uint32_t n_ubatch);
+uint32_t unified_cache_get_planned_pp_moe_onednn_n_ubatch(int device_id);
+
+// Slot sizes the ring needs for `n_ubatch`, from the per-row bytes above:
+// align256(n_ubatch * per_row) for both activation and output, through the
+// same pp_moe_onednn_checked_align_slot_bytes() (moe-scratch-admission.hpp)
+// the ring's own admission uses, so the two cannot round or overflow-check
+// differently. Returns false (leaving the output params untouched) when the
+// per-row bytes are 0 (dense model, no ring planned) or the multiply/align
+// would overflow.
+bool unified_cache_pp_moe_onednn_slots_for_ubatch(int      device_id,
+                                                  uint32_t n_ubatch,
+                                                  size_t * activation_slot_bytes,
+                                                  size_t * output_slot_bytes);
+
+// Inverse of the sizing above: the largest n_ubatch whose re-planned
+// activation+output slots -- plus the constant weight slot, both times
+// ring_depth -- fit within capacity_bytes, rounded DOWN to a multiple of 32
+// (llama's BLAS minimum; llama_context applies no 256-padding to n_ubatch).
+// Returns 0 when nothing fits (capacity_bytes does not clear the weight
+// slots' own total) or the inputs are degenerate (ring_depth == 0, or both
+// per-row terms 0). Same "hold the constant terms, divide the remainder by
+// the per-unit cost, round to the allocator granularity" method as
+// ggml_sycl_largest_fitting_n_ctx (ggml-sycl.cpp).
+uint32_t unified_cache_largest_fitting_n_ubatch_for_pp_moe_onednn(size_t   capacity_bytes,
+                                                                  size_t   weight_slot_bytes,
+                                                                  size_t   activation_bytes_per_row,
+                                                                  size_t   output_bytes_per_row,
+                                                                  uint32_t ring_depth);
+
 // These four figures are a HARD CAP, not a starting size. Before asking the
 // cache for scratch, run the request through `pp_moe_onednn_admit_scratch`
 // (moe-scratch-admission.hpp) and refuse on rejection; never pass
@@ -3440,6 +3488,15 @@ class unified_cache {
                                        size_t   activation_slot_bytes,
                                        size_t   output_slot_bytes,
                                        uint32_t ring_depth);
+    // llama.cpp-ibj0: explicit whole-ring release, distinct from
+    // release_pp_moe_onednn_scratch_slot() below (which releases one CLAIMED
+    // dispatch's lease, not the ring itself). reserve_pp_moe_onednn_scratch()'s
+    // own "already sufficient, reuse without reallocating" fast path never
+    // shrinks the physical ring, so a caller that needs the RUNTIME zone's
+    // accounting to track a SMALLER re-plan exactly must release first. Fails
+    // (returns false, ring left untouched) if any slot -- claimed or retired
+    // -- is still in use; see the .cpp definition for the full contract.
+    bool release_pp_moe_onednn_scratch_ring();
     bool claim_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
     void release_pp_moe_onednn_scratch_slot(uint32_t slot, uint64_t generation);
     bool get_pp_moe_onednn_scratch_slot(uint32_t slot, pp_moe_onednn_scratch_slot & out);
@@ -5195,6 +5252,20 @@ struct alloc_constraints {
     // through that VRAM zone (zone_alloc) instead of raw device malloc.
     // unified_free then calls zone_free(vram_zone, ptr) for explicit TLSF reclaim.
     vram_zone_id prefer_vram_zone           = vram_zone_id::COUNT;
+    // llama.cpp-ibj0 spec round 5 F13: paired with prefer_vram_zone. When
+    // the preferred zone cannot satisfy the request, unified_alloc's
+    // default behavior is to fall through to a raw sycl::malloc_device
+    // OUTSIDE the arena -- fine for a caller with no fixed budget, but
+    // silent VRAM overcommit for one whose sizing (and refusal arithmetic)
+    // assumes the request stays inside the zone. Setting this makes that
+    // fallthrough FAIL the allocation instead of spilling: the PP MoE
+    // oneDNN scratch ring's reservations (unified-cache.cpp,
+    // reserve_pp_moe_onednn_scratch()) set it, because a ring too big for
+    // the RUNTIME zone "succeeding" by escaping into raw device memory
+    // consumed the outside-arena headroom the oneMath gemm path needs and
+    // crashed mid-prefill with UR_RESULT_ERROR_OUT_OF_RESOURCES instead of
+    // refusing at context init.
+    bool         forbid_vram_zone_spill     = false;
 };
 
 struct alloc_intent {
@@ -5992,6 +6063,10 @@ bool                         unified_cache_reserve_pp_moe_onednn_scratch(int    
                                                                          size_t   activation_slot_bytes,
                                                                          size_t   output_slot_bytes,
                                                                          uint32_t ring_depth);
+// llama.cpp-ibj0: free-function wrapper for unified_cache::release_pp_moe_onednn_scratch_ring(),
+// matching the reserve wrapper immediately above. False (no-op) when the
+// device has no cache yet, or the ring is still in use.
+bool                         unified_cache_release_pp_moe_onednn_scratch_ring(int device_id);
 pp_moe_onednn_scratch_result unified_cache_get_pp_moe_onednn_scratch_slot(int device_id, uint32_t slot);
 
 // Get scratch buffers for oneDNN FP16 path. Returns pointers plus a logical
