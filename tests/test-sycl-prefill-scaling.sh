@@ -51,7 +51,7 @@
 #     named, hoisted once per model rather than once per pair, and gemma4
 #     (never rooted at MODELS_DIR) is proven untouched by it (cases
 #     16-17, llama.cpp-5iba);
-#   - the new `ub` column reads llama-bench's own `n_ubatch` column BY
+#   - the `ub@pp512` column reads llama-bench's own `n_ubatch` column BY
 #     COLUMN POSITION: "-" when the table carries no n_ubatch column at all
 #     (case 18), the table's own reported value when it does, independent
 #     of whether --ubatch was given (case 19); --ubatch 1024 / --ubatch
@@ -73,7 +73,14 @@
 #     exactly like --models-dir "" (case 25); (spec review round 2) an
 #     EMPTY SYCL_PREFILL_SCALING_UBATCH env var, with no --ubatch flag, is
 #     the opposite of case 25 and must NOT be rejected -- it collapses to
-#     "not given", exactly like an unset env var (case 26).
+#     "not given", exactly like an unset env var (case 26);
+#   - (llama.cpp-e7ls, post-Task-4a) the column is renamed `ub@pp512` and,
+#     under SYCL, is now ALWAYS present with a value RESOLVED per pp row
+#     rather than uniform across a whole invocation: a bare default run
+#     shows 128/512/512/512 across pp128/pp512/pp1024/pp2048, read here
+#     from the pp512 row's own cell -- the column-absent shape (case 18)
+#     and the uniform-value shape (case 19) both remain legitimate and
+#     stay covered; this per-row shape is additional (case 27).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -203,20 +210,22 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
 
 # mk_fake_bench_ub (llama.cpp-s0um): like mk_fake_bench_rc, but the
 # generated table ALSO carries an `n_ubatch` column, in the real column
-# order `model | size | params | backend | ngl | n_ubatch | test | t/s`.
-# Real llama-bench emits that column only when n_ubatch.size() > 1 OR a
-# single value other than its own built-in default 512 (see the script
-# header's --ubatch paragraph for the exact condition) -- this helper does
-# NOT reproduce that logic itself; it is told directly whether to include
-# the column and what to put in it, so a given case can build whichever
-# table shape it needs regardless of what a real sweep would produce. Every
-# row's n_ubatch cell is set to $6. $6="" is a legal, deliberately-used
-# value: it builds a table whose HEADER declares the n_ubatch column but
-# whose DATA rows are blank under it, the exact shape case 22 below needs.
-# Optional $7 audit path behaves exactly like mk_fake_bench_rc's own $7 --
-# it records the fake bench's OWN received argv, which is how cases 20-21
-# below prove `-ub VALUE` actually reached the wrapped bench, independent
-# of what $6 puts in the table.
+# order `model | size | params | backend | ngl | n_ubatch | test | t/s`,
+# with the SAME value on every row -- the pre-Task-4a / off-SYCL shape
+# (see the script header's --ubatch paragraph for the full post-4a
+# condition, and mk_fake_bench_ub_rows below for the per-row shape). Real
+# llama-bench off SYCL emits that column only when n_ubatch.size() > 1 OR
+# a single value other than its own built-in default 512 -- this helper
+# does NOT reproduce that logic itself; it is told directly whether to
+# include the column and what to put in it, so a given case can build
+# whichever table shape it needs regardless of what a real sweep would
+# produce. Every row's n_ubatch cell is set to $6. $6="" is a legal,
+# deliberately-used value: it builds a table whose HEADER declares the
+# n_ubatch column but whose DATA rows are blank under it, the exact shape
+# case 22 below needs. Optional $7 audit path behaves exactly like
+# mk_fake_bench_rc's own $7 -- it records the fake bench's OWN received
+# argv, which is how cases 20-21 below prove `-ub VALUE` actually reached
+# the wrapped bench, independent of what $6 puts in the table.
 mk_fake_bench_ub() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048 $6=ub $7=audit
     local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5" ub="$6" audit="${7:-}"
     {
@@ -230,6 +239,38 @@ cat <<'TABLE'
 | llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |             pp512 |      ${pp512} |
 | llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |            pp1024 |     ${pp1024} |
 | llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |      ${ub} |            pp2048 |     ${pp2048} |
+
+build: df51c5130 (7412)
+TABLE
+exit 0
+EOF
+    } > "$path"
+    chmod +x "$path"
+}
+
+# mk_fake_bench_ub_rows (llama.cpp-e7ls, post-Task-4a): like
+# mk_fake_bench_ub, but each of the four pp rows gets its OWN n_ubatch
+# cell ($6-$9) instead of one uniform value -- the shape Task 4a actually
+# produces under SYCL (llama_n_ubatch(ctx) resolves per pp-row instance;
+# see parse_ub_cell's own comment in the script for the clamp
+# arithmetic), e.g. a bare default run's 128/512/512/512 or an explicit
+# `-ub 1024` run's 128/512/1024/1024. Optional $10 audit path behaves
+# exactly like mk_fake_bench_ub's own $7.
+mk_fake_bench_ub_rows() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048
+                          # $6=ub128 $7=ub512 $8=ub1024 $9=ub2048 $10=audit
+    local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5"
+    local ub128="$6" ub512="$7" ub1024="$8" ub2048="$9" audit="${10:-}"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        [ -n "$audit" ] && printf '%s\n' "printf '%s\n' \"\$*\" >> \"$audit\""
+        cat <<EOF
+cat <<'TABLE'
+| model                          |       size |     params | backend    | ngl | n_ubatch |             test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | -------: | ----------------: | -------------------: |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |   ${ub128} |             pp128 |      ${pp128} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |   ${ub512} |             pp512 |      ${pp512} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |  ${ub1024} |            pp1024 |     ${pp1024} |
+| llama 7B Q4_0                  |   3.83 GiB |     7.24 B | SYCL       |  99 |  ${ub2048} |            pp2048 |     ${pp2048} |
 
 build: df51c5130 (7412)
 TABLE
@@ -1006,7 +1047,7 @@ cases=$((cases+1))
 # (mk_fake_bench/mk_fake_bench_rc), matching a real llama-bench table where
 # -ub was left at its single built-in default (512, see the script
 # header's --ubatch paragraph for the exact condition) -- must show "-" in
-# the new `ub` column: the legitimate, non-error "column absent" case
+# the `ub@pp512` column: the legitimate, non-error "column absent" case
 # find_header_index/parse_ub_cell's own comments describe. No --ubatch
 # flag is given, so -ub must never reach the fake bench's own argv either.
 UB_AUDIT_ABSENT="$T/bench-argv-ub-absent.log"
@@ -1016,7 +1057,7 @@ mk_fake_bench_rc "$BENCH_UB_ABSENT" "1000.00" "1000.00" "900.00" "850.00" 0 "$UB
 out="$("$SCALING" --bench "$BENCH_UB_ABSENT" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: column-absent case must still PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub column to show '-' when the table has no n_ubatch column (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show '-' when the table has no n_ubatch column (got: $out)"; fail=1; }
 grep -q -- "-ub" "$UB_AUDIT_ABSENT" && { echo "FAIL: -ub must not reach the bench when --ubatch was not given (audit: $(cat "$UB_AUDIT_ABSENT"))"; fail=1; }
 
 cases=$((cases+1))
@@ -1024,7 +1065,7 @@ cases=$((cases+1))
 # script header's --ubatch paragraph for real llama-bench's exact
 # condition for emitting one -- this fake table is built directly via
 # mk_fake_bench_ub, not by actually sweeping -ub, so its 512 here does NOT
-# mean a real run at -ub 512 would show this column) populates the `ub`
+# mean a real run at -ub 512 would show this column) populates the `ub@pp512`
 # column from the table's OWN reported value -- no --ubatch flag is given
 # here, so this proves the column is read from llama-bench's OWN OUTPUT,
 # never echoed back from something this script passed in (there is
@@ -1036,13 +1077,13 @@ mk_fake_bench_ub "$BENCH_UB_DEFAULT" "1000.00" "1000.00" "900.00" "850.00" "512"
 out="$("$SCALING" --bench "$BENCH_UB_DEFAULT" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
 [ "$rc" -eq 0 ] || { echo "FAIL: default ub-column-present case must PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+512[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub column to show 512 (the fake bench's own reported n_ubatch) (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+512[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show 512 (the fake bench's own reported n_ubatch) (got: $out)"; fail=1; }
 grep -q -- "-ub" "$UB_AUDIT_DEFAULT" && { echo "FAIL: -ub must not reach the bench when --ubatch was not given (audit: $(cat "$UB_AUDIT_DEFAULT"))"; fail=1; }
 
 cases=$((cases+1))
 # --- Case 20 (llama.cpp-s0um): --ubatch 1024 must forward "-ub 1024" to
 # the wrapped bench's own argv, proven via the audit -- independent of,
-# and in addition to, the ub column reading the table's own value.
+# and in addition to, the ub@pp512 column reading the table's own value.
 UB_AUDIT_1024="$T/bench-argv-ub-1024.log"
 : > "$UB_AUDIT_1024"
 BENCH_UB_1024="$T/fake-bench-ub-1024.sh"
@@ -1051,7 +1092,7 @@ out="$("$SCALING" --bench "$BENCH_UB_1024" --ubatch 1024 --only mistral,b70 "${G
 [ "$rc" -eq 0 ] || { echo "FAIL: --ubatch 1024 case must PASS (exit 0), got $rc. Output:
 $out"; fail=1; }
 grep -qF -- "-ub 1024" "$UB_AUDIT_1024" || { echo "FAIL: expected -ub 1024 to reach the wrapped bench's argv (audit: $(cat "$UB_AUDIT_1024"))"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+1024[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub column to show 1024 (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+1024[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show 1024 (got: $out)"; fail=1; }
 
 cases=$((cases+1))
 # --- Case 21 (llama.cpp-s0um): --ubatch auto must forward "-ub auto"
@@ -1180,7 +1221,7 @@ out="$("$SCALING" --bench "$BENCH_UB_NO_PP512" --only mistral,b70 "${GUARD_HOOKS
 $out"; fail=1; }
 grep -q "ERROR:parse-failed" <<< "$out" || { echo "FAIL: expected ERROR:parse-failed (an absent pp512 row is a parse failure, not a blank-cell malformation) (got: $out)"; fail=1; }
 grep -q "ERROR:ub-cell-blank" <<< "$out" && { echo "FAIL: an entirely ABSENT pp512 row must never be reported as ub-cell-blank (that label means the row was FOUND with a blank cell) (got: $out)"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub column to show '-' in the parse-failed row (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show '-' in the parse-failed row (got: $out)"; fail=1; }
 
 cases=$((cases+1))
 # --- Case 25 (llama.cpp-s0um, spec review round 1 F3): --ubatch "" (an
@@ -1206,13 +1247,44 @@ out="$(SYCL_PREFILL_SCALING_UBATCH="" "$SCALING" --bench "$BENCH2" --only mistra
 [ "$rc" -eq 0 ] || { echo "FAIL: an empty SYCL_PREFILL_SCALING_UBATCH env var (no --ubatch flag) must NOT be rejected -- expected exit 0, got $rc. Output:
 $out"; fail=1; }
 grep -qF -- "--ubatch requires a non-empty value" <<< "$out" && { echo "FAIL: an empty env var must never trip the --ubatch usage-error refusal -- that refusal is for the explicit FLAG only (got: $out)"; fail=1; }
-grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub column to show '-' (no --ubatch given, so no -ub forwarded, and BENCH2's table has no n_ubatch column) (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show '-' (no --ubatch given, so no -ub forwarded, and BENCH2's table has no n_ubatch column) (got: $out)"; fail=1; }
+
+cases=$((cases+1))
+# --- Case 27 (llama.cpp-e7ls, post-Task-4a): the DEFAULT-run shape Task
+# 4a actually produces under SYCL, which cases 18-26 above do not model --
+# those either omit the n_ubatch column entirely (the off-SYCL / pre-4a
+# "-" case, still legitimate and still exercised: case 18, case 21, case
+# 26) or give it one value UNIFORM across all four rows (case 19,
+# mk_fake_bench_ub). Post-4a, the column is unconditionally present under
+# SYCL and NOT uniform: llama_n_ubatch(ctx) resolves per pp-row instance
+# (see parse_ub_cell's own comment in the script for the clamp
+# arithmetic), so a bare default run shows 128/512/512/512 across
+# pp128/pp512/pp1024/pp2048 -- built here with mk_fake_bench_ub_rows, no
+# --ubatch flag given (mirroring case 19's "independent of whether
+# --ubatch was given"). Asserts (1) the printed report's HEADER carries
+# the renamed `ub@pp512` column, not the old bare `ub`; (2) the printed
+# row's ub@pp512 cell reads 512 -- the pp512 row's OWN cell, per
+# parse_ub_cell, never the pp128 row's distinct 128 (this is a real
+# per-row shape, so unlike case 19 there IS a wrong value a regression to
+# reading the wrong row could print); (3) -ub still never reaches the
+# bench's argv when --ubatch was not given, exactly like case 18/19.
+UB_AUDIT_POST4A="$T/bench-argv-ub-post4a.log"
+: > "$UB_AUDIT_POST4A"
+BENCH_UB_POST4A="$T/fake-bench-ub-post4a.sh"
+mk_fake_bench_ub_rows "$BENCH_UB_POST4A" "1000.00" "1000.00" "900.00" "850.00" \
+    "128" "512" "512" "512" "$UB_AUDIT_POST4A"
+out="$("$SCALING" --bench "$BENCH_UB_POST4A" --only mistral,b70 "${GUARD_HOOKS[@]}" 2>&1)" && rc=0 || rc=$?
+[ "$rc" -eq 0 ] || { echo "FAIL: post-4a default-run shape case must PASS (exit 0), got $rc. Output:
+$out"; fail=1; }
+grep -qF "ub@pp512" <<< "$out" || { echo "FAIL: expected the report header to print the renamed ub@pp512 column (got: $out)"; fail=1; }
+grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+512[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to read 512 from the pp512 row's own cell, not 128 from the pp128 row (got: $out)"; fail=1; }
+grep -q -- "-ub" "$UB_AUDIT_POST4A" && { echo "FAIL: -ub must not reach the bench when --ubatch was not given (audit: $(cat "$UB_AUDIT_POST4A"))"; fail=1; }
 
 # Expected total is a LITERAL, not derived from anything else in this file --
 # bump it whenever a case is added or removed above. Without this, a case
 # whose cases=$((cases+1)) increment is missing, misplaced, or silently
 # dropped would just change the printed digit rather than fail the suite
 # (llama.cpp-3e0f quality review round 1, finding Q6).
-[ "$cases" -eq 33 ] || { echo "FAIL: expected 33 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
+[ "$cases" -eq 34 ] || { echo "FAIL: expected 34 test cases to have run, got $cases (a case's cases=\$((cases+1)) increment is missing, misplaced, or this literal needs bumping)"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "OK: prefill scaling parser and ratio verdict ($cases cases)" || exit 1

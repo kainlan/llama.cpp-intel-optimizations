@@ -124,23 +124,38 @@
 # through unvalidated ("N" or the literal "auto") -- llama-bench itself is
 # the authority on what -ub accepts; this script does not second-guess it.
 #
-# The table gains a `ub` column, right after `card`, populated from
+# The table gains a `ub@pp512` column, right after `card`, populated from
 # llama-bench's OWN markdown output by COLUMN POSITION (the header row's
 # `n_ubatch` cell index, never a regex over the number -- see
-# find_header_index/parse_ub_cell below): "-" when the table carries no
-# n_ubatch column at all, the reported value when it does. llama-bench's OWN
-# condition for emitting that column (tools/llama-bench/llama-bench.cpp,
-# markdown_printer) is `n_ubatch.size() > 1 || n_ubatch != cmd_params_defaults.n_ubatch`
-# (default `{512}`) -- i.e. the column appears whenever -ub is swept OR
-# given a single value other than the built-in default 512, so `--ubatch
-# 512` still shows "-" while `--ubatch 1024` shows the column. (Task 4a of
-# this plan changes llama-bench's own SYCL default to "auto", which moves
-# this boundary -- re-check this paragraph once that lands.) The column is
-# REPORT-ONLY and read ONLY from what llama-bench itself printed -- NEVER
-# echoed back from --ubatch/UBATCH when the column is absent, even though
-# this script knows what it asked for: the ratio1024 verdict and this
-# script's exit code are computed exactly as before this flag existed, from
-# pp128/pp512/pp1024/pp2048 alone.
+# find_header_index/parse_ub_cell below), read from the pp512 row
+# specifically -- the name says so on its face; per-row values are a
+# later enhancement, not implemented here (see parse_ub_cell's own
+# comment for why pp512 alone no longer stands in for the other rows):
+# "-" when the table carries no n_ubatch column at all, the pp512 row's
+# reported value when it does. llama-bench's OWN condition for emitting
+# the n_ubatch column at all (tools/llama-bench/llama-bench.cpp,
+# markdown_printer / bench_prints_n_ubatch_column in
+# llama-bench-parse.hpp) is `n_ubatch.size() > 1 || n_ubatch !=
+# cmd_params_defaults.n_ubatch || -1 in n_ubatch` (the last clause is the
+# "-ub auto" sentinel). Off SYCL, the built-in default is `{512}` and
+# that sentinel clause never fires, so the pre-existing rule stands: the
+# column appears only when -ub is swept or given a single value other
+# than 512, so `--ubatch 512` still shows "-" while `--ubatch 1024` shows
+# the column. Under SYCL (Task 4a, llama.cpp-y8xv, merged in 6419b06bf,
+# docs/plans/2026-09-10-auto-ubatch.md), the built-in default n_ubatch IS
+# that sentinel (`{-1}`), so the clause fires on every SYCL run -- bare,
+# swept, or an explicit single value -- and the column is now ALWAYS
+# present under SYCL. Its value is also no longer one fixed number per
+# invocation: llama-bench prints llama_n_ubatch(ctx), RESOLVED per pp-row
+# instance (see parse_ub_cell), so a bare default SYCL run shows
+# 128/512/512/512 across this script's own pp128/pp512/pp1024/pp2048
+# rows and an explicit `-ub 1024` run shows 128/512/1024/1024; this
+# column reads only the pp512 row's own cell, 512 in both examples above.
+# The column is REPORT-ONLY and read ONLY from what llama-bench itself
+# printed -- NEVER echoed back from --ubatch/UBATCH when the column is
+# absent, even though this script knows what it asked for: the
+# ratio1024 verdict and this script's exit code are computed exactly as
+# before this flag existed, from pp128/pp512/pp1024/pp2048 alone.
 set -euo pipefail
 export LC_NUMERIC=C
 
@@ -373,10 +388,11 @@ parse_cell() {
 # the HEADER row by name, without a second, different mechanism. Echoes
 # the index, or "" when the log is unreadable, no header row is found, or
 # that header has no column named $2 -- llama-bench omits the n_ubatch
-# column outright unless -ub was swept or given a single value other than
-# its own built-in default (see the file header's --ubatch paragraph for
-# the exact condition and its `--ubatch 512` corner case); this is how
-# that legitimate case is told apart from a malformed table below.
+# column outright off SYCL unless -ub was swept or given a single value
+# other than its own built-in default, and never omits it under SYCL
+# (see the file header's --ubatch paragraph for the exact condition,
+# both branches, and the `--ubatch 512` corner case); this is how that
+# legitimate case is told apart from a malformed table below.
 find_header_index() {
     local log="$1" col="$2"
     [ -r "$log" ] || { echo ""; return 0; }
@@ -398,25 +414,29 @@ find_header_index() {
     ' "$log"
 }
 
-# parse_ub_cell: the `ub` column value for one pair's table, read from
-# llama-bench's own `n_ubatch` column BY COLUMN POSITION (never a regex on
-# the number -- a bare integer/word cell elsewhere in the same row cannot
-# be told apart from an n_ubatch value by pattern alone, only by which
-# column it sits in). llama-bench reports the same n_ubatch value on every
-# row of a single invocation (this script never sweeps -ub itself), so the
-# pp512 row -- already required to be present for the ratio1024 verdict --
-# is read as the one canonical source.
+# parse_ub_cell: the `ub@pp512` column value for one pair's table, read
+# from llama-bench's own `n_ubatch` column BY COLUMN POSITION (never a
+# regex on the number -- a bare integer/word cell elsewhere in the same
+# row cannot be told apart from an n_ubatch value by pattern alone, only
+# by which column it sits in), from the pp512 ROW specifically -- not
+# "the" n_ubatch value for the whole invocation, because post-Task-4a it
+# no longer is one (see below). The pp512 row -- already required to be
+# present for the ratio1024 verdict -- is read as the fixed, named
+# source; the column is named ub@pp512, not ub, so that scope is on its
+# face. Reading every pp row and printing per-row values is a later
+# enhancement, not implemented here.
 #
-# (Task 4a of this plan, llama.cpp-y8xv (unmerged), falsifies "same value on
-# every row": llama-bench prints llama_n_ubatch(ctx), which the
-# llama_context constructor clamps per instance to min(n_batch,
-# params.n_ubatch), with n_batch itself clamped to min(n_ctx,
-# params.n_batch) and n_ctx = n_prompt + n_gen -- so one `-ub 1024`
-# invocation yields 128 / 512 / 1024 / 1024 across this script's own
-# pp128/pp512/pp1024/pp2048 rows. Once 4a lands, this pp512-only read no
-# longer stands in for the other rows' actual n_ubatch: the column must be
-# read per pp row (or renamed ub@pp512) -- re-check this paragraph once that
-# lands. Until then, the pp512 read here stands.)
+# Why pp512 alone no longer stands in for the other rows (Task 4a,
+# llama.cpp-y8xv, merged in 6419b06bf): llama-bench prints
+# llama_n_ubatch(ctx), which the llama_context constructor resolves PER
+# INSTANCE (src/llama-context.cpp): with causal attention, n_batch is
+# itself clamped to min(n_ctx, params.n_batch) (n_ctx = n_prompt + n_gen
+# + n_depth; n_depth = 0 here, this gate never passes -d), and n_ubatch =
+# min(n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch).
+# So one `-ub 1024` invocation yields 128 / 512 / 1024 / 1024 across this
+# script's own pp128/pp512/pp1024/pp2048 rows, and a bare default SYCL
+# run (built-in default is the auto sentinel) yields 128/512/512/512 --
+# not one uniform value in either case.
 #
 # Echoes "-" (never an error) in TWO distinct cases, deliberately not told
 # apart by the caller:
@@ -454,7 +474,7 @@ parse_ub_cell() {
 # a header/row drift would not have been caught by any assertion).
 row() { printf '%-20s %-6s %6s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
 
-row "model" "card" "ub" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
+row "model" "card" "ub@pp512" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
 
 # any_fail / any_error / any_selected decide the FINAL exit code only after
 # every requested pair has been attempted -- never derived incrementally
