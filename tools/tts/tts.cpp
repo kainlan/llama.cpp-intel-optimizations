@@ -67,8 +67,9 @@ int main(int argc, char ** argv) {
 
     // always enable embd, so that we can pass hidden states to the audio generation helper
     params.embedding = true;
-    // non-causal-style embedding path (llama.cpp-ubj8): keep the micro-batch a
-    // later auto trial cannot shrink, same pairing as common/arg.cpp's --embedding handler.
+    // params.embedding reaches cparams through common_context_params_to_llama(), which
+    // copies n_ubatch_auto (true by default under SYCL), so every writer of it clears the
+    // auto trial; same pairing as common/arg.cpp's --embedding handler (llama.cpp-ubj8).
     params.n_ubatch_auto = false;
 
     llama_backend_init();
