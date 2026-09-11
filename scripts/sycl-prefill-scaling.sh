@@ -295,7 +295,7 @@ for model_entry in "${MODELS[@]}"; do
     }
 done
 
-# find_row: the LAST markdown table row of $1 whose `test` cell equals $2
+# find_row: the LAST markdown table row of $1 in which ANY cell equals $2
 # exactly -- never a substring match, so "pp128" cannot accidentally match
 # a hypothetical "pp1280" row or a non-data line that merely contains the
 # string "pp128" (scripts/sycl-decode-mode-capture.sh's parse_tg128 hit
@@ -325,7 +325,7 @@ find_row() {
 }
 
 # parse_cell: extracts the numeric t/s value (first token, spread stripped)
-# from the row find_row returns for the `test` cell $2. Prints "" (not an
+# from the row find_row returns for the `test`-cell value $2. Prints "" (not an
 # error) when the row or its value is missing or not a plain decimal -- the
 # caller decides what that means.
 parse_cell() {
@@ -366,8 +366,8 @@ parse_cell() {
 # named $2 in the markdown table HEADER row of $1 -- the row whose OWN
 # cells are column NAMES, not data. Anchored on the header carrying a
 # literal "test" cell: every llama-bench markdown table names one of its
-# own columns "test" (llama-bench's own markdown_printer), and no DATA
-# row's `test` cell ever holds that literal word (a data row's test cell
+# own columns "test" (llama-bench's own markdown_printer), and no data row
+# has ANY cell equal to the literal word `test` (a data row's test cell
 # holds a value like "pp128"), so the same "exact cell match" idiom
 # parse_cell already uses to find a DATA row by value doubles here to find
 # the HEADER row by name, without a second, different mechanism. Echoes
@@ -406,6 +406,17 @@ find_header_index() {
 # row of a single invocation (this script never sweeps -ub itself), so the
 # pp512 row -- already required to be present for the ratio1024 verdict --
 # is read as the one canonical source.
+#
+# (Task 4a of this plan, llama.cpp-y8xv (unmerged), falsifies "same value on
+# every row": llama-bench prints llama_n_ubatch(ctx), which the
+# llama_context constructor clamps per instance to min(n_batch,
+# params.n_ubatch), with n_batch itself clamped to min(n_ctx,
+# params.n_batch) and n_ctx = n_prompt + n_gen -- so one `-ub 1024`
+# invocation yields 128 / 512 / 1024 / 1024 across this script's own
+# pp128/pp512/pp1024/pp2048 rows. Once 4a lands, this pp512-only read no
+# longer stands in for the other rows' actual n_ubatch: the column must be
+# read per pp row (or renamed ub@pp512) -- re-check this paragraph once that
+# lands. Until then, the pp512 read here stands.)
 #
 # Echoes "-" (never an error) in TWO distinct cases, deliberately not told
 # apart by the caller:
