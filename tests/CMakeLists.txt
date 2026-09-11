@@ -3188,3 +3188,22 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
+
+# llama.cpp-tsfl: source gate for nphx Task 2 -- (A) the two compute-buffer
+# host-pinned fallback paths inside
+# ggml_backend_sycl_buffer_type_alloc_buffer() must be GGML_LOG_WARN (not
+# INFO) and counted in a per-device g_compute_buffer_host_fallbacks[]
+# counter, reset on the runtime-context transaction's own successful
+# (publishing) path; (B) the transaction and a new non-publishing probe,
+# ggml_backend_sycl_probe_runtime_context_for_model(), share one static
+# body up to (not including) the plan-publication CAS, with candidate
+# refusals dropping to GGML_LOG_INFO in probe mode. Host-only, reads the
+# sources as text. Same registration shape as
+# test-sycl-ubatch-ring-replan-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-compute-buffer-fallback-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-compute-buffer-fallback-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()

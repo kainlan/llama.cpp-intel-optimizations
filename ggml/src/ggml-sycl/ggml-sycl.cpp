@@ -16598,6 +16598,46 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
     return static_cast<uint32_t>((cells / 256) * 256);
 }
 
+// llama.cpp-tsfl: incremented by ggml_backend_sycl_buffer_type_alloc_buffer()
+// (defined much further below in this file) on both its host-pinned
+// compute-buffer fallback paths (oversize request, and a failed device
+// alloc retried host-pinned); reset to 0 by
+// ggml_sycl_run_runtime_context_transaction()'s own publish-path success.
+// Declared here (rather than next to the alloc function that increments it)
+// because ggml_sycl_run_runtime_context_transaction() below -- which resets
+// it -- is defined EARLIER in this translation unit than that function; a
+// plain static file-scope variable must be declared before every point that
+// uses it. See ggml_backend_sycl_compute_buffer_host_fallbacks() (ggml-sycl.h)
+// for the public accessor and the "delta, not lifetime total" contract.
+static std::atomic<uint64_t> g_compute_buffer_host_fallbacks[GGML_SYCL_MAX_DEVICES] = {};
+
+uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_compute_buffer_host_fallbacks[device].load(std::memory_order_relaxed);
+}
+
+// llama.cpp-tsfl (nphx comment c-wgxn): a runtime-context transaction
+// candidate refusal logs at GGML_LOG_ERROR on the publishing path (default
+// verbosity must show it -- GGML_LOG_INFO is dropped there, see this
+// section's other functions' own comments), but at GGML_LOG_INFO when it is
+// only being evaluated by ggml_backend_sycl_probe_runtime_context_for_model()'s
+// non-publishing probe, whose whole point is to be tried and rejected
+// repeatedly and quietly (Task 4b's ascending micro-batch trial). Used only
+// at genuine CANDIDATE refusal sites -- not at a "this should be
+// impossible" anomaly (e.g. a restore that itself fails), which stays
+// GGML_LOG_ERROR unconditionally because it means something is actually
+// broken, probe or not.
+#define GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode, ...) \
+    do {                                               \
+        if (probe_mode) {                              \
+            GGML_LOG_INFO(__VA_ARGS__);                \
+        } else {                                       \
+            GGML_LOG_ERROR(__VA_ARGS__);               \
+        }                                              \
+    } while (0)
+
 // Attempts to move full-attention KV overflow for `plan` -- a scratch COPY of
 // the runtime-update candidate -- onto the host tier and re-validate through
 // the same MMID gate every other plan goes through. `plan` is mutated in
@@ -16613,7 +16653,8 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
                                             uint32_t                                              n_ctx,
                                             size_t                               old_moe_mmid_device_pool_bytes,
                                             ggml_sycl::kv_demotion_result *      out_demotion,
-                                            ggml_sycl::moe_mmid_runtime_reason * out_reason) {
+                                            ggml_sycl::moe_mmid_runtime_reason * out_reason,
+                                            bool                                 probe_mode = false) {
     // Retained for a future multi-device demotion path; the hard refusal
     // below means it is not read on the branch that would have used it.
     GGML_UNUSED(old_mmid_charges);
@@ -16661,7 +16702,8 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
         // best-effort one.
         return false;
     } else if (plan.vram_bytes > SIZE_MAX - old_moe_mmid_device_pool_bytes) {
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow (demotion retry) -- "
             "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
             n_ctx, plan.vram_bytes / (1024.0 * 1024.0), old_moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
@@ -16704,7 +16746,8 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
                                                uint32_t n_ubatch,
                                                uint32_t n_head,
                                                bool     flash_attn_enabled,
-                                               bool     allow_replan) {
+                                               bool     allow_replan,
+                                               bool     probe_mode = false) {
     if (flash_attn_enabled) {
         return true;
     }
@@ -16833,7 +16876,8 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     const size_t   capacity_bytes = ggml_sycl::unified_cache_nonfa_attn_scratch_headroom_capacity_bytes(free_mem);
     const uint32_t fits_headroom_ctx =
         ggml_sycl::unified_cache_largest_fitting_n_ctx_for_nonfa_attn_scratch(capacity_bytes, n_head, n_ubatch);
-    GGML_LOG_ERROR(
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
         "[SYCL-PLAN] runtime context update rejected: non-FA attention scratch exceeds the device's "
         "outside-arena headroom -- n_ctx=%u n_ubatch=%u n_head=%u needs=%.1f MB (demand %.1f MB + reserve "
         "%.1f MB) free=%.1f MB over_by=%.1f MB\n",
@@ -16843,12 +16887,14 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
     // comparison, so it is an experimentation knob (llama.cpp-k1ev), not a
     // fix a user should reach for. Flash attention or a smaller context are
     // the only remediations with hardware support.
-    GGML_LOG_ERROR(
+    GGML_SYCL_RUNTIME_TXN_REFUSAL(
+        probe_mode,
         "[SYCL-PLAN] flash attention is disabled for this context and the non-FA attention path does not "
         "fit the device budget at this length; pass -fa 1/auto to use flash attention, or reduce -c/-p%s\n",
         fits_headroom_ctx >= 256 ? "" : " (no non-FA context at this shape is known to fit this device)");
     if (fits_headroom_ctx >= 256) {
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] the largest non-FA context estimated to fit this device's current headroom is "
             "about -c %u (headroom-limited; EMPIRICAL reserve, see docs/backend/sycl-memory-design.md)\n",
             fits_headroom_ctx);
@@ -16954,7 +17000,18 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // refuses BEFORE even attempting Step 3 when the new ring cannot fit
 // zone_available(RUNTIME) on the arena route, reproducing the exact same
 // refusal template without depending on the allocator-level behavior alone.
-static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
+// llama.cpp-tsfl: `probe_mode` (default false, unchanged behaviour) is set
+// by the shared runtime-context transaction body when it is only evaluating
+// a candidate for ggml_backend_sycl_probe_runtime_context_for_model() -- it
+// downgrades this function's own refusal logging to GGML_LOG_INFO. It does
+// NOT change what this function actually does: Steps 1-3 below still
+// physically release and (re)reserve the ring exactly as on the publishing
+// path, because the probe's caller needs the real fit-or-not answer; the
+// caller is responsible for calling this function a second time with the
+// pre-transaction n_ubatch (also probe_mode=true) to roll the physical ring
+// back before returning, the same way the publish path's own later-failure
+// sites already do.
+static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, bool probe_mode = false) {
     const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     if (weight_slot_bytes == 0) {
         return true;  // dense model: no MoE PP ring was ever planned
@@ -16985,7 +17042,8 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         // above already implies a ring was planned) or the multiply/align
         // overflowed -- refuse rather than reserve a wrapped, small-looking
         // size.
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring slot sizing for n_ubatch=%u "
             "overflowed (device=%d)\n",
             n_ubatch, device);
@@ -17015,7 +17073,8 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     // dispatch) is treated as a re-plan failure -- the ceiling has not been
     // touched yet at this point, so nothing needs restoring.
     if (!cache->release_pp_moe_onednn_scratch_ring()) {
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring re-plan for n_ubatch=%u could "
             "not release the existing ring (still claimed by an in-flight dispatch); device=%d\n",
             n_ubatch, device);
@@ -17066,7 +17125,8 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
         if (fits >= 32) {
             std::snprintf(fits_clause, sizeof(fits_clause), "; the largest -ub that fits is about %u", fits);
         }
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB "
             "(weights %.1f + activation %.1f + output %.1f, ring depth %u) but the %s zone has %.1f MB "
             "available%s\n",
@@ -17111,29 +17171,52 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch) {
     return refuse_and_restore();
 }
 
-void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
-                                           uint32_t       n_ctx,
-                                           uint32_t       n_ubatch,
-                                           uint32_t       n_seq_max,
-                                           bool           flash_attn_enabled) {
+// llama.cpp-tsfl (nphx comment c-wgxn): shared by
+// ggml_backend_sycl_set_runtime_context() (the publishing path,
+// probe_mode=false, out=nullptr, below) and
+// ggml_backend_sycl_probe_runtime_context_for_model()'s non-publishing probe
+// (probe_mode=true) up to (not including) the CAS at
+// ggml_sycl::lifecycle_replace_placement_plan() far below -- neither wrapper
+// duplicates any of the KV/MMID/non-FA/ring admission logic; see that CAS
+// call site's own comment for the exact boundary. `out` is filled
+// (accepted/would_demote_kv/host_kv_bytes/reason) on every return when
+// non-NULL; the publishing path always passes out=nullptr, so every
+// `if (out)`/`refuse(...)` below is then just a bool return for it.
+static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t                    backend,
+                                                      uint32_t                          n_ctx,
+                                                      uint32_t                          n_ubatch,
+                                                      uint32_t                          n_seq_max,
+                                                      bool                              flash_attn_enabled,
+                                                      bool                              probe_mode,
+                                                      ggml_sycl_runtime_context_probe * out) {
+    auto refuse = [&](const char * reason) -> bool {
+        if (out) {
+            out->accepted        = false;
+            out->would_demote_kv = false;
+            out->host_kv_bytes   = 0;
+            out->reason          = reason;
+        }
+        return false;
+    };
+
     if (!backend || n_ctx == 0) {
-        return;
+        return refuse("invalid arguments (null backend or n_ctx=0)");
     }
 
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
     if (!ctx) {
-        return;
+        return refuse("backend has no SYCL context");
     }
 
     const auto current = ggml_sycl_global_plan_snapshot();
     if (!current || !current->plan) {
-        return;
+        return refuse("no plan currently published");
     }
     if (g_runtime_expected_model_set && (current->model_id != g_runtime_expected_model.model_id ||
                                          current->load_txn_id != g_runtime_expected_model.load_txn_id ||
                                          current->slot != g_runtime_expected_model.slot ||
                                          current->slot_generation != g_runtime_expected_model.slot_generation)) {
-        return;
+        return refuse("stale identity (published plan changed underneath this call)");
     }
     const ggml_sycl::lifecycle::ModelToken current_token{
         { current->model_id },
@@ -17147,12 +17230,12 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     auto owned_update = g_runtime_external_lease ? ggml_sycl::lifecycle::live_update_guard{} :
                                                    registry.acquire_live_update(current_token);
     if (!g_runtime_external_lease && !owned_update) {
-        return;
+        return refuse("busy (could not acquire a live-update lease)");
     }
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
-        return;
+        return refuse("busy (plan changed while acquiring the transaction lock)");
     }
     auto next_kv_info = current->kv_info;
     if (n_ubatch > 0) {
@@ -17164,11 +17247,12 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
     if (!next_plan.rebuild_runtime_per_device_vram()) {
-        GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device KV accounting failed -- "
-                       "n_ctx=%u n_ubatch=%u kv=%.1f MB budget=%.1f MB\n",
-                       n_ctx, next_kv_info.n_ubatch, next_plan.kv_vram_bytes / (1024.0 * 1024.0),
-                       next_plan.vram_budget / (1024.0 * 1024.0));
-        return;
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                      "[SYCL-PLAN] runtime KV update rejected: per-device KV accounting failed -- "
+                                      "n_ctx=%u n_ubatch=%u kv=%.1f MB budget=%.1f MB\n",
+                                      n_ctx, next_kv_info.n_ubatch, next_plan.kv_vram_bytes / (1024.0 * 1024.0),
+                                      next_plan.vram_budget / (1024.0 * 1024.0));
+        return refuse("per-device KV accounting failed");
     }
     std::vector<std::pair<int, size_t>> old_mmid_charges;
     for (const auto & workspace : current->plan->moe_mmid_workspaces) {
@@ -17178,21 +17262,23 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         if (!ggml_sycl::moe_mmid_reaccount_replacement({}, old_mmid_charges, next_plan.devices,
                                                         next_plan.per_device_vram_budgets,
                                                         &next_plan.per_device_vram, &next_plan.vram_bytes)) {
-            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded -- "
-                           "n_ctx=%u n_ubatch=%u vram=%.1f MB (weights %.1f + kv %.1f) budget=%.1f MB\n",
-                           n_ctx, next_kv_info.n_ubatch, next_plan.vram_bytes / (1024.0 * 1024.0),
-                           next_plan.weight_vram_bytes / (1024.0 * 1024.0),
-                           next_plan.kv_vram_bytes / (1024.0 * 1024.0),
-                           next_plan.vram_budget / (1024.0 * 1024.0));
-            return;
+            GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                          "[SYCL-PLAN] runtime KV update rejected: per-device budget exceeded -- "
+                                          "n_ctx=%u n_ubatch=%u vram=%.1f MB (weights %.1f + kv %.1f) budget=%.1f MB\n",
+                                          n_ctx, next_kv_info.n_ubatch, next_plan.vram_bytes / (1024.0 * 1024.0),
+                                          next_plan.weight_vram_bytes / (1024.0 * 1024.0),
+                                          next_plan.kv_vram_bytes / (1024.0 * 1024.0),
+                                          next_plan.vram_budget / (1024.0 * 1024.0));
+            return refuse("per-device budget exceeded");
         }
     } else {
         if (next_plan.vram_bytes > SIZE_MAX - current->plan->moe_mmid_device_pool_bytes) {
-            GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow -- "
-                           "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
-                           n_ctx, next_plan.vram_bytes / (1024.0 * 1024.0),
-                           current->plan->moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
-            return;
+            GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
+                                          "[SYCL-PLAN] runtime KV update rejected: VRAM accounting overflow -- "
+                                          "n_ctx=%u vram=%.1f MB mmid_pool=%.1f MB\n",
+                                          n_ctx, next_plan.vram_bytes / (1024.0 * 1024.0),
+                                          current->plan->moe_mmid_device_pool_bytes / (1024.0 * 1024.0));
+            return refuse("VRAM accounting overflow");
         }
         next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
     }
@@ -17202,6 +17288,16 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
     bool replan_ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(next_plan, g_tensor_inventory_detail,
                                                                        next_kv_info.n_expert_used, &replan_reason);
+
+    // llama.cpp-tsfl: filled when the "over budget -> try host-tier
+    // demotion" branch just below actually demotes KV -- read into the
+    // probe's out->would_demote_kv/out->host_kv_bytes on acceptance. The
+    // demotion pass itself only ever mutates a local placement_plan COPY
+    // (demoted_plan below, or next_plan once adopted), never global cache
+    // state (see ggml_sycl_try_demote_runtime_kv() above), so it is
+    // inherently probe-safe: nothing to roll back either way.
+    bool   kv_was_demoted        = false;
+    size_t kv_demoted_host_bytes = 0;
 
     // Over budget: try re-placing full-attn KV overflow to the host tier
     // (owner ruling llama.cpp-uize c-qjb5) before refusing. Only the two
@@ -17221,7 +17317,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         ggml_sycl::moe_mmid_runtime_reason demote_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
         if (ggml_sycl_try_demote_runtime_kv(
                 demoted_plan, old_mmid_charges, g_tensor_inventory_detail, next_kv_info.n_expert_used, n_ctx,
-                current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason)) {
+                current->plan->moe_mmid_device_pool_bytes, &demotion_result, &demote_reason, probe_mode)) {
             // The "-c" figure describes what fits without ANY demotion, so it
             // must read the pre-demotion next_plan, not demoted_plan: the
             // demoted layers no longer count against budget in
@@ -17233,6 +17329,8 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                 "Largest all-VRAM context is about -c %u\n",
                 demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0), n_ctx,
                 ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+            kv_was_demoted        = true;
+            kv_demoted_host_bytes = demotion_result.host_kv_bytes_added;
             next_plan = std::move(demoted_plan);
             replan_ok = true;
         } else if (demote_reason != ggml_sycl::moe_mmid_runtime_reason::OK) {
@@ -17258,9 +17356,12 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         //
         // ERROR, not INFO, and deliberately: GGML_LOG_INFO is dropped at default
         // verbosity, so a diagnostic emitted at INFO is invisible in exactly the
-        // runs that need it.
+        // runs that need it. (In probe mode this drops to INFO regardless -- a
+        // probe is tried and rejected repeatedly by design; see
+        // GGML_SYCL_RUNTIME_TXN_REFUSAL's own comment.)
         const double mb = 1024.0 * 1024.0;
-        GGML_LOG_ERROR(
+        GGML_SYCL_RUNTIME_TXN_REFUSAL(
+            probe_mode,
             "[SYCL-PLAN] runtime KV update rejected: %s -- n_ctx=%u n_ubatch=%u vram=%.1f MB "
             "(weights %.1f + kv %.1f) budget=%.1f MB over_by=%.1f MB\n",
             ggml_sycl::moe_mmid_runtime_reason_name(replan_reason), n_ctx, next_kv_info.n_ubatch,
@@ -17271,13 +17372,14 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
             replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED) {
             const uint32_t fits = ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info);
             if (fits >= 256) {
-                GGML_LOG_ERROR(
+                GGML_SYCL_RUNTIME_TXN_REFUSAL(
+                    probe_mode,
                     "[SYCL-PLAN] the KV cache for this context does not fit the device budget; "
                     "the largest context that fits is about -c %u\n",
                     fits);
             }
         }
-        return;
+        return refuse(ggml_sycl::moe_mmid_runtime_reason_name(replan_reason));
     }
 
     // llama.cpp-oyfl: the KV/MMID replan above fits the device budget, but a
@@ -17327,10 +17429,18 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // runs for its own INFO logging. Do not reintroduce a zone-capacity or
     // compute-buffer-regrowth-only predicate without new hardware evidence
     // that k1ev's consumer is understood and bounded.
+    // llama.cpp-tsfl: allow_replan=!probe_mode -- the opportunistic SCRATCH
+    // zone raise this performs on success is a real, permanent device-state
+    // side effect (unified_cache_ensure_planned_arena_zones()), so a probe
+    // must not trigger it. The fit-or-refuse DECISION itself does not depend
+    // on allow_replan (it compares nonfa_demand, computed from the n_ctx/
+    // n_ubatch/n_head arguments directly, against a fresh live free-memory
+    // read that always happens) -- so allow_replan=false gives the identical
+    // answer for a probe, just without the zone-growth side effect.
     if (!ggml_sycl_check_nonfa_attn_scratch(ctx->device, n_ctx, next_kv_info.n_ubatch, next_plan.planner_n_head_all_max,
                                             flash_attn_enabled,
-                                            /*allow_replan=*/true)) {
-        return;
+                                            /*allow_replan=*/!probe_mode, probe_mode)) {
+        return refuse("non-FA attention scratch exceeds the device's outside-arena headroom");
     }
 
     // llama.cpp-ibj0: the PP MoE oneDNN scratch ring was sized at model load
@@ -17343,11 +17453,49 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     // exhaustion, MMID materialization) can roll the ring back to what it
     // was if THEY abort the transaction after the ring has already changed
     // (spec round 1 F8 -- an atomicity gap the pre-round-1 code left open).
+    // llama.cpp-tsfl: also read/used by the probe_mode branch immediately
+    // below to roll ITS OWN ring re-plan back before returning.
     const uint32_t pre_replan_pp_moe_ring_n_ubatch =
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(ctx->device);
-    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch)) {
-        return;  // refusal already logged with the largest fitting -ub
+    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode)) {
+        // refusal already logged (ERROR normally, INFO in probe mode) with
+        // the largest fitting -ub
+        return refuse("PP MoE oneDNN scratch ring does not fit");
     }
+
+    if (probe_mode) {
+        // llama.cpp-tsfl: every candidate check up to this point has passed
+        // (KV/MMID budget, non-FA attention scratch, PP MoE oneDNN ring) --
+        // but ggml_sycl_replan_pp_moe_onednn_ring() just above already
+        // performed REAL device-state side effects (Step 1 released the old
+        // physical ring, Step 3 reserved the new one), same as the three
+        // publish-path failure sites below. A probe must leave no trace:
+        // roll it back here the same way those three sites do, then return
+        // WITHOUT ever building `next`, consuming a publication ID
+        // (lifecycle_next_plan_publication_id() -- itself a side effect,
+        // even when never published), materializing MMID workspaces, or
+        // reaching THE CAS (ggml_sycl::lifecycle_replace_placement_plan(),
+        // further down) -- none of those three has a defined rollback and
+        // none may run for a candidate nobody is going to act on. This is
+        // the shared body's probe/publish split point.
+        (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch, /*probe_mode=*/true);
+        if (out) {
+            out->accepted        = true;
+            out->would_demote_kv = kv_was_demoted;
+            out->host_kv_bytes   = kv_demoted_host_bytes;
+            out->reason          = "OK";
+        }
+        return true;
+    }
+
+    // llama.cpp-tsfl: the compute-buffer host-pinned-fallback counter is
+    // reset here, on the publish path's own success, right before the plan
+    // that graph_reserve() will allocate compute buffers against is
+    // published -- so ggml_backend_sycl_compute_buffer_host_fallbacks()
+    // always answers "fallbacks since the last successful runtime-context
+    // transaction", never carrying over count from an already-superseded
+    // plan.
+    g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);
 
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
@@ -17368,7 +17516,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         // reserve the old size (see that function's RESTORE ON FAILURE
         // comment for why that is expected not to happen).
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
-        return;
+        return refuse("publication ID exhausted");
     }
     ggml_sycl::moe_mmid_materialize_reason mmid_reason = ggml_sycl::moe_mmid_materialize_reason::OK;
     if (!stable_mmid && !ggml_sycl_materialize_published_mmid_workspaces(current_token, next, &mmid_reason)) {
@@ -17377,7 +17525,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         GGML_LOG_ERROR("[SYCL-PLAN] runtime KV update rejected: MMID workspace materialization failed\n");
         // Same rollback as the publication-ID-exhaustion path above.
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
-        return;
+        return refuse("MMID workspace materialization failed");
     }
     std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> immutable = std::move(next);
     // All potentially throwing cache discovery, alias aggregation, and KV
@@ -17385,6 +17533,11 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     auto prepared_publication = ggml_sycl_prepare_plan_publication_locked(immutable);
     // The live-update ticket prevents exact-token teardown from entering
     // TEARING_DOWN until this CAS/publication transaction finalizes.
+    //
+    // llama.cpp-tsfl: THE CAS. The probe_mode branch above always returns
+    // before this line is ever reached -- that is the "shared static body up
+    // to (not including) the CAS" boundary ggml_sycl_run_runtime_context_
+    // transaction() splits the probe and the publisher across.
     if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {
         if (!stable_mmid) {
             (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
@@ -17398,7 +17551,7 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
         // alone could claim. Roll back to the pre-transaction n_ubatch, same
         // as the two earlier failure paths above.
         (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);
-        return;
+        return refuse("concurrent transaction won the CAS");
     }
     ggml_sycl_publish_prepared_plan_locked(prepared_publication);
     if (!stable_mmid) {
@@ -17425,6 +17578,72 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
             g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
             g_placement_kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
+    if (out) {
+        out->accepted        = true;
+        out->would_demote_kv = kv_was_demoted;
+        out->host_kv_bytes   = kv_demoted_host_bytes;
+        out->reason          = "OK";
+    }
+    return true;
+}
+
+void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
+                                           uint32_t       n_ctx,
+                                           uint32_t       n_ubatch,
+                                           uint32_t       n_seq_max,
+                                           bool           flash_attn_enabled) {
+    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, flash_attn_enabled,
+                                                     /*probe_mode=*/false, /*out=*/nullptr);
+}
+
+// llama.cpp-tsfl (nphx comment c-wgxn): see ggml_sycl_runtime_context_probe
+// and this declaration's own comment in ggml-sycl.h. Refuses up front
+// (GGML_SYCL_LIFECYCLE_STALE_IDENTITY) when `model` does not identify the
+// CURRENTLY PUBLISHED plan -- this probe evaluates candidates against
+// whichever plan is already current; unlike
+// ggml_backend_sycl_set_runtime_context_for_model(), it never itself selects
+// or publishes a different model's plan (no lifecycle_select_placement_plan()
+// call, no ggml_sycl_publish_plan_locked() call, no execution-state binding
+// -- all three are about SELECTING/BINDING a model, a different concern from
+// "does this candidate (n_ctx, n_ubatch) fit", which is all the shared
+// transaction body below answers). Once identity is confirmed, the shared
+// body's own g_runtime_external_lease==false path acquires its own
+// live-update lease from `current` exactly the way a direct (non-for_model)
+// call to ggml_backend_sycl_set_runtime_context() already does -- this probe
+// adds no lease machinery of its own.
+ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggml_backend_t        backend,
+                                                                             ggml_sycl_model_token model,
+                                                                             uint32_t              n_ctx,
+                                                                             uint32_t              n_ubatch,
+                                                                             uint32_t              n_seq_max,
+                                                                             bool                  flash_attn_enabled,
+                                                                             ggml_sycl_runtime_context_probe * out) {
+    if (!out) {
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    *out = ggml_sycl_runtime_context_probe{};
+    if (!backend || !backend->context || n_ctx == 0) {
+        out->reason = "invalid arguments (null backend/context or n_ctx=0)";
+        return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
+    }
+    if (!ggml_backend_is_sycl(backend) || !backend->device ||
+        ggml_backend_dev_backend_reg(backend->device) != ggml_backend_sycl_reg()) {
+        out->reason = "foreign backend";
+        return GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND;
+    }
+    const auto current = ggml_sycl_global_plan_snapshot();
+    if (!current || !current->plan) {
+        out->reason = "no plan currently published";
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+    if (current->model_id != model.model_id || current->load_txn_id != model.load_txn_id ||
+        current->slot != model.slot || current->slot_generation != model.slot_generation) {
+        out->reason = "stale identity: probe targets a model that is not currently published";
+        return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
+    }
+    const bool accepted = ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max,
+                                                                    flash_attn_enabled, /*probe_mode=*/true, out);
+    return accepted ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
 }
 
 // llama.cpp-nphx: thin wrapper so llama-context.cpp (a different translation
@@ -36121,7 +36340,12 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             if (!buft_ctx->allow_shared_fallback) {
                 return nullptr;
             }
-            GGML_LOG_INFO("SYCL: Large buffer (%zu MB) exceeds safe alloc (%zu MB), using host-pinned fallback\n",
+            // llama.cpp-tsfl: WARN, not INFO -- a compute buffer silently
+            // landing in host memory looks identical to a healthy run at
+            // default verbosity (GGML_LOG_INFO is dropped there); counted
+            // in g_compute_buffer_host_fallbacks for Task 4b's trial.
+            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
+            GGML_LOG_WARN("SYCL: Large buffer (%zu MB) exceeds safe alloc (%zu MB), using host-pinned fallback\n",
                           size / (1024 * 1024), safe_alloc / (1024 * 1024));
             req.intent.constraints.must_host_pinned = true;
         } else {
@@ -36159,7 +36383,11 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         // Allocation failed.  If we allowed tier selection and it chose device
         // but the driver rejected it, retry with explicit host-pinned.
         if (!req.intent.constraints.must_host_pinned && buft_ctx->allow_shared_fallback) {
-            GGML_LOG_INFO("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
+            // llama.cpp-tsfl: WARN, not INFO -- see the sibling fallback
+            // above; this path is entered before we know whether the retry
+            // itself will succeed, so count it (and print it) regardless.
+            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
+            GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
             req.intent.constraints.must_device      = false;
             req.intent.constraints.must_host_pinned = true;
             if (ggml_sycl::unified_alloc(req, &main_alloc) && main_alloc.ptr != nullptr) {

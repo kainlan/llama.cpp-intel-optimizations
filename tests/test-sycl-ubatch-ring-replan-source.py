@@ -112,7 +112,15 @@ def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
 # both the plain body-extraction helpers below and every mutation witness's
 # _body_of() call, so a boundary string is spelled in exactly one place.
 _REPLAN_START = "static bool ggml_sycl_replan_pp_moe_onednn_ring("
-_RUNTIME_CONTEXT_START = "void ggml_backend_sycl_set_runtime_context("
+# llama.cpp-tsfl: the transaction body this file's checks pin was extracted
+# out of ggml_backend_sycl_set_runtime_context() into a shared static
+# function, ggml_sycl_run_runtime_context_transaction() (also called, in
+# probe mode, by the new ggml_backend_sycl_probe_runtime_context_for_model())
+# -- ggml_backend_sycl_set_runtime_context() is now a thin wrapper around it.
+# This constant's NAME is kept (it is used throughout this file as both the
+# admission-logic start marker and the ring function's own end marker) but
+# its VALUE now points at the real logic.
+_RUNTIME_CONTEXT_START = "static bool ggml_sycl_run_runtime_context_transaction("
 _RUNTIME_CONTEXT_FOR_MODEL_START = "ggml_backend_sycl_set_runtime_context_for_model("
 _RESERVE_PP_MOE_START = "bool unified_cache::reserve_pp_moe_onednn_scratch("
 _RELEASE_RING_START = "bool unified_cache::release_pp_moe_onednn_scratch_ring("
@@ -164,8 +172,12 @@ def test_transaction_refuses_when_replan_fails():
     context construction, rather than silently publishing a plan whose ring
     the first prefill will refuse anyway."""
     body_norm = _normalize_ws(_runtime_context_body())
+    # llama.cpp-tsfl: the shared transaction body's early returns now go
+    # through a local `refuse(reason)` helper (which fills the probe's `out`
+    # struct when non-NULL before returning false) rather than a bare
+    # `return;` -- match `return refuse(` instead of a literal `return;`.
     assert re.search(
-        r"if\s*\(\s*!\s*ggml_sycl_replan_pp_moe_onednn_ring\([^)]*\)\s*\)\s*\{\s*return\s*;",
+        r"if\s*\(\s*!\s*ggml_sycl_replan_pp_moe_onednn_ring\([^)]*\)\s*\)\s*\{\s*return\s+refuse\(",
         body_norm,
     ), "a failed ggml_sycl_replan_pp_moe_onednn_ring() call must return from the transaction immediately"
 
@@ -176,14 +188,18 @@ def test_replan_call_has_a_mutation_witness():
     the current, correct source.
 
     Counts occurrences rather than asserting total absence: since spec round
-    1 F8 and round 2 F10, ggml_sycl_replan_pp_moe_onednn_ring() is
-    legitimately called FOUR times in this function (the original re-plan,
-    plus three later rollback call sites) -- deleting the original call site
-    must drop the count by exactly one, to three, not zero."""
+    1 F8 and round 2 F10, plus llama.cpp-tsfl's own probe-mode rollback,
+    ggml_sycl_replan_pp_moe_onednn_ring() is legitimately called FIVE times
+    in this function (the original re-plan, the probe_mode branch's own
+    rollback, plus three later publish-path rollback call sites) --
+    deleting the original call site must drop the count by exactly one, to
+    four, not zero."""
     raw = GGML_SYCL_CPP
     call_block = (
-        "    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch)) {\n"
-        "        return;  // refusal already logged with the largest fitting -ub\n"
+        '    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode)) {\n'
+        "        // refusal already logged (ERROR normally, INFO in probe mode) with\n"
+        "        // the largest fitting -ub\n"
+        '        return refuse("PP MoE oneDNN scratch ring does not fit");\n'
         "    }\n\n"
     )
     assert call_block in raw, "mutation target block not found -- update this witness to match the real source"
@@ -196,9 +212,10 @@ def test_replan_call_has_a_mutation_witness():
 
     original_count = _call_count(raw)
     mutated_count = _call_count(mutated_raw)
-    assert original_count == 4, (
-        f"expected exactly four calls in the unmutated source (the re-plan itself plus three rollback call "
-        f"sites) -- found {original_count}; update this witness to match the real source"
+    assert original_count == 5, (
+        f"expected exactly five calls in the unmutated source (the re-plan itself, the probe_mode branch's "
+        f"own rollback, plus three publish-path rollback call sites) -- found {original_count}; update this "
+        "witness to match the real source"
     )
     assert mutated_count == original_count - 1, (
         "mutation witness is broken: deleting the call site must drop the count by exactly one -- found "
@@ -291,14 +308,17 @@ def test_step3_failure_calls_refuse_and_restore_has_a_mutation_witness():
     unmodified (the final `return refuse_and_restore();` changed to
     `return false;`)."""
     raw = GGML_SYCL_CPP
-    original_tail = (
-        "    return refuse_and_restore();\n"
-        "}\n"
-        "\n"
-        "void ggml_backend_sycl_set_runtime_context("
+    # llama.cpp-tsfl: no longer anchored on the following function's name
+    # (ggml_backend_sycl_set_runtime_context() is now a thin wrapper defined
+    # much further below, after ggml_sycl_run_runtime_context_transaction())
+    # -- "return refuse_and_restore();\n}\n" alone (function-closing brace
+    # immediately after) is already unique in the file.
+    original_tail = "    return refuse_and_restore();\n}\n"
+    assert raw.count(original_tail) == 1, (
+        f"mutation target block not found or not unique (count={raw.count(original_tail)}) -- update this "
+        "witness to match the real source"
     )
-    assert original_tail in raw, "mutation target block not found -- update this witness to match the real source"
-    mutated_tail = "    return false;\n}\n\nvoid ggml_backend_sycl_set_runtime_context("
+    mutated_tail = "    return false;\n}\n"
     mutated_raw = raw.replace(original_tail, mutated_tail, 1)
     assert mutated_raw != raw
 
@@ -676,17 +696,21 @@ def test_cas_rollback_upper_bound_has_a_mutation_witness():
     # elsewhere in this function (the other two failure paths), but only
     # THIS occurrence is immediately preceded by "as the two earlier failure
     # paths above." and immediately followed by the publish call.
+    # llama.cpp-tsfl: the CAS-failure path's own `return;` is now
+    # `return refuse("concurrent transaction won the CAS");` (the shared
+    # body's local refuse() helper, which also fills the probe's `out` when
+    # non-NULL) -- text updated to match, structure unchanged.
     old_block = (
         "        // as the two earlier failure paths above.\n"
         "        (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);\n"
-        "        return;\n"
+        '        return refuse("concurrent transaction won the CAS");\n'
         "    }\n"
         "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
     )
     assert old_block in raw, "mutation target block not found -- update this witness to match the real source"
     new_block = (
         "        // as the two earlier failure paths above.\n"
-        "        return;\n"
+        '        return refuse("concurrent transaction won the CAS");\n'
         "    }\n"
         "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
         "    (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch);\n"
