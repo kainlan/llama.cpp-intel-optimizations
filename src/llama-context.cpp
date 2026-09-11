@@ -298,8 +298,13 @@ static llama_context_sycl_exec_hooks llama_context_sycl_exec_procs(ggml_backend_
     return hooks;
 }
 
-static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
-    ggml_backend_dev_t dev) {
+// llama.cpp-xojq (quality round 1 Q4): the null-dev and null-reg checks
+// below were duplicated verbatim across six proc-address lookups (the two
+// pre-existing ones, runtime_proc/recheck_proc, folded into this helper in
+// the same edit that added the four new ones for Task 4b). Every lookup is
+// now one reinterpret_cast wrapping this call with its own symbol name and
+// return type -- no template, since each caller's decltype differs.
+static void * llama_context_sycl_proc_addr(ggml_backend_dev_t dev, const char * name) {
     if (!dev) {
         return nullptr;
     }
@@ -307,8 +312,13 @@ static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_
     if (!reg) {
         return nullptr;
     }
+    return ggml_backend_reg_get_proc_address(reg, name);
+}
+
+static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_sycl_runtime_proc(
+    ggml_backend_dev_t dev) {
     return reinterpret_cast<decltype(&ggml_backend_sycl_set_runtime_context_for_model)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_set_runtime_context_for_model"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_set_runtime_context_for_model"));
 }
 
 // llama.cpp-oyfl: lookup for the NARROW flash-attn-only re-check,
@@ -318,15 +328,8 @@ static decltype(&ggml_backend_sycl_set_runtime_context_for_model) llama_context_
 // rather than a second call into the full transaction).
 static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_context_sycl_recheck_proc(
     ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
     return reinterpret_cast<decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_recheck_runtime_context_flash_attn"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_recheck_runtime_context_flash_attn"));
 }
 
 // llama.cpp-xojq (nphx Task 4b): proc-address lookups for the auto
@@ -340,54 +343,26 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
 // never dereferenced.
 static decltype(&ggml_backend_sycl_probe_runtime_context_for_model) llama_context_sycl_probe_proc(
     ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
     return reinterpret_cast<decltype(&ggml_backend_sycl_probe_runtime_context_for_model)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_probe_runtime_context_for_model"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_probe_runtime_context_for_model"));
 }
 
 static decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks) llama_context_sycl_fallbacks_proc(
     ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
     return reinterpret_cast<decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_compute_buffer_host_fallbacks"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_compute_buffer_host_fallbacks"));
 }
 
 static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_ubatch_enabled_proc(
     ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
     return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_auto_ubatch_enabled"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_auto_ubatch_enabled"));
 }
 
 static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gpu_ubatch_max_proc(
     ggml_backend_dev_t dev) {
-    if (!dev) {
-        return nullptr;
-    }
-    auto * reg = llama_context_sycl_reg_from_dev(dev);
-    if (!reg) {
-        return nullptr;
-    }
     return reinterpret_cast<decltype(&ggml_backend_sycl_moe_gpu_ubatch_max)>(
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_moe_gpu_ubatch_max"));
+        llama_context_sycl_proc_addr(dev, "ggml_backend_sycl_moe_gpu_ubatch_max"));
 }
 #endif
 
@@ -1068,6 +1043,14 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+// llama.cpp-xojq (quality round 1 Q5): shared by this function's own BUSY
+// retry below and sycl_select_auto_ubatch()'s per-candidate probe retry --
+// previously each declared its own local `constexpr int max_busy_waits = 7;`
+// with only a comment tying the two together.
+static constexpr int llama_context_sycl_max_busy_waits = 7;
+#endif
+
 // llama.cpp-oyfl: the constructor's own call, right after model activation,
 // before any auto flash_attn_type is resolved -- the FULL runtime-context
 // transaction (KV replan, MoE MMID reaccount/materialize, plan republish),
@@ -1100,8 +1083,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             // exhaust the model's finite ticket pool transiently. Wait
             // with bounded exponential backoff instead of spinning three
             // immediate calls; preserve BUSY if capacity never frees.
-            constexpr int max_busy_waits = 7;
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
                                         cparams.flash_attn);
@@ -1293,17 +1275,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // compute buffer host-pinned (ggml_backend_sycl_compute_buffer_host_
 // fallbacks() > 0, read AFTER the publish that resets it) also loses. The
 // last candidate that clears all three checks wins; if none do, the floor is
-// today's pre-trial default (already clamped to n_batch at :560-ish, read
-// before this function is entered). The settle step re-publishes and
-// re-reserves at the winner whenever the published plan/sched do not already
-// describe it (a losing final candidate's demand must not be left live) --
-// see c-wgxn's own safety analysis for why a settle-down transaction cannot
-// introduce a new KV demotion (its demand is never larger than one already
-// accepted).
+// today's pre-trial default (already clamped to n_batch by the
+// constructor's own `cparams.n_ubatch = std::min(cparams.n_batch, ...)`
+// assignment, which runs before this function is entered). The settle step
+// re-publishes and re-reserves at the winner whenever the published
+// plan/sched do not already describe it (a losing final candidate's demand
+// must not be left live) -- see c-wgxn's own safety analysis for why a
+// settle-down transaction cannot introduce a new KV demotion (its demand is
+// never larger than one already accepted).
 //
 // Exactly one GGML_LOG_WARN reports the outcome, with one of these stop
-// reasons: "ladder exhausted" (the n_batch/n_ctx cap won), "MoE GPU routing
-// ceiling" (the MoE cap won), "transaction refused", "transaction busy"
+// reasons: "ladder exhausted" (no candidate lost -- either the cap stopped
+// the ladder or all four rungs were accepted), "MoE GPU routing ceiling"
+// (the MoE cap won), "transaction refused", "transaction busy"
 // (BUSY persisted past the backoff), "not the published model"
 // (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second model published after
 // this one loaded), "KV would be demoted", or "compute buffer fell back to
@@ -1371,13 +1355,40 @@ void llama_context::sycl_select_auto_ubatch() {
         }
     }
 
-    const uint32_t fallback_ubatch         = cparams.n_ubatch;  // already clamped, see :560-ish above
+    // llama.cpp-xojq (quality round 1 Q2a): the smallest ladder rung does
+    // not fit at all -- any -c below 512, or llama-bench's own pp128/tg128
+    // rows -- so the trial cannot try a single candidate. Take exactly the
+    // pre-trial path (one reserve at whatever n_ubatch the constructor's
+    // own clamp already resolved) and log no WARN: a WARN here would report
+    // an empty `tried` list against a ladder that never got a chance to
+    // run, and the one WARN this function does log is reserved for "the
+    // trial actually ran".
+    if (cap < ladder[0]) {
+        sched_reserve();
+        return;
+    }
+
+    const auto & owner = model.get_sycl_model_token();
+    // llama.cpp-xojq (quality round 1 Q7): the same zero-token guard
+    // sycl_resync_runtime_context_flash_attn()/sycl_recheck_runtime_context_
+    // flash_attn() apply per backend before building a token -- a model
+    // that never had a SYCL token published is not "not the published
+    // model" (GGML_SYCL_LIFECYCLE_STALE_IDENTITY); it simply has nothing
+    // for the probe to evaluate against. Same no-WARN pre-trial fallback
+    // as the cap check above.
+    if (owner.model_id == 0 || owner.load_txn_id == 0) {
+        sched_reserve();
+        return;
+    }
+    const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot, owner.slot_generation };
+
+    // Already clamped to n_batch by the constructor's own
+    // `cparams.n_ubatch = std::min(cparams.n_batch, ...)` assignment, above.
+    const uint32_t fallback_ubatch         = cparams.n_ubatch;
     uint32_t       last_good               = 0;
     bool           sched_matches_last_good = false;
+    bool           published_any           = false;
     std::string    tried;
-
-    const auto &                owner = model.get_sycl_model_token();
-    const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot, owner.slot_generation };
 
     for (uint32_t c : ladder) {
         if (c > cap) {
@@ -1393,9 +1404,9 @@ void llama_context::sycl_select_auto_ubatch() {
             // Same bounded exponential backoff as
             // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
             // above -- transient lease/lock contention, not a
-            // candidate-shape refusal.
-            constexpr int max_busy_waits = 7;
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+            // candidate-shape refusal. Shares llama_context_sycl_max_busy_
+            // waits with that retry (quality round 1 Q5).
+            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
             }
@@ -1457,6 +1468,13 @@ void llama_context::sycl_select_auto_ubatch() {
         if (candidate_lost) {
             break;
         }
+        // llama.cpp-xojq (quality round 1 Q2b): this publish just took
+        // effect on every SYCL backend (the try above did not throw), so
+        // device state may now differ from fallback_ubatch even if this
+        // candidate goes on to lose the host-fallback check below -- the
+        // settle step's own publish gate reads this flag to know whether
+        // it must correct that state back.
+        published_any      = true;
         sched_need_reserve = true;
         sched_reserve();
         sched_matches_last_good = true;
@@ -1481,21 +1499,35 @@ void llama_context::sycl_select_auto_ubatch() {
         sched_matches_last_good = false;
     }
 
-    // Settle: only when the published plan/sched do not already describe
-    // last_good -- a losing final candidate's demand must not be left live.
+    // Settle: the RESERVE must always run here when this trial has not
+    // already reserved a sched matching last_good -- a context that skips
+    // this entirely (e.g. the very first candidate's probe refused) would
+    // otherwise end up with NO compute buffers at all, since this function
+    // replaces the constructor's own unconditional sched_reserve() call.
+    // The PUBLISH inside it (quality round 1 Q2b) is narrower: skip it when
+    // nothing was ever published this trial AND cparams.n_ubatch (as the
+    // loop left it, before being reset to last_good just below) already
+    // equals fallback_ubatch -- the plan the constructor's own earlier
+    // publish already put in place is then still correct, and republishing
+    // the same value again would be a redundant runtime-context transaction
+    // with no state change (the scenario this finding reported).
     if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
-        cparams.n_ubatch = last_good;
-        sycl_resync_runtime_context_flash_attn();
+        const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;
+        cparams.n_ubatch        = last_good;
+        if (need_publish) {
+            sycl_resync_runtime_context_flash_attn();
+        }
         sched_need_reserve = true;
         sched_reserve();
     }
 
     LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch=%u for n_ctx=%u n_batch=%u (tried %s; %s); pass -ub N to override\n",
                    cparams.n_ubatch, cparams.n_ctx, cparams.n_batch, tried.c_str(), stop);
-    // The constructor's own "n_ubatch = ..." INFO line (above, before this
-    // function's one call site) printed the PRE-TRIAL value; this states
-    // the resolved one.
-    LLAMA_LOG_INFO("%s: n_ubatch = %u (auto)\n", __func__, cparams.n_ubatch);
+    // llama.cpp-xojq (quality round 1 Q6): names the pre-trial value this
+    // line supersedes (the constructor's own "n_ubatch = ..." INFO line
+    // above, before this function's one call site), rather than leaving the
+    // reader to infer it.
+    LLAMA_LOG_INFO("%s: n_ubatch = %u (auto, was %u)\n", __func__, cparams.n_ubatch, fallback_ubatch);
 #else
     sched_reserve();
 #endif

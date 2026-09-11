@@ -254,6 +254,101 @@ def test_candidate_cap_uses_n_batch_and_n_ctx():
     )
 
 
+# ---------------------------------------------------------------------------
+# Early exits before the loop, quality round 1 -- both take the pre-trial
+# path (a bare sched_reserve()) with NO WARN, since the trial never got a
+# chance to try a single candidate.
+# ---------------------------------------------------------------------------
+
+
+def test_cap_below_first_rung_exits_before_the_loop_with_no_warn():
+    """Q2a: when the fully-narrowed cap is below the ladder's first rung
+    (any -c below 512, or llama-bench's pp128/tg128 rows), the function
+    must take the pre-trial path -- sched_reserve() then return -- BEFORE
+    ever entering the ladder loop, and must NOT log the [SYCL-PLAN] WARN
+    (an empty `tried` list against a ladder that never ran)."""
+    body_norm = _normalize_ws(_trial_body())
+    cap_check_idx = body_norm.find("if (cap < ladder[0]) {")
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
+    assert cap_check_idx != -1, "the cap < ladder[0] early exit must exist"
+    assert loop_idx != -1 and warn_idx != -1
+    assert cap_check_idx < loop_idx, "the cap < ladder[0] check must precede the ladder loop"
+    assert cap_check_idx < warn_idx, "the WARN literal must not appear before the cap < ladder[0] check"
+
+    early_exit_block = body_norm[cap_check_idx : body_norm.find("}", cap_check_idx) + 1]
+    assert re.search(r"sched_reserve\(\s*\)\s*;\s*return\s*;", early_exit_block), (
+        "the early exit must call sched_reserve() then return, with no publish and no WARN in between"
+    )
+
+
+def test_cap_below_first_rung_early_exit_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the early exit being deleted (falling through into the loop
+    with an empty ladder that would silently exhaust with an empty
+    `tried` list instead of exiting cleanly beforehand)."""
+    raw = LLAMA_CONTEXT_CPP
+    early_exit_block = (
+        "    if (cap < ladder[0]) {\n"
+        "        sched_reserve();\n"
+        "        return;\n"
+        "    }\n"
+    )
+    assert early_exit_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(early_exit_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "if (cap < ladder[0]) {" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the early-exit check"
+    )
+
+
+def test_zero_sycl_token_exits_before_the_loop_with_no_warn():
+    """Q7: the same zero-token guard sycl_resync_runtime_context_flash_
+    attn()/sycl_recheck_runtime_context_flash_attn() apply per backend
+    (owner.model_id == 0 || owner.load_txn_id == 0) must be applied here
+    too, BEFORE the token is used to enter the loop -- and, like the cap
+    check above, take the pre-trial path with no WARN rather than treating
+    a model with no SYCL token as "not the published model"."""
+    body_norm = _normalize_ws(_trial_body())
+    guard_idx = body_norm.find("if (owner.model_id == 0 || owner.load_txn_id == 0) {")
+    token_idx = body_norm.find("const ggml_sycl_model_token token")
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
+    assert guard_idx != -1, "the zero-token guard must exist"
+    assert token_idx != -1 and loop_idx != -1 and warn_idx != -1
+    assert guard_idx < token_idx < loop_idx, (
+        "the zero-token guard must precede both the token construction and the ladder loop"
+    )
+    assert guard_idx < warn_idx, "the WARN literal must not appear before the zero-token guard"
+
+    guard_block = body_norm[guard_idx : body_norm.find("}", guard_idx) + 1]
+    assert re.search(r"sched_reserve\(\s*\)\s*;\s*return\s*;", guard_block), (
+        "the zero-token guard must call sched_reserve() then return, with no publish and no WARN in between"
+    )
+
+
+def test_zero_sycl_token_guard_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the zero-token guard being deleted."""
+    raw = LLAMA_CONTEXT_CPP
+    guard_block = (
+        "    if (owner.model_id == 0 || owner.load_txn_id == 0) {\n"
+        "        sched_reserve();\n"
+        "        return;\n"
+        "    }\n"
+    )
+    assert guard_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(guard_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "if (owner.model_id == 0 || owner.load_txn_id == 0) {" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the zero-token guard"
+    )
+
+
 def test_moe_model_cap_uses_the_gpu_moe_ubatch_ceiling():
     """For a MoE model (hparams.n_expert > 0), the cap must be additionally
     narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() when that ceiling is
@@ -331,16 +426,25 @@ def test_probe_busy_retries_with_bounded_exponential_backoff():
     """A GGML_SYCL_LIFECYCLE_BUSY probe result must retry with the same
     bounded exponential backoff sycl_resync_runtime_context_flash_attn()
     uses (max 7 waits, 1<<wait ms), not spin immediately or retry
-    unbounded."""
-    body_norm = _normalize_ws(_trial_body())
-    assert re.search(r"constexpr\s+int\s+max_busy_waits\s*=\s*7\s*;", body_norm), (
-        "the BUSY retry must be bounded to 7 waits, matching sycl_resync_runtime_context_flash_attn()"
-    )
+    unbounded. Quality round 1 Q5: both retries share ONE named file-scope
+    constant, llama_context_sycl_max_busy_waits -- neither loop may
+    re-declare its own local max_busy_waits."""
     assert re.search(
-        r"for\s*\(\s*int\s+wait\s*=\s*0\s*;\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*&&\s*wait\s*<\s*max_busy_waits\s*;"
-        r"\s*\+\+wait\s*\)\s*\{",
+        r"static\s+constexpr\s+int\s+llama_context_sycl_max_busy_waits\s*=\s*7\s*;", LLAMA_CONTEXT_CPP_CODE
+    ), "the shared BUSY-retry bound must be declared once as llama_context_sycl_max_busy_waits = 7"
+    assert not re.search(r"constexpr\s+int\s+max_busy_waits\s*=\s*7\s*;", LLAMA_CONTEXT_CPP_CODE), (
+        "neither retry loop may re-declare its own local max_busy_waits -- both must use the shared constant"
+    )
+
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"for\s*\(\s*int\s+wait\s*=\s*0\s*;\s*rc\s*==\s*GGML_SYCL_LIFECYCLE_BUSY\s*&&\s*wait\s*<\s*"
+        r"llama_context_sycl_max_busy_waits\s*;\s*\+\+wait\s*\)\s*\{",
         body_norm,
-    ), "the BUSY retry loop must be gated on rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits"
+    ), (
+        "the BUSY retry loop must be gated on rc == GGML_SYCL_LIFECYCLE_BUSY && wait < "
+        "llama_context_sycl_max_busy_waits"
+    )
     assert "std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait))" in body_norm, (
         "the BUSY retry must sleep 1u << wait milliseconds, matching the exponential backoff shape"
     )
@@ -404,6 +508,13 @@ def test_publish_reserve_order_has_a_mutation_witness():
         "        }\n"
     )
     reserve_block = (
+        "        // llama.cpp-xojq (quality round 1 Q2b): this publish just took\n"
+        "        // effect on every SYCL backend (the try above did not throw), so\n"
+        "        // device state may now differ from fallback_ubatch even if this\n"
+        "        // candidate goes on to lose the host-fallback check below -- the\n"
+        "        // settle step's own publish gate reads this flag to know whether\n"
+        "        // it must correct that state back.\n"
+        "        published_any      = true;\n"
         "        sched_need_reserve = true;\n"
         "        sched_reserve();\n"
     )
@@ -637,6 +748,96 @@ def test_settle_republishes_only_when_needed():
     assert re.search(
         r"if\s*\(\s*!sched_matches_last_good\s*\|\|\s*cparams\.n_ubatch\s*!=\s*last_good\s*\)\s*\{", body_norm
     ), "the settle step must be gated on !sched_matches_last_good || cparams.n_ubatch != last_good"
+
+
+def test_published_any_is_declared_false_and_set_true_after_the_in_loop_publish():
+    """Q2b: published_any must start false and become true right after the
+    in-loop publish succeeds (the try did not throw, so the candidate_lost
+    check just above already returned false) -- tracking whether ANY
+    candidate's publish actually took effect this trial run, independent
+    of whether that candidate goes on to lose the host-fallback check."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r"bool\s+published_any\s*=\s*false\s*;", body_norm), (
+        "published_any must be declared, initialized false"
+    )
+
+    catch_idx = body_norm.find("sched_matches_last_good = false; } if (candidate_lost) { break; }")
+    assert catch_idx != -1, "could not find the try/catch's closing candidate_lost check"
+    published_any_idx = body_norm.find("published_any = true;", catch_idx)
+    reserve_idx = body_norm.find("sched_need_reserve = true;", catch_idx)
+    assert published_any_idx != -1 and reserve_idx != -1
+    assert catch_idx < published_any_idx < reserve_idx, (
+        "published_any must be set true strictly between the publish's own candidate_lost check and the "
+        "in-loop sched_reserve() call"
+    )
+
+
+def test_settle_publish_is_gated_on_published_any_or_changed_value():
+    """Q2b: the settle step's PUBLISH (not its reserve) must be gated on
+    `published_any || cparams.n_ubatch != fallback_ubatch` -- when nothing
+    was ever published this trial and the resolved value is the same one
+    already published by the constructor's own earlier publish, a settle
+    republish would be a redundant runtime-context transaction with no
+    state change (the exact scenario this finding reported: the loop
+    breaking at once on a first-candidate refusal). The RESERVE must still
+    run unconditionally inside the settle gate -- a context that never
+    calls sched_reserve() anywhere has no compute buffers at all."""
+    body_norm = _normalize_ws(_trial_body())
+    settle_idx = body_norm.find("if (!sched_matches_last_good")
+    assert settle_idx != -1
+    settle_block = body_norm[settle_idx:]
+
+    need_publish_idx = settle_block.find(
+        "const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;"
+    )
+    assign_idx = settle_block.find("cparams.n_ubatch = last_good;")
+    publish_guard_idx = settle_block.find("if (need_publish) {")
+    publish_call_idx = settle_block.find("sycl_resync_runtime_context_flash_attn();")
+    reserve_idx = settle_block.find("sched_reserve();")
+    assert -1 not in (need_publish_idx, assign_idx, publish_guard_idx, publish_call_idx, reserve_idx), (
+        "the settle block must compute need_publish, reassign cparams.n_ubatch, gate the publish on it, and "
+        "still reserve"
+    )
+    assert need_publish_idx < assign_idx < publish_guard_idx < publish_call_idx < reserve_idx, (
+        "the settle block's need_publish computation must precede the cparams.n_ubatch reassignment, which "
+        "must precede the publish gate, which must precede the publish call, which must precede the reserve"
+    )
+
+
+def test_settle_publish_gate_has_a_mutation_witness():
+    """Mutation witness for the two checks above: proves they would
+    actually catch the settle publish reverting to unconditional (always
+    publishing, even when nothing changed)."""
+    raw = LLAMA_CONTEXT_CPP
+    original_settle = (
+        "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
+        "        const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;\n"
+        "        cparams.n_ubatch        = last_good;\n"
+        "        if (need_publish) {\n"
+        "            sycl_resync_runtime_context_flash_attn();\n"
+        "        }\n"
+        "        sched_need_reserve = true;\n"
+        "        sched_reserve();\n"
+        "    }\n"
+    )
+    assert original_settle in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_settle = (
+        "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
+        "        cparams.n_ubatch = last_good;\n"
+        "        sycl_resync_runtime_context_flash_attn();\n"
+        "        sched_need_reserve = true;\n"
+        "        sched_reserve();\n"
+        "    }\n"
+    )
+    mutated_raw = raw.replace(original_settle, mutated_settle, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    mutated_settle_idx = mutated_body_norm.find("if (!sched_matches_last_good")
+    assert mutated_settle_idx != -1
+    assert "need_publish" not in mutated_body_norm[mutated_settle_idx:], (
+        "mutation witness is broken: reverting to an unconditional publish should remove need_publish entirely"
+    )
 
 
 def test_warn_and_settle_have_a_mutation_witness():
