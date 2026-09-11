@@ -134,6 +134,12 @@ int main(int argc, char ** argv) {
     cparams.n_batch              = 2048;
     cparams.n_ubatch             = 512;
     cparams.n_seq_max            = 1;
+    // llama.cpp-uajm: llama_context_default_params() defaults swa_full=true
+    // (src/llama-context.cpp:4149) but every tool runs with common's
+    // default false (common/common.h:571); the SYCL KV plan sizes SWA
+    // layers by the window, so the raw default overflows the planned slab
+    // at context init on GPT-OSS. Match the tools.
+    cparams.swa_full             = false;
     llama_context * ctx          = llama_init_from_model(model, cparams);
     if (!ctx) {
         fprintf(stderr, "[PROBE-HARNESS] llama_init_from_model failed\n");
