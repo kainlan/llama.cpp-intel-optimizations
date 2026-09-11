@@ -17733,8 +17733,8 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         req.intent.cohort_id                          = label;
         req.intent.constraints.must_device            = true;
         req.intent.constraints.prefer_vram_zone       = vram_zone_id::RUNTIME;
-        // llama.cpp-ibj0 spec round 5 F13: see the field's own comment
-        // (alloc_constraints::forbid_vram_zone_spill, unified-cache.hpp) for why.
+        // llama.cpp-ibj0 spec round 5 F13: see the field's own comment in
+        // unified-cache.hpp (alloc_constraints::forbid_vram_zone_spill) for why.
         req.intent.constraints.forbid_vram_zone_spill = true;
         owner                                         = {};
         alloc_handle handle{};

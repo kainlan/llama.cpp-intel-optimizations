@@ -16942,9 +16942,10 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // -- so 16304.0 - 14618.0 = ~1686.0 MB was left outside the arena for the
 // driver, kernel bundles, and oneMath scratch, and the ring's spill took
 // its own uncounted share of that fixed pool, leaving too little for the
-// gemm call that needed it moments later. The result was not this function's own refusal
-// template: it was a mid-prefill `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the
-// gemm call itself (ibj0-master-ubsweep-b1-a1.log), i.e. exactly the
+// gemm call that needed it moments later. The result was not this
+// function's own refusal template: it was a mid-prefill
+// `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the gemm call itself
+// (ibj0-master-ubsweep-b1-a1.log), i.e. exactly the
 // "res=-3 with nothing printed" failure mode Task 1 exists to close, just
 // reached by a different door. Two layers now close it: (1) the allocation
 // requests reserve_pp_moe_onednn_scratch() makes set
