@@ -388,23 +388,27 @@ def test_publish_happens_before_reserve_inside_the_loop():
 
 def test_publish_reserve_order_has_a_mutation_witness():
     """Mutation witness for the ordering check above: proves it would
-    actually catch the publish and reserve calls being swapped."""
+    actually catch the publish's try/catch block and the reserve calls
+    being swapped."""
     raw = LLAMA_CONTEXT_CPP
-    original_block = (
-        "        cparams.n_ubatch = c;\n"
-        "        sycl_resync_runtime_context_flash_attn();  // publish -- every SYCL backend's probe "
-        "already accepted c\n"
+    try_catch_block = (
+        "        try {\n"
+        "            sycl_resync_runtime_context_flash_attn();\n"
+        "        } catch (const std::exception &) {\n"
+        '            stop           = "transaction refused";\n'
+        "            candidate_lost = true;\n"
+        "        }\n"
+        "        if (candidate_lost) {\n"
+        "            break;\n"
+        "        }\n"
+    )
+    reserve_block = (
         "        sched_need_reserve = true;\n"
         "        sched_reserve();\n"
     )
+    original_block = try_catch_block + reserve_block
     assert original_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_block = (
-        "        cparams.n_ubatch = c;\n"
-        "        sched_need_reserve = true;\n"
-        "        sched_reserve();\n"
-        "        sycl_resync_runtime_context_flash_attn();  // publish -- every SYCL backend's probe "
-        "already accepted c\n"
-    )
+    mutated_block = reserve_block + try_catch_block
     mutated_raw = raw.replace(original_block, mutated_block, 1)
     assert mutated_raw != raw
 
@@ -414,7 +418,7 @@ def test_publish_reserve_order_has_a_mutation_witness():
     mutated_reserve_idx = mutated_body_norm.find("sched_reserve();", mutated_loop_idx)
     assert mutated_publish_idx != -1 and mutated_reserve_idx != -1
     assert not (mutated_publish_idx < mutated_reserve_idx), (
-        "mutation witness is broken: swapping the two calls should make the ordering check fail"
+        "mutation witness is broken: swapping the two blocks should make the ordering check fail"
     )
 
 
@@ -496,6 +500,89 @@ def test_all_seven_stop_reasons_are_present():
         "compute buffer fell back to host",
     ):
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# The candidate publish can still refuse after an accepted probe (Task 2
+# final review addendum, 2026-09-11: the probe's own exit branch returns
+# BEFORE the publication-ID check, MMID materialization, and the CAS, all of
+# which still run for a real publish and can still refuse).
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_publish_is_wrapped_in_try_catch():
+    """The CANDIDATE publish inside the loop must be wrapped in
+    try/catch(const std::exception&) -- sycl_resync_runtime_context_flash_
+    attn() throws on a refusal, and an accepted probe does not guarantee
+    the publish itself still succeeds."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
+        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*\}',
+        body_norm,
+    ), "the candidate publish must be wrapped in try { ... } catch (const std::exception &) { stop = \"transaction refused\"; candidate_lost = true; }"
+
+
+def test_candidate_lost_is_checked_immediately_after_the_try_catch():
+    """The candidate_lost check for the publish's own try/catch must run
+    BEFORE sched_need_reserve/sched_reserve() -- a refused publish must
+    never reach a reserve for the plan it failed to publish."""
+    body_norm = _normalize_ws(_trial_body())
+    try_idx = body_norm.find("try { sycl_resync_runtime_context_flash_attn(); }")
+    assert try_idx != -1, "could not find the candidate publish's try block"
+    after = body_norm[try_idx:]
+    break_idx = after.find("if (candidate_lost) { break; }")
+    reserve_idx = after.find("sched_need_reserve = true;")
+    assert break_idx != -1 and reserve_idx != -1
+    assert break_idx < reserve_idx, (
+        "the candidate_lost check for the publish's try/catch must precede sched_need_reserve/sched_reserve()"
+    )
+
+
+def test_candidate_publish_try_catch_has_a_mutation_witness():
+    """Mutation witness for the two checks above: proves they would
+    actually catch the try/catch being deleted (leaving a bare,
+    unprotected publish call that would let a refusal escape as an
+    uncaught exception instead of a clean "transaction refused" stop)."""
+    raw = LLAMA_CONTEXT_CPP
+    wrapped_block = (
+        "        try {\n"
+        "            sycl_resync_runtime_context_flash_attn();\n"
+        "        } catch (const std::exception &) {\n"
+        '            stop           = "transaction refused";\n'
+        "            candidate_lost = true;\n"
+        "        }\n"
+        "        if (candidate_lost) {\n"
+        "            break;\n"
+        "        }\n"
+    )
+    assert wrapped_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(wrapped_block, "        sycl_resync_runtime_context_flash_attn();\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(
+        r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
+        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*\}',
+        mutated_body_norm,
+    ), "mutation witness is broken: deleting the try/catch should make the wrapped-publish check fail"
+
+
+def test_settle_publish_is_not_wrapped_in_try_catch():
+    """Unlike the in-loop candidate publish, the SETTLE publish must let a
+    refusal propagate -- today's behaviour for a context that does not fit
+    at all (Task 2 final review addendum item 1: only the candidate publish
+    gets the new try/catch)."""
+    body_norm = _normalize_ws(_trial_body())
+    settle_start = body_norm.find("if (!sched_matches_last_good")
+    assert settle_start != -1, "could not find the settle step's own gate"
+    settle_block = body_norm[settle_start:]
+    settle_publish_idx = settle_block.find("sycl_resync_runtime_context_flash_attn();")
+    assert settle_publish_idx != -1, "could not find the settle step's own publish call"
+    assert "try {" not in settle_block[:settle_publish_idx + 40], (
+        "the settle publish must NOT be wrapped in try/catch -- its refusal must propagate, matching today's "
+        "behaviour for a context that does not fit"
+    )
 
 
 def test_settle_republishes_only_when_needed():

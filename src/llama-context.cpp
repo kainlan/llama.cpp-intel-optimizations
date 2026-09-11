@@ -1422,7 +1422,25 @@ void llama_context::sycl_select_auto_ubatch() {
         }
 
         cparams.n_ubatch = c;
-        sycl_resync_runtime_context_flash_attn();  // publish -- every SYCL backend's probe already accepted c
+        // llama.cpp-xojq (nphx Task 4b, Task 2 final review addendum): an
+        // accepted probe does NOT guarantee this publish succeeds -- the
+        // probe's own exit branch returns before the publication-ID check,
+        // MMID workspace materialization, and the CAS
+        // (ggml_sycl_run_runtime_context_transaction), all of which still
+        // run for a real publish and can still refuse (a race against
+        // another live update). sycl_resync_runtime_context_flash_attn()
+        // throws on that refusal; for a CANDIDATE publish (unlike the
+        // settle publish below) that must be treated as an ordinary
+        // "transaction refused" stop, not an escaped exception.
+        try {
+            sycl_resync_runtime_context_flash_attn();
+        } catch (const std::exception &) {
+            stop           = "transaction refused";
+            candidate_lost = true;
+        }
+        if (candidate_lost) {
+            break;
+        }
         sched_need_reserve = true;
         sched_reserve();
         sched_matches_last_good = true;
