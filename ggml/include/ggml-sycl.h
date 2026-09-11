@@ -389,9 +389,10 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 
 // llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
 // SUCCESSFUL host-pinned fallbacks for any of the buffer types whose
-// alloc_buffer is this function -- the name is kept from the plan's own
-// Task 4b read, which cares specifically about compute buffers, but is not
-// limited to them. Exactly two sites increment it, both only once a
+// alloc_buffer is ggml_backend_sycl_buffer_type_alloc_buffer()
+// (ggml-sycl.cpp) -- the name is kept from the plan's own Task 4b read,
+// which cares specifically about compute buffers, but is not limited to
+// them. Exactly two sites increment it, both only once a
 // SUCCESSFUL host-pinned landing is confirmed, never merely attempted: (1)
 // a single allocation exceeding the safe device-alloc limit, forced
 // host-pinned and counted once that forced attempt lands; and (2) a device
@@ -1106,15 +1107,21 @@ struct ggml_sycl_runtime_context_probe {
 // the publishing path's GGML_LOG_ERROR, because a probe exists to be tried
 // repeatedly and rejected quietly (Task 4b's ascending micro-batch trial).
 // Refuses with GGML_SYCL_LIFECYCLE_STALE_IDENTITY when `model` does not
-// identify the CURRENTLY PUBLISHED plan -- unlike
-// ggml_backend_sycl_set_runtime_context_for_model(), this probe does not
-// itself select or publish a different model's plan; it only evaluates
-// candidates against whichever plan is already current.
-// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6) means the caller MAY retry (a
-// live-update lease could not be acquired, the plan changed while acquiring
-// the transaction lock, or the module mutation guard refused); it is
-// distinct from GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT
-// retry (see that enum value's own comment).
+// identify the CURRENTLY PUBLISHED plan AT THIS FUNCTION'S OWN ENTRY CHECK
+// -- unlike ggml_backend_sycl_set_runtime_context_for_model(), this probe
+// does not itself select or publish a different model's plan; it only
+// evaluates candidates against whichever plan is already current. The SAME
+// condition, detected instead under the transaction's own lock (a race
+// between this entry check and that in-lock re-check), returns
+// GGML_SYCL_LIFECYCLE_BUSY, not STALE_IDENTITY -- it is a race a caller's
+// retry can resolve, unlike the entry check's own refusal.
+// GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
+// retry: a live-update lease could not be acquired, the plan changed while
+// acquiring the transaction lock, the module mutation guard refused, or the
+// published plan's identity changed between this probe's entry check and
+// the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
+// above). It is distinct from GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which
+// callers must NOT retry (see that enum value's own comment).
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
     ggml_backend_t                           backend,
     struct ggml_sycl_model_token             model,

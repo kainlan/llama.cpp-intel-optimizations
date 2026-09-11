@@ -37,6 +37,8 @@ make.
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 GGML_SYCL_H = (ROOT / "ggml/include/ggml-sycl.h").read_text()
 # llama.cpp-oyfl / CLAUDE.md: plain file I/O, not the codescout index --
@@ -223,6 +225,34 @@ def test_fallback_counter_declared_as_per_device_atomic():
     ), "g_compute_buffer_host_fallbacks must be declared as std::atomic<uint64_t>[GGML_SYCL_MAX_DEVICES]"
 
 
+def _assert_oversize_increment_after_alloc_succeeded(body_norm: str) -> None:
+    """llama.cpp-tsfl round 4 Q1 / round 5 R3: the oversize-request
+    fallback's landing must be counted strictly between alloc_succeeded:'s
+    own `if (forced_host_fallback)` guard and the `dev_ptr = main_alloc.ptr`
+    statement that follows it -- not inline in the oversize branch itself,
+    where the allocation attempt that decides success or failure has not
+    yet run. Factored out so the real test below and its round 5 R3
+    mutation witnesses call the IDENTICAL check, rather than each
+    re-implementing a copy that could silently drift from it (the bug R3
+    itself found: the previous witness's own re-implementation degenerated
+    to a vacuous empty-range comparison on one of its two mutants instead of
+    ever calling this logic)."""
+    increments = [
+        m.start()
+        for m in re.finditer(r"g_compute_buffer_host_fallbacks\[buft_ctx->device\]\.fetch_add\(\s*1", body_norm)
+    ]
+    alloc_succeeded_idx = body_norm.find("alloc_succeeded:")
+    assert alloc_succeeded_idx != -1, "could not find the alloc_succeeded: label"
+    guard_idx = body_norm.find("if (forced_host_fallback)", alloc_succeeded_idx)
+    assert guard_idx != -1, "could not find the forced_host_fallback guard after alloc_succeeded:"
+    dev_ptr_idx = body_norm.find("dev_ptr = main_alloc.ptr", alloc_succeeded_idx)
+    assert dev_ptr_idx != -1, "could not bound the forced_host_fallback guard block"
+    assert any(guard_idx < idx < dev_ptr_idx for idx in increments), (
+        "the oversize-request fallback must increment the counter AFTER the alloc_succeeded: label, INSIDE "
+        "the forced_host_fallback guard -- not inline in the oversize branch itself"
+    )
+
+
 def test_both_fallback_sites_increment_the_counter():
     """Both host-pinned fallback paths inside
     ggml_backend_sycl_buffer_type_alloc_buffer()'s bounded body must land on
@@ -251,16 +281,7 @@ def test_both_fallback_sites_increment_the_counter():
         "the oversize branch must set forced_host_fallback = true, at or before its own WARN log"
     )
 
-    alloc_succeeded_idx = body_norm.find("alloc_succeeded:")
-    assert alloc_succeeded_idx != -1, "could not find the alloc_succeeded: label"
-    guard_idx = body_norm.find("if (forced_host_fallback)", alloc_succeeded_idx)
-    assert guard_idx != -1, "could not find the forced_host_fallback guard after alloc_succeeded:"
-    dev_ptr_idx = body_norm.find("dev_ptr = main_alloc.ptr", alloc_succeeded_idx)
-    assert dev_ptr_idx != -1, "could not bound the forced_host_fallback guard block"
-    assert any(guard_idx < idx < dev_ptr_idx for idx in increments), (
-        "the oversize-request fallback must increment the counter AFTER the alloc_succeeded: label, INSIDE "
-        "the forced_host_fallback guard -- not inline in the oversize branch itself"
-    )
+    _assert_oversize_increment_after_alloc_succeeded(body_norm)
 
     # llama.cpp-tsfl round 2 G1: the retry-path increment sits AFTER its own
     # WARN (which only announces the retry attempt, before the outcome is
@@ -329,13 +350,21 @@ def test_retry_increment_after_warn_has_a_mutation_witness():
     )
 
 
-def test_oversize_increment_after_alloc_succeeded_has_a_mutation_witness():
-    """Mutation witness for llama.cpp-tsfl round 4 Q1: proves the fixed
-    check above (oversize site's landing counted at alloc_succeeded:, inside
-    the forced_host_fallback guard) would actually catch the increment
-    moving back to inline in the oversize branch -- exactly the pre-Q1
-    shape, where the counter was bumped before the allocation attempt that
-    decides success or failure had even run."""
+def test_oversize_guard_deleted_has_a_mutation_witness():
+    """Mutation witness A for llama.cpp-tsfl round 5 R3: proves
+    _assert_oversize_increment_after_alloc_succeeded() would actually catch
+    the forced_host_fallback guard block being deleted entirely.
+
+    R3 (reviewer finding): the PREVIOUS version of this witness deleted the
+    whole `if (forced_host_fallback) { ... }` block, then re-implemented its
+    own (buggy) copy of the check instead of calling the real one -- with
+    guard_idx now -1, its `guard_bound_start = mutated_dev_ptr_idx` fallback
+    collapsed the comparison range to (dev_ptr_idx, dev_ptr_idx), and
+    `not any(idx in an EMPTY range)` is vacuously True regardless of the
+    mutant. It never actually exercised the real check's own
+    `assert guard_idx != -1` failure at all. Calling the shared helper
+    directly, inside pytest.raises, fixes this: the helper's own assertion
+    is what fires, not a re-implemented approximation of it."""
     raw = GGML_SYCL_CPP
     guarded_increment = (
         "    if (forced_host_fallback) {\n"
@@ -343,12 +372,37 @@ def test_oversize_increment_after_alloc_succeeded_has_a_mutation_witness():
         "    }\n"
     )
     assert guarded_increment in raw, "mutation target (guarded increment) not found -- update this witness"
+    mutated_raw = raw.replace(guarded_increment, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _ALLOC_BUFFER_START, _ALLOC_BUFFER_END)
+    with pytest.raises(AssertionError, match="could not find the forced_host_fallback guard"):
+        _assert_oversize_increment_after_alloc_succeeded(mutated_body_norm)
+
+
+def test_oversize_increment_moved_above_warn_has_a_mutation_witness():
+    """Mutation witness B for llama.cpp-tsfl round 5 R3: proves the shared
+    check's POSITIONAL clause (the increment must fall strictly between the
+    guard and dev_ptr_idx) is exercised too, not just the guard's mere
+    existence -- keeps the `if (forced_host_fallback) { ... }` block (now
+    empty) and moves the fetch_add back inline in the oversize branch,
+    right after forced_host_fallback is set -- exactly the pre-Q1 shape,
+    just with the (now useless) empty guard left behind."""
+    raw = GGML_SYCL_CPP
+    guarded_increment = (
+        "    if (forced_host_fallback) {\n"
+        "        g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);\n"
+        "    }\n"
+    )
+    assert guarded_increment in raw, "mutation target (guarded increment) not found -- update this witness"
+    emptied_guard = "    if (forced_host_fallback) {\n    }\n"
+
     oversize_flag_set = "            forced_host_fallback = true;\n"
     assert raw.count(oversize_flag_set) == 1, (
         f"mutation target (oversize flag-set) not unique -- found {raw.count(oversize_flag_set)}"
     )
 
-    mutated_raw = raw.replace(guarded_increment, "", 1)
+    mutated_raw = raw.replace(guarded_increment, emptied_guard, 1)
     mutated_raw = mutated_raw.replace(
         oversize_flag_set,
         oversize_flag_set
@@ -358,28 +412,8 @@ def test_oversize_increment_after_alloc_succeeded_has_a_mutation_witness():
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _ALLOC_BUFFER_START, _ALLOC_BUFFER_END)
-    mutated_increments = [
-        m.start()
-        for m in re.finditer(
-            r"g_compute_buffer_host_fallbacks\[buft_ctx->device\]\.fetch_add\(\s*1", mutated_body_norm
-        )
-    ]
-    mutated_alloc_succeeded_idx = mutated_body_norm.find("alloc_succeeded:")
-    mutated_guard_idx = mutated_body_norm.find("if (forced_host_fallback)", mutated_alloc_succeeded_idx)
-    mutated_dev_ptr_idx = mutated_body_norm.find("dev_ptr = main_alloc.ptr", mutated_alloc_succeeded_idx)
-    assert mutated_alloc_succeeded_idx != -1 and mutated_dev_ptr_idx != -1
-
-    # The REAL (fixed) check requires an increment strictly between
-    # guard_idx and dev_ptr_idx (i.e. inside the forced_host_fallback
-    # guard block, after alloc_succeeded:); on this reverted mutant that
-    # must now be FALSE -- the guard block itself is gone, and the
-    # remaining increment sits back in the oversize branch, well before
-    # alloc_succeeded: is ever reached.
-    guard_bound_start = mutated_guard_idx if mutated_guard_idx != -1 else mutated_dev_ptr_idx
-    assert not any(guard_bound_start < idx < mutated_dev_ptr_idx for idx in mutated_increments), (
-        "mutation witness is broken: the mutated (pre-Q1, increment-inline-in-oversize-branch) source should "
-        "FAIL the 'increment after alloc_succeeded:, inside the guard' check, but it did not"
-    )
+    with pytest.raises(AssertionError, match="must increment the counter AFTER the alloc_succeeded"):
+        _assert_oversize_increment_after_alloc_succeeded(mutated_body_norm)
 
 
 def test_increment_sites_have_a_mutation_witness():

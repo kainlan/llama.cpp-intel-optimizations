@@ -17760,8 +17760,10 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
     // `g_runtime_expected_model = model;` assignment, further down this
     // file) so the shared
     // body's own in-lock re-check (`if (g_runtime_expected_model_set && ...)
-    // return refuse(...)`, near this function's top) is LIVE for a probe
-    // too. Without this, the identity check just above (outside the lock)
+    // return busy(...)`, near this function's top -- round 4 Q3: this site
+    // returns busy(), not refuse(), since the race it detects is one a
+    // caller's retry can resolve) is LIVE for a probe too. Without this,
+    // the identity check just above (outside the lock)
     // could pass, then a concurrent load/teardown could replace the
     // published plan with a DIFFERENT model's while this call is still
     // acquiring the transaction lock, and the shared body would silently

@@ -249,7 +249,23 @@ int main(int argc, char ** argv) {
     // B70, per CLAUDE.md's device-topology table) while the context may
     // have been placed on a different device entirely -- reviewer's ruling,
     // round 2: do not read this figure from a direct/unpinned invocation.
-    printf("HOST_FALLBACKS_AFTER=%llu\n", (unsigned long long) ggml_backend_sycl_compute_buffer_host_fallbacks(0));
+    //
+    // llama.cpp-tsfl round 5 R5: the figure is SCORED only when the
+    // selector is pinned -- the ctest registration pins it (and the lead's
+    // scripts also pin it), so under ctest this is a real assertion, not
+    // merely printed and ignored. An unpinned direct invocation cannot
+    // attribute index 0 to any particular device (see the reviewer's ruling
+    // above), so it prints the value only, unscored.
+    const bool     selector_pinned      = std::getenv("ONEAPI_DEVICE_SELECTOR") != nullptr;
+    const uint64_t host_fallbacks_after = ggml_backend_sycl_compute_buffer_host_fallbacks(0);
+    printf("HOST_FALLBACKS_AFTER=%llu\n", (unsigned long long) host_fallbacks_after);
+    if (selector_pinned && host_fallbacks_after != 0) {
+        fprintf(stderr,
+                "[PROBE-HARNESS] FAIL: host fallbacks after probes = %llu (expected 0 under a pinned "
+                "selector)\n",
+                (unsigned long long) host_fallbacks_after);
+        ok = false;
+    }
     fflush(stdout);
 
     // Step 11: prove the published state (at n_ctx=4096, n_ubatch=512 --
