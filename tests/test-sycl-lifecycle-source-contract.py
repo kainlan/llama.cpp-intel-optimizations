@@ -559,10 +559,18 @@ checks = {
         # reads the snapshot once lock-free (its own identity check against
         # the caller's model token) and once again under
         # g_tensor_inventory_mutex to confirm that snapshot is still the
-        # live one before acting on it (9 + 2).
+        # live one before acting on it (9 + 2). llama.cpp-tsfl added an
+        # eleventh->twelfth reader: the new non-publishing probe entry
+        # point, ggml_backend_sycl_probe_runtime_context_for_model(), reads
+        # the snapshot once lock-free for its own up-front identity check
+        # (the candidate's model token against the currently published
+        # plan) before deferring into the shared transaction body -- it
+        # arms no lease of its own and takes no second, in-lock read the
+        # way the narrow re-check above does, since it never mutates the
+        # published plan (11 + 1).
         "ggml_sycl_cache_plan_owner": 120,
         "ggml_sycl_global_plan_owner": 16,
-        "ggml_sycl_global_plan_snapshot": 11,
+        "ggml_sycl_global_plan_snapshot": 12,
         "ggml_sycl_has_global_plan": 26,
     },
     "cache snapshot pointer identity validation": "lifecycle_plan_snapshot_matches(authority, cached)"
