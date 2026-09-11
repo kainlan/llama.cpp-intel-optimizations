@@ -772,6 +772,22 @@ def test_published_any_is_declared_false_and_set_true_after_the_in_loop_publish(
     )
 
 
+def _assert_settle_publish_call_is_inside_the_guard(settle_block: str, publish_guard_idx: int) -> None:
+    """Shared by the real check below and its mutation witness (quality
+    round 2 R3): the positional ordering check alone (need_publish <
+    assign < guard < call < reserve) passes even when the guard's body is
+    EMPTIED and the publish call moved to just after it -- ordering never
+    notices, since the call still textually follows the guard. Bounding
+    the guard's own `{ ... }` body and requiring the call INSIDE it closes
+    that gap."""
+    guard_body_end = settle_block.find("}", publish_guard_idx)
+    assert guard_body_end != -1, "could not bound the publish guard's body"
+    guard_body = settle_block[publish_guard_idx : guard_body_end + 1]
+    assert "sycl_resync_runtime_context_flash_attn();" in guard_body, (
+        "the publish call must be INSIDE the need_publish guard's body, not merely appear somewhere after it"
+    )
+
+
 def test_settle_publish_is_gated_on_published_any_or_changed_value():
     """Q2b: the settle step's PUBLISH (not its reserve) must be gated on
     `published_any || cparams.n_ubatch != fallback_ubatch` -- when nothing
@@ -802,12 +818,16 @@ def test_settle_publish_is_gated_on_published_any_or_changed_value():
         "the settle block's need_publish computation must precede the cparams.n_ubatch reassignment, which "
         "must precede the publish gate, which must precede the publish call, which must precede the reserve"
     )
+    _assert_settle_publish_call_is_inside_the_guard(settle_block, publish_guard_idx)
 
 
 def test_settle_publish_gate_has_a_mutation_witness():
     """Mutation witness for the two checks above: proves they would
     actually catch the settle publish reverting to unconditional (always
-    publishing, even when nothing changed)."""
+    publishing, even when nothing changed), AND (quality round 2 R3) that
+    the guard-body check specifically would catch the guard being emptied
+    with the call moved below it -- a mutant the ordering assertion alone
+    cannot see (ordering is satisfied textually either way)."""
     raw = LLAMA_CONTEXT_CPP
     original_settle = (
         "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
@@ -838,6 +858,36 @@ def test_settle_publish_gate_has_a_mutation_witness():
     assert "need_publish" not in mutated_body_norm[mutated_settle_idx:], (
         "mutation witness is broken: reverting to an unconditional publish should remove need_publish entirely"
     )
+
+    # Second mutant (quality round 2 R3): keeps need_publish and its
+    # ordering intact, but EMPTIES the guard's body and moves the publish
+    # call to just after it -- passes the positional ordering assertion
+    # above (need_publish < assign < guard < call < reserve still holds
+    # textually) but must fail the REAL guard-body check, not a
+    # re-implementation of it.
+    emptied_guard_settle = (
+        "    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {\n"
+        "        const bool need_publish = published_any || cparams.n_ubatch != fallback_ubatch;\n"
+        "        cparams.n_ubatch        = last_good;\n"
+        "        if (need_publish) {\n"
+        "        }\n"
+        "        sycl_resync_runtime_context_flash_attn();\n"
+        "        sched_need_reserve = true;\n"
+        "        sched_reserve();\n"
+        "    }\n"
+    )
+    mutated_raw_2 = raw.replace(original_settle, emptied_guard_settle, 1)
+    assert mutated_raw_2 != raw
+
+    mutated_body_norm_2 = _body_of(mutated_raw_2, _TRIAL_START, _TRIAL_END)
+    mutated_settle_idx_2 = mutated_body_norm_2.find("if (!sched_matches_last_good")
+    assert mutated_settle_idx_2 != -1
+    mutated_settle_block_2 = mutated_body_norm_2[mutated_settle_idx_2:]
+    mutated_publish_guard_idx_2 = mutated_settle_block_2.find("if (need_publish) {")
+    assert mutated_publish_guard_idx_2 != -1, "mutation witness is broken: could not re-find the emptied guard"
+
+    with pytest.raises(AssertionError, match="must be INSIDE the need_publish guard"):
+        _assert_settle_publish_call_is_inside_the_guard(mutated_settle_block_2, mutated_publish_guard_idx_2)
 
 
 def test_warn_and_settle_have_a_mutation_witness():

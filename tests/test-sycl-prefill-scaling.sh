@@ -78,11 +78,14 @@
 #     under SYCL, is now ALWAYS present with a value RESOLVED per pp row
 #     rather than uniform across a whole invocation: since llama.cpp-xojq
 #     (Task 4b) landed the auto micro-batch trial, a bare default run
-#     resolves per row to its own n_ctx-capped ladder value -- e.g.
-#     128/512/1024/2048 across pp128/pp512/pp1024/pp2048 on a case that
-#     clears the whole ladder -- read here from the pp512 row's own cell
-#     (512 in that example); the column-absent shape (case 18) and the
-#     uniform-value shape (case 19) both remain legitimate and stay
+#     resolves per row to the largest ladder rung that row's n_ctx
+#     admits, or -- for a row whose n_ctx is below the first rung
+#     (pp128), where the trial exits early without trying a candidate --
+#     to the constructor's own n_batch clamp of the pre-trial default;
+#     e.g. 128/512/1024/2048 across pp128/pp512/pp1024/pp2048 on a case
+#     that clears the whole ladder, read here from the pp512 row's own
+#     cell (512 in that example); the column-absent shape (case 18) and
+#     the uniform-value shape (case 19) both remain legitimate and stay
 #     covered; this per-row shape is additional (case 27, whose fixture
 #     models a table shape and stays as-is).
 set -euo pipefail

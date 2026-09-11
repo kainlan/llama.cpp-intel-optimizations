@@ -151,12 +151,17 @@
 # Since llama.cpp-xojq (Task 4b) landed the auto micro-batch trial, a bare
 # default SYCL run no longer resolves to a flat 512 on every row: each
 # row's n_ctx (= n_prompt + n_gen [+ n_depth]) caps the trial's own ladder
-# {512, 1024, 2048, 4096}, so a case where the whole ladder fits (e.g. the
-# B70 Mistral case) resolves per row to its own row size -- e.g.
-# 128/512/1024/2048 across this script's own pp128/pp512/pp1024/pp2048
-# rows -- while a case where a larger candidate refuses (GPU MoE routing
-# ceiling, ring budget, ...) stops at the last accepted size instead. An
-# explicit `-ub 1024` run still shows 128/512/1024/1024 (the trial never
+# {512, 1024, 2048, 4096}. A row whose n_ctx is below the ladder's first
+# rung (pp128) never enters the trial at all -- it returns early with no
+# WARN and the row keeps the pre-trial default, which the constructor's
+# own n_batch clamp has already pulled down to that row's n_ctx -- so
+# pp128 reads 128 from the clamp, not from the ladder. Rows at or above
+# 512 resolve to the largest rung their n_ctx admits, so a case where the
+# whole ladder fits (e.g. the B70 Mistral case) reads 128/512/1024/2048
+# across this script's own pp128/pp512/pp1024/pp2048 rows, while a case
+# where a larger candidate refuses (GPU MoE routing ceiling, ring budget,
+# ...) stops at the last accepted size instead. An explicit `-ub 1024`
+# run still shows 128/512/1024/1024 (the trial never
 # runs when -ub is pinned); this column reads only the pp512 row's own
 # cell, which stays 512 in both examples above -- the pp512 row's own
 # n_ctx (~512) caps BOTH the trial's ladder and the explicit value's

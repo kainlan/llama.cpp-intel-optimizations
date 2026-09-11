@@ -374,14 +374,14 @@ static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gp
 // should not normally see at all. Guarded by the SAME broad condition as
 // the block at lines 87-233 above (GGML_USE_SYCL || GGML_BACKEND_DL) --
 // NOT the narrower GGML_BACKEND_DL-without-GGML_USE_SYCL condition the
-// proc-lookup helpers immediately above this comment (lines 235-331) need.
-// This function only needs the enum ggml-sycl.h declares under that
-// broader condition (see the #include near the top of this file), and its
-// caller (sycl_recheck_runtime_context_flash_attn(), far below) is
-// reachable in a direct GGML_USE_SYCL build too, where the narrower
-// 235-331 block never compiles at all. (Previously defined inside that
-// narrower block by mistake, which left it undeclared in a direct
-// GGML_USE_SYCL build -- build-oyfl-6 caught this.)
+// proc-lookup helpers immediately above this comment need. This function
+// only needs the enum ggml-sycl.h declares under that broader condition
+// (see the #include near the top of this file), and its caller
+// (sycl_recheck_runtime_context_flash_attn(), far below) is reachable in
+// a direct GGML_USE_SYCL build too, where that narrower block never
+// compiles at all. (Previously defined inside that narrower block by
+// mistake, which left it undeclared in a direct GGML_USE_SYCL build --
+// build-oyfl-6 caught this.)
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
 static const char * sycl_recheck_lifecycle_result_name(ggml_sycl_lifecycle_result rc) {
     switch (rc) {
