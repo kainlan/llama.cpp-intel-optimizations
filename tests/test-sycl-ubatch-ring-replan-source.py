@@ -95,20 +95,37 @@ def _bounded_body(code: str, start_marker: str, end_marker: str, *, after: int =
     return code[start:end]
 
 
+def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
+    """Comment-strip `raw`, bound the result from `start_marker` to the next
+    `end_marker`, and whitespace-normalize -- the strip+bound+normalize
+    pipeline every mutation witness needs to re-derive a checkable body from
+    its freshly mutated RAW string. llama.cpp-ibj0 quality round 4 Q6.6:
+    hoisted here so each witness's own copy of this three-call chain (with
+    its own copy of the boundary literals) cannot drift from the others; the
+    module-level *_CODE globals are already comment-stripped once at import
+    time, so a plain (non-witness) check uses `_bounded_body` on those
+    directly instead of this function."""
+    return _normalize_ws(_bounded_body(strip_comments(raw), start_marker, end_marker))
+
+
+# llama.cpp-ibj0 quality round 4 Q6.6: boundary literals named once, used by
+# both the plain body-extraction helpers below and every mutation witness's
+# _body_of() call, so a boundary string is spelled in exactly one place.
+_REPLAN_START = "static bool ggml_sycl_replan_pp_moe_onednn_ring("
+_RUNTIME_CONTEXT_START = "void ggml_backend_sycl_set_runtime_context("
+_RUNTIME_CONTEXT_FOR_MODEL_START = "ggml_backend_sycl_set_runtime_context_for_model("
+_RESERVE_PP_MOE_START = "bool unified_cache::reserve_pp_moe_onednn_scratch("
+_RELEASE_RING_START = "bool unified_cache::release_pp_moe_onednn_scratch_ring("
+_UNIFIED_ALLOC_START = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {"
+_ACQUIRE_OFFLOAD_BUFFER_START = "bool acquire_offload_buffer("
+
+
 def _runtime_context_body() -> str:
-    return _bounded_body(
-        GGML_SYCL_CPP_CODE,
-        "void ggml_backend_sycl_set_runtime_context(",
-        "ggml_backend_sycl_set_runtime_context_for_model(",
-    )
+    return _bounded_body(GGML_SYCL_CPP_CODE, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
 
 
 def _replan_ring_fn_body() -> str:
-    return _bounded_body(
-        GGML_SYCL_CPP_CODE,
-        "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
-        "void ggml_backend_sycl_set_runtime_context(",
-    )
+    return _bounded_body(GGML_SYCL_CPP_CODE, _REPLAN_START, _RUNTIME_CONTEXT_START)
 
 
 def test_transaction_calls_replan_after_nonfa_and_before_mmid_materialize():
@@ -173,18 +190,12 @@ def test_replan_call_has_a_mutation_witness():
     mutated_raw = raw.replace(call_block, "", 1)
     assert mutated_raw != raw
 
-    def _call_count(code: str) -> int:
-        body_norm = _normalize_ws(
-            _bounded_body(
-                code,
-                "void ggml_backend_sycl_set_runtime_context(",
-                "ggml_backend_sycl_set_runtime_context_for_model(",
-            )
-        )
+    def _call_count(raw_source: str) -> int:
+        body_norm = _body_of(raw_source, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
         return len(re.findall(r"ggml_sycl_replan_pp_moe_onednn_ring\(", body_norm))
 
-    original_count = _call_count(strip_comments(raw))
-    mutated_count = _call_count(strip_comments(mutated_raw))
+    original_count = _call_count(raw)
+    mutated_count = _call_count(mutated_raw)
     assert original_count == 4, (
         f"expected exactly four calls in the unmutated source (the re-plan itself plus three rollback call "
         f"sites) -- found {original_count}; update this witness to match the real source"
@@ -251,6 +262,55 @@ def test_replan_reads_before_writing_and_restores_on_failure():
         "test_replan_reserves_the_old_ring_on_a_failed_new_reserve)"
     )
 
+    # llama.cpp-ibj0 spec round 6 Q6.1: pin that the FAILED Step 3 path
+    # actually calls refuse_and_restore() -- presence checks for the OLD-size
+    # restore pair (above) are satisfied by refuse_and_restore()'s own body
+    # existing ANYWHERE, even if nothing on the Step-3-failure path ever
+    # calls it. There are exactly two legitimate call sites: the F13
+    # pre-check (before Step 3 ever runs) and this post-Step-3-failure
+    # fallthrough; a mutant changing either to a bare `return false;` (ring
+    # torn down, ceiling raised with no physical backing, nothing restored,
+    # nothing logged) must change that count away from 2.
+    refuse_calls = [m.start() for m in re.finditer(r"return\s+refuse_and_restore\(\)\s*;", body_norm)]
+    assert len(refuse_calls) == 2, (
+        "expected exactly two `return refuse_and_restore();` call sites (the F13 pre-check and the "
+        f"post-Step-3-failure fallthrough) -- found {len(refuse_calls)}"
+    )
+    assert any(idx > step3_reserve_match.start() for idx in refuse_calls), (
+        "the post-Step-3-failure path must call refuse_and_restore() -- a failed "
+        "reserve_pp_moe_onednn_scratch() for the NEW size must restore the OLD ring and log the refusal, "
+        "not silently return false and leave the ceiling raised with nothing physically backing it"
+    )
+
+
+def test_step3_failure_calls_refuse_and_restore_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-ibj0 spec round 6 Q6.1: proves the
+    checks above would actually catch the post-Step-3-failure path silently
+    returning false instead of restoring the old ring and logging the
+    refusal -- reproduces the exact mutant the review found passing 29/29
+    unmodified (the final `return refuse_and_restore();` changed to
+    `return false;`)."""
+    raw = GGML_SYCL_CPP
+    original_tail = (
+        "    return refuse_and_restore();\n"
+        "}\n"
+        "\n"
+        "void ggml_backend_sycl_set_runtime_context("
+    )
+    assert original_tail in raw, "mutation target block not found -- update this witness to match the real source"
+    mutated_tail = "    return false;\n}\n\nvoid ggml_backend_sycl_set_runtime_context("
+    mutated_raw = raw.replace(original_tail, mutated_tail, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _REPLAN_START, _RUNTIME_CONTEXT_START)
+    mutated_refuse_calls = [
+        m.start() for m in re.finditer(r"return\s+refuse_and_restore\(\)\s*;", mutated_body_norm)
+    ]
+    assert len(mutated_refuse_calls) != 2, (
+        "mutation witness is broken: the mutated source (Step-3-failure path no longer calling "
+        f"refuse_and_restore()) should have a DIFFERENT count than 2 -- found {len(mutated_refuse_calls)}"
+    )
+
 
 def test_step2_before_step3_has_a_mutation_witness():
     """Mutation witness for the check above (llama.cpp-ibj0 spec round 5
@@ -289,13 +349,7 @@ def test_step2_before_step3_has_a_mutation_witness():
     mutated_raw = raw.replace(original_block, mutated_block, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
-            "void ggml_backend_sycl_set_runtime_context(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _REPLAN_START, _RUNTIME_CONTEXT_START)
     step2_set_match = re.search(
         r"unified_cache_set_planned_pp_moe_onednn_scratch\(\s*device,\s*weight_slot_bytes,\s*"
         r"new_activation_slot_bytes",
@@ -640,13 +694,7 @@ def test_cas_rollback_upper_bound_has_a_mutation_witness():
     mutated_raw = raw.replace(old_block, new_block, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "void ggml_backend_sycl_set_runtime_context(",
-            "ggml_backend_sycl_set_runtime_context_for_model(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
     mutated_rollback_calls = [
         m.start()
         for m in re.finditer(
@@ -693,10 +741,9 @@ def test_release_ring_function_is_exported_and_refuses_when_busy():
         "the free-function wrapper must not be file-static"
     )
 
-    body = _bounded_body(
-        CACHE_CPP_CODE, "bool unified_cache::release_pp_moe_onednn_scratch_ring()", "bool unified_cache::claim_pp_moe_onednn_scratch_slot("
+    body_norm = _normalize_ws(
+        _bounded_body(CACHE_CPP_CODE, _RELEASE_RING_START, "bool unified_cache::claim_pp_moe_onednn_scratch_slot(")
     )
-    body_norm = _normalize_ws(body)
     assert re.search(r"if\s*\(\s*slot\.refcount\s*!=\s*0\s*\)\s*\{\s*return\s+false\s*;", body_norm), (
         "must refuse (return false) when a currently-held slot is still claimed (refcount != 0), before "
         "touching the ring"
@@ -756,13 +803,7 @@ def test_replan_guard_has_a_mutation_witness():
     mutated_raw = raw.replace(guard_block, "", 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
-            "void ggml_backend_sycl_set_runtime_context(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _REPLAN_START, _RUNTIME_CONTEXT_START)
     assert not re.search(r"if\s*\(\s*arena\s*&&\s*needed_total\s*>\s*capacity_bytes\s*\)", mutated_body_norm), (
         "mutation witness is broken: deleting the guard left a reference to it behind"
     )
@@ -775,12 +816,7 @@ def test_reserve_pp_moe_onednn_scratch_forbids_vram_zone_spill():
     the preferred zone FAILS the allocation instead of unified_alloc()
     silently falling through to a raw sycl::malloc_device outside the
     arena."""
-    body = _bounded_body(
-        CACHE_CPP_CODE,
-        "bool unified_cache::reserve_pp_moe_onednn_scratch(",
-        "bool unified_cache::release_pp_moe_onednn_scratch_ring(",
-    )
-    body_norm = _normalize_ws(body)
+    body_norm = _normalize_ws(_bounded_body(CACHE_CPP_CODE, _RESERVE_PP_MOE_START, _RELEASE_RING_START))
     assert "req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;" in body_norm, (
         "expected the existing prefer_vram_zone = RUNTIME line -- update this test if that call site moved"
     )
@@ -799,13 +835,7 @@ def test_reserve_pp_moe_onednn_scratch_spill_flag_has_a_mutation_witness():
     mutated_raw = raw.replace(line, "", 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "bool unified_cache::reserve_pp_moe_onednn_scratch(",
-            "bool unified_cache::release_pp_moe_onednn_scratch_ring(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _RESERVE_PP_MOE_START, _RELEASE_RING_START)
     assert "req.intent.constraints.forbid_vram_zone_spill = true;" not in mutated_body_norm, (
         "mutation witness is broken: deleting the assignment left a reference to it behind"
     )
@@ -818,12 +848,7 @@ def test_unified_alloc_enforces_forbid_vram_zone_spill():
     ANY caller that sets it (not just the PP MoE oneDNN ring), so the
     constraint is a real, enforced contract rather than a flag callers set
     that nothing reads."""
-    body = _bounded_body(
-        CACHE_CPP_CODE,
-        "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
-        "bool acquire_offload_buffer(",
-    )
-    body_norm = _normalize_ws(body)
+    body_norm = _normalize_ws(_bounded_body(CACHE_CPP_CODE, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START))
     guard_match = re.search(
         r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
         body_norm,
@@ -887,13 +912,7 @@ def test_unified_alloc_spill_guard_has_a_mutation_witness():
     mutated_raw = raw.replace(guard_block, "", 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
-            "bool acquire_offload_buffer(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START)
     assert not re.search(r"forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;", mutated_body_norm), (
         "mutation witness is broken: deleting the enforcement left a reference to it behind"
     )
@@ -928,13 +947,7 @@ def test_unified_alloc_spill_guard_nesting_has_a_mutation_witness():
     mutated_raw = raw.replace(nested_guard, flattened_guard, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _normalize_ws(
-        _bounded_body(
-            strip_comments(mutated_raw),
-            "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {",
-            "bool acquire_offload_buffer(",
-        )
-    )
+    mutated_body_norm = _body_of(mutated_raw, _UNIFIED_ALLOC_START, _ACQUIRE_OFFLOAD_BUFFER_START)
     guard_match = re.search(
         r"if\s*\(\s*!\s*ptr\s*&&\s*req\.intent\.constraints\.forbid_vram_zone_spill\s*\)\s*\{\s*return\s+false\s*;",
         mutated_body_norm,

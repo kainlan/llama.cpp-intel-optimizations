@@ -14784,25 +14784,13 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
                 // If zone is full, fall through to raw device malloc below --
                 // unless the caller forbids that spill (llama.cpp-ibj0 spec
-                // round 5 F13/F14, immediately below).
-                //
-                // llama.cpp-ibj0 spec round 5 F14: this check MUST live
-                // INSIDE this `cache && cache->arena_active()` scope, not
-                // after it. `ptr` is nullptr-initialized above and nothing
-                // else assigns it before this point, so a caller can reach
-                // "ptr is still null" for a reason that has NOTHING to do
-                // with a failed zone attempt -- the arena disabled
-                // (GGML_SYCL_VRAM_ARENA=0, vram_arena_enabled() false) or no
-                // cache yet -- in which case no zone attempt was ever made.
-                // The round-5a version of this check sat AFTER the whole
-                // enclosing `if` block and fired on that same "still null"
-                // regardless of cause, which refused EVERY direct-device-
-                // route allocation from a caller that sets
-                // forbid_vram_zone_spill, not just an actual zone-full
-                // case -- silently breaking the direct-device route's
-                // documented fallback to unified_alloc()'s own
-                // DEVICE_VRAM-tier overcommit guard as its only budget
-                // check.
+                // round 5 F13/F14). This check MUST stay nested INSIDE this
+                // `cache && cache->arena_active()` scope: `ptr` is
+                // nullptr-initialized above with nothing else assigning it
+                // before this point, so outside this scope (arena disabled,
+                // or no cache yet) "ptr still null" means no zone attempt
+                // ever ran, not that one failed -- forbid_vram_zone_spill
+                // must not fire on that case.
                 if (!ptr && req.intent.constraints.forbid_vram_zone_spill) {
                     return false;
                 }
@@ -17745,15 +17733,10 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
         req.intent.cohort_id                    = label;
         req.intent.constraints.must_device      = true;
         req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
-        // llama.cpp-ibj0 spec round 5 F13: a ring too big for the RUNTIME
-        // zone must FAIL this allocation, not silently escape into raw
-        // device memory outside the arena -- the caller (this function's
-        // own admission preflight above, and ggml_sycl_replan_pp_moe_onednn_ring()'s
-        // pre-check, ggml-sycl.cpp) sizes its refusal arithmetic against the
-        // zone's own budget, so a spill here would consume VRAM headroom
-        // other paths need without that arithmetic ever knowing.
+        // llama.cpp-ibj0 spec round 5 F13: see the field's own comment
+        // (alloc_constraints::forbid_vram_zone_spill, this file) for why.
         req.intent.constraints.forbid_vram_zone_spill = true;
-        owner                                   = {};
+        owner                                         = {};
         alloc_handle handle{};
         if (!unified_alloc(req, &handle) || handle.ptr == nullptr) {
             return nullptr;

@@ -16933,8 +16933,14 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // "succeeded" anyway -- unified_alloc()'s default behavior, when its
 // preferred zone is full, is to fall through to a raw sycl::malloc_device
 // OUTSIDE the arena, so reserve_pp_moe_onednn_scratch() reported success
-// while quietly consuming ~1.6 GB of the OUTSIDE-arena headroom the oneMath
-// gemm path also needs. The result was not this function's own refusal
+// while quietly consuming part of the OUTSIDE-arena headroom the oneMath
+// gemm path also needs -- on that card the arena's own log named its total
+// (16304.0 - 14618.0 = ~1686.0 MB left outside the arena for the driver,
+// kernel bundles, and oneMath scratch: "[VRAM-ARENA] Reserved single
+// chunk: 14618.0 MB (scratch=512.0, runtime=512.0, oneDNN=256.0, ...) on
+// a 16304 MB card"), and the ring's spill took its own uncounted share of
+// that fixed pool, leaving too little for the gemm call that needed it
+// moments later. The result was not this function's own refusal
 // template: it was a mid-prefill `UR_RESULT_ERROR_OUT_OF_RESOURCES` from the
 // gemm call itself (ibj0-master-ubsweep-b1-a1.log), i.e. exactly the
 // "res=-3 with nothing printed" failure mode Task 1 exists to close, just
