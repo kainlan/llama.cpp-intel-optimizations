@@ -192,6 +192,87 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    // llama.cpp-nphx Task 4a: -ub / --ubatch-size plumbing for n_ubatch_auto.
+    // LLAMA_EXAMPLE_COMMON requires -m/--model (common/arg.cpp: "error:
+    // --model is required" unless params.usage/completion/server_base is
+    // set), so every case below carries one even though this test cares
+    // only about n_ubatch/n_ubatch_auto.
+    {
+        common_params ubatch_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "--ubatch-size", "777"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(ubatch_params.n_ubatch == 777);
+        assert(ubatch_params.n_ubatch_auto == false);
+    }
+    {
+        // no -ub at all: the default is SYCL-only, both to record the
+        // fork-local #ifdef and so this test fails loudly if the default
+        // ever flips without the plumbing changing with it.
+        common_params ubatch_params;
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+#ifdef GGML_USE_SYCL
+        assert(ubatch_params.n_ubatch_auto == true);
+#else
+        assert(ubatch_params.n_ubatch_auto == false);
+#endif
+    }
+    {
+        common_params ubatch_params;
+        argv = {"binary_name", "-m", "model_file.gguf", "-ub", "auto"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), ubatch_params, LLAMA_EXAMPLE_COMMON));
+        assert(ubatch_params.n_ubatch_auto == true);
+    }
+    {
+        // llama.cpp-y8xv quality round 1, Q1: every OTHER writer of
+        // params.n_ubatch must also clear n_ubatch_auto, or a preset's
+        // deliberately chosen n_ubatch still arrives auto=true under SYCL
+        // (default true) and Task 4b's trial can override it. Use
+        // LLAMA_EXAMPLE_SERVER so common_params_parse() skips both the
+        // model download and the "--model is required" check for this
+        // preset (common/arg.cpp: "server will call
+        // common_params_handle_models() later, so we skip it here") --
+        // no network access, no -m needed.
+        common_params preset_params;
+        argv = {"binary_name", "--embd-gemma-default"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), preset_params, LLAMA_EXAMPLE_SERVER));
+        assert(preset_params.n_ubatch == 2048);
+        assert(preset_params.n_ubatch_auto == false);
+    }
+    {
+        // llama.cpp-y8xv quality round 2, Q8: --embedding/--embeddings is a
+        // TWELFTH site that had to clear n_ubatch_auto -- it does not itself
+        // write params.n_ubatch (a "writers of params.n_ubatch" search does
+        // not find it), but setting params.embedding=true makes the
+        // non-causal path apply (src/llama-context.cpp's
+        // GGML_ASSERT(causal_attn || n_ubatch >= n_tokens_all) requires
+        // n_ubatch == n_batch for it), so the auto trial must be off from
+        // the same handler, not just wherever n_ubatch happens to be
+        // assigned.
+        common_params embed_params;
+        argv = {"binary_name", "--embeddings"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), embed_params, LLAMA_EXAMPLE_SERVER));
+        assert(embed_params.embedding == true);
+        assert(embed_params.n_ubatch_auto == false);
+    }
+    {
+        // llama.cpp-y8xv quality round 3, Q10: --rerank/--reranking is a
+        // second handler that sets params.embedding=true (same non-causal
+        // n_ubatch == n_batch requirement as --embedding/--embeddings) and
+        // must clear n_ubatch_auto the same way.
+        common_params rerank_params;
+        argv = {"binary_name", "--rerank"};
+        assert(true ==
+               common_params_parse(argv.size(), list_str_to_char(argv).data(), rerank_params, LLAMA_EXAMPLE_SERVER));
+        assert(rerank_params.embedding == true);
+        assert(rerank_params.n_ubatch_auto == false);
+    }
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

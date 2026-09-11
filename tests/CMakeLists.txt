@@ -788,6 +788,11 @@ if (GGML_SYCL)
 endif()
 
 llama_build_and_test(test-arg-parser.cpp)
+# llama.cpp-y8xv quality round 1, Q5: host-only test for the -ub range
+# parser hoisted into tools/llama-bench/llama-bench-parse.hpp -- pulls in
+# only that header, not llama-bench itself.
+llama_build_and_test(test-llama-bench-parse.cpp)
+target_include_directories(test-llama-bench-parse PRIVATE ${PROJECT_SOURCE_DIR}/tools/llama-bench)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

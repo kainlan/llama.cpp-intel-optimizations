@@ -17109,6 +17109,13 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
     }
 }
 
+// llama.cpp-nphx: thin wrapper so llama-context.cpp (a different translation
+// unit) can read GGML_SYCL_AUTO_UBATCH without reaching into unified-cache.cpp
+// directly. Task 4a wires this; llama_context does not call it until Task 4b.
+bool ggml_backend_sycl_auto_ubatch_enabled() {
+    return ggml_sycl::unified_cache_auto_ubatch_enabled();
+}
+
 ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
                                                                            ggml_sycl_model_token model,
                                                                            uint32_t              n_ctx,

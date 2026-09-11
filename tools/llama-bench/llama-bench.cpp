@@ -26,6 +26,7 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-bench-parse.hpp"
 #include "log.h"
 
 #ifdef _WIN32
@@ -97,6 +98,12 @@ template <typename T, typename F> static std::vector<std::string> transform_to_s
     std::vector<std::string> str_values;
     std::transform(values.begin(), values.end(), std::back_inserter(str_values), f);
     return str_values;
+}
+
+// llama.cpp-nphx: render the -ub sentinel (-1) back to the "auto" spelling
+// users type, for help text and any other display of cmd_params.n_ubatch.
+static std::string n_ubatch_display_str(int n_ubatch) {
+    return n_ubatch < 0 ? "auto" : std::to_string(n_ubatch);
 }
 
 template <typename T> static T avg(const std::vector<T> & v) {
@@ -283,48 +290,6 @@ static std::string pair_str(const std::pair<int, int> & p) {
     return buf;
 }
 
-static std::vector<int> parse_int_range(const std::string & s, bool allow_negative = false) {
-    // first[-last[(+|*)step]]
-    std::regex range_regex(allow_negative
-        ? R"(^(-?\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))"
-        : R"(^(\d+)(?:-(\d+)(?:([\+|\*])(\d+))?)?(?:,|$))");
-
-    std::smatch match;
-    std::string::const_iterator search_start(s.cbegin());
-    std::vector<int> result;
-    while (std::regex_search(search_start, s.cend(), match, range_regex)) {
-        int  first = std::stoi(match[1]);
-        int  last  = match[2].matched ? std::stoi(match[2]) : first;
-        char op    = match[3].matched ? match[3].str()[0] : '+';
-        int  step  = match[4].matched ? std::stoi(match[4]) : 1;
-
-        for (int i = first; i <= last;) {
-            result.push_back(i);
-
-            int prev_i = i;
-
-            if (op == '+') {
-                i += step;
-            } else if (op == '*') {
-                i *= step;
-            } else {
-                throw std::invalid_argument("invalid range format");
-            }
-
-            if (i <= prev_i) {
-                throw std::invalid_argument("invalid range");
-            }
-        }
-        search_start = match.suffix().first;
-    }
-
-    if (search_start != s.cend()) {
-        throw std::invalid_argument("invalid range format");
-    }
-
-    return result;
-}
-
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -380,7 +345,11 @@ static const cmd_params cmd_params_defaults = {
     /* n_pg                 */ {},
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
+#ifdef GGML_USE_SYCL
+    /* n_ubatch             */ { -1 },  // llama.cpp-nphx: sentinel for "auto" (SYCL default)
+#else
     /* n_ubatch             */ { 512 },
+#endif
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { common_cpu_get_num_math() },
@@ -451,7 +420,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -pg <pp,tg>                                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
-    printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  -ub, --ubatch-size <n>, or \"auto\"                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_ubatch, n_ubatch_display_str), ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -615,7 +584,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto p = parse_int_range(argv[i]);
+                auto p = parse_ubatch_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
@@ -1289,7 +1258,19 @@ struct cmd_params_instance {
 
         cparams.n_ctx           = n_prompt + n_gen + n_depth;
         cparams.n_batch         = n_batch;
-        cparams.n_ubatch        = n_ubatch;
+        // llama.cpp-nphx: n_ubatch < 0 is the "-ub auto" sentinel. Leave
+        // cparams.n_ubatch at whatever llama_context_default_params() just
+        // set it to (512, a few lines up) instead of overwriting it -- that
+        // is bit-for-bit the value the old fixed {512} default used to pass
+        // explicitly, so every existing gate stays byte-identical until Task
+        // 4b's trial reads n_ubatch_auto and actually picks something.
+        // Reusing 0 here would NOT be byte-identical: 0 means "clamp to
+        // n_batch" (src/llama-context.cpp), which only coincides with 512
+        // when n_batch itself is <= 512.
+        cparams.n_ubatch_auto   = n_ubatch < 0;
+        if (n_ubatch >= 0) {
+            cparams.n_ubatch = n_ubatch;
+        }
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
@@ -1494,7 +1475,12 @@ struct test {
         model_size     = llama_model_size(lmodel);
         model_n_params = llama_model_n_params(lmodel);
         n_batch        = inst.n_batch;
-        n_ubatch       = inst.n_ubatch;
+        // llama.cpp-nphx: read the RESOLVED value back from the context
+        // rather than inst.n_ubatch, which can be 0 ("use n_batch", the
+        // library default) or -1 (the "-ub auto" sentinel) -- neither is
+        // ever what actually ran, and llama_n_ubatch(ctx) is always valid
+        // once the context exists.
+        n_ubatch       = llama_n_ubatch(ctx);
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
@@ -1951,7 +1937,13 @@ struct markdown_printer : public printer {
         if (params.n_batch.size() > 1 || params.n_batch != cmd_params_defaults.n_batch) {
             fields.emplace_back("n_batch");
         }
-        if (params.n_ubatch.size() > 1 || params.n_ubatch != cmd_params_defaults.n_ubatch) {
+        // llama.cpp-y8xv quality round 2, R1: under SYCL cmd_params_defaults.n_ubatch
+        // is {-1} (the auto sentinel), so a bare run (or an explicit "-ub auto")
+        // has params.n_ubatch == cmd_params_defaults.n_ubatch and this condition
+        // alone would never add the column -- exactly the case whose RESOLVED
+        // value (Q2-Q4's doc row) is the whole point of printing it. Also show
+        // the column whenever any requested n_ubatch is the auto sentinel.
+        if (bench_prints_n_ubatch_column(params.n_ubatch, cmd_params_defaults.n_ubatch)) {
             fields.emplace_back("n_ubatch");
         }
         if (params.type_k.size() > 1 || params.type_k != cmd_params_defaults.type_k) {

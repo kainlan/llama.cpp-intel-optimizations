@@ -110,6 +110,26 @@ and `GGML_UNUSED()`s every parameter; the non-SYCL arm keeps the original body u
 hunks merge with **no conflict markers** — but `common/fit.cpp` is the one "clean" file in this
 group that is not actually safe; see its own entry below for why.
 
+**New fork-local addition (2026-09-10, llama.cpp-nphx Task 4a, not one of the four behaviors
+above — recorded here because it is the same shape as (a), not because it extends that count).**
+`struct llama_context_params` gains a new boolean, `n_ubatch_auto` (declared at
+`include/llama.h`, grouped with the struct's other booleans right after `kv_unified`; default
+`false` in `llama_context_default_params()`, `src/llama-context.cpp`). `common_params` gains the
+mirror field `n_ubatch_auto` at `common/common.h`, immediately after `n_ubatch`, using the exact
+same `#ifdef GGML_USE_SYCL ... #else ... #endif` shape as `fit_params` above (default `true`
+under SYCL, `false` otherwise); `common_context_params_to_llama()` (`common/common.cpp`) copies
+it straight across, next to the existing `n_ubatch` copy. `common/arg.cpp`'s `-ub`/`--ubatch-size`
+handler changed from an `int`-typed `common_arg` to a `std::string`-typed one so it can accept the
+literal token `"auto"` (sets `n_ubatch_auto = true`) alongside the existing integer parse (sets
+`n_ubatch` and clears `n_ubatch_auto`); the non-integer error path is unchanged (`std::stoi` still
+throws, caught by the same call site as before). As of this task the field is plumbing only --
+`llama_context` does not yet read it (that is llama.cpp-nphx Task 4b), so this hunk changes no
+observable behavior on any backend. Any future upstream change to `llama_context_params`'s
+trailing-booleans block, `common_params`'s `n_ubatch` neighborhood, the `-ub` `common_arg`
+registration, or `common_context_params_to_llama()` should re-check this note; a same-shaped
+`#ifdef GGML_USE_SYCL` hunk two fields away from `fit_params` is the kind of thing a 3-way merge
+resolves silently in the wrong direction if upstream touches the same lines.
+
 **(b) `llama-tensor-class.*` call sites in `llama-model-loader.cpp`.** This premise does not
 hold today, and I want to flag the correction plainly rather than build the trace on a false
 floor. `src/llama-tensor-class.{h,cpp}` is a fork-only file (added by `1bb021aed`/`992c9acd5`,

@@ -140,6 +140,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
+        // llama.cpp-y8xv quality round 3, Q10: belt for every in-code writer
+        // of params.embedding (--embedding/--embeddings and --rerank in
+        // common/arg.cpp both already set n_ubatch_auto=false themselves,
+        // but a preset or any other future writer might not) -- kept
+        // UNCONDITIONAL, not nested inside the n_batch > n_ubatch check
+        // below, because embeddings are non-causal regardless of whether
+        // n_batch happened to already equal n_ubatch when the server
+        // started.
+        if (params.embedding) {
+            params.n_ubatch_auto = false;
+        }
+
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
