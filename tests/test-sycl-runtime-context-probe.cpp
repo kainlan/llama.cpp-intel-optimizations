@@ -213,7 +213,7 @@ int main(int argc, char ** argv) {
     // G5: cparams.flash_attn = params.flash_attn_type !=
     // LLAMA_FLASH_ATTN_TYPE_DISABLED (src/llama-context.cpp:542) is the
     // resolution this would ideally read; llama_context's own
-    // sycl_resync_runtime_context_flash_attn()/narrow-recheck comment
+    // sycl_recheck_runtime_context_flash_attn()'s doc comment
     // (src/llama-context.h:279-284) is where the "constructor's own call
     // ... sees an optimistic `true`" reasoning this line paraphrases
     // actually lives, not ggml-sycl.cpp.
@@ -310,7 +310,8 @@ int main(int argc, char ** argv) {
     // llama.cpp-tsfl round 2 G4: llama_free(ctx) and llama_model_free(model)
     // -- which tear down the CONTEXT's own SYCL backend -- must run BEFORE
     // ggml_backend_free(backend) frees this harness's auxiliary one.
-    // ggml_backend_sycl_free() (ggml-sycl.cpp:82018-82198) tears down
+    // ggml_backend_sycl_free() (ggml-sycl.cpp, the static function of that
+    // name; line cites into that file rot every commit) tears down
     // PROCESS-GLOBAL state (the prestage thread, pipeline copy queues,
     // tp_free, the pinned-owner shutdown GGML_ASSERT, the FP16 cache, split
     // rings) regardless of which ggml_backend_t instance triggers it, so
