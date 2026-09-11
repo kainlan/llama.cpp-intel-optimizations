@@ -67,6 +67,9 @@ int main(int argc, char ** argv) {
 
     // always enable embd, so that we can pass hidden states to the audio generation helper
     params.embedding = true;
+    // non-causal-style embedding path (llama.cpp-ubj8): keep the micro-batch a
+    // later auto trial cannot shrink, same pairing as common/arg.cpp's --embedding handler.
+    params.n_ubatch_auto = false;
 
     llama_backend_init();
     llama_numa_init(params.numa);
