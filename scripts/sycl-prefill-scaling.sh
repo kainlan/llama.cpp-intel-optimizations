@@ -143,14 +143,15 @@
 # than 512, so `--ubatch 512` still shows "-" while `--ubatch 1024` shows
 # the column. Under SYCL (Task 4a, llama.cpp-y8xv, merged in 6419b06bf,
 # docs/plans/2026-09-10-auto-ubatch.md), the built-in default n_ubatch IS
-# that sentinel (`{-1}`), so the clause fires on every SYCL run -- bare,
-# swept, or an explicit single value -- and the column is now ALWAYS
-# present under SYCL. Its value is also no longer one fixed number per
-# invocation: llama-bench prints llama_n_ubatch(ctx), RESOLVED per pp-row
-# instance (see parse_ub_cell), so a bare default SYCL run shows
-# 128/512/512/512 across this script's own pp128/pp512/pp1024/pp2048
-# rows and an explicit `-ub 1024` run shows 128/512/1024/1024; this
-# column reads only the pp512 row's own cell, 512 in both examples above.
+# that sentinel (`{-1}`), so the column is always present under SYCL --
+# via the sentinel clause on a bare run or `-ub auto`, and via the `!=
+# defaults` clause for any explicit value or sweep. Its value is also no
+# longer one fixed number per invocation: llama-bench prints
+# llama_n_ubatch(ctx), RESOLVED per pp-row instance (see parse_ub_cell),
+# so a bare default SYCL run shows 128/512/512/512 across this script's
+# own pp128/pp512/pp1024/pp2048 rows and an explicit `-ub 1024` run
+# shows 128/512/1024/1024; this column reads only the pp512 row's own
+# cell, 512 in both examples above.
 # The column is REPORT-ONLY and read ONLY from what llama-bench itself
 # printed -- NEVER echoed back from --ubatch/UBATCH when the column is
 # absent, even though this script knows what it asked for: the
@@ -474,7 +475,7 @@ parse_ub_cell() {
 # review round 1, nit 4 -- this printf used to be duplicated verbatim six
 # times, so a column change had to be made in six places in lockstep, and
 # a header/row drift would not have been caught by any assertion).
-row() { printf '%-20s %-6s %6s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
+row() { printf '%-20s %-6s %8s %10s %10s %10s %10s %10s %14s %s\n' "$@"; }
 
 row "model" "card" "ub@pp512" "pp128" "pp512" "pp1024" "pp2048" "ratio1024" "intercept_ms" "status"
 
