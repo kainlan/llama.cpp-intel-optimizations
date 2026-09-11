@@ -3447,10 +3447,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.embedding = true;
             // llama.cpp-y8xv quality round 2, Q8: embeddings are non-causal
             // (src/llama-context.cpp's GGML_ASSERT(causal_attn || n_ubatch
-            // >= n_tokens_all) requires n_ubatch == n_batch for them,
-            // tools/server/server.cpp:146-150 enforces this by lowering
-            // n_batch, not raising n_ubatch), so the auto micro-batch trial
-            // must never apply here regardless of backend.
+            // >= n_tokens_all) requires n_ubatch == n_batch for them, the
+            // embeddings n_batch/n_ubatch reconciliation in llama_server()
+            // (tools/server/server.cpp) enforces this by lowering n_batch,
+            // not raising n_ubatch), so the auto micro-batch trial must
+            // never apply here regardless of backend.
             params.n_ubatch_auto = false;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_EMBEDDINGS"));
@@ -4497,7 +4498,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "embeddinggemma-300M-qat-Q4_0.gguf";
             params.port = 8011;
             params.n_ubatch = 2048;
-            params.n_ubatch_auto  = false;
+            params.n_ubatch_auto = false;
             params.n_batch = 2048;
             params.n_parallel = 32;
             params.n_ctx = 2048*params.n_parallel;
@@ -4561,7 +4562,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
-            params.n_ubatch_auto                     = false;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4578,7 +4579,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
             params.port = 8012;
             params.n_ubatch = 1024;
-            params.n_ubatch_auto                     = false;
+            params.n_ubatch_auto = false;
             params.n_batch = 1024;
             params.n_ctx = 0;
             params.n_cache_reuse = 256;
@@ -4608,7 +4609,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_file = "gpt-oss-20b-mxfp4.gguf";
             params.port = 8013;
             params.n_ubatch = 2048;
-            params.n_ubatch_auto  = false;
+            params.n_ubatch_auto = false;
             params.n_batch = 32768;
             params.n_parallel = 2;
             params.n_ctx = 131072*params.n_parallel;
@@ -4627,7 +4628,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.hf_repo = "ggml-org/gpt-oss-120b-GGUF";
             params.port = 8013;
             params.n_ubatch = 2048;
-            params.n_ubatch_auto  = false;
+            params.n_ubatch_auto = false;
             params.n_batch = 32768;
             params.n_parallel = 2;
             params.n_ctx = 131072*params.n_parallel;

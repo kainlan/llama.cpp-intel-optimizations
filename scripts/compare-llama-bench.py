@@ -60,6 +60,9 @@ assert len(LLAMA_BENCH_DB_FIELDS) == len(LLAMA_BENCH_DB_TYPES)
 assert len(TEST_BACKEND_OPS_DB_FIELDS) == len(TEST_BACKEND_OPS_DB_TYPES)
 
 # Properties by which to differentiate results per commit for llama-bench:
+# NOTE (llama.cpp-ubj8): since llama.cpp-y8xv (6419b06bf) n_ubatch records the
+# RESOLVED value, not the requested one -- rows straddling that commit will
+# not pair here when the clamp changed the value (docs/backend/sycl-env-vars.md).
 LLAMA_BENCH_KEY_PROPERTIES = [
     "cpu_info", "gpu_info", "backends", "n_gpu_layers", "n_cpu_moe", "tensor_buft_overrides", "model_filename", "model_type",
     "n_batch", "n_ubatch", "embeddings", "cpu_mask", "cpu_strict", "poll", "n_threads", "type_k", "type_v",
