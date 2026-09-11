@@ -17725,16 +17725,16 @@ bool unified_cache::reserve_pp_moe_onednn_scratch(size_t   weight_slot_bytes,
 
     auto allocate_buffer = [&](size_t size, const char * label, mem_handle & owner) -> void * {
         alloc_request req{};
-        req.queue                               = &queue_;
-        req.device                              = ggml_sycl_get_device_id_from_queue(queue_);
-        req.size                                = size;
-        req.intent.role                         = alloc_role::COMPUTE;
-        req.intent.category                     = runtime_category::COMPUTE;
-        req.intent.cohort_id                    = label;
-        req.intent.constraints.must_device      = true;
-        req.intent.constraints.prefer_vram_zone = vram_zone_id::RUNTIME;
+        req.queue                                     = &queue_;
+        req.device                                    = ggml_sycl_get_device_id_from_queue(queue_);
+        req.size                                      = size;
+        req.intent.role                               = alloc_role::COMPUTE;
+        req.intent.category                           = runtime_category::COMPUTE;
+        req.intent.cohort_id                          = label;
+        req.intent.constraints.must_device            = true;
+        req.intent.constraints.prefer_vram_zone       = vram_zone_id::RUNTIME;
         // llama.cpp-ibj0 spec round 5 F13: see the field's own comment
-        // (alloc_constraints::forbid_vram_zone_spill, this file) for why.
+        // (alloc_constraints::forbid_vram_zone_spill, unified-cache.hpp) for why.
         req.intent.constraints.forbid_vram_zone_spill = true;
         owner                                         = {};
         alloc_handle handle{};
