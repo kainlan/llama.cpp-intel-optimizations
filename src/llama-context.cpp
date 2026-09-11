@@ -328,6 +328,67 @@ static decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn) llama_con
     return reinterpret_cast<decltype(&ggml_backend_sycl_recheck_runtime_context_flash_attn)>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_recheck_runtime_context_flash_attn"));
 }
+
+// llama.cpp-xojq (nphx Task 4b): proc-address lookups for the auto
+// micro-batch trial's four SYCL entry points, mirroring
+// llama_context_sycl_runtime_proc()/llama_context_sycl_recheck_proc() above.
+// A GGML_BACKEND_DL build whose SYCL DSO predates llama.cpp-tsfl (the probe
+// and fallback counter) or this task (auto_ubatch_enabled's registration,
+// moe_gpu_ubatch_max) exports none of these; sycl_select_auto_ubatch()
+// treats a nullptr proc the same way every other caller in this file
+// already does for llama_context_sycl_runtime_proc() -- as "unavailable",
+// never dereferenced.
+static decltype(&ggml_backend_sycl_probe_runtime_context_for_model) llama_context_sycl_probe_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_probe_runtime_context_for_model)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_probe_runtime_context_for_model"));
+}
+
+static decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks) llama_context_sycl_fallbacks_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_compute_buffer_host_fallbacks)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_compute_buffer_host_fallbacks"));
+}
+
+static decltype(&ggml_backend_sycl_auto_ubatch_enabled) llama_context_sycl_auto_ubatch_enabled_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_auto_ubatch_enabled)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_auto_ubatch_enabled"));
+}
+
+static decltype(&ggml_backend_sycl_moe_gpu_ubatch_max) llama_context_sycl_moe_gpu_ubatch_max_proc(
+    ggml_backend_dev_t dev) {
+    if (!dev) {
+        return nullptr;
+    }
+    auto * reg = llama_context_sycl_reg_from_dev(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    return reinterpret_cast<decltype(&ggml_backend_sycl_moe_gpu_ubatch_max)>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_sycl_moe_gpu_ubatch_max"));
+}
 #endif
 
 // llama.cpp-oyfl: name the specific ggml_sycl_lifecycle_result the narrow
@@ -911,7 +972,38 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        sched_reserve();
+        // llama.cpp-xojq (nphx Task 4b, c-wgxn): run the SYCL auto
+        // micro-batch selection trial IN PLACE OF the unconditional
+        // sched_reserve() below, when all four conditions hold: the caller
+        // did not pin -ub explicitly (n_ubatch_auto), this context has a
+        // SYCL backend, GGML_SYCL_AUTO_UBATCH allows it, and the model is
+        // causal (comment c-dcct: a non-causal model's n_ubatch == n_batch
+        // semantics must never be shrunk by the trial). Any condition false
+        // falls through to today's single sched_reserve() call, unchanged.
+        bool sycl_auto_ubatch_trial = false;
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+        if (params.n_ubatch_auto && cparams.causal_attn && llama_context_has_sycl_backend(backends)) {
+#    ifdef GGML_USE_SYCL
+            sycl_auto_ubatch_trial = ggml_backend_sycl_auto_ubatch_enabled();
+#    else
+            ggml_backend_dev_t sycl_dev = nullptr;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (llama_context_dev_is_sycl(dev)) {
+                    sycl_dev = dev;
+                    break;
+                }
+            }
+            auto auto_ubatch_enabled_fn = llama_context_sycl_auto_ubatch_enabled_proc(sycl_dev);
+            sycl_auto_ubatch_trial      = auto_ubatch_enabled_fn && auto_ubatch_enabled_fn();
+#    endif
+        }
+#endif
+        if (sycl_auto_ubatch_trial) {
+            sycl_select_auto_ubatch();
+        } else {
+            sched_reserve();
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1176,6 +1268,203 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
     }
+}
+
+// llama.cpp-xojq (nphx Task 4b, comment c-wgxn): the auto micro-batch
+// selection trial. See its declaration in llama-context.h and the
+// constructor's own gate right above its one call site for when this runs.
+//
+// Tries the ladder {512, 1024, 2048, 4096} ascending, each candidate capped
+// by min(n_batch, n_ctx) and, for a MoE model (model.hparams.n_expert > 0),
+// additionally by the GPU MoE routing ceiling
+// (ggml_backend_sycl_moe_gpu_ubatch_max(), llama.cpp-ohkx) until that
+// ceiling is lifted -- a candidate whose ring still fits but whose routing
+// silently falls off the GPU path is not a win. Per candidate, on every
+// SYCL backend this context has: Task 2's non-publishing probe
+// (ggml_backend_sycl_probe_runtime_context_for_model) must accept it without
+// demoting KV, with the same bounded exponential BUSY backoff
+// sycl_resync_runtime_context_flash_attn() uses just above (transient
+// lease/lock contention, not a candidate-shape refusal); only then is it
+// published (sycl_resync_runtime_context_flash_attn(), which every SYCL
+// backend's probe already accepted) and given a full sched_reserve() cycle
+// -- a fresh sched+galloc every call (ggml-alloc.c's realloc-on-shrink-no-op
+// means a losing candidate's oversized buffers are freed and reallocated by
+// the NEXT reserve, not left behind). A candidate whose reserve lands any
+// compute buffer host-pinned (ggml_backend_sycl_compute_buffer_host_
+// fallbacks() > 0, read AFTER the publish that resets it) also loses. The
+// last candidate that clears all three checks wins; if none do, the floor is
+// today's pre-trial default (already clamped to n_batch at :560-ish, read
+// before this function is entered). The settle step re-publishes and
+// re-reserves at the winner whenever the published plan/sched do not already
+// describe it (a losing final candidate's demand must not be left live) --
+// see c-wgxn's own safety analysis for why a settle-down transaction cannot
+// introduce a new KV demotion (its demand is never larger than one already
+// accepted).
+//
+// Exactly one GGML_LOG_WARN reports the outcome, with one of these stop
+// reasons: "ladder exhausted" (the n_batch/n_ctx cap won), "MoE GPU routing
+// ceiling" (the MoE cap won), "transaction refused", "transaction busy"
+// (BUSY persisted past the backoff), "not the published model"
+// (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second model published after
+// this one loaded), "KV would be demoted", or "compute buffer fell back to
+// host". Candidate refusals inside the probe itself log at GGML_LOG_INFO,
+// not ERROR (Task 2), so a multi-candidate trial does not print one scary
+// refusal per losing candidate.
+void llama_context::sycl_select_auto_ubatch() {
+#if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
+    struct sycl_probe_backend {
+        ggml_backend_t backend;
+        int            dev_index;
+    };
+
+    std::vector<sycl_probe_backend> sycl_backends;
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (llama_context_dev_is_sycl(dev)) {
+            sycl_backends.push_back(
+                { backend.get(), llama_context_sycl_device_index(dev, (int) sycl_backends.size()) });
+        }
+    }
+    if (sycl_backends.empty()) {
+        // The caller's own gate (llama_context_has_sycl_backend()) already
+        // checked this before calling us; defensive only.
+        sched_reserve();
+        return;
+    }
+
+#    ifdef GGML_USE_SYCL
+    auto probe_fn    = &ggml_backend_sycl_probe_runtime_context_for_model;
+    auto fallback_fn = &ggml_backend_sycl_compute_buffer_host_fallbacks;
+#    else
+    ggml_backend_dev_t first_dev   = ggml_backend_get_device(sycl_backends.front().backend);
+    auto               probe_fn    = llama_context_sycl_probe_proc(first_dev);
+    auto               fallback_fn = llama_context_sycl_fallbacks_proc(first_dev);
+    auto               moe_cap_fn  = llama_context_sycl_moe_gpu_ubatch_max_proc(first_dev);
+    if (!probe_fn || !fallback_fn) {
+        // A SYCL DSO too old to export the trial's own entry points --
+        // ggml_backend_sycl_auto_ubatch_enabled() should already have kept
+        // the caller from reaching here for the same reason; this is the
+        // defensive mirror. Fall back to today's single reserve.
+        sched_reserve();
+        return;
+    }
+#    endif
+
+    static const uint32_t ladder[] = { 512, 1024, 2048, 4096 };
+
+    uint32_t     cap  = std::min(cparams.n_batch, cparams.n_ctx);
+    const char * stop = "ladder exhausted";
+    if (model.hparams.n_expert > 0) {
+        // A direct GGML_USE_SYCL build's accessor is a real, always-defined
+        // function -- called unconditionally, no null check (there is
+        // nothing to be null). The DL-without-SYCL lookup genuinely can
+        // return nullptr on an older SYCL DSO, so it degrades to `cap`
+        // (no MoE-specific narrowing) rather than dereferencing one.
+#    ifdef GGML_USE_SYCL
+        const uint32_t moe_cap = ggml_backend_sycl_moe_gpu_ubatch_max();
+#    else
+        const uint32_t moe_cap = moe_cap_fn ? moe_cap_fn() : cap;
+#    endif
+        if (moe_cap < cap) {
+            cap  = moe_cap;
+            stop = "MoE GPU routing ceiling";
+        }
+    }
+
+    const uint32_t fallback_ubatch         = cparams.n_ubatch;  // already clamped, see :560-ish above
+    uint32_t       last_good               = 0;
+    bool           sched_matches_last_good = false;
+    std::string    tried;
+
+    const auto &                owner = model.get_sycl_model_token();
+    const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot, owner.slot_generation };
+
+    for (uint32_t c : ladder) {
+        if (c > cap) {
+            break;
+        }
+        tried += (tried.empty() ? "" : ",") + std::to_string(c);
+
+        bool candidate_lost = false;
+        for (auto & sb : sycl_backends) {
+            ggml_sycl_runtime_context_probe probe{};
+            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
+
+            // Same bounded exponential backoff as
+            // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
+            // above -- transient lease/lock contention, not a
+            // candidate-shape refusal.
+            constexpr int max_busy_waits = 7;
+            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < max_busy_waits; ++wait) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
+                rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
+            }
+
+            if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
+                stop           = "transaction busy";
+                candidate_lost = true;
+            } else if (rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
+                stop           = "not the published model";
+                candidate_lost = true;
+            } else if (rc != GGML_SYCL_LIFECYCLE_OK || !probe.accepted) {
+                stop           = "transaction refused";
+                candidate_lost = true;
+            } else if (probe.would_demote_kv) {
+                stop           = "KV would be demoted";
+                candidate_lost = true;
+            }
+            if (candidate_lost) {
+                break;
+            }
+        }
+        if (candidate_lost) {
+            break;
+        }
+
+        cparams.n_ubatch = c;
+        sycl_resync_runtime_context_flash_attn();  // publish -- every SYCL backend's probe already accepted c
+        sched_need_reserve = true;
+        sched_reserve();
+        sched_matches_last_good = true;
+
+        bool host_fallback = false;
+        for (auto & sb : sycl_backends) {
+            if (fallback_fn(sb.dev_index) > 0) {
+                host_fallback = true;
+                break;
+            }
+        }
+        if (host_fallback) {
+            stop                    = "compute buffer fell back to host";
+            sched_matches_last_good = false;
+            break;
+        }
+        last_good = c;
+    }
+
+    if (last_good == 0) {
+        last_good               = fallback_ubatch;
+        sched_matches_last_good = false;
+    }
+
+    // Settle: only when the published plan/sched do not already describe
+    // last_good -- a losing final candidate's demand must not be left live.
+    if (!sched_matches_last_good || cparams.n_ubatch != last_good) {
+        cparams.n_ubatch = last_good;
+        sycl_resync_runtime_context_flash_attn();
+        sched_need_reserve = true;
+        sched_reserve();
+    }
+
+    LLAMA_LOG_WARN("[SYCL-PLAN] auto n_ubatch=%u for n_ctx=%u n_batch=%u (tried %s; %s); pass -ub N to override\n",
+                   cparams.n_ubatch, cparams.n_ctx, cparams.n_batch, tried.c_str(), stop);
+    // The constructor's own "n_ubatch = ..." INFO line (above, before this
+    // function's one call site) printed the PRE-TRIAL value; this states
+    // the resolved one.
+    LLAMA_LOG_INFO("%s: n_ubatch = %u (auto)\n", __func__, cparams.n_ubatch);
+#else
+    sched_reserve();
+#endif
 }
 
 void llama_context::sched_reserve() {

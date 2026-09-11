@@ -289,6 +289,24 @@ private:
     // before any inference, so a refusal here is still a clean exception.
     void sycl_recheck_runtime_context_flash_attn();
 
+    // llama.cpp-xojq (nphx Task 4b, comment c-wgxn): the SYCL auto
+    // micro-batch selection trial. Called from the constructor IN PLACE OF
+    // the unconditional sched_reserve() call, only when params.n_ubatch_auto
+    // is set, the context has a SYCL backend, GGML_SYCL_AUTO_UBATCH allows
+    // it (ggml_backend_sycl_auto_ubatch_enabled()), and cparams.causal_attn
+    // is true -- a non-causal model keeps its n_ubatch == n_batch semantics
+    // unchanged (comment c-dcct; the assert this pins is the
+    // "non-causal attention requires n_ubatch >= n_tokens" GGML_ASSERT in
+    // llama-context.cpp's decode()). Tries an ascending ladder
+    // of n_ubatch candidates, each vetted by Task 2's non-publishing probe
+    // (ggml_backend_sycl_probe_runtime_context_for_model) before being
+    // published and given a full sched_reserve() cycle; settles on the
+    // largest candidate whose compute buffers land fully on-device (no
+    // host-pinned fallback). See its definition in llama-context.cpp (right
+    // before sched_reserve()) for the loop and its exact stop-reason
+    // vocabulary.
+    void sycl_select_auto_ubatch();
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);

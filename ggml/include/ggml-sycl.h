@@ -413,8 +413,8 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device);
 
 // llama.cpp-nphx: whether the SYCL auto micro-batch selection trial
-// (llama_context, Task 4b) is enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
-// Task 4a wires this query; llama_context does not call it until Task 4b.
+// (llama_context::sycl_select_auto_ubatch(), llama.cpp-xojq Task 4b) is
+// enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
 GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 
 // Provide the actual layer membership for the next KV buffer allocation on a
@@ -501,6 +501,15 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t * f
 // and secondary GPUs should NOT be exposed to the backend scheduler.
 GGML_BACKEND_API bool ggml_backend_sycl_moe_multi_gpu_requested(void);
 GGML_BACKEND_API void ggml_backend_sycl_set_debug(int level);
+
+// llama.cpp-xojq (nphx Task 4b): the GPU MoE routing ceiling
+// (MOE_GPU_UBATCH_MAX, ggml-sycl/moe-control-plan.hpp) exposed for
+// llama_context's auto micro-batch ladder. Above this micro-batch the
+// routing-id/compaction table stops being a control-sized allocation and
+// moe_build_context_control_layout() refuses the GPU route
+// (exceeds_gpu_ubatch), so the trial must not try a larger candidate on a
+// MoE model (hparams.n_expert > 0) until llama.cpp-ohkx lifts the ceiling.
+GGML_BACKEND_API uint32_t ggml_backend_sycl_moe_gpu_ubatch_max(void);
 
 // Device-to-host memcpy using the SYCL backend queue for the tensor's buffer.
 // This avoids mixing queues/contexts in tests.
