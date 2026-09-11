@@ -387,12 +387,14 @@ parse_cell() {
 # parse_cell already uses to find a DATA row by value doubles here to find
 # the HEADER row by name, without a second, different mechanism. Echoes
 # the index, or "" when the log is unreadable, no header row is found, or
-# that header has no column named $2 -- llama-bench omits the n_ubatch
-# column outright off SYCL unless -ub was swept or given a single value
-# other than its own built-in default, and never omits it under SYCL
-# (see the file header's --ubatch paragraph for the exact condition,
-# both branches, and the `--ubatch 512` corner case); this is how that
-# legitimate case is told apart from a malformed table below.
+# that header has no column named $2 -- whether llama-bench omits the
+# n_ubatch column at all is governed by its own
+# bench_prints_n_ubatch_column (tools/llama-bench/llama-bench-parse.hpp;
+# see the file header's --ubatch paragraph for the exact condition and
+# both its SYCL/off-SYCL branches). The `--ubatch 512` corner case (still
+# shows "-") is an OFF-SYCL-ONLY artifact of that predicate -- under SYCL
+# the column is never omitted, at 512 or any other value; this is how the
+# legitimate off-SYCL absence is told apart from a malformed table below.
 find_header_index() {
     local log="$1" col="$2"
     [ -r "$log" ] || { echo ""; return 0; }

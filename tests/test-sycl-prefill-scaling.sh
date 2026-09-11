@@ -214,18 +214,30 @@ mk_fake_bench_audit() { # $1=path $2=auditfile $3=pp128 $4=pp512 $5=pp1024 $6=pp
 # with the SAME value on every row -- the pre-Task-4a / off-SYCL shape
 # (see the script header's --ubatch paragraph for the full post-4a
 # condition, and mk_fake_bench_ub_rows below for the per-row shape). Real
-# llama-bench off SYCL emits that column only when n_ubatch.size() > 1 OR
-# a single value other than its own built-in default 512 -- this helper
-# does NOT reproduce that logic itself; it is told directly whether to
-# include the column and what to put in it, so a given case can build
-# whichever table shape it needs regardless of what a real sweep would
-# produce. Every row's n_ubatch cell is set to $6. $6="" is a legal,
-# deliberately-used value: it builds a table whose HEADER declares the
-# n_ubatch column but whose DATA rows are blank under it, the exact shape
-# case 22 below needs. Optional $7 audit path behaves exactly like
-# mk_fake_bench_rc's own $7 -- it records the fake bench's OWN received
-# argv, which is how cases 20-21 below prove `-ub VALUE` actually reached
-# the wrapped bench, independent of what $6 puts in the table.
+# llama-bench's own bench_prints_n_ubatch_column
+# (tools/llama-bench/llama-bench-parse.hpp) governs whether the column
+# appears at all: post-Task-4a, under SYCL it is ALWAYS present, with a
+# value RESOLVED PER ROW (never uniform, hence mk_fake_bench_ub_rows for
+# that shape); off SYCL the old rule still applies unchanged -- the
+# column appears only when n_ubatch.size() > 1 OR a single value other
+# than the built-in default 512. This helper does NOT reproduce either
+# rule itself; it is told directly whether to include the column and
+# what to put in it, so a given case can build whichever table shape it
+# needs regardless of what a real sweep would produce -- including
+# shapes a real SYCL run can no longer produce: cases 18, 21, and 26
+# below (which use mk_fake_bench_rc, not this helper, to build a
+# column-absent table, and assert the report's ub@pp512 cell reads "-")
+# now model the OFF-SYCL / old-log shape, never something a SYCL run
+# emits post-4a. (Case 24's own "-" is unrelated: a column-PRESENT table
+# whose pp512 row is entirely missing, a truncated/malformed-table shape
+# that is not SYCL/off-SYCL specific at all.) Every row's n_ubatch cell
+# is set to $6. $6="" is a legal, deliberately-used value: it builds a
+# table whose HEADER declares the n_ubatch column but whose DATA rows
+# are blank under it, the exact shape case 22 below needs. Optional $7
+# audit path behaves exactly like mk_fake_bench_rc's own $7 -- it
+# records the fake bench's OWN received argv, which is how cases 20-21
+# below prove `-ub VALUE` actually reached the wrapped bench,
+# independent of what $6 puts in the table.
 mk_fake_bench_ub() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048 $6=ub $7=audit
     local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5" ub="$6" audit="${7:-}"
     {
