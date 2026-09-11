@@ -118,7 +118,9 @@ def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
 # helpers below and every mutation witness's _body_of() call.
 _ALLOC_BUFFER_START = "static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer("
 _ALLOC_BUFFER_END = "} catch (const sycl::exception & exc) {"
-_TRANSACTION_START = "static bool ggml_sycl_run_runtime_context_transaction("
+# llama.cpp-tsfl round 1 F6: return type changed from bool to the internal
+# ggml_sycl_txn_result enum.
+_TRANSACTION_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 _SET_RUNTIME_CONTEXT_START = "void ggml_backend_sycl_set_runtime_context("
 _PROBE_START = "ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model("
 _AUTO_UBATCH_ENABLED_START = "bool ggml_backend_sycl_auto_ubatch_enabled("
@@ -270,29 +272,29 @@ def test_increment_sites_have_a_mutation_witness():
     )
 
 
-def test_transaction_resets_the_counter_on_success_before_publish():
-    """ggml_sycl_run_runtime_context_transaction()'s PUBLISH path (not the
-    probe path) must reset g_compute_buffer_host_fallbacks[ctx->device] to 0
-    once every candidate check has passed, before the plan that
-    graph_reserve() will allocate compute buffers against is published (the
-    CAS), so a caller reading the counter afterward sees "fallbacks since the
-    last successful runtime-context transaction", not carried over from a
-    stale plan."""
+def test_transaction_resets_the_counter_on_success_after_the_cas():
+    """llama.cpp-tsfl round 1 F4: ggml_sycl_run_runtime_context_transaction()'s
+    PUBLISH path must reset g_compute_buffer_host_fallbacks[ctx->device] to 0
+    on the SUCCESS TAIL, strictly AFTER the CAS has actually succeeded --
+    not any earlier, where the publication-ID check, MMID materialization,
+    or the CAS itself could still refuse and this transaction never
+    publishes anything. ggml_backend_sycl_compute_buffer_host_fallbacks()
+    (ggml-sycl.h) promises "since the last SUCCESSFUL runtime-context
+    transaction"; resetting before those three could-still-fail steps broke
+    that promise for every one of their refusal paths. (This test used to be
+    named ...before_publish and pinned the OLD, wrong position -- before the
+    CAS; F4 corrected the code and this test.)"""
     body_norm = _normalize_ws(_transaction_body())
     assert re.search(
         r"g_compute_buffer_host_fallbacks\[ctx->device\]\.store\(\s*0", body_norm
     ), "the transaction body must reset the counter with .store(0, ...)"
 
     reset_idx = body_norm.find("g_compute_buffer_host_fallbacks[ctx->device].store(0")
-    # The probe branch's own early "return true;" (right after its own
-    # "OK" fill and the ring rollback) must precede the reset -- the reset
-    # belongs only to the publish path that runs AFTER that branch.
-    probe_branch_idx = body_norm.find("if (probe_mode) {")
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
-    assert probe_branch_idx != -1 and reset_idx != -1 and cas_idx != -1
-    assert probe_branch_idx < reset_idx < cas_idx, (
-        "the counter reset must sit AFTER the probe_mode branch (so a probe never resets it) and BEFORE the "
-        "CAS (so it only fires once the transaction is actually about to publish)"
+    assert reset_idx != -1 and cas_idx != -1
+    assert cas_idx < reset_idx < len(body_norm), (
+        "the counter reset must sit AFTER the CAS (ggml_sycl::lifecycle_replace_placement_plan) -- resetting "
+        "any earlier risks resetting the counter for a transaction that still goes on to refuse"
     )
 
 
@@ -308,6 +310,32 @@ def test_reset_site_has_a_mutation_witness():
     mutated_body_norm = _body_of(mutated_raw, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
     assert not re.search(r"g_compute_buffer_host_fallbacks\[ctx->device\]\.store\(\s*0", mutated_body_norm), (
         "mutation witness is broken: deleting the reset line left a reference to it behind"
+    )
+
+
+def test_reset_after_cas_has_a_mutation_witness():
+    """Mutation witness for llama.cpp-tsfl round 1 F4 itself: proves the
+    ordering check above would actually catch the reset moving back to its
+    OLD (pre-F4) position, immediately before `auto next = ...` and
+    therefore before the publication-ID check, MMID materialization, and
+    the CAS -- exactly the bug F4 fixed."""
+    raw = GGML_SYCL_CPP
+    reset_line = "    g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);\n"
+    assert raw.count(reset_line) == 1, f"expected exactly one reset line -- found {raw.count(reset_line)}"
+    next_snapshot_line = "    auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);\n"
+    assert next_snapshot_line in raw, "mutation target (next snapshot line) not found -- update this witness"
+
+    mutated_raw = raw.replace(reset_line, "", 1)
+    mutated_raw = mutated_raw.replace(next_snapshot_line, reset_line + next_snapshot_line, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
+    mutated_reset_idx = mutated_body_norm.find("g_compute_buffer_host_fallbacks[ctx->device].store(0")
+    mutated_cas_idx = mutated_body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert mutated_reset_idx != -1 and mutated_cas_idx != -1
+    assert not (mutated_cas_idx < mutated_reset_idx < len(mutated_body_norm)), (
+        "mutation witness is broken: the mutated (pre-F4, reset-before-CAS) source should FAIL the "
+        "cas_idx < reset_idx ordering check, but it did not"
     )
 
 
@@ -380,8 +408,10 @@ def test_probe_and_publisher_share_one_static_body():
     the SAME shared static function,
     ggml_sycl_run_runtime_context_transaction() -- not two independent
     admission implementations that could silently drift apart."""
+    # llama.cpp-tsfl round 1 F6: return type is now the internal
+    # ggml_sycl_txn_result enum, not bool.
     assert re.search(
-        r"static\s+bool\s+ggml_sycl_run_runtime_context_transaction\s*\(", GGML_SYCL_CPP_CODE
+        r"static\s+ggml_sycl_txn_result\s+ggml_sycl_run_runtime_context_transaction\s*\(", GGML_SYCL_CPP_CODE
     ), "ggml_sycl_run_runtime_context_transaction() must exist and be file-static"
 
     publisher_body_norm = _normalize_ws(
@@ -415,9 +445,11 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     the probe silently going back to calling the OLD, non-shared, direct
     logic instead of the shared transaction function."""
     raw = GGML_SYCL_CPP
+    # llama.cpp-tsfl round 1 F6: the probe now dispatches the shared body's
+    # ggml_sycl_txn_result through a switch, not a bare bool.
     probe_call = (
-        "    const bool accepted = ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max,\n"
-        "                                                                    flash_attn_enabled, /*probe_mode=*/true, out);\n"
+        "    const ggml_sycl_txn_result result = ggml_sycl_run_runtime_context_transaction(\n"
+        "        backend, n_ctx, n_ubatch, n_seq_max, flash_attn_enabled, /*probe_mode=*/true, out);\n"
     )
     assert probe_call in raw, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw.replace(probe_call, "", 1)
@@ -429,27 +461,47 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     )
 
 
+# llama.cpp-tsfl round 1 F2/F8: after F2 added a SECOND `if (probe_mode) {`
+# inside the transaction body (the KV-demotion WARN/INFO branch, much
+# earlier in the function than the probe's own exit branch), a plain
+# re.search() for the bare `if (probe_mode) {` pattern finds THAT one
+# first, not the exit branch this section's checks actually care about.
+# Identify the exit branch specifically by content unique to it: it is the
+# only `if (probe_mode)` block that captures a rollback result into
+# `rollback_ok` (round 1 F1).
+def _find_probe_exit_branch(body_norm: str):
+    for m in re.finditer(r"if\s*\(\s*probe_mode\s*\)\s*\{", body_norm):
+        if "rollback_ok" in body_norm[m.start() : m.start() + 800]:
+            return m
+    return None
+
+
 def test_probe_mode_branch_returns_before_the_cas():
-    """The shared transaction body's `if (probe_mode) { ... return true; }`
-    branch must appear BEFORE the CAS
+    """The shared transaction body's probe EXIT branch (`if (probe_mode) {
+    ... return ggml_sycl_txn_result::ACCEPTED; }`, identified by
+    _find_probe_exit_branch() above -- NOT the separate F2 KV-demotion
+    `if (probe_mode)` branch) must appear BEFORE the CAS
     (ggml_sycl::lifecycle_replace_placement_plan) -- both bounds asserted:
-    the probe_mode branch must exist, the CAS call must exist, and the
-    branch's own `return true;` must precede the CAS textually (the shared
-    body is straight-line code with early returns, so "precedes textually"
-    means "cannot execute past this point when probe_mode is true, because
-    every branch between here and the CAS is either this one's own return or
-    an earlier, unconditional refusal")."""
+    the branch must exist, the CAS call must exist, and the branch's own
+    success return must precede the CAS textually (the shared body is
+    straight-line code with early returns, so "precedes textually" means
+    "cannot execute past this point when probe_mode is true, because every
+    branch between here and the CAS is either this one's own return or an
+    earlier, unconditional refusal")."""
     body_norm = _normalize_ws(_transaction_body())
 
-    probe_branch = re.search(r"if\s*\(\s*probe_mode\s*\)\s*\{", body_norm)
-    assert probe_branch is not None, "the shared body must have an `if (probe_mode) { ... }` branch"
+    probe_branch = _find_probe_exit_branch(body_norm)
+    assert probe_branch is not None, (
+        "the shared body must have an `if (probe_mode) { ... }` EXIT branch, identified by its own "
+        "rollback_ok capture"
+    )
 
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
     assert cas_idx != -1, "could not find the CAS call (ggml_sycl::lifecycle_replace_placement_plan)"
 
-    probe_return_idx = body_norm.find("return true", probe_branch.start())
+    probe_return_idx = body_norm.find("return ggml_sycl_txn_result::ACCEPTED", probe_branch.start())
     assert probe_return_idx != -1 and probe_return_idx < cas_idx, (
-        "probe_mode is not the anonymous case -- the branch's own `return true;` must precede the CAS"
+        "probe_mode is not the anonymous case -- the branch's own success return must precede the CAS"
     )
     assert probe_branch.start() < cas_idx, "the probe_mode branch itself must precede the CAS"
 
@@ -467,28 +519,68 @@ def test_probe_mode_branch_returns_before_the_cas():
 
 
 def test_probe_branch_ordering_has_a_mutation_witness():
-    """Mutation witness for the check above: proves it would actually catch
-    the probe_mode branch being moved to AFTER the CAS (so a probe could
-    reach it)."""
+    """Mutation witness for llama.cpp-tsfl round 1 F8: proves the ordering
+    check above would actually catch the probe's EXIT branch being moved to
+    AFTER the CAS (so a probe could reach it), by actually MOVING the
+    branch's text, not merely neutering its condition.
+
+    F8 (reviewer finding): the PREVIOUS version of this witness rewrote the
+    guard to `if (false && probe_mode)`, which only stops that literal
+    regex from matching -- an EXISTENCE mutation. It does not test the
+    ORDERING assertion at all: a probe_mode branch genuinely relocated to
+    after the CAS, verbatim, would still satisfy "the branch exists
+    somewhere" while failing exactly the property the ordering check exists
+    to catch. This version cuts the exit branch's own text out of its
+    original position and re-inserts it, byte-identical, immediately after
+    the publish call -- a real reordering."""
     raw = GGML_SYCL_CPP
-    probe_block = (
-        "    if (probe_mode) {\n"
+    # Anchored with a leading "\n" so this matches only a LINE that starts
+    # with exactly 4 spaces then "if (probe_mode) {" -- plain substring
+    # search without the anchor also matches as a SUFFIX of the two more
+    # deeply indented if(probe_mode) blocks (F2's demotion branch at 12
+    # spaces, F3's ring-replan success branch at 8), since "    if
+    # (probe_mode) {\n" is itself a trailing substring of both.
+    branch_start_marker = "\n    if (probe_mode) {\n"
+    branch_end_marker = "        return ggml_sycl_txn_result::ACCEPTED;\n    }\n"
+    publish_marker = "    ggml_sycl_publish_prepared_plan_locked(prepared_publication);\n"
+
+    assert raw.count(branch_start_marker) == 1, (
+        f"mutation target (branch start) not unique -- found {raw.count(branch_start_marker)}; the exit "
+        "branch is identified by exactly 4-space indentation at the start of a line, distinct from the two "
+        "other, more deeply indented if(probe_mode) blocks (F2's demotion branch, F3's ring-replan success "
+        "branch)"
     )
-    assert probe_block in raw, "mutation target not found -- update this witness to match the real source"
-    # Move the guard to text AFTER the CAS by renaming the real one and
-    # inserting a decoy after the CAS call -- this reproduces "the branch
-    # exists somewhere in the function" while breaking "the branch precedes
-    # the CAS", which is exactly what the ordering assertion must catch.
-    cas_line = "    if (!ggml_sycl::lifecycle_replace_placement_plan(current, immutable)) {\n"
-    assert cas_line in raw, "mutation target (CAS line) not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(probe_block, "    if (false && probe_mode) {\n", 1)
+    start = raw.find(branch_start_marker) + 1  # skip the leading "\n" itself -- it belongs to the previous line
+    end = raw.find(branch_end_marker, start)
+    assert end != -1, "mutation target (branch end) not found after the branch start"
+    end += len(branch_end_marker)
+    branch_block = raw[start:end]
+
+    # llama.cpp-tsfl: search from `end`, not index 0 -- an unrelated,
+    # earlier occurrence of this exact call (a different function, the
+    # model-load path) exists elsewhere in this ~100k-line file.
+    publish_idx = raw.find(publish_marker, end)
+    assert publish_idx != -1, "mutation target (publish call) not found after the branch"
+
+    mutated_raw = raw[:start] + raw[end:]
+    # Same "search from `start`, not 0" reasoning as above -- the cut did
+    # not move `start`'s own position in the file, so the unrelated earlier
+    # occurrence is still there ahead of it.
+    insert_at = mutated_raw.find(publish_marker, start) + len(publish_marker)
+    mutated_raw = mutated_raw[:insert_at] + branch_block + mutated_raw[insert_at:]
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
-    probe_branch = re.search(r"if\s*\(\s*probe_mode\s*\)\s*\{", mutated_body_norm)
-    assert probe_branch is None, (
-        "mutation witness is broken: the mutated source (guard changed to `false && probe_mode`) should no "
-        "longer match the exact `if (probe_mode) {` pattern the real check requires"
+    mutated_probe_branch = _find_probe_exit_branch(mutated_body_norm)
+    assert mutated_probe_branch is not None, "mutation witness is broken: could not re-find the moved branch"
+    mutated_cas_idx = mutated_body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert mutated_cas_idx != -1
+
+    # The REAL (fixed) check requires probe_branch.start() < cas_idx; on this
+    # genuinely-reordered mutant that must now be FALSE.
+    assert not (mutated_probe_branch.start() < mutated_cas_idx), (
+        "mutation witness is broken: the F8 ordering check should FAIL on this genuinely-reordered mutant "
+        "(branch moved after the CAS), but the branch still appears to precede it"
     )
 
 
@@ -499,7 +591,14 @@ def test_probe_rolls_back_the_ring_before_returning():
     above it already performed real device-state side effects (release +
     reserve), which a probe must not leave behind."""
     body_norm = _normalize_ws(_transaction_body())
-    probe_branch = re.search(r"if\s*\(\s*probe_mode\s*\)\s*\{", body_norm)
+    # llama.cpp-tsfl round 1 F2/F8: identify the EXIT branch specifically
+    # (see _find_probe_exit_branch's own comment) -- a plain re.search()
+    # would find the earlier F2 KV-demotion `if (probe_mode)` branch
+    # instead, and this test happened to still pass on that wrong anchor
+    # only because the resulting slice was a SUPERSET that also contained
+    # the real exit branch (the two are adjacent, with nothing excluded in
+    # between) -- a coincidental pass, not a correct one.
+    probe_branch = _find_probe_exit_branch(body_norm)
     assert probe_branch is not None
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
     probe_block = body_norm[probe_branch.start():cas_idx]

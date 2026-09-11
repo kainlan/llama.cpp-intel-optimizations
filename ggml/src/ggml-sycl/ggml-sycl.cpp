@@ -17162,10 +17162,26 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
     if (cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, new_activation_slot_bytes, new_output_slot_bytes,
                                              ring_depth)) {
         ggml_sycl::unified_cache_set_planned_pp_moe_onednn_n_ubatch(device, n_ubatch);
-        GGML_LOG_WARN(
-            "[SYCL-PLAN] PP MoE oneDNN scratch ring re-planned for n_ubatch=%u: activation %.1f MB, output %.1f MB, "
-            "weights %.1f MB, depth %u\n",
-            n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb, ring_depth);
+        // llama.cpp-tsfl (round 1 F3): this line is unconditionally WARN
+        // regardless of probe_mode; the trial the probe exists for is a
+        // ladder over several candidates, and each accepted one prints this
+        // (plus the probe's own rollback log) -- at WARN that is several
+        // unremarkable lines per start. In probe mode, log the identical
+        // numbers at INFO with a "probe: " prefix; the publish path's text
+        // is byte-identical to before this fix.
+        if (probe_mode) {
+            GGML_LOG_INFO(
+                "[SYCL-PLAN] probe: PP MoE oneDNN scratch ring re-planned for n_ubatch=%u: activation %.1f MB, "
+                "output %.1f MB, weights %.1f MB, depth %u\n",
+                n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb,
+                ring_depth);
+        } else {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] PP MoE oneDNN scratch ring re-planned for n_ubatch=%u: activation %.1f MB, output "
+                "%.1f MB, weights %.1f MB, depth %u\n",
+                n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb,
+                ring_depth);
+        }
         return true;
     }
 
@@ -17183,21 +17199,45 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
 // (accepted/would_demote_kv/host_kv_bytes/reason) on every return when
 // non-NULL; the publishing path always passes out=nullptr, so every
 // `if (out)`/`refuse(...)` below is then just a bool return for it.
-static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t                    backend,
-                                                      uint32_t                          n_ctx,
-                                                      uint32_t                          n_ubatch,
-                                                      uint32_t                          n_seq_max,
-                                                      bool                              flash_attn_enabled,
-                                                      bool                              probe_mode,
-                                                      ggml_sycl_runtime_context_probe * out) {
-    auto refuse = [&](const char * reason) -> bool {
+// llama.cpp-tsfl (round 1 F6): the shared body's own outcome, distinct from
+// the two lifecycle enums built on top of it -- ggml_sycl_lifecycle_result
+// (the probe's public return type) and the bool the publishing wrapper
+// discards. GGML_SYCL_LIFECYCLE_PLAN_REJECTED is documented (ggml-sycl.h)
+// as a DETERMINISTIC refusal callers must not retry; collapsing a transient
+// "could not acquire a live-update lease" / "plan changed while acquiring
+// the transaction lock" refusal into that same bucket would tell a caller
+// not to retry something that is, in fact, exactly what BUSY exists for.
+// ACCEPTED/REFUSED/BUSY let the probe map each outcome to the right public
+// enum value without ever string-comparing `out->reason`.
+enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
+
+static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backend_t backend,
+                                                                      uint32_t       n_ctx,
+                                                                      uint32_t       n_ubatch,
+                                                                      uint32_t       n_seq_max,
+                                                                      bool           flash_attn_enabled,
+                                                                      bool           probe_mode,
+                                                                      ggml_sycl_runtime_context_probe * out) {
+    auto refuse = [&](const char * reason) -> ggml_sycl_txn_result {
         if (out) {
             out->accepted        = false;
             out->would_demote_kv = false;
             out->host_kv_bytes   = 0;
             out->reason          = reason;
         }
-        return false;
+        return ggml_sycl_txn_result::REFUSED;
+    };
+    // llama.cpp-tsfl (round 1 F6): same field-fill as refuse() above, but for
+    // the two transient sites below -- a caller (the probe) MAY retry a BUSY
+    // outcome; it must never retry a REFUSED one.
+    auto busy = [&](const char * reason) -> ggml_sycl_txn_result {
+        if (out) {
+            out->accepted        = false;
+            out->would_demote_kv = false;
+            out->host_kv_bytes   = 0;
+            out->reason          = reason;
+        }
+        return ggml_sycl_txn_result::BUSY;
     };
 
     if (!backend || n_ctx == 0) {
@@ -17231,12 +17271,12 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
     auto owned_update = g_runtime_external_lease ? ggml_sycl::lifecycle::live_update_guard{} :
                                                    registry.acquire_live_update(current_token);
     if (!g_runtime_external_lease && !owned_update) {
-        return refuse("busy (could not acquire a live-update lease)");
+        return busy("busy (could not acquire a live-update lease)");
     }
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
     if (ggml_sycl_global_plan_snapshot().get() != current.get()) {
-        return refuse("busy (plan changed while acquiring the transaction lock)");
+        return busy("busy (plan changed while acquiring the transaction lock)");
     }
     auto next_kv_info = current->kv_info;
     if (n_ubatch > 0) {
@@ -17324,12 +17364,28 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
             // demoted layers no longer count against budget in
             // ggml_sycl_largest_fitting_n_ctx, which would overstate the
             // all-VRAM figure if read from the post-demotion plan.
-            GGML_LOG_WARN(
-                "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
-                "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
-                "Largest all-VRAM context is about -c %u\n",
-                demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0), n_ctx,
-                ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+            //
+            // llama.cpp-tsfl (round 1 F2): in probe mode nothing was actually
+            // demoted -- demoted_plan is a scratch copy this branch is about
+            // to discard into next_plan, never published -- so the WARN
+            // below (which reads as a completed, durable action) would be a
+            // false claim at default verbosity. Report the SAME numbers at
+            // INFO instead, worded as a prediction ("would be"); the publish
+            // path's WARN text is unchanged.
+            if (probe_mode) {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] probe: KV overflow would be re-placed to host tier: %zu layer(s) "
+                    "(%.1f MB host KV) for n_ctx=%u\n",
+                    demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0),
+                    n_ctx);
+            } else {
+                GGML_LOG_WARN(
+                    "[SYCL-PLAN] KV overflow re-placed to host tier: %zu layer(s) demoted "
+                    "(%.1f MB host KV) for n_ctx=%u; attention for those layers runs on CPU. "
+                    "Largest all-VRAM context is about -c %u\n",
+                    demotion_result.demoted_layers.size(), demotion_result.host_kv_bytes_added / (1024.0 * 1024.0),
+                    n_ctx, ggml_sycl_largest_fitting_n_ctx(next_plan, next_kv_info));
+            }
             kv_was_demoted        = true;
             kv_demoted_host_bytes = demotion_result.host_kv_bytes_added;
             next_plan = std::move(demoted_plan);
@@ -17341,8 +17397,13 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
             // next_plan/replan_reason -- the refusal below still reports the
             // original numbers, this just adds the extra context that
             // demotion was tried and could not help either.
-            GGML_LOG_WARN("[SYCL-PLAN] host-tier demotion also rejected: %s\n",
-                          ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
+            //
+            // llama.cpp-tsfl (round 1 F2): this IS a refusal (the demotion
+            // attempt's own), so it goes through the same INFO/ERROR split
+            // as every other candidate refusal in this function, not a bare
+            // WARN in both modes.
+            GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode, "[SYCL-PLAN] host-tier demotion also rejected: %s\n",
+                                          ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
         }
         // On failure, demoted_plan is discarded here -- next_plan and
         // replan_reason (the original refusal) are untouched, so the refusal
@@ -17480,24 +17541,36 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
         // further down) -- none of those three has a defined rollback and
         // none may run for a candidate nobody is going to act on. This is
         // the shared body's probe/publish split point.
-        (void) ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch, /*probe_mode=*/true);
+        //
+        // llama.cpp-tsfl (round 1 F1): the rollback's own result is NOT
+        // discarded. Three shapes exist for it to fail -- the release
+        // refusing because the ring is still claimed by an in-flight
+        // dispatch, the F13 pre-check refusing, or the Step-3 reserve itself
+        // failing (all documented at ggml_sycl_replan_pp_moe_onednn_ring()'s
+        // own definition) -- and in the first two of those the physical ring
+        // is left at the CANDIDATE size PERMANENTLY, with only an INFO-level
+        // (probe_mode) diagnostic from the rollback call itself. That is
+        // exactly the kind of durable, unreported side effect this whole
+        // probe exists to prevent, so it gets its own unconditional WARN
+        // (regardless of probe_mode -- this is an anomaly, not a candidate
+        // refusal) and turns the probe's own outcome into a refusal too.
+        const bool rollback_ok =
+            ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch, /*probe_mode=*/true);
+        if (!rollback_ok) {
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] probe rollback of the PP MoE oneDNN scratch ring to n_ubatch=%u failed; ring left "
+                "at n_ubatch=%u\n",
+                pre_replan_pp_moe_ring_n_ubatch, next_kv_info.n_ubatch);
+            return refuse("probe rollback failed: ring left at candidate size");
+        }
         if (out) {
             out->accepted        = true;
             out->would_demote_kv = kv_was_demoted;
             out->host_kv_bytes   = kv_demoted_host_bytes;
             out->reason          = "OK";
         }
-        return true;
+        return ggml_sycl_txn_result::ACCEPTED;
     }
-
-    // llama.cpp-tsfl: the compute-buffer host-pinned-fallback counter is
-    // reset here, on the publish path's own success, right before the plan
-    // that graph_reserve() will allocate compute buffers against is
-    // published -- so ggml_backend_sycl_compute_buffer_host_fallbacks()
-    // always answers "fallbacks since the last successful runtime-context
-    // transaction", never carrying over count from an already-superseded
-    // plan.
-    g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);
 
     auto next     = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     next->plan          = std::make_shared<const ggml_sycl::placement_plan>(std::move(next_plan));
@@ -17580,13 +17653,22 @@ static bool ggml_sycl_run_runtime_context_transaction(ggml_backend_t            
             g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
             g_placement_kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
+    // llama.cpp-tsfl (round 1 F4): the compute-buffer host-pinned-fallback
+    // counter is reset here, on the success tail, AFTER the CAS has actually
+    // succeeded -- not earlier, where the publication-ID check, MMID
+    // materialization, or the CAS itself could still refuse and this
+    // transaction never publishes anything. ggml_backend_sycl_compute_buffer_
+    // host_fallbacks() (ggml-sycl.h) promises "since the last SUCCESSFUL
+    // runtime-context transaction"; resetting before those three could-still-
+    // fail steps broke that promise for every one of their refusal paths.
+    g_compute_buffer_host_fallbacks[ctx->device].store(0, std::memory_order_relaxed);
     if (out) {
         out->accepted        = true;
         out->would_demote_kv = kv_was_demoted;
         out->host_kv_bytes   = kv_demoted_host_bytes;
         out->reason          = "OK";
     }
-    return true;
+    return ggml_sycl_txn_result::ACCEPTED;
 }
 
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
@@ -17624,6 +17706,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
     }
     *out = ggml_sycl_runtime_context_probe{};
+    // llama.cpp-tsfl (round 1 F7): every public _for_model lifecycle entry
+    // point takes this guard as its first real statement (the publisher,
+    // below), and the probe is not read-only either -- it mutates real
+    // device state (the PP MoE oneDNN ring's release/reserve) even though it
+    // rolls that back before returning. `out` is already zeroed above so a
+    // BUSY return here still leaves a well-formed, reason-carrying struct.
+    sycl_module_mutation_guard module_guard;
+    if (!module_guard) {
+        out->reason = "busy (module mutation guard)";
+        return GGML_SYCL_LIFECYCLE_BUSY;
+    }
     if (!backend || !backend->context || n_ctx == 0) {
         out->reason = "invalid arguments (null backend/context or n_ctx=0)";
         return GGML_SYCL_LIFECYCLE_NULL_OUTPUT;
@@ -17643,9 +17736,49 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
         out->reason = "stale identity: probe targets a model that is not currently published";
         return GGML_SYCL_LIFECYCLE_STALE_IDENTITY;
     }
-    const bool accepted = ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max,
-                                                                    flash_attn_enabled, /*probe_mode=*/true, out);
-    return accepted ? GGML_SYCL_LIFECYCLE_OK : GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+
+    // llama.cpp-tsfl (round 1 F5): arm the IDENTITY half of the publisher's
+    // own expected-model mechanism (g_runtime_expected_model /
+    // g_runtime_expected_model_set, set below by
+    // ggml_backend_sycl_set_runtime_context_for_model() -- its own
+    // `g_runtime_expected_model = model;` assignment, further down this
+    // file) so the shared
+    // body's own in-lock re-check (`if (g_runtime_expected_model_set && ...)
+    // return refuse(...)`, near this function's top) is LIVE for a probe
+    // too. Without this, the identity check just above (outside the lock)
+    // could pass, then a concurrent load/teardown could replace the
+    // published plan with a DIFFERENT model's while this call is still
+    // acquiring the transaction lock, and the shared body would silently
+    // evaluate the wrong model's candidate. Deliberately narrower than the
+    // publisher's own expected_model_guard (below): no live-update ticket,
+    // and g_runtime_external_lease is left false, so the shared body's own
+    // lease-acquisition path (the `g_runtime_external_lease == false`
+    // branch) still runs for the probe, exactly as it already does for a
+    // direct (non-for_model) publisher call -- this guard adds no lease
+    // machinery, only the identity comparison.
+    struct probe_expected_model_guard {
+        ~probe_expected_model_guard() { g_runtime_expected_model_set = false; }
+    } expected_model_guard;
+
+    g_runtime_expected_model     = model;
+    g_runtime_expected_model_set = true;
+
+    // llama.cpp-tsfl (round 1 F6): the shared body returns an internal
+    // ACCEPTED/REFUSED/BUSY result, not a bare bool -- map it to the public
+    // lifecycle enum without ever string-comparing out->reason (see
+    // ggml_sycl_txn_result's own comment for why BUSY must not collapse into
+    // PLAN_REJECTED).
+    const ggml_sycl_txn_result result = ggml_sycl_run_runtime_context_transaction(
+        backend, n_ctx, n_ubatch, n_seq_max, flash_attn_enabled, /*probe_mode=*/true, out);
+    switch (result) {
+        case ggml_sycl_txn_result::ACCEPTED:
+            return GGML_SYCL_LIFECYCLE_OK;
+        case ggml_sycl_txn_result::BUSY:
+            return GGML_SYCL_LIFECYCLE_BUSY;
+        case ggml_sycl_txn_result::REFUSED:
+        default:
+            return GGML_SYCL_LIFECYCLE_PLAN_REJECTED;
+    }
 }
 
 // llama.cpp-nphx: thin wrapper so llama-context.cpp (a different translation
@@ -36386,13 +36519,17 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
         // but the driver rejected it, retry with explicit host-pinned.
         if (!req.intent.constraints.must_host_pinned && buft_ctx->allow_shared_fallback) {
             // llama.cpp-tsfl: WARN, not INFO -- see the sibling fallback
-            // above; this path is entered before we know whether the retry
-            // itself will succeed, so count it (and print it) regardless.
-            g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
+            // above. The retry is announced here, before we know whether it
+            // will succeed; the counter, though, is only incremented below
+            // once it actually has (round 1 F10: a retry that ALSO returns
+            // nullptr is not a fallback -- it falls through to the
+            // allocation-failure ERROR just past this block, a hard
+            // failure, not a successful landing in host memory).
             GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\n", size / (1024 * 1024));
             req.intent.constraints.must_device      = false;
             req.intent.constraints.must_host_pinned = true;
             if (ggml_sycl::unified_alloc(req, &main_alloc) && main_alloc.ptr != nullptr) {
+                g_compute_buffer_host_fallbacks[buft_ctx->device].fetch_add(1, std::memory_order_relaxed);
                 goto alloc_succeeded;
             }
         }

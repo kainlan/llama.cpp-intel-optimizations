@@ -787,6 +787,28 @@ if (GGML_SYCL)
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
 endif()
 
+# llama.cpp-tsfl (F-lead-1, orphan-deliverable fix): calls
+# ggml_backend_sycl_probe_runtime_context_for_model() on a live GPT-OSS 20B
+# context -- the Task 2 plan's own acceptance criterion ("probe(512) on B50
+# GPT-OSS returns accepted ...; probe(8192) returns refused ... (lead-run)")
+# had no caller anywhere in the tree before this harness. Guarded the same
+# way test-quantize-stats.cpp is above (NOT GGML_BACKEND_DL): this harness
+# includes the private src/llama-model.h AND calls ggml-sycl.h functions
+# directly (not merely referencing their types the way
+# test-sycl-lifecycle-public-api.cpp's ABI gate does), both of which require
+# ggml-sycl to be linked in statically rather than loaded as a
+# GGML_BACKEND_DL module. The model is LOCAL (not the downloaded fixture),
+# so unlike test-sycl-two-context-ownership above, no FIXTURES_REQUIRED.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-runtime-context-probe.cpp ARGS /models/gpt-oss-20b-mxfp4.gguf)
+    set_tests_properties(test-sycl-runtime-context-probe PROPERTIES
+        LABELS "main;sycl;cache;probe"
+        RUN_SERIAL TRUE
+        TIMEOUT 600
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 llama_build_and_test(test-arg-parser.cpp)
 # llama.cpp-y8xv quality round 1, Q5: host-only test for the -ub range
 # parser hoisted into tools/llama-bench/llama-bench-parse.hpp -- pulls in

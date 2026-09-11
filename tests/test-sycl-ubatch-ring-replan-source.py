@@ -1,9 +1,13 @@
 """Source contract for llama.cpp-ibj0: the PP MoE oneDNN scratch ring must be
-re-planned for the RUNTIME n_ubatch inside ggml_backend_sycl_set_runtime_context()
--- the same transaction that re-plans KV and the non-FA attention scratch --
-not left fixed at the loader's own load-time n_ubatch (src/llama-model.cpp
-hardcodes inventory.n_ubatch = 512). Without this, the first prefill at a
-larger runtime n_ubatch hits the ring's own admission refusal
+re-planned for the RUNTIME n_ubatch inside the runtime-context transaction
+(llama.cpp-tsfl round 1 F9: as of that task, the actual admission logic --
+including this ring re-plan -- lives in
+ggml_sycl_run_runtime_context_transaction(); ggml_backend_sycl_set_runtime_
+context() is now a thin wrapper around it) -- the same transaction that
+re-plans KV and the non-FA attention scratch -- not left fixed at the
+loader's own load-time n_ubatch (src/llama-model.cpp hardcodes
+inventory.n_ubatch = 512). Without this, the first prefill at a larger
+runtime n_ubatch hits the ring's own admission refusal
 (moe-scratch-admission.hpp's "activation-cap"/"output-cap") and llama_decode
 returns -3 with nothing printed at default verbosity (see this ticket's repro,
 scratchpad ibj0-repro-ub1024-v.log).
@@ -120,8 +124,24 @@ _REPLAN_START = "static bool ggml_sycl_replan_pp_moe_onednn_ring("
 # This constant's NAME is kept (it is used throughout this file as both the
 # admission-logic start marker and the ring function's own end marker) but
 # its VALUE now points at the real logic.
-_RUNTIME_CONTEXT_START = "static bool ggml_sycl_run_runtime_context_transaction("
+# llama.cpp-tsfl round 1 F6: the function's return type changed from bool
+# to the internal ggml_sycl_txn_result enum -- the marker must match the
+# real signature or every downstream _bounded_body() call silently fails to
+# find it.
+_RUNTIME_CONTEXT_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 _RUNTIME_CONTEXT_FOR_MODEL_START = "ggml_backend_sycl_set_runtime_context_for_model("
+# llama.cpp-tsfl round 1 F9: _runtime_context_body() used to end at
+# _RUNTIME_CONTEXT_FOR_MODEL_START, which (after the shared-body extraction)
+# meant it silently spanned FOUR functions -- the real transaction body, the
+# now-thin ggml_backend_sycl_set_runtime_context() wrapper,
+# ggml_backend_sycl_probe_runtime_context_for_model(), and
+# ggml_backend_sycl_auto_ubatch_enabled() -- because none of those three
+# happen to contain the literal text
+# "ggml_backend_sycl_set_runtime_context_for_model(" either, so .find() just
+# kept going until it hit the real thing. End the slice at the wrapper's own
+# start instead, which is exactly where the transaction body this file's
+# checks pin actually ends.
+_SET_RUNTIME_CONTEXT_WRAPPER_START = "void ggml_backend_sycl_set_runtime_context("
 _RESERVE_PP_MOE_START = "bool unified_cache::reserve_pp_moe_onednn_scratch("
 _RELEASE_RING_START = "bool unified_cache::release_pp_moe_onednn_scratch_ring("
 _UNIFIED_ALLOC_START = "bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {"
@@ -129,7 +149,16 @@ _ACQUIRE_OFFLOAD_BUFFER_START = "bool acquire_offload_buffer("
 
 
 def _runtime_context_body() -> str:
-    return _bounded_body(GGML_SYCL_CPP_CODE, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
+    # llama.cpp-tsfl round 1 F9: assert both bounds explicitly and that the
+    # slice is strictly forward -- _bounded_body() already raises a clear
+    # AssertionError if either marker is entirely missing, so this is a
+    # second, explicit check that the slice actually landed where intended.
+    start = GGML_SYCL_CPP_CODE.find(_RUNTIME_CONTEXT_START)
+    assert start != -1, f"{_RUNTIME_CONTEXT_START!r} not found"
+    end = GGML_SYCL_CPP_CODE.find(_SET_RUNTIME_CONTEXT_WRAPPER_START, start + 1)
+    assert end != -1, f"{_SET_RUNTIME_CONTEXT_WRAPPER_START!r} not found after the transaction body"
+    assert start < end, "the transaction body's start marker must precede its end marker"
+    return _bounded_body(GGML_SYCL_CPP_CODE, _RUNTIME_CONTEXT_START, _SET_RUNTIME_CONTEXT_WRAPPER_START)
 
 
 def _replan_ring_fn_body() -> str:
@@ -137,22 +166,25 @@ def _replan_ring_fn_body() -> str:
 
 
 def test_transaction_calls_replan_after_nonfa_and_before_mmid_materialize():
-    """ggml_backend_sycl_set_runtime_context() must call the ring re-plan
-    AFTER ggml_sycl_check_nonfa_attn_scratch() (so it sees the post-nonfa-
-    guard plan) and BEFORE the MMID workspace materialization call that
-    finalizes the plan for publication -- inserting it later would mean the
-    plan could be published (or the transaction could return early for an
-    unrelated reason) without the ring ever having been checked against the
-    real runtime n_ubatch."""
+    """ggml_sycl_run_runtime_context_transaction() (llama.cpp-tsfl round 1
+    F9: the shared body ggml_backend_sycl_set_runtime_context() now merely
+    wraps) must call the ring re-plan AFTER ggml_sycl_check_nonfa_attn_
+    scratch() (so it sees the post-nonfa-guard plan) and BEFORE the MMID
+    workspace materialization call that finalizes the plan for publication
+    -- inserting it later would mean the plan could be published (or the
+    transaction could return early for an unrelated reason) without the
+    ring ever having been checked against the real runtime n_ubatch."""
     body_norm = _normalize_ws(_runtime_context_body())
 
     nonfa_idx = body_norm.find("ggml_sycl_check_nonfa_attn_scratch(")
     replan_idx = body_norm.find("ggml_sycl_replan_pp_moe_onednn_ring(")
     mmid_materialize_idx = body_norm.find("ggml_sycl_materialize_published_mmid_workspaces(")
 
-    assert nonfa_idx != -1, "ggml_backend_sycl_set_runtime_context() must call ggml_sycl_check_nonfa_attn_scratch()"
+    assert nonfa_idx != -1, (
+        "ggml_sycl_run_runtime_context_transaction() must call ggml_sycl_check_nonfa_attn_scratch()"
+    )
     assert replan_idx != -1, (
-        "ggml_backend_sycl_set_runtime_context() must call ggml_sycl_replan_pp_moe_onednn_ring() -- "
+        "ggml_sycl_run_runtime_context_transaction() must call ggml_sycl_replan_pp_moe_onednn_ring() -- "
         "the PP MoE oneDNN scratch ring is never re-planned for the runtime n_ubatch otherwise"
     )
     assert mmid_materialize_idx != -1, (
@@ -174,8 +206,9 @@ def test_transaction_refuses_when_replan_fails():
     body_norm = _normalize_ws(_runtime_context_body())
     # llama.cpp-tsfl: the shared transaction body's early returns now go
     # through a local `refuse(reason)` helper (which fills the probe's `out`
-    # struct when non-NULL before returning false) rather than a bare
-    # `return;` -- match `return refuse(` instead of a literal `return;`.
+    # struct when non-NULL, then returns ggml_sycl_txn_result::REFUSED --
+    # round 1 F6) rather than a bare `return;` -- match `return refuse(`
+    # instead of a literal `return;`.
     assert re.search(
         r"if\s*\(\s*!\s*ggml_sycl_replan_pp_moe_onednn_ring\([^)]*\)\s*\)\s*\{\s*return\s+refuse\(",
         body_norm,
@@ -207,7 +240,7 @@ def test_replan_call_has_a_mutation_witness():
     assert mutated_raw != raw
 
     def _call_count(raw_source: str) -> int:
-        body_norm = _body_of(raw_source, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
+        body_norm = _body_of(raw_source, _RUNTIME_CONTEXT_START, _SET_RUNTIME_CONTEXT_WRAPPER_START)
         return len(re.findall(r"ggml_sycl_replan_pp_moe_onednn_ring\(", body_norm))
 
     original_count = _call_count(raw)
@@ -617,11 +650,13 @@ def test_transaction_rolls_back_the_ring_on_a_later_failure():
     publication-ID exhaustion, MMID workspace materialization, or the
     lifecycle_replace_placement_plan CAS losing to a concurrent transaction
     (F10: the winning plan may describe a different n_ubatch, so the
-    leftover ring is not provably harmless) -- all THREE later `return;`
-    sites must roll the ring back to the pre-transaction n_ubatch (by
-    re-invoking the same, direction-symmetric re-plan function), or a
-    refused transaction leaves a changed ring behind even though nothing
-    about the ring itself was ever refused."""
+    leftover ring is not provably harmless) -- all THREE later
+    `return refuse(...);` sites (llama.cpp-tsfl round 1 F6: refuse() now
+    returns ggml_sycl_txn_result::REFUSED rather than bare `false`) must
+    roll the ring back to the pre-transaction n_ubatch (by re-invoking the
+    same, direction-symmetric re-plan function), or a refused transaction
+    leaves a changed ring behind even though nothing about the ring itself
+    was ever refused."""
     body_norm = _normalize_ws(_runtime_context_body())
     assert "pre_replan_pp_moe_ring_n_ubatch" in body_norm, (
         "the pre-transaction ring n_ubatch must be captured BEFORE the re-plan call, so later failure paths "
@@ -718,7 +753,7 @@ def test_cas_rollback_upper_bound_has_a_mutation_witness():
     mutated_raw = raw.replace(old_block, new_block, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _body_of(mutated_raw, _RUNTIME_CONTEXT_START, _RUNTIME_CONTEXT_FOR_MODEL_START)
+    mutated_body_norm = _body_of(mutated_raw, _RUNTIME_CONTEXT_START, _SET_RUNTIME_CONTEXT_WRAPPER_START)
     mutated_rollback_calls = [
         m.start()
         for m in re.finditer(
