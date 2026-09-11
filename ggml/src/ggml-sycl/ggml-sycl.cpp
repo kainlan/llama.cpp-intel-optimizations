@@ -17398,12 +17398,24 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             // original numbers, this just adds the extra context that
             // demotion was tried and could not help either.
             //
-            // llama.cpp-tsfl (round 1 F2): this IS a refusal (the demotion
-            // attempt's own), so it goes through the same INFO/ERROR split
-            // as every other candidate refusal in this function, not a bare
-            // WARN in both modes.
-            GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode, "[SYCL-PLAN] host-tier demotion also rejected: %s\n",
-                                          ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
+            // llama.cpp-tsfl round 2 G7: round 1 F2 routed this through
+            // GGML_SYCL_RUNTIME_TXN_REFUSAL, which raised the PUBLISH path
+            // from its base (10c68bba5) GGML_LOG_WARN to GGML_LOG_ERROR --
+            // a publish-path behaviour change the spec forbids (the
+            // publishing entry point's behaviour, log levels included, must
+            // stay unchanged). This line is WARN, byte-identical to base,
+            // when !probe_mode; in probe mode it drops to INFO with a
+            // "probe: " prefix, matching the F2/F3 sibling sites just above
+            // and below this one in the function (both also WARN-on-
+            // publish, INFO-with-"probe:"-prefix-on-probe, not routed
+            // through the ERROR/INFO refusal macro either).
+            if (probe_mode) {
+                GGML_LOG_INFO("[SYCL-PLAN] probe: host-tier demotion also rejected: %s\n",
+                              ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
+            } else {
+                GGML_LOG_WARN("[SYCL-PLAN] host-tier demotion also rejected: %s\n",
+                              ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
+            }
         }
         // On failure, demoted_plan is discarded here -- next_plan and
         // replan_reason (the original refusal) are untouched, so the refusal
