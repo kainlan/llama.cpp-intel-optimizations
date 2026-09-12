@@ -149,7 +149,7 @@ _ACQUIRE_OFFLOAD_BUFFER_START = "bool acquire_offload_buffer("
 
 
 def _runtime_context_body() -> str:
-    # llama.cpp-tsfl round 1 F9: assert both bounds explicitly and that the
+    # llama.cpp-tsfl: assert both bounds explicitly and that the
     # slice is strictly forward -- _bounded_body() already raises a clear
     # AssertionError if either marker is entirely missing, so this is a
     # second, explicit check that the slice actually landed where intended.
