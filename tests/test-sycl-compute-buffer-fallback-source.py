@@ -782,6 +782,7 @@ def test_probe_rolls_back_the_ring_before_returning():
     probe_branch = _find_probe_exit_branch(body_norm)
     assert probe_branch is not None
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert cas_idx != -1, "could not find the CAS call (ggml_sycl::lifecycle_replace_placement_plan)"
     probe_block = body_norm[probe_branch.start():cas_idx]
 
     # Comment-stripped text drops any /*probe_mode=*/-style inline comment --
@@ -866,6 +867,7 @@ def test_probe_rollback_failure_logs_error_not_warn():
     probe_branch = _find_probe_exit_branch(body_norm)
     assert probe_branch is not None
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert cas_idx != -1, "could not find the CAS call (ggml_sycl::lifecycle_replace_placement_plan)"
     probe_block = body_norm[probe_branch.start():cas_idx]
 
     assert "probe rollback of the PP MoE oneDNN scratch ring" in probe_block, (

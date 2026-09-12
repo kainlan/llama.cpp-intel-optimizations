@@ -118,7 +118,7 @@ def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
 # llama.cpp-jumy: return type changed from bool to the internal
 # ggml_sycl_ring_replan_result enum (OK / RELEASE_REFUSED / DOES_NOT_FIT) --
 # the marker must match the real signature or every downstream
-# _bounded_body() call silently fails to find it.
+# _bounded_body() call fails loudly with "'<marker>' not found".
 _REPLAN_START = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring("
 # llama.cpp-tsfl: the transaction body this file's checks pin was extracted
 # out of ggml_backend_sycl_set_runtime_context() into a shared static
@@ -130,8 +130,8 @@ _REPLAN_START = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_one
 # its VALUE now points at the real logic.
 # llama.cpp-tsfl round 1 F6: the function's return type changed from bool
 # to the internal ggml_sycl_txn_result enum -- the marker must match the
-# real signature or every downstream _bounded_body() call silently fails to
-# find it.
+# real signature or every downstream _bounded_body() call fails loudly with
+# "'<marker>' not found".
 _RUNTIME_CONTEXT_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 # llama.cpp-tsfl: the transaction body's own end marker is the
 # now-thin ggml_backend_sycl_set_runtime_context() wrapper's start, not

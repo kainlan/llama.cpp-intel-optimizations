@@ -1106,9 +1106,10 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
 // guarantee holds whenever `accepted` is true, OR whenever `reason` names a
 // CANDIDATE refusal (the fit-or-not decision itself, unmet by this n_ctx/
 // n_ubatch) -- both cases roll their own transient PP MoE oneDNN scratch
-// ring re-plan back before returning. There are two exceptions, both
-// anomalies rather than ordinary candidate refusals, and both logged at
-// GGML_LOG_ERROR unconditionally (probe or not) for that reason:
+// ring re-plan back before returning. There are two exceptions; in each
+// the ANOMALY line is logged at GGML_LOG_ERROR unconditionally (probe or
+// not), even where the refusal the probe then returns still follows the
+// probe's INFO policy:
 //   1. reason=="probe rollback failed: ring left at candidate size": the
 //      probe's OWN rollback attempt (rolling the ring back to the
 //      pre-transaction n_ubatch) itself failed, and the ring is left at the
@@ -1119,9 +1120,11 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
 //      ggml_sycl_replan_pp_moe_onednn_ring()'s refuse_and_restore() closure
 //      re-reserves the OLD ring on any refusal, and that re-reserve can
 //      itself fail ("... restore FAILED ...", ggml-sycl.cpp) -- handled
-//      (logged), not asserted, but the probe then returns the plain
-//      candidate refusal with the ring left unbacked by any physical
-//      allocation rather than restored to its pre-candidate state.
+//      (that line logged at GGML_LOG_ERROR), not asserted, but the probe
+//      then returns the plain candidate refusal (logged at INFO in probe
+//      mode like any candidate refusal) with the ring left unbacked by
+//      any physical allocation rather than restored to its pre-candidate
+//      state.
 struct ggml_sycl_runtime_context_probe {
     bool         accepted;
     bool         would_demote_kv;
