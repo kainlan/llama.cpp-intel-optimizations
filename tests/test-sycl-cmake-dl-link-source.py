@@ -96,10 +96,19 @@ CMAKELISTS_CODE = strip_comments(CMAKELISTS_RAW)
 # extractor. This is not a CMake evaluator -- it only tracks the handful of
 # shapes this file actually uses for GGML_BACKEND_DL/BUILD_TESTING guards
 # (verified against every `if (...GGML_BACKEND_DL...)` in the file at the
-# time this test was written; see the module docstring). An `elseif` on a
-# frame this tracker is watching would need new handling, so one is asserted
-# not to occur inside a call's enclosing stack rather than silently
-# mis-evaluated.
+# time this test was written; see the module docstring). No guard in the file
+# today uses `elseif`, and this tracker does not attempt to reason about one:
+# an `elseif` REPLACES the enclosing frame's condition outright (the frame
+# forgets the original `if`'s condition, exactly matching CMake's own
+# semantics that only one of if/elseif/.../else is active at a time), so a
+# target_link_libraries or add_executable call recorded while an elseif
+# branch is active is judged purely against ITS condition text. If neither
+# `NOT GGML_BACKEND_DL` nor `BUILD_TESTING`/`LLAMA_BUILD_TESTS` appears in
+# that elseif's own condition, the call reads as unguarded -- fails closed,
+# not silently guarded. Rather than trust that reasoning to stay correct as
+# this file grows, a tracked call recorded with an elseif-derived frame
+# anywhere in its stack raises immediately (see `_walk`), so a future elseif
+# guard gets a human to check this file instead of a silent misread.
 # ---------------------------------------------------------------------------
 
 _STATEMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
@@ -154,11 +163,12 @@ def _normalize_ws(text: str) -> str:
 
 
 class _Frame:
-    __slots__ = ("cond", "in_else")
+    __slots__ = ("cond", "in_else", "via_elseif")
 
-    def __init__(self, cond: str):
+    def __init__(self, cond: str, via_elseif: bool = False):
         self.cond = cond
         self.in_else = False
+        self.via_elseif = via_elseif
 
 
 def _dl_off_active(stack) -> bool:
@@ -166,10 +176,10 @@ def _dl_off_active(stack) -> bool:
     false along this path -- either an `if` branch whose condition contains
     `NOT GGML_BACKEND_DL`, or an `else` branch of an `if` whose ENTIRE
     condition is exactly `GGML_BACKEND_DL` (no other ANDed terms).
-    `stack` is a snapshot of (cond, in_else) tuples, not live _Frame
-    objects -- see the note on `_walk`'s snapshot for why that distinction
-    is load-bearing."""
-    for cond, in_else in stack:
+    `stack` is a snapshot of (cond, in_else, via_elseif) tuples, not live
+    _Frame objects -- see the note on `_walk`'s snapshot for why that
+    distinction is load-bearing."""
+    for cond, in_else, _via_elseif in stack:
         if not in_else and re.search(r"\bNOT\s+GGML_BACKEND_DL\b", cond):
             return True
         if in_else and cond == "GGML_BACKEND_DL":
@@ -184,9 +194,28 @@ def _build_testing_active(stack) -> bool:
     is a shape this file does not use for test registration, so treating
     presence-in-condition as sufficient, rather than also resolving
     if/else polarity, keeps this check simple and matches every occurrence
-    in the file today). `stack` is the same (cond, in_else) snapshot as
-    `_dl_off_active` above."""
-    return any(re.search(r"\b(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond) for cond, _in_else in stack)
+    in the file today). `stack` is the same (cond, in_else, via_elseif)
+    snapshot as `_dl_off_active` above."""
+    return any(re.search(r"\b(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond) for cond, _in_else, _via_elseif in stack)
+
+
+def _assert_not_via_elseif(stack, what: str, line: int) -> None:
+    """Raise when `stack` contains a frame this checker's guard reasoning
+    does not cover -- an elseif REPLACES the enclosing frame's condition
+    (see the comment above `_STATEMENT_RE`), so a call recorded under one is
+    judged purely on that elseif's own condition text. Call this only for a
+    call the checker is about to actually rely on a verdict for (a genuine
+    bare-ggml-sycl-link candidate, or any add_executable), not for every
+    target_link_libraries call recorded by `_walk` -- most of those are
+    ordinary production configuration (e.g. ggml-sycl's own
+    `elseif (TARGET ccl)` oneCCL link) that no check here ever consults."""
+    if any(via_elseif for _cond, _in_else, via_elseif in stack):
+        raise AssertionError(
+            f"{what} at line {line} sits under an elseif-derived frame this checker "
+            "does not model past its own condition text -- update _dl_off_active/"
+            "_build_testing_active (and this assertion) before trusting this "
+            "checker's verdict on it"
+        )
 
 
 def _walk(code: str):
@@ -208,7 +237,10 @@ def _walk(code: str):
     this checker against the real, already-fixed source and finding
     test-attn-host-pool reported as a violation despite being correctly
     guarded -- i.e. the checker failed against a known-GREEN case, the
-    same shape as a positive-control failure elsewhere in this file family."""
+    same shape as a positive-control failure elsewhere in this file family.
+
+    Raises AssertionError instead of yielding a call recorded under an
+    elseif-derived frame -- see the comment above `_STATEMENT_RE`."""
     stack = []
     results = []
     for name, args_text, line in _iter_statements(code):
@@ -219,7 +251,10 @@ def _walk(code: str):
             if not stack:
                 raise AssertionError(f"elseif with no open if at line {line}")
             # New condition at the same nesting depth; reset the else flag.
-            stack[-1] = _Frame(_normalize_ws(args_text))
+            # via_elseif=True marks this frame so a call recorded under it
+            # trips the assertion below rather than being silently judged
+            # against only the elseif's own condition text.
+            stack[-1] = _Frame(_normalize_ws(args_text), via_elseif=True)
         elif lname == "else":
             if not stack:
                 raise AssertionError(f"else with no open if at line {line}")
@@ -228,10 +263,21 @@ def _walk(code: str):
             if not stack:
                 raise AssertionError(f"endif with no open if at line {line}")
             stack.pop()
-        elif lname == "target_link_libraries":
-            results.append(("target_link_libraries", args_text, line, [(f.cond, f.in_else) for f in stack]))
-        elif lname == "add_executable":
-            results.append(("add_executable", args_text, line, [(f.cond, f.in_else) for f in stack]))
+        elif lname in ("target_link_libraries", "add_executable"):
+            # Snapshot via_elseif alongside (cond, in_else) so a consumer can
+            # raise when it is about to judge a call this checker's guard
+            # reasoning does not cover -- see the comment above
+            # `_STATEMENT_RE`. Not raised HERE: most target_link_libraries
+            # calls recorded under an elseif frame in this file are ordinary
+            # production configuration (e.g. ggml-sycl's own oneCCL link,
+            # `elseif (TARGET ccl)`) that neither check ever consults, so a
+            # blanket raise here is a false positive against real, harmless
+            # source -- caught the same way the aliasing bug on `_Frame` was:
+            # this checker run against the real file raised on a call check A
+            # was always going to `continue` past anyway (target ==
+            # "ggml-sycl", i.e. ggml-sycl configuring itself, not a candidate
+            # offender).
+            results.append((lname, args_text, line, [(f.cond, f.in_else, f.via_elseif) for f in stack]))
     if stack:
         raise AssertionError(f"unbalanced if/endif: {len(stack)} still open at EOF")
     return results
@@ -240,12 +286,20 @@ def _walk(code: str):
 _STATEMENTS = _walk(CMAKELISTS_CODE)
 
 
-def _find_bare_ggml_sycl_link_violations(statements):
-    """Every target_link_libraries(...) call naming the bare `ggml-sycl`
-    target as a LINKED library (not as the target-being-configured, i.e. not
-    its own first argument -- that's ggml-sycl's production setup) outside
-    a GGML_BACKEND_DL-is-off guard."""
-    violations = []
+def _iter_bare_ggml_sycl_link_candidates(statements):
+    """Yield (target_being_configured, line, stack) for every
+    target_link_libraries(...) call that names the bare `ggml-sycl` target
+    as a LINKED library -- not as the target-being-configured, i.e. not its
+    own first argument, which is ggml-sycl's production setup and never a
+    candidate offender. Shared by _find_bare_ggml_sycl_link_violations and
+    _count_all_bare_ggml_sycl_links so the candidate-detection logic (and
+    the elseif guard below) lives in exactly one place.
+
+    Asserts (via `_assert_not_via_elseif`) rather than silently judging a
+    candidate recorded under an elseif-derived frame -- scoped to genuine
+    candidates only, not every target_link_libraries call `_walk` recorded
+    (most of those are ordinary production configuration this checker never
+    consults)."""
     for kind, args_text, line, stack in statements:
         if kind != "target_link_libraries":
             continue
@@ -261,20 +315,45 @@ def _find_bare_ggml_sycl_link_violations(statements):
             if "$<" in tok:
                 continue  # generator expression, e.g. $<TARGET_FILE:ggml-sycl>
             if tok == "ggml-sycl":
-                if not _dl_off_active(stack):
-                    violations.append((target_being_configured, line))
+                _assert_not_via_elseif(stack, f"target_link_libraries({target_being_configured} ...)", line)
+                yield target_being_configured, line, stack
                 break
-    return violations
+
+
+def _find_bare_ggml_sycl_link_violations(statements):
+    """Every bare-ggml-sycl-link candidate (see
+    _iter_bare_ggml_sycl_link_candidates) outside a GGML_BACKEND_DL-is-off
+    guard."""
+    return [
+        (target, line)
+        for target, line, stack in _iter_bare_ggml_sycl_link_candidates(statements)
+        if not _dl_off_active(stack)
+    ]
+
+
+def _count_all_bare_ggml_sycl_links(statements):
+    """Total bare-ggml-sycl-link candidates -- guarded AND unguarded
+    together. A lower bound on this count is the sanity check that keeps
+    test_no_bare_ggml_sycl_link_outside_a_dl_off_guard from passing having
+    silently examined zero calls (a token-matching regression, a quoted
+    "ggml-sycl" string that should not count, a variable-expanded library
+    list, or a quote-parity desync inside one of the `[=[ ... ]=]`
+    bracket-argument calls elsewhere in the file that `_iter_statements`
+    does not model) -- `violations == []` is also true of an empty list."""
+    return sum(1 for _ in _iter_bare_ggml_sycl_link_candidates(statements))
 
 
 def _count_unguarded_test_targets(statements):
     """Every add_executable(...) whose currently-open if-stack does not
-    mention BUILD_TESTING/LLAMA_BUILD_TESTS anywhere."""
+    mention BUILD_TESTING/LLAMA_BUILD_TESTS anywhere. Every add_executable is
+    a candidate for this check (unlike check A, there is no "configuring
+    itself" case to skip), so the elseif guard applies to all of them."""
     unguarded = []
     for kind, args_text, line, stack in statements:
         if kind != "add_executable":
             continue
         target = args_text.split()[0] if args_text.split() else "<unknown>"
+        _assert_not_via_elseif(stack, f"add_executable({target} ...)", line)
         if not _build_testing_active(stack):
             unguarded.append((target, line))
     return unguarded
@@ -284,8 +363,34 @@ def _count_unguarded_test_targets(statements):
 # Check A: bare `ggml-sycl` links must be DL-guarded.
 # ---------------------------------------------------------------------------
 
+# Shared by test_no_bare_ggml_sycl_link_outside_a_dl_off_guard's positive
+# control and test_bare_ggml_sycl_link_check_has_a_mutation_witness below --
+# one guarded call, moved outside its guard, so it is exactly one violation.
+_UNGUARDED_LINK_SNIPPET = (
+    "if (NOT GGML_BACKEND_DL)\n"
+    "    add_executable(test-example test-example.cpp)\n"
+    "endif()\n"
+    "target_link_libraries(test-example PRIVATE ggml-base ggml ggml-sycl Threads::Threads)\n"
+)
+
 
 def test_no_bare_ggml_sycl_link_outside_a_dl_off_guard():
+    # Lower-bound sanity count first: a checker that silently stopped seeing
+    # any bare ggml-sycl links would also report violations == [] below, for
+    # the wrong reason. The file carries 61 such calls today (guarded and
+    # unguarded together); 40 gives headroom for future additions/removals
+    # without making this brittle.
+    total_links = _count_all_bare_ggml_sycl_links(_STATEMENTS)
+    assert total_links >= 40, (
+        f"only found {total_links} target_link_libraries(...) call(s) naming the bare "
+        "ggml-sycl target (guarded or not) -- the file has 61 today. A count this low "
+        "means the token match likely broke silently (a quoted \"ggml-sycl\" string "
+        "wrongly counted or excluded, a variable-expanded library list, or a "
+        "quote-parity desync inside one of the `[=[ ... ]=]` bracket-argument calls "
+        "this parser does not model), and the assertion below may be passing having "
+        "examined nothing."
+    )
+
     violations = _find_bare_ggml_sycl_link_violations(_STATEMENTS)
     assert violations == [], (
         "target_link_libraries(...) linking the bare `ggml-sycl` MODULE target "
@@ -296,6 +401,17 @@ def test_no_bare_ggml_sycl_link_outside_a_dl_off_guard():
         "Wrap the target's real link line in `if (NOT GGML_BACKEND_DL) ... else() "
         "<disabled placeholder add_test> endif()`, matching the other ~85 targets "
         "in this file that already do."
+    )
+
+    # Positive control, in the same test: the identical checker, given a copy
+    # with exactly one such link moved outside its guard, must report exactly
+    # one violation -- not zero (which would mean it stopped seeing links
+    # entirely, the same failure mode the count above guards against) and not
+    # more than one (double-counting).
+    control_violations = _find_bare_ggml_sycl_link_violations(_walk(_UNGUARDED_LINK_SNIPPET))
+    assert len(control_violations) == 1, (
+        "positive control is broken: one un-guarded bare ggml-sycl link should "
+        f"produce exactly 1 violation, got {control_violations}"
     )
 
 
@@ -317,17 +433,14 @@ def test_bare_ggml_sycl_link_check_has_a_mutation_witness():
         "    target_link_libraries(test-example PRIVATE ggml-base ggml ggml-sycl Threads::Threads)\n"
         "endif()\n"
     )
-    unguarded_snippet = (
-        "if (NOT GGML_BACKEND_DL)\n"
-        "    add_executable(test-example test-example.cpp)\n"
-        "endif()\n"
-        "target_link_libraries(test-example PRIVATE ggml-base ggml ggml-sycl Threads::Threads)\n"
-    )
-
     assert _find_bare_ggml_sycl_link_violations(_walk(guarded_snippet)) == [], (
         "checker false-positives on a correctly DL-guarded link"
     )
-    violations = _find_bare_ggml_sycl_link_violations(_walk(unguarded_snippet))
+    # Reuses _UNGUARDED_LINK_SNIPPET (module-level, above check A) -- the
+    # same one test_no_bare_ggml_sycl_link_outside_a_dl_off_guard uses as its
+    # own positive control, which already asserts len(violations) == 1; this
+    # test additionally names the target to confirm WHICH call was flagged.
+    violations = _find_bare_ggml_sycl_link_violations(_walk(_UNGUARDED_LINK_SNIPPET))
     assert any(target == "test-example" for target, _line in violations), (
         "mutation witness is broken: an un-guarded bare ggml-sycl link should have been reported"
     )
