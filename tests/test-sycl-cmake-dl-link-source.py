@@ -106,8 +106,11 @@ CMAKELISTS_CODE = strip_comments(CMAKELISTS_RAW)
 # `NOT GGML_BACKEND_DL` nor `BUILD_TESTING`/`LLAMA_BUILD_TESTS` appears in
 # that elseif's own condition, the call reads as unguarded -- fails closed,
 # not silently guarded. Rather than trust that reasoning to stay correct as
-# this file grows, a tracked call recorded with an elseif-derived frame
-# anywhere in its stack raises immediately (see `_walk`), so a future elseif
+# this file grows, a call this checker forms a verdict from (a bare
+# ggml-sycl link candidate, or any add_executable) that was recorded with
+# an elseif-derived frame anywhere in its stack raises immediately (see
+# `_assert_not_via_elseif`; other tracked calls, e.g. ggml-sycl's own oneCCL
+# link, are recorded with via_elseif=True and never judged), so a future elseif
 # guard gets a human to check this file instead of a silent misread.
 # ---------------------------------------------------------------------------
 
@@ -239,8 +242,9 @@ def _walk(code: str):
     guarded -- i.e. the checker failed against a known-GREEN case, the
     same shape as a positive-control failure elsewhere in this file family.
 
-    Raises AssertionError instead of yielding a call recorded under an
-    elseif-derived frame -- see the comment above `_STATEMENT_RE`."""
+    Records a call found under an elseif-derived frame with via_elseif=True
+    and returns it; the consumers that form a verdict from such a call raise
+    (`_assert_not_via_elseif`) -- see the comment above `_STATEMENT_RE`."""
     stack = []
     results = []
     for name, args_text, line in _iter_statements(code):
@@ -378,10 +382,10 @@ def test_no_bare_ggml_sycl_link_outside_a_dl_off_guard():
     # Lower-bound sanity count first: a checker that silently stopped seeing
     # any bare ggml-sycl links would also report violations == [] below, for
     # the wrong reason. The file carries 61 such calls today (guarded and
-    # unguarded together); 40 gives headroom for future additions/removals
+    # unguarded together); 55 gives headroom for future additions/removals
     # without making this brittle.
     total_links = _count_all_bare_ggml_sycl_links(_STATEMENTS)
-    assert total_links >= 40, (
+    assert total_links >= 55, (
         f"only found {total_links} target_link_libraries(...) call(s) naming the bare "
         "ggml-sycl target (guarded or not) -- the file has 61 today. A count this low "
         "means the token match likely broke silently (a quoted \"ggml-sycl\" string "
