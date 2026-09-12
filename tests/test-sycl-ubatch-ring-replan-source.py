@@ -1,6 +1,6 @@
 """Source contract for llama.cpp-ibj0: the PP MoE oneDNN scratch ring must be
 re-planned for the RUNTIME n_ubatch inside the runtime-context transaction
-(llama.cpp-tsfl round 1 F9: as of that task, the actual admission logic --
+(llama.cpp-tsfl: as of that task, the actual admission logic --
 including this ring re-plan -- lives in
 ggml_sycl_run_runtime_context_transaction(); ggml_backend_sycl_set_runtime_
 context() is now a thin wrapper around it) -- the same transaction that
@@ -115,7 +115,11 @@ def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
 # llama.cpp-ibj0 quality round 4 Q6.6: boundary literals named once, used by
 # both the plain body-extraction helpers below and every mutation witness's
 # _body_of() call, so a boundary string is spelled in exactly one place.
-_REPLAN_START = "static bool ggml_sycl_replan_pp_moe_onednn_ring("
+# llama.cpp-jumy: return type changed from bool to the internal
+# ggml_sycl_ring_replan_result enum (OK / RELEASE_REFUSED / DOES_NOT_FIT) --
+# the marker must match the real signature or every downstream
+# _bounded_body() call fails loudly with "'<marker>' not found".
+_REPLAN_START = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring("
 # llama.cpp-tsfl: the transaction body this file's checks pin was extracted
 # out of ggml_backend_sycl_set_runtime_context() into a shared static
 # function, ggml_sycl_run_runtime_context_transaction() (also called, in
@@ -126,21 +130,17 @@ _REPLAN_START = "static bool ggml_sycl_replan_pp_moe_onednn_ring("
 # its VALUE now points at the real logic.
 # llama.cpp-tsfl round 1 F6: the function's return type changed from bool
 # to the internal ggml_sycl_txn_result enum -- the marker must match the
-# real signature or every downstream _bounded_body() call silently fails to
-# find it.
+# real signature or every downstream _bounded_body() call fails loudly with
+# "'<marker>' not found".
 _RUNTIME_CONTEXT_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
-_RUNTIME_CONTEXT_FOR_MODEL_START = "ggml_backend_sycl_set_runtime_context_for_model("
-# llama.cpp-tsfl round 1 F9: _runtime_context_body() used to end at
-# _RUNTIME_CONTEXT_FOR_MODEL_START, which (after the shared-body extraction)
-# meant it silently spanned FOUR functions -- the real transaction body, the
-# now-thin ggml_backend_sycl_set_runtime_context() wrapper,
-# ggml_backend_sycl_probe_runtime_context_for_model(), and
-# ggml_backend_sycl_auto_ubatch_enabled() -- because none of those three
-# happen to contain the literal text
-# "ggml_backend_sycl_set_runtime_context_for_model(" either, so .find() just
-# kept going until it hit the real thing. End the slice at the wrapper's own
-# start instead, which is exactly where the transaction body this file's
-# checks pin actually ends.
+# llama.cpp-tsfl: the transaction body's own end marker is the
+# now-thin ggml_backend_sycl_set_runtime_context() wrapper's start, not
+# ggml_backend_sycl_set_runtime_context_for_model() -- ".find()" would
+# otherwise silently span FOUR functions (the real transaction body, the
+# wrapper, ggml_backend_sycl_probe_runtime_context_for_model(), and
+# ggml_backend_sycl_auto_ubatch_enabled()), because none of the latter three
+# contain "ggml_backend_sycl_set_runtime_context_for_model(" either, so
+# .find() just kept going until it hit the real thing.
 _SET_RUNTIME_CONTEXT_WRAPPER_START = "void ggml_backend_sycl_set_runtime_context("
 _RESERVE_PP_MOE_START = "bool unified_cache::reserve_pp_moe_onednn_scratch("
 _RELEASE_RING_START = "bool unified_cache::release_pp_moe_onednn_scratch_ring("
@@ -149,7 +149,7 @@ _ACQUIRE_OFFLOAD_BUFFER_START = "bool acquire_offload_buffer("
 
 
 def _runtime_context_body() -> str:
-    # llama.cpp-tsfl round 1 F9: assert both bounds explicitly and that the
+    # llama.cpp-tsfl: assert both bounds explicitly and that the
     # slice is strictly forward -- _bounded_body() already raises a clear
     # AssertionError if either marker is entirely missing, so this is a
     # second, explicit check that the slice actually landed where intended.
@@ -166,8 +166,8 @@ def _replan_ring_fn_body() -> str:
 
 
 def test_transaction_calls_replan_after_nonfa_and_before_mmid_materialize():
-    """ggml_sycl_run_runtime_context_transaction() (llama.cpp-tsfl round 1
-    F9: the shared body ggml_backend_sycl_set_runtime_context() now merely
+    """ggml_sycl_run_runtime_context_transaction() (llama.cpp-tsfl: the
+    shared body ggml_backend_sycl_set_runtime_context() now merely
     wraps) must call the ring re-plan AFTER ggml_sycl_check_nonfa_attn_
     scratch() (so it sees the post-nonfa-guard plan) and BEFORE the MMID
     workspace materialization call that finalizes the plan for publication
@@ -204,13 +204,23 @@ def test_transaction_refuses_when_replan_fails():
     context construction, rather than silently publishing a plan whose ring
     the first prefill will refuse anyway."""
     body_norm = _normalize_ws(_runtime_context_body())
-    # llama.cpp-tsfl: the shared transaction body's early returns now go
-    # through a local `refuse(reason)` helper (which fills the probe's `out`
-    # struct when non-NULL, then returns ggml_sycl_txn_result::REFUSED --
-    # round 1 F6) rather than a bare `return;` -- match `return refuse(`
-    # instead of a literal `return;`.
+    # llama.cpp-jumy: the call site now captures the ring re-plan's own
+    # ggml_sycl_ring_replan_result (RELEASE_REFUSED classified BUSY, every
+    # other non-OK value REFUSED) rather than testing a bare `!` on the
+    # call directly -- match the DOES_NOT_FIT-shaped branch, which is the
+    # one this test's docstring cares about ("a failed re-plan must abort
+    # the transaction"). test_ring_release_refused_is_classified_busy (in
+    # tests/test-sycl-compute-buffer-fallback-source.py) pins the BUSY
+    # branch on its own.
     assert re.search(
-        r"if\s*\(\s*!\s*ggml_sycl_replan_pp_moe_onednn_ring\([^)]*\)\s*\)\s*\{\s*return\s+refuse\(",
+        r"const\s+ggml_sycl_ring_replan_result\s+ring_replan_result\s*=\s*"
+        r"ggml_sycl_replan_pp_moe_onednn_ring\([^;]*;\s*"
+        r"if\s*\(\s*ring_replan_result\s*==\s*ggml_sycl_ring_replan_result::RELEASE_REFUSED\s*\)\s*\{\s*"
+        r"return\s+busy\(",
+        body_norm,
+    ), "the ring release-refused shape must return busy(), not refuse() -- transient, a caller may retry"
+    assert re.search(
+        r"if\s*\(\s*ring_replan_result\s*!=\s*ggml_sycl_ring_replan_result::OK\s*\)\s*\{\s*return\s+refuse\(",
         body_norm,
     ), "a failed ggml_sycl_replan_pp_moe_onednn_ring() call must return from the transaction immediately"
 
@@ -229,7 +239,13 @@ def test_replan_call_has_a_mutation_witness():
     four, not zero."""
     raw = GGML_SYCL_CPP
     call_block = (
-        '    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode)) {\n'
+        "    const ggml_sycl_ring_replan_result ring_replan_result =\n"
+        "        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode);\n"
+        "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {\n"
+        "        // refusal already logged (ERROR normally, INFO in probe mode)\n"
+        '        return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");\n'
+        "    }\n"
+        "    if (ring_replan_result != ggml_sycl_ring_replan_result::OK) {\n"
         "        // refusal already logged (ERROR normally, INFO in probe mode) with\n"
         "        // the largest fitting -ub\n"
         '        return refuse("PP MoE oneDNN scratch ring does not fit");\n'
@@ -451,21 +467,22 @@ def test_success_warn_message_contains_the_required_fragments():
 
 def test_replan_is_idempotent_and_skips_dense_models():
     """A dense model (weight_slot_bytes == 0, no MoE PP ring ever planned)
-    and a repeated call at the SAME n_ubatch must both return true without
+    and a repeated call at the SAME n_ubatch must both return OK without
     calling reserve -- the first because there is nothing to re-plan, the
     second so a transaction re-run at an unchanged n_ubatch (e.g. the narrow
     flash-attn re-check path) is a no-op rather than repeating the
     ceiling-raise/reserve dance every time."""
     body_norm = _normalize_ws(_replan_ring_fn_body())
+    ok_return = r"return\s+ggml_sycl_ring_replan_result::OK\s*;"
     assert re.search(
-        r"if\s*\(\s*weight_slot_bytes\s*==\s*0\s*\)\s*\{\s*return\s+true\s*;", body_norm
-    ), "weight_slot_bytes == 0 (dense model) must return true immediately, before any reserve attempt"
+        r"if\s*\(\s*weight_slot_bytes\s*==\s*0\s*\)\s*\{\s*" + ok_return, body_norm
+    ), "weight_slot_bytes == 0 (dense model) must return OK immediately, before any reserve attempt"
     assert re.search(
         r"if\s*\(\s*n_ubatch\s*==\s*ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch\(device\)\s*\)\s*"
-        r"\{\s*return\s+true\s*;",
+        r"\{\s*" + ok_return,
         body_norm,
     ), (
-        "n_ubatch already equal to the planned n_ubatch must return true immediately (idempotent re-plan)"
+        "n_ubatch already equal to the planned n_ubatch must return OK immediately (idempotent re-plan)"
     )
 
 
@@ -638,7 +655,9 @@ def test_replan_guards_n_ubatch_zero():
     )
     guard_block = body_norm[guard_match.start() : idempotence_idx]
     assert "GGML_LOG_WARN(" in guard_block, "the n_ubatch==0 guard must WARN, not silently return"
-    assert "return true" in guard_block, "the n_ubatch==0 guard must skip the re-plan (return true), not proceed"
+    assert "return ggml_sycl_ring_replan_result::OK" in guard_block, (
+        "the n_ubatch==0 guard must skip the re-plan (return OK), not proceed"
+    )
     assert "unified_cache_set_planned_pp_moe_onednn_scratch(" not in guard_block, (
         "the n_ubatch==0 guard must never publish a zero ceiling"
     )
