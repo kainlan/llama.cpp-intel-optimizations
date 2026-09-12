@@ -1974,14 +1974,22 @@ static long onednn_graph_zone_mb_override() {
 // 1.5 x n_head x n_ubatch x K x sizeof(f32) for K against measured
 // Graph-scratch requests gives K = n_swa + n_ubatch exactly at two
 // different ubatch sizes -- see the gemma4 real-shape derivation below).
-// n_swa + n_ubatch is scoped to a SINGLE sequence (n_seq_max=1), matching
-// placement_kv_info::kv_bytes_per_swa_layer()'s identical
-// min(n_ctx, n_swa + n_ubatch) precedent (unified-cache.hpp) -- a unified
-// iSWA cache serving n_seq_max > 1 concurrent sequences could in
-// principle reach n_swa * n_seq_max + n_ubatch keys instead; threading
-// plan.planner_n_seq_max into this formula is deferred until the floor
-// is actually live at a real n_ctx (llama.cpp-fkpg), since n_seq_max > 1
-// support does not change today's n_seq_max=1-only behavior either way.
+// n_swa + n_ubatch here is STILL scoped to a single sequence (n_seq_max=1)
+// -- as of llama.cpp-3aos, that is no longer true of the KV budget itself:
+// placement_kv_info::kv_bytes_per_swa_layer()/kv_bytes_for_layer() (below,
+// and unified-cache.hpp) now scale their SWA cell count by
+// planner_n_seq_max (n_swa * n_seq_max + n_ubatch, matching
+// llama_kv_cache_iswa exactly), because a stock `llama-server --parallel >
+// 1` under-sized every SWA layer's KV zone against that formula's old
+// n_seq_max=1 assumption -- a real, hit bug, not a theoretical one. THIS
+// floor formula's own n_seq_max threading is a SEPARATE, still-open
+// residual: it estimates oneDNN Graph-SCRATCH bytes (a transient compute
+// buffer), not KV storage, and llama.cpp-fkpg's deferral of
+// plan.planner_n_seq_max into this specific formula remains outstanding
+// until the floor is live at a real n_ctx to verify against. Do not read
+// the KV-budget fix above as having resolved this floor's deferral too --
+// they are two different consumers of planner_n_seq_max, fixed on two
+// different tickets.
 // Non-SWA and SWA layers can both be oneDNN-eligible in the same model, so
 // the true peak is whichever CLASS demands more, not their sum -- the
 // compiled partitions for each class are not concurrently outstanding for
@@ -27226,9 +27234,15 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.kv_per_layer                        = kv_info.kv_bytes_per_layer();
     plan.kv_per_swa_layer                    = kv_info.kv_bytes_per_swa_layer();
     plan.swa_layer_mask                      = kv_info.swa_layer_mask;
+    // llama.cpp-3aos: per-layer KV truth, mirrored so kv_size_for_layer()
+    // can size a specific layer without needing kv_info again later.
+    plan.layer_kind                          = kv_info.layer_kind;
+    plan.layer_k_width                       = kv_info.layer_k_width;
+    plan.layer_v_width                       = kv_info.layer_v_width;
     plan.planner_n_ctx                       = kv_info.n_ctx;
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
-    plan.planner_n_seq_max                   = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
+    plan.planner_n_seq_max =
+        envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max              = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max              = kv_info.n_head_swa_max;
@@ -27428,15 +27442,17 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     for (const auto & [layer_id, indices] : dense_layer_indices) {
         const size_t weight_bytes  = layer_weight_bytes[layer_id];
         const size_t weight_charge = layer_weight_charge_bytes[layer_id];
-        // Charge each attention layer at its actual KV cost: SWA layers only
-        // need min(n_ctx, n_swa) tokens of KV (typically ~8 MB at 4096 tokens)
-        // while full-attention layers need the full per-layer allocation (~256 MB
-        // at 131K context).  TLSF supports heterogeneous slot sizes so the old
+        // Charge each attention layer at its actual per-LAYER KV cost
+        // (llama.cpp-3aos: kv_bytes_for_layer(), not the uniform
+        // is_swa_layer()-class split -- SWA layers only need
+        // min(n_ctx, n_swa) tokens of KV (typically ~8 MB at 4096 tokens)
+        // while full-attention layers need the full per-layer allocation
+        // (~256 MB at 131K context), and a heterogeneous model's SWA/full
+        // widths can themselves differ (Gemma 4 E4B), and shared-KV layers
+        // cost 0). TLSF supports heterogeneous slot sizes so the old
         // uniform-charging workaround is no longer needed.
         const size_t kv_cost =
-            layer_has_attention[layer_id] ?
-                (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) :
-                0;
+            layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
         const size_t total_cost = weight_charge + kv_cost;
         const bool   on_device  = total_cost <= remaining;
         const int    target     = on_device ? device_id : -1;
@@ -27620,11 +27636,20 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         }
         std::sort(layer_ids.begin(), layer_ids.end());
         for (int layer_id : layer_ids) {
-            const size_t weight_bytes = layer_weight_bytes[layer_id];
-            const bool   has_attn     = layer_has_attention[layer_id];
-            const bool   is_swa       = has_attn && kv_info.is_swa_layer(layer_id);
-            const size_t kv_bytes     = has_attn ? (is_swa ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) : 0;
-            const char * kv_label     = has_attn ? (is_swa ? "swa" : "full") : "none";
+            const size_t   weight_bytes = layer_weight_bytes[layer_id];
+            const bool     has_attn     = layer_has_attention[layer_id];
+            const uint32_t uil          = static_cast<uint32_t>(layer_id);
+            // llama.cpp-3aos: kv_bytes_for_layer() already returns 0 for a
+            // SHARED layer (no K/V of its own), so kv_bytes stays correct
+            // whether or not has_attn is set for it; the label distinguishes
+            // that case from a genuinely non-attention layer.
+            const size_t   kv_bytes     = has_attn ? kv_info.kv_bytes_for_layer(uil) : 0;
+            const char *   kv_label =
+                !has_attn ? "none" :
+                  (kv_info.has_per_layer_kv_truth(uil) && kv_info.layer_kind[uil] == GGML_SYCL_KV_LAYER_SHARED) ?
+                              "shared" :
+                  kv_info.is_swa_layer(layer_id) ? "swa" :
+                                                   "full";
             const int    dense_target = plan.get_layer_device(layer_id);
             const int    kv_target    = plan.get_kv_device(layer_id);
             GGML_LOG_INFO(
@@ -28092,7 +28117,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
         }
         auto has_attn = layer_has_attention.find(layer_id);
         if (has_attn != layer_has_attention.end() && has_attn->second) {
-            charge += kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : kv_info.kv_bytes_per_layer();
+            charge += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
         }
         return charge;
     };
@@ -28159,8 +28184,7 @@ static void populate_no_p2p_candidate_layer_blocks(placement_plan &             
             }
             auto has_attn = layer_has_attention.find(layer_id);
             if (has_attn != layer_has_attention.end() && has_attn->second) {
-                block.kv_bytes +=
-                    kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : kv_info.kv_bytes_per_layer();
+                block.kv_bytes += kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id));
             }
         }
 
@@ -28529,9 +28553,15 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.kv_per_layer             = kv_info.kv_bytes_per_layer();
     plan.kv_per_swa_layer         = kv_info.kv_bytes_per_swa_layer();
     plan.swa_layer_mask           = kv_info.swa_layer_mask;
+    // llama.cpp-3aos: per-layer KV truth, mirrored so kv_size_for_layer()
+    // can size a specific layer without needing kv_info again later.
+    plan.layer_kind               = kv_info.layer_kind;
+    plan.layer_k_width            = kv_info.layer_k_width;
+    plan.layer_v_width            = kv_info.layer_v_width;
     plan.planner_n_ctx            = kv_info.n_ctx;
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
-    plan.planner_n_seq_max        = envelope && envelope->n_seq_max ? envelope->n_seq_max : 1;
+    plan.planner_n_seq_max =
+        envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max   = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;
@@ -28899,9 +28929,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
             const size_t kv_cost =
-                layer_has_attention[layer_id] ?
-                    (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) :
-                    0;
+                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
             all_layers_charge += dense_weight_charge + moe_layer_charge[static_cast<size_t>(layer_id)] + kv_cost;
         }
 
@@ -28962,9 +28990,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             const size_t dense_weight_charge =
                 layer_weight_charge_bytes.count(layer_id) ? layer_weight_charge_bytes.at(layer_id) : 0;
             const size_t kv_cost =
-                layer_has_attention[layer_id] ?
-                    (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) :
-                    0;
+                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
             const size_t moe_weight_bytes  = moe_layer_bytes[static_cast<size_t>(layer_id)];
             const size_t moe_weight_charge = moe_layer_charge[static_cast<size_t>(layer_id)];
             const size_t total_charge      = dense_weight_charge + moe_weight_charge + kv_cost;
@@ -29141,12 +29167,13 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         for (const auto & [layer_id, indices] : dense_layer_indices) {
             const size_t weight_bytes  = layer_weight_bytes[layer_id];
             const size_t weight_charge = layer_weight_charge_bytes[layer_id];
-            // Charge each attention layer at its actual KV cost (SWA vs full-attn).
-            // TLSF supports heterogeneous slot sizes — see single-device path for details.
+            // Charge each attention layer at its actual per-layer KV cost
+            // (llama.cpp-3aos: kv_bytes_for_layer() -- SWA vs full-attn vs
+            // shared-KV, per layer, not a uniform class split). TLSF
+            // supports heterogeneous slot sizes — see single-device path for
+            // details.
             const size_t kv_cost =
-                layer_has_attention[layer_id] ?
-                    (kv_info.is_swa_layer(layer_id) ? kv_info.kv_bytes_per_swa_layer() : plan.kv_per_layer) :
-                    0;
+                layer_has_attention[layer_id] ? kv_info.kv_bytes_for_layer(static_cast<uint32_t>(layer_id)) : 0;
             const size_t total_cost     = weight_charge + kv_cost;
             const char * reason         = nullptr;
             int          target_dev_idx = choose_dense_target_device(total_cost, &reason);
@@ -29566,8 +29593,16 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     // conservatively: the full KV footprint across all layers, so the host zone is
     // always large enough regardless of runtime GPU availability.
     if (plan.kv_host_bytes == 0 && kv_info.valid()) {
-        const size_t total_kv = kv_info.n_full_attn_layers() * kv_info.kv_bytes_per_layer() +
-                                kv_info.n_swa_layers * kv_info.kv_bytes_per_swa_layer();
+        // llama.cpp-3aos: a real sum over every layer's own KV bytes, not
+        // "n_full_attn_layers x one representative full layer + n_swa_layers
+        // x one representative SWA layer" -- that uniform-per-class product
+        // is wrong the moment a model's layers of the same class don't all
+        // share one width (Gemma 4 E4B), or some layers hold no KV at all
+        // (SHARED, charged 0 by kv_bytes_for_layer()).
+        size_t total_kv = 0;
+        for (uint32_t il = 0; il < kv_info.n_layer; ++il) {
+            total_kv += kv_info.kv_bytes_for_layer(il);
+        }
         plan.kv_host_bytes = total_kv;
     }
 

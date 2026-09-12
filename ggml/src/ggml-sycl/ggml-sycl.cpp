@@ -15912,6 +15912,25 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
     } else {
         g_placement_kv_info.swa_layer_mask.clear();
     }
+    // llama.cpp-3aos: per-layer KV truth (see the field comments in
+    // ggml-sycl.h and unified-cache.hpp). n_seq_max is NOT set here -- it
+    // is a runtime-context input, not a load-time model property, and stays
+    // at the struct's default (1) until
+    // ggml_backend_sycl_set_runtime_context_for_model()'s transaction body
+    // sets it on next_kv_info from the caller's real n_seq_max.
+    if (inventory->kv_layer_count > 0 && inventory->kv_k_width_per_layer != nullptr &&
+        inventory->kv_v_width_per_layer != nullptr && inventory->kv_layer_kind != nullptr) {
+        g_placement_kv_info.layer_kind.assign(inventory->kv_layer_kind,
+                                              inventory->kv_layer_kind + inventory->kv_layer_count);
+        g_placement_kv_info.layer_k_width.assign(inventory->kv_k_width_per_layer,
+                                                 inventory->kv_k_width_per_layer + inventory->kv_layer_count);
+        g_placement_kv_info.layer_v_width.assign(inventory->kv_v_width_per_layer,
+                                                 inventory->kv_v_width_per_layer + inventory->kv_layer_count);
+    } else {
+        g_placement_kv_info.layer_kind.clear();
+        g_placement_kv_info.layer_k_width.clear();
+        g_placement_kv_info.layer_v_width.clear();
+    }
     g_placement_kv_info.n_ctx_is_runtime = false;
     if (g_placement_kv_info.valid()) {
         GGML_LOG_INFO(
@@ -17309,8 +17328,27 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     }
     next_kv_info.n_ctx            = n_ctx;
     next_kv_info.n_ctx_is_runtime = true;
+    // llama.cpp-3aos: SWA layer sizing scales with n_seq_max (see
+    // kv_bytes_per_swa_layer()/kv_bytes_for_layer()). Without this the
+    // runtime plan keeps the load-time default of 1 and under-sizes every
+    // SWA layer for any --parallel > 1 context. Unconditional, matching
+    // next_plan.planner_n_seq_max below (n_seq_max has no "unset" sentinel
+    // here the way n_ubatch==0 does above) -- callers always pass the
+    // context's real n_seq_max.
+    next_kv_info.n_seq_max        = n_seq_max;
 
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
+    // llama.cpp-3aos: these three must be current on next_plan BEFORE
+    // update_runtime_kv_sizes()/rebuild_runtime_per_device_vram() below --
+    // kv_size_for_layer()'s per-layer-truth path (unified-cache.hpp) reads
+    // next_plan.planner_n_ctx/n_ubatch/n_seq_max directly, not this
+    // function's own n_ctx/n_ubatch/n_seq_max parameters, so setting them
+    // only after those calls (as this used to) sizes every SWA/full layer's
+    // zone from the PREVIOUS runtime context instead of this one whenever a
+    // model carries per-layer KV truth.
+    next_plan.planner_n_ctx     = n_ctx;
+    next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
+    next_plan.planner_n_seq_max = n_seq_max;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
     if (!next_plan.rebuild_runtime_per_device_vram()) {
         GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
@@ -17348,9 +17386,10 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         }
         next_plan.vram_bytes += current->plan->moe_mmid_device_pool_bytes;
     }
-    next_plan.planner_n_ctx     = n_ctx;
-    next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;
-    next_plan.planner_n_seq_max = n_seq_max;
+    // llama.cpp-3aos: planner_n_ctx/n_ubatch/n_seq_max are now set earlier,
+    // right after next_plan is constructed (see the comment there) -- they
+    // must be current before update_runtime_kv_sizes()/
+    // rebuild_runtime_per_device_vram() above run, not only from this point.
     ggml_sycl::moe_mmid_runtime_reason replan_reason = ggml_sycl::moe_mmid_runtime_reason::OK;
     bool replan_ok = ggml_sycl::replan_moe_mmid_workspaces_for_runtime(next_plan, g_tensor_inventory_detail,
                                                                        next_kv_info.n_expert_used, &replan_reason);

@@ -1803,6 +1803,18 @@ if (NOT WIN32)
         LABEL "sycl;python;source-assert;onednn;eligibility"
         TIMEOUT 120
     )
+    # llama.cpp-3aos: pins the shape of the SYCL KV planner's per-layer
+    # sizing fix -- n_seq_max actually consumed by the SWA cell formula, the
+    # three-kind (FULL/SWA/SHARED) switch with SHARED charged 0, and the
+    # runtime transaction body threading its caller's n_seq_max into
+    # next_kv_info before the KV budget is recomputed.
+    llama_test_pytest(
+        ${LLAMA_PYTHON3}
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-kv-layer-sizing-source.py
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        LABEL "sycl;python;source-assert;kv;sizing"
+        TIMEOUT 120
+    )
     llama_test_pytest(
         ${LLAMA_PYTHON3}
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-direct-mem-op-extents.py
