@@ -8,7 +8,7 @@
 // Tests JSON serialization/deserialization, file I/O, and atomic writes
 //
 // llama.cpp-7n6n: several of the tests below (the
-// matmul-dispatch-tuning ones: save_load_roundtrip, version_check,
+// matmul-dispatch-tuning ones: cache_file_roundtrip, version_check,
 // atomic_write) exercise save_cache()/load_cache()/get_cache_file(), which
 // resolve their directory through get_cache_dir() -- XDG_CACHE_HOME if set,
 // else the REAL $HOME/.cache/llama.cpp/sycl-tuning. This binary must never
@@ -781,7 +781,7 @@ TEST(ubatch_cache_load_missing_file) {
 // =============================================================================
 int main() {
     // llama.cpp-7n6n: several tests in this binary
-    // (save_load_roundtrip, version_check, atomic_write) resolve their
+    // (cache_file_roundtrip, version_check, atomic_write) resolve their
     // directory through get_cache_dir(), which falls back to the REAL
     // $HOME/.cache/llama.cpp/sycl-tuning whenever XDG_CACHE_HOME is unset.
     // Refuse outright rather than let a direct invocation reach that real

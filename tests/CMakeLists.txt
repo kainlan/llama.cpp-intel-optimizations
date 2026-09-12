@@ -3269,7 +3269,7 @@ endif()
 #
 # llama.cpp-7n6n: this file's NEW ubatch-cache tests
 # each use their own unique per-pid /tmp directory, passed as an explicit
-# argument -- but THREE PRE-EXISTING tests (save_load_roundtrip,
+# argument -- but THREE PRE-EXISTING tests (cache_file_roundtrip,
 # version_check, atomic_write) call the matmul-dispatch-tuning save_cache()/
 # load_cache()/get_cache_file(), which go through get_cache_dir() and so
 # fall back to the REAL $HOME/.cache/llama.cpp/sycl-tuning whenever
