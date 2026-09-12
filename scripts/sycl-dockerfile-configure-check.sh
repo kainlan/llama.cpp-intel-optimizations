@@ -77,6 +77,14 @@ if ! command -v cmake >/dev/null 2>&1; then
     exit 77
 fi
 
+# -G Ninja is this script's own choice (see the PASS message below), not the
+# Dockerfile's -- the Dockerfile's cmake line names no generator. Check for it
+# here too so a missing generator reads as SKIP, not a confusing CMake error.
+if ! command -v ninja >/dev/null 2>&1; then
+    echo "SKIP: ninja not found in PATH" >&2
+    exit 77
+fi
+
 # --- Extract the Dockerfile's OWN -D flags, never a hardcoded copy ----------
 # The build stage's cmake invocation lives in one RUN block:
 #   RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
@@ -149,4 +157,4 @@ if [[ ${rc} -ne 0 ]]; then
     exit 1
 fi
 
-echo "PASS: configure succeeded against ${REPO_ROOT} with the Dockerfile's exact flag set"
+echo "PASS: configure succeeded against ${REPO_ROOT} with the Dockerfile's flag set (plus -G Ninja)"

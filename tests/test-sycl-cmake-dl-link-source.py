@@ -36,10 +36,10 @@ LLAMA_BUILD_TESTS) somewhere in its currently-open if-stack, so that
 LLAMA_BUILD_TESTS=OFF (which never calls include(CTest), leaving
 BUILD_TESTING unset/false -- see the top-level CMakeLists.txt) stops the
 target from being added at all instead of silently ignoring
-LLAMA_BUILD_TESTS. This check REPORTS A COUNT rather than a boolean: on
-523ca33b0 (pre-llama.cpp-9goq) essentially every test target after line ~472
-fails it (~90), which is exactly the "SYCL test targets ignore
-LLAMA_BUILD_TESTS" half of the ticket. The fix wraps that whole region in one
+LLAMA_BUILD_TESTS. This check REPORTS A COUNT rather than a boolean: on the
+source before the llama.cpp-9goq fix, 119 test targets fail it, the first at
+~:950 (test-xmx-hardware-detect), which is exactly the "SYCL test targets
+ignore LLAMA_BUILD_TESTS" half of the ticket. The fix wraps that whole region in one
 outer `if (BUILD_TESTING)` (opened right after the last statement that
 configures the ordinary ggml-sycl target, closed at end of file), so the
 count must be exactly 0 on a tree carrying that fix.
@@ -68,7 +68,10 @@ CMAKELISTS_RAW = CMAKELISTS_PATH.read_text()
 # comments, but the same lexeme-alternation shape (keep string literals,
 # drop comments) is reused for the identical reason: an occurrence of
 # "target_link_libraries" or "ggml-sycl" inside a `#` comment must not count
-# as a real call.
+# as a real call. Parser limit: the string-literal branch (`[^"\\\n]*`)
+# excludes newlines, so a MULTI-LINE quoted CMake string containing a `#`
+# would have that `#` onward mis-stripped as a line comment instead of kept
+# as part of the string -- none exists in this file today.
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
     r"|#[^\n]*",  # line comment (dropped)
@@ -191,15 +194,26 @@ def _dl_off_active(stack) -> bool:
 
 
 def _build_testing_active(stack) -> bool:
-    """True if some currently-open `if` frame's condition mentions
-    BUILD_TESTING or LLAMA_BUILD_TESTS (in either the if or the else branch
-    of that frame is irrelevant here -- an else of `if (NOT BUILD_TESTING)`
-    is a shape this file does not use for test registration, so treating
-    presence-in-condition as sufficient, rather than also resolving
-    if/else polarity, keeps this check simple and matches every occurrence
-    in the file today). `stack` is the same (cond, in_else, via_elseif)
+    """True if some currently-open `if` (not `else`) frame's condition
+    mentions BUILD_TESTING or LLAMA_BUILD_TESTS WITHOUT negating it -- i.e.
+    that frame guarantees BUILD_TESTING is required for its branch to run at
+    all. Mirrors `_dl_off_active`'s polarity handling rather than treating
+    mere presence-in-condition as sufficient: an `else` branch is not a
+    guarantee (a target reached only via `else()` of `if (BUILD_TESTING)` is
+    reachable when BUILD_TESTING is false, the exact vacuous-pass shape this
+    check exists to catch), and a condition containing
+    `NOT BUILD_TESTING`/`NOT LLAMA_BUILD_TESTS` is rejected even in the `if`
+    branch (that branch runs when BUILD_TESTING is off, the opposite of what
+    this check needs). `stack` is the same (cond, in_else, via_elseif)
     snapshot as `_dl_off_active` above."""
-    return any(re.search(r"\b(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond) for cond, _in_else, _via_elseif in stack)
+    for cond, in_else, _via_elseif in stack:
+        if in_else:
+            continue
+        if re.search(r"\bNOT\s+(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond):
+            continue
+        if re.search(r"\b(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond):
+            return True
+    return False
 
 
 def _assert_not_via_elseif(stack, what: str, line: int) -> None:
@@ -347,7 +361,7 @@ def _count_all_bare_ggml_sycl_links(statements):
     return sum(1 for _ in _iter_bare_ggml_sycl_link_candidates(statements))
 
 
-def _count_unguarded_test_targets(statements):
+def _find_unguarded_test_targets(statements):
     """Every add_executable(...) whose currently-open if-stack does not
     mention BUILD_TESTING/LLAMA_BUILD_TESTS anywhere. Every add_executable is
     a candidate for this check (unlike check A, there is no "configuring
@@ -469,7 +483,7 @@ def test_bare_ggml_sycl_link_check_has_a_mutation_witness():
 
 def test_build_testing_gate_check_has_a_mutation_witness():
     """Positive control for check B, run through the identical `_walk` /
-    `_count_unguarded_test_targets` pipeline: a target inside
+    `_find_unguarded_test_targets` pipeline: a target inside
     `if (BUILD_TESTING)` must read as guarded, and the same target with the
     wrap deleted must be reported -- proving the check is not vacuously
     green (e.g. because the stack-tracker silently treats an unrecognized
@@ -483,19 +497,41 @@ def test_build_testing_gate_check_has_a_mutation_witness():
     guarded_snippet = "if (BUILD_TESTING)\n    add_executable(test-example test-example.cpp)\nendif()\n"
     unguarded_snippet = "add_executable(test-example test-example.cpp)\n"
 
-    assert _count_unguarded_test_targets(_walk(guarded_snippet)) == [], (
+    assert _find_unguarded_test_targets(_walk(guarded_snippet)) == [], (
         "checker false-positives on a target correctly gated by BUILD_TESTING"
     )
-    unguarded = _count_unguarded_test_targets(_walk(unguarded_snippet))
+    unguarded = _find_unguarded_test_targets(_walk(unguarded_snippet))
     assert any(target == "test-example" for target, _line in unguarded), (
         "mutation witness is broken: a test target outside BUILD_TESTING should have been reported"
+    )
+
+    # Two fail-open shapes the pre-fix _build_testing_active read as guarded
+    # (mere presence of BUILD_TESTING in an open condition, ignoring negation
+    # and in_else): a target under `if (NOT BUILD_TESTING)`, and a target
+    # reached only through the `else()` of `if (BUILD_TESTING)`. Both are
+    # reachable with BUILD_TESTING unset/false and must be reported unguarded.
+    not_build_testing_snippet = (
+        "if (NOT BUILD_TESTING)\n    add_executable(test-example test-example.cpp)\nendif()\n"
+    )
+    not_unguarded = _find_unguarded_test_targets(_walk(not_build_testing_snippet))
+    assert any(target == "test-example" for target, _line in not_unguarded), (
+        "mutation witness is broken: a target under `if (NOT BUILD_TESTING)` should have been reported unguarded"
+    )
+
+    else_branch_snippet = (
+        "if (BUILD_TESTING)\nelse()\n    add_executable(test-example test-example.cpp)\nendif()\n"
+    )
+    else_unguarded = _find_unguarded_test_targets(_walk(else_branch_snippet))
+    assert any(target == "test-example" for target, _line in else_unguarded), (
+        "mutation witness is broken: a target under the else() of `if (BUILD_TESTING)` "
+        "should have been reported unguarded"
     )
 
 
 def test_build_testing_gate_is_clean_on_the_real_file():
     """The real file's own count must be exactly 0 once llama.cpp-9goq's
-    file-spanning `if (BUILD_TESTING)` wrap is in place -- pre-fix (523ca33b0)
-    essentially every one of the ~90 add_executable() calls after line ~472
+    file-spanning `if (BUILD_TESTING)` wrap is in place -- before the
+    llama.cpp-9goq fix, 119 of the add_executable() calls after line ~472
     failed this same check (see the module docstring); this is the GREEN
     side of that RED baseline. Also sanity-checks that the parser is
     actually walking the whole file (a silently-empty statement list would
@@ -505,7 +541,7 @@ def test_build_testing_gate_is_clean_on_the_real_file():
         f"only found {total_add_executable} add_executable() calls -- the parser "
         "likely stopped walking the file early rather than the file having " "few test targets"
     )
-    unguarded = _count_unguarded_test_targets(_STATEMENTS)
+    unguarded = _find_unguarded_test_targets(_STATEMENTS)
     assert unguarded == [], (
         f"{len(unguarded)} add_executable() test target(s) in "
         "ggml/src/ggml-sycl/CMakeLists.txt are reachable with LLAMA_BUILD_TESTS=OFF "
@@ -527,7 +563,7 @@ def test_the_three_llama_cpp_9goq_offenders_are_now_dl_guarded():
     ):
         assert target not in violation_targets, f"{target} still links bare ggml-sycl outside a DL-off guard"
 
-    unguarded_targets = {t for t, _line in _count_unguarded_test_targets(_STATEMENTS)}
+    unguarded_targets = {t for t, _line in _find_unguarded_test_targets(_STATEMENTS)}
     for target in (
         "test-attn-host-pool",
         "test-attn-host-flash-attn-identity",

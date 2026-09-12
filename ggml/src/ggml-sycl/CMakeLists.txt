@@ -866,7 +866,7 @@ endif()
 # two earlier blocks at the top of this file (~:119, ~:130) already use, so
 # that LLAMA_BUILD_TESTS=OFF (which never calls include(CTest), leaving
 # BUILD_TESTING unset/false -- see root CMakeLists.txt) stops every one of
-# these ~90 add_executable() test targets and their add_test() registrations
+# these ~120 add_executable() test targets and their add_test() registrations
 # from being added at all, instead of silently ignoring LLAMA_BUILD_TESTS as
 # they did before this fix.
 #
@@ -876,6 +876,7 @@ endif()
 # guaranteed merge collision (same reason CLAUDE.md forbids a whole-file
 # clang-format -i). CMake does not care about indentation; only the two
 # boundary lines (this one and the matching endif() at EOF) change semantics.
+# Re-indent tracked as llama.cpp-44jq (blocked on the concurrent branches landing).
 if (BUILD_TESTING)
 
 # =============================================================================

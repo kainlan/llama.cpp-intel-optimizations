@@ -3288,8 +3288,10 @@ if (NOT WIN32)
         bash
         NAME test-sycl-dockerfile-configure-check
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        ARGS ${CMAKE_SOURCE_DIR}/scripts/sycl-dockerfile-configure-check.sh
+        ARGS ${PROJECT_SOURCE_DIR}/scripts/sycl-dockerfile-configure-check.sh
     )
+    # Same LABEL caveat as test-sycl-prefill-scaling above (llama_test_cmd's
+    # LABEL is single-valued) -- set via set_tests_properties instead.
     set_tests_properties(test-sycl-dockerfile-configure-check PROPERTIES
         LABELS "sycl;cmake;configure"
         SKIP_RETURN_CODE 77
