@@ -876,7 +876,8 @@ endif()
 # guaranteed merge collision (same reason CLAUDE.md forbids a whole-file
 # clang-format -i). CMake does not care about indentation; only the two
 # boundary lines (this one and the matching endif() at EOF) change semantics.
-# Re-indent tracked as llama.cpp-44jq (blocked on the concurrent branches landing).
+# Re-indent tracked as llama.cpp-44jq (blocked on the concurrent branches
+# landing).
 if (BUILD_TESTING)
 
 # =============================================================================

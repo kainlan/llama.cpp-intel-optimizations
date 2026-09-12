@@ -39,10 +39,10 @@ target from being added at all instead of silently ignoring
 LLAMA_BUILD_TESTS. This check REPORTS A COUNT rather than a boolean: on the
 source before the llama.cpp-9goq fix, 119 test targets fail it, the first at
 ~:950 (test-xmx-hardware-detect), which is exactly the "SYCL test targets
-ignore LLAMA_BUILD_TESTS" half of the ticket. The fix wraps that whole region in one
-outer `if (BUILD_TESTING)` (opened right after the last statement that
-configures the ordinary ggml-sycl target, closed at end of file), so the
-count must be exactly 0 on a tree carrying that fix.
+ignore LLAMA_BUILD_TESTS" half of the ticket. The fix wraps that whole
+region in one outer `if (BUILD_TESTING)` (opened right after the last
+statement that configures the ordinary ggml-sycl target, closed at end of
+file), so the count must be exactly 0 on a tree carrying that fix.
 
 Checks run against COMMENT-STRIPPED text so a positive structural check
 cannot be fooled by prose that quotes a call the code does not actually
@@ -68,10 +68,11 @@ CMAKELISTS_RAW = CMAKELISTS_PATH.read_text()
 # comments, but the same lexeme-alternation shape (keep string literals,
 # drop comments) is reused for the identical reason: an occurrence of
 # "target_link_libraries" or "ggml-sycl" inside a `#` comment must not count
-# as a real call. Parser limit: the string-literal branch (`[^"\\\n]*`)
-# excludes newlines, so a MULTI-LINE quoted CMake string containing a `#`
-# would have that `#` onward mis-stripped as a line comment instead of kept
-# as part of the string -- none exists in this file today.
+# as a real call. Parser limit: the string-literal branch
+# (`(?:\\.|[^"\\\n])*`) excludes newlines, so a MULTI-LINE quoted CMake
+# string containing a `#` would have that `#` onward mis-stripped as a line
+# comment instead of kept as part of the string -- none exists in this file
+# today.
 _LEXEME_RE = re.compile(
     r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
     r"|#[^\n]*",  # line comment (dropped)
