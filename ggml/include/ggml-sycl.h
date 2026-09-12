@@ -408,10 +408,18 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // llama.cpp-k1ev) -- an earlier revision of this comment described a
 // live-free-VRAM predicate that hardware measurement falsified; do not
 // reintroduce it without first closing k1ev.
+// llama.cpp-3aos (round 1 F9): kv_unified -- see
+// ggml_backend_sycl_set_runtime_context_for_model()'s declaration for the
+// full rationale. This entry point has two real callers, both internal to
+// ggml-sycl.cpp: ggml_backend_sycl_set_runtime_context_for_model() (which
+// forwards its own caller's real kv_unified), and the legacy
+// ggml_backend_sycl_set_runtime_n_ctx() (which, like its own n_seq_max=1,
+// passes false -- it has no way to learn a real kv_unified either).
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                                             uint32_t       n_ctx,
                                                             uint32_t       n_ubatch,
                                                             uint32_t       n_seq_max,
+                                                            bool           kv_unified,
                                                             bool           flash_attn_enabled);
 
 // llama.cpp-tsfl (round 1 F10; round 4 Q1/Q6): per-device count of
@@ -1111,12 +1119,24 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
 //
 // llama.cpp-oyfl: flash_attn_enabled forwards to
 // ggml_backend_sycl_set_runtime_context() -- see that declaration's comment.
+//
+// llama.cpp-3aos (round 1 F9): kv_unified mirrors llama_cparams::kv_unified
+// (src/llama-context.cpp; default false). It changes how many cells a SWA
+// layer's KV cache actually holds: with kv_unified==false (llama-completion/
+// llama-bench's default, and llama-server unless overridden) the cache is
+// split into n_seq_max independent streams of n_ctx/n_seq_max cells each,
+// and EACH stream's SWA window is capped independently (n_swa + n_ubatch,
+// not n_swa * n_seq_max + n_ubatch); with kv_unified==true there is one
+// stream shared by all n_seq_max sequences, and ITS window scales with
+// n_seq_max. See kv_layer_bytes_for_kind() (unified-cache.hpp) for the full
+// derivation against src/llama-context.cpp/llama-kv-cache-iswa.cpp.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(
     ggml_backend_t               backend,
     struct ggml_sycl_model_token model,
     uint32_t                     n_ctx,
     uint32_t                     n_ubatch,
     uint32_t                     n_seq_max,
+    bool                         kv_unified,
     bool                         flash_attn_enabled);
 
 // llama.cpp-tsfl (nphx comment c-wgxn): result of
@@ -1189,12 +1209,18 @@ struct ggml_sycl_runtime_context_probe {
 // which stays PLAN_REJECTED below). It is distinct from
 // GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
 // enum value's own comment).
+// llama.cpp-3aos (round 1 F9): kv_unified -- see
+// ggml_backend_sycl_set_runtime_context_for_model()'s declaration above for
+// the full rationale. The probe must be given the SAME kv_unified the
+// candidate would actually publish with, or its accept/reject decision
+// (and would_demote_kv/host_kv_bytes) answers for the wrong KV shape.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
     ggml_backend_t                           backend,
     struct ggml_sycl_model_token             model,
     uint32_t                                 n_ctx,
     uint32_t                                 n_ubatch,
     uint32_t                                 n_seq_max,
+    bool                                     kv_unified,
     bool                                     flash_attn_enabled,
     struct ggml_sycl_runtime_context_probe * out);
 

@@ -482,13 +482,42 @@ enum class multi_gpu_mode : uint8_t {
 // (llama_hparams::has_kv() == false -- they reuse an earlier layer's KV).
 // Both call sites now go through this one function, parameterized by the
 // PER-LAYER kind/width so they cannot independently drift out of sync again.
+//
+// llama.cpp-3aos (round 1 F9): SWA sizing has TWO modes, and round bae0e2305
+// only implemented one of them. Derived from src/llama-context.cpp:637-650
+// and src/llama-kv-cache-iswa.cpp:69-81 (both cited by line at the branch
+// below), confirmed against a live GPU run's own printed shapes
+// (n_ctx_seq/kv_unified log lines, and the exact overflow byte counts):
+//   - kv_unified == false (llama-completion/llama-bench's default; also
+//     llama-server unless overridden): the KV cache is split into n_seq_max
+//     independent STREAMS, each of n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256)
+//     cells (llama-context.cpp's own derivation -- re-derived here from the
+//     ALREADY-ADJUSTED n_ctx this function receives, which
+//     llama_context::llama_context() guarantees equals n_ctx_seq * n_seq_max
+//     exactly by construction, ibid.:649-650). Each stream's SWA window is
+//     capped independently: n_swa * 1 + n_ubatch (the "unified ? n_seq_max :
+//     1" term in llama-kv-cache-iswa.cpp:73 is 1 here). Total SWA cells
+//     across all streams = n_seq_max * that per-stream cap.
+//   - kv_unified == true: one stream of n_ctx_seq == n_ctx cells; ITS window
+//     scales with n_seq_max (n_swa * n_seq_max + n_ubatch) -- the formula
+//     this function already had before this fix, and the one the NAS box's
+//     server (llama.cpp-3aos's original report) actually exercised.
+// Verified against the lead's GPU run (-c 4096 -np 4 -ub 512, kv_unified=
+// false, n_ctx_seq=1024 printed by llama itself): Gemma 4 E4B (n_swa=512)
+// size_swa_per_stream = PAD(min(1024, 512+512=1024), 256) = 1024,
+// total_cells = 4*1024 = 4096, K bytes = 4096*512*2 = 4,194,304 -- exactly
+// the overflow line's nbytes. GPT-OSS 20B (n_swa=128, same -np 4)
+// size_swa_per_stream = PAD(min(1024, 128+512=640), 256) = 768,
+// total_cells = 4*768 = 3072, K bytes = 3072*512*2 = 3,145,728 -- exactly
+// its overflow line's nbytes too.
 inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
                                       uint32_t k_width,
                                       uint32_t v_width,
                                       uint32_t n_ctx,
                                       uint32_t n_swa,
                                       uint32_t n_ubatch,
-                                      uint32_t n_seq_max) {
+                                      uint32_t n_seq_max,
+                                      bool     kv_unified) {
     if (kind == GGML_SYCL_KV_LAYER_SHARED) {
         return 0;
     }
@@ -496,30 +525,63 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         if (n_swa == 0) {
             return 0;
         }
-        // Must match the actual SWA KV size from llama_kv_cache_iswa:
-        //   size_swa = GGML_PAD(min(kv_size, n_swa * n_seq_max + n_ubatch), 256)
-        const uint32_t seqs      = n_seq_max > 0 ? n_seq_max : 1;
-        const uint32_t swa_cells = ((std::min(n_ctx, n_swa * seqs + n_ubatch) + 255) / 256) * 256;
+        const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
+        uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
+        uint32_t       n_stream;     // number of independent KV streams
+        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama-kv-cache-iswa.cpp:73
+        if (kv_unified) {
+            // llama-context.cpp:640: cparams.n_ctx_seq = cparams.n_ctx.
+            n_ctx_seq   = n_ctx;
+            n_stream    = 1;
+            window_seqs = seqs;
+        } else {
+            // llama-context.cpp:642-650: n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256),
+            // and n_ctx itself is then adjusted to n_ctx_seq * n_seq_max exactly --
+            // so dividing the (already-adjusted) n_ctx this function receives back
+            // out by seqs reproduces llama's own n_ctx_seq exactly (no remainder,
+            // and re-padding an already-256-aligned value is a no-op).
+            n_ctx_seq   = GGML_PAD(n_ctx / seqs, 256);
+            n_stream    = seqs;
+            window_seqs = 1;
+        }
+        // llama-kv-cache-iswa.cpp:73: size_swa = GGML_PAD(min(size_base,
+        // n_swa*(unified?n_seq_max:1) + n_ubatch), 256), one size PER STREAM;
+        // llama-kv-cache.cpp:347-348 allocates n_stream such streams.
+        const uint32_t swa_cells_per_stream = GGML_PAD(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch), 256);
+        const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
         return static_cast<size_t>(swa_cells) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
     }
-    // GGML_SYCL_KV_LAYER_FULL: the whole context window, every cell.
+    // GGML_SYCL_KV_LAYER_FULL: the whole context window, every cell. Total
+    // cells across streams is n_ctx_seq * n_stream, which by the same
+    // llama-context.cpp:649-650 invariant equals n_ctx exactly in both modes
+    // (kv_unified==true: n_stream=1, n_ctx_seq=n_ctx; kv_unified==false:
+    // n_ctx already adjusted to n_ctx_seq * n_seq_max) -- so this branch
+    // needs no unified/non-unified split.
     return static_cast<size_t>(n_ctx) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
 }
 
 // Explicit planner inputs used for KV sizing and placement.
 struct placement_kv_info {
-    uint32_t          n_layer          = 0;
+    uint32_t              n_layer      = 0;
     uint32_t              n_embd_k_gqa = 0;  // FULL-attention width fallback (homogeneous models / no per-layer data)
-    uint32_t          n_embd_v_gqa     = 0;
-    uint32_t          n_ctx            = 0;
-    uint32_t          n_ubatch         = 512;  // Physical batch size (for SWA KV sizing)
+    uint32_t              n_embd_v_gqa = 0;
+    uint32_t              n_ctx        = 0;
+    uint32_t              n_ubatch     = 512;  // Physical batch size (for SWA KV sizing)
     // llama.cpp-3aos: max active sequences (llama_context's n_seq_max /
     // --parallel). Scales the SWA cell count in kv_bytes_per_swa_layer()/
     // kv_bytes_for_layer() -- llama_kv_cache_iswa allocates
     // n_swa * n_seq_max + n_ubatch cells, not n_swa + n_ubatch; the latter
     // is only correct at n_seq_max == 1. Default 1 preserves that
     // single-sequence behavior when a caller never sets this field.
-    uint32_t              n_seq_max        = 1;
+    uint32_t              n_seq_max    = 1;
+    // llama.cpp-3aos (round 1 F9): mirrors llama_cparams::kv_unified
+    // (src/llama-context.cpp; default false, matching llama's own default).
+    // Selects which of the two SWA sizing modes kv_layer_bytes_for_kind()
+    // uses -- see that function's own comment for the full derivation. This
+    // is a RUNTIME property (like n_seq_max above), never known at model
+    // load time; only the runtime transaction body
+    // (ggml_sycl_run_runtime_context_transaction(), ggml-sycl.cpp) sets it.
+    bool                  kv_unified   = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers
     // (0 if unknown/unset), split by attention window class -- see
     // ggml_sycl_tensor_inventory::n_head_ctx_max/n_head_swa_max
@@ -601,7 +663,7 @@ struct placement_kv_info {
         // layer_v_width are populated.
         // Tensor per layer: K=[n_embd_k_gqa, size_swa] + V=[n_embd_v_gqa, size_swa], both fp16.
         return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_SWA, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
-                                       n_seq_max);
+                                       n_seq_max, kv_unified);
     }
 
     // llama.cpp-3aos: the one per-layer source of truth -- both the
@@ -620,7 +682,7 @@ struct placement_kv_info {
         }
         if (has_per_layer_kv_truth(il)) {
             return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,
-                                           n_seq_max);
+                                           n_seq_max, kv_unified);
         }
         return is_swa_layer(static_cast<int>(il)) ? kv_bytes_per_swa_layer() : kv_bytes_per_layer();
     }
@@ -668,6 +730,10 @@ struct placement_plan {
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
+    // llama.cpp-3aos (round 1 F9): mirrors placement_kv_info::kv_unified --
+    // see that field's comment. Default false matches llama_cparams::
+    // kv_unified's own default.
+    bool                                       planner_kv_unified       = false;
     bool                         planner_n_ctx_is_runtime = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers,
     // split by attention window class and threaded from
@@ -872,7 +938,8 @@ struct placement_plan {
         // anything from kv_info.
         if (layer_id < layer_kind.size() && layer_id < layer_k_width.size() && layer_id < layer_v_width.size()) {
             return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],
-                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max);
+                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,
+                                           planner_kv_unified);
         }
         // Fallback: legacy uniform-per-class split (no per-layer truth populated).
         if (kv_per_swa_layer > 0 && layer_id < swa_layer_mask.size() && swa_layer_mask[layer_id]) {

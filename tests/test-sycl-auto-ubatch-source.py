@@ -415,9 +415,13 @@ def test_probe_is_called_with_the_candidate_shape():
     """Each candidate must be checked with the non-publishing probe before
     anything is published."""
     body_norm = _normalize_ws(_trial_body())
+    # llama.cpp-3aos: tolerate additional cparams.* arguments inserted
+    # between n_seq_max and flash_attn (e.g. cparams.kv_unified) -- the
+    # intent is "flash_attn is the real cparams field, passed to the probe",
+    # not "these two parameters are adjacent".
     assert re.search(
-        r"probe_fn\(\s*sb\.backend\s*,\s*token\s*,\s*cparams\.n_ctx\s*,\s*c\s*,\s*cparams\.n_seq_max\s*,\s*"
-        r"cparams\.flash_attn\s*,\s*&probe\s*\)",
+        r"probe_fn\(\s*sb\.backend\s*,\s*token\s*,\s*cparams\.n_ctx\s*,\s*c\s*,\s*cparams\.n_seq_max\s*,"
+        r"(?:\s*cparams\.\w+\s*,)*\s*cparams\.flash_attn\s*,\s*&probe\s*\)",
         body_norm,
     ), "the probe must be called with (backend, token, n_ctx, the CANDIDATE c, n_seq_max, flash_attn, &probe)"
 

@@ -1077,8 +1077,13 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             }
             const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                   owner.slot_generation };
+            // llama.cpp-3aos (round 1 F9): cparams.kv_unified threaded the
+            // same way cparams.n_seq_max already is -- SYCL's KV planner
+            // needs it to pick the right SWA sizing mode (see
+            // ggml_backend_sycl_set_runtime_context_for_model()'s
+            // declaration comment, ggml-sycl.h).
             auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                         cparams.flash_attn);
+                                         cparams.kv_unified, cparams.flash_attn);
             // Context construction may overlap enough live updates to
             // exhaust the model's finite ticket pool transiently. Wait
             // with bounded exponential backoff instead of spinning three
@@ -1086,7 +1091,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                        cparams.flash_attn);
+                                        cparams.kv_unified, cparams.flash_attn);
             }
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
@@ -1399,7 +1404,12 @@ void llama_context::sycl_select_auto_ubatch() {
         bool candidate_lost = false;
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
-            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
+            // llama.cpp-3aos (round 1 F9): cparams.kv_unified -- the probe
+            // must be given the SAME kv_unified the candidate would
+            // actually publish with, or its accept/reject answer is for the
+            // wrong KV shape (ggml-sycl.h, this probe's declaration).
+            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
+                               cparams.flash_attn, &probe);
 
             // Same bounded exponential backoff as
             // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
@@ -1408,7 +1418,8 @@ void llama_context::sycl_select_auto_ubatch() {
             // waits with that retry (quality round 1 Q5).
             for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
+                rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
+                              cparams.flash_attn, &probe);
             }
 
             if (rc == GGML_SYCL_LIFECYCLE_BUSY) {

@@ -27199,6 +27199,22 @@ static const char * placement_envelope_fa_name(int32_t t) {
     }
 }
 
+// llama.cpp-3aos (round 1 F7): named cases instead of a nested ternary chain
+// -- SHARED (no K/V of its own) takes priority over the SWA/FULL mask so a
+// SHARED layer never mislabels as either.
+static const char * placement_kv_layer_label(const placement_kv_info & kv_info,
+                                             int                       layer_id,
+                                             uint32_t                  uil,
+                                             bool                      has_attn) {
+    if (!has_attn) {
+        return "none";
+    }
+    if (kv_info.has_per_layer_kv_truth(uil) && kv_info.layer_kind[uil] == GGML_SYCL_KV_LAYER_SHARED) {
+        return "shared";
+    }
+    return kv_info.is_swa_layer(layer_id) ? "swa" : "full";
+}
+
 placement_plan compute_placement_plan(const std::vector<std::pair<std::string, size_t>> & tensor_inventory,
                                       size_t                                              vram_budget,
                                       int                                                 device_id,
@@ -27243,6 +27259,13 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
+    // llama.cpp-3aos (round 1 F9): no envelope override -- kv_unified, like
+    // n_seq_max, is a per-context runtime property the model-load-time
+    // envelope never actually carries (llama_model_sycl_make_placement_
+    // envelope() hardcodes a placeholder default); the REAL value is set
+    // later by ggml_sycl_run_runtime_context_transaction() mutating a COPY
+    // of this plan directly, not by recomputing it through this function.
+    plan.planner_kv_unified                  = kv_info.kv_unified;
     plan.planner_n_ctx_is_runtime            = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max              = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max              = kv_info.n_head_swa_max;
@@ -27644,12 +27667,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             // whether or not has_attn is set for it; the label distinguishes
             // that case from a genuinely non-attention layer.
             const size_t   kv_bytes     = has_attn ? kv_info.kv_bytes_for_layer(uil) : 0;
-            const char *   kv_label =
-                !has_attn ? "none" :
-                  (kv_info.has_per_layer_kv_truth(uil) && kv_info.layer_kind[uil] == GGML_SYCL_KV_LAYER_SHARED) ?
-                              "shared" :
-                  kv_info.is_swa_layer(layer_id) ? "swa" :
-                                                   "full";
+            const char *   kv_label     = placement_kv_layer_label(kv_info, layer_id, uil, has_attn);
             const int    dense_target = plan.get_layer_device(layer_id);
             const int    kv_target    = plan.get_kv_device(layer_id);
             GGML_LOG_INFO(
@@ -28562,6 +28580,10 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
+    // llama.cpp-3aos (round 1 F9): see the single-device path's identical
+    // comment above -- no envelope override, the real value is set later by
+    // the runtime transaction mutating a plan copy directly.
+    plan.planner_kv_unified       = kv_info.kv_unified;
     plan.planner_n_ctx_is_runtime = kv_info.n_ctx_is_runtime;
     plan.planner_n_head_ctx_max   = kv_info.n_head_ctx_max;
     plan.planner_n_head_swa_max   = kv_info.n_head_swa_max;

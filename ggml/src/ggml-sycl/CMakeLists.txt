@@ -1656,7 +1656,10 @@ set_tests_properties(sycl-kv-layer-sizing PROPERTIES
     # No ONEAPI_DEVICE_SELECTOR: this test never creates a queue.  LD_LIBRARY_PATH
     # is still needed -- the binary links the SYCL runtime because of the headers.
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    LABELS "sycl;kv;sizing;host-only"
+    # llama.cpp-3aos (round 1 F8): "hostonly" (no hyphen) matches the
+    # sibling sycl-kv-slice-sizing's own spelling, the one the existing
+    # label filters actually key on.
+    LABELS "sycl;kv;sizing;hostonly"
     TIMEOUT 60
 )
 

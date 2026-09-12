@@ -11,14 +11,6 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         return r;
     }
 
-    // Loop-invariant: kv_per_layer never changes across layers, so a caller
-    // that supplied no per-layer byte figure cannot size any demotion --
-    // decide nothing rather than evaluate the same false premise per layer.
-    if (in.kv_per_layer == 0) {
-        r.fits = false;
-        return r;
-    }
-
     const int n_layers = (int) in.kv_device.size();
     for (int l = n_layers - 1; l >= 0; --l) {
         if (in.kv_device[l] < 0) {
@@ -28,12 +20,20 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         if (is_swa) {
             continue;  // SWA KV is ~1.5 MB/layer; demoting it buys nothing and costs a split
         }
-        if (in.kv_per_layer > r.vram_bytes_after) {
+        // llama.cpp-3aos (round 1 F3): THIS layer's own recorded bytes, not a
+        // uniform figure applied to every full-attention layer -- 0 means
+        // nothing is recorded for it (untracked, or a SHARED layer with no
+        // independent KV to move), so there is nothing to demote.
+        const size_t layer_bytes = l < (int) in.kv_bytes_per_layer.size() ? in.kv_bytes_per_layer[l] : 0;
+        if (layer_bytes == 0) {
+            continue;
+        }
+        if (layer_bytes > r.vram_bytes_after) {
             break;  // demoting would underflow vram_bytes_after; refuse rather than wrap
         }
         r.demoted_layers.push_back(l);
-        r.vram_bytes_after -= in.kv_per_layer;
-        r.host_kv_bytes_added += in.kv_per_layer;
+        r.vram_bytes_after -= layer_bytes;
+        r.host_kv_bytes_added += layer_bytes;
         if (r.vram_bytes_after <= in.vram_budget) {
             break;
         }

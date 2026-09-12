@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 """Pin the shape of the SYCL KV planner's per-layer sizing fix (llama.cpp-3aos).
 
-Two bugs, one root, described in the ticket:
+Three bugs, one root, described in the ticket:
 
   Bug 1: placement_kv_info::kv_bytes_per_swa_layer() hardcoded n_seq_max=1
-  in its SWA cell-count formula, while llama_kv_cache_iswa allocates
-  GGML_PAD(min(kv_size, n_swa * n_seq_max + n_ubatch), 256) cells -- any SWA
-  model served with `--parallel > 1` was under-budgeted.
+  in its SWA cell-count formula. Any SWA model served with `--parallel > 1`
+  was under-budgeted.
 
   Bug 2: a single global (n_embd_k_gqa, n_embd_v_gqa) width pair and one
   SWA/non-SWA mask cannot represent a heterogeneous model (Gemma 4 E4B: full
   layers wider than SWA layers, and a trailing block with no K/V of their
-  own at all).
+  own at all) -- both in the per-layer inventory (ggml-sycl.h/llama-model.cpp)
+  AND in the aggregate fallback width src/llama-model.cpp assigns
+  (n_embd_k_gqa_max()/n_embd_v_gqa_max(), not layer 0's width).
+
+  Bug 3 (found on a live GPU acceptance run after Bugs 1-2 were fixed):
+  llama_context splits its KV cache into n_seq_max independent STREAMS
+  unless kv_unified==true (the default for llama-completion/llama-bench is
+  kv_unified==false); each stream's SWA window is then capped independently
+  (n_swa + n_ubatch, not n_swa * n_seq_max + n_ubatch), and there are
+  n_seq_max such streams. The Bug-1 fix alone assumed the OPPOSITE (a single
+  shared stream whose window scales with n_seq_max) -- correct only when
+  kv_unified==true.
 
 The fix threads a shared per-layer formula (kv_layer_bytes_for_kind(), a
-three-way FULL/SWA/SHARED switch that consumes n_seq_max) through both the
-planner (placement_kv_info::kv_bytes_for_layer()) and the persisted plan
-(placement_plan::kv_size_for_layer()), and the runtime transaction body
-(ggml_backend_sycl_set_runtime_context_for_model's shared body) threads its
-caller's n_seq_max into next_kv_info before the KV budget is recomputed from
-it.
+three-way FULL/SWA/SHARED switch that consumes n_seq_max AND kv_unified)
+through both the planner (placement_kv_info::kv_bytes_for_layer()) and the
+persisted plan (placement_plan::kv_size_for_layer()), and the runtime
+transaction body (ggml_sycl_run_runtime_context_transaction) threads its
+caller's n_seq_max and kv_unified into next_kv_info/next_plan before the KV
+budget is recomputed from them.
 
 This is a regex/structural check on the SOURCE, not a build+run test --
 see test-sycl-kv-layer-sizing.cpp for the numeric RED/GREEN behavioral
 check. This file exists because the numeric test can pass for the wrong
-reason (e.g. a hand test that never exercises the real n_seq_max plumbing);
-pinning the shape independently closes that gap.
+reason (e.g. a hand test that never exercises the real n_seq_max/kv_unified
+plumbing); pinning the shape independently closes that gap.
 """
 from pathlib import Path
 import re
@@ -34,6 +44,7 @@ ROOT = Path(__file__).resolve().parents[1]
 UNIFIED_CACHE_HPP = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
 UNIFIED_CACHE_CPP = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 GGML_SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
+LLAMA_MODEL_CPP = ROOT / "src/llama-model.cpp"
 
 KV_LAYER_BYTES_FOR_KIND = "kv_layer_bytes_for_kind"
 # The actual shared transaction body -- ggml_backend_sycl_set_runtime_context_
@@ -98,38 +109,61 @@ def function_or_none(text: str, signature: str) -> str | None:
 
 
 def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
-    body = function_or_none(source, KV_LAYER_BYTES_FOR_KIND)
+    body = function_or_none(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)
     if body is None:
         return [f"{KV_LAYER_BYTES_FOR_KIND} is missing"]
 
     found: list[str] = []
 
     # Bug 1: n_seq_max must actually be consumed by the SWA cell formula --
-    # not just accepted as a parameter and ignored. A caller that always
-    # forces seqs=1 (the pre-fix behavior) would still compile against this
-    # signature, so the check is on the formula itself, not merely the
-    # parameter list.
-    if not re.search(r"n_seq_max\s*>\s*0\s*\?\s*n_seq_max\s*:\s*1", body):
-        found.append(f"{KV_LAYER_BYTES_FOR_KIND} does not derive seqs from n_seq_max (with a >0 guard)")
-    if not re.search(r"n_swa\s*\*\s*seqs\s*\+\s*n_ubatch", body):
-        found.append(f"{KV_LAYER_BYTES_FOR_KIND} does not multiply n_swa by seqs in the window formula")
+    # not just accepted as a parameter and ignored.
+    if not re.search(r"seqs\s*=\s*n_seq_max\s*>\s*0\s*\?\s*n_seq_max\s*:\s*1", body):
+        found.append("does not derive seqs from n_seq_max (with a >0 guard)")
 
     # Bug 2: the three-way switch, SHARED charged 0.
-    if "GGML_SYCL_KV_LAYER_SHARED" not in body:
-        found.append(f"{KV_LAYER_BYTES_FOR_KIND} does not branch on GGML_SYCL_KV_LAYER_SHARED")
     if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SHARED\s*\)\s*\{\s*return\s+0\s*;", body):
-        found.append(f"{KV_LAYER_BYTES_FOR_KIND} does not return 0 for a SHARED layer")
+        found.append("does not return 0 for a SHARED layer")
     if "GGML_SYCL_KV_LAYER_SWA" not in body:
-        found.append(f"{KV_LAYER_BYTES_FOR_KIND} does not branch on GGML_SYCL_KV_LAYER_SWA")
+        found.append("does not branch on GGML_SYCL_KV_LAYER_SWA")
+
+    # Bug 3: the kv_unified two-mode split.
+    if "bool" not in function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND):
+        found.append("has no bool kv_unified parameter")
+    if not re.search(r"if\s*\(\s*kv_unified\s*\)\s*\{", body):
+        found.append("does not branch on kv_unified")
+    # Unified mode: single stream, window scales with n_seq_max.
+    if not re.search(r"n_ctx_seq\s*=\s*n_ctx\s*;\s*\n\s*n_stream\s*=\s*1\s*;\s*\n\s*window_seqs\s*=\s*seqs\s*;", body):
+        found.append("kv_unified==true branch does not set n_ctx_seq=n_ctx, n_stream=1, window_seqs=seqs")
+    # Non-unified mode: n_seq_max independent streams, each windowed at 1 sequence.
+    if not re.search(r"n_ctx_seq\s*=\s*GGML_PAD\(n_ctx\s*/\s*seqs,\s*256\)", body):
+        found.append("kv_unified==false branch does not derive n_ctx_seq = GGML_PAD(n_ctx / seqs, 256)")
+    if not re.search(r"n_stream\s*=\s*seqs\s*;\s*\n\s*window_seqs\s*=\s*1\s*;", body):
+        found.append("kv_unified==false branch does not set n_stream=seqs, window_seqs=1")
+    # The per-stream cap and the stream multiplication must both survive
+    # into the final formula, in EITHER mode.
+    if not re.search(r"n_swa\s*\*\s*window_seqs\s*\+\s*n_ubatch", body):
+        found.append("does not multiply n_swa by window_seqs in the per-stream window formula")
+    if not re.search(r"swa_cells\s*=\s*swa_cells_per_stream\s*\*\s*n_stream", body):
+        found.append("does not multiply the per-stream cell count by n_stream")
 
     return found
+
+
+def function_signature_params(source: str, signature: str) -> str:
+    """The parameter list text between a function signature and its opening
+    brace -- used only to check a parameter TYPE/NAME exists, not to parse
+    the body."""
+    start = source.index(signature)
+    brace = source.index("{", start)
+    return source[start:brace]
 
 
 def kv_bytes_for_layer_violations(source: str) -> list[str]:
     """placement_kv_info::kv_bytes_for_layer() must route through the shared
     per-layer formula when per-layer truth is populated, not re-derive its
     own copy -- the exact "two independent formulas can drift" shape this
-    ticket fixes.
+    ticket fixes. Must also forward kv_unified (round 1 F9), not just
+    n_seq_max.
     """
     body = function_or_none(source, "size_t kv_bytes_for_layer(uint32_t il) const")
     if body is None:
@@ -137,40 +171,46 @@ def kv_bytes_for_layer_violations(source: str) -> list[str]:
     found: list[str] = []
     # A real CALL, not merely a comment mentioning the function's name --
     # `kv_layer_bytes_for_kind()` also appears in this function's own prose.
-    if not re.search(re.escape(KV_LAYER_BYTES_FOR_KIND) + r"\(\s*layer_kind\[", body):
-        found.append("kv_bytes_for_layer does not call kv_layer_bytes_for_kind with the per-layer arrays")
+    call = re.search(re.escape(KV_LAYER_BYTES_FOR_KIND) + r"\(\s*layer_kind\[il\][^;]*\)", body, re.S)
+    if call is None:
+        found.append("does not call kv_layer_bytes_for_kind with the per-layer arrays")
+    elif "kv_unified" not in call.group(0):
+        found.append("calls kv_layer_bytes_for_kind without forwarding kv_unified")
     if "has_per_layer_kv_truth" not in body:
-        found.append("kv_bytes_for_layer does not check has_per_layer_kv_truth before using per-layer arrays")
+        found.append("does not check has_per_layer_kv_truth before using per-layer arrays")
     return found
 
 
 def kv_size_for_layer_violations(source: str) -> list[str]:
     """placement_plan::kv_size_for_layer() -- the function the runtime
     transaction body's refresh_kv_byte_totals()/rebuild_runtime_per_device_
-    vram() actually query -- must ALSO route through kv_layer_bytes_for_kind,
-    not just placement_kv_info's copy. Two call sites computing the same
-    per-layer byte count from two different formulas is exactly how the
-    planner and the allocator disagreed before this ticket.
+    vram() actually query -- must ALSO route through kv_layer_bytes_for_kind
+    (forwarding planner_kv_unified), not just placement_kv_info's copy. Two
+    call sites computing the same per-layer byte count from two different
+    formulas -- or the same formula fed a stale kv_unified -- is exactly how
+    the planner and the allocator disagreed before this ticket.
     """
     body = function_or_none(source, "size_t kv_size_for_layer(uint32_t layer_id) const")
     if body is None:
         return ["placement_plan::kv_size_for_layer is missing"]
     found: list[str] = []
-    # A real CALL, not merely a comment mentioning the function's name --
-    # `kv_layer_bytes_for_kind()` also appears in this function's own prose.
-    if not re.search(re.escape(KV_LAYER_BYTES_FOR_KIND) + r"\(\s*layer_kind\[", body):
-        found.append("kv_size_for_layer does not call kv_layer_bytes_for_kind with the per-layer arrays")
+    call = re.search(re.escape(KV_LAYER_BYTES_FOR_KIND) + r"\(\s*layer_kind\[layer_id\][^;]*\)", body, re.S)
+    if call is None:
+        found.append("does not call kv_layer_bytes_for_kind with the per-layer arrays")
+    elif "planner_kv_unified" not in call.group(0):
+        found.append("calls kv_layer_bytes_for_kind without forwarding planner_kv_unified")
     if "layer_kind" not in body or "layer_k_width" not in body or "layer_v_width" not in body:
-        found.append("kv_size_for_layer does not consult the plan's per-layer kind/width arrays")
+        found.append("does not consult the plan's per-layer kind/width arrays")
     return found
 
 
 def transaction_body_violations(source: str) -> list[str]:
     """The shared runtime-context transaction body must thread the caller's
-    n_seq_max into next_kv_info BEFORE the KV budget is (re)computed from
-    it -- setting it only afterward (as this file's own git history shows
-    for planner_n_ctx/n_ubatch/n_seq_max on next_plan) silently sizes every
-    layer's zone from the STALE previous n_seq_max.
+    n_seq_max AND kv_unified into next_kv_info/next_plan BEFORE the KV
+    budget is (re)computed from them -- setting either only afterward
+    (as this file's own git history shows for planner_n_ctx/n_ubatch/
+    n_seq_max) silently sizes every layer's zone from the STALE previous
+    runtime context.
     """
     body = function_or_none(source, TRANSACTION_SIGNATURE)
     if body is None:
@@ -179,36 +219,55 @@ def transaction_body_violations(source: str) -> list[str]:
     # Whitespace-tolerant: clang-format column-aligns adjacent `=` signs, so
     # the exact spacing here drifts with whatever sibling assignment lines
     # sit next to it.
-    kv_info_re = re.compile(r"next_kv_info\.n_seq_max\s*=\s*n_seq_max;")
-    plan_re    = re.compile(r"next_plan\.planner_n_seq_max\s*=\s*n_seq_max;")
-
+    patterns = {
+        "next_kv_info.n_seq_max":    r"next_kv_info\.n_seq_max\s*=\s*n_seq_max;",
+        "next_kv_info.kv_unified":   r"next_kv_info\.kv_unified\s*=\s*kv_unified;",
+        "next_plan.planner_n_seq_max":   r"next_plan\.planner_n_seq_max\s*=\s*n_seq_max;",
+        "next_plan.planner_kv_unified":  r"next_plan\.planner_kv_unified\s*=\s*kv_unified;",
+    }
+    positions: dict[str, int] = {}
     found: list[str] = []
-    kv_info_match = kv_info_re.search(body)
-    if kv_info_match is None:
-        found.append("the transaction body never sets next_kv_info.n_seq_max")
-    plan_match = plan_re.search(body)
-    if plan_match is None:
-        found.append("the transaction body never sets next_plan.planner_n_seq_max")
+    for name, pattern in patterns.items():
+        m = re.search(pattern, body)
+        if m is None:
+            found.append(f"the transaction body never sets {name}")
+        else:
+            positions[name] = m.start()
 
-    # Ordering: both next_kv_info.n_seq_max and next_plan.planner_n_seq_max
-    # must be set before next_plan.update_runtime_kv_sizes() -- that call's
-    # refresh_kv_byte_totals() walks kv_size_for_layer() per layer, which
-    # reads next_plan.planner_n_seq_max/n_ubatch/n_ctx directly, and the call
-    # also computes next_kv_info.kv_bytes_per_layer()/kv_bytes_per_swa_layer()
-    # as its own arguments. Setting either only afterward (as this file's own
-    # git history shows for planner_n_ctx/n_ubatch/n_seq_max, which used to
-    # be set only after the per-device budget accounting that follows this
-    # call) sizes every layer's zone from the STALE previous n_seq_max.
-    # Anchored to the qualified CALL (`next_plan.foo(`), not a bare mention --
-    # this file's own comments name the function in prose too.
-    kv_info_pos = kv_info_match.start() if kv_info_match else -1
-    plan_pos    = plan_match.start() if plan_match else -1
-    update_pos  = body.find("next_plan.update_runtime_kv_sizes(")
-    if kv_info_pos == -1 or update_pos == -1 or kv_info_pos > update_pos:
-        found.append("next_kv_info.n_seq_max is not set before next_plan.update_runtime_kv_sizes() consumes it")
-    if plan_pos == -1 or update_pos == -1 or plan_pos > update_pos:
-        found.append("next_plan.planner_n_seq_max is not set before next_plan.update_runtime_kv_sizes() consumes it")
+    # Ordering: all four must be set before next_plan.update_runtime_kv_sizes()
+    # -- that call's refresh_kv_byte_totals() walks kv_size_for_layer() per
+    # layer, which reads next_plan.planner_n_seq_max/n_ubatch/n_ctx/
+    # kv_unified directly, and the call also computes
+    # next_kv_info.kv_bytes_per_layer()/kv_bytes_per_swa_layer() as its own
+    # arguments. Anchored to the qualified CALL (`next_plan.foo(`), not a
+    # bare mention -- this file's own comments name the function in prose
+    # too.
+    update_pos = body.find("next_plan.update_runtime_kv_sizes(")
+    if update_pos == -1:
+        found.append("next_plan.update_runtime_kv_sizes( is missing")
+    else:
+        for name, pos in positions.items():
+            if pos > update_pos:
+                found.append(f"{name} is not set before next_plan.update_runtime_kv_sizes() consumes it")
 
+    return found
+
+
+def n_embd_gqa_max_violations(source: str) -> list[str]:
+    """llama.cpp-3aos round 1 F1: the inventory's FULL-attention width
+    fallback fields must be the model-wide MAXIMUM per-layer width
+    (hparams.n_embd_k_gqa_max()/n_embd_v_gqa_max()), not layer 0's width
+    (hparams.n_embd_k_gqa()/n_embd_v_gqa() with no explicit layer index) --
+    on Gemma 4 E4B layer 0 is a SWA layer, so the il=0 form silently
+    under-widens the FULL-attention fallback (512 instead of 1024),
+    corrupting kv_bytes_per_layer() and everything that reads it
+    (ggml_sycl_largest_fitting_n_ctx(), the KV-buffer-kind heuristic).
+    """
+    found: list[str] = []
+    if not re.search(r"inventory\.n_embd_k_gqa\s*=\s*hparams\.n_embd_k_gqa_max\(\)\s*;", source):
+        found.append("inventory.n_embd_k_gqa is not assigned from hparams.n_embd_k_gqa_max()")
+    if not re.search(r"inventory\.n_embd_v_gqa\s*=\s*hparams\.n_embd_v_gqa_max\(\)\s*;", source):
+        found.append("inventory.n_embd_v_gqa is not assigned from hparams.n_embd_v_gqa_max()")
     return found
 
 
@@ -221,7 +280,7 @@ def stale_comment_violations(hpp_source: str, cpp_source: str) -> list[str]:
     return found
 
 
-def test_kv_layer_bytes_for_kind_consumes_n_seq_max_and_the_three_kinds() -> None:
+def test_kv_layer_bytes_for_kind_consumes_n_seq_max_and_kv_unified() -> None:
     assert kv_layer_bytes_for_kind_violations(UNIFIED_CACHE_HPP.read_text()) == []
 
 
@@ -233,63 +292,161 @@ def test_kv_size_for_layer_shares_the_formula() -> None:
     assert kv_size_for_layer_violations(UNIFIED_CACHE_HPP.read_text()) == []
 
 
-def test_transaction_body_threads_n_seq_max_before_use() -> None:
+def test_transaction_body_threads_n_seq_max_and_kv_unified_before_use() -> None:
     assert transaction_body_violations(GGML_SYCL_CPP.read_text()) == []
+
+
+def test_llama_model_uses_n_embd_gqa_max() -> None:
+    assert n_embd_gqa_max_violations(LLAMA_MODEL_CPP.read_text()) == []
 
 
 def test_no_stale_n_seq_max_one_comment_remains() -> None:
     assert stale_comment_violations(UNIFIED_CACHE_HPP.read_text(), UNIFIED_CACHE_CPP.read_text()) == []
 
 
-def test_mutations_are_witnessed() -> None:
-    """Every check above must actually fire on the defect it claims to catch."""
-    hpp = UNIFIED_CACHE_HPP.read_text()
-    hpp_mutations = [
-        # Bug 1 reinstated: hardcode seqs=1, dropping the n_seq_max> 0 guard.
-        hpp.replace("const uint32_t seqs      = n_seq_max > 0 ? n_seq_max : 1;",
-                    "const uint32_t seqs      = 1;", 1),
-        # Bug 1 reinstated a different way: seqs computed but not multiplied in.
-        hpp.replace("n_swa * seqs + n_ubatch", "n_swa + n_ubatch", 1),
-        # Bug 2 reinstated: drop the SHARED arm entirely.
-        re.sub(r"if \(kind == GGML_SYCL_KV_LAYER_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1),
-        # kv_bytes_for_layer stops routing through the shared formula.
-        hpp.replace(
-            "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-            "                                           n_seq_max);",
-            "return 0;", 1),
-        # kv_size_for_layer stops routing through the shared formula.
-        hpp.replace(
-            "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
-            "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max);",
-            "return 0;", 1),
-        # The stale comment reappears.
-        hpp.replace(
-            "// n_seq_max scales the window -- see the field comment above; it\n",
-            "// with n_seq_max=1. n_seq_max scales the window -- see the field comment above; it\n", 1),
-    ]
-    for index, mutated in enumerate(hpp_mutations):
-        assert mutated != hpp, f"unified-cache.hpp mutation {index} did not change the source"
-        violated = (kv_layer_bytes_for_kind_violations(mutated) or kv_bytes_for_layer_violations(mutated) or
-                    kv_size_for_layer_violations(mutated) or stale_comment_violations(mutated, ""))
-        assert violated, f"unified-cache.hpp mutation {index} was not witnessed"
+# ---------------------------------------------------------------------------
+# llama.cpp-3aos (round 1 F6): each mutation below names ONE checker and ONE
+# expected violation substring, and the assertion is that THAT specific
+# check fires with THAT specific message -- not "any of several checkers
+# fired something". A check that has gone dead (matches nothing, or matches
+# the wrong thing) is caught here even if some OTHER checker happens to
+# still notice the same mutated text.
+# ---------------------------------------------------------------------------
 
+def _assert_witnessed(original: str, mutated: str, checker, expected_substring: str, label: str) -> None:
+    assert mutated != original, f"{label}: mutation did not change the source"
+    violations = checker(mutated)
+    assert any(expected_substring in v for v in violations), (
+        f"{label}: expected a violation containing {expected_substring!r}, got {violations!r}")
+
+
+def test_mutation_seqs_hardcoded_to_1_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace("const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;", "const uint32_t seqs = 1;", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not derive seqs from n_seq_max",
+                      "seqs hardcoded to 1")
+
+
+def test_mutation_shared_arm_dropped_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = re.sub(r"if \(kind == GGML_SYCL_KV_LAYER_SHARED\) \{\s*\n\s*return 0;\s*\n\s*\}\s*\n", "", hpp, count=1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not return 0 for a SHARED layer",
+                      "SHARED arm dropped")
+
+
+def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    # Collapse the two-mode split to the (kv_unified==true) formula
+    # unconditionally -- the exact Bug 3 shape (assumes a single shared
+    # stream regardless of the caller's real kv_unified).
+    mutated = hpp.replace(
+        "if (kv_unified) {\n"
+        "            // llama-context.cpp:640: cparams.n_ctx_seq = cparams.n_ctx.\n"
+        "            n_ctx_seq   = n_ctx;\n"
+        "            n_stream    = 1;\n"
+        "            window_seqs = seqs;\n"
+        "        } else {",
+        "if (true) {\n"
+        "            n_ctx_seq   = n_ctx;\n"
+        "            n_stream    = 1;\n"
+        "            window_seqs = seqs;\n"
+        "        } else if (false) {", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations,
+                      "does not branch on kv_unified", "kv_unified branch collapsed")
+
+
+def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace(
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "                                           n_seq_max, kv_unified);",
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "                                           n_seq_max, false);", 1)
+    _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding kv_unified",
+                      "kv_bytes_for_layer stops forwarding kv_unified")
+
+
+def test_mutation_kv_size_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace(
+        "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
+        "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
+        "                                           planner_kv_unified);",
+        "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
+        "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
+        "                                           false);", 1)
+    _assert_witnessed(hpp, mutated, kv_size_for_layer_violations, "without forwarding planner_kv_unified",
+                      "kv_size_for_layer stops forwarding planner_kv_unified")
+
+
+def test_mutation_stale_comment_reappears_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace(
+        "// n_seq_max scales the window -- see the field comment above; it\n",
+        "// with n_seq_max=1. n_seq_max scales the window -- see the field comment above; it\n", 1)
+    _assert_witnessed(hpp, mutated, lambda s: stale_comment_violations(s, ""),
+                      "stale 'with n_seq_max=1' comment", "stale comment reappears")
+
+
+def test_mutation_next_kv_info_n_seq_max_dropped_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
-    cpp_mutations = [
-        # The line the ticket names explicitly as the fix. Whitespace-tolerant
-        # (clang-format column-aligns the `=`) via re.sub rather than a
-        # literal .replace().
-        re.sub(r"[ \t]*next_kv_info\.n_seq_max\s*=\s*n_seq_max;\n", "", cpp, count=1),
-        # planner_n_seq_max still set, but only after the calls that need it.
-        cpp.replace(
-            "    next_plan.planner_n_ctx     = n_ctx;\n"
-            "    next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;\n"
-            "    next_plan.planner_n_seq_max = n_seq_max;\n"
-            "    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());\n",
-            "    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());\n"
-            "    next_plan.planner_n_ctx     = n_ctx;\n"
-            "    next_plan.planner_n_ubatch  = next_kv_info.n_ubatch;\n"
-            "    next_plan.planner_n_seq_max = n_seq_max;\n", 1),
-    ]
-    for index, mutated in enumerate(cpp_mutations):
-        assert mutated != cpp, f"ggml-sycl.cpp mutation {index} did not change the source"
-        assert transaction_body_violations(mutated), f"ggml-sycl.cpp mutation {index} was not witnessed"
+    mutated = re.sub(r"[ \t]*next_kv_info\.n_seq_max\s*=\s*n_seq_max;\n", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations, "never sets next_kv_info.n_seq_max",
+                      "next_kv_info.n_seq_max dropped")
+
+
+def test_mutation_next_kv_info_kv_unified_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"[ \t]*next_kv_info\.kv_unified\s*=\s*kv_unified;\n", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations, "never sets next_kv_info.kv_unified",
+                      "next_kv_info.kv_unified dropped")
+
+
+def test_mutation_next_plan_kv_unified_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"[ \t]*next_plan\.planner_kv_unified\s*=\s*kv_unified;\n", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations, "never sets next_plan.planner_kv_unified",
+                      "next_plan.planner_kv_unified dropped")
+
+
+def test_mutation_planner_assignments_reordered_after_update_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    before = (
+        "    next_plan.planner_n_ctx      = n_ctx;\n"
+        "    next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;\n"
+        "    next_plan.planner_n_seq_max  = n_seq_max;\n"
+        "    next_plan.planner_kv_unified = kv_unified;\n"
+        "    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());\n"
+    )
+    after = (
+        "    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());\n"
+        "    next_plan.planner_n_ctx      = n_ctx;\n"
+        "    next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;\n"
+        "    next_plan.planner_n_seq_max  = n_seq_max;\n"
+        "    next_plan.planner_kv_unified = kv_unified;\n"
+    )
+    mutated = cpp.replace(before, after, 1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations,
+                      "is not set before next_plan.update_runtime_kv_sizes() consumes it",
+                      "planner_* assignments moved after update_runtime_kv_sizes()")
+
+
+def test_mutation_n_embd_k_gqa_reverts_to_layer0_form_is_witnessed() -> None:
+    src = LLAMA_MODEL_CPP.read_text()
+    # Whitespace-tolerant: clang-format column-aligns adjacent `=` signs, so
+    # the exact spacing here drifts with whatever sibling assignment sits
+    # next to it.
+    mutated = re.sub(r"inventory\.n_embd_k_gqa(\s*)=\s*hparams\.n_embd_k_gqa_max\(\);",
+                     r"inventory.n_embd_k_gqa\1= hparams.n_embd_k_gqa();", src, count=1)
+    _assert_witnessed(src, mutated, n_embd_gqa_max_violations,
+                      "inventory.n_embd_k_gqa is not assigned from hparams.n_embd_k_gqa_max()",
+                      "n_embd_k_gqa reverts to the layer-0 (non-_max) accessor")
+
+
+def test_mutation_n_embd_v_gqa_reverts_to_layer0_form_is_witnessed() -> None:
+    src = LLAMA_MODEL_CPP.read_text()
+    mutated = re.sub(r"inventory\.n_embd_v_gqa(\s*)=\s*hparams\.n_embd_v_gqa_max\(\);",
+                     r"inventory.n_embd_v_gqa\1= hparams.n_embd_v_gqa();", src, count=1)
+    _assert_witnessed(src, mutated, n_embd_gqa_max_violations,
+                      "inventory.n_embd_v_gqa is not assigned from hparams.n_embd_v_gqa_max()",
+                      "n_embd_v_gqa reverts to the layer-0 (non-_max) accessor")

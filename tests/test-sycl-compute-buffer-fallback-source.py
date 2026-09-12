@@ -604,8 +604,12 @@ def test_probe_and_publisher_share_one_static_body():
     # Comment-stripped text has already dropped any /*probe_mode=*/-style
     # inline comment (strip_comments() removes /* */ blocks) -- match the
     # positional call itself: (..., flash_attn_enabled, false, nullptr).
+    # llama.cpp-3aos: tolerate additional bare arguments inserted between
+    # n_seq_max and flash_attn_enabled (e.g. kv_unified) -- the intent is
+    # "probe_mode=false, out=nullptr reach the shared body", not that these
+    # two parameters are adjacent.
     assert re.search(
-        r"ggml_sycl_run_runtime_context_transaction\(\s*backend,\s*n_ctx,\s*n_ubatch,\s*n_seq_max,\s*"
+        r"ggml_sycl_run_runtime_context_transaction\(\s*backend,\s*n_ctx,\s*n_ubatch,\s*n_seq_max,(?:\s*\w+,)*\s*"
         r"flash_attn_enabled,\s*false,\s*nullptr\s*\)",
         publisher_body_norm,
     ), "the publishing wrapper must call the shared body with probe_mode=false, out=nullptr"
@@ -615,7 +619,7 @@ def test_probe_and_publisher_share_one_static_body():
         "ggml_backend_sycl_probe_runtime_context_for_model() must call ggml_sycl_run_runtime_context_transaction()"
     )
     assert re.search(
-        r"ggml_sycl_run_runtime_context_transaction\(\s*backend,\s*n_ctx,\s*n_ubatch,\s*n_seq_max,\s*"
+        r"ggml_sycl_run_runtime_context_transaction\(\s*backend,\s*n_ctx,\s*n_ubatch,\s*n_seq_max,(?:\s*\w+,)*\s*"
         r"flash_attn_enabled,\s*true,\s*out\s*\)",
         probe_body_norm,
     ), "the probe must call the shared body with probe_mode=true, out=out"
@@ -630,7 +634,7 @@ def test_shared_body_call_sites_have_a_mutation_witness():
     # ggml_sycl_txn_result through a switch, not a bare bool.
     probe_call = (
         "    const ggml_sycl_txn_result result = ggml_sycl_run_runtime_context_transaction(\n"
-        "        backend, n_ctx, n_ubatch, n_seq_max, flash_attn_enabled, /*probe_mode=*/true, out);\n"
+        "        backend, n_ctx, n_ubatch, n_seq_max, kv_unified, flash_attn_enabled, /*probe_mode=*/true, out);\n"
     )
     assert probe_call in raw, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw.replace(probe_call, "", 1)
