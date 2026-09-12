@@ -54,6 +54,9 @@ GGML_SYCL_H = (ROOT / "ggml/include/ggml-sycl.h").read_text()
 # is documented blind/oversized for this specific file, so a tool-assisted
 # search here would silently miss real occurrences.
 GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
+# llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch tuning
+# cache's own TU -- small enough not to need the ggml-sycl.cpp caveat above.
+UBATCH_TUNING_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/ubatch-tuning-cache.cpp").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +94,7 @@ def strip_comments(src: str) -> str:
 LLAMA_CONTEXT_CPP_CODE = strip_comments(LLAMA_CONTEXT_CPP)
 GGML_SYCL_H_CODE = strip_comments(GGML_SYCL_H)
 GGML_SYCL_CPP_CODE = strip_comments(GGML_SYCL_CPP)
+UBATCH_TUNING_CACHE_CPP_CODE = strip_comments(UBATCH_TUNING_CACHE_CPP)
 
 
 def _normalize_ws(text: str) -> str:
@@ -595,9 +599,18 @@ def test_host_fallback_query_has_a_mutation_witness():
     mutated_raw = raw.replace(fallback_block, "", 1)
     assert mutated_raw != raw
 
+    # llama.cpp-7n6n: scoped to the LADDER LOOP specifically (not "every
+    # fallback_fn( call in the whole body") -- the persisted tuning-cache
+    # lookup added ahead of the loop revalidates a cached candidate through
+    # its own host-fallback check (same fallback_fn(sb.dev_index) call), so
+    # a bare "not in mutated_body_norm" now sees that legitimate second call
+    # site and reads as "the witness is broken" even though the LOOP's own
+    # call was in fact deleted.
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert "fallback_fn(" not in mutated_body_norm, (
-        "mutation witness is broken: deleting the block should remove every fallback_fn( call from the body"
+    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
+    assert mutated_loop_idx != -1
+    assert "fallback_fn(" not in mutated_body_norm[mutated_loop_idx:], (
+        "mutation witness is broken: deleting the block should remove the ladder loop's own fallback_fn( call"
     )
 
 
@@ -618,14 +631,18 @@ def test_exactly_one_sycl_plan_auto_warn_in_the_body():
     )
 
 
-def test_all_seven_stop_reasons_are_present():
-    """The trial's stop-reason vocabulary must be EXACTLY the seven
-    strings the task spec names -- every `stop = "..."` literal in the
-    body (including the initial `const char * stop = "...";`
-    declaration) must be drawn from this set, with none missing and none
-    extra."""
+def test_all_eight_stop_reasons_are_present():
+    """The trial's stop-reason vocabulary must be EXACTLY the eight
+    strings the task spec names -- the original seven (llama.cpp-xojq
+    Task 4b) plus "cached" (llama.cpp-7n6n, Task 5: a persisted-cache hit
+    that revalidates cleanly skips the ladder with this stop reason).
+    Every `stop = "..."` literal in the body (including the initial
+    `const char * stop = "...";` declaration, and the cache-lookup block's
+    own reuse of five of the original seven while revalidating a cached
+    candidate through the same per-candidate steps) must be drawn from
+    this set, with none missing and none extra."""
     body_norm = _normalize_ws(_trial_body())
-    seven = {
+    eight = {
         "ladder exhausted",
         "MoE GPU routing ceiling",
         "transaction refused",
@@ -633,15 +650,16 @@ def test_all_seven_stop_reasons_are_present():
         "not the published model",
         "KV would be demoted",
         "compute buffer fell back to host",
+        "cached",
     }
-    for reason in seven:
+    for reason in eight:
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
 
-    # Presence alone (the loop above) would pass even if an eighth string
+    # Presence alone (the loop above) would pass even if a ninth string
     # had silently slipped in as a `stop = "..."` assignment somewhere --
     # this closes that gap by requiring the extracted SET to match exactly.
     found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm))
-    assert found == seven, f"stop-reason literal set does not match exactly -- found {found}"
+    assert found == eight, f"stop-reason literal set does not match exactly -- found {found}"
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +697,16 @@ def test_candidate_lost_is_checked_immediately_after_the_try_catch():
     BEFORE sched_need_reserve/sched_reserve() -- a refused publish must
     never reach a reserve for the plan it failed to publish."""
     body_norm = _normalize_ws(_trial_body())
-    try_idx = body_norm.find("try { sycl_resync_runtime_context_flash_attn(); }")
+    # llama.cpp-7n6n: anchored to the ladder LOOP specifically (not a bare
+    # body_norm.find()) -- the persisted tuning-cache lookup added ahead of
+    # the loop revalidates a cached candidate through its own try {
+    # sycl_resync_runtime_context_flash_attn(); } (same literal text, a
+    # different local flag name `cached_candidate_lost`), which would
+    # otherwise be the FIRST match a bare find() sees and point this check
+    # at the wrong block entirely.
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    assert loop_idx != -1
+    try_idx = body_norm.find("try { sycl_resync_runtime_context_flash_attn(); }", loop_idx)
     assert try_idx != -1, "could not find the candidate publish's try block"
     after = body_norm[try_idx:]
     break_idx = after.find("if (candidate_lost) { break; }")
@@ -907,4 +934,154 @@ def test_warn_and_settle_have_a_mutation_witness():
     assert count == 2, (
         f"mutation witness is broken: duplicating the WARN line should make the count-exactly-one check see 2, "
         f"saw {count}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch tuning
+# cache -- a lookup tried BEFORE the ladder (a clean hit skips it entirely,
+# with the new "cached" stop reason) and a store that follows any ladder run
+# (never after a hit, which is already the persisted value). GGML_SYCL_
+# TUNING_CACHE=0 disables both; the cache is advisory throughout, so every
+# check here is about ORDERING and PRESENCE, never about changing the
+# ladder's own pre-existing behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_header_declares_the_ubatch_cache_key_and_four_accessors():
+    """ggml-sycl.h must declare the ggml_sycl_ubatch_cache_key struct and
+    all four entry points the trial and ubatch-tuning-cache.cpp share --
+    enabled/path (diagnostics) and lookup/store (the two calls the trial
+    makes)."""
+    assert re.search(r"struct\s+ggml_sycl_ubatch_cache_key\s*\{", GGML_SYCL_H_CODE), (
+        "ggml_sycl_ubatch_cache_key must be declared in ggml-sycl.h"
+    )
+    for member in ("int\\s+device\\s*;", "const\\s+char\\s*\\*\\s*model_name\\s*;", "uint64_t\\s+model_size\\s*;",
+                   "uint64_t\\s+model_hash\\s*;", "uint32_t\\s+n_ctx\\s*;", "uint32_t\\s+n_batch\\s*;",
+                   "bool\\s+flash_attn\\s*;"):
+        assert re.search(member, GGML_SYCL_H_CODE), f"ggml_sycl_ubatch_cache_key is missing a member matching {member!r}"
+
+    assert re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_enabled\s*\(\s*void\s*\)\s*;",
+                      GGML_SYCL_H_CODE), "ggml_backend_sycl_ubatch_cache_enabled(void) must be declared"
+    assert re.search(
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_path\s*\(\s*int\s+device\s*,\s*char\s*\*\s*buf\s*,"
+        r"\s*size_t\s+buf_size\s*\)\s*;",
+        GGML_SYCL_H_CODE,
+    ), "ggml_backend_sycl_ubatch_cache_path(int, char*, size_t) must be declared"
+    assert re.search(
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup\s*\(\s*const\s+struct\s+"
+        r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s*\*\s*n_ubatch\s*\)\s*;",
+        GGML_SYCL_H_CODE,
+    ), "ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key*, uint32_t*) must be declared"
+    assert re.search(
+        r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store\s*\(\s*const\s+struct\s+"
+        r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s+n_ubatch\s*,\s*const\s+char\s*\*\s*reason\s*\)\s*;",
+        GGML_SYCL_H_CODE,
+    ), "ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key*, uint32_t, const char*) must be declared"
+
+
+def test_proc_address_registers_the_four_ubatch_cache_accessors():
+    """A GGML_BACKEND_DL build's llama-context lookup needs all four
+    entry points registered in the strcmp proc-address chain, mirroring
+    the auto_ubatch_enabled/moe_gpu_ubatch_max precedent just above."""
+    for symbol in (
+        "ggml_backend_sycl_ubatch_cache_enabled",
+        "ggml_backend_sycl_ubatch_cache_path",
+        "ggml_backend_sycl_ubatch_cache_lookup",
+        "ggml_backend_sycl_ubatch_cache_store",
+    ):
+        assert re.search(
+            rf'strcmp\(\s*name\s*,\s*"{symbol}"\s*\)\s*==\s*0\s*\)\s*\{{\s*'
+            rf"return\s*\(\s*void\s*\*\s*\)\s*{symbol}\s*;",
+            GGML_SYCL_CPP_CODE,
+        ), f"{symbol} must be registered in the proc-address strcmp chain"
+
+
+def test_ubatch_cache_lookup_precedes_the_ladder():
+    """The tuning-cache lookup must be tried BEFORE the ladder loop --
+    the whole point of Task 5 is to skip the ladder on a clean hit."""
+    body_norm = _normalize_ws(_trial_body())
+    lookup_idx = body_norm.find("cache_lookup_fn(&cache_key,")
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    assert lookup_idx != -1, "could not find the cache_lookup_fn(&cache_key, ...) call"
+    assert loop_idx != -1
+    assert lookup_idx < loop_idx, "the tuning-cache lookup must precede the ladder loop"
+
+
+def test_ubatch_cache_store_follows_the_ladder():
+    """The tuning-cache store must run AFTER the ladder loop has finished
+    (and after the last_good == 0 fallback correction, so it never
+    persists 0) -- never before it, and never inside it."""
+    body_norm = _normalize_ws(_trial_body())
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    fallback_fixup_idx = body_norm.find("if (last_good == 0) {")
+    store_idx = body_norm.find("cache_store_fn(&cache_key,")
+    assert loop_idx != -1 and fallback_fixup_idx != -1
+    assert store_idx != -1, "could not find the cache_store_fn(&cache_key, ...) call"
+    assert loop_idx < fallback_fixup_idx < store_idx, (
+        "the tuning-cache store must run after both the ladder loop and the last_good == 0 fallback fixup"
+    )
+
+
+def test_cache_hit_gates_the_ladder_and_sets_the_cached_stop_reason():
+    """A validated cache hit must set stop = "cached", flip ladder_needed
+    to false, and the ladder loop's very first statement must check
+    ladder_needed -- otherwise a hit would still (uselessly) walk the
+    ladder's cap/probe/publish machinery for nothing."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r'stop\s*=\s*"cached"\s*;', body_norm), 'a cache hit must set stop = "cached";'
+    assert re.search(r"ladder_needed\s*=\s*false\s*;", body_norm), "a cache hit must set ladder_needed = false;"
+
+    loop_idx = body_norm.find("for (uint32_t c : ladder) {")
+    assert loop_idx != -1
+    after_loop_open = body_norm[loop_idx + len("for (uint32_t c : ladder) {") :]
+    assert re.match(r"\s*if\s*\(\s*!ladder_needed\s*\)\s*\{\s*break\s*;\s*\}", after_loop_open), (
+        "the ladder loop's first statement must be `if (!ladder_needed) { break; }`, so a cache hit skips every "
+        "rung without trying any of them"
+    )
+
+
+def test_ubatch_cache_disabled_by_env_var_zero():
+    """GGML_SYCL_TUNING_CACHE=0 must disable both lookup and store --
+    ubatch-tuning-cache.cpp's memoized accessor must return false for
+    exactly "0", mirroring unified_cache_auto_ubatch_enabled()'s own
+    convention (unified-cache.cpp)."""
+    assert re.search(
+        r'std::strcmp\(\s*env\s*,\s*"0"\s*\)\s*==\s*0\s*\)\s*\{\s*return\s+false\s*;\s*\}',
+        UBATCH_TUNING_CACHE_CPP_CODE,
+    ), 'GGML_SYCL_TUNING_CACHE="0" must return false (disabled) from the memoized accessor'
+    assert re.search(
+        r"ggml_backend_sycl_ubatch_cache_lookup[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        UBATCH_TUNING_CACHE_CPP_CODE,
+    ), "ggml_backend_sycl_ubatch_cache_lookup must consult the enabled accessor before doing anything else"
+    assert re.search(
+        r"ggml_backend_sycl_ubatch_cache_store[\s\S]{0,400}?ubatch_tuning_cache_env_enabled\s*\(\s*\)",
+        UBATCH_TUNING_CACHE_CPP_CODE,
+    ), "ggml_backend_sycl_ubatch_cache_store must consult the enabled accessor before doing anything else"
+
+
+def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
+    """Mutation witnesses for the two position checks above: prove they
+    would actually catch the lookup/store being moved to the wrong side
+    of the ladder loop."""
+    raw = LLAMA_CONTEXT_CPP
+
+    lookup_line = "    if (!cache_available) {\n"
+    assert lookup_line in raw, "mutation target not found -- update this witness to match the real source"
+    loop_line = "    for (uint32_t c : ladder) {\n"
+    assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
+
+    # Swap the two markers' relative order by moving the loop's opening
+    # line to just before the cache-availability check -- crude, but
+    # sufficient to prove the position assertions would notice.
+    mutated_raw = raw.replace(loop_line, "", 1).replace(lookup_line, loop_line + lookup_line, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    mutated_lookup_idx = mutated_body_norm.find("cache_lookup_fn(&cache_key,")
+    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
+    assert mutated_lookup_idx != -1 and mutated_loop_idx != -1
+    assert not (mutated_lookup_idx < mutated_loop_idx), (
+        "mutation witness is broken: moving the loop ahead of the cache check should make the lookup-precedes-"
+        "the-ladder check fail"
     )
