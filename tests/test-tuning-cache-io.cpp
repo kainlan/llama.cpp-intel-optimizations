@@ -965,9 +965,9 @@ TEST(ubatch_cache_entry_cap) {
     return true;
 }
 
-// Test: an oversized digit run (more than parse_u64()'s 19-digit cap) loads
-// without UB and simply fails to match any real key
-// -- the cap exists specifically to avoid overflowing a signed/unsigned
+// Test: a wildly oversized digit run (n_ctx, parsed by parse_int()) loads
+// without UB and simply fails to match any real key -- parse_int()'s
+// overflow check exists specifically to avoid overflowing a signed
 // accumulator, which would be UB; this test's real assertion is "no crash,
 // no match", not any particular numeric value.
 TEST(ubatch_cache_oversized_digit_no_ub) {
@@ -1002,6 +1002,80 @@ TEST(ubatch_cache_oversized_digit_no_ub) {
     lookup_key.type_k     = 1;
     lookup_key.type_v     = 1;
     ASSERT(!(loaded[0].key == lookup_key));  // the corrupted n_ctx never matches a real lookup
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: parse_u64() must accept every value up to and including UINT64_MAX,
+// not just values up to a fixed digit count. A fixed 19-digit cap (the
+// original Q8 fix) rejected legitimate 20-digit FNV-1a model_hash values --
+// found on live GPU hardware (llama.cpp-7n6n round 2): a Mistral run's own
+// stored model_hash was 12629460749384247297, a 20-digit value the 19-digit
+// cap silently truncated on load, so the parsed key never matched the
+// entry that had just been written and every subsequent start missed.
+TEST(parse_u64_rejects_overflow) {
+    // UINT64_MAX itself (20 digits) must parse back exactly.
+    ASSERT(parse_u64("{\"h\":18446744073709551615}", "h") == UINT64_MAX);
+
+    // 2^64 (one past UINT64_MAX, also 20 digits) must NOT silently wrap to 0
+    // or to any other value that could pass as a real hash -- the overflow
+    // check must engage before the last digit and stop accumulating there,
+    // pinning the result at the safe 19-digit prefix.
+    ASSERT(parse_u64("{\"h\":18446744073709551616}", "h") == 1844674407370955161ULL);
+
+    // A 21-digit value overflows even sooner; same "pin, don't wrap" outcome.
+    ASSERT(parse_u64("{\"h\":999999999999999999999}", "h") == 9999999999999999999ULL);
+
+    return true;
+}
+
+// Test: a 20-digit model_hash (>= 10^19, i.e. the upper half of the 64-bit
+// hash space) round-trips through a real save/load cycle and matches its
+// own lookup key -- the file-level counterpart to
+// parse_u64_rejects_overflow above, exercising save_ubatch_cache()/
+// load_ubatch_cache() end to end rather than the parser alone. Covers both
+// boundary values from the GPU-run defect: the exact model_hash observed
+// live, and UINT64_MAX itself.
+TEST(ubatch_cache_u64_hash_boundary_roundtrip) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_u64hash_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchU64Hash_" + std::to_string(getpid());
+
+    UbatchCacheEntry e1;
+    e1.key.device_key = "Arc_Pro_B70@1.0";
+    e1.key.model_name = "mistral-7b-v0.1.Q4_0.gguf";
+    e1.key.model_hash = 12629460749384247297ULL;  // the exact value from the live GPU run
+    e1.key.n_ctx      = 4096;
+    e1.n_ubatch       = 1024;
+    e1.reason         = "ladder exhausted";
+    e1.created        = "2026-09-12T00:00:00Z";
+
+    UbatchCacheEntry e2 = e1;
+    e2.key.model_hash   = UINT64_MAX;
+    e2.n_ubatch         = 2048;
+
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { e1, e2 }));
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 2);
+
+    bool found1 = false, found2 = false;
+    for (const auto & e : loaded) {
+        if (e.key == e1.key) {
+            ASSERT(e.key.model_hash == 12629460749384247297ULL);
+            ASSERT(e.n_ubatch == 1024);
+            found1 = true;
+        }
+        if (e.key == e2.key) {
+            ASSERT(e.key.model_hash == UINT64_MAX);
+            ASSERT(e.n_ubatch == 2048);
+            found2 = true;
+        }
+    }
+    ASSERT(found1);
+    ASSERT(found2);
 
     std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
     rmdir(cache_dir.c_str());
@@ -1065,6 +1139,8 @@ int main() {
     RUN_TEST(ubatch_cache_atomic_write);
     RUN_TEST(ubatch_cache_entry_cap);
     RUN_TEST(ubatch_cache_oversized_digit_no_ub);
+    RUN_TEST(parse_u64_rejects_overflow);
+    RUN_TEST(ubatch_cache_u64_hash_boundary_roundtrip);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

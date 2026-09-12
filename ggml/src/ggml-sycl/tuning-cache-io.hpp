@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -200,14 +201,19 @@ inline size_t skip_whitespace(const std::string& json, size_t pos) {
     return pos;
 }
 
-// Parse integer value from JSON at key position. Capped at 10 digits
-// (INT_MAX is 10 digits): a value with more digits than this is malformed or
-// corrupted input, and accumulating past that overflows a signed int, which
-// is UB. Digits beyond the cap are still consumed (so
-// the scan position stays correct for whatever comes after) but not
-// accumulated, which pins the result at whatever leading digits were seen --
-// safe, and reliably fails to match any real key a caller would ever look
-// up with.
+// Parse integer value from JSON at key position. Accumulates the magnitude
+// with an overflow check before each multiply-add (reject a digit whenever
+// `val > (INT_MAX - digit) / 10`, the same test parse_u64() below uses
+// against UINT64_MAX) rather than a fixed digit-count cap -- a fixed cap of
+// N digits rejects some in-range N-digit values while accepting some
+// out-of-range ones, since digit count alone doesn't determine whether a
+// value overflows. Once a digit would overflow, accumulation stops for good
+// (a later digit is still consumed, so the scan position stays correct for
+// whatever comes after, but never accumulated again, even if a later digit
+// alone would not itself have overflowed) -- this pins the result at
+// whatever leading digits were seen before the overflow point, which is
+// safe and reliably fails to match any real key a caller would ever look up
+// with.
 inline int parse_int(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
@@ -222,11 +228,15 @@ inline int parse_int(const std::string& json, const std::string& key) {
         neg = true;
         pos++;
     }
-    int digits = 0;
+    bool overflowed = false;
     while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-        if (digits < 10) {
-            val = val * 10 + (json[pos] - '0');
-            digits++;
+        int digit = json[pos] - '0';
+        if (!overflowed) {
+            if (val > (INT_MAX - digit) / 10) {
+                overflowed = true;
+            } else {
+                val = val * 10 + digit;
+            }
         }
         pos++;
     }
@@ -511,10 +521,11 @@ struct UbatchCacheKey {
     uint32_t    n_ctx           = 0;
     uint32_t    n_batch         = 0;
     bool        flash_attn      = false;
-    // llama.cpp-7n6n: three key omissions that all
-    // land in the same direction as the Q2 sticky-hit bug -- a shape change
-    // in any of these can change which candidates the ladder accepts
-    // without changing anything the key used to track.
+    // llama.cpp-7n6n: three key omissions that all land in the same
+    // direction as the sticky cache-hit bug (a too-small cached value
+    // pinned forever) -- a shape change in any of these can change which
+    // candidates the ladder accepts without changing anything the key used
+    // to track.
     uint32_t    n_seq_max       = 0;  // cparams.n_seq_max, passed to the probe on every candidate
     int32_t     type_k          = 0;  // params.type_k -- KV element type drives would_demote_kv
     int32_t     type_v          = 0;  // params.type_v -- ditto
@@ -555,13 +566,21 @@ struct UbatchCacheEntry {
 
 // Parse an unsigned 64-bit value from JSON at key position. parse_int()
 // above is capped at a plain `int`; model_size and model_hash need the full
-// 64-bit range (model_hash in particular is an arbitrary hash, not a count).
-// Capped at 19 digits: UINT64_MAX is 20 digits, but
-// 19 nines (9999999999999999999) still fits in 64 bits, so a 19-digit cap
-// is the largest that can never overflow during accumulation, which would
-// otherwise be UB. As with parse_int() above, digits beyond the cap are
-// consumed but not accumulated -- safe, and reliably fails to match any
-// real key.
+// 64-bit range (model_hash in particular is an arbitrary FNV-1a hash, not a
+// count, so roughly half of all possible values are >= 10^19, i.e. the full
+// 20 digits UINT64_MAX itself needs). A FIXED 19-digit cap -- the largest
+// digit count that can never overflow regardless of which digits they are
+// -- used to reject every one of those legitimate 20-digit hashes: the
+// parsed model_hash then differed from the one that was stored, so the key
+// could never match its own entry again (every start missed). Digit COUNT
+// alone cannot tell a valid 20-digit value from an overflowing one, so this
+// checks for overflow before each multiply-add instead (reject a digit
+// whenever `val > (UINT64_MAX - digit) / 10`); once a digit would overflow,
+// accumulation stops for good (a later digit is still consumed, so the scan
+// position stays correct for whatever comes after, but never accumulated
+// again, even if a later digit alone would not itself have overflowed) --
+// this pins the result at whatever leading digits were seen before the
+// overflow point, which is safe and reliably fails to match any real key.
 inline uint64_t parse_u64(const std::string & json, const std::string & key) {
     std::string search = "\"" + key + "\":";
     size_t      pos    = json.find(search);
@@ -572,12 +591,16 @@ inline uint64_t parse_u64(const std::string & json, const std::string & key) {
     pos += search.size();
     pos = skip_whitespace(json, pos);
 
-    uint64_t val    = 0;
-    int      digits = 0;
+    uint64_t val        = 0;
+    bool     overflowed = false;
     while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-        if (digits < 19) {
-            val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
-            digits++;
+        uint64_t digit = static_cast<uint64_t>(json[pos] - '0');
+        if (!overflowed) {
+            if (val > (UINT64_MAX - digit) / 10) {
+                overflowed = true;
+            } else {
+                val = val * 10 + digit;
+            }
         }
         pos++;
     }

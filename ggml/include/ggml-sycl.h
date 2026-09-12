@@ -471,8 +471,10 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf
 // Look up a previously-persisted auto n_ubatch for this exact key, along
 // with the REASON it was stored with -- copied into
 // `reason_buf`, truncated to fit `reason_buf_size` including the
-// terminating NUL, like `ggml_backend_sycl_ubatch_cache_path()` above;
-// `reason_buf`/`reason_buf_size` may be null/0 to skip it). The caller uses
+// terminating NUL (unlike `ggml_backend_sycl_ubatch_cache_path()`, which
+// refuses instead: a truncated reason fails safe to non-terminal, a
+// truncated path would not); `reason_buf`/`reason_buf_size` may be null/0
+// to skip it). The caller uses
 // the reason to tell a TERMINAL outcome ("ladder exhausted", "MoE GPU
 // routing ceiling") from one that merely lost a transient race, and decides
 // from that whether to trust the cached value outright or resume searching
@@ -496,8 +498,8 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup(const struct ggml_sy
 // unchanged outcome does not re-store at all) or "transaction busy"/"not
 // the published model" (pure races it explicitly skips storing). Returns
 // false (never throws) on a disabled cache, an out-of-range device, or a
-// write failure -- the caller ignores the result; a failed store never
-// blocks inference.
+// write failure -- the caller logs one WARN and continues; a failed store
+// never blocks inference.
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store(const struct ggml_sycl_ubatch_cache_key * key,
                                                            uint32_t                                  n_ubatch,
                                                            const char *                              reason);

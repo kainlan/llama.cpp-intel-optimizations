@@ -57,6 +57,11 @@ GGML_SYCL_CPP = (ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text()
 # llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch tuning
 # cache's own TU -- small enough not to need the ggml-sycl.cpp caveat above.
 UBATCH_TUNING_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/ubatch-tuning-cache.cpp").read_text()
+# llama.cpp-7n6n: the host-only unit test file itself, read here only to pin
+# the two 64-bit boundary literals a live GPU defect was found against (see
+# test_boundary_literals_are_pinned_in_the_unit_test below) -- not otherwise
+# parsed by this file's checks.
+TEST_TUNING_CACHE_IO_CPP = (ROOT / "tests/test-tuning-cache-io.cpp").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -1544,3 +1549,21 @@ def test_ubatch_cache_path_source_returns_false_on_oversized_path():
         r"if\s*\(\s*path\.size\s*\(\s*\)\s*>=\s*buf_size\s*\)\s*\{\s*return\s+false\s*;\s*\}",
         _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE),
     ), "ggml_backend_sycl_ubatch_cache_path must return false when path.size() >= buf_size"
+
+
+def test_boundary_literals_are_pinned_in_the_unit_test():
+    """llama.cpp-7n6n round 2: a live GPU run found a Mistral model_hash of
+    12629460749384247297 (20 digits) silently mismatching after a save/load
+    round trip, because parse_u64()'s old fixed 19-digit cap truncated it on
+    read. Pin the two boundary literals -- the exact value observed live,
+    and UINT64_MAX itself -- so a future edit cannot quietly narrow
+    parse_u64_rejects_overflow / ubatch_cache_u64_hash_boundary_roundtrip
+    (tests/test-tuning-cache-io.cpp) back down to values that never exercise
+    the 20-digit boundary."""
+    text = TEST_TUNING_CACHE_IO_CPP
+    assert "12629460749384247297" in text, (
+        "the exact model_hash observed on live GPU hardware must stay covered by a unit test"
+    )
+    assert "18446744073709551615" in text, "UINT64_MAX itself must stay covered by a unit test"
+    assert "parse_u64_rejects_overflow" in text
+    assert "ubatch_cache_u64_hash_boundary_roundtrip" in text
