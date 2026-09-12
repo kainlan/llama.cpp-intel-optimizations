@@ -166,8 +166,8 @@ def _replan_ring_fn_body() -> str:
 
 
 def test_transaction_calls_replan_after_nonfa_and_before_mmid_materialize():
-    """ggml_sycl_run_runtime_context_transaction() (llama.cpp-tsfl round 1
-    F9: the shared body ggml_backend_sycl_set_runtime_context() now merely
+    """ggml_sycl_run_runtime_context_transaction() (llama.cpp-tsfl: the
+    shared body ggml_backend_sycl_set_runtime_context() now merely
     wraps) must call the ring re-plan AFTER ggml_sycl_check_nonfa_attn_
     scratch() (so it sees the post-nonfa-guard plan) and BEFORE the MMID
     workspace materialization call that finalizes the plan for publication
