@@ -17024,10 +17024,11 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // will not change on retry. ggml_sycl_run_runtime_context_transaction()
 // (the only caller that inspects this value) maps RELEASE_REFUSED to
 // GGML_SYCL_LIFECYCLE_BUSY and DOES_NOT_FIT to GGML_SYCL_LIFECYCLE_
-// PLAN_REJECTED; every rollback call site (the probe's own rollback, and
-// the three publish-path later-failure rollbacks) discards this value with
-// a (void) cast -- they only care that the ring ends up at the intended
-// n_ubatch, not why an earlier attempt in the opposite direction failed.
+// PLAN_REJECTED. The three publish-path later-failure rollbacks discard
+// this value with a (void) cast -- they only care that the ring ends up
+// at the intended n_ubatch, not why an earlier attempt in the opposite
+// direction failed. The probe's own rollback compares it against OK and
+// treats any other value as a failed rollback (ERROR, then a refusal).
 enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
 
 static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int      device,

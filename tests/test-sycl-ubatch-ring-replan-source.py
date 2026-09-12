@@ -1,6 +1,6 @@
 """Source contract for llama.cpp-ibj0: the PP MoE oneDNN scratch ring must be
 re-planned for the RUNTIME n_ubatch inside the runtime-context transaction
-(llama.cpp-tsfl round 1 F9: as of that task, the actual admission logic --
+(llama.cpp-tsfl: as of that task, the actual admission logic --
 including this ring re-plan -- lives in
 ggml_sycl_run_runtime_context_transaction(); ggml_backend_sycl_set_runtime_
 context() is now a thin wrapper around it) -- the same transaction that
@@ -133,7 +133,7 @@ _REPLAN_START = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_one
 # real signature or every downstream _bounded_body() call silently fails to
 # find it.
 _RUNTIME_CONTEXT_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
-# llama.cpp-tsfl round 1 F9: the transaction body's own end marker is the
+# llama.cpp-tsfl: the transaction body's own end marker is the
 # now-thin ggml_backend_sycl_set_runtime_context() wrapper's start, not
 # ggml_backend_sycl_set_runtime_context_for_model() -- ".find()" would
 # otherwise silently span FOUR functions (the real transaction body, the
