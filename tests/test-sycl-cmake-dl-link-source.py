@@ -1,0 +1,425 @@
+"""Source contract for llama.cpp-9goq: ggml/src/ggml-sycl/CMakeLists.txt must
+not regress the way three test targets did (test-attn-host-pool,
+test-attn-host-flash-attn-identity, test-sycl-expert-predictor-guard, all
+introduced between 2026-08-27 and 2026-09-02): each called
+`target_link_libraries(<test> ... ggml-sycl ...)` unconditionally. Under
+-DGGML_BACKEND_DL=ON, ggml-sycl is a MODULE library and CMake hard-errors --
+"Target \"ggml-sycl\" of type MODULE_LIBRARY may not be linked into another
+target" -- which broke .devops/intel.Dockerfile's configure step (that stage
+passes exactly GGML_BACKEND_DL=ON + GGML_CPU_ALL_VARIANTS=ON +
+LLAMA_BUILD_TESTS=OFF; see scripts/sycl-dockerfile-configure-check.sh, the
+configure-only smoke test that reproduces this directly against the
+Dockerfile's own flags rather than a hardcoded copy of them).
+
+Two independent checks, both host-only, pure text assertions against the
+CMakeLists.txt source (Python is test-only; its absence must not break a
+clean SYCL configuration -- llama_test_pytest skips at run time, not
+configure time, matching test-sycl-compute-buffer-fallback-source.py's own
+convention):
+
+(A) Every target_link_libraries(...) call in that file that names the bare
+`ggml-sycl` target as one of the libraries to link -- as opposed to being the
+target the call itself configures, which is ggml-sycl's own production
+setup at the top of the file and already unconditionally correct -- must sit
+under a condition that guarantees GGML_BACKEND_DL is off: either directly
+inside an `if (...)` whose condition contains `NOT GGML_BACKEND_DL`
+(ANDed with anything else), or inside the `else()` branch of an `if (...)`
+whose ENTIRE condition is the single term `GGML_BACKEND_DL` (both shapes are
+used in the file today -- the former is the overwhelming majority, the
+latter is test-sycl-device-uuid-api's `if (GGML_BACKEND_DL) ... else()`).
+A target_link_libraries call that does not resolve to either shape is
+reported as a violation.
+
+(B) Every add_executable(...) test target registered in that file must sit
+under an `if (...)` whose condition mentions BUILD_TESTING (or
+LLAMA_BUILD_TESTS) somewhere in its currently-open if-stack, so that
+LLAMA_BUILD_TESTS=OFF (which never calls include(CTest), leaving
+BUILD_TESTING unset/false -- see the top-level CMakeLists.txt) stops the
+target from being added at all instead of silently ignoring
+LLAMA_BUILD_TESTS. This check REPORTS A COUNT rather than a boolean: on
+523ca33b0 (pre-llama.cpp-9goq) essentially every test target after line ~472
+fails it (~90), which is exactly the "SYCL test targets ignore
+LLAMA_BUILD_TESTS" half of the ticket. The fix wraps that whole region in one
+outer `if (BUILD_TESTING)` (opened right after the last statement that
+configures the ordinary ggml-sycl target, closed at end of file), so the
+count must be exactly 0 on a tree carrying that fix.
+
+Checks run against COMMENT-STRIPPED text so a positive structural check
+cannot be fooled by prose that quotes a call the code does not actually
+make -- same convention as test-sycl-compute-buffer-fallback-source.py.
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+CMAKELISTS_PATH = ROOT / "ggml/src/ggml-sycl/CMakeLists.txt"
+CMAKELISTS_RAW = CMAKELISTS_PATH.read_text()
+
+# ---------------------------------------------------------------------------
+# Comment-stripping helper, copied verbatim (not imported) from
+# test-sycl-compute-buffer-fallback-source.py, which documents this as the
+# established convention in this file family: each source-gate test file is
+# collected standalone by pytest with no shared conftest.py / importable
+# helper module in tests/, so copying with attribution is the working,
+# already-proven pattern here. CMake has no block comments, only `#` line
+# comments, but the same lexeme-alternation shape (keep string literals,
+# drop comments) is reused for the identical reason: an occurrence of
+# "target_link_libraries" or "ggml-sycl" inside a `#` comment must not count
+# as a real call.
+_LEXEME_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"'  # string literal (kept)
+    r"|#[^\n]*",  # line comment (dropped)
+    flags=re.DOTALL,
+)
+
+
+def strip_comments(src: str) -> str:
+    """Remove CMake `#` line comments; keep string literals verbatim."""
+
+    def repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok[0] == '"':
+            return tok
+        return ""
+
+    return _LEXEME_RE.sub(repl, src)
+
+
+CMAKELISTS_CODE = strip_comments(CMAKELISTS_RAW)
+
+
+# ---------------------------------------------------------------------------
+# A minimal if/elseif/else/endif tracker plus a paren-balanced statement
+# extractor. This is not a CMake evaluator -- it only tracks the handful of
+# shapes this file actually uses for GGML_BACKEND_DL/BUILD_TESTING guards
+# (verified against every `if (...GGML_BACKEND_DL...)` in the file at the
+# time this test was written; see the module docstring). An `elseif` on a
+# frame this tracker is watching would need new handling, so one is asserted
+# not to occur inside a call's enclosing stack rather than silently
+# mis-evaluated.
+# ---------------------------------------------------------------------------
+
+_STATEMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _iter_statements(code: str):
+    """Yield (name, args_text, start_line) for every CMake command
+    invocation in `code`, in document order. `start_line` is 1-based and
+    refers to the line the command keyword starts on. Paren depth is tracked
+    character-by-character, SKIPPING parens inside quoted string literals
+    (e.g. the "not built: ... (needs ...)" placeholder messages this file's
+    own DL-guard else() branches print) so a stray paren in prose cannot
+    desynchronize the statement boundary. This is not merely defensive: the
+    parser must correctly bound a call whose message string contains
+    parens, not merely happen to work because today's strings are
+    paren-balanced by coincidence."""
+    pos = 0
+    line_no = 1
+    for m in _STATEMENT_RE.finditer(code):
+        if m.start() < pos:
+            continue
+        line_no += code.count("\n", pos, m.start())
+        pos = m.start()
+        name = m.group(1)
+        depth = 1
+        i = m.end()
+        in_string = False
+        while depth > 0:
+            if i >= len(code):
+                raise AssertionError(f"unbalanced parens starting at line {line_no} ({name})")
+            c = code[i]
+            if in_string:
+                if c == "\\":
+                    i += 1  # skip the escaped character too
+                elif c == '"':
+                    in_string = False
+            elif c == '"':
+                in_string = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+        args_text = code[m.end() : i - 1]
+        yield name, args_text, line_no
+        line_no += code.count("\n", pos, i)
+        pos = i
+
+
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+class _Frame:
+    __slots__ = ("cond", "in_else")
+
+    def __init__(self, cond: str):
+        self.cond = cond
+        self.in_else = False
+
+
+def _dl_off_active(stack) -> bool:
+    """True if some currently-open frame guarantees GGML_BACKEND_DL is
+    false along this path -- either an `if` branch whose condition contains
+    `NOT GGML_BACKEND_DL`, or an `else` branch of an `if` whose ENTIRE
+    condition is exactly `GGML_BACKEND_DL` (no other ANDed terms).
+    `stack` is a snapshot of (cond, in_else) tuples, not live _Frame
+    objects -- see the note on `_walk`'s snapshot for why that distinction
+    is load-bearing."""
+    for cond, in_else in stack:
+        if not in_else and re.search(r"\bNOT\s+GGML_BACKEND_DL\b", cond):
+            return True
+        if in_else and cond == "GGML_BACKEND_DL":
+            return True
+    return False
+
+
+def _build_testing_active(stack) -> bool:
+    """True if some currently-open `if` frame's condition mentions
+    BUILD_TESTING or LLAMA_BUILD_TESTS (in either the if or the else branch
+    of that frame is irrelevant here -- an else of `if (NOT BUILD_TESTING)`
+    is a shape this file does not use for test registration, so treating
+    presence-in-condition as sufficient, rather than also resolving
+    if/else polarity, keeps this check simple and matches every occurrence
+    in the file today). `stack` is the same (cond, in_else) snapshot as
+    `_dl_off_active` above."""
+    return any(re.search(r"\b(BUILD_TESTING|LLAMA_BUILD_TESTS)\b", cond) for cond, _in_else in stack)
+
+
+def _walk(code: str):
+    """Replay the file's if/elseif/else/endif structure, yielding
+    (kind, args_text, line, stack_snapshot) for every target_link_libraries
+    and add_executable call, where stack_snapshot is a list of (cond,
+    in_else) tuples for every frame open at that point (top of stack last).
+
+    Snapshotting as plain tuples -- not a `list(stack)` of the live _Frame
+    objects -- is load-bearing, not merely tidy: a _Frame is mutated in
+    place by a LATER `else()` on the same block (`frame.in_else = True`), so
+    a shallow copy of the stack list still aliases that same object. A
+    target_link_libraries call recorded inside the `if` branch would then
+    read back, once parsing reaches that block's `else()`, as if it had
+    been inside the `else` branch all along -- silently misclassifying
+    every guarded call in a block that also has an else (which is every
+    __one of the three llama.cpp-9goq targets fixed by this ticket, since
+    each of them gained a disabled-placeholder else()). Caught by running
+    this checker against the real, already-fixed source and finding
+    test-attn-host-pool reported as a violation despite being correctly
+    guarded -- i.e. the checker failed against a known-GREEN case, the
+    same shape as a positive-control failure elsewhere in this file family."""
+    stack = []
+    results = []
+    for name, args_text, line in _iter_statements(code):
+        lname = name.lower()
+        if lname == "if":
+            stack.append(_Frame(_normalize_ws(args_text)))
+        elif lname == "elseif":
+            if not stack:
+                raise AssertionError(f"elseif with no open if at line {line}")
+            # New condition at the same nesting depth; reset the else flag.
+            stack[-1] = _Frame(_normalize_ws(args_text))
+        elif lname == "else":
+            if not stack:
+                raise AssertionError(f"else with no open if at line {line}")
+            stack[-1].in_else = True
+        elif lname == "endif":
+            if not stack:
+                raise AssertionError(f"endif with no open if at line {line}")
+            stack.pop()
+        elif lname == "target_link_libraries":
+            results.append(("target_link_libraries", args_text, line, [(f.cond, f.in_else) for f in stack]))
+        elif lname == "add_executable":
+            results.append(("add_executable", args_text, line, [(f.cond, f.in_else) for f in stack]))
+    if stack:
+        raise AssertionError(f"unbalanced if/endif: {len(stack)} still open at EOF")
+    return results
+
+
+_STATEMENTS = _walk(CMAKELISTS_CODE)
+
+
+def _find_bare_ggml_sycl_link_violations(statements):
+    """Every target_link_libraries(...) call naming the bare `ggml-sycl`
+    target as a LINKED library (not as the target-being-configured, i.e. not
+    its own first argument -- that's ggml-sycl's production setup) outside
+    a GGML_BACKEND_DL-is-off guard."""
+    violations = []
+    for kind, args_text, line, stack in statements:
+        if kind != "target_link_libraries":
+            continue
+        tokens = args_text.split()
+        if not tokens:
+            continue
+        target_being_configured, *rest = tokens
+        if target_being_configured == "ggml-sycl":
+            continue  # ggml-sycl configuring itself; not a candidate offender.
+        for tok in rest:
+            if tok in ("PRIVATE", "PUBLIC", "INTERFACE"):
+                continue
+            if "$<" in tok:
+                continue  # generator expression, e.g. $<TARGET_FILE:ggml-sycl>
+            if tok == "ggml-sycl":
+                if not _dl_off_active(stack):
+                    violations.append((target_being_configured, line))
+                break
+    return violations
+
+
+def _count_unguarded_test_targets(statements):
+    """Every add_executable(...) whose currently-open if-stack does not
+    mention BUILD_TESTING/LLAMA_BUILD_TESTS anywhere."""
+    unguarded = []
+    for kind, args_text, line, stack in statements:
+        if kind != "add_executable":
+            continue
+        target = args_text.split()[0] if args_text.split() else "<unknown>"
+        if not _build_testing_active(stack):
+            unguarded.append((target, line))
+    return unguarded
+
+
+# ---------------------------------------------------------------------------
+# Check A: bare `ggml-sycl` links must be DL-guarded.
+# ---------------------------------------------------------------------------
+
+
+def test_no_bare_ggml_sycl_link_outside_a_dl_off_guard():
+    violations = _find_bare_ggml_sycl_link_violations(_STATEMENTS)
+    assert violations == [], (
+        "target_link_libraries(...) linking the bare `ggml-sycl` MODULE target "
+        "outside a `NOT GGML_BACKEND_DL` (or equivalent else-of-GGML_BACKEND_DL) "
+        f"guard: {violations}. Under -DGGML_BACKEND_DL=ON this is a hard CMake "
+        'configure error ("Target \\"ggml-sycl\\" of type MODULE_LIBRARY may not '
+        'be linked into another target"), exactly the llama.cpp-9goq regression. '
+        "Wrap the target's real link line in `if (NOT GGML_BACKEND_DL) ... else() "
+        "<disabled placeholder add_test> endif()`, matching the other ~85 targets "
+        "in this file that already do."
+    )
+
+
+def test_bare_ggml_sycl_link_check_has_a_mutation_witness():
+    """Positive control, run through the IDENTICAL `_walk` /
+    `_find_bare_ggml_sycl_link_violations` pipeline used against the real
+    file: a bare ggml-sycl link inside `if (NOT GGML_BACKEND_DL)` must read
+    clean, and the same call moved outside that guard must be reported.
+
+    Deliberately synthetic rather than a string-mutation of the real
+    5700-line file: an exact-substring mutation is brittle against
+    reflowing (this file's own add_executable calls span multiple lines,
+    which an earlier version of this witness got wrong), and it is the
+    _checker_ this test needs to exercise, not this file's current
+    formatting."""
+    guarded_snippet = (
+        "if (NOT GGML_BACKEND_DL)\n"
+        "    add_executable(test-example test-example.cpp)\n"
+        "    target_link_libraries(test-example PRIVATE ggml-base ggml ggml-sycl Threads::Threads)\n"
+        "endif()\n"
+    )
+    unguarded_snippet = (
+        "if (NOT GGML_BACKEND_DL)\n"
+        "    add_executable(test-example test-example.cpp)\n"
+        "endif()\n"
+        "target_link_libraries(test-example PRIVATE ggml-base ggml ggml-sycl Threads::Threads)\n"
+    )
+
+    assert _find_bare_ggml_sycl_link_violations(_walk(guarded_snippet)) == [], (
+        "checker false-positives on a correctly DL-guarded link"
+    )
+    violations = _find_bare_ggml_sycl_link_violations(_walk(unguarded_snippet))
+    assert any(target == "test-example" for target, _line in violations), (
+        "mutation witness is broken: an un-guarded bare ggml-sycl link should have been reported"
+    )
+
+    # The else-of-GGML_BACKEND_DL shape (test-sycl-device-uuid-api's own
+    # pattern, bare ggml-sycl linked only in the else() branch of a plain
+    # `if (GGML_BACKEND_DL)`) must also read as guarded.
+    else_guarded_snippet = (
+        "if (GGML_BACKEND_DL)\n"
+        "    target_link_libraries(test-example PRIVATE ggml ${CMAKE_DL_LIBS})\n"
+        "else()\n"
+        "    target_link_libraries(test-example PRIVATE ggml-base ggml-sycl ggml-cpu)\n"
+        "endif()\n"
+    )
+    assert _find_bare_ggml_sycl_link_violations(_walk(else_guarded_snippet)) == []
+
+
+# ---------------------------------------------------------------------------
+# Check B: every test target must be reachable only under BUILD_TESTING.
+# ---------------------------------------------------------------------------
+
+
+def test_build_testing_gate_check_has_a_mutation_witness():
+    """Positive control for check B, run through the identical `_walk` /
+    `_count_unguarded_test_targets` pipeline: a target inside
+    `if (BUILD_TESTING)` must read as guarded, and the same target with the
+    wrap deleted must be reported -- proving the check is not vacuously
+    green (e.g. because the stack-tracker silently treats an unrecognized
+    structure as always-guarded). Synthetic rather than a string-mutation
+    of the real file for the same reflow-fragility reason given in
+    test_bare_ggml_sycl_link_check_has_a_mutation_witness above (this
+    check's real wrap boundary sits next to comment lines that
+    strip_comments removes from CMAKELISTS_CODE entirely, so a literal
+    substring match against the stripped text is not even the right shape
+    of witness)."""
+    guarded_snippet = "if (BUILD_TESTING)\n    add_executable(test-example test-example.cpp)\nendif()\n"
+    unguarded_snippet = "add_executable(test-example test-example.cpp)\n"
+
+    assert _count_unguarded_test_targets(_walk(guarded_snippet)) == [], (
+        "checker false-positives on a target correctly gated by BUILD_TESTING"
+    )
+    unguarded = _count_unguarded_test_targets(_walk(unguarded_snippet))
+    assert any(target == "test-example" for target, _line in unguarded), (
+        "mutation witness is broken: a test target outside BUILD_TESTING should have been reported"
+    )
+
+
+def test_build_testing_gate_is_clean_on_the_real_file():
+    """The real file's own count must be exactly 0 once llama.cpp-9goq's
+    file-spanning `if (BUILD_TESTING)` wrap is in place -- pre-fix (523ca33b0)
+    essentially every one of the ~90 add_executable() calls after line ~472
+    failed this same check (see the module docstring); this is the GREEN
+    side of that RED baseline. Also sanity-checks that the parser is
+    actually walking the whole file (a silently-empty statement list would
+    make the `== []` assertion pass for the wrong reason)."""
+    total_add_executable = sum(1 for kind, *_ in _STATEMENTS if kind == "add_executable")
+    assert total_add_executable > 50, (
+        f"only found {total_add_executable} add_executable() calls -- the parser "
+        "likely stopped walking the file early rather than the file having " "few test targets"
+    )
+    unguarded = _count_unguarded_test_targets(_STATEMENTS)
+    assert unguarded == [], (
+        f"{len(unguarded)} add_executable() test target(s) in "
+        "ggml/src/ggml-sycl/CMakeLists.txt are reachable with LLAMA_BUILD_TESTS=OFF "
+        f"(BUILD_TESTING unset): {unguarded[:10]}"
+        + (" ... (truncated)" if len(unguarded) > 10 else "")
+    )
+
+
+def test_the_three_llama_cpp_9goq_offenders_are_now_dl_guarded():
+    """Named regression check for the exact three targets the ticket
+    reported (test-attn-host-pool, test-attn-host-flash-attn-identity,
+    test-sycl-expert-predictor-guard): each must have NO bare-ggml-sycl-link
+    violation and must sit under a BUILD_TESTING-mentioning guard."""
+    violation_targets = {t for t, _line in _find_bare_ggml_sycl_link_violations(_STATEMENTS)}
+    for target in (
+        "test-attn-host-pool",
+        "test-attn-host-flash-attn-identity",
+        "test-sycl-expert-predictor-guard",
+    ):
+        assert target not in violation_targets, f"{target} still links bare ggml-sycl outside a DL-off guard"
+
+    unguarded_targets = {t for t, _line in _count_unguarded_test_targets(_STATEMENTS)}
+    for target in (
+        "test-attn-host-pool",
+        "test-attn-host-flash-attn-identity",
+        "test-sycl-expert-predictor-guard",
+    ):
+        assert target not in unguarded_targets, f"{target} is not reachable only under BUILD_TESTING"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
