@@ -17801,9 +17801,17 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
 
 // llama.cpp-nphx: thin wrapper so llama-context.cpp (a different translation
 // unit) can read GGML_SYCL_AUTO_UBATCH without reaching into unified-cache.cpp
-// directly. Task 4a wires this; llama_context does not call it until Task 4b.
+// directly. Called from llama_context::sycl_select_auto_ubatch()'s caller
+// gate (llama.cpp-xojq, Task 4b).
 bool ggml_backend_sycl_auto_ubatch_enabled() {
     return ggml_sycl::unified_cache_auto_ubatch_enabled();
+}
+
+// llama.cpp-xojq (nphx Task 4b): see the declaration in ggml-sycl.h. A thin
+// accessor so llama-context.cpp's auto micro-batch ladder can cap a MoE
+// model's candidates without depending on moe-control-plan.hpp directly.
+uint32_t ggml_backend_sycl_moe_gpu_ubatch_max() {
+    return ggml_sycl::MOE_GPU_UBATCH_MAX;
 }
 
 ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_backend_t        backend,
@@ -36505,7 +36513,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_buffer_type_alloc_buffer(ggml_bac
             // llama.cpp-tsfl: WARN, not INFO -- a compute buffer silently
             // landing in host memory looks identical to a healthy run at
             // default verbosity (GGML_LOG_INFO is dropped there); counted
-            // in g_compute_buffer_host_fallbacks for Task 4b's trial.
+            // in g_compute_buffer_host_fallbacks, which
+            // llama_context::sycl_select_auto_ubatch()'s trial (llama.cpp-xojq,
+            // Task 4b) reads after each candidate's sched_reserve() cycle.
             //
             // llama.cpp-tsfl round 4 Q1: NOT counted here -- this only
             // records the intent to force host-pinned; the actual
@@ -106672,13 +106682,22 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     // build's llama-context lookup of either symbol gets nullptr -- same gap
     // their sibling registrations just above exist to close for
     // set_runtime_context_for_model/recheck_runtime_context_flash_attn.
-    // (ggml_backend_sycl_auto_ubatch_enabled has the same gap; that one is
-    // Task 4b's own, tracked on its ticket -- not added here.)
     if (strcmp(name, "ggml_backend_sycl_probe_runtime_context_for_model") == 0) {
         return (void *) ggml_backend_sycl_probe_runtime_context_for_model;
     }
     if (strcmp(name, "ggml_backend_sycl_compute_buffer_host_fallbacks") == 0) {
         return (void *) ggml_backend_sycl_compute_buffer_host_fallbacks;
+    }
+    // llama.cpp-xojq (nphx Task 4b, comment c-1mwi): closes the gap the
+    // comment above used to name for ggml_backend_sycl_auto_ubatch_enabled
+    // (Task 4a defined the symbol but never registered it here, so a
+    // GGML_BACKEND_DL build's llama-context lookup returned nullptr) and
+    // registers this task's own new accessor alongside it.
+    if (strcmp(name, "ggml_backend_sycl_auto_ubatch_enabled") == 0) {
+        return (void *) ggml_backend_sycl_auto_ubatch_enabled;
+    }
+    if (strcmp(name, "ggml_backend_sycl_moe_gpu_ubatch_max") == 0) {
+        return (void *) ggml_backend_sycl_moe_gpu_ubatch_max;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

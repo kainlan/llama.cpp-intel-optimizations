@@ -1261,9 +1261,13 @@ struct cmd_params_instance {
         // llama.cpp-nphx: n_ubatch < 0 is the "-ub auto" sentinel. Leave
         // cparams.n_ubatch at whatever llama_context_default_params() just
         // set it to (512, a few lines up) instead of overwriting it -- that
-        // is bit-for-bit the value the old fixed {512} default used to pass
-        // explicitly, so every existing gate stays byte-identical until Task
-        // 4b's trial reads n_ubatch_auto and actually picks something.
+        // is the pre-trial default llama_context falls back to if the SYCL
+        // auto micro-batch trial (llama.cpp-xojq, Task 4b) cannot accept any
+        // ladder candidate at all; when it can, cparams.n_ubatch_auto below
+        // is what makes the context actually run the trial and resolve to
+        // something larger. The printed n_ubatch column and CSV/JSON field
+        // read the RESOLVED llama_n_ubatch(ctx) after context creation (see
+        // n_ubatch below), never this raw sentinel value.
         // Reusing 0 here would NOT be byte-identical: 0 means "clamp to
         // n_batch" (src/llama-context.cpp), which only coincides with 512
         // when n_batch itself is <= 512.

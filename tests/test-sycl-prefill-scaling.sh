@@ -76,11 +76,18 @@
 #     "not given", exactly like an unset env var (case 26);
 #   - (llama.cpp-e7ls, post-Task-4a) the column is renamed `ub@pp512` and,
 #     under SYCL, is now ALWAYS present with a value RESOLVED per pp row
-#     rather than uniform across a whole invocation: a bare default run
-#     shows 128/512/512/512 across pp128/pp512/pp1024/pp2048, read here
-#     from the pp512 row's own cell -- the column-absent shape (case 18)
-#     and the uniform-value shape (case 19) both remain legitimate and
-#     stay covered; this per-row shape is additional (case 27).
+#     rather than uniform across a whole invocation: since llama.cpp-xojq
+#     (Task 4b) landed the auto micro-batch trial, a bare default run
+#     resolves per row to the largest ladder rung that row's n_ctx
+#     admits, or -- for a row whose n_ctx is below the first rung
+#     (pp128), where the trial exits early without trying a candidate --
+#     to the constructor's own n_batch clamp of the pre-trial default;
+#     e.g. 128/512/1024/2048 across pp128/pp512/pp1024/pp2048 on a case
+#     that clears the whole ladder, read here from the pp512 row's own
+#     cell (512 in that example); the column-absent shape (case 18) and
+#     the uniform-value shape (case 19) both remain legitimate and stay
+#     covered; this per-row shape is additional (case 27, whose fixture
+#     models a table shape and stays as-is).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -245,12 +252,14 @@ mk_fake_bench_ub() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048 $6=ub $7=au
 
 # mk_fake_bench_ub_rows (llama.cpp-e7ls, post-Task-4a): like
 # mk_fake_bench_ub, but each of the four pp rows gets its OWN n_ubatch
-# cell ($6-$9) instead of one uniform value -- the shape Task 4a actually
-# produces under SYCL (llama_n_ubatch(ctx) resolves per pp-row instance;
-# see parse_ub_cell's own comment in the script for the clamp
-# arithmetic), e.g. a bare default run's 128/512/512/512 or an explicit
-# `-ub 1024` run's 128/512/1024/1024. Optional $10 audit path behaves
-# exactly like mk_fake_bench_ub's own $7.
+# cell ($6-$9) instead of one uniform value -- the shape SYCL actually
+# produces (llama_n_ubatch(ctx) resolves per pp-row instance; see
+# parse_ub_cell's own comment in the script for the clamp arithmetic),
+# e.g. an explicit `-ub 1024` run's 128/512/1024/1024 or, since
+# llama.cpp-xojq (Task 4b) landed the auto micro-batch trial, a bare
+# default run's e.g. 128/512/1024/2048 on a case that clears the whole
+# ladder. Optional $10 audit path behaves exactly like mk_fake_bench_ub's
+# own $7.
 mk_fake_bench_ub_rows() { # $1=path $2=pp128 $3=pp512 $4=pp1024 $5=pp2048
                           # $6=ub128 $7=ub512 $8=ub1024 $9=ub2048 $10=audit
     local path="$1" pp128="$2" pp512="$3" pp1024="$4" pp2048="$5"
@@ -1245,17 +1254,22 @@ grep -qF -- "--ubatch requires a non-empty value" <<< "$out" && { echo "FAIL: an
 grep -qE 'Mistral 7B Q4_0[[:space:]]+B70[[:space:]]+-[[:space:]]' <<< "$out" || { echo "FAIL: expected the ub@pp512 column to show '-' (no --ubatch given, so no -ub forwarded, and BENCH2's table has no n_ubatch column) (got: $out)"; fail=1; }
 
 cases=$((cases+1))
-# --- Case 27 (llama.cpp-e7ls, post-Task-4a): the DEFAULT-run shape Task
-# 4a actually produces under SYCL, which cases 18-26 above do not model --
-# those either omit the n_ubatch column entirely (the off-SYCL / pre-4a
-# "-" case, still legitimate and still exercised: case 18, case 21, case
-# 26) or give it one value UNIFORM across all four rows (case 19,
-# mk_fake_bench_ub). Post-4a, the column is unconditionally present under
-# SYCL and NOT uniform: llama_n_ubatch(ctx) resolves per pp-row instance
-# (see parse_ub_cell's own comment in the script for the clamp
-# arithmetic), so a bare default run shows 128/512/512/512 across
-# pp128/pp512/pp1024/pp2048 -- built here with mk_fake_bench_ub_rows, no
-# --ubatch flag given (mirroring case 19's "independent of whether
+# --- Case 27 (llama.cpp-e7ls, post-Task-4a): a DEFAULT-run SHAPE (four
+# per-row-distinct cells, NOT one uniform value), which cases 18-26 above
+# do not model -- those either omit the n_ubatch column entirely (the
+# off-SYCL / pre-4a "-" case, still legitimate and still exercised: case
+# 18, case 21, case 26) or give it one value UNIFORM across all four rows
+# (case 19, mk_fake_bench_ub). Post-4a, the column is unconditionally
+# present under SYCL and NOT uniform: llama_n_ubatch(ctx) resolves per
+# pp-row instance (see parse_ub_cell's own comment in the script for the
+# clamp arithmetic). This fixture's own cells (128/512/512/512) are a
+# STAND-IN for that shape, not a live measurement -- kept as-is
+# post-llama.cpp-xojq (Task 4b) even though a real bare-default run under
+# the auto micro-batch trial now typically resolves e.g. 128/512/1024/2048
+# instead (see scripts/sycl-prefill-scaling.sh's own updated comment);
+# this case only exercises the PARSER's per-row read, which is agnostic to
+# which four numbers it is given. Built here with mk_fake_bench_ub_rows,
+# no --ubatch flag given (mirroring case 19's "independent of whether
 # --ubatch was given"). Asserts (1) the printed report's HEADER carries
 # the renamed `ub@pp512` column, not the old bare `ub`; (2) the printed
 # row's ub@pp512 cell reads 512 -- the pp512 row's OWN cell, per
