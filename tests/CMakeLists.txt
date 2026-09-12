@@ -3247,3 +3247,54 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
+
+# llama.cpp-9goq: source gate over ggml/src/ggml-sycl/CMakeLists.txt itself --
+# (A) every target_link_libraries(...) naming the bare `ggml-sycl` MODULE
+# target must sit under a guard that guarantees GGML_BACKEND_DL is off (the
+# regression: three test targets landed without this and broke
+# .devops/intel.Dockerfile's GGML_BACKEND_DL=ON configure -- CMake hard-errors
+# linking a MODULE_LIBRARY into another target); (B) every add_executable()
+# test target must sit under a BUILD_TESTING-mentioning guard, so
+# LLAMA_BUILD_TESTS=OFF actually stops them from being added, rather than
+# silently ignoring it. Host-only, reads ggml/src/ggml-sycl/CMakeLists.txt as
+# text -- same registration shape as test-sycl-compute-buffer-fallback-source
+# above. Registered here (not in ggml/src/ggml-sycl/CMakeLists.txt) for the
+# same reason test-sycl-fattn-onednn-scale-gate is: that file is only
+# add_subdirectory'd when the SYCL backend is enabled, so a test registered
+# inside it would not exist in a non-SYCL configure and could not catch a
+# regression in the very file it is meant to guard.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-cmake-dl-link-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cmake-dl-link-source.py
+        LABEL "sycl;python;source-assert;cmake"
+        TIMEOUT 120)
+endif()
+
+# llama.cpp-9goq: configure-only smoke test that reproduces
+# .devops/intel.Dockerfile's server-image build stage's exact `cmake -B build`
+# flags (parsed live from the Dockerfile, never a hardcoded copy) against a
+# throwaway build directory -- no build step, so this is safe at any
+# parallelism and needs no GPU. The fork's GitHub Actions are disabled (memory
+# fork-github-actions-disabled-manually), so nothing else exercises the
+# Dockerfile's GGML_BACKEND_DL=ON + GGML_CPU_ALL_VARIANTS=ON +
+# LLAMA_BUILD_TESTS=OFF combination; this is the substitute.
+#
+# The script itself exits 77 (SKIP) when oneAPI is not sourced and icx/icpx
+# are not on PATH, matching SKIP_RETURN_CODE below -- a machine with no SYCL
+# toolchain reports Skipped, not Passed or Failed.
+if (NOT WIN32)
+    llama_test_cmd(
+        bash
+        NAME test-sycl-dockerfile-configure-check
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        ARGS ${PROJECT_SOURCE_DIR}/scripts/sycl-dockerfile-configure-check.sh
+    )
+    # Same LABEL caveat as test-sycl-prefill-scaling above (llama_test_cmd's
+    # LABEL is single-valued) -- set via set_tests_properties instead.
+    set_tests_properties(test-sycl-dockerfile-configure-check PROPERTIES
+        LABELS "sycl;cmake;configure"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300
+    )
+endif()
