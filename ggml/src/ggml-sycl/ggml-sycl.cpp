@@ -17012,10 +17012,31 @@ static bool ggml_sycl_check_nonfa_attn_scratch(int      device,
 // pre-transaction n_ubatch (also probe_mode=true) to roll the physical ring
 // back before returning, the same way the publish path's own later-failure
 // sites already do.
-static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, bool probe_mode = false) {
+//
+// llama.cpp-jumy: this function's own outcome, distinguishing WHY it
+// refused rather than collapsing every non-success into one bit.
+// RELEASE_REFUSED (release_pp_moe_onednn_scratch_ring() refused because the
+// ring is still claimed by an in-flight dispatch) is TRANSIENT -- nothing
+// about the requested size was ever evaluated, so a caller retrying later
+// may succeed once the in-flight dispatch completes. DOES_NOT_FIT covers
+// every other refusal (the sizing overflow, the F13 pre-check, and a failed
+// Step 3 reserve): a deterministic answer about the requested size that
+// will not change on retry. ggml_sycl_run_runtime_context_transaction()
+// (the only caller that inspects this value) maps RELEASE_REFUSED to
+// GGML_SYCL_LIFECYCLE_BUSY and DOES_NOT_FIT to GGML_SYCL_LIFECYCLE_
+// PLAN_REJECTED. The three publish-path later-failure rollbacks discard
+// this value with a (void) cast -- they only care that the ring ends up
+// at the intended n_ubatch, not why an earlier attempt in the opposite
+// direction failed. The probe's own rollback compares it against OK and
+// treats any other value as a failed rollback (ERROR, then a refusal).
+enum class ggml_sycl_ring_replan_result { OK, RELEASE_REFUSED, DOES_NOT_FIT };
+
+static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int      device,
+                                                                        uint32_t n_ubatch,
+                                                                        bool     probe_mode = false) {
     const size_t weight_slot_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(device);
     if (weight_slot_bytes == 0) {
-        return true;  // dense model: no MoE PP ring was ever planned
+        return ggml_sycl_ring_replan_result::OK;  // dense model: no MoE PP ring was ever planned
     }
     if (n_ubatch == 0) {
         // llama.cpp-ibj0 spec round 1 F9: unified_cache_pp_moe_onednn_slots_for_ubatch()
@@ -17029,10 +17050,10 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
             "[SYCL-PLAN] PP MoE oneDNN scratch ring re-plan skipped: n_ubatch=0 is not a valid runtime micro-batch "
             "(device=%d); keeping the existing plan\n",
             device);
-        return true;
+        return ggml_sycl_ring_replan_result::OK;
     }
     if (n_ubatch == ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device)) {
-        return true;  // already planned for this n_ubatch -- idempotent
+        return ggml_sycl_ring_replan_result::OK;  // already planned for this n_ubatch -- idempotent
     }
 
     size_t new_activation_slot_bytes = 0;
@@ -17048,12 +17069,12 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
             "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring slot sizing for n_ubatch=%u "
             "overflowed (device=%d)\n",
             n_ubatch, device);
-        return false;
+        return ggml_sycl_ring_replan_result::DOES_NOT_FIT;
     }
 
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache) {
-        return true;  // no cache yet -- should not happen once weight_slot_bytes != 0 above
+        return ggml_sycl_ring_replan_result::OK;  // no cache yet -- should not happen once weight_slot_bytes != 0 above
     }
 
     const uint32_t ring_depth = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device);
@@ -17079,7 +17100,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
             "[SYCL-PLAN] runtime context update rejected: PP MoE oneDNN scratch ring re-plan for n_ubatch=%u could "
             "not release the existing ring (still claimed by an in-flight dispatch); device=%d\n",
             n_ubatch, device);
-        return false;
+        return ggml_sycl_ring_replan_result::RELEASE_REFUSED;
     }
 
     // Capacity/fits are computed ONCE, right after the release above and
@@ -17109,7 +17130,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
     // means when handled anyway), then log the one-line refusal. Used by
     // both the F13 pre-check below (never attempted Step 3 at all) and the
     // post-Step-3-failure path (Step 3 was attempted and failed).
-    auto refuse_and_restore = [&]() -> bool {
+    auto refuse_and_restore = [&]() -> ggml_sycl_ring_replan_result {
         ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, weight_slot_bytes, old_activation_slot_bytes,
                                                                    old_output_slot_bytes, ring_depth);
         if (!cache->reserve_pp_moe_onednn_scratch(weight_slot_bytes, old_activation_slot_bytes, old_output_slot_bytes,
@@ -17133,7 +17154,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
             "available%s\n",
             n_ubatch, needed_total / mb, weight_slot_bytes / mb, new_activation_slot_bytes / mb,
             new_output_slot_bytes / mb, ring_depth, zone_name, capacity_bytes / mb, fits_clause);
-        return false;
+        return ggml_sycl_ring_replan_result::DOES_NOT_FIT;
     };
 
     // llama.cpp-ibj0 spec round 5 F13: on the arena route, refuse BEFORE
@@ -17182,7 +17203,7 @@ static bool ggml_sycl_replan_pp_moe_onednn_ring(int device, uint32_t n_ubatch, b
                 n_ubatch, new_activation_slot_bytes / mb, new_output_slot_bytes / mb, weight_slot_bytes / mb,
                 ring_depth);
         }
-        return true;
+        return ggml_sycl_ring_replan_result::OK;
     }
 
     return refuse_and_restore();
@@ -17402,17 +17423,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
             // original numbers, this just adds the extra context that
             // demotion was tried and could not help either.
             //
-            // llama.cpp-tsfl round 2 G7: round 1 F2 routed this through
-            // GGML_SYCL_RUNTIME_TXN_REFUSAL, which raised the PUBLISH path
-            // from its base (10c68bba5) GGML_LOG_WARN to GGML_LOG_ERROR --
-            // a publish-path behaviour change the spec forbids (the
-            // publishing entry point's behaviour, log levels included, must
-            // stay unchanged). This line is WARN, byte-identical to base,
-            // when !probe_mode; in probe mode it drops to INFO with a
-            // "probe: " prefix, matching the F2/F3 sibling sites just above
-            // and below this one in the function (both also WARN-on-
-            // publish, INFO-with-"probe:"-prefix-on-probe, not routed
-            // through the ERROR/INFO refusal macro either).
+            // The publishing entry point's own behaviour, including its log
+            // level, must never change here: this line is WARN on publish
+            // (not routed through the GGML_SYCL_RUNTIME_TXN_REFUSAL macro,
+            // which would raise it to ERROR) and drops to INFO with a
+            // "probe: " prefix only in probe mode, matching the sibling
+            // sites just above and below this one in the function (both
+            // also WARN-on-publish, INFO-with-"probe:"-prefix-on-probe, not
+            // routed through the ERROR/INFO refusal macro either).
             if (probe_mode) {
                 GGML_LOG_INFO("[SYCL-PLAN] probe: host-tier demotion also rejected: %s\n",
                               ggml_sycl::moe_mmid_runtime_reason_name(demote_reason));
@@ -17536,7 +17554,19 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // below to roll ITS OWN ring re-plan back before returning.
     const uint32_t pre_replan_pp_moe_ring_n_ubatch =
         ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(ctx->device);
-    if (!ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode)) {
+    // llama.cpp-jumy: RELEASE_REFUSED is a transient failure to release the
+    // ring's OLD physical backing (still claimed by an in-flight dispatch)
+    // -- nothing about the requested size was evaluated, so a caller may
+    // retry. Only that shape maps to BUSY; every other refusal
+    // (DOES_NOT_FIT) is the deterministic "this size does not fit" answer
+    // and stays a PLAN_REJECTED-mapped refusal, unchanged from before.
+    const ggml_sycl_ring_replan_result ring_replan_result =
+        ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, next_kv_info.n_ubatch, probe_mode);
+    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {
+        // refusal already logged (ERROR normally, INFO in probe mode)
+        return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");
+    }
+    if (ring_replan_result != ggml_sycl_ring_replan_result::OK) {
         // refusal already logged (ERROR normally, INFO in probe mode) with
         // the largest fitting -ub
         return refuse("PP MoE oneDNN scratch ring does not fit");
@@ -17567,13 +17597,16 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // is left at the CANDIDATE size PERMANENTLY, with only an INFO-level
         // (probe_mode) diagnostic from the rollback call itself. That is
         // exactly the kind of durable, unreported side effect this whole
-        // probe exists to prevent, so it gets its own unconditional WARN
-        // (regardless of probe_mode -- this is an anomaly, not a candidate
-        // refusal) and turns the probe's own outcome into a refusal too.
+        // probe exists to prevent, so it gets its own unconditional
+        // GGML_LOG_ERROR (regardless of probe_mode -- this is an anomaly,
+        // not a candidate refusal, matching GGML_SYCL_RUNTIME_TXN_REFUSAL's
+        // own policy that an anomaly stays ERROR "probe or not", llama.cpp-jumy)
+        // and turns the probe's own outcome into a refusal too.
         const bool rollback_ok =
-            ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch, /*probe_mode=*/true);
+            ggml_sycl_replan_pp_moe_onednn_ring(ctx->device, pre_replan_pp_moe_ring_n_ubatch, /*probe_mode=*/true) ==
+            ggml_sycl_ring_replan_result::OK;
         if (!rollback_ok) {
-            GGML_LOG_WARN(
+            GGML_LOG_ERROR(
                 "[SYCL-PLAN] probe rollback of the PP MoE oneDNN scratch ring to n_ubatch=%u failed; ring left "
                 "at n_ubatch=%u\n",
                 pre_replan_pp_moe_ring_n_ubatch, next_kv_info.n_ubatch);
@@ -17687,6 +17720,11 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     return ggml_sycl_txn_result::ACCEPTED;
 }
 
+// llama.cpp-jumy: undef right after this macro's last use (above, in this
+// function) so it cannot leak into the rest of this ~100k-line translation
+// unit.
+#undef GGML_SYCL_RUNTIME_TXN_REFUSAL
+
 void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ctx,
                                            uint32_t       n_ubatch,
@@ -17774,6 +17812,13 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
     // branch) still runs for the probe, exactly as it already does for a
     // direct (non-for_model) publisher call -- this guard adds no lease
     // machinery, only the identity comparison.
+    //
+    // llama.cpp-jumy: this destructor clears g_runtime_expected_model_set
+    // UNCONDITIONALLY and does not touch g_runtime_external_lease, so this
+    // guard must never be nested inside the publisher's own armed window
+    // (ggml_backend_sycl_set_runtime_context_for_model()'s
+    // expected_model_guard, below) on the same thread -- both are
+    // thread_local, and no such nesting exists today.
     struct probe_expected_model_guard {
         ~probe_expected_model_guard() { g_runtime_expected_model_set = false; }
     } expected_model_guard;

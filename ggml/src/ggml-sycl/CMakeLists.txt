@@ -858,6 +858,29 @@ if (GGML_SYCL_DEVICE_ARCH)
 endif()
 
 # =============================================================================
+# llama.cpp-9goq: everything from this point to the end of the file is test
+# scaffolding -- no further statement here configures the ordinary ggml-sycl
+# target itself (verified: `target_(compile_definitions|link_libraries|
+# include_directories|compile_options|sources)(ggml-sycl ...)` has no match
+# past this line). Gate all of it behind BUILD_TESTING, the same variable the
+# two earlier blocks at the top of this file (~:119, ~:130) already use, so
+# that LLAMA_BUILD_TESTS=OFF (which never calls include(CTest), leaving
+# BUILD_TESTING unset/false -- see root CMakeLists.txt) stops every one of
+# these ~120 add_executable() test targets and their add_test() registrations
+# from being added at all, instead of silently ignoring LLAMA_BUILD_TESTS as
+# they did before this fix.
+#
+# Deliberately NOT re-indented: reformatting ~4800 lines by one level would
+# touch every line in the region other implementers are concurrently adding
+# test blocks to, turning a two-line wrap into a whole-file diff and a
+# guaranteed merge collision (same reason CLAUDE.md forbids a whole-file
+# clang-format -i). CMake does not care about indentation; only the two
+# boundary lines (this one and the matching endif() at EOF) change semantics.
+# Re-indent tracked as llama.cpp-44jq (blocked on the concurrent branches
+# landing).
+if (BUILD_TESTING)
+
+# =============================================================================
 # XMX ESIMD Tests
 # =============================================================================
 option(GGML_SYCL_BUILD_XMX_TESTS "Build XMX ESIMD unit tests" OFF)
@@ -1677,34 +1700,56 @@ set_tests_properties(sycl-attn-host-dispatch PROPERTIES
 # ask the CPU selector to find a CPU device on a backend that doesn't expose
 # one and break the test outright. LD_LIBRARY_PATH is still required -- the
 # binary links the SYCL runtime because of the headers.
-add_executable(test-attn-host-pool
-    tests/test-attn-host-pool.cpp
-    attn-host-pool.cpp
-)
-target_include_directories(test-attn-host-pool PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_link_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_compile_definitions(test-attn-host-pool PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-attn-host-pool PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-attn-host-pool PRIVATE IntelSYCL::SYCL_CXX)
+# llama.cpp-9goq: `NOT GGML_BACKEND_DL` is load-bearing, same reason as the
+# XMX-test guard above (llama.cpp-yg0d) -- under -DGGML_BACKEND_DL=ON
+# ggml-sycl is a MODULE library and CMake hard-errors on
+# target_link_libraries(<test> ... ggml-sycl): "Target 'ggml-sycl' of type
+# MODULE_LIBRARY may not be linked into another target". This test needs the
+# real compiled attn-host-pool.cpp/unified-cache.cpp object code (it calls
+# ggml_sycl_is_shutting_down()), so unlike a header-only fixture it cannot
+# dodge the MODULE restriction by simply omitting the link -- it must either
+# link the ordinary module (DL=OFF only) or be disabled under DL. A disabled
+# placeholder ctest entry is registered in the `else()` branch rather than
+# leaving the name unregistered, because a guard that removes the add_test()
+# call entirely makes `ctest -R <name>` report success by matching zero
+# tests (llama.cpp-5exz, documented above for the XMX family).
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-attn-host-pool
+        tests/test-attn-host-pool.cpp
+        attn-host-pool.cpp
+    )
+    target_include_directories(test-attn-host-pool PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-attn-host-pool PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_compile_definitions(test-attn-host-pool PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-attn-host-pool PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-attn-host-pool PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-attn-host-pool PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-attn-host-pool COMMAND test-attn-host-pool)
+    set_tests_properties(sycl-attn-host-pool PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;attn;tkv13;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-attn-host-pool
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for ggml_sycl_is_shutting_down())")
+    set_tests_properties(sycl-attn-host-pool PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
-set_target_properties(test-attn-host-pool PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-add_test(NAME sycl-attn-host-pool COMMAND test-attn-host-pool)
-set_tests_properties(sycl-attn-host-pool PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    LABELS "sycl;attn;tkv13;hostonly"
-    TIMEOUT 30
-)
 
 # TKV-13 (B2) step 4: identity-case correctness harness
 # (docs/plans/2026-08-27-tkv13-b2-addendum.md §4.3, §7 step 4). Proves the
@@ -1720,34 +1765,49 @@ set_tests_properties(sycl-attn-host-pool PROPERTIES
 # ggml_graph_plan-sized params->wdata/threadpool a bare caller cannot safely
 # fabricate). Same shape as test-attn-host-pool above -- needs -fsycl only
 # for attn-host-pool.hpp's sycl::queue type, cpu_selector_v, no device.
-add_executable(test-attn-host-flash-attn-identity
-    tests/test-attn-host-flash-attn-identity.cpp
-    attn-host-pool.cpp
-)
-target_include_directories(test-attn-host-flash-attn-identity PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_link_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_compile_definitions(test-attn-host-flash-attn-identity PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-attn-host-flash-attn-identity PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-attn-host-flash-attn-identity PRIVATE IntelSYCL::SYCL_CXX)
+# llama.cpp-9goq: same `NOT GGML_BACKEND_DL` guard as test-attn-host-pool
+# above, for the same reason -- this target also links attn-host-pool.cpp and
+# the ordinary ggml-sycl module for its real object code, which CMake refuses
+# to link into another target once GGML_BACKEND_DL makes ggml-sycl a MODULE
+# library. See the comment on test-attn-host-pool for the disabled-placeholder
+# rationale (llama.cpp-5exz).
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-attn-host-flash-attn-identity
+        tests/test-attn-host-flash-attn-identity.cpp
+        attn-host-pool.cpp
+    )
+    target_include_directories(test-attn-host-flash-attn-identity PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-attn-host-flash-attn-identity PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_compile_definitions(test-attn-host-flash-attn-identity PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-attn-host-flash-attn-identity PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-attn-host-flash-attn-identity PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-attn-host-flash-attn-identity PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-attn-host-flash-attn-identity COMMAND test-attn-host-flash-attn-identity)
+    set_tests_properties(sycl-attn-host-flash-attn-identity PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;attn;tkv13;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-attn-host-flash-attn-identity
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for ggml_sycl_is_shutting_down())")
+    set_tests_properties(sycl-attn-host-flash-attn-identity PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;attn;tkv13;hostonly;not-built")
 endif()
-set_target_properties(test-attn-host-flash-attn-identity PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-add_test(NAME sycl-attn-host-flash-attn-identity COMMAND test-attn-host-flash-attn-identity)
-set_tests_properties(sycl-attn-host-flash-attn-identity PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    LABELS "sycl;attn;tkv13;hostonly"
-    TIMEOUT 30
-)
 
 # TKV-13 (B2) step 5.1: sustained host DDR5 read bandwidth roofline
 # prerequisite (docs/plans/2026-08-27-tkv13-b2-addendum.md §5.1). Pure host
@@ -5647,30 +5707,50 @@ endif()
 # because expert-prefetch.hpp includes sycl/sycl.hpp for other class members.
 # No ONEAPI_DEVICE_SELECTOR pin and no SKIP_RETURN_CODE: unlike a
 # device-touching test there is no "no device" case to skip.
-add_executable(test-sycl-expert-predictor-guard
-    tests/test-sycl-expert-predictor-guard.cpp
-)
-target_include_directories(test-sycl-expert-predictor-guard PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
-)
-target_compile_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_link_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
-target_compile_definitions(test-sycl-expert-predictor-guard PRIVATE
-    GGML_SYCL_WARP_SIZE=32
-    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
-)
-target_link_libraries(test-sycl-expert-predictor-guard PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-sycl-expert-predictor-guard PRIVATE IntelSYCL::SYCL_CXX)
+# llama.cpp-9goq: same `NOT GGML_BACKEND_DL` guard as test-attn-host-pool
+# above, for the same reason. This target exercises the real
+# ggml_sycl::ExpertPredictor from expert-prefetch.cpp -- whose destructor
+# calls ggml_sycl_is_shutting_down() (unified-cache.cpp) -- so it needs the
+# ordinary ggml-sycl module's compiled object code, which CMake refuses to
+# link into another target once GGML_BACKEND_DL makes ggml-sycl a MODULE
+# library. See the comment on test-attn-host-pool for the disabled-placeholder
+# rationale (llama.cpp-5exz).
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-expert-predictor-guard
+        tests/test-sycl-expert-predictor-guard.cpp
+    )
+    target_include_directories(test-sycl-expert-predictor-guard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-sycl-expert-predictor-guard PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_compile_definitions(test-sycl-expert-predictor-guard PRIVATE
+        GGML_SYCL_WARP_SIZE=32
+        GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    )
+    target_link_libraries(test-sycl-expert-predictor-guard PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-expert-predictor-guard PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-sycl-expert-predictor-guard PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-expert-predictor-guard COMMAND test-sycl-expert-predictor-guard)
+    set_tests_properties(sycl-expert-predictor-guard PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;expert-predict;41bs;hostonly"
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-expert-predictor-guard
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for ggml_sycl_is_shutting_down())")
+    set_tests_properties(sycl-expert-predictor-guard PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
-set_target_properties(test-sycl-expert-predictor-guard PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-add_test(NAME sycl-expert-predictor-guard COMMAND test-sycl-expert-predictor-guard)
-set_tests_properties(sycl-expert-predictor-guard PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
-    LABELS "sycl;expert-predict;41bs;hostonly"
-    TIMEOUT 30
-)
+
+endif() # BUILD_TESTING (llama.cpp-9goq, opened right after the production
+        # GGML_SYCL_DEVICE_ARCH block near the top of this file)

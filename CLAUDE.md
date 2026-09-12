@@ -72,6 +72,12 @@ source /opt/intel/oneapi/setvars.sh --force
 # 1. BEST: run only what your change actually gates. Almost always sufficient.
 ctest --test-dir build -R <name-or-regex> --output-on-failure
 
+# Since llama.cpp-9goq the SYCL test targets in
+# ggml/src/ggml-sycl/CMakeLists.txt follow BUILD_TESTING (LLAMA_BUILD_TESTS):
+# a -DLLAMA_BUILD_TESTS=OFF build (the Dockerfile's) configures none of them,
+# and three host-only tests that link ggml-sycl directly are also disabled
+# placeholders under GGML_BACKEND_DL=ON.
+
 # 2. Full suite. `-j 1` is NOT a typo and NOT negotiable -- see below.
 #    Check `uptime` first; never on a loaded machine.
 ctest --test-dir build --output-on-failure -j 1 \

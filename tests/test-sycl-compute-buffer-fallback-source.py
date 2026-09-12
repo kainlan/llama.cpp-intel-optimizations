@@ -124,6 +124,9 @@ _ALLOC_BUFFER_END = "} catch (const sycl::exception & exc) {"
 # ggml_sycl_txn_result enum.
 _TRANSACTION_START = "static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction("
 _SET_RUNTIME_CONTEXT_START = "void ggml_backend_sycl_set_runtime_context("
+# llama.cpp-jumy: return type changed from bool to the internal
+# ggml_sycl_ring_replan_result enum (OK / RELEASE_REFUSED / DOES_NOT_FIT).
+_REPLAN_START = "static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring("
 _PROBE_START = "ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model("
 _AUTO_UBATCH_ENABLED_START = "bool ggml_backend_sycl_auto_ubatch_enabled("
 
@@ -134,9 +137,9 @@ def _alloc_buffer_body() -> str:
 
 def _transaction_body() -> str:
     # Bounded by the NEXT function's start (the thin wrapper this shared body
-    # was extracted from) -- everything from "static bool
-    # ggml_sycl_run_runtime_context_transaction(" up to (not including)
-    # "void ggml_backend_sycl_set_runtime_context(".
+    # was extracted from) -- everything from _TRANSACTION_START ("static
+    # ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(") up to
+    # (not including) "void ggml_backend_sycl_set_runtime_context(".
     return _bounded_body(GGML_SYCL_CPP_CODE, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
 
 
@@ -301,13 +304,14 @@ def test_both_fallback_sites_increment_the_counter():
 
 
 def test_retry_increment_after_warn_has_a_mutation_witness():
-    """Mutation witness for llama.cpp-tsfl round 2 G1: proves the fixed
-    ordering check above (increment AFTER its own WARN, inside the retry's
-    success branch, BEFORE `goto alloc_succeeded`) would actually catch the
-    increment moving back to BEFORE the WARN -- exactly the shape round 1
-    F10 fixed, and exactly what the PREVIOUS (round 1) version of this file's
-    check required (`idx < warn2_idx`) rather than forbade, passing only
-    because it was satisfied by the OTHER (oversize-request) increment."""
+    """Mutation witness for the ordering check above: proves it would
+    actually catch the failed-alloc-retry counter increment moving back to
+    BEFORE its own WARN, inside the retry's success branch, rather than
+    only ever passing on the current, correct source. The check must
+    FORBID `idx < warn2_idx`, not merely fail to require it -- a check that
+    only required the ordering (rather than forbidding its opposite) would
+    still pass on this mutant, satisfied by the OTHER (oversize-request)
+    increment, which legitimately precedes both WARN calls."""
     raw = GGML_SYCL_CPP
     original_block = (
         '            GGML_LOG_WARN("SYCL: Alloc failed (%zu MB), retrying with host-pinned fallback\\n", '
@@ -778,6 +782,7 @@ def test_probe_rolls_back_the_ring_before_returning():
     probe_branch = _find_probe_exit_branch(body_norm)
     assert probe_branch is not None
     cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert cas_idx != -1, "could not find the CAS call (ggml_sycl::lifecycle_replace_placement_plan)"
     probe_block = body_norm[probe_branch.start():cas_idx]
 
     # Comment-stripped text drops any /*probe_mode=*/-style inline comment --
@@ -794,6 +799,107 @@ def test_probe_rolls_back_the_ring_before_returning():
         "the ring rollback must happen BEFORE out->accepted is filled and the branch returns -- not after, "
         "which would leave a window where the ring is still in its (unrolled-back) probed state"
     )
+
+
+def test_ring_release_refused_is_classified_busy():
+    """llama.cpp-jumy: ggml_sycl_replan_pp_moe_onednn_ring() reports
+    RELEASE_REFUSED when release_pp_moe_onednn_scratch_ring() refuses
+    because the ring is still claimed by an in-flight dispatch -- a
+    TRANSIENT condition unrelated to whether the requested size fits. The
+    shared transaction body must classify only that shape as BUSY (a caller
+    may retry); every other non-OK value (the sizing overflow, the F13
+    pre-check, or a failed Step 3 reserve) must stay the deterministic
+    REFUSED "does not fit" answer, unchanged from before this task."""
+    body_norm = _normalize_ws(_transaction_body())
+    busy_match = re.search(
+        r"if\s*\(\s*ring_replan_result\s*==\s*ggml_sycl_ring_replan_result::RELEASE_REFUSED\s*\)\s*\{\s*"
+        r'return\s+busy\(\s*"busy \(PP MoE oneDNN scratch ring claimed by an in-flight dispatch\)"\s*\)',
+        body_norm,
+    )
+    assert busy_match is not None, (
+        "a RELEASE_REFUSED ring re-plan result must return busy(...) with a distinct, transient-sounding reason"
+    )
+    refused_match = re.search(
+        r"if\s*\(\s*ring_replan_result\s*!=\s*ggml_sycl_ring_replan_result::OK\s*\)\s*\{\s*"
+        r'return\s+refuse\(\s*"PP MoE oneDNN scratch ring does not fit"\s*\)',
+        body_norm,
+    )
+    assert refused_match is not None, (
+        "every other non-OK ring re-plan result must still refuse() -- the deterministic 'does not fit' answer"
+    )
+    assert busy_match.start() < refused_match.start(), (
+        "the RELEASE_REFUSED (BUSY) check must run BEFORE the general non-OK (REFUSED) check, or "
+        "RELEASE_REFUSED would be caught by the broader != OK check first and misclassified as REFUSED"
+    )
+
+
+def test_ring_release_refused_busy_classification_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually catch
+    the RELEASE_REFUSED branch being deleted -- collapsing back to the
+    pre-task shape where every ring re-plan failure, including a transient
+    release refusal, was classified REFUSED."""
+    raw = GGML_SYCL_CPP
+    busy_branch = (
+        "    if (ring_replan_result == ggml_sycl_ring_replan_result::RELEASE_REFUSED) {\n"
+        "        // refusal already logged (ERROR normally, INFO in probe mode)\n"
+        '        return busy("busy (PP MoE oneDNN scratch ring claimed by an in-flight dispatch)");\n'
+        "    }\n"
+    )
+    assert busy_branch in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(busy_branch, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
+    assert not re.search(
+        r"ring_replan_result\s*==\s*ggml_sycl_ring_replan_result::RELEASE_REFUSED", mutated_body_norm
+    ), "mutation witness is broken: deleting the branch left a reference to it behind"
+
+
+def test_probe_rollback_failure_logs_error_not_warn():
+    """llama.cpp-jumy: the probe's OWN rollback failure (its attempt to roll
+    the PP MoE oneDNN scratch ring back to the pre-transaction n_ubatch
+    itself fails) is an anomaly, not a candidate refusal --
+    GGML_SYCL_RUNTIME_TXN_REFUSAL's own policy comment says an anomaly stays
+    GGML_LOG_ERROR unconditionally, probe or not (matching the sibling
+    "restore FAILED" anomaly a few lines above it in the same function).
+    This log must be ERROR, not WARN."""
+    body_norm = _normalize_ws(_transaction_body())
+    probe_branch = _find_probe_exit_branch(body_norm)
+    assert probe_branch is not None
+    cas_idx = body_norm.find("lifecycle_replace_placement_plan(current, immutable)")
+    assert cas_idx != -1, "could not find the CAS call (ggml_sycl::lifecycle_replace_placement_plan)"
+    probe_block = body_norm[probe_branch.start():cas_idx]
+
+    assert "probe rollback of the PP MoE oneDNN scratch ring" in probe_block, (
+        "could not find the probe's own rollback-failure message"
+    )
+    assert re.search(
+        r'GGML_LOG_ERROR\(\s*"\[SYCL-PLAN\] probe rollback of the PP MoE oneDNN scratch ring',
+        probe_block,
+    ), "the probe's own rollback failure must log at GGML_LOG_ERROR, not GGML_LOG_WARN -- it is an anomaly"
+    assert not re.search(
+        r'GGML_LOG_WARN\(\s*"\[SYCL-PLAN\] probe rollback of the PP MoE oneDNN scratch ring',
+        probe_block,
+    ), "the probe's own rollback failure must not log at GGML_LOG_WARN"
+
+
+def test_probe_rollback_failure_log_level_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually catch
+    the rollback-failure log reverting to GGML_LOG_WARN."""
+    raw = GGML_SYCL_CPP
+    error_call = (
+        "            GGML_LOG_ERROR(\n"
+        '                "[SYCL-PLAN] probe rollback of the PP MoE oneDNN scratch ring to n_ubatch=%u failed; ring left "\n'
+    )
+    assert error_call in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(error_call, error_call.replace("GGML_LOG_ERROR", "GGML_LOG_WARN"), 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRANSACTION_START, _SET_RUNTIME_CONTEXT_START)
+    assert re.search(
+        r'GGML_LOG_WARN\(\s*"\[SYCL-PLAN\] probe rollback of the PP MoE oneDNN scratch ring',
+        mutated_body_norm,
+    ), "mutation witness is broken: could not find the mutated (WARN) log line"
 
 
 def test_refusal_macro_downgrades_to_info_in_probe_mode():
@@ -846,15 +952,13 @@ def test_refusal_macro_used_at_the_kv_budget_and_ring_and_nonfa_sites():
         "the shared transaction body must use the refusal macro for its own KV/MMID budget refusals"
     )
 
-    ring_fn_body_norm = _normalize_ws(_bounded_body(GGML_SYCL_CPP_CODE, "static bool ggml_sycl_replan_pp_moe_onednn_ring(",
-                                                     _TRANSACTION_START))
+    ring_fn_body_norm = _normalize_ws(_bounded_body(GGML_SYCL_CPP_CODE, _REPLAN_START, _TRANSACTION_START))
     assert macro_call_re.search(ring_fn_body_norm), (
         "ggml_sycl_replan_pp_moe_onednn_ring() must use the refusal macro for its own candidate refusals"
     )
 
     nonfa_fn_body_norm = _normalize_ws(
-        _bounded_body(GGML_SYCL_CPP_CODE, "static bool ggml_sycl_check_nonfa_attn_scratch(",
-                     "static bool ggml_sycl_replan_pp_moe_onednn_ring(")
+        _bounded_body(GGML_SYCL_CPP_CODE, "static bool ggml_sycl_check_nonfa_attn_scratch(", _REPLAN_START)
     )
     assert macro_call_re.search(nonfa_fn_body_norm), (
         "ggml_sycl_check_nonfa_attn_scratch() must use the refusal macro for its own candidate refusals"
@@ -887,9 +991,7 @@ def test_refusal_macro_has_a_mutation_witness():
     assert mutated_raw != raw
 
     macro_call_re = re.compile(r"GGML_SYCL_RUNTIME_TXN_REFUSAL\(\s*probe_mode\s*,")
-    original_ring_fn_body_norm = _body_of(
-        raw, "static bool ggml_sycl_replan_pp_moe_onednn_ring(", _TRANSACTION_START
-    )
+    original_ring_fn_body_norm = _body_of(raw, _REPLAN_START, _TRANSACTION_START)
     original_count = len(macro_call_re.findall(original_ring_fn_body_norm))
     assert original_count == 3, (
         "expected exactly three macro uses in the unmutated ring function (the slot-sizing-overflow refusal, "
@@ -897,9 +999,7 @@ def test_refusal_macro_has_a_mutation_witness():
         "update this witness to match the real source"
     )
 
-    mutated_ring_fn_body_norm = _body_of(
-        mutated_raw, "static bool ggml_sycl_replan_pp_moe_onednn_ring(", _TRANSACTION_START
-    )
+    mutated_ring_fn_body_norm = _body_of(mutated_raw, _REPLAN_START, _TRANSACTION_START)
     matches = macro_call_re.findall(mutated_ring_fn_body_norm)
     assert len(matches) == original_count - 1, (
         "mutation witness is broken: reverting one call site to a bare GGML_LOG_ERROR must drop the count by "

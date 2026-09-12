@@ -401,14 +401,20 @@ GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backe
 // that retry itself succeeds -- in both cases, an attempt that also fails
 // falls through to the allocation-failure ERROR and is not a "fallback".
 // NOT counted: the !vram_arena_enabled() < 512 MB headroom branch (dead in
-// this fork's default arena-on configuration), or the silent
+// this fork's default arena-on configuration), the silent
 // must_device=false routing that lets the unified cache choose VRAM or
-// host-pinned on its own -- neither logs nor increments this counter, so a
-// zero reading does not prove every compute buffer actually stayed on the
-// device. This is a DELTA, not a lifetime total: the runtime-context
-// transaction resets it to 0 on its own successful completion (after the
-// plan has been published), so a caller reading it sees "fallbacks since
-// the last successful runtime-context transaction". Returns 0 for an
+// host-pinned on its own, or the is_kv_buft branch that routes a KV
+// allocation to effective_mem_type=GGML_SYCL_MEM_HOST when it does not fit
+// zone_available(KV) (ggml-sycl.cpp) -- none of the three logs or
+// increments this counter, so a zero reading does not prove every compute
+// buffer or KV allocation actually stayed on the device. This is a DELTA,
+// not a lifetime total, and the reset is PER-DEVICE: the runtime-context
+// transaction resets only ctx->device's own counter to 0 on its own
+// successful completion (after the plan has been published), so on a
+// multi-device plan every OTHER device's counter is left as a lifetime
+// total until that device's own runtime-context transaction succeeds --
+// a caller reading it sees "fallbacks since the last successful
+// runtime-context transaction FOR THIS DEVICE". Returns 0 for an
 // out-of-range device.
 GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int device);
 
@@ -1186,11 +1192,25 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_c
 // guarantee holds whenever `accepted` is true, OR whenever `reason` names a
 // CANDIDATE refusal (the fit-or-not decision itself, unmet by this n_ctx/
 // n_ubatch) -- both cases roll their own transient PP MoE oneDNN scratch
-// ring re-plan back before returning. The one exception is
-// reason=="probe rollback failed: ring left at candidate size": that
-// rollback attempt itself failed, and the ring is left changed. That
-// outcome also logs an unconditional GGML_LOG_WARN naming both the
-// candidate and the pre-transaction n_ubatch it could not be restored to.
+// ring re-plan back before returning. There are two exceptions; in each
+// the ANOMALY line is logged at GGML_LOG_ERROR unconditionally (probe or
+// not), even where the refusal the probe then returns still follows the
+// probe's INFO policy:
+//   1. reason=="probe rollback failed: ring left at candidate size": the
+//      probe's OWN rollback attempt (rolling the ring back to the
+//      pre-transaction n_ubatch) itself failed, and the ring is left at the
+//      candidate size. Names both the candidate and the pre-transaction
+//      n_ubatch it could not be restored to (llama.cpp-jumy: raised from
+//      GGML_LOG_WARN to GGML_LOG_ERROR to match this policy).
+//   2. A candidate refusal whose own internal restore also fails:
+//      ggml_sycl_replan_pp_moe_onednn_ring()'s refuse_and_restore() closure
+//      re-reserves the OLD ring on any refusal, and that re-reserve can
+//      itself fail ("... restore FAILED ...", ggml-sycl.cpp) -- handled
+//      (that line logged at GGML_LOG_ERROR), not asserted, but the probe
+//      then returns the plain candidate refusal (logged at INFO in probe
+//      mode like any candidate refusal) with the ring left unbacked by
+//      any physical allocation rather than restored to its pre-candidate
+//      state.
 struct ggml_sycl_runtime_context_probe {
     bool         accepted;
     bool         would_demote_kv;
@@ -1202,6 +1222,12 @@ struct ggml_sycl_runtime_context_probe {
 // zero-initialized on entry. Candidate refusals log at GGML_LOG_INFO, not
 // the publishing path's GGML_LOG_ERROR, because a probe exists to be tried
 // repeatedly and rejected quietly (Task 4b's ascending micro-batch trial).
+// Two return values are argument-validation failures rather than a decision
+// about the candidate itself: GGML_SYCL_LIFECYCLE_NULL_OUTPUT when `out` is
+// NULL, or when `backend`/`backend->context` is NULL or n_ctx==0; and
+// GGML_SYCL_LIFECYCLE_FOREIGN_BACKEND when `backend` is not a SYCL backend
+// (ggml_backend_is_sycl() false, no device, or registered against a
+// different backend registry).
 // Refuses with GGML_SYCL_LIFECYCLE_STALE_IDENTITY when `model` does not
 // identify the CURRENTLY PUBLISHED plan AT THIS FUNCTION'S OWN ENTRY CHECK
 // -- unlike ggml_backend_sycl_set_runtime_context_for_model(), this probe
@@ -1213,11 +1239,15 @@ struct ggml_sycl_runtime_context_probe {
 // retry can resolve, unlike the entry check's own refusal.
 // GGML_SYCL_LIFECYCLE_BUSY (round 1 F6; round 4 Q3) means the caller MAY
 // retry: a live-update lease could not be acquired, the plan changed while
-// acquiring the transaction lock, the module mutation guard refused, or the
+// acquiring the transaction lock, the module mutation guard refused, the
 // published plan's identity changed between this probe's entry check and
 // the transaction's in-lock re-check (the STALE_IDENTITY-shaped race just
-// above). It is distinct from GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which
-// callers must NOT retry (see that enum value's own comment).
+// above), or the PP MoE oneDNN scratch ring's release refused because it is
+// still claimed by an in-flight dispatch (llama.cpp-jumy: transient, unlike
+// a ring re-plan that refuses because the requested size does not fit,
+// which stays PLAN_REJECTED below). It is distinct from
+// GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
+// enum value's own comment).
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
     ggml_backend_t                           backend,
     struct ggml_sycl_model_token             model,
