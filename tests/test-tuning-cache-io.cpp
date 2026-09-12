@@ -1010,8 +1010,8 @@ TEST(ubatch_cache_oversized_digit_no_ub) {
 
 // Test: parse_u64() must accept every value up to and including UINT64_MAX,
 // not just values up to a fixed digit count. A fixed 19-digit cap (the
-// original Q8 fix) rejected legitimate 20-digit FNV-1a model_hash values --
-// found on live GPU hardware (llama.cpp-7n6n round 2): a Mistral run's own
+// first overflow fix) rejected legitimate 20-digit FNV-1a model_hash values --
+// found on live GPU hardware (llama.cpp-7n6n): a Mistral run's own
 // stored model_hash was 12629460749384247297, a 20-digit value the 19-digit
 // cap silently truncated on load, so the parsed key never matched the
 // entry that had just been written and every subsequent start missed.
