@@ -1342,16 +1342,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 // settle-down transaction cannot introduce a new KV demotion (its demand is
 // never larger than one already accepted).
 //
-// Exactly one GGML_LOG_WARN reports the outcome, with one of these stop
-// reasons: "ladder exhausted" (no candidate lost -- either the cap stopped
-// the ladder or all four rungs were accepted), "MoE GPU routing ceiling"
-// (the MoE cap won), "transaction refused", "transaction busy"
+// Two GGML_LOG_WARN lines report the outcome (llama.cpp-7n6n, Task 5, wires
+// the persisted auto n_ubatch cache into this trial). The first, `[SYCL-PLAN]
+// tuning cache %s: n_ubatch=%u (%s)`, reports the CACHE lookup's own outcome
+// (hit/miss/disabled) before the ladder decision below it. The second (the
+// pre-existing one) is `[SYCL-PLAN] auto n_ubatch=...`, with one of these
+// eight stop reasons: "ladder exhausted" (no candidate lost -- either the
+// cap stopped the ladder or all four rungs were accepted), "MoE GPU routing
+// ceiling" (the MoE cap won), "transaction refused", "transaction busy"
 // (BUSY persisted past the backoff), "not the published model"
 // (GGML_SYCL_LIFECYCLE_STALE_IDENTITY -- a second model published after
-// this one loaded), "KV would be demoted", or "compute buffer fell back to
-// host". Candidate refusals inside the probe itself log at GGML_LOG_INFO,
-// not ERROR (Task 2), so a multi-candidate trial does not print one scary
-// refusal per losing candidate.
+// this one loaded), "KV would be demoted", "compute buffer fell back to
+// host", or "cached" (a persisted value passed the same per-candidate
+// validation a ladder rung uses, so the ladder never ran). Candidate
+// refusals inside the probe itself log at GGML_LOG_INFO, not ERROR (Task
+// 2), so a multi-candidate trial does not print one scary refusal per
+// losing candidate.
 void llama_context::sycl_select_auto_ubatch() {
 #if defined(GGML_USE_SYCL) || defined(GGML_BACKEND_DL)
     struct sycl_probe_backend {
@@ -1448,133 +1454,25 @@ void llama_context::sycl_select_auto_ubatch() {
     bool           published_any           = false;
     std::string    tried;
 
-    // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch cache's
-    // four entry points, mirroring probe_fn/fallback_fn/moe_cap_fn's own
-    // direct-vs-DL resolution just above.
-#    ifdef GGML_USE_SYCL
-    auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
-    auto cache_path_fn    = &ggml_backend_sycl_ubatch_cache_path;
-    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup;
-    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store;
-#    else
-    auto cache_enabled_fn = llama_context_sycl_ubatch_cache_enabled_proc(first_dev);
-    auto cache_path_fn    = llama_context_sycl_ubatch_cache_path_proc(first_dev);
-    auto cache_lookup_fn  = llama_context_sycl_ubatch_cache_lookup_proc(first_dev);
-    auto cache_store_fn   = llama_context_sycl_ubatch_cache_store_proc(first_dev);
-#    endif
-    const bool have_cache_accessors = cache_enabled_fn && cache_path_fn && cache_lookup_fn && cache_store_fn;
-
-    ggml_sycl_ubatch_cache_key cache_key{};
-    cache_key.device     = sycl_backends.front().dev_index;
-    cache_key.model_name = model.name.c_str();
-    cache_key.model_size = model.size();
-    cache_key.model_hash = llama_context_sycl_model_tensor_hash(model);
-    cache_key.n_ctx      = cparams.n_ctx;
-    cache_key.n_batch    = cparams.n_batch;
-    cache_key.flash_attn = cparams.flash_attn;
-
-    char cache_path_buf[512] = { 0 };
-    if (have_cache_accessors) {
-        cache_path_fn(cache_key.device, cache_path_buf, sizeof(cache_path_buf));
-    }
-
-    // Try the cache BEFORE running the ladder. A hit is revalidated through
-    // the EXACT same per-candidate steps the ladder below uses (probe with
-    // busy backoff -> publish in a try/catch -> sched_reserve -> host-
-    // fallback check) -- this is not a shortcut around that validation, only
-    // around re-discovering the value from scratch. A pass sets `stop =
-    // "cached"` and skips the ladder entirely (`ladder_needed = false`); a
-    // miss (no entry, an out-of-range cached value, or a failed
-    // revalidation) leaves the ladder to run exactly as it did before this
-    // task -- the cache is advisory, so at worst this costs one extra
-    // validation, never a wrong choice.
-    bool       ladder_needed   = true;
-    const bool cache_available = have_cache_accessors && cache_enabled_fn();
-    uint32_t   cached_ubatch   = 0;
-    bool       cache_hit_ok    = false;
-
-    if (!cache_available) {
-        LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache disabled: n_ubatch=%u (%s)\n", 0u, cache_path_buf);
-    } else if (!cache_lookup_fn(&cache_key, &cached_ubatch) || cached_ubatch < ladder[0] || cached_ubatch > cap) {
-        cached_ubatch = 0;
-        LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache miss: n_ubatch=%u (%s)\n", 0u, cache_path_buf);
-    } else {
-        bool cached_candidate_lost = false;
-        for (auto & sb : sycl_backends) {
-            ggml_sycl_runtime_context_probe probe{};
-            auto rc = probe_fn(sb.backend, token, cparams.n_ctx, cached_ubatch, cparams.n_seq_max, cparams.flash_attn,
-                               &probe);
-            for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
-                rc = probe_fn(sb.backend, token, cparams.n_ctx, cached_ubatch, cparams.n_seq_max, cparams.flash_attn,
-                              &probe);
-            }
-            if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
-                stop                  = "transaction busy";
-                cached_candidate_lost = true;
-            } else if (rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
-                stop                  = "not the published model";
-                cached_candidate_lost = true;
-            } else if (rc != GGML_SYCL_LIFECYCLE_OK || !probe.accepted) {
-                stop                  = "transaction refused";
-                cached_candidate_lost = true;
-            } else if (probe.would_demote_kv) {
-                stop                  = "KV would be demoted";
-                cached_candidate_lost = true;
-            }
-            if (cached_candidate_lost) {
-                break;
-            }
-        }
-        if (!cached_candidate_lost) {
-            cparams.n_ubatch = cached_ubatch;
-            try {
-                sycl_resync_runtime_context_flash_attn();
-            } catch (const std::exception &) {
-                stop                    = "transaction refused";
-                cached_candidate_lost   = true;
-                sched_matches_last_good = false;
-            }
-        }
-        if (!cached_candidate_lost) {
-            published_any      = true;
-            sched_need_reserve = true;
-            sched_reserve();
-            sched_matches_last_good = true;
-
-            bool host_fallback = false;
-            for (auto & sb : sycl_backends) {
-                if (fallback_fn(sb.dev_index) > 0) {
-                    host_fallback = true;
-                    break;
-                }
-            }
-            if (host_fallback) {
-                stop                    = "compute buffer fell back to host";
-                sched_matches_last_good = false;
-                cached_candidate_lost   = true;
-            }
-        }
-        if (!cached_candidate_lost) {
-            last_good     = cached_ubatch;
-            stop          = "cached";
-            ladder_needed = false;
-            cache_hit_ok  = true;
-        }
-        LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\n", cache_hit_ok ? "hit" : "miss",
-                       cache_hit_ok ? cached_ubatch : 0u, cache_path_buf);
-    }
-
-    for (uint32_t c : ladder) {
-        if (!ladder_needed) {
-            break;
-        }
-        if (c > cap) {
-            break;
-        }
-        tried += (tried.empty() ? "" : ",") + std::to_string(c);
-
-        bool candidate_lost = false;
+    // llama.cpp-7n6n: ONE per-candidate validator,
+    // shared by the cache-hit revalidation below and the ladder loop -- the
+    // two call sites used to carry independently-maintained copies of this
+    // exact sequence (probe with busy backoff -> publish in a try/catch ->
+    // sched_reserve -> host-fallback check), which is also where a bug used
+    // to live: the cache copy wrote a losing reason into the SAME `stop`
+    // variable the ladder's own vocabulary owns, so a cache miss could leave
+    // a stale reason in `stop` for a ladder that went on to finish cleanly.
+    // Returning the reason instead of assigning it anywhere fixes both: the
+    // ladder call site is the only one that ever writes it into `stop`; the
+    // cache call site puts it in its own separate WARN parenthetical
+    // (below). Returns nullptr on a full pass (accepted, published,
+    // reserved, and no host-pinned fallback); otherwise the stop-reason
+    // string that lost. Mutates `cparams.n_ubatch`, `published_any`, and
+    // `sched_matches_last_good` exactly as the two pre-refactor copies each
+    // did inline -- callers must not assume `cparams.n_ubatch` is unchanged
+    // after a losing call, since the probe stage can already have set it via
+    // the publish before the host-fallback stage fails.
+    auto try_candidate = [&](uint32_t c) -> const char * {
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
             auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.flash_attn, &probe);
@@ -1590,24 +1488,17 @@ void llama_context::sycl_select_auto_ubatch() {
             }
 
             if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
-                stop           = "transaction busy";
-                candidate_lost = true;
-            } else if (rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
-                stop           = "not the published model";
-                candidate_lost = true;
-            } else if (rc != GGML_SYCL_LIFECYCLE_OK || !probe.accepted) {
-                stop           = "transaction refused";
-                candidate_lost = true;
-            } else if (probe.would_demote_kv) {
-                stop           = "KV would be demoted";
-                candidate_lost = true;
+                return "transaction busy";
             }
-            if (candidate_lost) {
-                break;
+            if (rc == GGML_SYCL_LIFECYCLE_STALE_IDENTITY) {
+                return "not the published model";
             }
-        }
-        if (candidate_lost) {
-            break;
+            if (rc != GGML_SYCL_LIFECYCLE_OK || !probe.accepted) {
+                return "transaction refused";
+            }
+            if (probe.would_demote_kv) {
+                return "KV would be demoted";
+            }
         }
 
         cparams.n_ubatch = c;
@@ -1639,12 +1530,8 @@ void llama_context::sycl_select_auto_ubatch() {
         try {
             sycl_resync_runtime_context_flash_attn();
         } catch (const std::exception &) {
-            stop                    = "transaction refused";
-            candidate_lost          = true;
             sched_matches_last_good = false;
-        }
-        if (candidate_lost) {
-            break;
+            return "transaction refused";
         }
         // llama.cpp-xojq (quality round 1 Q2b): this publish just took
         // effect on every SYCL backend (the try above did not throw), so
@@ -1657,16 +1544,112 @@ void llama_context::sycl_select_auto_ubatch() {
         sched_reserve();
         sched_matches_last_good = true;
 
-        bool host_fallback = false;
         for (auto & sb : sycl_backends) {
             if (fallback_fn(sb.dev_index) > 0) {
-                host_fallback = true;
-                break;
+                sched_matches_last_good = false;
+                return "compute buffer fell back to host";
             }
         }
-        if (host_fallback) {
-            stop                    = "compute buffer fell back to host";
-            sched_matches_last_good = false;
+        return nullptr;
+    };
+
+    // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch cache's
+    // four entry points, mirroring probe_fn/fallback_fn/moe_cap_fn's own
+    // direct-vs-DL resolution just above.
+#    ifdef GGML_USE_SYCL
+    auto cache_enabled_fn = &ggml_backend_sycl_ubatch_cache_enabled;
+    auto cache_path_fn    = &ggml_backend_sycl_ubatch_cache_path;
+    auto cache_lookup_fn  = &ggml_backend_sycl_ubatch_cache_lookup;
+    auto cache_store_fn   = &ggml_backend_sycl_ubatch_cache_store;
+#    else
+    auto cache_enabled_fn = llama_context_sycl_ubatch_cache_enabled_proc(first_dev);
+    auto cache_path_fn    = llama_context_sycl_ubatch_cache_path_proc(first_dev);
+    auto cache_lookup_fn  = llama_context_sycl_ubatch_cache_lookup_proc(first_dev);
+    auto cache_store_fn   = llama_context_sycl_ubatch_cache_store_proc(first_dev);
+#    endif
+    const bool have_cache_accessors = cache_enabled_fn && cache_path_fn && cache_lookup_fn && cache_store_fn;
+
+    ggml_sycl_ubatch_cache_key cache_key{};
+    cache_key.device     = sycl_backends.front().dev_index;
+    cache_key.model_name = model.name.c_str();
+    cache_key.model_size = model.size();
+    cache_key.model_hash = llama_context_sycl_model_tensor_hash(model);
+    cache_key.n_ctx      = cparams.n_ctx;
+    cache_key.n_batch    = cparams.n_batch;
+    cache_key.flash_attn = cparams.flash_attn;
+
+    // llama.cpp-7n6n: the sentinel below is the ONLY
+    // arm that can reach the tuning-cache WARN with an empty parenthetical
+    // -- ggml_backend_sycl_ubatch_cache_path() is never called when the
+    // accessors are unavailable (an old GGML_BACKEND_DL SYCL DSO), and an
+    // empty buffer used to print a bare "()" there.
+    char cache_path_buf[512] = "(no cache accessor in this backend build)";
+    if (have_cache_accessors) {
+        cache_path_fn(cache_key.device, cache_path_buf, sizeof(cache_path_buf));
+    }
+
+    // Try the cache BEFORE running the ladder. A hit is revalidated through
+    // try_candidate() -- the EXACT same per-candidate steps the ladder below
+    // uses -- so this is not a shortcut around that validation, only around
+    // re-discovering the value from scratch. A pass sets `stop = "cached"`
+    // and skips the ladder entirely (`ladder_needed = false`); a miss (no
+    // entry, an out-of-range cached value, or a failed revalidation) leaves
+    // the ladder to run exactly as it did before this task -- the cache is
+    // advisory, so at worst this costs one extra validation, never a wrong
+    // choice. `stop` is untouched by every arm below: a failed revalidation's
+    // reason is reported only in this cache block's own WARN, never left
+    // behind for the ladder's outcome line to inherit.
+    bool         ladder_needed       = true;
+    const bool   cache_available     = have_cache_accessors && cache_enabled_fn();
+    const char * cache_state         = "disabled";
+    uint32_t     cache_report_ubatch = 0;
+    std::string  cache_paren         = cache_path_buf;
+
+    if (cache_available) {
+        uint32_t cached_ubatch = 0;
+        if (!cache_lookup_fn(&cache_key, &cached_ubatch) || cached_ubatch < ladder[0] || cached_ubatch > cap) {
+            cache_state = "miss";
+        } else {
+            // The cached candidate was actually validated here (whether it
+            // passed or lost) -- name it in `tried` so the final outcome
+            // WARN's "(tried %s; %s)" is never empty for a hit, and so a
+            // lost cache candidate that falls through to the ladder is
+            // still visible in the trail even though it is not itself a
+            // ladder rung.
+            tried += (tried.empty() ? "" : ",") + std::to_string(cached_ubatch);
+
+            const char * cache_reason = try_candidate(cached_ubatch);
+            if (cache_reason == nullptr) {
+                last_good           = cached_ubatch;
+                stop                = "cached";
+                ladder_needed       = false;
+                cache_state         = "hit";
+                cache_report_ubatch = cached_ubatch;
+            } else {
+                cache_state = "miss";
+                cache_paren = "cached " + std::to_string(cached_ubatch) + " refused: " + cache_reason;
+            }
+        }
+    }
+
+    // One format string, one call site -- hit/miss/disabled is an argument,
+    // not three separately-literal WARN calls that could drift out of sync
+    // with each other or with the format string above them.
+    LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\n", cache_state, cache_report_ubatch,
+                   cache_paren.c_str());
+
+    for (uint32_t c : ladder) {
+        if (!ladder_needed) {
+            break;
+        }
+        if (c > cap) {
+            break;
+        }
+        tried += (tried.empty() ? "" : ",") + std::to_string(c);
+
+        const char * reason = try_candidate(c);
+        if (reason != nullptr) {
+            stop = reason;
             break;
         }
         last_good = c;

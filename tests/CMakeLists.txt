@@ -3265,7 +3265,23 @@ endif()
 # rejecting a v1 file, and an unwritable directory failing save/load
 # cleanly). Pure header + STL: no ggml/llama/SYCL dependency at all, so this
 # was previously an unregistered file (zero production callers, per
-# plan-research/tuning-cache.md) -- this task adds the registration. Never
-# writes to the real $HOME; every test that touches the filesystem uses a
-# unique per-pid device/dir name under /tmp and cleans up after itself.
+# plan-research/tuning-cache.md) -- this task adds the registration.
+#
+# llama.cpp-7n6n: this file's NEW ubatch-cache tests
+# each use their own unique per-pid /tmp directory, passed as an explicit
+# argument -- but THREE PRE-EXISTING tests (save_load_roundtrip,
+# version_check, atomic_write) call the matmul-dispatch-tuning save_cache()/
+# load_cache()/get_cache_file(), which go through get_cache_dir() and so
+# fall back to the REAL $HOME/.cache/llama.cpp/sycl-tuning whenever
+# XDG_CACHE_HOME is unset -- registering this binary at all made them reach
+# that real directory for the first time (caught in review: an empty
+# ~/.cache/llama.cpp/sycl-tuning/ left behind by a local pre-commit run).
+# ENVIRONMENT pins BOTH variables so ctest can never repeat that: XDG_
+# CACHE_HOME confines the pre-existing tests' get_cache_dir() fallback to a
+# build-tree scratch directory, and GGML_SYCL_TUNING_CACHE_DIR is set
+# alongside it for consistency with the runtime accessor of the same name
+# (ubatch-tuning-cache.cpp) even though this binary's own tests do not
+# currently read it (they pass an explicit cache_dir argument instead).
 llama_build_and_test(test-tuning-cache-io.cpp)
+set_tests_properties(test-tuning-cache-io PROPERTIES
+    ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-home;GGML_SYCL_TUNING_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-dir")

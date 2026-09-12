@@ -362,7 +362,12 @@ struct UbatchCacheKey {
 struct UbatchCacheEntry {
     UbatchCacheKey key;
     uint32_t       n_ubatch = 0;
-    std::string    reason;   // "ladder" | "cached"
+    // Free-form diagnostic (see ggml_backend_sycl_ubatch_cache_store()'s own
+    // comment, ggml-sycl.h): today's only writer always passes "ladder" --
+    // a cache hit never re-stores itself, so "cached" never actually reaches
+    // this field despite being a valid stop-reason string on the caller's
+    // own vocabulary. Reserved, not currently written.
+    std::string    reason;
     std::string    created;  // ISO 8601, UTC (e.g. "2026-09-11T12:34:56Z")
 };
 

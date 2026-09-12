@@ -464,10 +464,17 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup(const struct ggml_sy
                                                             uint32_t *                                n_ubatch);
 
 // Persist the chosen n_ubatch for this exact key (atomic write; see
-// tuning-cache-io.hpp). `reason` is recorded verbatim ("ladder" or "cached")
-// for diagnostics. Returns false (never throws) on a disabled cache, an
-// out-of-range device, or a write failure -- the caller logs one WARN and
-// continues; a failed store never blocks inference.
+// tuning-cache-io.hpp). `reason` is recorded verbatim for diagnostics --
+// today the only caller (llama_context::sycl_select_auto_ubatch()) ever
+// passes "ladder" (a cache HIT never re-stores itself, since the entry it
+// validated is already the one on disk); "cached" is a STOP reason on that
+// caller's own vocabulary, never a value this store persists. A future
+// caller could legitimately pass "cached" here (e.g. to refresh a hit
+// entry's `created` timestamp without changing its n_ubatch) -- this field
+// is free-form specifically to leave that open, not because "cached" is
+// already written somewhere. Returns false (never throws) on a disabled
+// cache, an out-of-range device, or a write failure -- the caller logs one
+// WARN and continues; a failed store never blocks inference.
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store(const struct ggml_sycl_ubatch_cache_key * key,
                                                            uint32_t                                  n_ubatch,
                                                            const char *                              reason);

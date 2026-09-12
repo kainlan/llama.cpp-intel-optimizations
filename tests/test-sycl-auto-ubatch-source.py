@@ -130,6 +130,16 @@ _CALL_SITE_START = "bool sycl_auto_ubatch_trial = false;"
 _CALL_SITE_END = "if (!cparams.flash_attn) {"
 _TRIAL_START = "void llama_context::sycl_select_auto_ubatch() {"
 _TRIAL_END = "void llama_context::sched_reserve() {"
+# llama.cpp-7n6n: the shared per-candidate validator --
+# probe with busy backoff, publish in a try/catch, reserve, host-fallback
+# check -- extracted into one lambda used by BOTH the cache-hit revalidation
+# and the ladder loop (previously two independently-maintained copies of the
+# same sequence). Bounds a smaller region than the old loop-anchored checks
+# used to; several per-candidate tests below are anchored here instead of to
+# "for (uint32_t c : ladder)" now that the sequence itself lives here, not
+# in the loop body.
+_TRY_CANDIDATE_START = "auto try_candidate = [&](uint32_t c) -> const char * {"
+_TRY_CANDIDATE_END = "auto cache_enabled_fn ="
 
 
 def _call_site_body() -> str:
@@ -138,6 +148,10 @@ def _call_site_body() -> str:
 
 def _trial_body() -> str:
     return _bounded_body(LLAMA_CONTEXT_CPP_CODE, _TRIAL_START, _TRIAL_END)
+
+
+def _try_candidate_body() -> str:
+    return _bounded_body(LLAMA_CONTEXT_CPP_CODE, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
 
 
 # ---------------------------------------------------------------------------
@@ -457,40 +471,74 @@ def test_probe_busy_retries_with_bounded_exponential_backoff():
 def test_stale_identity_branches_to_not_the_published_model():
     """GGML_SYCL_LIFECYCLE_STALE_IDENTITY must be branched distinctly to
     the "not the published model" stop reason (c-rkye item 2), not folded
-    into the generic "transaction refused" branch."""
-    body_norm = _normalize_ws(_trial_body())
+    into the generic "transaction refused" branch.
+
+    llama.cpp-7n6n: try_candidate() now RETURNS the
+    reason instead of assigning `stop` directly (the two pre-refactor call
+    sites -- the cache-hit revalidation and the ladder loop -- used to each
+    assign this into the SAME `stop` variable inline, which is exactly the
+    bug this caused: a failed cache revalidation could leave a stale reason
+    in `stop` for a ladder that went on to finish cleanly). Only the ladder
+    loop's own call site writes the returned reason into `stop`; this test
+    is scoped to try_candidate()'s body, where the string literal itself
+    lives, not to the assignment (which is now generic and reason-agnostic:
+    `stop = reason;`)."""
+    body_norm = _normalize_ws(_try_candidate_body())
     assert re.search(
-        r'rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*\)\s*\{\s*stop\s*=\s*"not the published model"\s*;',
+        r'rc\s*==\s*GGML_SYCL_LIFECYCLE_STALE_IDENTITY\s*\)\s*\{\s*return\s*"not the published model"\s*;\s*\}',
         body_norm,
-    ), 'GGML_SYCL_LIFECYCLE_STALE_IDENTITY must set stop = "not the published model"'
+    ), 'GGML_SYCL_LIFECYCLE_STALE_IDENTITY must return "not the published model"'
 
 
 def test_would_demote_kv_is_consulted_and_stops_the_ladder():
     """probe.would_demote_kv must be consulted and, when true, stop the
-    ladder with the "KV would be demoted" reason -- never published."""
-    body_norm = _normalize_ws(_trial_body())
+    ladder with the "KV would be demoted" reason -- never published.
+    Scoped to try_candidate() -- see the note on the sibling check above
+    for why this is now a `return`, not a `stop = ...` assignment."""
+    body_norm = _normalize_ws(_try_candidate_body())
     assert re.search(
-        r'probe\.would_demote_kv\s*\)\s*\{\s*stop\s*=\s*"KV would be demoted"\s*;', body_norm
-    ), 'probe.would_demote_kv must be consulted and set stop = "KV would be demoted"'
+        r'probe\.would_demote_kv\s*\)\s*\{\s*return\s*"KV would be demoted"\s*;\s*\}', body_norm
+    ), 'probe.would_demote_kv must be consulted and return "KV would be demoted"'
+
+
+def test_probe_reasons_never_assign_stop_directly():
+    """None of the four probe-outcome branches inside try_candidate() may
+    assign `stop` directly (the pre-refactor shape, and the bug that shape
+    caused) -- each must RETURN its reason so the two call sites (cache-hit
+    revalidation, ladder loop) can each decide for themselves where it
+    belongs. A direct `stop = "...";` inside try_candidate() would silently
+    reintroduce that bug: a losing cache revalidation would again leave its
+    reason in `stop` for a ladder that subsequently finishes cleanly."""
+    body_norm = _normalize_ws(_try_candidate_body())
+    for reason in ("transaction busy", "not the published model", "transaction refused", "KV would be demoted"):
+        assert not re.search(rf'stop\s*=\s*"{re.escape(reason)}"', body_norm), (
+            f"try_candidate() must not assign stop directly for {reason!r} -- it must return the reason instead"
+        )
+        # The positive half: every reason IS returned (not silently dropped).
+        assert re.search(rf'return\s*"{re.escape(reason)}"\s*;', body_norm), (
+            f"try_candidate() must return {reason!r} from somewhere in its body"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Publish-before-reserve order, and the host-fallback query after reserve
+# Publish-before-reserve order, and the host-fallback query after reserve --
+# both now checked WITHIN try_candidate() (llama.cpp-7n6n): the sequence
+# used to live twice (once inline in the ladder loop, once inline in the
+# cache-hit revalidation); it now lives once, in the shared lambda, called
+# from both places (pinned by test_both_call_sites_use_try_candidate below).
 # ---------------------------------------------------------------------------
 
 
-def test_publish_happens_before_reserve_inside_the_loop():
+def test_publish_happens_before_reserve_in_try_candidate():
     """sycl_resync_runtime_context_flash_attn() (publish) must be called
-    strictly BEFORE sched_reserve() inside the candidate loop -- the narrow
+    strictly BEFORE sched_reserve() inside try_candidate() -- the narrow
     flash-attn re-check inside sched_reserve() re-evaluates against the
     PUBLISHED plan's planner_n_ubatch, so publishing after reserving would
     let sched_reserve() see the PREVIOUS candidate's plan."""
-    body_norm = _normalize_ws(_trial_body())
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
-    assert loop_idx != -1
-    publish_idx = body_norm.find("sycl_resync_runtime_context_flash_attn();", loop_idx)
-    reserve_idx = body_norm.find("sched_reserve();", loop_idx)
-    assert publish_idx != -1 and reserve_idx != -1, "both the publish and the in-loop reserve call must exist"
+    body_norm = _normalize_ws(_try_candidate_body())
+    publish_idx = body_norm.find("sycl_resync_runtime_context_flash_attn();")
+    reserve_idx = body_norm.find("sched_reserve();")
+    assert publish_idx != -1 and reserve_idx != -1, "both the publish and the reserve call must exist"
     assert publish_idx < reserve_idx, "sycl_resync_runtime_context_flash_attn() must precede sched_reserve()"
 
 
@@ -503,12 +551,8 @@ def test_publish_reserve_order_has_a_mutation_witness():
         "        try {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
         "        } catch (const std::exception &) {\n"
-        '            stop                    = "transaction refused";\n'
-        "            candidate_lost          = true;\n"
         "            sched_matches_last_good = false;\n"
-        "        }\n"
-        "        if (candidate_lost) {\n"
-        "            break;\n"
+        '            return "transaction refused";\n'
         "        }\n"
     )
     reserve_block = (
@@ -528,10 +572,9 @@ def test_publish_reserve_order_has_a_mutation_witness():
     mutated_raw = raw.replace(original_block, mutated_block, 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
-    mutated_publish_idx = mutated_body_norm.find("sycl_resync_runtime_context_flash_attn();", mutated_loop_idx)
-    mutated_reserve_idx = mutated_body_norm.find("sched_reserve();", mutated_loop_idx)
+    mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    mutated_publish_idx = mutated_body_norm.find("sycl_resync_runtime_context_flash_attn();")
+    mutated_reserve_idx = mutated_body_norm.find("sched_reserve();")
     assert mutated_publish_idx != -1 and mutated_reserve_idx != -1
     assert not (mutated_publish_idx < mutated_reserve_idx), (
         "mutation witness is broken: swapping the two blocks should make the ordering check fail"
@@ -540,20 +583,32 @@ def test_publish_reserve_order_has_a_mutation_witness():
 
 def test_host_fallback_query_is_consulted_after_reserve():
     """ggml_backend_sycl_compute_buffer_host_fallbacks() must be consulted
-    AFTER the in-loop sched_reserve() call (it reports fallbacks since the
-    last successful publish, which sched_reserve() just exercised), and
-    BEFORE last_good is updated to this candidate -- a candidate whose
-    reserve fell back to host must not win."""
+    AFTER the reserve call inside try_candidate() (it reports fallbacks
+    since the last successful publish, which sched_reserve() just
+    exercised), and BEFORE the lambda's own success return -- a candidate
+    whose reserve fell back to host must not be reported as a pass."""
+    body_norm = _normalize_ws(_try_candidate_body())
+    reserve_idx = body_norm.find("sched_reserve();")
+    fallback_idx = body_norm.find("fallback_fn(", reserve_idx)
+    success_return_idx = body_norm.find("return nullptr;", reserve_idx)
+    assert reserve_idx != -1 and fallback_idx != -1 and success_return_idx != -1
+    assert reserve_idx < fallback_idx < success_return_idx, (
+        "the host-fallback query must run strictly between the reserve() call and the lambda's own success "
+        "return"
+    )
+
+
+def test_ladder_updates_last_good_only_after_try_candidate_passes():
+    """In the LADDER LOOP specifically (not try_candidate() itself), the
+    call to try_candidate(c) must precede the `last_good = c;` assignment
+    -- a losing candidate (non-null reason) must not win."""
     body_norm = _normalize_ws(_trial_body())
     loop_idx = body_norm.find("for (uint32_t c : ladder)")
-    reserve_idx = body_norm.find("sched_reserve();", loop_idx)
-    fallback_idx = body_norm.find("fallback_fn(", reserve_idx)
-    last_good_idx = body_norm.find("last_good = c;", reserve_idx)
-    assert reserve_idx != -1 and fallback_idx != -1 and last_good_idx != -1
-    assert reserve_idx < fallback_idx < last_good_idx, (
-        "the host-fallback query must run strictly between the in-loop sched_reserve() call and the "
-        "last_good = c assignment"
-    )
+    assert loop_idx != -1
+    call_idx = body_norm.find("try_candidate(c)", loop_idx)
+    last_good_idx = body_norm.find("last_good = c;", loop_idx)
+    assert call_idx != -1 and last_good_idx != -1
+    assert call_idx < last_good_idx, "the ladder loop must call try_candidate(c) before assigning last_good = c"
 
 
 def test_fallback_fn_is_bound_to_the_real_accessor():
@@ -579,38 +634,52 @@ def test_fallback_fn_is_bound_to_the_real_accessor():
 def test_host_fallback_query_has_a_mutation_witness():
     """Mutation witness for the check above: proves it would actually
     catch the host-fallback query being deleted (a losing candidate would
-    then silently win)."""
+    then silently win).
+
+    llama.cpp-7n6n: unlike the pre-refactor version of
+    this witness, no loop-scoping workaround is needed any more -- since
+    try_candidate() is now the ONLY place fallback_fn( is called at all
+    (both the cache-hit revalidation and the ladder loop call the same
+    lambda instead of each carrying their own copy), deleting this block
+    removes every fallback_fn( occurrence in the whole trial body, not just
+    the loop's own copy."""
     raw = LLAMA_CONTEXT_CPP
     fallback_block = (
-        "        bool host_fallback = false;\n"
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
-        "                host_fallback = true;\n"
-        "                break;\n"
+        "                sched_matches_last_good = false;\n"
+        '                return "compute buffer fell back to host";\n'
         "            }\n"
-        "        }\n"
-        "        if (host_fallback) {\n"
-        '            stop                    = "compute buffer fell back to host";\n'
-        "            sched_matches_last_good = false;\n"
-        "            break;\n"
         "        }\n"
     )
     assert fallback_block in raw, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw.replace(fallback_block, "", 1)
     assert mutated_raw != raw
 
-    # llama.cpp-7n6n: scoped to the LADDER LOOP specifically (not "every
-    # fallback_fn( call in the whole body") -- the persisted tuning-cache
-    # lookup added ahead of the loop revalidates a cached candidate through
-    # its own host-fallback check (same fallback_fn(sb.dev_index) call), so
-    # a bare "not in mutated_body_norm" now sees that legitimate second call
-    # site and reads as "the witness is broken" even though the LOOP's own
-    # call was in fact deleted.
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
-    assert mutated_loop_idx != -1
-    assert "fallback_fn(" not in mutated_body_norm[mutated_loop_idx:], (
-        "mutation witness is broken: deleting the block should remove the ladder loop's own fallback_fn( call"
+    assert "fallback_fn(" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove every fallback_fn( call from the body"
+    )
+
+
+def test_both_call_sites_use_try_candidate():
+    """llama.cpp-7n6n: both the cache-hit
+    revalidation and the ladder loop must call the SAME try_candidate()
+    lambda -- not each carry their own inline copy of the per-candidate
+    sequence, which is what previously let a losing cache revalidation's
+    reason leak into the ladder's own outcome (see test_all_eight_stop_
+    reasons_are_present's docstring). A regression that reintroduced
+    an inline copy at either call site (rather than a call to the shared
+    lambda) would satisfy every other check in this section (they all
+    look inside try_candidate()'s own body) while silently duplicating the
+    logic again."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r"try_candidate\s*\(\s*cached_ubatch\s*\)", body_norm), (
+        "the cache-hit revalidation must call try_candidate(cached_ubatch)"
+    )
+    assert re.search(r"try_candidate\s*\(\s*c\s*\)", body_norm), "the ladder loop must call try_candidate(c)"
+    assert len(re.findall(r"auto\s+try_candidate\s*=\s*\[&\]", body_norm)) == 1, (
+        "try_candidate must be defined exactly once"
     )
 
 
@@ -622,7 +691,9 @@ def test_host_fallback_query_has_a_mutation_witness():
 def test_exactly_one_sycl_plan_auto_warn_in_the_body():
     """Exactly one [SYCL-PLAN] auto n_ubatch= WARN must appear in the
     trial's body -- the task spec's "keep the trial's own log to ONE WARN"
-    gotcha."""
+    gotcha. (A second, separate WARN family -- "[SYCL-PLAN] tuning cache
+    ..." -- reports the persisted-cache outcome, llama.cpp-7n6n Task 5; it
+    is a different literal string and does not count against this one.)"""
     body_norm = _normalize_ws(_trial_body())
     count = len(re.findall(r"\[SYCL-PLAN\] auto n_ubatch=", body_norm))
     assert count == 1, f"expected exactly one '[SYCL-PLAN] auto n_ubatch=' WARN -- found {count}"
@@ -636,11 +707,14 @@ def test_all_eight_stop_reasons_are_present():
     strings the task spec names -- the original seven (llama.cpp-xojq
     Task 4b) plus "cached" (llama.cpp-7n6n, Task 5: a persisted-cache hit
     that revalidates cleanly skips the ladder with this stop reason).
-    Every `stop = "..."` literal in the body (including the initial
-    `const char * stop = "...";` declaration, and the cache-lookup block's
-    own reuse of five of the original seven while revalidating a cached
-    candidate through the same per-candidate steps) must be drawn from
-    this set, with none missing and none extra."""
+
+    llama.cpp-7n6n: three of the eight are still
+    literal `stop = "...";` assignments ("ladder exhausted"'s initial
+    declaration, "MoE GPU routing ceiling", and "cached"); the other five
+    are `return "...";` statements inside try_candidate(), moved there
+    specifically so a losing cache revalidation cannot leave its reason
+    behind in `stop`. Both forms are drawn from and must match this
+    one set, with none missing and none extra."""
     body_norm = _normalize_ws(_trial_body())
     eight = {
         "ladder exhausted",
@@ -655,10 +729,12 @@ def test_all_eight_stop_reasons_are_present():
     for reason in eight:
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
 
-    # Presence alone (the loop above) would pass even if a ninth string
-    # had silently slipped in as a `stop = "..."` assignment somewhere --
+    # Presence alone (the loop above) would pass even if a ninth string had
+    # silently slipped in as a `stop = "..."` or `return "...";` somewhere --
     # this closes that gap by requiring the extracted SET to match exactly.
-    found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm))
+    found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm)) | set(
+        re.findall(r'return\s*"([^"]*)"\s*;', body_norm)
+    )
     assert found == eight, f"stop-reason literal set does not match exactly -- found {found}"
 
 
@@ -671,88 +747,60 @@ def test_all_eight_stop_reasons_are_present():
 
 
 def test_candidate_publish_is_wrapped_in_try_catch():
-    """The CANDIDATE publish inside the loop must be wrapped in
+    """The publish inside try_candidate() must be wrapped in
     try/catch(const std::exception&) -- sycl_resync_runtime_context_flash_
     attn() throws on a refusal, and an accepted probe does not guarantee
     the publish itself still succeeds. The catch must also mark
-    sched_matches_last_good false (spec round 1 F1): the publish loop can
-    throw partway through the SYCL backends it walks, so the published
-    plan can no longer be trusted to describe last_good on any device,
-    and only sched_matches_last_good=false forces the settle step to
-    unconditionally re-publish last_good everywhere."""
-    body_norm = _normalize_ws(_trial_body())
+    sched_matches_last_good false (spec round 1 F1) and return the
+    "transaction refused" reason immediately -- try_candidate() RETURNING
+    from inside the catch block is itself the guarantee that a refused
+    publish can never fall through to the reserve/host-fallback stages
+    below it. This replaces the pre-refactor `candidate_lost = true;`
+    flag-and-check-immediately-after pattern with a stronger, structural
+    one -- a `return` cannot be "forgotten" the way a flag check
+    theoretically could be."""
+    body_norm = _normalize_ws(_try_candidate_body())
     assert re.search(
         r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*'
-        r"sched_matches_last_good\s*=\s*false\s*;\s*\}",
+        r'&\s*\)\s*\{\s*sched_matches_last_good\s*=\s*false\s*;\s*return\s*"transaction refused"\s*;\s*\}',
         body_norm,
     ), (
-        "the candidate publish must be wrapped in try { ... } catch (const std::exception &) { "
-        'stop = "transaction refused"; candidate_lost = true; sched_matches_last_good = false; }'
-    )
-
-
-def test_candidate_lost_is_checked_immediately_after_the_try_catch():
-    """The candidate_lost check for the publish's own try/catch must run
-    BEFORE sched_need_reserve/sched_reserve() -- a refused publish must
-    never reach a reserve for the plan it failed to publish."""
-    body_norm = _normalize_ws(_trial_body())
-    # llama.cpp-7n6n: anchored to the ladder LOOP specifically (not a bare
-    # body_norm.find()) -- the persisted tuning-cache lookup added ahead of
-    # the loop revalidates a cached candidate through its own try {
-    # sycl_resync_runtime_context_flash_attn(); } (same literal text, a
-    # different local flag name `cached_candidate_lost`), which would
-    # otherwise be the FIRST match a bare find() sees and point this check
-    # at the wrong block entirely.
-    loop_idx = body_norm.find("for (uint32_t c : ladder)")
-    assert loop_idx != -1
-    try_idx = body_norm.find("try { sycl_resync_runtime_context_flash_attn(); }", loop_idx)
-    assert try_idx != -1, "could not find the candidate publish's try block"
-    after = body_norm[try_idx:]
-    break_idx = after.find("if (candidate_lost) { break; }")
-    reserve_idx = after.find("sched_need_reserve = true;")
-    assert break_idx != -1 and reserve_idx != -1
-    assert break_idx < reserve_idx, (
-        "the candidate_lost check for the publish's try/catch must precede sched_need_reserve/sched_reserve()"
+        "the publish must be wrapped in try { ... } catch (const std::exception &) { sched_matches_last_good = "
+        'false; return "transaction refused"; }'
     )
 
 
 def test_candidate_publish_try_catch_has_a_mutation_witness():
-    """Mutation witness for the two checks above: proves they would
-    actually catch the try/catch being deleted (leaving a bare,
-    unprotected publish call that would let a refusal escape as an
-    uncaught exception instead of a clean "transaction refused" stop)."""
+    """Mutation witness for the check above: proves it would actually
+    catch the try/catch being deleted (leaving a bare, unprotected publish
+    call that would let a refusal escape as an uncaught exception instead
+    of a clean "transaction refused" stop)."""
     raw = LLAMA_CONTEXT_CPP
     wrapped_block = (
         "        try {\n"
         "            sycl_resync_runtime_context_flash_attn();\n"
         "        } catch (const std::exception &) {\n"
-        '            stop                    = "transaction refused";\n'
-        "            candidate_lost          = true;\n"
         "            sched_matches_last_good = false;\n"
-        "        }\n"
-        "        if (candidate_lost) {\n"
-        "            break;\n"
+        '            return "transaction refused";\n'
         "        }\n"
     )
     assert wrapped_block in raw, "mutation target not found -- update this witness to match the real source"
     mutated_raw = raw.replace(wrapped_block, "        sycl_resync_runtime_context_flash_attn();\n", 1)
     assert mutated_raw != raw
 
-    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
     assert not re.search(
         r"try\s*\{\s*sycl_resync_runtime_context_flash_attn\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*"
-        r'&\s*\)\s*\{\s*stop\s*=\s*"transaction refused"\s*;\s*candidate_lost\s*=\s*true\s*;\s*'
-        r"sched_matches_last_good\s*=\s*false\s*;\s*\}",
+        r'&\s*\)\s*\{\s*sched_matches_last_good\s*=\s*false\s*;\s*return\s*"transaction refused"\s*;\s*\}',
         mutated_body_norm,
     ), "mutation witness is broken: deleting the try/catch should make the wrapped-publish check fail"
 
 
 def test_settle_publish_is_not_wrapped_in_try_catch():
-    """Unlike the in-loop candidate publish, the SETTLE publish must let a
-    refusal propagate -- today's behaviour for a context that does not fit
-    at all (Task 2 final review addendum item 1: only the candidate publish
-    gets the new try/catch)."""
+    """Unlike the candidate publish inside try_candidate(), the SETTLE
+    publish must let a refusal propagate -- today's behaviour for a
+    context that does not fit at all (Task 2 final review addendum item 1:
+    only the candidate publish gets the try/catch)."""
     body_norm = _normalize_ws(_trial_body())
     settle_start = body_norm.find("if (!sched_matches_last_good")
     assert settle_start != -1, "could not find the settle step's own gate"
@@ -777,10 +825,10 @@ def test_settle_republishes_only_when_needed():
     ), "the settle step must be gated on !sched_matches_last_good || cparams.n_ubatch != last_good"
 
 
-def test_published_any_is_declared_false_and_set_true_after_the_in_loop_publish():
-    """Q2b: published_any must start false and become true right after the
-    in-loop publish succeeds (the try did not throw, so the candidate_lost
-    check just above already returned false) -- tracking whether ANY
+def test_published_any_is_declared_false_and_set_true_after_the_publish_catch():
+    """Q2b: published_any must start false and become true right after
+    try_candidate()'s own publish succeeds (the try did not throw, so its
+    catch block's early return was not taken) -- tracking whether ANY
     candidate's publish actually took effect this trial run, independent
     of whether that candidate goes on to lose the host-fallback check."""
     body_norm = _normalize_ws(_trial_body())
@@ -788,14 +836,18 @@ def test_published_any_is_declared_false_and_set_true_after_the_in_loop_publish(
         "published_any must be declared, initialized false"
     )
 
-    catch_idx = body_norm.find("sched_matches_last_good = false; } if (candidate_lost) { break; }")
-    assert catch_idx != -1, "could not find the try/catch's closing candidate_lost check"
+    # llama.cpp-7n6n: the old anchor
+    # (`"sched_matches_last_good = false; } if (candidate_lost) { break; }"`)
+    # named a flag-and-check pattern that no longer exists -- the catch
+    # block now returns immediately instead. The new anchor is the catch
+    # clause's own opening, which is still unique in the body.
+    catch_idx = body_norm.find("catch (const std::exception &) { sched_matches_last_good = false;")
+    assert catch_idx != -1, "could not find the publish's try/catch clause"
     published_any_idx = body_norm.find("published_any = true;", catch_idx)
     reserve_idx = body_norm.find("sched_need_reserve = true;", catch_idx)
     assert published_any_idx != -1 and reserve_idx != -1
     assert catch_idx < published_any_idx < reserve_idx, (
-        "published_any must be set true strictly between the publish's own candidate_lost check and the "
-        "in-loop sched_reserve() call"
+        "published_any must be set true strictly between the publish's own try/catch and the reserve() call"
     )
 
 
@@ -1066,7 +1118,7 @@ def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
     of the ladder loop."""
     raw = LLAMA_CONTEXT_CPP
 
-    lookup_line = "    if (!cache_available) {\n"
+    lookup_line = "    if (cache_available) {\n"
     assert lookup_line in raw, "mutation target not found -- update this witness to match the real source"
     loop_line = "    for (uint32_t c : ladder) {\n"
     assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
@@ -1085,3 +1137,64 @@ def test_ubatch_cache_lookup_and_store_have_mutation_witnesses():
         "mutation witness is broken: moving the loop ahead of the cache check should make the lookup-precedes-"
         "the-ladder check fail"
     )
+
+
+def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
+    """llama.cpp-7n6n: a SEPARATE mutation witness for
+    the store-follows-the-ladder position check -- the combined witness
+    above (test_ubatch_cache_lookup_and_store_have_mutation_witnesses) only
+    exercises the lookup-precedes-the-ladder half; moving the loop earlier
+    proves that half fails but says nothing about whether the STORE's own
+    position check would catch the store being moved too early."""
+    raw = LLAMA_CONTEXT_CPP
+    store_line = '        cache_store_fn(&cache_key, last_good, "ladder");\n'
+    assert store_line in raw, "mutation target not found -- update this witness to match the real source"
+    loop_line = "    for (uint32_t c : ladder) {\n"
+    assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
+
+    # Move the store call to just BEFORE the ladder loop itself (not merely
+    # before the last_good == 0 fixup, which is already after the loop and
+    # so would not actually exercise the loop-vs-store ordering check).
+    mutated_raw = raw.replace(store_line, "", 1).replace(loop_line, store_line + loop_line, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    mutated_loop_idx = mutated_body_norm.find("for (uint32_t c : ladder)")
+    mutated_store_idx = mutated_body_norm.find("cache_store_fn(&cache_key,")
+    assert mutated_loop_idx != -1 and mutated_store_idx != -1
+    assert not (mutated_loop_idx < mutated_store_idx), (
+        "mutation witness is broken: moving the store ahead of the ladder loop should make the "
+        "store-follows-the-ladder check fail"
+    )
+
+
+def test_ubatch_cache_store_is_gated_on_ladder_needed():
+    """llama.cpp-7n6n: the store must be gated on
+    `ladder_needed` (never re-storing an identical entry right after a
+    cache hit validated it), alongside the pre-existing have_cache_
+    accessors/cache_enabled_fn() gate."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r'if\s*\(\s*ladder_needed\s*&&\s*have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{\s*'
+        r'cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*"ladder"\s*\)\s*;\s*\}',
+        body_norm,
+    ), 'the store must be gated on ladder_needed && have_cache_accessors && cache_enabled_fn()'
+
+
+def test_ubatch_cache_store_ladder_needed_gate_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the `ladder_needed &&` clause being dropped from the store's
+    gate (which would re-store an identical entry after every cache hit,
+    not just after a real ladder run)."""
+    raw = LLAMA_CONTEXT_CPP
+    guard_line = "    if (ladder_needed && have_cache_accessors && cache_enabled_fn()) {\n"
+    assert guard_line in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(guard_line, "    if (have_cache_accessors && cache_enabled_fn()) {\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(
+        r'if\s*\(\s*ladder_needed\s*&&\s*have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{\s*'
+        r'cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*"ladder"\s*\)\s*;\s*\}',
+        mutated_body_norm,
+    ), "mutation witness is broken: dropping ladder_needed from the guard should make the gate check fail"

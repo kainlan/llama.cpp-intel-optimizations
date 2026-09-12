@@ -6,6 +6,20 @@
 
 // Unit tests for tuning-cache-io.hpp
 // Tests JSON serialization/deserialization, file I/O, and atomic writes
+//
+// llama.cpp-7n6n: several of the tests below (the
+// matmul-dispatch-tuning ones: save_load_roundtrip, version_check,
+// atomic_write) exercise save_cache()/load_cache()/get_cache_file(), which
+// resolve their directory through get_cache_dir() -- XDG_CACHE_HOME if set,
+// else the REAL $HOME/.cache/llama.cpp/sycl-tuning. This binary must never
+// touch that real directory, so `main()` below refuses to run at all
+// (SKIP, exit 77) unless XDG_CACHE_HOME is already set to a scratch
+// directory. tests/CMakeLists.txt's registration sets it (and
+// GGML_SYCL_TUNING_CACHE_DIR alongside it) via ENVIRONMENT for exactly this
+// reason -- a direct invocation of this binary must set both the same way.
+// The NEWER "ubatch" entry-kind tests further below (ubatch_cache_*) do NOT
+// need either variable: they pass an explicit cache_dir argument straight
+// to save_ubatch_cache()/load_ubatch_cache(), never through get_cache_dir().
 
 #include <cassert>
 #include <cstdio>
@@ -538,10 +552,14 @@ TEST(atomic_write) {
 // =============================================================================
 // llama.cpp-7n6n (wires nphx Task 5): the "ubatch" entry kind (v2) --
 // UbatchCacheKey/UbatchCacheEntry, their JSON (de)serialization, and
-// save_ubatch_cache()/load_ubatch_cache(). Every test below uses its OWN
-// temp directory (never get_cache_dir()'s real XDG/$HOME location) so this
-// binary never touches the real cache, matching the rest of this file's
-// per-pid-unique-device-name discipline.
+// save_ubatch_cache()/load_ubatch_cache(). Every test below passes its own
+// explicit, unique per-pid /tmp directory straight to those two functions
+// -- never get_cache_dir(), so these specific tests never depend on
+// XDG_CACHE_HOME or the real $HOME. This is NOT true of every test in this
+// file: see the file's own top-of-file comment for the
+// pre-existing matmul-dispatch-tuning tests that DO resolve through
+// get_cache_dir(), and the main()-level guard that keeps this binary from
+// ever running against the real cache directory unsandboxed.
 // =============================================================================
 
 // Test: CACHE_VERSION was bumped to 2 for this task (v1 stays reserved for
@@ -762,6 +780,25 @@ TEST(ubatch_cache_load_missing_file) {
 // Main test runner
 // =============================================================================
 int main() {
+    // llama.cpp-7n6n: several tests in this binary
+    // (save_load_roundtrip, version_check, atomic_write) resolve their
+    // directory through get_cache_dir(), which falls back to the REAL
+    // $HOME/.cache/llama.cpp/sycl-tuning whenever XDG_CACHE_HOME is unset.
+    // Refuse outright rather than let a direct invocation reach that real
+    // directory -- tests/CMakeLists.txt's registration always sets this
+    // (via ENVIRONMENT) before ctest runs the binary, so this only fires
+    // for someone invoking the built binary by hand without also setting
+    // it, matching CLAUDE.md's "what the registration provides, direct
+    // invocation does not" lesson.
+    const char * xdg_cache_home = std::getenv("XDG_CACHE_HOME");
+    if (xdg_cache_home == nullptr || xdg_cache_home[0] == '\0') {
+        std::cerr << "SKIP: XDG_CACHE_HOME must be set to a scratch directory before running this binary "
+                     "directly -- several of its tests fall back to the real $HOME/.cache/llama.cpp/sycl-tuning "
+                     "otherwise. See tests/CMakeLists.txt's test-tuning-cache-io registration for the values "
+                     "ctest itself uses.\n";
+        return 77;
+    }
+
     std::cout << "=== Tuning Cache I/O Tests ===\n\n";
 
     RUN_TEST(get_cache_dir);
