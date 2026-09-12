@@ -81138,9 +81138,10 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     // forbidden CPU-backend symbols. Unlike the ggml_backend_graph_compute
     // call sites below, no #ifdef is needed here: the wrapper itself is
     // already safe to call in every build, but its RESULT is guarded before
-    // dereferencing, matching every other call site in this file (:27339,
-    // :62850, :63036, :73628, :105980) -- it returns nullptr for an
-    // out-of-range type (cpu-traits-support.cpp).
+    // dereferencing, matching every other ggml_sycl_get_type_traits_cpu()
+    // call site in this file, which all null-check the result before
+    // reading a member -- it returns nullptr for an out-of-range type
+    // (cpu-traits-support.cpp).
     const ggml_type_traits_cpu * cpu_traits = ggml_sycl_get_type_traits_cpu(dst->type);
     if (!cpu_traits) {
         GGML_LOG_WARN("[ATTN-HOST] no CPU type traits for dst type; declining host SET_ROWS\n");
