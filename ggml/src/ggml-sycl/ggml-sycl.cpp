@@ -81136,9 +81136,17 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     // accessor outside GGML_BACKEND_DL, a private portable baseline table
     // under it -- and the raw accessor is itself one of the DL audit's
     // forbidden CPU-backend symbols. Unlike the ggml_backend_graph_compute
-    // call sites below, no #ifdef is needed here: the wrapper is already
-    // safe to call in every build.
-    const ggml_from_float_t from_float = ggml_sycl_get_type_traits_cpu(dst->type)->from_float;
+    // call sites below, no #ifdef is needed here: the wrapper itself is
+    // already safe to call in every build, but its RESULT is guarded before
+    // dereferencing, matching every other call site in this file (:27339,
+    // :62850, :63036, :73628, :105980) -- it returns nullptr for an
+    // out-of-range type (cpu-traits-support.cpp).
+    const ggml_type_traits_cpu * cpu_traits = ggml_sycl_get_type_traits_cpu(dst->type);
+    if (!cpu_traits) {
+        GGML_LOG_WARN("[ATTN-HOST] no CPU type traits for dst type; declining host SET_ROWS\n");
+        return false;
+    }
+    const ggml_from_float_t from_float = cpu_traits->from_float;
     if (val_src->type == GGML_TYPE_F32 && from_float &&
         (ids_src->type == GGML_TYPE_I64 || ids_src->type == GGML_TYPE_I32)) {
         const int64_t nc   = val_src->ne[0];
