@@ -536,6 +536,229 @@ TEST(atomic_write) {
 }
 
 // =============================================================================
+// llama.cpp-7n6n (wires nphx Task 5): the "ubatch" entry kind (v2) --
+// UbatchCacheKey/UbatchCacheEntry, their JSON (de)serialization, and
+// save_ubatch_cache()/load_ubatch_cache(). Every test below uses its OWN
+// temp directory (never get_cache_dir()'s real XDG/$HOME location) so this
+// binary never touches the real cache, matching the rest of this file's
+// per-pid-unique-device-name discipline.
+// =============================================================================
+
+// Test: CACHE_VERSION was bumped to 2 for this task (v1 stays reserved for
+// the pre-existing matmul dispatch-tuning format alone).
+TEST(cache_version_is_2) {
+    ASSERT(CACHE_VERSION == 2);
+    return true;
+}
+
+// Test: UbatchCacheKey::operator== compares every field; changing any ONE
+// field must make two otherwise-identical keys compare unequal.
+TEST(ubatch_key_equality) {
+    UbatchCacheKey a;
+    a.device_key = "Arc_Pro_B70@1.3.12345";
+    a.model_name = "mistral-7b-v0.1";
+    a.model_size = 4108931808ULL;
+    a.model_hash = 0x0123456789abcdefULL;
+    a.n_ctx      = 4096;
+    a.n_batch    = 2048;
+    a.flash_attn = true;
+
+    UbatchCacheKey b = a;
+    ASSERT(a == b);
+    ASSERT(!(a != b));
+
+    b            = a;
+    b.device_key = "Arc_Pro_B50@1.3.12345";
+    ASSERT(a != b);
+    b            = a;
+    b.model_name = "mistral-7b-v0.2";
+    ASSERT(a != b);
+    b            = a;
+    b.model_size = a.model_size + 1;
+    ASSERT(a != b);
+    b            = a;
+    b.model_hash = a.model_hash ^ 1ULL;
+    ASSERT(a != b);
+    b       = a;
+    b.n_ctx = a.n_ctx + 1;
+    ASSERT(a != b);
+    b         = a;
+    b.n_batch = a.n_batch + 1;
+    ASSERT(a != b);
+    b            = a;
+    b.flash_attn = !a.flash_attn;
+    ASSERT(a != b);
+
+    return true;
+}
+
+// Test: ubatch_entry_to_json / ubatch_entry_from_json round-trip every
+// field, including the nested key.
+TEST(ubatch_entry_serialization) {
+    UbatchCacheEntry e;
+    e.key.device_key = "Arc_Pro_B70@1.3.12345";
+    e.key.model_name = "mistral-7b-v0.1";
+    e.key.model_size = 4108931808ULL;
+    e.key.model_hash = 0x0123456789abcdefULL;
+    e.key.n_ctx      = 4096;
+    e.key.n_batch    = 2048;
+    e.key.flash_attn = true;
+    e.n_ubatch       = 1024;
+    e.reason         = "ladder";
+    e.created        = "2026-09-11T12:34:56Z";
+
+    std::string json = ubatch_entry_to_json(e);
+    ASSERT(json.find("\"device_key\":\"Arc_Pro_B70@1.3.12345\"") != std::string::npos);
+    ASSERT(json.find("\"model_size\":4108931808") != std::string::npos);
+    ASSERT(json.find("\"n_ubatch\":1024") != std::string::npos);
+    ASSERT(json.find("\"reason\":\"ladder\"") != std::string::npos);
+
+    UbatchCacheEntry restored = ubatch_entry_from_json(json);
+    ASSERT(restored.key == e.key);
+    ASSERT(restored.n_ubatch == e.n_ubatch);
+    ASSERT(restored.reason == e.reason);
+    ASSERT(restored.created == e.created);
+
+    return true;
+}
+
+// Test: save_ubatch_cache()/load_ubatch_cache() round-trip several entries
+// for one device, under an explicit temp cache_dir (never get_cache_dir()).
+TEST(ubatch_cache_file_roundtrip) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchDevice_" + std::to_string(getpid());
+
+    UbatchCacheEntry e1;
+    e1.key.device_key = "Arc_Pro_B70@1.3.12345";
+    e1.key.model_name = "mistral-7b-v0.1";
+    e1.key.model_size = 4108931808ULL;
+    e1.key.model_hash = 111ULL;
+    e1.key.n_ctx      = 4096;
+    e1.key.n_batch    = 2048;
+    e1.key.flash_attn = true;
+    e1.n_ubatch       = 1024;
+    e1.reason         = "ladder";
+    e1.created        = "2026-09-11T12:34:56Z";
+
+    UbatchCacheEntry e2 = e1;
+    e2.key.n_ctx        = 8192;
+    e2.n_ubatch         = 512;
+    e2.reason           = "cached";
+
+    std::vector<UbatchCacheEntry> entries{ e1, e2 };
+    ASSERT(save_ubatch_cache(cache_dir, device_name, entries));
+
+    struct stat st;
+    ASSERT(stat(get_ubatch_cache_file(cache_dir, device_name).c_str(), &st) == 0);
+    ASSERT(S_ISREG(st.st_mode));
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 2);
+
+    bool found_e1 = false, found_e2 = false;
+    for (const auto & e : loaded) {
+        if (e.key == e1.key) {
+            ASSERT(e.n_ubatch == 1024);
+            ASSERT(e.reason == "ladder");
+            found_e1 = true;
+        }
+        if (e.key == e2.key) {
+            ASSERT(e.n_ubatch == 512);
+            ASSERT(e.reason == "cached");
+            found_e2 = true;
+        }
+    }
+    ASSERT(found_e1 && found_e2);
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    return true;
+}
+
+// Test: a v1 (or any non-current-version) ubatch cache file is rejected --
+// load_ubatch_cache() must return false, leaving `entries` empty, exactly
+// like load_cache()'s own version check (tuning-cache-io.hpp:~380-384).
+TEST(ubatch_cache_v1_file_rejected) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v1_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchV1Device_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 1,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": []\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == false);
+    ASSERT(loaded.empty());
+
+    // A store afterwards must rewrite it wholesale at the current version --
+    // never merge with (or preserve) the rejected v1 content.
+    UbatchCacheEntry e;
+    e.key.device_key = "Dev@1.0";
+    e.key.model_name = "m";
+    e.n_ubatch       = 777;
+    e.reason         = "ladder";
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { e }));
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1);
+    ASSERT(loaded[0].n_ubatch == 777);
+
+    std::remove(path.c_str());
+    return true;
+}
+
+// Test: an unwritable directory makes save_ubatch_cache() return false (no
+// throw), and a missing file makes load_ubatch_cache() return false (no
+// throw, entries left empty) -- the two halves of the "unwritable dir"
+// acceptance criterion.
+TEST(ubatch_cache_unwritable_dir) {
+    std::string device_name = "TestUbatchUnwritable_" + std::to_string(getpid());
+
+    // A regular FILE occupying the path a directory is expected at: mkdir()
+    // (inside create_dir_recursive()) fails, and so does opening the
+    // "<file>/<sanitized>-ubatch.json.tmp" temp path underneath it --
+    // reliable and portable, unlike relying on permission bits (which root
+    // or a container can bypass).
+    std::string blocker = "/tmp/llama_test_ubatch_cache_blocker_" + std::to_string(getpid());
+    std::remove(blocker.c_str());
+    std::ofstream(blocker) << "not a directory\n";
+
+    std::string cache_dir = blocker + "/nested";  // blocker is a FILE, so this can never be created
+
+    UbatchCacheEntry e;
+    e.key.device_key = "Dev@1.0";
+    e.key.model_name = "m";
+    e.n_ubatch       = 1;
+    e.reason         = "ladder";
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { e }) == false);
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded) == false);
+    ASSERT(loaded.empty());
+
+    std::remove(blocker.c_str());
+    return true;
+}
+
+// Test: load_ubatch_cache() on a device with no file at all returns false
+// and leaves `entries` empty -- mirrors load_missing_file above, for the
+// ubatch entry kind.
+TEST(ubatch_cache_load_missing_file) {
+    std::string                   cache_dir = "/tmp/llama_test_ubatch_cache_missing_" + std::to_string(getpid());
+    std::vector<UbatchCacheEntry> entries;
+    bool                          result = load_ubatch_cache(cache_dir, "NonExistentUbatchDevice_12345678", entries);
+    ASSERT(result == false);
+    ASSERT(entries.empty());
+    return true;
+}
+
+// =============================================================================
 // Main test runner
 // =============================================================================
 int main() {
@@ -560,6 +783,14 @@ int main() {
     RUN_TEST(parse_bool_edge_cases);
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
+
+    RUN_TEST(cache_version_is_2);
+    RUN_TEST(ubatch_key_equality);
+    RUN_TEST(ubatch_entry_serialization);
+    RUN_TEST(ubatch_cache_file_roundtrip);
+    RUN_TEST(ubatch_cache_v1_file_rejected);
+    RUN_TEST(ubatch_cache_unwritable_dir);
+    RUN_TEST(ubatch_cache_load_missing_file);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";

@@ -417,6 +417,61 @@ GGML_BACKEND_API uint64_t ggml_backend_sycl_compute_buffer_host_fallbacks(int de
 // enabled -- GGML_SYCL_AUTO_UBATCH, default ON.
 GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 
+// llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch tuning
+// cache -- a small on-disk store at
+// ~/.cache/llama.cpp/sycl-tuning/<sanitized device name>-ubatch.json (see
+// tuning-cache-io.hpp's "Ubatch Cache Entry (v2)" section for the format)
+// that lets a repeat start of the SAME device+model+context shape skip
+// sycl_select_auto_ubatch()'s ladder entirely. `device` is the same logical
+// SYCL device index used throughout this header (indexes
+// ggml_sycl_info().devices[]); the device name and driver version making up
+// the on-disk key are read from there, never passed in, so callers never
+// duplicate that lookup. `model_name`/`model_size`/`model_hash` identify the
+// exact set of loaded tensors (GGUF general.name, llama_model::size()'s
+// total tensor bytes, and a cheap FNV-1a hash over each tensor's (name,
+// byte size)) -- the same model file copied elsewhere hits; a re-quantised
+// file changes tensor byte sizes and so misses. All pointer fields are
+// borrowed: valid only for the duration of the call, never retained.
+struct ggml_sycl_ubatch_cache_key {
+    int          device;
+    const char * model_name;
+    uint64_t     model_size;
+    uint64_t     model_hash;
+    uint32_t     n_ctx;
+    uint32_t     n_batch;
+    bool         flash_attn;
+};
+
+// Whether the persisted auto n_ubatch cache is enabled -- GGML_SYCL_TUNING_CACHE,
+// default ON. "0" disables BOTH lookup and store below (every call then
+// returns false without touching the filesystem); any other non-empty value
+// is treated as enabled, with one WARN.
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_enabled(void);
+
+// Resolve the on-disk path `device`'s cache file would use (honours
+// GGML_SYCL_TUNING_CACHE_DIR; falls back to XDG per tuning-cache-io.hpp's
+// get_cache_dir()), for diagnostics -- resolved unconditionally, even when
+// the cache is disabled, so a WARN can still name where it would have
+// written. Returns false (buf left untouched) for an out-of-range device.
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size);
+
+// Look up a previously-persisted auto n_ubatch for this exact key. Returns
+// false (leaving *n_ubatch untouched) on a cache miss, a disabled cache, an
+// out-of-range device, or an unreadable/corrupt/wrong-version file -- the
+// caller's ladder trial tolerates every one of those identically (a cold
+// cache), so this never throws and never distinguishes them.
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup(const struct ggml_sycl_ubatch_cache_key * key,
+                                                            uint32_t *                                n_ubatch);
+
+// Persist the chosen n_ubatch for this exact key (atomic write; see
+// tuning-cache-io.hpp). `reason` is recorded verbatim ("ladder" or "cached")
+// for diagnostics. Returns false (never throws) on a disabled cache, an
+// out-of-range device, or a write failure -- the caller logs one WARN and
+// continues; a failed store never blocks inference.
+GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store(const struct ggml_sycl_ubatch_cache_key * key,
+                                                           uint32_t                                  n_ubatch,
+                                                           const char *                              reason);
+
 // Provide the actual layer membership for the next KV buffer allocation on a
 // SYCL device. llama_kv_cache may create multiple same-sized KV buffers for
 // heterogeneous attention (for example non-SWA and SWA layers); the SYCL

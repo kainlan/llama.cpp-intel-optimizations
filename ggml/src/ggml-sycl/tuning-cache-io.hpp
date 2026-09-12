@@ -17,13 +17,17 @@
 
 #include "tuning-engine.hpp"
 
+#include <sys/stat.h>
+
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
+#include <vector>
 #ifdef _WIN32
 #    include <direct.h>
 #endif
@@ -43,7 +47,17 @@ inline int sycl_tuning_mkdir(const char * path) {
 // =============================================================================
 // Cache Version: Increment when format changes (for migration support)
 // =============================================================================
-constexpr int CACHE_VERSION = 1;
+// v2 (llama.cpp-7n6n): adds the "ubatch" entry kind below (UbatchCacheKey /
+// UbatchCacheEntry / save_ubatch_cache / load_ubatch_cache), alongside the
+// pre-existing matmul dispatch-tuning entry kind (TuningKey / TuningEntry /
+// TunedParams / save_cache / load_cache) this header already implemented.
+// The two kinds are otherwise independent -- different structs, different
+// per-device files (get_cache_file() vs get_ubatch_cache_file(), the latter
+// suffixed "-ubatch" so the two never collide) -- but share this constant,
+// so a v1 file of EITHER kind is rejected by the version check already in
+// load_cache()/load_ubatch_cache() below and gets rewritten wholesale on the
+// next store; no separate migration code was needed for that.
+constexpr int CACHE_VERSION = 2;
 
 // =============================================================================
 // Path Utilities
@@ -303,6 +317,240 @@ inline TuningEntry entry_from_json(const std::string& json) {
     entry.timestamp = static_cast<int64_t>(parse_int(json, "timestamp"));
 
     return entry;
+}
+
+// =============================================================================
+// Ubatch Cache Entry (v2): persists the SYCL auto micro-batch selection
+// trial's chosen n_ubatch (llama.cpp-7n6n, wiring llama.cpp-nphx Task 5).
+// Orthogonal to the matmul dispatch-tuning TuningKey/TuningEntry/TunedParams
+// model above: this entry kind has its own key composition (device+driver+
+// model identity+context shape, not quant_type/batch_bucket/K/N) and its
+// own per-device file (get_ubatch_cache_file(), suffixed "-ubatch.json" so
+// it never collides with the matmul cache's <device>.json for the SAME
+// device), but shares CACHE_VERSION and the same atomic-write /
+// version-mismatch-rejects-and-rewrites discipline as save_cache()/
+// load_cache() above.
+// =============================================================================
+
+struct UbatchCacheKey {
+    // sanitize_device_name(name) + "@" + driver_version -- both queried at
+    // device init (ggml-sycl.cpp's ggml_sycl_info() builder) and carried in
+    // sycl_device_info next to device_name (common.hpp). No PCI id: it
+    // moves across boots on this host (see CLAUDE.md's device-topology
+    // note), so it cannot be part of a stable key.
+    std::string device_key;
+    // GGUF general.name (llama_model::name) + llama_model::size()'s total
+    // tensor bytes + a 64-bit FNV-1a hash over every tensor's (name, byte
+    // size) -- the same model file copied elsewhere hits; a re-quantised
+    // file misses (its tensor byte sizes change).
+    std::string model_name;
+    uint64_t    model_size = 0;
+    uint64_t    model_hash = 0;
+    uint32_t    n_ctx      = 0;
+    uint32_t    n_batch    = 0;
+    bool        flash_attn = false;
+
+    bool operator==(const UbatchCacheKey & other) const {
+        return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
+               model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
+               flash_attn == other.flash_attn;
+    }
+
+    bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
+};
+
+struct UbatchCacheEntry {
+    UbatchCacheKey key;
+    uint32_t       n_ubatch = 0;
+    std::string    reason;   // "ladder" | "cached"
+    std::string    created;  // ISO 8601, UTC (e.g. "2026-09-11T12:34:56Z")
+};
+
+// Parse an unsigned 64-bit value from JSON at key position. parse_int()
+// above is capped at a plain `int`; model_size and model_hash need the full
+// 64-bit range (model_hash in particular is an arbitrary hash, not a count).
+inline uint64_t parse_u64(const std::string & json, const std::string & key) {
+    std::string search = "\"" + key + "\":";
+    size_t      pos    = json.find(search);
+    if (pos == std::string::npos) {
+        return 0;
+    }
+
+    pos += search.size();
+    pos = skip_whitespace(json, pos);
+
+    uint64_t val = 0;
+    while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
+        val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
+        pos++;
+    }
+    return val;
+}
+
+// Serialize a UbatchCacheKey's fields into a JSON object body (no enclosing
+// braces -- the caller wraps it alongside its own n_ubatch/reason/created
+// fields, mirroring how entry_to_json() above nests params_to_json()).
+inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
+    std::ostringstream ss;
+    ss << "\"device_key\":\"" << k.device_key << "\","
+       << "\"model_name\":\"" << k.model_name << "\","
+       << "\"model_size\":" << k.model_size << ","
+       << "\"model_hash\":" << k.model_hash << ","
+       << "\"n_ctx\":" << k.n_ctx << ","
+       << "\"n_batch\":" << k.n_batch << ","
+       << "\"flash_attn\":" << (k.flash_attn ? "true" : "false");
+    return ss.str();
+}
+
+inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
+    UbatchCacheKey k;
+    k.device_key = parse_string(json, "device_key");
+    k.model_name = parse_string(json, "model_name");
+    k.model_size = parse_u64(json, "model_size");
+    k.model_hash = parse_u64(json, "model_hash");
+    k.n_ctx      = static_cast<uint32_t>(parse_int(json, "n_ctx"));
+    k.n_batch    = static_cast<uint32_t>(parse_int(json, "n_batch"));
+    k.flash_attn = parse_bool(json, "flash_attn");
+    return k;
+}
+
+inline std::string ubatch_entry_to_json(const UbatchCacheEntry & e) {
+    std::ostringstream ss;
+    ss << "{" << ubatch_key_to_json(e.key) << ","
+       << "\"n_ubatch\":" << e.n_ubatch << ","
+       << "\"reason\":\"" << e.reason << "\","
+       << "\"created\":\"" << e.created << "\""
+       << "}";
+    return ss.str();
+}
+
+inline UbatchCacheEntry ubatch_entry_from_json(const std::string & json) {
+    UbatchCacheEntry e;
+    e.key      = ubatch_key_from_json(json);
+    e.n_ubatch = static_cast<uint32_t>(parse_int(json, "n_ubatch"));
+    e.reason   = parse_string(json, "reason");
+    e.created  = parse_string(json, "created");
+    return e;
+}
+
+// Cache file path for one device's ubatch entries, under `cache_dir` (the
+// caller resolves `cache_dir` itself -- get_cache_dir() for the default XDG
+// location, or a GGML_SYCL_TUNING_CACHE_DIR override; unlike get_cache_file()
+// above, this is not hardwired to get_cache_dir(), so a caller-supplied
+// override never has to fight this header's own XDG default). Suffixed
+// "-ubatch" so this store never collides with the matmul dispatch-tuning
+// cache, which already claims "<sanitized device name>.json" for the SAME
+// physical device.
+inline std::string get_ubatch_cache_file(const std::string & cache_dir, const std::string & device_name) {
+    return cache_dir + "/" + sanitize_device_name(device_name) + "-ubatch.json";
+}
+
+// Save every entry for one device, atomically (write to .tmp, then rename;
+// same discipline as save_cache() above). Returns true on success, false on
+// failure (e.g. an unwritable directory) -- never throws.
+inline bool save_ubatch_cache(const std::string &                   cache_dir,
+                              const std::string &                   device_name,
+                              const std::vector<UbatchCacheEntry> & entries) {
+    create_dir_recursive(cache_dir);
+
+    std::string path      = get_ubatch_cache_file(cache_dir, device_name);
+    std::string temp_path = path + ".tmp";
+
+    std::ofstream f(temp_path);
+    if (!f) {
+        return false;
+    }
+
+    f << "{\n";
+    f << "  \"version\": " << CACHE_VERSION << ",\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        f << "    " << ubatch_entry_to_json(entries[i]);
+        if (i + 1 < entries.size()) {
+            f << ",";
+        }
+        f << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+
+    f.close();
+    if (!f) {
+        std::remove(temp_path.c_str());
+        return false;
+    }
+
+    if (std::rename(temp_path.c_str(), path.c_str()) != 0) {
+        std::remove(temp_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+// Load every entry for one device. Returns false (entries left empty) on a
+// missing file, an unreadable file, or a version mismatch (a v1 -- or any
+// other-version -- file is rejected exactly like load_cache() above, so it
+// reads as a plain miss and gets rewritten wholesale on the next store).
+// Never throws.
+inline bool load_ubatch_cache(const std::string &             cache_dir,
+                              const std::string &             device_name,
+                              std::vector<UbatchCacheEntry> & entries) {
+    entries.clear();
+
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ifstream f(path);
+    if (!f) {
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+
+    int version = parse_int(content, "version");
+    if (version != CACHE_VERSION) {
+        return false;
+    }
+
+    size_t entries_pos = content.find("\"entries\":");
+    if (entries_pos == std::string::npos) {
+        return false;
+    }
+    size_t array_start = content.find('[', entries_pos);
+    if (array_start == std::string::npos) {
+        return false;
+    }
+
+    size_t pos = array_start + 1;
+    while (pos < content.size()) {
+        while (pos < content.size() &&
+               (std::isspace(static_cast<unsigned char>(content[pos])) || content[pos] == ',')) {
+            pos++;
+        }
+        if (pos >= content.size() || content[pos] == ']') {
+            break;
+        }
+        if (content[pos] == '{') {
+            int    brace_count = 1;
+            size_t start       = pos;
+            pos++;
+            while (pos < content.size() && brace_count > 0) {
+                if (content[pos] == '{') {
+                    brace_count++;
+                }
+                if (content[pos] == '}') {
+                    brace_count--;
+                }
+                pos++;
+            }
+            entries.push_back(ubatch_entry_from_json(content.substr(start, pos - start)));
+        } else {
+            pos++;  // Skip unexpected character
+        }
+    }
+
+    return true;
 }
 
 // =============================================================================

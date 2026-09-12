@@ -3237,9 +3237,19 @@ endif()
 # {512, 1024, 2048, 4096} ladder and its n_batch/n_ctx/MoE-ceiling caps, the
 # per-candidate probe (BUSY backoff, STALE_IDENTITY, would_demote_kv),
 # publish-before-reserve ordering, the host-fallback query consulted after
-# reserve, the settle step, the seven stop-reason strings, and exactly one
-# [SYCL-PLAN] auto n_ubatch= WARN. Host-only, reads the sources as text.
-# Same registration shape as test-sycl-compute-buffer-fallback-source above.
+# reserve, the settle step, the stop-reason strings (eight since
+# llama.cpp-7n6n added "cached" -- see below), and exactly one [SYCL-PLAN]
+# auto n_ubatch= WARN. Host-only, reads the sources as text. Same
+# registration shape as test-sycl-compute-buffer-fallback-source above.
+#
+# llama.cpp-7n6n (nphx Task 5, wired into the same trial): the persisted
+# auto n_ubatch cache -- tried BEFORE the ladder (a clean hit sets the new
+# "cached" stop reason and skips every rung); a store that follows any
+# ladder run, never a hit; GGML_SYCL_TUNING_CACHE=0 disabling both. This
+# file's own tests cover the ordering and the new stop reason; the on-disk
+# format (tuning-cache-io.hpp's UbatchCacheKey/UbatchCacheEntry) is covered
+# by test-tuning-cache-io below instead, since that part is pure host I/O
+# with no SYCL device involved either way.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-auto-ubatch-source
@@ -3247,3 +3257,15 @@ if (Python3_Interpreter_FOUND)
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()
+
+# llama.cpp-7n6n: unit tests for tuning-cache-io.hpp (JSON I/O, atomic
+# writes, XDG cache-dir resolution, and -- as of this task -- the "ubatch"
+# entry kind wired for the persisted auto n_ubatch cache: UbatchCacheKey/
+# UbatchCacheEntry round-trip, key equality per field, CACHE_VERSION bump
+# rejecting a v1 file, and an unwritable directory failing save/load
+# cleanly). Pure header + STL: no ggml/llama/SYCL dependency at all, so this
+# was previously an unregistered file (zero production callers, per
+# plan-research/tuning-cache.md) -- this task adds the registration. Never
+# writes to the real $HOME; every test that touches the filesystem uses a
+# unique per-pid device/dir name under /tmp and cleans up after itself.
+llama_build_and_test(test-tuning-cache-io.cpp)
