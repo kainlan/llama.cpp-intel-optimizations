@@ -19,6 +19,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -30,6 +31,9 @@
 #include <vector>
 #ifdef _WIN32
 #    include <direct.h>
+#    include <process.h>
+#else
+#    include <unistd.h>
 #endif
 
 namespace ggml_sycl_tuning {
@@ -41,6 +45,24 @@ inline int sycl_tuning_mkdir(const char * path) {
     return _mkdir(path);
 #else
     return mkdir(path, 0755);
+#endif
+}
+
+// Portable getpid (Windows: _getpid in <process.h>; POSIX: getpid in
+// <unistd.h>) -- gives each process's atomic-write temp file a unique name
+// (llama.cpp-7n6n): two processes writing the SAME device's cache
+// concurrently used to interleave into one shared "<path>.tmp", so whichever
+// renamed last could win with a partially-written file. A per-pid suffix
+// makes that impossible; the pre-existing atomic rename-into-place still
+// makes any ONE writer's own result crash-safe. A concurrent writer can
+// still lose an entry the OTHER writer had (last rename wins) -- accepted,
+// since that costs one extra ladder revalidation on the next start, never a
+// wrong choice (see ubatch-tuning-cache.cpp's store for the same tradeoff).
+inline long sycl_tuning_getpid() {
+#ifdef _WIN32
+    return static_cast<long>(_getpid());
+#else
+    return static_cast<long>(getpid());
 #endif
 }
 
@@ -178,7 +200,14 @@ inline size_t skip_whitespace(const std::string& json, size_t pos) {
     return pos;
 }
 
-// Parse integer value from JSON at key position
+// Parse integer value from JSON at key position. Capped at 10 digits
+// (INT_MAX is 10 digits): a value with more digits than this is malformed or
+// corrupted input, and accumulating past that overflows a signed int, which
+// is UB. Digits beyond the cap are still consumed (so
+// the scan position stays correct for whatever comes after) but not
+// accumulated, which pins the result at whatever leading digits were seen --
+// safe, and reliably fails to match any real key a caller would ever look
+// up with.
 inline int parse_int(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
@@ -193,8 +222,12 @@ inline int parse_int(const std::string& json, const std::string& key) {
         neg = true;
         pos++;
     }
+    int digits = 0;
     while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-        val = val * 10 + (json[pos] - '0');
+        if (digits < 10) {
+            val = val * 10 + (json[pos] - '0');
+            digits++;
+        }
         pos++;
     }
     return neg ? -val : val;
@@ -216,7 +249,59 @@ inline bool parse_bool(const std::string& json, const std::string& key) {
     return false;
 }
 
-// Parse string value from JSON at key position
+// Escape a string for embedding as a JSON string value: backslash, double
+// quote, and control characters (< 0x20) as \uXXXX.
+// parse_string() below already un-escapes on load; WITHOUT this, a
+// model_name/device_key/reason containing a `"` or `\` (e.g. a Windows path
+// "C:\models\foo.gguf", or a model name containing a quote) round-trips to
+// a DIFFERENT string, so the stored key never matches the looked-up key on
+// the next start -- no hit ever, and a new entry is appended on every run.
+inline std::string json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\b':
+                out += "\\b";
+                break;
+            case '\f':
+                out += "\\f";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+// Parse string value from JSON at key position. Handles the standard JSON
+// escapes (\", \\, \/, \b, \f, \n, \r, \t) and \uXXXX --
+// json_escape() above emits \uXXXX for every control character, so this
+// must be able to read it back; a malformed \u sequence falls back to the
+// pre-existing lenient behaviour of dropping the backslash and keeping the
+// next character literally, so a hand-edited or partially-corrupted file
+// still loads something rather than truncating the string at that point).
 inline std::string parse_string(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
@@ -231,7 +316,84 @@ inline std::string parse_string(const std::string& json, const std::string& key)
     std::string result;
     while (pos < json.size() && json[pos] != '"') {
         if (json[pos] == '\\' && pos + 1 < json.size()) {
-            pos++;  // Skip escape character
+            char esc = json[pos + 1];
+            if (esc == 'u' && pos + 5 < json.size()) {
+                unsigned int code = 0;
+                bool         ok   = true;
+                for (int i = 0; i < 4 && ok; ++i) {
+                    char h = json[pos + 2 + i];
+                    code <<= 4;
+                    if (h >= '0' && h <= '9') {
+                        code |= static_cast<unsigned int>(h - '0');
+                    } else if (h >= 'a' && h <= 'f') {
+                        code |= static_cast<unsigned int>(h - 'a' + 10);
+                    } else if (h >= 'A' && h <= 'F') {
+                        code |= static_cast<unsigned int>(h - 'A' + 10);
+                    } else {
+                        ok = false;
+                    }
+                }
+                if (ok) {
+                    // UTF-8 encode; our own json_escape() only ever emits
+                    // \u for control chars < 0x20 (single-byte), but encode
+                    // the full BMP range correctly for a foreign/hand-edited
+                    // file (no surrogate-pair handling -- not needed for
+                    // anything this store writes itself).
+                    if (code < 0x80) {
+                        result += static_cast<char>(code);
+                    } else if (code < 0x800) {
+                        result += static_cast<char>(0xC0 | (code >> 6));
+                        result += static_cast<char>(0x80 | (code & 0x3F));
+                    } else {
+                        result += static_cast<char>(0xE0 | (code >> 12));
+                        result += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                        result += static_cast<char>(0x80 | (code & 0x3F));
+                    }
+                    pos += 6;
+                    continue;
+                }
+                // Malformed \u -- fall through to the generic lenient case.
+            } else {
+                switch (esc) {
+                    case '"':
+                        result += '"';
+                        pos += 2;
+                        continue;
+                    case '\\':
+                        result += '\\';
+                        pos += 2;
+                        continue;
+                    case '/':
+                        result += '/';
+                        pos += 2;
+                        continue;
+                    case 'b':
+                        result += '\b';
+                        pos += 2;
+                        continue;
+                    case 'f':
+                        result += '\f';
+                        pos += 2;
+                        continue;
+                    case 'n':
+                        result += '\n';
+                        pos += 2;
+                        continue;
+                    case 'r':
+                        result += '\r';
+                        pos += 2;
+                        continue;
+                    case 't':
+                        result += '\t';
+                        pos += 2;
+                        continue;
+                    default:
+                        break;
+                }
+            }
+            // Generic lenient fallback (pre-existing behaviour): drop the
+            // backslash, keep the next character literally.
+            pos++;
         }
         result += json[pos];
         pos++;
@@ -344,16 +506,31 @@ struct UbatchCacheKey {
     // size) -- the same model file copied elsewhere hits; a re-quantised
     // file misses (its tensor byte sizes change).
     std::string model_name;
-    uint64_t    model_size = 0;
-    uint64_t    model_hash = 0;
-    uint32_t    n_ctx      = 0;
-    uint32_t    n_batch    = 0;
-    bool        flash_attn = false;
+    uint64_t    model_size      = 0;
+    uint64_t    model_hash      = 0;
+    uint32_t    n_ctx           = 0;
+    uint32_t    n_batch         = 0;
+    bool        flash_attn      = false;
+    // llama.cpp-7n6n: three key omissions that all
+    // land in the same direction as the Q2 sticky-hit bug -- a shape change
+    // in any of these can change which candidates the ladder accepts
+    // without changing anything the key used to track.
+    uint32_t    n_seq_max       = 0;  // cparams.n_seq_max, passed to the probe on every candidate
+    int32_t     type_k          = 0;  // params.type_k -- KV element type drives would_demote_kv
+    int32_t     type_v          = 0;  // params.type_v -- ditto
+    // FNV-1a 32-bit hash over the ORDERED dev_index sequence of every SYCL
+    // backend this context has, not just the first -- level_zero:0 and
+    // level_zero:0,1 both put device 0 first, so keying only on the first
+    // device made those two selector shapes share one cache entry even
+    // though the actual runtime demand (and so which candidates fit)
+    // differs between a single-GPU and a multi-GPU run.
+    uint32_t    device_set_hash = 0;
 
     bool operator==(const UbatchCacheKey & other) const {
         return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
                model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
-               flash_attn == other.flash_attn;
+               flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
+               type_v == other.type_v && device_set_hash == other.device_set_hash;
     }
 
     bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
@@ -362,11 +539,16 @@ struct UbatchCacheKey {
 struct UbatchCacheEntry {
     UbatchCacheKey key;
     uint32_t       n_ubatch = 0;
-    // Free-form diagnostic (see ggml_backend_sycl_ubatch_cache_store()'s own
-    // comment, ggml-sycl.h): today's only writer always passes "ladder" --
-    // a cache hit never re-stores itself, so "cached" never actually reaches
-    // this field despite being a valid stop-reason string on the caller's
-    // own vocabulary. Reserved, not currently written.
+    // llama.cpp-7n6n: the REAL outcome the value was
+    // stored with -- one of the eight sycl_select_auto_ubatch() stop
+    // reasons, MINUS "cached" (a hit never re-stores an unchanged outcome;
+    // see the store's own doc comment, ggml-sycl.h) and minus "transaction
+    // busy"/"not the published model" (pure races the caller explicitly
+    // does not persist). A future lookup uses this to tell a TERMINAL
+    // outcome ("ladder exhausted", "MoE GPU routing ceiling" -- nothing
+    // above this value was ever going to fit) from one that merely lost a
+    // transient race, in which case the ladder resumes above the cached
+    // value instead of trusting it forever.
     std::string    reason;
     std::string    created;  // ISO 8601, UTC (e.g. "2026-09-11T12:34:56Z")
 };
@@ -374,6 +556,12 @@ struct UbatchCacheEntry {
 // Parse an unsigned 64-bit value from JSON at key position. parse_int()
 // above is capped at a plain `int`; model_size and model_hash need the full
 // 64-bit range (model_hash in particular is an arbitrary hash, not a count).
+// Capped at 19 digits: UINT64_MAX is 20 digits, but
+// 19 nines (9999999999999999999) still fits in 64 bits, so a 19-digit cap
+// is the largest that can never overflow during accumulation, which would
+// otherwise be UB. As with parse_int() above, digits beyond the cap are
+// consumed but not accumulated -- safe, and reliably fails to match any
+// real key.
 inline uint64_t parse_u64(const std::string & json, const std::string & key) {
     std::string search = "\"" + key + "\":";
     size_t      pos    = json.find(search);
@@ -384,9 +572,13 @@ inline uint64_t parse_u64(const std::string & json, const std::string & key) {
     pos += search.size();
     pos = skip_whitespace(json, pos);
 
-    uint64_t val = 0;
+    uint64_t val    = 0;
+    int      digits = 0;
     while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-        val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
+        if (digits < 19) {
+            val = val * 10 + static_cast<uint64_t>(json[pos] - '0');
+            digits++;
+        }
         pos++;
     }
     return val;
@@ -395,35 +587,49 @@ inline uint64_t parse_u64(const std::string & json, const std::string & key) {
 // Serialize a UbatchCacheKey's fields into a JSON object body (no enclosing
 // braces -- the caller wraps it alongside its own n_ubatch/reason/created
 // fields, mirroring how entry_to_json() above nests params_to_json()).
+// device_key and model_name are free-form strings (a Windows path, or a
+// model name containing a quote, are both real inputs) and so are routed
+// through json_escape(); every other field here is
+// numeric/boolean and needs no escaping.
 inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
     std::ostringstream ss;
-    ss << "\"device_key\":\"" << k.device_key << "\","
-       << "\"model_name\":\"" << k.model_name << "\","
+    ss << "\"device_key\":\"" << json_escape(k.device_key) << "\","
+       << "\"model_name\":\"" << json_escape(k.model_name) << "\","
        << "\"model_size\":" << k.model_size << ","
        << "\"model_hash\":" << k.model_hash << ","
        << "\"n_ctx\":" << k.n_ctx << ","
        << "\"n_batch\":" << k.n_batch << ","
-       << "\"flash_attn\":" << (k.flash_attn ? "true" : "false");
+       << "\"flash_attn\":" << (k.flash_attn ? "true" : "false") << ","
+       << "\"n_seq_max\":" << k.n_seq_max << ","
+       << "\"type_k\":" << k.type_k << ","
+       << "\"type_v\":" << k.type_v << ","
+       << "\"device_set_hash\":" << k.device_set_hash;
     return ss.str();
 }
 
 inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     UbatchCacheKey k;
-    k.device_key = parse_string(json, "device_key");
-    k.model_name = parse_string(json, "model_name");
-    k.model_size = parse_u64(json, "model_size");
-    k.model_hash = parse_u64(json, "model_hash");
-    k.n_ctx      = static_cast<uint32_t>(parse_int(json, "n_ctx"));
-    k.n_batch    = static_cast<uint32_t>(parse_int(json, "n_batch"));
-    k.flash_attn = parse_bool(json, "flash_attn");
+    k.device_key      = parse_string(json, "device_key");
+    k.model_name      = parse_string(json, "model_name");
+    k.model_size      = parse_u64(json, "model_size");
+    k.model_hash      = parse_u64(json, "model_hash");
+    k.n_ctx           = static_cast<uint32_t>(parse_int(json, "n_ctx"));
+    k.n_batch         = static_cast<uint32_t>(parse_int(json, "n_batch"));
+    k.flash_attn      = parse_bool(json, "flash_attn");
+    k.n_seq_max       = static_cast<uint32_t>(parse_int(json, "n_seq_max"));
+    k.type_k          = static_cast<int32_t>(parse_int(json, "type_k"));
+    k.type_v          = static_cast<int32_t>(parse_int(json, "type_v"));
+    k.device_set_hash = static_cast<uint32_t>(parse_u64(json, "device_set_hash"));
     return k;
 }
 
+// `reason` is free-form (escaped for the same reason
+// device_key/model_name are above).
 inline std::string ubatch_entry_to_json(const UbatchCacheEntry & e) {
     std::ostringstream ss;
     ss << "{" << ubatch_key_to_json(e.key) << ","
        << "\"n_ubatch\":" << e.n_ubatch << ","
-       << "\"reason\":\"" << e.reason << "\","
+       << "\"reason\":\"" << json_escape(e.reason) << "\","
        << "\"created\":\"" << e.created << "\""
        << "}";
     return ss.str();
@@ -450,6 +656,23 @@ inline std::string get_ubatch_cache_file(const std::string & cache_dir, const st
     return cache_dir + "/" + sanitize_device_name(device_name) + "-ubatch.json";
 }
 
+// Cap the entry count before a save (llama.cpp-7n6n): unbounded growth
+// is plausible across many models/context shapes on one device, and
+// `created` (an ISO-8601 timestamp, so plain string comparison sorts
+// correctly) was written to every entry but never read until this. A no-op
+// when `entries.size() <= max_entries`; otherwise keeps only the
+// `max_entries` most recently created entries. Lives here (not in
+// ubatch-tuning-cache.cpp, the only current caller) so it is testable from
+// a host-only unit test with no SYCL device involved.
+inline void cap_ubatch_cache_entries(std::vector<UbatchCacheEntry> & entries, size_t max_entries = 64) {
+    if (entries.size() <= max_entries) {
+        return;
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const UbatchCacheEntry & a, const UbatchCacheEntry & b) { return a.created > b.created; });
+    entries.resize(max_entries);
+}
+
 // Save every entry for one device, atomically (write to .tmp, then rename;
 // same discipline as save_cache() above). Returns true on success, false on
 // failure (e.g. an unwritable directory) -- never throws.
@@ -459,7 +682,10 @@ inline bool save_ubatch_cache(const std::string &                   cache_dir,
     create_dir_recursive(cache_dir);
 
     std::string path      = get_ubatch_cache_file(cache_dir, device_name);
-    std::string temp_path = path + ".tmp";
+    // Per-pid temp name (llama.cpp-7n6n): see sycl_tuning_getpid()'s
+    // own comment for why a shared "<path>.tmp" is unsafe under concurrent
+    // writers.
+    std::string temp_path = path + "." + std::to_string(sycl_tuning_getpid()) + ".tmp";
 
     std::ofstream f(temp_path);
     if (!f) {
@@ -468,7 +694,7 @@ inline bool save_ubatch_cache(const std::string &                   cache_dir,
 
     f << "{\n";
     f << "  \"version\": " << CACHE_VERSION << ",\n";
-    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"device\": \"" << json_escape(device_name) << "\",\n";
     f << "  \"entries\": [\n";
     for (size_t i = 0; i < entries.size(); ++i) {
         f << "    " << ubatch_entry_to_json(entries[i]);
@@ -567,7 +793,10 @@ inline bool load_ubatch_cache(const std::string &             cache_dir,
 template<typename IterableCache>
 inline bool save_cache(const IterableCache& cache, const std::string& device_name) {
     std::string path = get_cache_file(device_name);
-    std::string temp_path = path + ".tmp";
+    // Per-pid temp name (llama.cpp-7n6n): see sycl_tuning_getpid()'s
+    // own comment for why a shared "<path>.tmp" is unsafe under concurrent
+    // writers.
+    std::string temp_path = path + "." + std::to_string(sycl_tuning_getpid()) + ".tmp";
 
     // Ensure directory exists
     create_dir_recursive(get_cache_dir());
@@ -581,7 +810,7 @@ inline bool save_cache(const IterableCache& cache, const std::string& device_nam
     // Write JSON header
     f << "{\n";
     f << "  \"version\": " << CACHE_VERSION << ",\n";
-    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"device\": \"" << json_escape(device_name) << "\",\n";
     f << "  \"entries\": [\n";
 
     // Write entries

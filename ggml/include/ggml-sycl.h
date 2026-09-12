@@ -430,8 +430,15 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // exact set of loaded tensors (GGUF general.name, llama_model::size()'s
 // total tensor bytes, and a cheap FNV-1a hash over each tensor's (name,
 // byte size)) -- the same model file copied elsewhere hits; a re-quantised
-// file changes tensor byte sizes and so misses. All pointer fields are
-// borrowed: valid only for the duration of the call, never retained.
+// file changes tensor byte sizes and so misses. `n_seq_max`/`type_k`/
+// `type_v` round out the shapes that can change which
+// ladder candidates fit without changing anything the rest of the key
+// tracks. `device_set_hash` (same finding) is a hash over every SYCL
+// device's dev_index this context actually uses, in order -- `device`
+// alone names only the FIRST one, so a single-GPU and a multi-GPU run that
+// both start with the same device 0 would otherwise share one entry even
+// though the real demand differs. All pointer fields are borrowed: valid
+// only for the duration of the call, never retained.
 struct ggml_sycl_ubatch_cache_key {
     int          device;
     const char * model_name;
@@ -440,6 +447,10 @@ struct ggml_sycl_ubatch_cache_key {
     uint32_t     n_ctx;
     uint32_t     n_batch;
     bool         flash_attn;
+    uint32_t     n_seq_max;
+    int32_t      type_k;
+    int32_t      type_v;
+    uint32_t     device_set_hash;
 };
 
 // Whether the persisted auto n_ubatch cache is enabled -- GGML_SYCL_TUNING_CACHE,
@@ -452,29 +463,41 @@ GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_enabled(void);
 // GGML_SYCL_TUNING_CACHE_DIR; falls back to XDG per tuning-cache-io.hpp's
 // get_cache_dir()), for diagnostics -- resolved unconditionally, even when
 // the cache is disabled, so a WARN can still name where it would have
-// written. Returns false (buf left untouched) for an out-of-range device.
+// written. Returns false (buf left untouched) for an out-of-range device or
+// when `path` would not fit in `buf_size` bytes including the terminating
+// NUL (this used to truncate silently).
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size);
 
-// Look up a previously-persisted auto n_ubatch for this exact key. Returns
-// false (leaving *n_ubatch untouched) on a cache miss, a disabled cache, an
-// out-of-range device, or an unreadable/corrupt/wrong-version file -- the
-// caller's ladder trial tolerates every one of those identically (a cold
-// cache), so this never throws and never distinguishes them.
+// Look up a previously-persisted auto n_ubatch for this exact key, along
+// with the REASON it was stored with -- copied into
+// `reason_buf`, truncated to fit `reason_buf_size` including the
+// terminating NUL, like `ggml_backend_sycl_ubatch_cache_path()` above;
+// `reason_buf`/`reason_buf_size` may be null/0 to skip it). The caller uses
+// the reason to tell a TERMINAL outcome ("ladder exhausted", "MoE GPU
+// routing ceiling") from one that merely lost a transient race, and decides
+// from that whether to trust the cached value outright or resume searching
+// above it. Returns false (leaving *n_ubatch and reason_buf untouched) on a
+// cache miss, a disabled cache, an out-of-range device, or an
+// unreadable/corrupt/wrong-version file -- the caller's ladder trial
+// tolerates every one of those identically (a cold cache), so this never
+// throws and never distinguishes them.
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_lookup(const struct ggml_sycl_ubatch_cache_key * key,
-                                                            uint32_t *                                n_ubatch);
+                                                            uint32_t *                                n_ubatch,
+                                                            char *                                    reason_buf,
+                                                            size_t                                    reason_buf_size);
 
 // Persist the chosen n_ubatch for this exact key (atomic write; see
-// tuning-cache-io.hpp). `reason` is recorded verbatim for diagnostics --
-// today the only caller (llama_context::sycl_select_auto_ubatch()) ever
-// passes "ladder" (a cache HIT never re-stores itself, since the entry it
-// validated is already the one on disk); "cached" is a STOP reason on that
-// caller's own vocabulary, never a value this store persists. A future
-// caller could legitimately pass "cached" here (e.g. to refresh a hit
-// entry's `created` timestamp without changing its n_ubatch) -- this field
-// is free-form specifically to leave that open, not because "cached" is
-// already written somewhere. Returns false (never throws) on a disabled
-// cache, an out-of-range device, or a write failure -- the caller ignores
-// the result; a failed store never blocks inference.
+// tuning-cache-io.hpp). `reason` is recorded verbatim -- llama.cpp-7n6n
+// made the only caller (llama_context::sycl_select_auto_ubatch()) pass
+// its OWN actual stop reason here (one of the eight-string vocabulary that
+// function documents), not a fixed "ladder" literal: doing so is what lets
+// a future lookup on this entry (above) tell a terminal outcome from a
+// transient one. That caller never passes "cached" (a hit that produces an
+// unchanged outcome does not re-store at all) or "transaction busy"/"not
+// the published model" (pure races it explicitly skips storing). Returns
+// false (never throws) on a disabled cache, an out-of-range device, or a
+// write failure -- the caller ignores the result; a failed store never
+// blocks inference.
 GGML_BACKEND_API bool ggml_backend_sycl_ubatch_cache_store(const struct ggml_sycl_ubatch_cache_key * key,
                                                            uint32_t                                  n_ubatch,
                                                            const char *                              reason);

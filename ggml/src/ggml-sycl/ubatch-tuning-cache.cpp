@@ -98,13 +98,17 @@ bool resolve_device_key(int device, std::string & out_device_name, std::string &
 
 UbatchCacheKey to_internal_key(const std::string & device_key, const ggml_sycl_ubatch_cache_key & c_key) {
     UbatchCacheKey k;
-    k.device_key = device_key;
-    k.model_name = c_key.model_name ? c_key.model_name : "";
-    k.model_size = c_key.model_size;
-    k.model_hash = c_key.model_hash;
-    k.n_ctx      = c_key.n_ctx;
-    k.n_batch    = c_key.n_batch;
-    k.flash_attn = c_key.flash_attn;
+    k.device_key      = device_key;
+    k.model_name      = c_key.model_name ? c_key.model_name : "";
+    k.model_size      = c_key.model_size;
+    k.model_hash      = c_key.model_hash;
+    k.n_ctx           = c_key.n_ctx;
+    k.n_batch         = c_key.n_batch;
+    k.flash_attn      = c_key.flash_attn;
+    k.n_seq_max       = c_key.n_seq_max;
+    k.type_k          = c_key.type_k;
+    k.type_v          = c_key.type_v;
+    k.device_set_hash = c_key.device_set_hash;
     return k;
 }
 
@@ -135,13 +139,24 @@ bool ggml_backend_sycl_ubatch_cache_path(int device, char * buf, size_t buf_size
     if (!resolve_device_key(device, device_name, device_key)) {
         return false;
     }
+    // resolve_device_key() is shared with _lookup/_store below, which DO
+    // need device_key; a path-only caller has no use for it.
+    (void) device_key;
     std::string path = get_ubatch_cache_file(ubatch_tuning_cache_dir(), device_name);
+    // `path.size() >= buf_size` would truncate --
+    // refuse instead of silently handing back a wrong (truncated) path.
+    if (path.size() >= buf_size) {
+        return false;
+    }
     std::strncpy(buf, path.c_str(), buf_size - 1);
     buf[buf_size - 1] = '\0';
     return true;
 }
 
-bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * key, uint32_t * n_ubatch) {
+bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * key,
+                                           uint32_t *                         n_ubatch,
+                                           char *                             reason_buf,
+                                           size_t                             reason_buf_size) {
     if (key == nullptr || n_ubatch == nullptr || !ubatch_tuning_cache_env_enabled()) {
         return false;
     }
@@ -158,6 +173,10 @@ bool ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key * ke
     for (const auto & e : entries) {
         if (e.key == lookup_key) {
             *n_ubatch = e.n_ubatch;
+            if (reason_buf != nullptr && reason_buf_size > 0) {
+                std::strncpy(reason_buf, e.reason.c_str(), reason_buf_size - 1);
+                reason_buf[reason_buf_size - 1] = '\0';
+            }
             return true;
         }
     }
@@ -181,6 +200,16 @@ bool ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key * key
     // empty" case here (load_ubatch_cache() already treats all three
     // identically) -- never a reason to refuse the store; the whole point
     // of this call is to (re)write the file.
+    //
+    // This load-modify-save is NOT atomic across processes (llama.cpp-7n6n):
+    // two starts storing for the SAME device concurrently can both
+    // load the same snapshot, and whichever save_ubatch_cache() renames
+    // last wins, silently dropping the other's entry. Per-pid temp names
+    // (sycl_tuning_getpid()) only fix the WRITE race (two writers can no
+    // longer corrupt one shared temp file); they do not make this
+    // read-modify-write a transaction. Accepted: the dropped entry costs
+    // its key one extra ladder run on its next start, never a wrong choice
+    // -- the same advisory-cache tradeoff this whole store already makes.
     load_ubatch_cache(ubatch_tuning_cache_dir(), device_name, entries);
 
     bool replaced = false;
@@ -201,6 +230,12 @@ bool ggml_backend_sycl_ubatch_cache_store(const ggml_sycl_ubatch_cache_key * key
         e.created  = iso8601_now_utc();
         entries.push_back(e);
     }
+
+    // llama.cpp-7n6n: cap the per-device entry count.
+    // The sort-and-truncate logic itself lives in tuning-cache-io.hpp's
+    // cap_ubatch_cache_entries() so it is testable from a host-only unit
+    // test with no SYCL device involved.
+    cap_ubatch_cache_entries(entries);
 
     return save_ubatch_cache(ubatch_tuning_cache_dir(), device_name, entries);
 }

@@ -128,7 +128,12 @@ def _body_of(raw: str, start_marker: str, end_marker: str) -> str:
 # helpers below and every mutation witness's _body_of() call.
 _CALL_SITE_START = "bool sycl_auto_ubatch_trial = false;"
 _CALL_SITE_END = "if (!cparams.flash_attn) {"
-_TRIAL_START = "void llama_context::sycl_select_auto_ubatch() {"
+# llama.cpp-7n6n (quality round 1, Q4): the signature grew two parameters
+# (type_k/type_v, forwarded from the constructor's own llama_context_params
+# -- see test_sycl_select_auto_ubatch_takes_type_k_and_type_v below) --
+# updated here since every other check in this file depends on this exact
+# string via _trial_body().
+_TRIAL_START = "void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) {"
 _TRIAL_END = "void llama_context::sched_reserve() {"
 # llama.cpp-7n6n: the shared per-candidate validator --
 # probe with busy backoff, publish in a try/catch, reserve, host-fallback
@@ -190,8 +195,15 @@ def test_call_site_gates_on_all_four_conditions():
 
     # And the trial itself must only run when sycl_auto_ubatch_trial ends up
     # true; otherwise today's single sched_reserve() call is unchanged.
-    assert re.search(r"if\s*\(\s*sycl_auto_ubatch_trial\s*\)\s*\{\s*sycl_select_auto_ubatch\s*\(\s*\)\s*;", body_norm), (
-        "the call site must call sycl_select_auto_ubatch() only when sycl_auto_ubatch_trial is true"
+    # quality round 1, Q4: the call now forwards params.type_k/type_v (see
+    # test_sycl_select_auto_ubatch_takes_type_k_and_type_v).
+    assert re.search(
+        r"if\s*\(\s*sycl_auto_ubatch_trial\s*\)\s*\{\s*sycl_select_auto_ubatch\s*\(\s*params\.type_k\s*,\s*"
+        r"params\.type_v\s*\)\s*;",
+        body_norm,
+    ), (
+        "the call site must call sycl_select_auto_ubatch(params.type_k, params.type_v) only when "
+        "sycl_auto_ubatch_trial is true"
     )
     assert re.search(r"\}\s*else\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}", body_norm), (
         "the call site must fall through to today's unconditional sched_reserve() otherwise"
@@ -1010,7 +1022,10 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
     )
     for member in ("int\\s+device\\s*;", "const\\s+char\\s*\\*\\s*model_name\\s*;", "uint64_t\\s+model_size\\s*;",
                    "uint64_t\\s+model_hash\\s*;", "uint32_t\\s+n_ctx\\s*;", "uint32_t\\s+n_batch\\s*;",
-                   "bool\\s+flash_attn\\s*;"):
+                   "bool\\s+flash_attn\\s*;",
+                   # quality round 1, Q4: the four fields added this round.
+                   "uint32_t\\s+n_seq_max\\s*;", "int32_t\\s+type_k\\s*;", "int32_t\\s+type_v\\s*;",
+                   "uint32_t\\s+device_set_hash\\s*;"):
         assert re.search(member, GGML_SYCL_H_CODE), f"ggml_sycl_ubatch_cache_key is missing a member matching {member!r}"
 
     assert re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_enabled\s*\(\s*void\s*\)\s*;",
@@ -1020,11 +1035,17 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
         r"\s*size_t\s+buf_size\s*\)\s*;",
         GGML_SYCL_H_CODE,
     ), "ggml_backend_sycl_ubatch_cache_path(int, char*, size_t) must be declared"
+    # quality round 1, Q2: lookup gained a reason_buf/reason_buf_size pair so
+    # the caller can tell a TERMINAL cached outcome from a transient one.
     assert re.search(
         r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_lookup\s*\(\s*const\s+struct\s+"
-        r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s*\*\s*n_ubatch\s*\)\s*;",
+        r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s*\*\s*n_ubatch\s*,\s*char\s*\*\s*reason_buf\s*,"
+        r"\s*size_t\s+reason_buf_size\s*\)\s*;",
         GGML_SYCL_H_CODE,
-    ), "ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key*, uint32_t*) must be declared"
+    ), (
+        "ggml_backend_sycl_ubatch_cache_lookup(const ggml_sycl_ubatch_cache_key*, uint32_t*, char*, size_t) must "
+        "be declared"
+    )
     assert re.search(
         r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_store\s*\(\s*const\s+struct\s+"
         r"ggml_sycl_ubatch_cache_key\s*\*\s*key\s*,\s*uint32_t\s+n_ubatch\s*,\s*const\s+char\s*\*\s*reason\s*\)\s*;",
@@ -1147,15 +1168,26 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
     proves that half fails but says nothing about whether the STORE's own
     position check would catch the store being moved too early."""
     raw = LLAMA_CONTEXT_CPP
-    store_line = '        cache_store_fn(&cache_key, last_good, "ladder");\n'
-    assert store_line in raw, "mutation target not found -- update this witness to match the real source"
+    # quality round 1, Q2/Q3: the whole store gate (not just the call) --
+    # moved as one block, since its two preceding stop_is_pure_race/
+    # resumed_outcome_unchanged declarations are not part of what this
+    # witness is testing (this mutation is not meant to compile).
+    store_block = (
+        "    if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+        "        cache_enabled_fn()) {\n"
+        "        if (!cache_store_fn(&cache_key, last_good, stop)) {\n"
+        '            LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache store failed: %s\\n", cache_path_buf);\n'
+        "        }\n"
+        "    }\n"
+    )
+    assert store_block in raw, "mutation target not found -- update this witness to match the real source"
     loop_line = "    for (uint32_t c : ladder) {\n"
     assert loop_line in raw, "mutation target not found -- update this witness to match the real source"
 
-    # Move the store call to just BEFORE the ladder loop itself (not merely
+    # Move the store block to just BEFORE the ladder loop itself (not merely
     # before the last_good == 0 fixup, which is already after the loop and
     # so would not actually exercise the loop-vs-store ordering check).
-    mutated_raw = raw.replace(store_line, "", 1).replace(loop_line, store_line + loop_line, 1)
+    mutated_raw = raw.replace(store_block, "", 1).replace(loop_line, store_block + loop_line, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
@@ -1170,31 +1202,345 @@ def test_ubatch_cache_store_follows_the_ladder_has_a_mutation_witness():
 
 def test_ubatch_cache_store_is_gated_on_ladder_needed():
     """llama.cpp-7n6n: the store must be gated on
-    `ladder_needed` (never re-storing an identical entry right after a
-    cache hit validated it), alongside the pre-existing have_cache_
-    accessors/cache_enabled_fn() gate."""
+    `ladder_needed` (never re-storing right after a TERMINAL cache hit
+    skipped the ladder entirely), alongside the newer Q2/Q3 conditions
+    (quality round 1: !stop_is_pure_race, !resumed_outcome_unchanged) and
+    the pre-existing have_cache_accessors/cache_enabled_fn() gate."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(
-        r'if\s*\(\s*ladder_needed\s*&&\s*have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{\s*'
-        r'cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*"ladder"\s*\)\s*;\s*\}',
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*!resumed_outcome_unchanged\s*&&\s*"
+        r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         body_norm,
-    ), 'the store must be gated on ladder_needed && have_cache_accessors && cache_enabled_fn()'
+    ), (
+        "the store must be gated on ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && "
+        "have_cache_accessors && cache_enabled_fn()"
+    )
 
 
 def test_ubatch_cache_store_ladder_needed_gate_has_a_mutation_witness():
     """Mutation witness for the check above: proves it would actually
     catch the `ladder_needed &&` clause being dropped from the store's
-    gate (which would re-store an identical entry after every cache hit,
-    not just after a real ladder run)."""
+    gate (which would re-store an identical entry after every TERMINAL
+    cache hit, not just after a real ladder run)."""
     raw = LLAMA_CONTEXT_CPP
-    guard_line = "    if (ladder_needed && have_cache_accessors && cache_enabled_fn()) {\n"
+    guard_line = (
+        "    if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+    )
     assert guard_line in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_raw = raw.replace(guard_line, "    if (have_cache_accessors && cache_enabled_fn()) {\n", 1)
+    mutated_guard_line = (
+        "    if (!stop_is_pure_race && !resumed_outcome_unchanged && have_cache_accessors &&\n"
+    )
+    mutated_raw = raw.replace(guard_line, mutated_guard_line, 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert not re.search(
-        r'if\s*\(\s*ladder_needed\s*&&\s*have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{\s*'
-        r'cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*"ladder"\s*\)\s*;\s*\}',
+        r"if\s*\(\s*ladder_needed\s*&&\s*!stop_is_pure_race\s*&&\s*!resumed_outcome_unchanged\s*&&\s*"
+        r"have_cache_accessors\s*&&\s*cache_enabled_fn\s*\(\s*\)\s*\)\s*\{",
         mutated_body_norm,
     ), "mutation witness is broken: dropping ladder_needed from the guard should make the gate check fail"
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-7n6n quality round 1: Q2 (a stale hit could pin a value
+# forever), Q3 (a silent store failure), Q4 (three key omissions).
+# ---------------------------------------------------------------------------
+
+
+def test_sycl_select_auto_ubatch_takes_type_k_and_type_v():
+    """quality round 1, Q4: type_k/type_v are constructor-local
+    llama_context_params fields sycl_select_auto_ubatch() cannot otherwise
+    see (it is a separate member function, not inline in the constructor),
+    so they are passed in as parameters and forwarded from the one call
+    site."""
+    assert re.search(
+        r"void\s+llama_context::sycl_select_auto_ubatch\s*\(\s*ggml_type\s+type_k\s*,\s*ggml_type\s+type_v\s*\)\s*\{",
+        LLAMA_CONTEXT_CPP_CODE,
+    ), "sycl_select_auto_ubatch must take (ggml_type type_k, ggml_type type_v)"
+    assert re.search(
+        r"sycl_select_auto_ubatch\s*\(\s*params\.type_k\s*,\s*params\.type_v\s*\)\s*;", LLAMA_CONTEXT_CPP_CODE
+    ), "the call site must forward params.type_k, params.type_v"
+
+
+def test_cache_key_populates_the_four_new_fields():
+    """quality round 1, Q4: n_seq_max/type_k/type_v/device_set_hash must
+    all be assigned into cache_key -- declaring the struct fields (covered
+    elsewhere) is not enough if nothing ever fills them in."""
+    body_norm = _normalize_ws(_trial_body())
+    for assignment in (
+        r"cache_key\.n_seq_max\s*=\s*cparams\.n_seq_max\s*;",
+        r"cache_key\.type_k\s*=\s*static_cast<int32_t>\s*\(\s*type_k\s*\)\s*;",
+        r"cache_key\.type_v\s*=\s*static_cast<int32_t>\s*\(\s*type_v\s*\)\s*;",
+        r"cache_key\.device_set_hash\s*=\s*device_set_hash\s*;",
+    ):
+        assert re.search(assignment, body_norm), f"missing cache_key field assignment matching {assignment!r}"
+
+
+def test_device_set_hash_is_computed_over_every_sycl_backend():
+    """quality round 1, Q4: device_set_hash must be an FNV-1a accumulation
+    over EVERY entry of sycl_backends (not just the first, which is what
+    cache_key.device itself already names) -- level_zero:0 and
+    level_zero:0,1 both start with device 0, so a hash over only the first
+    entry would not tell the two selector shapes apart."""
+    body_norm = _normalize_ws(_trial_body())
+    hash_idx = body_norm.find("uint32_t device_set_hash")
+    assert hash_idx != -1, "could not find the device_set_hash declaration"
+    loop_idx = body_norm.find("for (auto & sb : sycl_backends)", hash_idx)
+    assert loop_idx != -1, "device_set_hash must be computed via a loop over sycl_backends"
+    cache_key_idx = body_norm.find("cache_key.device_set_hash", loop_idx)
+    assert cache_key_idx != -1, "device_set_hash must be computed before it is assigned into cache_key"
+    loop_body = body_norm[loop_idx:cache_key_idx]
+    assert re.search(r"device_set_hash\s*\^=\s*static_cast<uint32_t>\s*\(\s*sb\.dev_index\s*\)\s*;", loop_body), (
+        "the loop must XOR in each backend's dev_index"
+    )
+    assert re.search(r"device_set_hash\s*\*=\s*0x01000193u\s*;", loop_body), (
+        "the loop must multiply by the FNV-1a 32-bit prime after each XOR"
+    )
+
+
+def test_cache_hit_reads_the_stored_reason():
+    """quality round 1, Q2: the lookup must read back the REASON the entry
+    was stored with (not just n_ubatch) -- that reason is what tells a
+    TERMINAL hit from one that should resume the ladder."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"cache_lookup_fn\s*\(\s*&cache_key\s*,\s*&cached_ubatch\s*,\s*cached_reason_buf\s*,\s*"
+        r"sizeof\s*\(\s*cached_reason_buf\s*\)\s*\)", body_norm
+    ), "the lookup call must pass cached_reason_buf/sizeof(cached_reason_buf) alongside &cached_ubatch"
+
+
+def test_terminal_reasons_are_exactly_two_strings():
+    """quality round 1, Q2(c): the TERMINAL reason set -- the ones that
+    still skip the ladder outright on a hit -- must be EXACTLY "ladder
+    exhausted" and "MoE GPU routing ceiling", no more and no fewer. Any
+    OTHER stored reason must resume the ladder instead of trusting the
+    cached value forever."""
+    body_norm = _normalize_ws(_trial_body())
+    terminal_idx = body_norm.find("const bool terminal =")
+    assert terminal_idx != -1, "could not find the `terminal` reason check"
+    # Bound to the statement itself (up to its terminating `;`) so this
+    # cannot accidentally pick up an unrelated later `strcmp` call.
+    terminal_stmt_end = body_norm.find(";", terminal_idx)
+    assert terminal_stmt_end != -1
+    terminal_stmt = body_norm[terminal_idx : terminal_stmt_end + 1]
+    found = set(re.findall(r'std::strcmp\s*\(\s*cached_reason_buf\s*,\s*"([^"]*)"\s*\)\s*==\s*0', terminal_stmt))
+    assert found == {"ladder exhausted", "MoE GPU routing ceiling"}, (
+        f"the terminal-reason set must be exactly {{'ladder exhausted', 'MoE GPU routing ceiling'}} -- found {found}"
+    )
+
+
+def test_terminal_reasons_have_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch a third reason being silently added to the terminal set (which
+    would wrongly let that reason skip the ladder on a hit, the exact
+    sticky behaviour this finding fixed)."""
+    raw = LLAMA_CONTEXT_CPP
+    terminal_stmt = (
+        '                const bool terminal = std::strcmp(cached_reason_buf, "ladder exhausted") == 0 ||\n'
+        '                                      std::strcmp(cached_reason_buf, "MoE GPU routing ceiling") == 0;\n'
+    )
+    assert terminal_stmt in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_stmt = terminal_stmt.replace(
+        '== 0;\n', '== 0 || std::strcmp(cached_reason_buf, "transaction refused") == 0;\n', 1
+    )
+    mutated_raw = raw.replace(terminal_stmt, mutated_stmt, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    terminal_idx = mutated_body_norm.find("const bool terminal =")
+    assert terminal_idx != -1
+    terminal_stmt_end = mutated_body_norm.find(";", terminal_idx)
+    mutated_terminal_stmt = mutated_body_norm[terminal_idx : terminal_stmt_end + 1]
+    found = set(re.findall(r'std::strcmp\s*\(\s*cached_reason_buf\s*,\s*"([^"]*)"\s*\)\s*==\s*0', mutated_terminal_stmt))
+    assert found != {"ladder exhausted", "MoE GPU routing ceiling"}, (
+        "mutation witness is broken: adding a third reason should make the exact-set check fail"
+    )
+
+
+def test_non_terminal_hit_resumes_the_ladder_above_the_cached_value():
+    """quality round 1, Q2: a non-terminal hit must set cache_resume_above
+    to the cached (already-validated) value BEFORE the ladder loop, and the
+    loop must skip every rung at or below it -- otherwise the ladder would
+    needlessly re-try a value already known to pass."""
+    body_norm = _normalize_ws(_trial_body())
+    resume_assign_idx = body_norm.find("cache_resume_above = cached_ubatch;")
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    assert resume_assign_idx != -1, "could not find `cache_resume_above = cached_ubatch;`"
+    assert loop_idx != -1
+    assert resume_assign_idx < loop_idx, "cache_resume_above must be set before the ladder loop runs"
+
+    skip_idx = body_norm.find("if (c <= cache_resume_above) { continue; }", loop_idx)
+    assert skip_idx != -1, "the ladder loop must skip rungs at or below cache_resume_above"
+
+
+def test_resume_skip_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the resume-skip being deleted (which would make the ladder
+    re-try the already-validated cached rung, harmless but wasteful, and --
+    more importantly -- proves the position/presence check is load-bearing
+    rather than vacuous)."""
+    raw = LLAMA_CONTEXT_CPP
+    skip_block = (
+        "        if (c <= cache_resume_above) {\n"
+        "            continue;\n"
+        "        }\n"
+    )
+    assert skip_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(skip_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "if (c <= cache_resume_above)" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the resume-skip check"
+    )
+
+
+def test_store_writes_the_real_stop_reason_not_a_literal():
+    """quality round 1, Q2(a): the store must persist `stop` (the trial's
+    OWN actual outcome) -- not a fixed "ladder" literal, which is what let
+    a lost cache revalidation's reason go unrecorded in the first place."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r"cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*stop\s*\)", body_norm), (
+        'the store must be called as cache_store_fn(&cache_key, last_good, stop) -- not a "ladder" literal'
+    )
+    assert '"ladder"' not in body_norm, 'the literal "ladder" must not appear anywhere in the trial body any more'
+
+
+def test_store_call_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the store reverting to a fixed "ladder" literal."""
+    raw = LLAMA_CONTEXT_CPP
+    call = "cache_store_fn(&cache_key, last_good, stop)"
+    assert call in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(call, 'cache_store_fn(&cache_key, last_good, "ladder")', 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(r"cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*stop\s*\)", mutated_body_norm), (
+        "mutation witness is broken: reverting to a literal should make the variable-reason check fail"
+    )
+
+
+def test_store_skips_exactly_the_two_pure_race_reasons():
+    """quality round 1, Q2(b): the store must be skipped for EXACTLY
+    "transaction busy" and "not the published model" (pure races) -- no
+    more, no fewer. Persisting either as if it were a real shape limit
+    would reintroduce a sticky-hit bug one level up."""
+    body_norm = _normalize_ws(_trial_body())
+    race_idx = body_norm.find("const bool stop_is_pure_race =")
+    assert race_idx != -1, "could not find the stop_is_pure_race computation"
+    race_stmt_end = body_norm.find(";", race_idx)
+    assert race_stmt_end != -1
+    race_stmt = body_norm[race_idx : race_stmt_end + 1]
+    found = set(re.findall(r'std::strcmp\s*\(\s*stop\s*,\s*"([^"]*)"\s*\)\s*==\s*0', race_stmt))
+    assert found == {"transaction busy", "not the published model"}, (
+        f"stop_is_pure_race must check exactly {{'transaction busy', 'not the published model'}} -- found {found}"
+    )
+
+
+def test_store_pure_race_skip_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch a third reason being silently added to the pure-race set."""
+    raw = LLAMA_CONTEXT_CPP
+    race_stmt = (
+        "    const bool stop_is_pure_race =\n"
+        '        std::strcmp(stop, "transaction busy") == 0 || std::strcmp(stop, "not the published model") == 0;\n'
+    )
+    assert race_stmt in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_stmt = race_stmt.replace(
+        "== 0;\n", '== 0 || std::strcmp(stop, "KV would be demoted") == 0;\n', 1
+    )
+    mutated_raw = raw.replace(race_stmt, mutated_stmt, 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    race_idx = mutated_body_norm.find("const bool stop_is_pure_race =")
+    assert race_idx != -1
+    race_stmt_end = mutated_body_norm.find(";", race_idx)
+    mutated_race_stmt = mutated_body_norm[race_idx : race_stmt_end + 1]
+    found = set(re.findall(r'std::strcmp\s*\(\s*stop\s*,\s*"([^"]*)"\s*\)\s*==\s*0', mutated_race_stmt))
+    assert found != {"transaction busy", "not the published model"}, (
+        "mutation witness is broken: adding a third reason should make the exact-set check fail"
+    )
+
+
+def test_store_skips_an_unchanged_resumed_outcome():
+    """quality round 1, Q2(c): a RESUMED hit whose ladder run reproduced
+    the exact same (last_good, reason) it started from must not re-store
+    -- an identical outcome is not worth a rewrite."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"resumed_outcome_unchanged\s*=\s*cache_resumed\s*&&\s*last_good\s*==\s*cache_resume_ubatch\s*&&\s*"
+        r"cache_resume_reason\s*==\s*stop\s*;",
+        body_norm,
+    ), "resumed_outcome_unchanged must compare last_good and the reason against the resumed-from hit"
+    store_gate_idx = body_norm.find("if (ladder_needed && !stop_is_pure_race && !resumed_outcome_unchanged")
+    assert store_gate_idx != -1, "the store gate must check !resumed_outcome_unchanged"
+
+
+def test_store_failure_logs_exactly_one_warn():
+    """quality round 1, Q3: a failed store must log exactly one
+    "[SYCL-PLAN] tuning cache store failed: ..." WARN naming the path --
+    the store's own return value used to be discarded silently."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r'if\s*\(\s*!cache_store_fn\s*\(\s*&cache_key\s*,\s*last_good\s*,\s*stop\s*\)\s*\)\s*\{\s*'
+        r'LLAMA_LOG_WARN\s*\(\s*"\[SYCL-PLAN\] tuning cache store failed: %s\\n"\s*,\s*cache_path_buf\s*\)\s*;\s*\}',
+        body_norm,
+    ), "a failed store must log exactly one [SYCL-PLAN] tuning cache store failed: %s WARN naming cache_path_buf"
+
+
+def test_store_failure_warn_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the store-failure WARN being deleted (a read-only HOME would then
+    silently re-run the ladder on every start with no diagnostic)."""
+    raw = LLAMA_CONTEXT_CPP
+    block = (
+        "        if (!cache_store_fn(&cache_key, last_good, stop)) {\n"
+        '            LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache store failed: %s\\n", cache_path_buf);\n'
+        "        }\n"
+    )
+    assert block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(block, "        cache_store_fn(&cache_key, last_good, stop);\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "tuning cache store failed" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the store-failure WARN"
+    )
+
+
+def test_at_most_three_llama_log_warn_call_sites_in_the_body():
+    """quality round 1, Q3: this function's own docstring was updated to
+    say AT MOST THREE GGML_LOG_WARN lines report the outcome (the
+    tuning-cache lookup outcome, an optional store-failure WARN, and the
+    pre-existing auto n_ubatch outcome) -- pin the literal call-site count
+    in the source, not just the docstring's prose."""
+    body_norm = _normalize_ws(_trial_body())
+    count = len(re.findall(r"LLAMA_LOG_WARN\(", body_norm))
+    assert count == 3, f"expected exactly 3 LLAMA_LOG_WARN( call sites in the trial body -- found {count}"
+
+
+def test_cache_path_return_is_checked_and_substituted():
+    """quality round 1, Q9: ggml_backend_sycl_ubatch_cache_path()'s return
+    must be checked -- a call that fails (an out-of-range device, or a
+    path too long for the buffer) must not leave a caller trusting a
+    silently-truncated or stale path."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"if\s*\(\s*have_cache_accessors\s*&&\s*!cache_path_fn\s*\(\s*cache_key\.device\s*,\s*cache_path_buf\s*,\s*"
+        r"sizeof\s*\(\s*cache_path_buf\s*\)\s*\)\s*\)\s*\{", body_norm
+    ), "the cache_path_fn(...) call must be negated and checked"
+    assert '"(cache path unavailable)"' in body_norm, (
+        'a failed cache_path_fn(...) call must substitute "(cache path unavailable)"'
+    )
+
+
+def test_ubatch_cache_path_source_returns_false_on_oversized_path():
+    """quality round 1, Q9: ggml_backend_sycl_ubatch_cache_path() itself
+    (ubatch-tuning-cache.cpp) must refuse rather than silently truncate
+    when the resolved path does not fit in the caller's buffer."""
+    assert re.search(
+        r"if\s*\(\s*path\.size\s*\(\s*\)\s*>=\s*buf_size\s*\)\s*\{\s*return\s+false\s*;\s*\}",
+        _normalize_ws(UBATCH_TUNING_CACHE_CPP_CODE),
+    ), "ggml_backend_sycl_ubatch_cache_path must return false when path.size() >= buf_size"

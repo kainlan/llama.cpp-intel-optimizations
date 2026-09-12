@@ -21,16 +21,18 @@
 // need either variable: they pass an explicit cache_dir argument straight
 // to save_ubatch_cache()/load_ubatch_cache(), never through get_cache_dir().
 
+#include "../ggml/src/ggml-sycl/tuning-cache-io.hpp"
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include "../ggml/src/ggml-sycl/tuning-cache-io.hpp"
 
 using namespace ggml_sycl_tuning;
 
@@ -38,11 +40,13 @@ using namespace ggml_sycl_tuning;
 static int g_passed = 0;
 static int g_failed = 0;
 
-#define TEST(name) \
+// llama.cpp-7n6n: the macro used to also declare
+// `static bool test_##name##_registered = [] { return true; }();` -- dead
+// code (RUN_TEST() below calls test_##name() by name; nothing ever reads
+// the `_registered` variable), and the sole source of the 26
+// -Wunused-variable warnings this task made visible in every build log.
+#define TEST(name)             \
     static bool test_##name(); \
-    static bool test_##name##_registered = [] { \
-        return true; \
-    }(); \
     static bool test_##name()
 
 #define ASSERT(cond) \
@@ -607,6 +611,27 @@ TEST(ubatch_key_equality) {
     b.flash_attn = !a.flash_attn;
     ASSERT(a != b);
 
+    // llama.cpp-7n6n: the four fields added to UbatchCacheKey must each
+    // independently affect equality too.
+    a.n_seq_max       = 1;
+    a.type_k          = 1;  // GGML_TYPE_F16
+    a.type_v          = 1;
+    a.device_set_hash = 0xdeadbeefu;
+    b                 = a;
+    ASSERT(a == b);
+
+    b.n_seq_max = a.n_seq_max + 1;
+    ASSERT(a != b);
+    b        = a;
+    b.type_k = a.type_k + 1;
+    ASSERT(a != b);
+    b        = a;
+    b.type_v = a.type_v + 1;
+    ASSERT(a != b);
+    b                 = a;
+    b.device_set_hash = a.device_set_hash ^ 1u;
+    ASSERT(a != b);
+
     return true;
 }
 
@@ -695,7 +720,7 @@ TEST(ubatch_cache_file_roundtrip) {
 
 // Test: a v1 (or any non-current-version) ubatch cache file is rejected --
 // load_ubatch_cache() must return false, leaving `entries` empty, exactly
-// like load_cache()'s own version check (tuning-cache-io.hpp:~380-384).
+// like load_cache()'s own version check.
 TEST(ubatch_cache_v1_file_rejected) {
     std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v1_" + std::to_string(getpid());
     std::string device_name = "TestUbatchV1Device_" + std::to_string(getpid());
@@ -776,6 +801,213 @@ TEST(ubatch_cache_load_missing_file) {
     return true;
 }
 
+// Test: a model_name/device_key/reason containing a `"` or `\` (a Windows
+// path, or a model name with a quote in it) round-trips byte-for-byte
+// -- without json_escape()/the parse_string() fix,
+// these would round-trip to a DIFFERENT string, so a stored key would never
+// match the same lookup key again.
+TEST(ubatch_cache_string_escaping_roundtrip) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_escape_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchEscape_" + std::to_string(getpid());
+
+    UbatchCacheEntry e;
+    e.key.device_key = "Arc_Pro_B70@driver\\with\\backslash";
+    e.key.model_name = "C:\\models\\foo \"v2\".gguf";
+    e.key.n_ctx      = 4096;
+    e.n_ubatch       = 1024;
+    e.reason         = "cached \"result\": ok\\done";
+    e.created        = "2026-09-12T00:00:00Z";
+
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { e }));
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1);
+    ASSERT(loaded[0].key == e.key);
+    ASSERT(loaded[0].key.device_key == e.key.device_key);
+    ASSERT(loaded[0].key.model_name == e.key.model_name);
+    ASSERT(loaded[0].reason == e.reason);
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: a truncated/malformed JSON file loads without throwing or invoking
+// UB. NOTE: the specific outcome checked here was
+// verified empirically, not assumed -- a truncated entry whose opening
+// brace never closes still gets pushed by load_ubatch_cache()'s scan (the
+// brace-counting loop simply runs out of characters with brace_count > 0,
+// and the code pushes whatever substring it scanned regardless of whether
+// the count reached zero), producing ONE entry with garbage/empty fields
+// rather than zero entries. The load-bearing guarantee -- and the one this
+// test actually checks -- is that this never throws or invokes UB, and
+// that the resulting garbage entry's fields are empty/zero, so it can
+// never coincidentally equal a real lookup key.
+TEST(ubatch_cache_corrupt_json) {
+    std::string cache_dir    = "/tmp/llama_test_ubatch_cache_corrupt_" + std::to_string(getpid());
+    std::string device_name  = "TestUbatchCorrupt_" + std::to_string(getpid());
+    std::string device_name2 = device_name + "_bin";
+    create_dir_recursive(cache_dir);
+
+    {
+        std::ofstream f(get_ubatch_cache_file(cache_dir, device_name));
+        f << "{\"version\": 2, \"entries\": [{\"device_key\":\"a";
+    }
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == true);
+    ASSERT(loaded.size() == 1);
+    ASSERT(loaded[0].key.device_key == "a");
+    ASSERT(loaded[0].n_ubatch == 0);
+
+    {
+        std::ofstream f(get_ubatch_cache_file(cache_dir, device_name2), std::ios::binary);
+        char          bytes[] = { 0x00, 0x01, static_cast<char>(0xFF), static_cast<char>(0xFE), 0x02 };
+        f.write(bytes, sizeof(bytes));
+    }
+    std::vector<UbatchCacheEntry> loaded2;
+    bool                          result2 = load_ubatch_cache(cache_dir, device_name2, loaded2);
+    ASSERT(result2 == false);
+    ASSERT(loaded2.empty());
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    std::remove(get_ubatch_cache_file(cache_dir, device_name2).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: no "*.tmp" file remains in the cache directory after a save
+// -- globs the directory (rather than checking
+// one fixed name) since the temp name now carries the writer's pid. Also
+// confirms the resulting file actually parses.
+TEST(ubatch_cache_atomic_write) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_atomic_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchAtomic_" + std::to_string(getpid());
+
+    UbatchCacheEntry e;
+    e.key.device_key = "Dev@1.0";
+    e.key.model_name = "m";
+    e.n_ubatch       = 512;
+    e.reason         = "ladder exhausted";
+    e.created        = "2026-09-12T00:00:00Z";
+    ASSERT(save_ubatch_cache(cache_dir, device_name, { e }));
+
+    DIR * dir = opendir(cache_dir.c_str());
+    ASSERT(dir != nullptr);
+    bool found_tmp = false;
+    for (struct dirent * ent = readdir(dir); ent != nullptr; ent = readdir(dir)) {
+        std::string name = ent->d_name;
+        if (name.find(".tmp") != std::string::npos) {
+            found_tmp = true;
+        }
+    }
+    closedir(dir);
+    ASSERT(!found_tmp);
+
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 1);
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
+// Test: cap_ubatch_cache_entries() keeps only the 64 most recently created
+// entries -- store 70 distinct keys (via the
+// helper directly, then a real save/load round-trip), and confirm exactly
+// 64 remain and the newest 64 (by `created`) survive.
+TEST(ubatch_cache_entry_cap) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_cap_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchCap_" + std::to_string(getpid());
+
+    std::vector<UbatchCacheEntry> entries;
+    for (int i = 0; i < 70; ++i) {
+        UbatchCacheEntry e;
+        e.key.device_key = "Dev@1.0";
+        e.key.model_name = "m";
+        e.key.n_ctx      = static_cast<uint32_t>(i);  // distinct key per entry
+        e.n_ubatch       = 512;
+        e.reason         = "ladder exhausted";
+        // Zero-padded so lexicographic (string) order matches numeric order
+        // -- entry i is "created" i seconds after entry 0, so higher i is
+        // newer.
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "2026-09-12T00:%02d:%02dZ", i / 60, i % 60);
+        e.created = buf;
+        entries.push_back(e);
+    }
+    ASSERT(entries.size() == 70);
+
+    ASSERT(save_ubatch_cache(cache_dir, device_name, entries));  // no cap here -- direct save, not through the store
+    std::vector<UbatchCacheEntry> loaded;
+    ASSERT(load_ubatch_cache(cache_dir, device_name, loaded));
+    ASSERT(loaded.size() == 70);  // confirms save_ubatch_cache() itself is uncapped -- capping is the caller's job
+
+    cap_ubatch_cache_entries(loaded);
+    ASSERT(loaded.size() == 64);
+
+    // The newest 64 are n_ctx == 6..69 (the oldest 6, n_ctx == 0..5, were
+    // evicted).
+    bool has_oldest_survivor = false, has_evicted = false;
+    for (const auto & e : loaded) {
+        if (e.key.n_ctx < 6) {
+            has_evicted = true;
+        }
+        if (e.key.n_ctx == 69) {
+            has_oldest_survivor = true;  // the single newest entry must always survive
+        }
+    }
+    ASSERT(!has_evicted);
+    ASSERT(has_oldest_survivor);
+
+    return true;
+}
+
+// Test: an oversized digit run (more than parse_u64()'s 19-digit cap) loads
+// without UB and simply fails to match any real key
+// -- the cap exists specifically to avoid overflowing a signed/unsigned
+// accumulator, which would be UB; this test's real assertion is "no crash,
+// no match", not any particular numeric value.
+TEST(ubatch_cache_oversized_digit_no_ub) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_oversized_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchOversized_" + std::to_string(getpid());
+    create_dir_recursive(cache_dir);
+
+    {
+        std::ofstream f(get_ubatch_cache_file(cache_dir, device_name));
+        f << "{\n"
+             "  \"version\": 2,\n"
+             "  \"entries\": [\n"
+             "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,\"model_hash\":0,"
+             "\"n_ctx\":123456789012345678901234567890,\"n_batch\":2048,\"flash_attn\":false,"
+             "\"n_seq_max\":1,\"type_k\":1,\"type_v\":1,\"device_set_hash\":0,"
+             "\"n_ubatch\":512,\"reason\":\"ladder exhausted\",\"created\":\"2026-09-12T00:00:00Z\"}\n"
+             "  ]\n"
+             "}\n";
+    }
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == true);
+    ASSERT(loaded.size() == 1);  // no crash, no UB -- parsed one entry
+
+    UbatchCacheKey lookup_key;
+    lookup_key.device_key = "Dev@1.0";
+    lookup_key.model_name = "m";
+    lookup_key.n_ctx      = 512;  // any real n_ctx a caller would actually look up with
+    lookup_key.n_batch    = 2048;
+    lookup_key.n_seq_max  = 1;
+    lookup_key.type_k     = 1;
+    lookup_key.type_v     = 1;
+    ASSERT(!(loaded[0].key == lookup_key));  // the corrupted n_ctx never matches a real lookup
+
+    std::remove(get_ubatch_cache_file(cache_dir, device_name).c_str());
+    rmdir(cache_dir.c_str());
+    return true;
+}
+
 // =============================================================================
 // Main test runner
 // =============================================================================
@@ -828,6 +1060,11 @@ int main() {
     RUN_TEST(ubatch_cache_v1_file_rejected);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
+    RUN_TEST(ubatch_cache_string_escaping_roundtrip);
+    RUN_TEST(ubatch_cache_corrupt_json);
+    RUN_TEST(ubatch_cache_atomic_write);
+    RUN_TEST(ubatch_cache_entry_cap);
+    RUN_TEST(ubatch_cache_oversized_digit_no_ub);
 
     std::cout << "\n=== Summary ===\n";
     std::cout << "Passed: " << g_passed << ", Failed: " << g_failed << "\n";
