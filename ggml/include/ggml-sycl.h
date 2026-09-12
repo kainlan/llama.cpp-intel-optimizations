@@ -224,6 +224,17 @@ struct ggml_sycl_tensor_info {
     int64_t        ne[GGML_MAX_DIMS];
 };
 
+// llama.cpp-3aos: per-layer attention/KV kind, carried by
+// ggml_sycl_tensor_inventory::kv_layer_kind[] below. SHARED covers layers
+// with no K/V tensors of their own (Gemma 4/3n's reuse pattern,
+// llama_hparams::has_kv() == false); the planner must charge them 0 bytes
+// instead of the SWA or FULL formula.
+enum ggml_sycl_kv_layer_kind {
+    GGML_SYCL_KV_LAYER_FULL   = 0,  // full n_ctx-window attention, has its own K/V
+    GGML_SYCL_KV_LAYER_SWA    = 1,  // sliding-window attention, has its own K/V
+    GGML_SYCL_KV_LAYER_SHARED = 2,  // no K/V of its own -- reuses an earlier layer's
+};
+
 struct ggml_sycl_tensor_inventory {
     struct ggml_sycl_tensor_info * tensors;
     size_t                         count;
@@ -251,8 +262,8 @@ struct ggml_sycl_tensor_inventory {
     int                            n_expert_used;  // Experts activated per token (0 for dense models)
     // Model hparams for KV cache size estimation (used by VRAM budget coordination)
     uint32_t                       n_layer;       // Number of transformer layers
-    uint32_t                       n_embd_k_gqa;  // Key embedding dim (GQA-adjusted), per layer
-    uint32_t                       n_embd_v_gqa;  // Value embedding dim (GQA-adjusted), per layer
+    uint32_t                       n_embd_k_gqa;  // Key embedding dim (GQA-adjusted) of FULL-attention layers
+    uint32_t                       n_embd_v_gqa;  // Value embedding dim (GQA-adjusted) of FULL-attention layers
     uint32_t                       n_ctx;         // Context size (tokens)
     uint32_t                       n_ubatch;      // Physical batch size (for SWA KV sizing)
     // SWA (Sliding Window Attention) info for models with heterogeneous attention
@@ -297,6 +308,22 @@ struct ggml_sycl_tensor_inventory {
     // is oneDNN-ineligible (e.g. a DeepSeek-V3-class model, D=576), which
     // would leave that model's non-FA scratch demand unguarded.
     uint32_t                       n_head_all_max;
+    // llama.cpp-3aos: per-layer attention kind and KV width, populated
+    // alongside swa_layer_mask above. A single global (n_embd_k_gqa,
+    // n_embd_v_gqa) pair plus one SWA/non-SWA mask cannot express a
+    // heterogeneous model like Gemma 4 E4B, where full-attention layers are
+    // WIDER than SWA layers (1024 vs 512 on E4B) and a trailing block of
+    // layers has NO K/V of its own (llama_hparams::has_kv() == false; they
+    // reuse an earlier layer's KV entirely). NULL/0 = not populated;
+    // consumers fall back to the aggregate n_embd_k_gqa/n_embd_v_gqa and
+    // swa_layer_mask fields above (homogeneous models, or an inventory built
+    // before this ticket). Added at the end of the struct, same reason as
+    // n_head_ctx_max/n_head_swa_max/n_head_all_max above: every zero-init
+    // `ggml_sycl_tensor_inventory x = {};` call site stays correct.
+    const uint32_t *               kv_k_width_per_layer;  // Per-layer K width (elements) [kv_layer_count]; 0 for SHARED
+    const uint32_t *               kv_v_width_per_layer;  // Per-layer V width (elements) [kv_layer_count]; symmetric
+    const uint8_t *                kv_layer_kind;         // Per-layer enum ggml_sycl_kv_layer_kind [kv_layer_count]
+    uint32_t                       kv_layer_count;        // Length of the three arrays above (0 = not populated)
 };
 
 // SYCL-side projection of the four placement-envelope fields the llama
