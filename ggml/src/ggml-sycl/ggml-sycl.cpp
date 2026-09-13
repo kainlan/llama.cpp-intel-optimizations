@@ -24200,6 +24200,15 @@ static ggml_sycl_device_info ggml_sycl_init() {
         std::strncpy(info.devices[i].device_name, name.c_str(), sizeof(info.devices[i].device_name) - 1);
         info.devices[i].device_name[sizeof(info.devices[i].device_name) - 1] = '\0';
 
+        // llama.cpp-7n6n: store the driver version next to device_name --
+        // previously only queried for the startup table
+        // (print_device_detail(), below) and discarded. See
+        // sycl_device_info::driver_version's comment (common.hpp).
+        std::string driver_version = device.get_info<sycl::info::device::driver_version>();
+        std::strncpy(info.devices[i].driver_version, driver_version.c_str(),
+                     sizeof(info.devices[i].driver_version) - 1);
+        info.devices[i].driver_version[sizeof(info.devices[i].driver_version) - 1] = '\0';
+
         size_t     free_vram           = 0;
         size_t     total_vram_reported = device_vram;
         dpct::err0 mem_err             = CHECK_TRY_ERROR(device_i.get_memory_info(free_vram, total_vram_reported));
@@ -106743,6 +106752,23 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_moe_gpu_ubatch_max") == 0) {
         return (void *) ggml_backend_sycl_moe_gpu_ubatch_max;
+    }
+    // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch
+    // tuning cache's four entry points (ubatch-tuning-cache.cpp),
+    // registered alongside their sibling Task 4b accessors above so a
+    // GGML_BACKEND_DL build's llama-context lookup does not return nullptr
+    // for them either.
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_enabled") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_enabled;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_path") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_path;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

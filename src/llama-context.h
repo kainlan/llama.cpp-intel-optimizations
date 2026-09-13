@@ -304,8 +304,13 @@ private:
     // largest candidate whose compute buffers land fully on-device (no
     // host-pinned fallback). See its definition in llama-context.cpp (right
     // before sched_reserve()) for the loop and its exact stop-reason
-    // vocabulary.
-    void sycl_select_auto_ubatch();
+    // vocabulary. `type_k`/`type_v` are the constructor's own
+    // llama_context_params fields, passed in because they are constructor
+    // locals this member function cannot otherwise see -- they feed the
+    // persisted tuning-cache key (llama.cpp-7n6n): the KV element type
+    // drives would_demote_kv, so a shape change there can change which
+    // candidates fit without changing anything else the key tracks.
+    void sycl_select_auto_ubatch(enum ggml_type type_k, enum ggml_type type_v);
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);

@@ -1478,6 +1478,14 @@ struct sycl_device_info {
     bool            supports_soa_reorder = false;  // Device capability: can use SoA weight layout
     XMXCapabilities xmx_caps;                      // XMX matrix engine capabilities (queried at init)
     char            device_name[256] = { 0 };      // Device name for GPU family detection
+    // llama.cpp-7n6n: SYCL driver version string, queried at the same init
+    // site as device_name above but previously only printed
+    // (print_device_detail()'s startup table) and discarded. Stored here so
+    // the persisted auto n_ubatch tuning cache can compose a device key that
+    // invalidates itself across a driver upgrade (sanitize_device_name(name)
+    // + "@" + driver_version -- no PCI id, which moves across boots on this
+    // host).
+    char            driver_version[64] = { 0 };
 };
 
 struct sycl_peer_link_info {
