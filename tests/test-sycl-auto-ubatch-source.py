@@ -62,6 +62,9 @@ UBATCH_TUNING_CACHE_CPP = (ROOT / "ggml/src/ggml-sycl/ubatch-tuning-cache.cpp").
 # test_boundary_literals_are_pinned_in_the_unit_test below) -- not otherwise
 # parsed by this file's checks.
 TEST_TUNING_CACHE_IO_CPP = (ROOT / "tests/test-tuning-cache-io.cpp").read_text()
+# llama.cpp-pyu4: the env-var catalog row this task's doc clause
+# lands in.
+SYCL_ENV_VARS_MD = (ROOT / "docs/backend/sycl-env-vars.md").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -384,12 +387,16 @@ def test_zero_sycl_token_guard_has_a_mutation_witness():
     )
 
 
-def test_moe_model_cap_uses_the_gpu_moe_ubatch_ceiling():
+def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap():
     """For a MoE model (hparams.n_expert > 0), the cap must be additionally
-    narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() when that ceiling is
-    smaller than the n_batch/n_ctx cap -- comment c-s747 / llama.cpp-ohkx.
-    The 512 constant itself must NOT be hardcoded in llama-context.cpp; it
-    must come from the accessor."""
+    narrowed to ggml_backend_sycl_moe_gpu_ubatch_max() -- comment c-s747 /
+    llama.cpp-ohkx -- and the "MoE GPU routing ceiling" stop reason reported
+    whenever that ceiling BINDS, i.e. moe_cap <= cap, not only when it is
+    STRICTLY smaller (llama.cpp-pyu4: a MoE context whose batch/ctx cap
+    already equals moe_cap, e.g. cap == 512, is bound by the ceiling exactly
+    as much as one where moe_cap is smaller, and used to silently report
+    "ladder exhausted" instead). The 512 constant itself must NOT be
+    hardcoded in llama-context.cpp; it must come from the accessor."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(r"if\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*\)\s*\{", body_norm), (
         "the MoE cap must be gated on model.hparams.n_expert > 0"
@@ -397,11 +404,29 @@ def test_moe_model_cap_uses_the_gpu_moe_ubatch_ceiling():
     assert "ggml_backend_sycl_moe_gpu_ubatch_max" in body_norm, (
         "the MoE cap must be read from ggml_backend_sycl_moe_gpu_ubatch_max(), not a local constant"
     )
-    assert re.search(r"if\s*\(\s*moe_cap\s*<\s*cap\s*\)\s*\{", body_norm), (
-        "the MoE cap must only narrow `cap` when it is actually smaller"
+    assert re.search(r"if\s*\(\s*moe_cap\s*<=\s*cap\s*\)\s*\{", body_norm), (
+        "the MoE cap must narrow `cap` (and report the ceiling reason) whenever moe_cap <= cap, not only when "
+        "it is strictly smaller"
     )
     assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
         "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
+    )
+
+
+def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the condition reverting to strict `<` (which silently drops the
+    "MoE GPU routing ceiling" reason whenever moe_cap == cap, e.g. a MoE
+    model whose batch/ctx cap is already exactly 512)."""
+    raw = LLAMA_CONTEXT_CPP
+    line = "        if (moe_cap <= cap) {\n"
+    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
+    mutated_raw = raw.replace(line, "        if (moe_cap < cap) {\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(r"if\s*\(\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm), (
+        "mutation witness is broken: reverting to strict < should make the <= check fail"
     )
 
 
@@ -585,11 +610,48 @@ def test_publish_reserve_order_has_a_mutation_witness():
         "        // it must correct that state back.\n"
         "        published_any      = true;\n"
         "        sched_need_reserve = true;\n"
-        "        sched_reserve();\n"
     )
-    original_block = try_catch_block + reserve_block
+    # llama.cpp-pyu4: the in-loop reserve is now wrapped in its own
+    # try/catch (with its own explanatory comment block) and a
+    # pipeline_parallel save right before it -- all included here verbatim
+    # (not just the bare `sched_reserve();` this witness used to target) so
+    # swapping the two blocks below still produces a string that actually
+    # appears once, unmodified, in the real source.
+    n1_n2_block = (
+        "        // llama.cpp-pyu4: this reserve was unguarded while the\n"
+        "        // candidate publish right above it already is -- sched_reserve()\n"
+        '        // throws "failed to allocate compute pp/tg buffers" when\n'
+        "        // graph_reserve() fails even after its own host-pinned-retry\n"
+        "        // fallback (ggml-sycl.cpp's ggml_backend_sycl_buffer_type_alloc_\n"
+        "        // buffer path), and can also throw from inside resolve_fused_ops()'s\n"
+        "        // call to sycl_recheck_runtime_context_flash_attn(). A candidate the\n"
+        "        // probe accepted but whose reserve throws must lose like any other\n"
+        "        // candidate, not abort context creation outright -- the pre-trial\n"
+        "        // fallback_ubatch path would otherwise have succeeded. The settle\n"
+        "        // step below still recovers to last_good; the settle's OWN reserve\n"
+        "        // stays unguarded, matching today's behaviour for a context that\n"
+        "        // does not fit at all.\n"
+        "        //\n"
+        "        // llama.cpp-pyu4: sched_reserve()'s own pipeline-parallel\n"
+        '        // fallback (its "retrying without pipeline parallelism" branch\n'
+        "        // below) sets cparams.pipeline_parallel = false PERMANENTLY the\n"
+        "        // moment a reserve needs it, win or lose. Save it here, immediately\n"
+        "        // before the call that can flip it, and restore it on every path\n"
+        "        // where THIS candidate goes on to lose -- so a losing candidate's\n"
+        "        // fallback never leaves pipeline parallelism disabled for last_good,\n"
+        "        // which may never have needed it.\n"
+        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
+        "        try {\n"
+        "            sched_reserve();\n"
+        "        } catch (const std::exception &) {\n"
+        "            cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
+        "            sched_matches_last_good   = false;\n"
+        '            return "compute buffers did not fit";\n'
+        "        }\n"
+    )
+    original_block = try_catch_block + reserve_block + n1_n2_block
     assert original_block in raw, "mutation target not found -- update this witness to match the real source"
-    mutated_block = reserve_block + try_catch_block
+    mutated_block = reserve_block + n1_n2_block + try_catch_block
     mutated_raw = raw.replace(original_block, mutated_block, 1)
     assert mutated_raw != raw
 
@@ -665,10 +727,14 @@ def test_host_fallback_query_has_a_mutation_witness():
     removes every fallback_fn( occurrence in the whole trial body, not just
     the loop's own copy."""
     raw = LLAMA_CONTEXT_CPP
+    # llama.cpp-pyu4: the block now also restores cparams.pipeline_
+    # parallel before returning the loss -- included verbatim so this
+    # witness still matches the real source exactly.
     fallback_block = (
         "        for (auto & sb : sycl_backends) {\n"
         "            if (fallback_fn(sb.dev_index) > 0) {\n"
-        "                sched_matches_last_good = false;\n"
+        "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
+        "                sched_matches_last_good   = false;\n"
         '                return "compute buffer fell back to host";\n'
         "            }\n"
         "        }\n"
@@ -680,6 +746,263 @@ def test_host_fallback_query_has_a_mutation_witness():
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert "fallback_fn(" not in mutated_body_norm, (
         "mutation witness is broken: deleting the block should remove every fallback_fn( call from the body"
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-pyu4: the in-loop candidate's own sched_reserve() call
+# must be guarded exactly like the publish beside it (a candidate the probe
+# accepted but whose reserve throws must lose like any other candidate, not
+# abort context creation), and a losing candidate must not leave
+# cparams.pipeline_parallel permanently disabled for last_good.
+# ---------------------------------------------------------------------------
+
+
+def test_in_loop_reserve_is_wrapped_in_try_catch():
+    """llama.cpp-pyu4: the candidate's own sched_reserve() call -- distinct from the
+    settle step's own reserve, which must stay unguarded (see
+    test_settle_reserve_is_not_wrapped_in_try_catch below) -- must be
+    wrapped in try/catch exactly like the publish beside it, catching on
+    "compute buffers did not fit" and marking sched_matches_last_good
+    false. sched_reserve() throws "failed to allocate compute pp/tg
+    buffers" when graph_reserve() fails even after its own host-pinned
+    retry, and can also throw from inside resolve_fused_ops()'s call to
+    sycl_recheck_runtime_context_flash_attn() -- either must make this
+    candidate lose cleanly, not escape as an uncaught exception."""
+    body_norm = _normalize_ws(_try_candidate_body())
+    assert re.search(
+        r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*\)\s*\{\s*"
+        r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;\s*sched_matches_last_good\s*=\s*"
+        r'false\s*;\s*return\s*"compute buffers did not fit"\s*;\s*\}',
+        body_norm,
+    ), (
+        "the in-loop candidate reserve must be wrapped in try { sched_reserve(); } catch (const std::exception "
+        '&) { ...; sched_matches_last_good = false; return "compute buffers did not fit"; }'
+    )
+
+
+def test_in_loop_reserve_try_catch_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the try/catch being deleted, leaving a bare, unprotected
+    sched_reserve() call that would let a reserve failure escape as an
+    uncaught exception instead of a clean "compute buffers did not fit"
+    stop."""
+    raw = LLAMA_CONTEXT_CPP
+    wrapped_block = (
+        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
+        "        try {\n"
+        "            sched_reserve();\n"
+        "        } catch (const std::exception &) {\n"
+        "            cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
+        "            sched_matches_last_good   = false;\n"
+        '            return "compute buffers did not fit";\n'
+        "        }\n"
+        "        sched_matches_last_good = true;\n"
+    )
+    assert wrapped_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(
+        wrapped_block,
+        "        const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;\n"
+        "        sched_reserve();\n"
+        "        sched_matches_last_good = true;\n",
+        1,
+    )
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    assert not re.search(
+        r"try\s*\{\s*sched_reserve\s*\(\s*\)\s*;\s*\}\s*catch\s*\(\s*const\s+std::exception\s*&\s*\)\s*\{",
+        mutated_body_norm,
+    ), "mutation witness is broken: deleting the try/catch should make the wrapped-reserve check fail"
+
+
+def test_settle_reserve_is_not_wrapped_in_try_catch():
+    """llama.cpp-pyu4: unlike the in-loop candidate reserve above, the SETTLE step's
+    own sched_reserve() call must stay unguarded -- a refusal there must
+    propagate, matching today's behaviour for a context that does not fit
+    at all (the same asymmetry test_settle_publish_is_not_wrapped_in_try_
+    catch already pins for the settle's publish)."""
+    body_norm = _normalize_ws(_trial_body())
+    settle_start = body_norm.find("if (!sched_matches_last_good")
+    assert settle_start != -1, "could not find the settle step's own gate"
+    settle_block = body_norm[settle_start:]
+    settle_reserve_idx = settle_block.rfind("sched_reserve();")
+    assert settle_reserve_idx != -1, "could not find the settle step's own reserve call"
+    assert "try {" not in settle_block[:settle_reserve_idx + 40], (
+        "the settle reserve must NOT be wrapped in try/catch -- its failure must propagate"
+    )
+
+
+def test_pipeline_parallel_is_saved_before_the_in_loop_reserve():
+    """llama.cpp-pyu4: sched_reserve()'s own pipeline-parallel fallback sets
+    cparams.pipeline_parallel = false PERMANENTLY the moment a reserve
+    needs it -- save the pre-reserve value immediately before the call
+    that can flip it, so a losing candidate's fallback can be undone."""
+    body_norm = _normalize_ws(_try_candidate_body())
+    save_idx = body_norm.find("const bool pipeline_parallel_before_reserve = cparams.pipeline_parallel;")
+    reserve_idx = body_norm.find("sched_reserve();", save_idx)
+    assert save_idx != -1, "pipeline_parallel_before_reserve must be saved somewhere in try_candidate()"
+    assert reserve_idx != -1 and save_idx < reserve_idx, (
+        "pipeline_parallel_before_reserve must be saved BEFORE the in-loop sched_reserve() call"
+    )
+
+
+def test_pipeline_parallel_is_restored_on_every_losing_path_after_the_reserve():
+    """llama.cpp-pyu4: cparams.pipeline_parallel must be restored to its pre-reserve
+    value on BOTH paths where the candidate goes on to lose after the
+    reserve call succeeds or throws -- the reserve's own catch, and the
+    host-fallback loss right below it -- so a losing candidate never
+    leaves pipeline parallelism disabled for last_good, which may never
+    have needed the fallback."""
+    body_norm = _normalize_ws(_try_candidate_body())
+    reserve_idx = body_norm.find("sched_reserve();")
+    assert reserve_idx != -1
+    restores = [
+        m.start()
+        for m in re.finditer(r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;", body_norm)
+    ]
+    assert len(restores) == 2, (
+        f"expected exactly 2 restores of cparams.pipeline_parallel (reserve-throws and host-fallback paths) -- "
+        f"found {len(restores)}"
+    )
+    assert all(idx > reserve_idx for idx in restores), (
+        "both restores must appear after the in-loop sched_reserve() call"
+    )
+    fallback_return_idx = body_norm.find('return "compute buffer fell back to host";')
+    assert fallback_return_idx != -1
+    assert restores[1] < fallback_return_idx, (
+        "the host-fallback loss must restore cparams.pipeline_parallel before returning its reason"
+    )
+
+
+def test_pipeline_parallel_restore_has_a_mutation_witness():
+    """Mutation witness for the two checks above: proves they would
+    actually catch the host-fallback loss's own restore being deleted
+    (leaving pipeline parallelism disabled for last_good after an
+    unrelated LATER candidate's host-pinned fallback)."""
+    raw = LLAMA_CONTEXT_CPP
+    fallback_block = (
+        "        for (auto & sb : sycl_backends) {\n"
+        "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                cparams.pipeline_parallel = pipeline_parallel_before_reserve;\n"
+        "                sched_matches_last_good   = false;\n"
+        '                return "compute buffer fell back to host";\n'
+        "            }\n"
+        "        }\n"
+    )
+    assert fallback_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(
+        fallback_block,
+        "        for (auto & sb : sycl_backends) {\n"
+        "            if (fallback_fn(sb.dev_index) > 0) {\n"
+        "                sched_matches_last_good   = false;\n"
+        '                return "compute buffer fell back to host";\n'
+        "            }\n"
+        "        }\n",
+        1,
+    )
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRY_CANDIDATE_START, _TRY_CANDIDATE_END)
+    restores = re.findall(
+        r"cparams\.pipeline_parallel\s*=\s*pipeline_parallel_before_reserve\s*;", mutated_body_norm
+    )
+    assert len(restores) != 2, (
+        "mutation witness is broken: deleting the host-fallback restore should make the restore-count check fail"
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-pyu4: the ladder (and a cache hit) must never choose
+# something SMALLER than the caller's own explicit n_ubatch
+# (fallback_ubatch) -- a raw-API caller can set llama_context_params.
+# n_ubatch above the ladder's first rung together with n_ubatch_auto=true.
+# ---------------------------------------------------------------------------
+
+
+def test_ladder_skips_rungs_below_fallback_ubatch():
+    """llama.cpp-pyu4: the ladder loop must skip every rung strictly below
+    fallback_ubatch -- a rung the ladder never tries can never become
+    last_good, so this is what actually enforces the "never silently
+    shrink" contract for a raw-API caller's explicit n_ubatch."""
+    body_norm = _normalize_ws(_trial_body())
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    assert loop_idx != -1
+    skip_idx = body_norm.find("if (c < fallback_ubatch) { continue; }", loop_idx)
+    assert skip_idx != -1, "the ladder loop must skip rungs strictly below fallback_ubatch"
+
+    cache_resume_skip_idx = body_norm.find("if (c <= cache_resume_above) { continue; }", loop_idx)
+    assert cache_resume_skip_idx != -1 and cache_resume_skip_idx < skip_idx, (
+        "the fallback_ubatch floor skip must come after the cache_resume_above skip"
+    )
+
+
+def test_ladder_floor_skip_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the floor-skip being deleted (which would let the ladder pick a
+    rung below the caller's explicit n_ubatch, silently shrinking it)."""
+    raw = LLAMA_CONTEXT_CPP
+    skip_block = (
+        "        if (c < fallback_ubatch) {\n"
+        "            continue;\n"
+        "        }\n"
+    )
+    assert skip_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(skip_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "if (c < fallback_ubatch)" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the floor-skip check"
+    )
+
+
+def test_cache_hit_below_fallback_ubatch_is_treated_as_a_miss():
+    """llama.cpp-pyu4: a cached value below fallback_ubatch must not win either --
+    the lookup's miss condition must also check cached_ubatch <
+    fallback_ubatch, alongside the pre-existing ladder[0]/cap bounds."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(
+        r"cached_ubatch\s*<\s*ladder\[0\]\s*\|\|\s*cached_ubatch\s*>\s*cap\s*\|\|\s*cached_ubatch\s*<\s*"
+        r"fallback_ubatch\s*\)\s*\{\s*cache_state\s*=\s*\"miss\"\s*;",
+        body_norm,
+    ), "the cache-lookup miss condition must also reject cached_ubatch < fallback_ubatch"
+
+
+def test_cache_hit_floor_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the `|| cached_ubatch < fallback_ubatch` clause being dropped
+    (which would let a stale cached value below the caller's explicit
+    n_ubatch win without ever revalidating against the floor)."""
+    raw = LLAMA_CONTEXT_CPP
+    line = "            cached_ubatch < ladder[0] || cached_ubatch > cap || cached_ubatch < fallback_ubatch) {\n"
+    assert line in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(line, "            cached_ubatch < ladder[0] || cached_ubatch > cap) {\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "cached_ubatch < fallback_ubatch" not in mutated_body_norm, (
+        "mutation witness is broken: dropping the clause should remove it from the body"
+    )
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-pyu4: comment inaccuracy -- residue-freedom is the sched.reset()
+# inside sched_reserve(), not ggml-alloc.c's realloc-on-shrink-no-op.
+# ---------------------------------------------------------------------------
+
+
+def test_residue_freedom_comment_credits_sched_reset_not_ggml_alloc():
+    """The trial's own docstring must credit residue-freedom (a losing
+    candidate's oversized buffers not being left behind) to
+    sched_reserve()'s sched.reset(ggml_backend_sched_new(...)) call, which
+    is the actual mechanism -- not to a nonexistent "ggml-alloc.c's
+    realloc-on-shrink-no-op"."""
+    assert "ggml-alloc.c's realloc-on-shrink-no-op" not in LLAMA_CONTEXT_CPP, (
+        "the inaccurate ggml-alloc.c attribution must be gone from the comment"
+    )
+    assert "sched.reset(ggml_backend_sched_new(...)) destroys the whole scheduler" in LLAMA_CONTEXT_CPP, (
+        "the comment must credit the real mechanism: sched_reserve()'s own sched.reset(...) call"
     )
 
 
@@ -723,21 +1046,24 @@ def test_exactly_one_sycl_plan_auto_warn_in_the_body():
     )
 
 
-def test_all_eight_stop_reasons_are_present():
-    """The trial's stop-reason vocabulary must be EXACTLY the eight
-    strings the task spec names -- the original seven (llama.cpp-xojq
-    Task 4b) plus "cached" (llama.cpp-7n6n, Task 5: a persisted-cache hit
-    that revalidates cleanly skips the ladder with this stop reason).
+def test_all_nine_stop_reasons_are_present():
+    """The trial's stop-reason vocabulary must be EXACTLY the nine strings
+    the task spec names -- the original seven (llama.cpp-xojq Task 4b),
+    "cached" (llama.cpp-7n6n, Task 5: a persisted-cache hit that
+    revalidates cleanly skips the ladder with this stop reason), and
+    "compute buffers did not fit" (llama.cpp-pyu4: the in-loop
+    candidate's own sched_reserve() threw).
 
-    llama.cpp-7n6n: three of the eight are still
+    llama.cpp-7n6n: three of these are still
     literal `stop = "...";` assignments ("ladder exhausted"'s initial
-    declaration, "MoE GPU routing ceiling", and "cached"); the other five
-    are `return "...";` statements inside try_candidate(), moved there
-    specifically so a losing cache revalidation cannot leave its reason
-    behind in `stop`. Both forms are drawn from and must match this
-    one set, with none missing and none extra."""
+    declaration, "MoE GPU routing ceiling", and "cached"); the other six --
+    including this task's new one -- are `return "...";` statements inside
+    try_candidate(), moved there specifically so a losing cache
+    revalidation cannot leave its reason behind in `stop`. Both forms are
+    drawn from and must match this one set, with none missing and none
+    extra."""
     body_norm = _normalize_ws(_trial_body())
-    eight = {
+    nine = {
         "ladder exhausted",
         "MoE GPU routing ceiling",
         "transaction refused",
@@ -745,18 +1071,19 @@ def test_all_eight_stop_reasons_are_present():
         "not the published model",
         "KV would be demoted",
         "compute buffer fell back to host",
+        "compute buffers did not fit",
         "cached",
     }
-    for reason in eight:
+    for reason in nine:
         assert f'"{reason}"' in body_norm, f"missing stop reason literal: {reason!r}"
 
-    # Presence alone (the loop above) would pass even if a ninth string had
+    # Presence alone (the loop above) would pass even if a tenth string had
     # silently slipped in as a `stop = "..."` or `return "...";` somewhere --
     # this closes that gap by requiring the extracted SET to match exactly.
     found = set(re.findall(r'stop\s*=\s*"([^"]*)"', body_norm)) | set(
         re.findall(r'return\s*"([^"]*)"\s*;', body_norm)
     )
-    assert found == eight, f"stop-reason literal set does not match exactly -- found {found}"
+    assert found == nine, f"stop-reason literal set does not match exactly -- found {found}"
 
 
 # ---------------------------------------------------------------------------
@@ -1599,3 +1926,30 @@ def test_boundary_literals_are_pinned_in_the_unit_test():
     assert "18446744073709551615" in text, "UINT64_MAX itself must stay covered by a unit test"
     assert "parse_u64_rejects_overflow" in text
     assert "ubatch_cache_u64_hash_boundary_roundtrip" in text
+
+
+# ---------------------------------------------------------------------------
+# llama.cpp-pyu4: the GGML_SYCL_AUTO_UBATCH doc row must explain that
+# every MoE model is pinned at 512 by the GPU MoE routing ceiling.
+# ---------------------------------------------------------------------------
+
+
+def test_env_vars_doc_explains_the_moe_512_pin():
+    """llama.cpp-pyu4: the GGML_SYCL_AUTO_UBATCH row must state that every MoE model
+    is pinned at 512 today by the GPU MoE routing ceiling (llama.cpp-ohkx),
+    and name why GPT-OSS (MoE) and Mistral (dense) report different
+    outcomes -- otherwise a reader sees "MoE GPU routing ceiling" reported
+    for every MoE model and has no explanation for why it is always 512."""
+    row_start = SYCL_ENV_VARS_MD.find("| `GGML_SYCL_AUTO_UBATCH=0` |")
+    assert row_start != -1, "could not find the GGML_SYCL_AUTO_UBATCH row"
+    row_end = SYCL_ENV_VARS_MD.find("\n", row_start)
+    assert row_end != -1
+    row = SYCL_ENV_VARS_MD[row_start:row_end]
+
+    assert "llama.cpp-ohkx" in row, "the row must cite llama.cpp-ohkx for the GPU MoE routing ceiling"
+    assert "every MoE model is pinned at 512" in row, (
+        "the row must state that every MoE model is pinned at 512 by the ceiling"
+    )
+    assert "GPT-OSS" in row and "Mistral" in row, (
+        "the row must name GPT-OSS (MoE, pinned) and Mistral (dense, not pinned) as the contrasting example"
+    )
