@@ -405,7 +405,7 @@ def _dispatch_enabled_has_dl_decline_arm(fn_body: str) -> bool:
 
 
 def test_dispatch_enabled_declines_under_backend_dl():
-    """llama.cpp-n4ee Q1: ggml_sycl_attn_host_dispatch_enabled() itself must
+    """llama.cpp-n4ee: ggml_sycl_attn_host_dispatch_enabled() itself must
     decline under GGML_BACKEND_DL, not just the dispatch bodies it gates --
     otherwise supports_op/supports_buft still ACCEPT a demoted-layer node in
     a GGML_BACKEND_DL build with GGML_SYCL_ATTN_HOST_DISPATCH set, routing it
@@ -415,7 +415,7 @@ def test_dispatch_enabled_declines_under_backend_dl():
     body specifically (not merely somewhere in the file -- the forbidden-
     symbol scan elsewhere in this gate cannot see this: the arm contains no
     forbidden symbol, only a WARN and a `return false`), with a mutation
-    witness that deleting the arm (the function's pre-Q1 shape: read the env
+    witness that deleting the arm (the function's pre-fix shape: read the env
     var, done) is caught."""
     body = _extract_function_source("ggml_sycl_attn_host_dispatch_enabled", GGML_SYCL_CPP_CODE)
 
@@ -533,7 +533,7 @@ def test_gate_is_live_on_the_real_file():
     actually live against ggml-sycl.cpp's own #ifdef/#ifndef structure. This
     control disables every real DL-exclusion guard in the file at once:
     renaming every occurrence of GGML_BACKEND_DL to an unrelated macro name
-    turns each of the file's six `#ifdef GGML_BACKEND_DL` / `#ifndef
+    turns each of the file's `#ifdef GGML_BACKEND_DL` / `#ifndef
     GGML_BACKEND_DL` directives into an "other" condition, so
     `_dl_excluded_active` can no longer recognize any of them as
     DL-excluding -- every forbidden-symbol reference the real guards

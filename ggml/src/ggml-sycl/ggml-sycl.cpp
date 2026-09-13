@@ -80141,7 +80141,7 @@ static thread_local bool g_sycl_timeline_graph_spans_enabled = false;
 // downstream consumer (docs/plans/2026-08-27-tkv13-b2-addendum.md §6).
 // -----------------------------------------------------------------------
 
-// llama.cpp-n4ee (rev-n4ee-qual-1 Q1): the feature gate itself, not just the
+// llama.cpp-n4ee: the feature gate itself, not just the
 // dispatch bodies, must know about GGML_BACKEND_DL. Before this fix, a DL
 // build with the env var set still had supports_op/supports_buft ACCEPT a
 // demoted-layer node (they only check this function), so the node routed to
@@ -80374,7 +80374,7 @@ static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
     // ggml-cpu", CMakeLists.txt:46-47), so ggml_backend_cpu_init() -- a
     // ggml-cpu export -- is not a symbol this module can call. This
     // function is not actually reachable in a DL build anymore --
-    // ggml_sycl_attn_host_dispatch_enabled() (llama.cpp-n4ee Q1) declines
+    // ggml_sycl_attn_host_dispatch_enabled() (llama.cpp-n4ee) declines
     // before supports_op/supports_buft ever accept a node that would lead
     // here, and that is where the once-per-process WARN now lives -- but
     // the #ifdef stays regardless: a symbol reference is a link-time fact
