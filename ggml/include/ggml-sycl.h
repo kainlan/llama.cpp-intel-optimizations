@@ -408,7 +408,7 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // llama.cpp-k1ev) -- an earlier revision of this comment described a
 // live-free-VRAM predicate that hardware measurement falsified; do not
 // reintroduce it without first closing k1ev.
-// llama.cpp-3aos (round 1 F9): kv_unified -- see
+// llama.cpp-3aos: kv_unified -- see
 // ggml_backend_sycl_set_runtime_context_for_model()'s declaration for the
 // full rationale. This entry point has two real callers, both internal to
 // ggml-sycl.cpp: ggml_backend_sycl_set_runtime_context_for_model() (which
@@ -1120,7 +1120,7 @@ GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_activate_mode
 // llama.cpp-oyfl: flash_attn_enabled forwards to
 // ggml_backend_sycl_set_runtime_context() -- see that declaration's comment.
 //
-// llama.cpp-3aos (round 1 F9): kv_unified mirrors llama_cparams::kv_unified
+// llama.cpp-3aos: kv_unified mirrors llama_cparams::kv_unified
 // (src/llama-context.cpp; default false). It changes how many cells a SWA
 // layer's KV cache actually holds: with kv_unified==false (llama-completion/
 // llama-bench's default, and llama-server unless overridden) the cache is
@@ -1209,7 +1209,7 @@ struct ggml_sycl_runtime_context_probe {
 // which stays PLAN_REJECTED below). It is distinct from
 // GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
 // enum value's own comment).
-// llama.cpp-3aos (round 1 F9): kv_unified -- see
+// llama.cpp-3aos: kv_unified -- see
 // ggml_backend_sycl_set_runtime_context_for_model()'s declaration above for
 // the full rationale. The probe must be given the SAME kv_unified the
 // candidate would actually publish with, or its accept/reject decision

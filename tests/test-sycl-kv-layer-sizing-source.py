@@ -162,8 +162,7 @@ def kv_bytes_for_layer_violations(source: str) -> list[str]:
     """placement_kv_info::kv_bytes_for_layer() must route through the shared
     per-layer formula when per-layer truth is populated, not re-derive its
     own copy -- the exact "two independent formulas can drift" shape this
-    ticket fixes. Must also forward kv_unified (round 1 F9), not just
-    n_seq_max.
+    ticket fixes. Must also forward kv_unified, not just n_seq_max.
     """
     body = function_or_none(source, "size_t kv_bytes_for_layer(uint32_t il) const")
     if body is None:
@@ -254,7 +253,7 @@ def transaction_body_violations(source: str) -> list[str]:
 
 
 def n_embd_gqa_max_violations(source: str) -> list[str]:
-    """llama.cpp-3aos round 1 F1: the inventory's FULL-attention width
+    """llama.cpp-3aos: the inventory's FULL-attention width
     fallback fields must be the model-wide MAXIMUM per-layer width
     (hparams.n_embd_k_gqa_max()/n_embd_v_gqa_max()), not layer 0's width
     (hparams.n_embd_k_gqa()/n_embd_v_gqa() with no explicit layer index) --
@@ -305,7 +304,7 @@ def test_no_stale_n_seq_max_one_comment_remains() -> None:
 
 
 # ---------------------------------------------------------------------------
-# llama.cpp-3aos (round 1 F6): each mutation below names ONE checker and ONE
+# llama.cpp-3aos: each mutation below names ONE checker and ONE
 # expected violation substring, and the assertion is that THAT specific
 # check fires with THAT specific message -- not "any of several checkers
 # fired something". A check that has gone dead (matches nothing, or matches

@@ -368,21 +368,22 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.n_expert                = hparams.n_expert;
     inventory.n_expert_used           = hparams.n_expert_used;
     inventory.n_layer                 = n_layer;
-    // llama.cpp-3aos (correction of record, round 1 F1): d3884b444's own
-    // body claimed this used n_embd_k_gqa_max()/n_embd_v_gqa_max() already;
-    // it did not -- these were still the il=0 (layer 0's width) accessors,
-    // byte-identical to the pre-ticket code. On Gemma 4 E4B layer 0 is a
-    // SWA layer (width 512), so the FULL-attention-width fields this
-    // struct's own field comment (ggml-sycl.h) and unified-cache.hpp's
-    // kv_bytes_per_layer()/kv_bytes_per_swa_layer() comments now describe
-    // were silently still the narrower SWA width -- kv_bytes_per_layer()
-    // computed n_ctx * (512+512) * 2 = 8,388,608 for Gemma 4 E4B instead of
-    // the real full-attention n_ctx * (1024+1024) * 2 = 16,777,216, which
-    // is plan.kv_per_layer, consumed by ggml_sycl_largest_fitting_n_ctx()
-    // and the KV-buffer-kind heuristic in ggml-sycl.cpp. _max() is the
-    // correct accessor: the maximum per-layer width, which for a model
-    // whose full-attention layers are its widest (true of every SWA
-    // architecture in this codebase) is genuinely the FULL-attention width.
+    // llama.cpp-3aos: layer 0 may be a sliding layer whose width is
+    // narrower than the full-attention layers', so the fallback width
+    // here must be the per-layer MAXIMUM, not layer 0's own width. On
+    // Gemma 4 E4B layer 0 is a SWA layer (width 512), so the il=0
+    // accessor (no explicit layer argument) silently under-widens the
+    // FULL-attention-width fields this struct's own field comment
+    // (ggml-sycl.h) and unified-cache.hpp's kv_bytes_per_layer()/
+    // kv_bytes_per_swa_layer() comments describe -- kv_bytes_per_layer()
+    // would compute n_ctx * (512+512) * 2 = 8,388,608 for Gemma 4 E4B
+    // instead of the real full-attention n_ctx * (1024+1024) * 2 =
+    // 16,777,216, which is plan.kv_per_layer, consumed by
+    // ggml_sycl_largest_fitting_n_ctx() and the KV-buffer-kind heuristic
+    // in ggml-sycl.cpp. _max() is the correct accessor: the maximum
+    // per-layer width, which for a model whose full-attention layers are
+    // its widest (true of every SWA architecture in this codebase) is
+    // genuinely the FULL-attention width.
     inventory.n_embd_k_gqa              = hparams.n_embd_k_gqa_max();
     inventory.n_embd_v_gqa              = hparams.n_embd_v_gqa_max();
     // Model loading no longer has runtime context params. Do not reserve

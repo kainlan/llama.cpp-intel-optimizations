@@ -33,7 +33,7 @@ using ggml_sycl::plan_runtime_kv_demotion;
 
 // Helper: n_layers alternating geometry like GPT-OSS (even = full-attn, odd = SWA).
 //
-// llama.cpp-3aos (round 1 F3): kv_bytes_per_layer is now a REAL per-layer
+// llama.cpp-3aos: kv_bytes_per_layer is now a REAL per-layer
 // vector (kv_per_layer/kv_per_swa_layer scalars removed) -- this helper
 // still builds a uniform-width vector (kv_full on every even layer, kv_swa
 // on every odd one) so every existing case below keeps its original
@@ -118,7 +118,7 @@ int main() {
         CHECK_EQ(r.vram_bytes_after, 50, "case 7: vram_bytes_after unchanged, no underflow");
         CHECK_EQ(r.host_kv_bytes_added, 0, "case 7: no bytes added");
     }
-    // 8. llama.cpp-3aos (round 1 F3): a device-resident, non-SWA layer with
+    // 8. llama.cpp-3aos: a device-resident, non-SWA layer with
     // kv_bytes_per_layer[l] == 0 (e.g. a SHARED layer that holds no
     // independent KV of its own) must never be demoted -- there is nothing
     // for it to give back, and counting it would silently manufacture

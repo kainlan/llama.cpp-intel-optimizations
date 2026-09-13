@@ -20,7 +20,7 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         if (is_swa) {
             continue;  // SWA KV is ~1.5 MB/layer; demoting it buys nothing and costs a split
         }
-        // llama.cpp-3aos (round 1 F3): THIS layer's own recorded bytes, not a
+        // llama.cpp-3aos: THIS layer's own recorded bytes, not a
         // uniform figure applied to every full-attention layer -- 0 means
         // nothing is recorded for it (untracked, or a SHARED layer with no
         // independent KV to move), so there is nothing to demote.

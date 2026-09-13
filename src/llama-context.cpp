@@ -1077,7 +1077,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             }
             const ggml_sycl_model_token token = { owner.model_id, owner.load_txn_id, owner.slot,
                                                   owner.slot_generation };
-            // llama.cpp-3aos (round 1 F9): cparams.kv_unified threaded the
+            // llama.cpp-3aos: cparams.kv_unified threaded the
             // same way cparams.n_seq_max already is -- SYCL's KV planner
             // needs it to pick the right SWA sizing mode (see
             // ggml_backend_sycl_set_runtime_context_for_model()'s
@@ -1404,7 +1404,7 @@ void llama_context::sycl_select_auto_ubatch() {
         bool candidate_lost = false;
         for (auto & sb : sycl_backends) {
             ggml_sycl_runtime_context_probe probe{};
-            // llama.cpp-3aos (round 1 F9): cparams.kv_unified -- the probe
+            // llama.cpp-3aos: cparams.kv_unified -- the probe
             // must be given the SAME kv_unified the candidate would
             // actually publish with, or its accept/reject answer is for the
             // wrong KV shape (ggml-sycl.h, this probe's declaration).

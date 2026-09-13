@@ -16587,7 +16587,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
 // overstate the cost when part of the KV is host-resident. SWA layers are a
 // constant at the plan's OWN (already-fitting) n_ctx: kv_bytes_for_layer()
 // caps their cells at the SWA window, which does not grow further once
-// n_ctx exceeds it (llama.cpp-3aos, round 1 F2). SHARED layers (no K/V of
+// n_ctx exceeds it (llama.cpp-3aos). SHARED layers (no K/V of
 // their own -- e.g. 18 of Gemma 4 E4B's 42 layers) cost nothing and must
 // not be counted as full-attention layers, which is exactly the bug this
 // fixes: the pre-fix code had no SHARED concept, so a device-resident
@@ -16709,7 +16709,7 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
     kv_demotion_in.vram_bytes  = plan.vram_bytes;
     kv_demotion_in.kv_device.resize(n_layers);
     kv_demotion_in.swa_layer_mask.assign(plan.swa_layer_mask.begin(), plan.swa_layer_mask.end());
-    // llama.cpp-3aos (round 1 F3): THIS layer's own bytes via
+    // llama.cpp-3aos: THIS layer's own bytes via
     // placement_plan::kv_size_for_layer() (which already routes through the
     // per-layer kv_layer_bytes_for_kind() formula when the plan carries
     // per-layer truth, falling back to the legacy uniform split otherwise)
@@ -17282,7 +17282,7 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
 // enum value without ever string-comparing `out->reason`.
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
-// llama.cpp-3aos (round 1 F9): kv_unified -- see placement_kv_info::
+// llama.cpp-3aos: kv_unified -- see placement_kv_info::
 // kv_unified / kv_layer_bytes_for_kind() (unified-cache.hpp) for the
 // rationale. Threaded the same way n_seq_max already is: onto next_kv_info
 // and next_plan below, before either is consulted.
@@ -17372,7 +17372,7 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // here the way n_ubatch==0 does above) -- callers always pass the
     // context's real n_seq_max.
     next_kv_info.n_seq_max        = n_seq_max;
-    // llama.cpp-3aos (round 1 F9): kv_unified selects which of the two SWA
+    // llama.cpp-3aos: kv_unified selects which of the two SWA
     // sizing modes applies (kv_layer_bytes_for_kind(), unified-cache.hpp) --
     // same unconditional treatment as n_seq_max just above.
     next_kv_info.kv_unified       = kv_unified;
@@ -18191,7 +18191,7 @@ void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx)
     // flash attention actually is off; defaulting to "skip the check" here
     // would silently reopen exactly the abort this ticket exists to prevent
     // for any caller of this legacy entry point.
-    // llama.cpp-3aos (round 1 F9): same reasoning as n_seq_max=1 above --
+    // llama.cpp-3aos: same reasoning as n_seq_max=1 above --
     // this legacy entry point has no way to learn a real kv_unified either,
     // so it passes llama_cparams::kv_unified's own default (false).
     ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1, /*kv_unified=*/false, /*flash_attn_enabled=*/false);

@@ -483,8 +483,8 @@ enum class multi_gpu_mode : uint8_t {
 // Both call sites now go through this one function, parameterized by the
 // PER-LAYER kind/width so they cannot independently drift out of sync again.
 //
-// llama.cpp-3aos (round 1 F9): SWA sizing has TWO modes, and round bae0e2305
-// only implemented one of them. Derived from src/llama-context.cpp:637-650
+// llama.cpp-3aos: llama's iSWA cache is per-stream unless kv_unified, so
+// SWA sizing has TWO modes. Derived from src/llama-context.cpp:637-650
 // and src/llama-kv-cache-iswa.cpp:69-81 (both cited by line at the branch
 // below), confirmed against a live GPU run's own printed shapes
 // (n_ctx_seq/kv_unified log lines, and the exact overflow byte counts):
@@ -574,7 +574,7 @@ struct placement_kv_info {
     // is only correct at n_seq_max == 1. Default 1 preserves that
     // single-sequence behavior when a caller never sets this field.
     uint32_t              n_seq_max    = 1;
-    // llama.cpp-3aos (round 1 F9): mirrors llama_cparams::kv_unified
+    // llama.cpp-3aos: mirrors llama_cparams::kv_unified
     // (src/llama-context.cpp; default false, matching llama's own default).
     // Selects which of the two SWA sizing modes kv_layer_bytes_for_kind()
     // uses -- see that function's own comment for the full derivation. This
@@ -644,7 +644,12 @@ struct placement_kv_info {
         if (!valid()) {
             return 0;
         }
-        return static_cast<size_t>(n_ctx) * static_cast<size_t>(n_embd_k_gqa + n_embd_v_gqa) * sizeof(ggml_fp16_t);
+        // llama.cpp-3aos: routed through kv_layer_bytes_for_kind()'s FULL
+        // branch (numerically identical -- that branch does not consult
+        // n_swa/n_ubatch/n_seq_max/kv_unified) so the arithmetic lives in
+        // exactly one place, matching kv_bytes_per_swa_layer() below.
+        return kv_layer_bytes_for_kind(GGML_SYCL_KV_LAYER_FULL, n_embd_k_gqa, n_embd_v_gqa, n_ctx, n_swa, n_ubatch,
+                                       n_seq_max, kv_unified);
     }
 
     size_t kv_bytes_per_swa_layer() const {
@@ -730,9 +735,9 @@ struct placement_plan {
     uint32_t                     planner_n_ctx            = 0;
     uint32_t                     planner_n_ubatch         = 0;
     uint32_t                     planner_n_seq_max        = 0;
-    // llama.cpp-3aos (round 1 F9): mirrors placement_kv_info::kv_unified --
-    // see that field's comment. Default false matches llama_cparams::
-    // kv_unified's own default.
+    // llama.cpp-3aos: mirrors placement_kv_info::kv_unified -- see that
+    // field's comment. Default false matches llama_cparams::kv_unified's
+    // own default.
     bool                                       planner_kv_unified       = false;
     bool                         planner_n_ctx_is_runtime = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers,

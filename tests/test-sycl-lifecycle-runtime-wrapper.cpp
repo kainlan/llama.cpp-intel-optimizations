@@ -1186,7 +1186,7 @@ int main() {
     // llama.cpp-oyfl: flash_attn_enabled's value is irrelevant here -- n_ctx=0
     // makes the callee return NULL_OUTPUT before that parameter is ever
     // consulted; false is passed only to keep this call well-formed.
-    // llama.cpp-3aos (round 1 F9): kv_unified is irrelevant for the same
+    // llama.cpp-3aos: kv_unified is irrelevant for the same
     // reason -- false keeps the call well-formed.
     if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||
         CALL_SYCL(ggml_backend_sycl_set_runtime_context_for_model)(nullptr, zero, 0, 0, 0, false, false) !=

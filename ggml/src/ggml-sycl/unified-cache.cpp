@@ -27199,7 +27199,7 @@ static const char * placement_envelope_fa_name(int32_t t) {
     }
 }
 
-// llama.cpp-3aos (round 1 F7): named cases instead of a nested ternary chain
+// llama.cpp-3aos: named cases instead of a nested ternary chain
 // -- SHARED (no K/V of its own) takes priority over the SWA/FULL mask so a
 // SHARED layer never mislabels as either.
 static const char * placement_kv_layer_label(const placement_kv_info & kv_info,
@@ -27259,7 +27259,7 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
     plan.planner_n_ubatch                    = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
-    // llama.cpp-3aos (round 1 F9): no envelope override -- kv_unified, like
+    // llama.cpp-3aos: no envelope override -- kv_unified, like
     // n_seq_max, is a per-context runtime property the model-load-time
     // envelope never actually carries (llama_model_sycl_make_placement_
     // envelope() hardcodes a placeholder default); the REAL value is set
@@ -28580,7 +28580,7 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
     plan.planner_n_ubatch         = envelope && envelope->n_ubatch ? envelope->n_ubatch : kv_info.n_ubatch;
     plan.planner_n_seq_max =
         envelope && envelope->n_seq_max ? envelope->n_seq_max : (kv_info.n_seq_max > 0 ? kv_info.n_seq_max : 1);
-    // llama.cpp-3aos (round 1 F9): see the single-device path's identical
+    // llama.cpp-3aos: see the single-device path's identical
     // comment above -- no envelope override, the real value is set later by
     // the runtime transaction mutating a plan copy directly.
     plan.planner_kv_unified       = kv_info.kv_unified;

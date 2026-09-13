@@ -9,7 +9,7 @@ namespace ggml_sycl {
 // Adapted from placement_plan (unified-cache.hpp) as plain values so this TU
 // stays host-linkable with no unified-cache dependency.
 //
-// llama.cpp-3aos (round 1 F3): kv_bytes_per_layer replaces what used to be a
+// llama.cpp-3aos: kv_bytes_per_layer replaces what used to be a
 // single kv_per_layer/kv_per_swa_layer scalar pair -- a uniform "one
 // representative full-attention layer's bytes" figure applied to every
 // full-attention layer regardless of its REAL per-layer width
