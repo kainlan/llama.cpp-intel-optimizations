@@ -396,7 +396,14 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     already equals moe_cap, e.g. cap == 512, is bound by the ceiling exactly
     as much as one where moe_cap is smaller, and used to silently report
     "ladder exhausted" instead). The 512 constant itself must NOT be
-    hardcoded in llama-context.cpp; it must come from the accessor."""
+    hardcoded in llama-context.cpp; it must come from the accessor.
+
+    The condition must also be gated on moe_cap_available -- the
+    DL-without-SYCL branch degrades moe_cap to `cap` itself (no
+    MoE-specific narrowing) when the accessor is absent, which would
+    otherwise satisfy `moe_cap <= cap` trivially and report the ceiling
+    reason for every such MoE model although no ceiling was ever
+    consulted."""
     body_norm = _normalize_ws(_trial_body())
     assert re.search(r"if\s*\(\s*model\.hparams\.n_expert\s*>\s*0\s*\)\s*\{", body_norm), (
         "the MoE cap must be gated on model.hparams.n_expert > 0"
@@ -404,9 +411,16 @@ def test_moe_model_cap_binds_whenever_moe_cap_does_not_exceed_the_batch_ctx_cap(
     assert "ggml_backend_sycl_moe_gpu_ubatch_max" in body_norm, (
         "the MoE cap must be read from ggml_backend_sycl_moe_gpu_ubatch_max(), not a local constant"
     )
-    assert re.search(r"if\s*\(\s*moe_cap\s*<=\s*cap\s*\)\s*\{", body_norm), (
-        "the MoE cap must narrow `cap` (and report the ceiling reason) whenever moe_cap <= cap, not only when "
-        "it is strictly smaller"
+    assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*true\s*;", body_norm), (
+        "the direct GGML_USE_SYCL branch must declare moe_cap_available = true (the accessor is always real there)"
+    )
+    assert re.search(r"const\s+bool\s+moe_cap_available\s*=\s*moe_cap_fn\s*!=\s*nullptr\s*;", body_norm), (
+        "the GGML_BACKEND_DL-without-SYCL branch must declare moe_cap_available = (moe_cap_fn != nullptr)"
+    )
+    assert re.search(r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", body_norm), (
+        "the MoE cap must narrow `cap` (and report the ceiling reason) only when moe_cap_available && "
+        "moe_cap <= cap -- not on moe_cap <= cap alone, which is trivially true when the accessor degraded "
+        "moe_cap to cap itself"
     )
     assert not re.search(r"\bcap\s*=\s*512\b", body_norm), (
         "the MoE ceiling must not be hardcoded as a bare 512 in llama-context.cpp"
@@ -419,15 +433,33 @@ def test_moe_model_cap_binds_at_equal_has_a_mutation_witness():
     "MoE GPU routing ceiling" reason whenever moe_cap == cap, e.g. a MoE
     model whose batch/ctx cap is already exactly 512)."""
     raw = LLAMA_CONTEXT_CPP
-    line = "        if (moe_cap <= cap) {\n"
+    line = "        if (moe_cap_available && moe_cap <= cap) {\n"
     assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
-    mutated_raw = raw.replace(line, "        if (moe_cap < cap) {\n", 1)
+    mutated_raw = raw.replace(line, "        if (moe_cap_available && moe_cap < cap) {\n", 1)
     assert mutated_raw != raw
 
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
-    assert not re.search(r"if\s*\(\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm), (
+    assert not re.search(r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm), (
         "mutation witness is broken: reverting to strict < should make the <= check fail"
     )
+
+
+def test_moe_model_cap_accessor_gate_has_a_mutation_witness():
+    """Mutation witness for the moe_cap_available gate itself: proves it
+    would actually catch the gate being dropped (which would report "MoE
+    GPU routing ceiling" for every MoE model on a GGML_BACKEND_DL build
+    whose SYCL DSO lacks the accessor, even though moe_cap was never
+    narrowed by anything)."""
+    raw = LLAMA_CONTEXT_CPP
+    line = "        if (moe_cap_available && moe_cap <= cap) {\n"
+    assert raw.count(line) == 1, f"mutation target not unique -- found {raw.count(line)}"
+    mutated_raw = raw.replace(line, "        if (moe_cap <= cap) {\n", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert not re.search(
+        r"if\s*\(\s*moe_cap_available\s*&&\s*moe_cap\s*<=\s*cap\s*\)\s*\{", mutated_body_norm
+    ), "mutation witness is broken: dropping the moe_cap_available gate should make the gated-condition check fail"
 
 
 def test_header_declares_the_moe_gpu_ubatch_max_accessor():
@@ -983,6 +1015,66 @@ def test_cache_hit_floor_has_a_mutation_witness():
     mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
     assert "cached_ubatch < fallback_ubatch" not in mutated_body_norm, (
         "mutation witness is broken: dropping the clause should remove it from the body"
+    )
+
+
+def test_fallback_above_every_rung_exits_before_the_loop_with_no_warn():
+    """llama.cpp-pyu4: the floor-skip above means a raw-API caller whose
+    explicit n_ubatch (fallback_ubatch) already exceeds every ladder rung
+    (e.g. 8192 with n_ubatch_auto and cap >= 8192) would otherwise walk an
+    entirely-skipped ladder loop, leaving `tried` empty and reaching the
+    [SYCL-PLAN] auto n_ubatch= WARN with a "ladder exhausted" reason that
+    never actually ran a ladder -- exactly the shape
+    test_cap_below_first_rung_exits_before_the_loop_with_no_warn already
+    forbids at the OTHER edge. This early exit must be positioned AFTER
+    the tuning-cache lookup (so a persisted value at or above the floor
+    can still be revalidated and reported) and BEFORE the ladder loop, and
+    gated on `tried.empty()` so a genuine cache attempt this trial still
+    gets its normal outcome WARN."""
+    body_norm = _normalize_ws(_trial_body())
+    cache_warn_idx = body_norm.find('[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)')
+    loop_idx = body_norm.find("for (uint32_t c : ladder)")
+    warn_idx = body_norm.find("[SYCL-PLAN] auto n_ubatch=")
+    assert cache_warn_idx != -1 and loop_idx != -1 and warn_idx != -1
+
+    exit_match = re.search(
+        r"if\s*\(\s*tried\.empty\s*\(\s*\)\s*&&\s*fallback_ubatch\s*>\s*"
+        r"ladder\[\s*sizeof\s*\(\s*ladder\s*\)\s*/\s*sizeof\s*\(\s*ladder\[0\]\s*\)\s*-\s*1\s*\]\s*\)\s*\{",
+        body_norm,
+    )
+    assert exit_match is not None, (
+        "there must be an early exit gated on tried.empty() && fallback_ubatch > the ladder's last rung"
+    )
+    assert cache_warn_idx < exit_match.start() < loop_idx, (
+        "the fallback-above-every-rung early exit must come after the tuning-cache WARN and before the ladder "
+        "loop"
+    )
+    assert exit_match.start() < warn_idx, "the WARN literal must not appear before this early exit"
+
+    exit_block = body_norm[exit_match.start() : body_norm.find("}", exit_match.start()) + 1]
+    assert re.search(r"sched_reserve\(\s*\)\s*;\s*return\s*;", exit_block), (
+        "the early exit must call sched_reserve() then return, with no publish, no store, and no WARN in between"
+    )
+
+
+def test_fallback_above_every_rung_early_exit_has_a_mutation_witness():
+    """Mutation witness for the check above: proves it would actually
+    catch the early exit being deleted (falling through into a ladder that
+    can try nothing, with `tried` staying empty)."""
+    raw = LLAMA_CONTEXT_CPP
+    early_exit_block = (
+        "    if (tried.empty() && fallback_ubatch > ladder[sizeof(ladder) / sizeof(ladder[0]) - 1]) {\n"
+        "        sched_reserve();\n"
+        "        return;\n"
+        "    }\n"
+    )
+    assert early_exit_block in raw, "mutation target not found -- update this witness to match the real source"
+    mutated_raw = raw.replace(early_exit_block, "", 1)
+    assert mutated_raw != raw
+
+    mutated_body_norm = _body_of(mutated_raw, _TRIAL_START, _TRIAL_END)
+    assert "fallback_ubatch > ladder[" not in mutated_body_norm, (
+        "mutation witness is broken: deleting the block should remove the early-exit check"
     )
 
 

@@ -1427,17 +1427,24 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
         // return nullptr on an older SYCL DSO, so it degrades to `cap`
         // (no MoE-specific narrowing) rather than dereferencing one.
 #    ifdef GGML_USE_SYCL
-        const uint32_t moe_cap = ggml_backend_sycl_moe_gpu_ubatch_max();
+        const uint32_t moe_cap           = ggml_backend_sycl_moe_gpu_ubatch_max();
+        const bool     moe_cap_available = true;
 #    else
-        const uint32_t moe_cap = moe_cap_fn ? moe_cap_fn() : cap;
+        const uint32_t moe_cap           = moe_cap_fn ? moe_cap_fn() : cap;
+        const bool     moe_cap_available = moe_cap_fn != nullptr;
 #    endif
         // llama.cpp-pyu4: report the MoE ceiling reason whenever it is
         // the BINDING cap, not only when it strictly narrows a larger
         // batch/ctx cap -- a MoE context whose batch/ctx cap already equals
         // moe_cap (e.g. cap == 512) is bound by the ceiling exactly as much
         // as one where moe_cap is smaller, and used to silently report
-        // "ladder exhausted" instead.
-        if (moe_cap <= cap) {
+        // "ladder exhausted" instead. Gated on moe_cap_available: the
+        // DL-without-SYCL branch above degrades moe_cap to `cap` itself
+        // (no MoE-specific narrowing) when the accessor is absent, which
+        // would otherwise satisfy `moe_cap <= cap` trivially and report the
+        // ceiling reason for every such MoE model even though no ceiling
+        // was ever consulted.
+        if (moe_cap_available && moe_cap <= cap) {
             cap  = moe_cap;
             stop = "MoE GPU routing ceiling";
         }
@@ -1769,6 +1776,24 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     LLAMA_LOG_WARN("[SYCL-PLAN] tuning cache %s: n_ubatch=%u (%s)\n", cache_state, cache_report_ubatch,
                    cache_paren.c_str());
 
+    // llama.cpp-pyu4: mirrors the cap < ladder[0] early exit above, for the
+    // OPPOSITE edge -- a raw-API caller whose explicit n_ubatch
+    // (fallback_ubatch) already exceeds every ladder rung leaves the
+    // floor-skip below unable to try anything, which would otherwise reach
+    // the [SYCL-PLAN] auto n_ubatch= WARN with an empty `tried` list and a
+    // "ladder exhausted" reason that never actually ran a ladder -- exactly
+    // the shape that early exit exists to prevent. Placed AFTER the cache
+    // lookup (not before it) so a persisted value at or above the floor can
+    // still be revalidated and reported; gated on tried.empty() so a
+    // genuine cache attempt this trial (a hit, or a lost cache candidate)
+    // still gets its normal outcome WARN and, on a hit, its store skip
+    // logic, same as today. No `[SYCL-PLAN] auto n_ubatch=` WARN and no
+    // cache store here, matching the other silent pre-trial exits.
+    if (tried.empty() && fallback_ubatch > ladder[sizeof(ladder) / sizeof(ladder[0]) - 1]) {
+        sched_reserve();
+        return;
+    }
+
     for (uint32_t c : ladder) {
         if (!ladder_needed) {
             break;
@@ -1868,10 +1893,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // when sched_matches_last_good is actually true -- the settle-skipped
     // condition must still imply the ring and plan describe the winner.
     //
-    // llama.cpp-pyu4: the ring's correctness after a probe rollback
-    // failure (llama.cpp-jumy N3's path) here is ARITHMETIC, not something
-    // this gate has to know about structurally: a 512 rollback failure
-    // leaves last_good at 512, which is the winner anyway, so the settle
+    // llama.cpp-pyu4: the ring's correctness after the probe
+    // rollback-failure path (llama.cpp-jumy) here is ARITHMETIC, not
+    // something this gate has to know about structurally: a 512 rollback
+    // failure leaves last_good at 512, which is the winner anyway, so the settle
     // reserve below just re-confirms it; a 1024+ rollback failure has
     // already set published_any true earlier in the trial, so need_publish
     // is true and the settle republishes and re-plans regardless. The
