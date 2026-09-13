@@ -24294,6 +24294,15 @@ static ggml_sycl_device_info ggml_sycl_init() {
         std::strncpy(info.devices[i].device_name, name.c_str(), sizeof(info.devices[i].device_name) - 1);
         info.devices[i].device_name[sizeof(info.devices[i].device_name) - 1] = '\0';
 
+        // llama.cpp-7n6n: store the driver version next to device_name --
+        // previously only queried for the startup table
+        // (print_device_detail(), below) and discarded. See
+        // sycl_device_info::driver_version's comment (common.hpp).
+        std::string driver_version = device.get_info<sycl::info::device::driver_version>();
+        std::strncpy(info.devices[i].driver_version, driver_version.c_str(),
+                     sizeof(info.devices[i].driver_version) - 1);
+        info.devices[i].driver_version[sizeof(info.devices[i].driver_version) - 1] = '\0';
+
         size_t     free_vram           = 0;
         size_t     total_vram_reported = device_vram;
         dpct::err0 mem_err             = CHECK_TRY_ERROR(device_i.get_memory_info(free_vram, total_vram_reported));
@@ -80280,8 +80289,32 @@ static thread_local bool g_sycl_timeline_graph_spans_enabled = false;
 // downstream consumer (docs/plans/2026-08-27-tkv13-b2-addendum.md §6).
 // -----------------------------------------------------------------------
 
+// llama.cpp-n4ee: the feature gate itself, not just the
+// dispatch bodies, must know about GGML_BACKEND_DL. Before this fix, a DL
+// build with the env var set still had supports_op/supports_buft ACCEPT a
+// demoted-layer node (they only check this function), so the node routed to
+// a dispatch that always declines under DL -- and the node-loop's handler is
+// GGML_ASSERT(ok), i.e. an abort, not the graceful "feature unavailable"
+// this env var's default-OFF opt-in is supposed to mean. Declining HERE
+// keeps supports_op/supports_buft in their pre-existing "not accepted"
+// state, which restores the scheduler's own CPU split for demoted-layer
+// attention -- the behavior this whole opt-in feature intercepts, not a new
+// failure mode.
 static bool ggml_sycl_attn_host_dispatch_enabled() {
-    static const bool enabled = std::getenv("GGML_SYCL_ATTN_HOST_DISPATCH") != nullptr;
+    static const bool enabled = [] {
+        if (std::getenv("GGML_SYCL_ATTN_HOST_DISPATCH") == nullptr) {
+            return false;
+        }
+#ifdef GGML_BACKEND_DL
+        GGML_LOG_WARN(
+            "[ATTN-HOST] GGML_SYCL_ATTN_HOST_DISPATCH is unavailable in a "
+            "GGML_BACKEND_DL build (the SYCL module does not link ggml-cpu); "
+            "demoted-layer attention falls back to the scheduler's CPU split\n");
+        return false;
+#else
+        return true;
+#endif
+    }();
     return enabled;
 }
 
@@ -80483,6 +80516,20 @@ static void ggml_sycl_attn_host_staging_free_all() {
 // cache). Freed once in ggml_sycl_attn_host_cpu_backend_free() (called from
 // ggml_sycl_shutdown_global_runtime_pinned_owners(), above).
 static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
+#ifdef GGML_BACKEND_DL
+    // A DL module links only the public backend-registration surface and
+    // never ggml-cpu itself ("DL modules remain completely independent of
+    // ggml-cpu", CMakeLists.txt:46-47), so ggml_backend_cpu_init() -- a
+    // ggml-cpu export -- is not a symbol this module can call. This
+    // function is not actually reachable in a DL build anymore --
+    // ggml_sycl_attn_host_dispatch_enabled() (llama.cpp-n4ee) declines
+    // before supports_op/supports_buft ever accept a node that would lead
+    // here, and that is where the once-per-process WARN now lives -- but
+    // the #ifdef stays regardless: a symbol reference is a link-time fact
+    // regardless of runtime reachability, and ggml_backend_cpu_init is one
+    // of the DL audit's forbidden CPU-backend symbols.
+    return nullptr;
+#else
     ggml_backend_t be = g_attn_host_cpu_backend;
     if (be) {
         return be;
@@ -80531,9 +80578,22 @@ static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
     }
     g_attn_host_cpu_backend = be;
     return be;
+#endif
 }
 
 static void ggml_sycl_attn_host_cpu_backend_free() {
+#ifdef GGML_BACKEND_DL
+    // ggml_sycl_attn_host_cpu_backend() above never sets
+    // g_attn_host_cpu_backend/g_attn_host_cpu_threadpool in a DL build (it
+    // declines before ever calling ggml_backend_cpu_init()/
+    // ggml_threadpool_new()), so there is nothing to release here. The
+    // ggml_threadpool_free() teardown call below is skipped entirely --
+    // not merely left dead behind an always-false runtime check -- so that
+    // symbol never appears in the DL module's undefined-symbol table
+    // (it's one of the checker's forbidden imports, tests/test-sycl-module-
+    // dependencies.py).
+    ggml_sycl_attn_host_staging_free_all();
+#else
     std::lock_guard<std::mutex> lock(g_attn_host_cpu_backend_mutex);
     if (g_attn_host_cpu_backend) {
         ggml_backend_free(g_attn_host_cpu_backend);
@@ -80544,6 +80604,7 @@ static void ggml_sycl_attn_host_cpu_backend_free() {
         g_attn_host_cpu_threadpool = nullptr;
     }
     ggml_sycl_attn_host_staging_free_all();
+#endif
 }
 
 // TKV-13 (B2) final increment: the overlapped, deferred-flush form of the
@@ -80710,7 +80771,13 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
 
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
-        GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host dispatch\n");
+        // Reworded (was "ggml_backend_cpu_init() failed"): in a
+        // GGML_BACKEND_DL build ggml_sycl_attn_host_cpu_backend() declines
+        // before ever calling ggml_backend_cpu_init(), so that phrasing
+        // would misreport the cause -- see its own once-per-process WARN
+        // for why. This line stays generic so it is accurate for both that
+        // case and a genuine (non-DL) ggml_backend_cpu_init() failure.
+        GGML_LOG_WARN("[ATTN-HOST] no CPU backend available; declining host dispatch\n");
         return false;
     }
 
@@ -80861,7 +80928,18 @@ static bool ggml_sycl_dispatch_host_flash_attn_async(ggml_backend_sycl_context &
         if (have_mask_evt) {
             mask_evt.wait();
         }
+#ifndef GGML_BACKEND_DL
         ggml_backend_graph_compute(cpu_backend, graph);
+#else
+        // Unreachable: ggml_sycl_attn_host_cpu_backend() always returns
+        // nullptr in a GGML_BACKEND_DL build, so this function already
+        // returned false above, before ever calling pool.submit(). Guarded
+        // out anyway so the forbidden ggml_backend_graph_compute symbol
+        // never appears in the DL module's undefined-symbol table
+        // (tests/test-sycl-module-dependencies.py).
+        GGML_UNUSED(cpu_backend);
+        GGML_UNUSED(graph);
+#endif
     });
 
     return true;
@@ -80911,7 +80989,10 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
 
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
-        GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host dispatch\n");
+        // See ggml_sycl_dispatch_host_flash_attn_async's identical rewording
+        // above: generic so it stays accurate under both a GGML_BACKEND_DL
+        // decline and a genuine (non-DL) ggml_backend_cpu_init() failure.
+        GGML_LOG_WARN("[ATTN-HOST] no CPU backend available; declining host dispatch\n");
         return false;
     }
 
@@ -81046,7 +81127,19 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
         t_graph = std::chrono::steady_clock::now();
     }
 
-    std::future<void> future = pool.submit([cpu_backend, graph] { ggml_backend_graph_compute(cpu_backend, graph); });
+    std::future<void> future = pool.submit([cpu_backend, graph] {
+#ifndef GGML_BACKEND_DL
+        ggml_backend_graph_compute(cpu_backend, graph);
+#else
+        // Unreachable under GGML_BACKEND_DL -- see the identical comment in
+        // ggml_sycl_dispatch_host_flash_attn_async, above, which this
+        // function's own header comment cross-references. Guarded out so
+        // the forbidden ggml_backend_graph_compute symbol never appears in
+        // the DL module's undefined-symbol table.
+        GGML_UNUSED(cpu_backend);
+        GGML_UNUSED(graph);
+#endif
+    });
     future.get();  // synchronous for this landing -- see the function comment above
 
     if (attn_profile) {
@@ -81120,7 +81213,10 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
 static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
-        GGML_LOG_WARN("[ATTN-HOST] ggml_backend_cpu_init() failed; declining host SET_ROWS\n");
+        // See the FA dispatch bodies' identical rewording above: generic so
+        // it stays accurate under both a GGML_BACKEND_DL decline and a
+        // genuine (non-DL) ggml_backend_cpu_init() failure.
+        GGML_LOG_WARN("[ATTN-HOST] no CPU backend available; declining host SET_ROWS\n");
         return false;
     }
 
@@ -81195,7 +81291,26 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     // exactly, including the ids broadcast over dims 2/3, and uses the
     // same per-type from_float as the reference kernel. Anything outside
     // the f32-values case falls through to the CPU-backend graph below.
-    const ggml_from_float_t from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    //
+    // ggml_sycl_get_type_traits_cpu() -- the module-independent wrapper
+    // (cpu-traits-support.cpp), not the module-dependent raw CPU-traits
+    // accessor this wrapper exists to hide (llama.cpp-n4ee): this file's
+    // other CPU-traits call sites already go through it -- the real
+    // accessor outside GGML_BACKEND_DL, a private portable baseline table
+    // under it -- and the raw accessor is itself one of the DL audit's
+    // forbidden CPU-backend symbols. Unlike the ggml_backend_graph_compute
+    // call sites below, no #ifdef is needed here: the wrapper itself is
+    // already safe to call in every build. Its RESULT is guarded before
+    // dereferencing, matching every other ggml_sycl_get_type_traits_cpu()
+    // call site in this file, which all null-check the result before
+    // reading a member -- it returns nullptr for an out-of-range type
+    // (cpu-traits-support.cpp). No early decline on null here (unlike the
+    // cpu_backend checks above): a missing converter just means `from_float`
+    // reads nullptr, which the very next condition already treats as
+    // "outside the fast path" and falls through to the CPU-backend graph
+    // below, exactly like an unsupported val_src/ids_src type does today.
+    const ggml_type_traits_cpu * cpu_traits = ggml_sycl_get_type_traits_cpu(dst->type);
+    const ggml_from_float_t      from_float = cpu_traits ? cpu_traits->from_float : nullptr;
     if (val_src->type == GGML_TYPE_F32 && from_float &&
         (ids_src->type == GGML_TYPE_I64 || ids_src->type == GGML_TYPE_I32)) {
         const int64_t nc   = val_src->ne[0];
@@ -81237,7 +81352,15 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     graph->n_nodes      = 1;
     graph->nodes[0]     = &dst_host;
 
+#ifndef GGML_BACKEND_DL
     ggml_backend_graph_compute(cpu_backend, graph);
+#else
+    // Unreachable under GGML_BACKEND_DL -- see the identical comment in
+    // ggml_sycl_dispatch_host_flash_attn_async, above. Guarded out so the
+    // forbidden ggml_backend_graph_compute symbol never appears in the DL
+    // module's undefined-symbol table. `graph` is already used above
+    // (n_nodes/nodes[0]), so no GGML_UNUSED is needed for it here.
+#endif
 
     ggml_free(gctx);
 
@@ -106837,6 +106960,23 @@ static void * ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_sycl_moe_gpu_ubatch_max") == 0) {
         return (void *) ggml_backend_sycl_moe_gpu_ubatch_max;
+    }
+    // llama.cpp-7n6n (wires nphx Task 5): the persisted auto n_ubatch
+    // tuning cache's four entry points (ubatch-tuning-cache.cpp),
+    // registered alongside their sibling Task 4b accessors above so a
+    // GGML_BACKEND_DL build's llama-context lookup does not return nullptr
+    // for them either.
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_enabled") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_enabled;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_path") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_path;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_lookup") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_lookup;
+    }
+    if (strcmp(name, "ggml_backend_sycl_ubatch_cache_store") == 0) {
+        return (void *) ggml_backend_sycl_ubatch_cache_store;
     }
     if (strcmp(name, "ggml_backend_sycl_execution_context_create") == 0) {
         return (void *) ggml_backend_sycl_execution_context_create;

@@ -3249,9 +3249,19 @@ endif()
 # {512, 1024, 2048, 4096} ladder and its n_batch/n_ctx/MoE-ceiling caps, the
 # per-candidate probe (BUSY backoff, STALE_IDENTITY, would_demote_kv),
 # publish-before-reserve ordering, the host-fallback query consulted after
-# reserve, the settle step, the seven stop-reason strings, and exactly one
-# [SYCL-PLAN] auto n_ubatch= WARN. Host-only, reads the sources as text.
-# Same registration shape as test-sycl-compute-buffer-fallback-source above.
+# reserve, the settle step, the stop-reason strings (eight since
+# llama.cpp-7n6n added "cached" -- see below), and exactly one [SYCL-PLAN]
+# auto n_ubatch= WARN. Host-only, reads the sources as text. Same
+# registration shape as test-sycl-compute-buffer-fallback-source above.
+#
+# llama.cpp-7n6n (nphx Task 5, wired into the same trial): the persisted
+# auto n_ubatch cache -- tried BEFORE the ladder (a clean hit sets the new
+# "cached" stop reason and skips every rung); a store that follows any
+# ladder run, never a hit; GGML_SYCL_TUNING_CACHE=0 disabling both. This
+# file's own tests cover the ordering and the new stop reason; the on-disk
+# format (tuning-cache-io.hpp's UbatchCacheKey/UbatchCacheEntry) is covered
+# by test-tuning-cache-io below instead, since that part is pure host I/O
+# with no SYCL device involved either way.
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-auto-ubatch-source
@@ -3283,6 +3293,26 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-n4ee: DL=OFF-reachable equivalent of tests/test-sycl-module-
+# dependencies.py's POST_BUILD audit (that audit only runs under
+# -DGGML_BACKEND_DL=ON, independent of BUILD_TESTING -- the ordinary
+# workstation build never exercises it, which is how the TKV-13 (B2)
+# attention host-dispatch regression this ticket fixes went unnoticed for two
+# weeks). Tracks #ifdef/#ifndef/#else/#endif nesting for GGML_BACKEND_DL over
+# ggml-sycl.cpp as pure text and fails, naming file:line, on any of that
+# audit's forbidden CPU-backend symbols found outside a region the nesting
+# proves is excluded from a GGML_BACKEND_DL build. The forbidden-symbol list
+# is extracted from test-sycl-module-dependencies.py's own source, never a
+# second copy. Host-only, no SYCL device, no DL build -- same registration
+# shape as test-sycl-cmake-dl-link-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-attn-host-dl-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-attn-host-dl-source.py
+        LABEL "sycl;python;source-assert;dl"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-9goq: configure-only smoke test that reproduces
 # .devops/intel.Dockerfile's server-image build stage's exact `cmake -B build`
 # flags (parsed live from the Dockerfile, never a hardcoded copy) against a
@@ -3310,3 +3340,31 @@ if (NOT WIN32)
         TIMEOUT 300
     )
 endif()
+
+# llama.cpp-7n6n: unit tests for tuning-cache-io.hpp (JSON I/O, atomic
+# writes, XDG cache-dir resolution, and -- as of this task -- the "ubatch"
+# entry kind wired for the persisted auto n_ubatch cache: UbatchCacheKey/
+# UbatchCacheEntry round-trip, key equality per field, CACHE_VERSION bump
+# rejecting a v1 file, and an unwritable directory failing save/load
+# cleanly). Pure header + STL: no ggml/llama/SYCL dependency at all, so this
+# was previously an unregistered file (zero production callers, per
+# plan-research/tuning-cache.md) -- this task adds the registration.
+#
+# llama.cpp-7n6n: this file's NEW ubatch-cache tests
+# each use their own unique per-pid /tmp directory, passed as an explicit
+# argument -- but THREE PRE-EXISTING tests (cache_file_roundtrip,
+# version_check, atomic_write) call the matmul-dispatch-tuning save_cache()/
+# load_cache()/get_cache_file(), which go through get_cache_dir() and so
+# fall back to the REAL $HOME/.cache/llama.cpp/sycl-tuning whenever
+# XDG_CACHE_HOME is unset -- registering this binary at all made them reach
+# that real directory for the first time (caught in review: an empty
+# ~/.cache/llama.cpp/sycl-tuning/ left behind by a local pre-commit run).
+# ENVIRONMENT pins BOTH variables so ctest can never repeat that: XDG_
+# CACHE_HOME confines the pre-existing tests' get_cache_dir() fallback to a
+# build-tree scratch directory, and GGML_SYCL_TUNING_CACHE_DIR is set
+# alongside it for consistency with the runtime accessor of the same name
+# (ubatch-tuning-cache.cpp) even though this binary's own tests do not
+# currently read it (they pass an explicit cache_dir argument instead).
+llama_build_and_test(test-tuning-cache-io.cpp)
+set_tests_properties(test-tuning-cache-io PROPERTIES
+    ENVIRONMENT "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-home;GGML_SYCL_TUNING_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-tuning-cache-io-dir")
