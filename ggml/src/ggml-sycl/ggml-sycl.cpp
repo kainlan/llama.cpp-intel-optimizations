@@ -80141,8 +80141,32 @@ static thread_local bool g_sycl_timeline_graph_spans_enabled = false;
 // downstream consumer (docs/plans/2026-08-27-tkv13-b2-addendum.md §6).
 // -----------------------------------------------------------------------
 
+// llama.cpp-n4ee (rev-n4ee-qual-1 Q1): the feature gate itself, not just the
+// dispatch bodies, must know about GGML_BACKEND_DL. Before this fix, a DL
+// build with the env var set still had supports_op/supports_buft ACCEPT a
+// demoted-layer node (they only check this function), so the node routed to
+// a dispatch that always declines under DL -- and the node-loop's handler is
+// GGML_ASSERT(ok), i.e. an abort, not the graceful "feature unavailable"
+// this env var's default-OFF opt-in is supposed to mean. Declining HERE
+// keeps supports_op/supports_buft in their pre-existing "not accepted"
+// state, which restores the scheduler's own CPU split for demoted-layer
+// attention -- the behavior this whole opt-in feature intercepts, not a new
+// failure mode.
 static bool ggml_sycl_attn_host_dispatch_enabled() {
-    static const bool enabled = std::getenv("GGML_SYCL_ATTN_HOST_DISPATCH") != nullptr;
+    static const bool enabled = [] {
+        if (std::getenv("GGML_SYCL_ATTN_HOST_DISPATCH") == nullptr) {
+            return false;
+        }
+#ifdef GGML_BACKEND_DL
+        GGML_LOG_WARN(
+            "[ATTN-HOST] GGML_SYCL_ATTN_HOST_DISPATCH is unavailable in a "
+            "GGML_BACKEND_DL build (the SYCL module does not link ggml-cpu); "
+            "demoted-layer attention falls back to the scheduler's CPU split\n");
+        return false;
+#else
+        return true;
+#endif
+    }();
     return enabled;
 }
 
@@ -80348,20 +80372,14 @@ static ggml_backend_t ggml_sycl_attn_host_cpu_backend() {
     // A DL module links only the public backend-registration surface and
     // never ggml-cpu itself ("DL modules remain completely independent of
     // ggml-cpu", CMakeLists.txt:46-47), so ggml_backend_cpu_init() -- a
-    // ggml-cpu export -- is not a symbol this module can call. Host
-    // dispatch is simply unavailable here; decline once with a WARN (every
-    // caller already handles a null return the same way a genuine
-    // ggml_backend_cpu_init() failure would be handled). Warning once,
-    // not per-call, because GGML_SYCL_ATTN_HOST_DISPATCH stays opted in for
-    // the process's lifetime and every FLASH_ATTN_EXT/SET_ROWS node on a
-    // demoted layer would otherwise repeat the identical line.
-    static bool warned = false;
-    if (!warned) {
-        warned = true;
-        GGML_LOG_WARN(
-            "[ATTN-HOST] GGML_SYCL_ATTN_HOST_DISPATCH is unavailable in a GGML_BACKEND_DL build "
-            "(the SYCL module does not link ggml-cpu); declining host dispatch\n");
-    }
+    // ggml-cpu export -- is not a symbol this module can call. This
+    // function is not actually reachable in a DL build anymore --
+    // ggml_sycl_attn_host_dispatch_enabled() (llama.cpp-n4ee Q1) declines
+    // before supports_op/supports_buft ever accept a node that would lead
+    // here, and that is where the once-per-process WARN now lives -- but
+    // the #ifdef stays regardless: a symbol reference is a link-time fact
+    // regardless of runtime reachability, and ggml_backend_cpu_init is one
+    // of the DL audit's forbidden CPU-backend symbols.
     return nullptr;
 #else
     ggml_backend_t be = g_attn_host_cpu_backend;
@@ -80823,12 +80841,9 @@ static bool ggml_sycl_dispatch_host_flash_attn_sync(ggml_backend_sycl_context & 
 
     ggml_backend_t cpu_backend = ggml_sycl_attn_host_cpu_backend();
     if (!cpu_backend) {
-        // Reworded (was "ggml_backend_cpu_init() failed"): in a
-        // GGML_BACKEND_DL build ggml_sycl_attn_host_cpu_backend() declines
-        // before ever calling ggml_backend_cpu_init(), so that phrasing
-        // would misreport the cause -- see its own once-per-process WARN
-        // for why. This line stays generic so it is accurate for both that
-        // case and a genuine (non-DL) ggml_backend_cpu_init() failure.
+        // See ggml_sycl_dispatch_host_flash_attn_async's identical rewording
+        // above: generic so it stays accurate under both a GGML_BACKEND_DL
+        // decline and a genuine (non-DL) ggml_backend_cpu_init() failure.
         GGML_LOG_WARN("[ATTN-HOST] no CPU backend available; declining host dispatch\n");
         return false;
     }
@@ -81132,22 +81147,22 @@ static bool ggml_sycl_dispatch_host_set_rows_sync(ggml_backend_sycl_context & ct
     // ggml_sycl_get_type_traits_cpu() -- the module-independent wrapper
     // (cpu-traits-support.cpp), not the module-dependent raw CPU-traits
     // accessor this wrapper exists to hide (llama.cpp-n4ee): this file's
-    // other 5 CPU-traits call sites already go through it -- the real
+    // other CPU-traits call sites already go through it -- the real
     // accessor outside GGML_BACKEND_DL, a private portable baseline table
     // under it -- and the raw accessor is itself one of the DL audit's
     // forbidden CPU-backend symbols. Unlike the ggml_backend_graph_compute
     // call sites below, no #ifdef is needed here: the wrapper itself is
-    // already safe to call in every build, but its RESULT is guarded before
+    // already safe to call in every build. Its RESULT is guarded before
     // dereferencing, matching every other ggml_sycl_get_type_traits_cpu()
     // call site in this file, which all null-check the result before
     // reading a member -- it returns nullptr for an out-of-range type
-    // (cpu-traits-support.cpp).
+    // (cpu-traits-support.cpp). No early decline on null here (unlike the
+    // cpu_backend checks above): a missing converter just means `from_float`
+    // reads nullptr, which the very next condition already treats as
+    // "outside the fast path" and falls through to the CPU-backend graph
+    // below, exactly like an unsupported val_src/ids_src type does today.
     const ggml_type_traits_cpu * cpu_traits = ggml_sycl_get_type_traits_cpu(dst->type);
-    if (!cpu_traits) {
-        GGML_LOG_WARN("[ATTN-HOST] no CPU type traits for dst type; declining host SET_ROWS\n");
-        return false;
-    }
-    const ggml_from_float_t from_float = cpu_traits->from_float;
+    const ggml_from_float_t      from_float = cpu_traits ? cpu_traits->from_float : nullptr;
     if (val_src->type == GGML_TYPE_F32 && from_float &&
         (ids_src->type == GGML_TYPE_I64 || ids_src->type == GGML_TYPE_I32)) {
         const int64_t nc   = val_src->ne[0];

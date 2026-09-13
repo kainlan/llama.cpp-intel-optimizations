@@ -360,9 +360,86 @@ def find_dl_unsafe_forbidden_occurrences(stripped_code: str, forbidden_names):
     return violations
 
 
+def _extract_function_source(name: str, code: str) -> str:
+    """Extract one function's braced body (opening `{` through its matching
+    `}`) from raw/comment-stripped C++ source, by brace-depth counting from
+    the first `name(...) {` match. A heuristic, not a real parser -- good
+    enough here because every function name this gate looks up names a
+    unique, unambiguous definition in ggml-sycl.cpp (a bare call to the
+    function elsewhere is never immediately followed by `{`, so it cannot
+    be mistaken for the definition)."""
+    m = re.search(re.escape(name) + r"\s*\([^)]*\)\s*\{", code)
+    if not m:
+        raise AssertionError(f"could not find a `{name}(...) {{` definition in the source")
+    start = m.end() - 1
+    depth = 0
+    i = start
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start:i + 1]
+        i += 1
+    raise AssertionError(f"unbalanced braces while extracting {name}()")
+
+
+def _dispatch_enabled_has_dl_decline_arm(fn_body: str) -> bool:
+    """True if `fn_body` contains an `#ifdef GGML_BACKEND_DL` directive
+    whose arm (up to the next `#else`/`#endif`) contains `return false;`."""
+    m = re.search(r"#ifdef\s+GGML_BACKEND_DL\b", fn_body)
+    if not m:
+        return False
+    rest = fn_body[m.end():]
+    m_end = re.search(r"#else\b|#endif\b", rest)
+    arm = rest[:m_end.start()] if m_end else rest
+    return bool(re.search(r"\breturn\s+false\s*;", arm))
+
+
 # ---------------------------------------------------------------------------
 # The real check.
 # ---------------------------------------------------------------------------
+
+
+def test_dispatch_enabled_declines_under_backend_dl():
+    """llama.cpp-n4ee Q1: ggml_sycl_attn_host_dispatch_enabled() itself must
+    decline under GGML_BACKEND_DL, not just the dispatch bodies it gates --
+    otherwise supports_op/supports_buft still ACCEPT a demoted-layer node in
+    a GGML_BACKEND_DL build with GGML_SYCL_ATTN_HOST_DISPATCH set, routing it
+    to a dispatch that always declines, and the node loop's GGML_ASSERT(ok)
+    aborts instead of falling back to the scheduler's own CPU split. Pins the
+    `#ifdef GGML_BACKEND_DL ... return false` arm inside THIS ONE function's
+    body specifically (not merely somewhere in the file -- the forbidden-
+    symbol scan elsewhere in this gate cannot see this: the arm contains no
+    forbidden symbol, only a WARN and a `return false`), with a mutation
+    witness that deleting the arm (the function's pre-Q1 shape: read the env
+    var, done) is caught."""
+    body = _extract_function_source("ggml_sycl_attn_host_dispatch_enabled", GGML_SYCL_CPP_CODE)
+
+    assert _dispatch_enabled_has_dl_decline_arm(body), (
+        "ggml_sycl_attn_host_dispatch_enabled() no longer contains an "
+        "`#ifdef GGML_BACKEND_DL ... return false` arm -- supports_op/"
+        "supports_buft would accept a demoted-layer node under "
+        "GGML_BACKEND_DL again, routing it to an abort instead of the "
+        "scheduler's CPU split"
+    )
+
+    # Mutation witness: deleting the arm from a COPY of the real body must be
+    # caught -- proves the check above is not vacuously true.
+    mutated = re.sub(
+        r"#ifdef\s+GGML_BACKEND_DL\b.*?(?=#else\b|#endif\b)",
+        "",
+        body,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert not _dispatch_enabled_has_dl_decline_arm(mutated), (
+        "mutation witness is broken: deleting the #ifdef GGML_BACKEND_DL arm "
+        "should make _dispatch_enabled_has_dl_decline_arm return False"
+    )
 
 
 def test_forbidden_symbol_list_extraction_is_sane():
@@ -373,7 +450,7 @@ def test_forbidden_symbol_list_extraction_is_sane():
     also pins that both of THIS ticket's symbols are actually present in the
     extracted set, since a regex that quietly dropped one would make this
     gate blind to exactly the regression it exists to catch."""
-    assert len(FORBIDDEN_SYMBOLS) >= 10, (
+    assert len(FORBIDDEN_SYMBOLS) >= 11, (
         f"only extracted {len(FORBIDDEN_SYMBOLS)} forbidden symbol name(s) from "
         "test-sycl-module-dependencies.py -- the extraction regex likely broke "
         "silently and the real-file check below may be passing having examined "
@@ -447,6 +524,49 @@ def test_dl_exclusion_tracker_has_a_mutation_witness():
     )
     assert find_dl_unsafe_forbidden_occurrences(blank_string_bodies(strip_comments(comment_snippet)), FORBIDDEN_SYMBOLS) == [], (
         "checker false-positives on a comment/string literal merely naming a forbidden symbol"
+    )
+
+
+def test_gate_is_live_on_the_real_file():
+    """test_dl_exclusion_tracker_has_a_mutation_witness (above) only proves
+    the pipeline against SYNTHETIC snippets -- nothing there proves it is
+    actually live against ggml-sycl.cpp's own #ifdef/#ifndef structure. This
+    control disables every real DL-exclusion guard in the file at once:
+    renaming every occurrence of GGML_BACKEND_DL to an unrelated macro name
+    turns each of the file's six `#ifdef GGML_BACKEND_DL` / `#ifndef
+    GGML_BACKEND_DL` directives into an "other" condition, so
+    `_dl_excluded_active` can no longer recognize any of them as
+    DL-excluding -- every forbidden-symbol reference the real guards
+    normally hide becomes a violation. A real-file run that ALSO passed with
+    its own exclusion mechanism disabled would mean that mechanism was doing
+    nothing; this is the check that it is not."""
+    renamed = GGML_SYCL_CPP_CODE.replace("GGML_BACKEND_DL", "GGML_BACKEND_DL_RENAMED_FOR_TEST")
+    renamed_search_text = blank_string_bodies(renamed)
+    violations = find_dl_unsafe_forbidden_occurrences(renamed_search_text, FORBIDDEN_SYMBOLS)
+
+    # Census, not a floor: with every GGML_BACKEND_DL guard in the real file
+    # disabled, EXACTLY this set of forbidden-symbol references should
+    # surface -- the ten call sites the llama.cpp-n4ee fix guards (three
+    # ggml_backend_graph_compute, one ggml_backend_cpu_init, and two
+    # ggml_threadpool_new/free pairs -- one in ggml_sycl_attn_host_cpu_
+    # backend/_free, one in the pre-existing ggml_sycl_cpu_fallback_graph
+    # non-DL branch, which also contributes its own ggml_graph_plan and
+    # ggml_graph_compute). A count that grows or shrinks means a guard was
+    # added, removed, or this tracker regressed -- update the number
+    # deliberately if the real file's guards genuinely change; don't raise
+    # it just to make a failure go away.
+    assert len(violations) == 10, (
+        f"expected exactly 10 forbidden-symbol references once every "
+        f"GGML_BACKEND_DL guard in ggml-sycl.cpp is disabled, got "
+        f"{len(violations)}: {violations}"
+    )
+    assert violations, "the real-file control found nothing -- the pipeline is not live"
+
+    graph_compute_hits = [v for v in violations if v[1] == "ggml_backend_graph_compute"]
+    assert len(graph_compute_hits) == 3, (
+        f"expected the three ggml_backend_graph_compute call sites (async FA "
+        f"dispatch, sync FA dispatch, sync SET_ROWS dispatch) among the "
+        f"disabled-guard violations, got {graph_compute_hits}"
     )
 
 

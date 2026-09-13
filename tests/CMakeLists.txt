@@ -3287,7 +3287,7 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-attn-host-dl-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-attn-host-dl-source.py
-        LABEL "sycl;source-contract"
+        LABEL "sycl;python;source-assert;dl"
         TIMEOUT 120)
 endif()
 
