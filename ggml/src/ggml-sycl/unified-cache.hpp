@@ -574,13 +574,13 @@ struct placement_kv_info {
     // is only correct at n_seq_max == 1. Default 1 preserves that
     // single-sequence behavior when a caller never sets this field.
     uint32_t              n_seq_max    = 1;
-    // llama.cpp-3aos: mirrors llama_cparams::kv_unified
-    // (src/llama-context.cpp; default false, matching llama's own default).
-    // Selects which of the two SWA sizing modes kv_layer_bytes_for_kind()
-    // uses -- see that function's own comment for the full derivation. This
-    // is a RUNTIME property (like n_seq_max above), never known at model
-    // load time; only the runtime transaction body
-    // (ggml_sycl_run_runtime_context_transaction(), ggml-sycl.cpp) sets it.
+    // llama.cpp-3aos: mirrors llama_cparams::kv_unified (src/llama-context.cpp;
+    // default false, matching llama's own default). Selects which of the
+    // two SWA sizing modes kv_layer_bytes_for_kind() uses -- see that
+    // function's own comment for the full derivation. This is a RUNTIME
+    // property (like n_seq_max above), never known at model load time;
+    // only the runtime transaction body (ggml_sycl_run_runtime_context_transaction(),
+    // ggml-sycl.cpp) sets it.
     bool                  kv_unified   = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers
     // (0 if unknown/unset), split by attention window class -- see
@@ -738,7 +738,7 @@ struct placement_plan {
     // llama.cpp-3aos: mirrors placement_kv_info::kv_unified -- see that
     // field's comment. Default false matches llama_cparams::kv_unified's
     // own default.
-    bool                                       planner_kv_unified       = false;
+    bool                         planner_kv_unified       = false;
     bool                         planner_n_ctx_is_runtime = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers,
     // split by attention window class and threaded from

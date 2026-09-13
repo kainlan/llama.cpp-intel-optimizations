@@ -15913,11 +15913,11 @@ static void populate_inventory_globals(ggml_backend_sycl_context * ctx, const gg
         g_placement_kv_info.swa_layer_mask.clear();
     }
     // llama.cpp-3aos: per-layer KV truth (see the field comments in
-    // ggml-sycl.h and unified-cache.hpp). n_seq_max is NOT set here -- it
-    // is a runtime-context input, not a load-time model property, and stays
-    // at the struct's default (1) until
-    // ggml_backend_sycl_set_runtime_context_for_model()'s transaction body
-    // sets it on next_kv_info from the caller's real n_seq_max.
+    // ggml-sycl.h and unified-cache.hpp). n_seq_max is NOT set here --
+    // it is a runtime-context input, not a load-time model property, and
+    // stays at the struct's default (1) until ggml_backend_sycl_set_runtime_context_for_model()'s
+    // transaction body sets it on next_kv_info from the caller's real
+    // n_seq_max.
     if (inventory->kv_layer_count > 0 && inventory->kv_k_width_per_layer != nullptr &&
         inventory->kv_v_width_per_layer != nullptr && inventory->kv_layer_kind != nullptr) {
         g_placement_kv_info.layer_kind.assign(inventory->kv_layer_kind,
@@ -16709,13 +16709,13 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
     kv_demotion_in.vram_bytes  = plan.vram_bytes;
     kv_demotion_in.kv_device.resize(n_layers);
     kv_demotion_in.swa_layer_mask.assign(plan.swa_layer_mask.begin(), plan.swa_layer_mask.end());
-    // llama.cpp-3aos: THIS layer's own bytes via
-    // placement_plan::kv_size_for_layer() (which already routes through the
-    // per-layer kv_layer_bytes_for_kind() formula when the plan carries
-    // per-layer truth, falling back to the legacy uniform split otherwise)
-    // -- not the uniform plan.kv_per_layer/kv_per_swa_layer scalars, which
-    // disagreed with plan.refresh_kv_byte_totals() on this very same plan
-    // for a heterogeneous model.
+    // llama.cpp-3aos: THIS layer's own bytes via placement_plan::kv_size_for_layer()
+    // (which already routes through the per-layer kv_layer_bytes_for_kind()
+    // formula when the plan carries per-layer truth, falling back to the
+    // legacy uniform split otherwise) -- not the uniform
+    // plan.kv_per_layer/kv_per_swa_layer scalars, which disagreed with
+    // plan.refresh_kv_byte_totals() on this very same plan for a
+    // heterogeneous model.
     kv_demotion_in.kv_bytes_per_layer.resize(n_layers);
     for (size_t l = 0; l < n_layers; ++l) {
         kv_demotion_in.kv_device[l]          = plan.get_kv_device((int) l);
@@ -17282,10 +17282,10 @@ static ggml_sycl_ring_replan_result ggml_sycl_replan_pp_moe_onednn_ring(int     
 // enum value without ever string-comparing `out->reason`.
 enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 
-// llama.cpp-3aos: kv_unified -- see placement_kv_info::
-// kv_unified / kv_layer_bytes_for_kind() (unified-cache.hpp) for the
-// rationale. Threaded the same way n_seq_max already is: onto next_kv_info
-// and next_plan below, before either is consulted.
+// llama.cpp-3aos: kv_unified -- see placement_kv_info::kv_unified
+// / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
+// Threaded the same way n_seq_max already is: onto next_kv_info and
+// next_plan below, before either is consulted.
 static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backend_t backend,
                                                                       uint32_t       n_ctx,
                                                                       uint32_t       n_ubatch,

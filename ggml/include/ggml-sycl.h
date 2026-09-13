@@ -408,11 +408,10 @@ GGML_BACKEND_API void ggml_backend_sycl_set_placement_envelope(ggml_backend_t   
 // llama.cpp-k1ev) -- an earlier revision of this comment described a
 // live-free-VRAM predicate that hardware measurement falsified; do not
 // reintroduce it without first closing k1ev.
-// llama.cpp-3aos: kv_unified -- see
-// ggml_backend_sycl_set_runtime_context_for_model()'s declaration for the
-// full rationale. This entry point has two real callers, both internal to
-// ggml-sycl.cpp: ggml_backend_sycl_set_runtime_context_for_model() (which
-// forwards its own caller's real kv_unified), and the legacy
+// llama.cpp-3aos: kv_unified -- see ggml_backend_sycl_set_runtime_context_for_model()'s
+// declaration for the full rationale. This entry point has two real
+// callers, both internal to ggml-sycl.cpp: ggml_backend_sycl_set_runtime_context_for_model()
+// (which forwards its own caller's real kv_unified), and the legacy
 // ggml_backend_sycl_set_runtime_n_ctx() (which, like its own n_seq_max=1,
 // passes false -- it has no way to learn a real kv_unified either).
 GGML_BACKEND_API void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
@@ -1209,11 +1208,11 @@ struct ggml_sycl_runtime_context_probe {
 // which stays PLAN_REJECTED below). It is distinct from
 // GGML_SYCL_LIFECYCLE_PLAN_REJECTED, which callers must NOT retry (see that
 // enum value's own comment).
-// llama.cpp-3aos: kv_unified -- see
-// ggml_backend_sycl_set_runtime_context_for_model()'s declaration above for
-// the full rationale. The probe must be given the SAME kv_unified the
-// candidate would actually publish with, or its accept/reject decision
-// (and would_demote_kv/host_kv_bytes) answers for the wrong KV shape.
+// llama.cpp-3aos: kv_unified -- see ggml_backend_sycl_set_runtime_context_for_model()'s
+// declaration above for the full rationale. The probe must be given the
+// SAME kv_unified the candidate would actually publish with, or its
+// accept/reject decision (and would_demote_kv/host_kv_bytes) answers for
+// the wrong KV shape.
 GGML_BACKEND_API enum ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(
     ggml_backend_t                           backend,
     struct ggml_sycl_model_token             model,
