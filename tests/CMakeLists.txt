@@ -3281,6 +3281,26 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# llama.cpp-n4ee: DL=OFF-reachable equivalent of tests/test-sycl-module-
+# dependencies.py's POST_BUILD audit (that audit only runs under
+# -DGGML_BACKEND_DL=ON, independent of BUILD_TESTING -- the ordinary
+# workstation build never exercises it, which is how the TKV-13 (B2)
+# attention host-dispatch regression this ticket fixes went unnoticed for two
+# weeks). Tracks #ifdef/#ifndef/#else/#endif nesting for GGML_BACKEND_DL over
+# ggml-sycl.cpp as pure text and fails, naming file:line, on any of that
+# audit's forbidden CPU-backend symbols found outside a region the nesting
+# proves is excluded from a GGML_BACKEND_DL build. The forbidden-symbol list
+# is extracted from test-sycl-module-dependencies.py's own source, never a
+# second copy. Host-only, no SYCL device, no DL build -- same registration
+# shape as test-sycl-cmake-dl-link-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-attn-host-dl-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-attn-host-dl-source.py
+        LABEL "sycl;python;source-assert;dl"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-9goq: configure-only smoke test that reproduces
 # .devops/intel.Dockerfile's server-image build stage's exact `cmake -B build`
 # flags (parsed live from the Dockerfile, never a hardcoded copy) against a

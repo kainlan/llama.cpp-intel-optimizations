@@ -39,7 +39,14 @@ if "ggml-cpu" in deps.lower() or "ggml_cpu" in deps.lower():
     raise SystemExit("SYCL module has a CPU DT_NEEDED/import dependency:\n" + deps)
 for forbidden in ("ggml_backend_reg_by_name", "ggml_backend_reg_get_proc_address", "ggml_backend_dev_init",
                   "ggml_backend_graph_compute", "ggml_get_type_traits_cpu", "ggml_compute_forward_get_rows", "ggml_graph_plan",
-                  "ggml_graph_compute", "ggml_threadpool_new", "ggml_threadpool_free"):
+                  "ggml_graph_compute", "ggml_threadpool_new", "ggml_threadpool_free",
+                  # ggml-cpu export (llama.cpp-n4ee): naming it here makes THIS scan
+                  # report it by name as soon as the first forbidden import
+                  # (ggml_backend_graph_compute) is gone, instead of leaving it to be
+                  # caught later, by the RTLD_NOW load below, as an unresolved-symbol
+                  # message that does not say which contract was broken -- the
+                  # second, previously masked failure behind ggml_backend_graph_compute.
+                  "ggml_backend_cpu_init"):
     if forbidden in symbols:
         raise SystemExit(f"SYCL module directly imports forbidden CPU symbol {forbidden}")
 
