@@ -1657,8 +1657,7 @@ set_tests_properties(sycl-kv-layer-sizing PROPERTIES
     # is still needed -- the binary links the SYCL runtime because of the headers.
     ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     # llama.cpp-3aos: "hostonly" (no hyphen) matches the sibling
-    # sycl-kv-slice-sizing's own spelling, the one the existing label
-    # filters actually key on.
+    # sycl-kv-slice-sizing's own spelling.
     LABELS "sycl;kv;sizing;hostonly"
     TIMEOUT 60
 )

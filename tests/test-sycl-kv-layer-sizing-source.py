@@ -127,7 +127,8 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
         found.append("does not branch on GGML_SYCL_KV_LAYER_SWA")
 
     # Bug 3: the kv_unified two-mode split.
-    if "bool" not in function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND):
+    if not re.search(r"bool\s+kv_unified\b",
+                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
         found.append("has no bool kv_unified parameter")
     if not re.search(r"if\s*\(\s*kv_unified\s*\)\s*\{", body):
         found.append("does not branch on kv_unified")
@@ -333,23 +334,43 @@ def test_mutation_shared_arm_dropped_is_witnessed() -> None:
                       "SHARED arm dropped")
 
 
+def test_mutation_kv_unified_param_renamed_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    # Renaming the parameter (not removing "bool") is the exact gap the old
+    # `"bool" not in ...` check missed -- it would still find "bool" in the
+    # signature and pass. This mutation keeps a bool parameter present
+    # under a different name, so only a check anchored on "bool kv_unified"
+    # as a pair (not "bool" alone) can catch it.
+    mutated = hpp.replace(
+        "                                      bool     kv_unified) {",
+        "                                      bool     kv_unified_flag) {", 1)
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool kv_unified parameter",
+                      "kv_unified parameter renamed away")
+
+
 def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
     hpp = UNIFIED_CACHE_HPP.read_text()
     # Collapse the two-mode split to the (kv_unified==true) formula
     # unconditionally -- the exact Bug 3 shape (assumes a single shared
-    # stream regardless of the caller's real kv_unified).
-    mutated = hpp.replace(
-        "if (kv_unified) {\n"
-        "            // llama-context.cpp:640: cparams.n_ctx_seq = cparams.n_ctx.\n"
-        "            n_ctx_seq   = n_ctx;\n"
-        "            n_stream    = 1;\n"
-        "            window_seqs = seqs;\n"
-        "        } else {",
+    # stream regardless of the caller's real kv_unified). Skips any
+    # comment lines between the brace and the assignments (a (?:...)*
+    # non-capturing group, not the literal comment text) so the witness
+    # anchors on code only and does not go stale when the comment's
+    # wording changes.
+    mutated, n = re.subn(
+        r"if \(kv_unified\) \{\n"
+        r"(?:[ \t]*//[^\n]*\n)*"
+        r"            n_ctx_seq   = n_ctx;\n"
+        r"            n_stream    = 1;\n"
+        r"            window_seqs = seqs;\n"
+        r"        \} else \{",
         "if (true) {\n"
         "            n_ctx_seq   = n_ctx;\n"
         "            n_stream    = 1;\n"
         "            window_seqs = seqs;\n"
-        "        } else if (false) {", 1)
+        "        } else if (false) {",
+        hpp, count=1)
+    assert n == 1, "kv_unified branch pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations,
                       "does not branch on kv_unified", "kv_unified branch collapsed")
 
@@ -385,6 +406,20 @@ def test_mutation_stale_comment_reappears_is_witnessed() -> None:
         "// with n_seq_max=1. n_seq_max scales the window -- see the field comment above; it\n", 1)
     _assert_witnessed(hpp, mutated, lambda s: stale_comment_violations(s, ""),
                       "stale 'with n_seq_max=1' comment", "stale comment reappears")
+
+
+def test_mutation_stale_cpp_comment_reappears_is_witnessed() -> None:
+    # Mirrors the .hpp witness above for the .cpp half of
+    # stale_comment_violations() -- only the .hpp half had a mutation
+    # witness before this commit, so the .cpp half's marker string could
+    # have gone dead (matched nothing) unnoticed.
+    cpp = UNIFIED_CACHE_CPP.read_text()
+    mutated = cpp.replace(
+        "// llama.cpp-3aos: kv_bytes_for_layer() already returns 0 for a\n",
+        "// n_seq_max=1-only deferral rationale, superseded.\n"
+        "// llama.cpp-3aos: kv_bytes_for_layer() already returns 0 for a\n", 1)
+    _assert_witnessed(cpp, mutated, lambda s: stale_comment_violations("", s),
+                      "stale 'n_seq_max=1-only' deferral rationale", "stale cpp comment reappears")
 
 
 def test_mutation_next_kv_info_n_seq_max_dropped_is_witnessed() -> None:

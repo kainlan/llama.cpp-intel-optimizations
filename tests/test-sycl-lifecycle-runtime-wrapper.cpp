@@ -1189,7 +1189,8 @@ int main() {
     // llama.cpp-3aos: kv_unified is irrelevant for the same
     // reason -- false keeps the call well-formed.
     if (CALL_SYCL(ggml_backend_sycl_activate_model_plan)(zero) != GGML_SYCL_LIFECYCLE_STALE_IDENTITY ||
-        CALL_SYCL(ggml_backend_sycl_set_runtime_context_for_model)(nullptr, zero, 0, 0, 0, false, false) !=
+        CALL_SYCL(ggml_backend_sycl_set_runtime_context_for_model)(nullptr, zero, 0, 0, 0, /*kv_unified=*/false,
+                                                                   /*flash_attn_enabled=*/false) !=
             GGML_SYCL_LIFECYCLE_NULL_OUTPUT) {
         std::fprintf(stderr, "activation/runtime API signature or invalid-input result mismatch\n");
         return 1;

@@ -24,7 +24,7 @@ kv_demotion_result plan_runtime_kv_demotion(const kv_demotion_input & in) {
         // uniform figure applied to every full-attention layer -- 0 means
         // nothing is recorded for it (untracked, or a SHARED layer with no
         // independent KV to move), so there is nothing to demote.
-        const size_t layer_bytes = l < (int) in.kv_bytes_per_layer.size() ? in.kv_bytes_per_layer[l] : 0;
+        const size_t layer_bytes = l < (int) in.layer_kv_bytes.size() ? in.layer_kv_bytes[l] : 0;
         if (layer_bytes == 0) {
             continue;
         }

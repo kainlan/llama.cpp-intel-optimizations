@@ -16584,16 +16584,21 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
 //
 // Counts the full-attention layers the PLAN actually placed on a device;
 // placement_kv_info::n_full_attn_layers() counts them model-wide and would
-// overstate the cost when part of the KV is host-resident. SWA layers are a
-// constant at the plan's OWN (already-fitting) n_ctx: kv_bytes_for_layer()
-// caps their cells at the SWA window, which does not grow further once
-// n_ctx exceeds it (llama.cpp-3aos). SHARED layers (no K/V of
-// their own -- e.g. 18 of Gemma 4 E4B's 42 layers) cost nothing and must
-// not be counted as full-attention layers, which is exactly the bug this
-// fixes: the pre-fix code had no SHARED concept, so a device-resident
-// SHARED layer fell into the `else { ++full_layers; }` arm and was charged
-// (and counted against the n_ctx solve) as if it scaled with n_ctx like a
-// real full-attention layer.
+// overstate the cost when part of the KV is host-resident.
+//
+// SWA layers are a constant at the plan's OWN (already-fitting) n_ctx:
+// kv_bytes_for_layer() caps their cells at the SWA window, which does not grow
+// further once n_ctx exceeds it (llama.cpp-3aos). Evaluated at the plan's
+// current n_ctx while solving for a smaller one, so it over-states the SWA
+// share when the answer falls below the window -- conservative, and the result
+// is advisory.
+//
+// SHARED layers (no K/V of their own -- e.g. 18 of Gemma 4 E4B's 42 layers)
+// cost nothing and must not be counted as full-attention layers, which is
+// exactly the bug this fixes: the pre-fix code had no SHARED concept, so a
+// device-resident SHARED layer fell into the `else { ++full_layers; }` arm and
+// was charged (and counted against the n_ctx solve) as if it scaled with n_ctx
+// like a real full-attention layer.
 //
 // Rounded DOWN to a multiple of 256 because llama_context applies
 // GGML_PAD(n_ctx, 256), which would round a suggestion back over the budget.
@@ -16632,9 +16637,11 @@ static uint32_t ggml_sycl_largest_fitting_n_ctx(const ggml_sycl::placement_plan 
             }
         }
     }
+    if (plan.vram_bytes < plan.kv_vram_bytes) {
+        return 0;  // would underflow the subtraction below; nothing useful to suggest
+    }
     const size_t non_kv_bytes = plan.vram_bytes - plan.kv_vram_bytes;
-    if (full_bytes_per_cell == 0 || plan.vram_bytes < plan.kv_vram_bytes ||
-        plan.vram_budget <= non_kv_bytes + swa_bytes) {
+    if (full_bytes_per_cell == 0 || plan.vram_budget <= non_kv_bytes + swa_bytes) {
         return 0;
     }
     const size_t cells = (plan.vram_budget - non_kv_bytes - swa_bytes) / full_bytes_per_cell;
@@ -16716,10 +16723,10 @@ static bool ggml_sycl_try_demote_runtime_kv(ggml_sycl::placement_plan &         
     // plan.kv_per_layer/kv_per_swa_layer scalars, which disagreed with
     // plan.refresh_kv_byte_totals() on this very same plan for a
     // heterogeneous model.
-    kv_demotion_in.kv_bytes_per_layer.resize(n_layers);
+    kv_demotion_in.layer_kv_bytes.resize(n_layers);
     for (size_t l = 0; l < n_layers; ++l) {
-        kv_demotion_in.kv_device[l]          = plan.get_kv_device((int) l);
-        kv_demotion_in.kv_bytes_per_layer[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));
+        kv_demotion_in.kv_device[l]      = plan.get_kv_device((int) l);
+        kv_demotion_in.layer_kv_bytes[l] = plan.kv_size_for_layer(static_cast<uint32_t>(l));
     }
 
     const ggml_sycl::kv_demotion_result demotion_result = ggml_sycl::plan_runtime_kv_demotion(kv_demotion_in);

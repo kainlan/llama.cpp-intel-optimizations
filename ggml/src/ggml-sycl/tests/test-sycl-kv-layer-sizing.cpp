@@ -32,8 +32,9 @@
 //   scaling with n_seq_max) -- correct only when kv_unified==true, which is
 //   not this fork's or upstream's default for either tool.
 //   kv_layer_bytes_for_kind() (unified-cache.hpp) derives both modes from
-//   src/llama-context.cpp:637-650 and src/llama-kv-cache-iswa.cpp:69-81;
-//   see that function's own comment for the full derivation and the
+//   llama_context::llama_context()'s n_ctx_seq derivation and
+//   llama_kv_cache_iswa::llama_kv_cache_iswa()'s size_swa; see that
+//   function's own comment for the full derivation and the
 //   GPU-run numbers it was checked against.
 //
 // This test exercises the REAL ggml_sycl::placement_kv_info and
@@ -153,7 +154,7 @@ static void test_gemma4_non_unified_n_seq_max_4() {
 
     // n_ctx_seq = pad256(4096/4) = 1024, n_stream = 4, window_seqs = 1.
     // l0 (SWA): per-stream cells = pad256(min(1024, 512*1 + 512)) = pad256(1024) = 1024.
-    // total cells = 4 * 1024 = 4096. bytes = 4096 * (512+512) * 2 = 4,194,304 *2 = 8,388,608.
+    // total cells = 4 * 1024 = 4096 cells * 1024 elements = 4,194,304, * 2 B = 8,388,608.
     check_eq("l0 (SWA)", kv.kv_bytes_for_layer(0), 8388608u);
 
     // l5 (FULL): total cells across streams == n_ctx always (n_ctx_seq * n_stream == n_ctx).
@@ -171,6 +172,34 @@ static void test_gemma4_non_unified_n_seq_max_4() {
         total += kv.kv_bytes_for_layer(il);
     }
     check_eq("total", total, 20u * 8388608u + 4u * 16777216u);
+}
+
+// ---------------------------------------------------------------------------
+// (a1b) Same shape, n_seq_max=3 -- every other case in this file divides
+//       n_ctx by n_seq_max exactly (4096/4, 4096/1), so the floor-then-pad
+//       arithmetic (n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256)) never
+//       actually sees a remainder. 4096/3 does. Precondition worth
+//       stating: in real llama usage n_ctx is already rounded DOWN to
+//       n_ctx_seq * n_seq_max before the SYCL planner ever sees it
+//       (llama_context::llama_context()'s n_ctx_seq derivation), so 4096
+//       paired with n_seq_max=3 is not a shape llama would actually send
+//       here -- it is used deliberately anyway, to pin today's floor+pad
+//       arithmetic against a non-exact quotient, so a change to either
+//       that arithmetic or to llama's own rounding shows up as a failure
+//       here instead of silently.
+// ---------------------------------------------------------------------------
+static void test_gemma4_non_unified_n_seq_max_3_uneven_division() {
+    printf("(a1b) gemma4 E4B, kv_unified=false, n_ctx=4096 n_ubatch=512 n_seq_max=3 (uneven)\n");
+    placement_kv_info kv = make_gemma4_e4b(4096, 512, 3, /*kv_unified=*/false);
+
+    // n_ctx_seq = pad256(4096/3) = pad256(1365) = 1536, n_stream = 3, window_seqs = 1.
+    // l0 (SWA): per-stream cells = pad256(min(1536, 512*1 + 512)) = pad256(1024) = 1024.
+    // total cells = 3 * 1024 = 3072 cells * 1024 elements = 3,145,728, * 2 B = 6,291,456.
+    check_eq("l0 (SWA)", kv.kv_bytes_for_layer(0), 6291456u);
+
+    // l5 (FULL): unaffected by the uneven division -- the FULL branch
+    // returns n_ctx * width * 2 directly, never n_ctx_seq * n_stream.
+    check_eq("l5 (FULL)", kv.kv_bytes_for_layer(5), 16777216u);
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +378,7 @@ int main() {
     printf("=== SYCL KV planner per-layer sizing (llama.cpp-3aos) ===\n");
 
     test_gemma4_non_unified_n_seq_max_4();
+    test_gemma4_non_unified_n_seq_max_3_uneven_division();
     test_gemma4_unified_n_seq_max_4();
     test_gemma4_n_seq_max_1_both_modes();
     test_gptoss_non_unified_np4();

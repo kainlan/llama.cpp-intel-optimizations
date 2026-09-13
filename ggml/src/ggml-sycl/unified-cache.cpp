@@ -27202,13 +27202,11 @@ static const char * placement_envelope_fa_name(int32_t t) {
 // llama.cpp-3aos: named cases instead of a nested ternary chain
 // -- SHARED (no K/V of its own) takes priority over the SWA/FULL mask so a
 // SHARED layer never mislabels as either.
-static const char * placement_kv_layer_label(const placement_kv_info & kv_info,
-                                             int                       layer_id,
-                                             uint32_t                  uil,
-                                             bool                      has_attn) {
+static const char * placement_kv_layer_label(const placement_kv_info & kv_info, int layer_id, bool has_attn) {
     if (!has_attn) {
         return "none";
     }
+    const uint32_t uil = static_cast<uint32_t>(layer_id);
     if (kv_info.has_per_layer_kv_truth(uil) && kv_info.layer_kind[uil] == GGML_SYCL_KV_LAYER_SHARED) {
         return "shared";
     }
@@ -27467,9 +27465,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         const size_t weight_charge = layer_weight_charge_bytes[layer_id];
         // Charge each attention layer at its actual per-LAYER KV cost
         // (llama.cpp-3aos: kv_bytes_for_layer(), not the uniform
-        // is_swa_layer()-class split -- SWA layers only need
-        // min(n_ctx, n_swa) tokens of KV (typically ~8 MB at 4096 tokens)
-        // while full-attention layers need the full per-layer allocation
+        // is_swa_layer()-class split -- SWA layers only need a sliding
+        // window's worth of KV (see kv_layer_bytes_for_kind()) while
+        // full-attention layers need the full per-layer allocation
         // (~256 MB at 131K context), and a heterogeneous model's SWA/full
         // widths can themselves differ (Gemma 4 E4B), and shared-KV layers
         // cost 0). TLSF supports heterogeneous slot sizes so the old
@@ -27667,9 +27665,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             // whether or not has_attn is set for it; the label distinguishes
             // that case from a genuinely non-attention layer.
             const size_t   kv_bytes     = has_attn ? kv_info.kv_bytes_for_layer(uil) : 0;
-            const char *   kv_label     = placement_kv_layer_label(kv_info, layer_id, uil, has_attn);
-            const int    dense_target = plan.get_layer_device(layer_id);
-            const int    kv_target    = plan.get_kv_device(layer_id);
+            const char *   kv_label     = placement_kv_layer_label(kv_info, layer_id, has_attn);
+            const int      dense_target = plan.get_layer_device(layer_id);
+            const int      kv_target    = plan.get_kv_device(layer_id);
             GGML_LOG_INFO(
                 "[PLACEMENT] layer %3d  weight=%.1f MB  kv=%.1f MB (%s)  total=%.1f MB  "
                 "dense_target=%s%d  kv_target=%s%d\n",

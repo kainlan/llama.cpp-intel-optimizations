@@ -33,7 +33,7 @@ using ggml_sycl::plan_runtime_kv_demotion;
 
 // Helper: n_layers alternating geometry like GPT-OSS (even = full-attn, odd = SWA).
 //
-// llama.cpp-3aos: kv_bytes_per_layer is now a REAL per-layer
+// llama.cpp-3aos: layer_kv_bytes is now a REAL per-layer
 // vector (kv_per_layer/kv_per_swa_layer scalars removed) -- this helper
 // still builds a uniform-width vector (kv_full on every even layer, kv_swa
 // on every odd one) so every existing case below keeps its original
@@ -45,10 +45,10 @@ static kv_demotion_input make_input(size_t budget, size_t vram, size_t kv_full, 
     in.vram_bytes  = vram;
     in.kv_device.assign(n_layers, 0);  // all on device 0
     in.swa_layer_mask.assign(n_layers, 0);
-    in.kv_bytes_per_layer.assign(n_layers, kv_full);
+    in.layer_kv_bytes.assign(n_layers, kv_full);
     for (int l = 1; l < n_layers; l += 2) {
-        in.swa_layer_mask[l]     = 1;
-        in.kv_bytes_per_layer[l] = kv_swa;
+        in.swa_layer_mask[l] = 1;
+        in.layer_kv_bytes[l] = kv_swa;
     }
     return in;
 }
@@ -110,7 +110,7 @@ int main() {
         kv_demotion_input in;
         in.vram_budget = 0;
         in.vram_bytes  = 50;
-        in.kv_bytes_per_layer.assign(3, 100);
+        in.layer_kv_bytes.assign(3, 100);
         in.kv_device.assign(3, 0);
         in.swa_layer_mask.assign(3, 0);
         auto r = plan_runtime_kv_demotion(in);
@@ -119,14 +119,14 @@ int main() {
         CHECK_EQ(r.host_kv_bytes_added, 0, "case 7: no bytes added");
     }
     // 8. llama.cpp-3aos: a device-resident, non-SWA layer with
-    // kv_bytes_per_layer[l] == 0 (e.g. a SHARED layer that holds no
+    // layer_kv_bytes[l] == 0 (e.g. a SHARED layer that holds no
     // independent KV of its own) must never be demoted -- there is nothing
     // for it to give back, and counting it would silently manufacture
     // phantom VRAM savings.
     {
-        auto in                  = make_input(1000, 1050, 100, 10, 6);
-        in.kv_bytes_per_layer[4] = 0;  // layer 4 (full-attn slot) holds no KV of its own
-        auto r                   = plan_runtime_kv_demotion(in);
+        auto in              = make_input(1000, 1050, 100, 10, 6);
+        in.layer_kv_bytes[4] = 0;  // layer 4 (full-attn slot) holds no KV of its own
+        auto r               = plan_runtime_kv_demotion(in);
         // Layer 4 cannot be demoted (0 bytes); the next full-attn layer (2)
         // is demoted instead to reach the same 950 target.
         CHECK(r.fits, "case 8: fits by demoting the next real full-attn layer");

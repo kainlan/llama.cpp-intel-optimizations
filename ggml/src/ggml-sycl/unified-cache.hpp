@@ -484,20 +484,22 @@ enum class multi_gpu_mode : uint8_t {
 // PER-LAYER kind/width so they cannot independently drift out of sync again.
 //
 // llama.cpp-3aos: llama's iSWA cache is per-stream unless kv_unified, so
-// SWA sizing has TWO modes. Derived from src/llama-context.cpp:637-650
-// and src/llama-kv-cache-iswa.cpp:69-81 (both cited by line at the branch
-// below), confirmed against a live GPU run's own printed shapes
-// (n_ctx_seq/kv_unified log lines, and the exact overflow byte counts):
+// SWA sizing has TWO modes. Derived from llama_context::llama_context()'s
+// n_ctx_seq derivation and llama_kv_cache_iswa::llama_kv_cache_iswa()'s
+// size_swa (both cited by function at the branch below), confirmed
+// against a live GPU run's own printed shapes (n_ctx_seq/kv_unified log
+// lines, and the exact overflow byte counts):
 //   - kv_unified == false (llama-completion/llama-bench's default; also
 //     llama-server unless overridden): the KV cache is split into n_seq_max
 //     independent STREAMS, each of n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256)
 //     cells (llama-context.cpp's own derivation -- re-derived here from the
 //     ALREADY-ADJUSTED n_ctx this function receives, which
 //     llama_context::llama_context() guarantees equals n_ctx_seq * n_seq_max
-//     exactly by construction, ibid.:649-650). Each stream's SWA window is
-//     capped independently: n_swa * 1 + n_ubatch (the "unified ? n_seq_max :
-//     1" term in llama-kv-cache-iswa.cpp:73 is 1 here). Total SWA cells
-//     across all streams = n_seq_max * that per-stream cap.
+//     exactly by construction, in that same constructor). Each stream's
+//     SWA window is capped independently: n_swa * 1 + n_ubatch (the
+//     "unified ? n_seq_max : 1" term in llama_kv_cache_iswa::llama_kv_cache_iswa()'s
+//     size_swa is 1 here). Total SWA cells across all streams = n_seq_max *
+//     that per-stream cap.
 //   - kv_unified == true: one stream of n_ctx_seq == n_ctx cells; ITS window
 //     scales with n_seq_max (n_swa * n_seq_max + n_ubatch) -- the formula
 //     this function already had before this fix, and the one the NAS box's
@@ -528,35 +530,38 @@ inline size_t kv_layer_bytes_for_kind(uint8_t  kind,
         const uint32_t seqs = n_seq_max > 0 ? n_seq_max : 1;
         uint32_t       n_ctx_seq;    // cells per stream in the non-SWA (base) cache
         uint32_t       n_stream;     // number of independent KV streams
-        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama-kv-cache-iswa.cpp:73
+        uint32_t       window_seqs;  // the "unified ? n_seq_max : 1" term, llama_kv_cache_iswa::llama_kv_cache_iswa()
         if (kv_unified) {
-            // llama-context.cpp:640: cparams.n_ctx_seq = cparams.n_ctx.
+            // llama_context::llama_context() sets cparams.n_ctx_seq =
+            // cparams.n_ctx.
             n_ctx_seq   = n_ctx;
             n_stream    = 1;
             window_seqs = seqs;
         } else {
-            // llama-context.cpp:642-650: n_ctx_seq = GGML_PAD(n_ctx / n_seq_max, 256),
-            // and n_ctx itself is then adjusted to n_ctx_seq * n_seq_max exactly --
-            // so dividing the (already-adjusted) n_ctx this function receives back
-            // out by seqs reproduces llama's own n_ctx_seq exactly (no remainder,
+            // llama_context::llama_context() computes n_ctx_seq =
+            // GGML_PAD(n_ctx / n_seq_max, 256), and n_ctx itself is then
+            // adjusted to n_ctx_seq * n_seq_max exactly -- so dividing the
+            // (already-adjusted) n_ctx this function receives back out by
+            // seqs reproduces llama's own n_ctx_seq exactly (no remainder,
             // and re-padding an already-256-aligned value is a no-op).
             n_ctx_seq   = GGML_PAD(n_ctx / seqs, 256);
             n_stream    = seqs;
             window_seqs = 1;
         }
-        // llama-kv-cache-iswa.cpp:73: size_swa = GGML_PAD(min(size_base,
-        // n_swa*(unified?n_seq_max:1) + n_ubatch), 256), one size PER STREAM;
-        // llama-kv-cache.cpp:347-348 allocates n_stream such streams.
+        // llama_kv_cache_iswa::llama_kv_cache_iswa()'s size_swa =
+        // GGML_PAD(min(size_base, n_swa*(unified?n_seq_max:1) + n_ubatch),
+        // 256), one size PER STREAM; llama_kv_cache::llama_kv_cache()'s
+        // per-stream K/V tensor creation allocates n_stream such streams.
         const uint32_t swa_cells_per_stream = GGML_PAD(std::min(n_ctx_seq, n_swa * window_seqs + n_ubatch), 256);
         const uint32_t swa_cells            = swa_cells_per_stream * n_stream;
         return static_cast<size_t>(swa_cells) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
     }
     // GGML_SYCL_KV_LAYER_FULL: the whole context window, every cell. Total
     // cells across streams is n_ctx_seq * n_stream, which by the same
-    // llama-context.cpp:649-650 invariant equals n_ctx exactly in both modes
-    // (kv_unified==true: n_stream=1, n_ctx_seq=n_ctx; kv_unified==false:
-    // n_ctx already adjusted to n_ctx_seq * n_seq_max) -- so this branch
-    // needs no unified/non-unified split.
+    // llama_context::llama_context()'s n_ctx_seq invariant equals n_ctx
+    // exactly in both modes (kv_unified==true: n_stream=1, n_ctx_seq=n_ctx;
+    // kv_unified==false: n_ctx already adjusted to n_ctx_seq * n_seq_max)
+    // -- so this branch needs no unified/non-unified split.
     return static_cast<size_t>(n_ctx) * static_cast<size_t>(k_width + v_width) * sizeof(ggml_fp16_t);
 }
 
