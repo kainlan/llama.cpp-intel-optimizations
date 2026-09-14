@@ -644,6 +644,33 @@ TEST(ubatch_key_equality) {
     return true;
 }
 
+// Exercise the persisted key boundary without requiring a kv_unified struct
+// member, so this same regression can run against the pre-v3 header.
+TEST(ubatch_kv_mode_json_roundtrip) {
+    const std::string prefix =
+        "{\"device_key\":\"Dev@1.0\",\"model_name\":\"mode-regression\","
+        "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
+        "\"flash_attn\":true,\"n_seq_max\":4,\"type_k\":1,\"type_v\":1,"
+        "\"device_set_hash\":23,\"kv_unified\":";
+    const UbatchCacheKey separate = ubatch_key_from_json(prefix + "false}");
+    const UbatchCacheKey unified  = ubatch_key_from_json(prefix + "true}");
+    // Positive parse controls must pass before the mode distinction is tested.
+    ASSERT(separate.device_key == "Dev@1.0");
+    ASSERT(separate.model_name == "mode-regression");
+    ASSERT(separate.n_ctx == 4096 && separate.n_seq_max == 4);
+    ASSERT(unified.device_key == separate.device_key);
+    ASSERT(unified.model_name == separate.model_name);
+    ASSERT(unified.n_ctx == separate.n_ctx && unified.n_seq_max == separate.n_seq_max);
+    ASSERT(separate != unified);
+
+    const UbatchCacheKey separate_restored = ubatch_key_from_json("{" + ubatch_key_to_json(separate) + "}");
+    const UbatchCacheKey unified_restored  = ubatch_key_from_json("{" + ubatch_key_to_json(unified) + "}");
+    ASSERT(separate_restored == separate);
+    ASSERT(unified_restored == unified);
+    ASSERT(separate_restored != unified_restored);
+    return true;
+}
+
 // Test: ubatch_entry_to_json / ubatch_entry_from_json round-trip every
 // field, including the nested key.
 TEST(ubatch_entry_serialization) {
@@ -1173,6 +1200,7 @@ int main() {
 
     RUN_TEST(cache_version_is_3);
     RUN_TEST(ubatch_key_equality);
+    RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_entry_serialization);
     RUN_TEST(ubatch_cache_file_roundtrip);
     RUN_TEST(ubatch_cache_v1_file_rejected);
