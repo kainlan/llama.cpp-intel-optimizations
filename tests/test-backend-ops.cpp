@@ -820,6 +820,9 @@ struct console_printer : public printer {
             print_perf_console(result);
         } else if (result.test_mode == "support") {
             print_support_console(result);
+        } else if (result.test_mode == "unavailable") {
+            fprintf(fout, "  %s(%s): unavailable: %s\n", result.op_name.c_str(),
+                    result.op_params.c_str(), result.error_message.c_str());
         }
     }
 
@@ -7416,6 +7419,11 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
             print_test_result_locked(output_printer, result);
             return status;
         };
+        // Apply exactly the ordinary operation/full-parameter matcher before
+        // checking reference support or allocating anything.
+        ggml_tensor filter_op = {};
+        filter_op.op = GGML_OP_FLASH_ATTN_EXT;
+        if (!matches_filter(&filter_op, filter)) { return test_status_t::SKIPPED; }
         // Fail closed if this is not the independent CPU reference backend.
         using set_ref_t = void (*)(ggml_backend_t, bool);
         auto * cpu_dev = ggml_backend_get_device(backend2);
@@ -11173,6 +11181,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();
+            // Materialize only the opt-in descriptors so the same parameter
+            // and operator filters can reject unsupported stateful PERF, too.
+            // Their inherited perf driver must never be invoked.
+            if (const char * probe = getenv("GGML_TEST_GEMMA4_STREAM_PROBE")) {
+                if (strcmp(probe, "1") == 0) {
+                    for (int64_t d : {256, 512}) {
+                        test_cases.emplace_back(new test_flash_attn_ext_gemma4_stateful(d));
+                    }
+                }
+            }
             break;
         }
     } else {
@@ -11187,10 +11205,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     if (mode != MODE_TEST) {
         test_cases.erase(std::remove_if(test_cases.begin(), test_cases.end(), [&](const std::unique_ptr<test_case> & tc) {
             if (tc->vars().find("gemma4_stateful_probe=1,") != 0) { return false; }
-            stateful_mode_unavailable = true;
-            test_result result(ggml_backend_name(backend), "FLASH_ATTN_EXT", tc->vars(), "unavailable",
-                               false, false, "stateful fixture requires test mode");
-            print_test_result_locked(output_printer, result);
+            ggml_tensor filter_op = {};
+            filter_op.op = GGML_OP_FLASH_ATTN_EXT;
+            if (tc->matches_filter(&filter_op, op_names_filter)) {
+                stateful_mode_unavailable = true;
+                test_result result(ggml_backend_name(backend), "FLASH_ATTN_EXT", tc->vars(), "unavailable",
+                                   false, false, "stateful fixture requires test mode");
+                print_test_result_locked(output_printer, result);
+            }
+            // Unrelated operators silently skip this descriptor, just as TEST
+            // does. Either way, never dispatch its inherited isolated graph.
             return true;
         }), test_cases.end());
     }
