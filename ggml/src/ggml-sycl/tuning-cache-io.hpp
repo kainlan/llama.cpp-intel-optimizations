@@ -80,7 +80,15 @@ inline long sycl_tuning_getpid() {
 // so a v1 file of EITHER kind is rejected by the version check already in
 // load_cache()/load_ubatch_cache() below and gets rewritten wholesale on the
 // next store; no separate migration code was needed for that.
-constexpr int CACHE_VERSION = 2;
+// v3 (llama.cpp-3aos): adds UbatchCacheKey::kv_unified. A v2 entry parsed
+// under v3 would have this field default to false via ubatch_key_from_json()
+// (no "kv_unified" key present), which could falsely MATCH a real
+// kv_unified=false query even though the entry was never validated against
+// a kv_unified-aware KV-sizing formula -- the same silent-wrong-match shape
+// the v1->v2 bump already fixed for n_seq_max/type_k/type_v/device_set_hash.
+// Bumping the shared version rejects every v2 (and v1) file of either kind
+// cleanly, same mechanism as above.
+constexpr int CACHE_VERSION = 3;
 
 // =============================================================================
 // Path Utilities
@@ -536,12 +544,19 @@ struct UbatchCacheKey {
     // though the actual runtime demand (and so which candidates fit)
     // differs between a single-GPU and a multi-GPU run.
     uint32_t    device_set_hash = 0;
+    // llama.cpp-3aos: cparams.kv_unified -- once KV sizing depends on it
+    // (kv_layer_bytes_for_kind(), unified-cache.hpp), two contexts
+    // differing only in this flag need different auto n_ubatch candidates
+    // and must not share one cache entry (CACHE_VERSION bumped to 3 above
+    // so a pre-existing v2 entry, which has no opinion on this field,
+    // cannot silently match either).
+    bool        kv_unified      = false;
 
     bool operator==(const UbatchCacheKey & other) const {
         return device_key == other.device_key && model_name == other.model_name && model_size == other.model_size &&
                model_hash == other.model_hash && n_ctx == other.n_ctx && n_batch == other.n_batch &&
                flash_attn == other.flash_attn && n_seq_max == other.n_seq_max && type_k == other.type_k &&
-               type_v == other.type_v && device_set_hash == other.device_set_hash;
+               type_v == other.type_v && device_set_hash == other.device_set_hash && kv_unified == other.kv_unified;
     }
 
     bool operator!=(const UbatchCacheKey & other) const { return !(*this == other); }
@@ -626,7 +641,8 @@ inline std::string ubatch_key_to_json(const UbatchCacheKey & k) {
        << "\"n_seq_max\":" << k.n_seq_max << ","
        << "\"type_k\":" << k.type_k << ","
        << "\"type_v\":" << k.type_v << ","
-       << "\"device_set_hash\":" << k.device_set_hash;
+       << "\"device_set_hash\":" << k.device_set_hash << ","
+       << "\"kv_unified\":" << (k.kv_unified ? "true" : "false");
     return ss.str();
 }
 
@@ -643,6 +659,7 @@ inline UbatchCacheKey ubatch_key_from_json(const std::string & json) {
     k.type_k          = static_cast<int32_t>(parse_int(json, "type_k"));
     k.type_v          = static_cast<int32_t>(parse_int(json, "type_v"));
     k.device_set_hash = static_cast<uint32_t>(parse_u64(json, "device_set_hash"));
+    k.kv_unified      = parse_bool(json, "kv_unified");
     return k;
 }
 

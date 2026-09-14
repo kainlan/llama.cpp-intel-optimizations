@@ -1602,6 +1602,11 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     cache_key.n_ctx           = cparams.n_ctx;
     cache_key.n_batch         = cparams.n_batch;
     cache_key.flash_attn      = cparams.flash_attn;
+    // llama.cpp-3aos: two contexts differing only in kv_unified need
+    // different auto n_ubatch candidates once KV sizing depends on it
+    // (kv_layer_bytes_for_kind(), unified-cache.hpp) -- must not share a
+    // cache entry (CACHE_VERSION 3, ggml-sycl.h's struct comment).
+    cache_key.kv_unified      = cparams.kv_unified;
     cache_key.n_seq_max       = cparams.n_seq_max;
     cache_key.type_k          = static_cast<int32_t>(type_k);
     cache_key.type_v          = static_cast<int32_t>(type_v);

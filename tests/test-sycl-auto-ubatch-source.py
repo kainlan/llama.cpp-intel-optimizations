@@ -1034,7 +1034,9 @@ def test_header_declares_the_ubatch_cache_key_and_four_accessors():
                    "bool\\s+flash_attn\\s*;",
                    # quality round 1, Q4: the four fields added this round.
                    "uint32_t\\s+n_seq_max\\s*;", "int32_t\\s+type_k\\s*;", "int32_t\\s+type_v\\s*;",
-                   "uint32_t\\s+device_set_hash\\s*;"):
+                   "uint32_t\\s+device_set_hash\\s*;",
+                   # llama.cpp-3aos: kv_unified, added once KV sizing depended on it.
+                   "bool\\s+kv_unified\\s*;"):
         assert re.search(member, GGML_SYCL_H_CODE), f"ggml_sycl_ubatch_cache_key is missing a member matching {member!r}"
 
     assert re.search(r"GGML_BACKEND_API\s+bool\s+ggml_backend_sycl_ubatch_cache_enabled\s*\(\s*void\s*\)\s*;",
@@ -1283,6 +1285,18 @@ def test_cache_key_populates_the_four_new_fields():
         r"cache_key\.device_set_hash\s*=\s*device_set_hash\s*;",
     ):
         assert re.search(assignment, body_norm), f"missing cache_key field assignment matching {assignment!r}"
+
+
+def test_cache_key_populates_kv_unified():
+    """llama.cpp-3aos: cache_key.kv_unified must be assigned from
+    cparams.kv_unified -- declaring the struct field (covered elsewhere) is
+    not enough if nothing ever fills it in, and a stale (always-false)
+    field would silently let two different-kv_unified contexts collide on
+    one cache entry."""
+    body_norm = _normalize_ws(_trial_body())
+    assert re.search(r"cache_key\.kv_unified\s*=\s*cparams\.kv_unified\s*;", body_norm), (
+        "missing cache_key.kv_unified = cparams.kv_unified; assignment"
+    )
 
 
 def test_device_set_hash_is_computed_over_every_sycl_backend():

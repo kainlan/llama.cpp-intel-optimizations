@@ -477,7 +477,11 @@ GGML_BACKEND_API bool ggml_backend_sycl_auto_ubatch_enabled(void);
 // device's dev_index this context actually uses, in order -- `device`
 // alone names only the FIRST one, so a single-GPU and a multi-GPU run that
 // both start with the same device 0 would otherwise share one entry even
-// though the real demand differs. All pointer fields are borrowed: valid
+// though the real demand differs. `kv_unified` (llama.cpp-3aos) is
+// cparams.kv_unified -- once KV sizing depends on it (see
+// kv_layer_bytes_for_kind(), unified-cache.hpp), two contexts differing
+// only in that flag need different auto n_ubatch candidates, so they must
+// not share one cache entry either. All pointer fields are borrowed: valid
 // only for the duration of the call, never retained.
 struct ggml_sycl_ubatch_cache_key {
     int          device;
@@ -491,6 +495,7 @@ struct ggml_sycl_ubatch_cache_key {
     int32_t      type_k;
     int32_t      type_v;
     uint32_t     device_set_hash;
+    bool         kv_unified;
 };
 
 // Whether the persisted auto n_ubatch cache is enabled -- GGML_SYCL_TUNING_CACHE,
