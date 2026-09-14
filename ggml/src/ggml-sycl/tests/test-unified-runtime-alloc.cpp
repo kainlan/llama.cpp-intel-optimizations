@@ -746,8 +746,9 @@ static bool host_zone_config_ordering_matters(sycl::queue & q) {
 }
 
 // Run only via --case host_inventory_initializes_zones, in a fresh process.
-// Metadata describes enough one-MiB experts to exceed the actual shared
-// arena by 64 MiB; no GGUF or weight payload is loaded. Empty/all-device plans
+// Metadata describes complete gate/up/down groups (one MiB per role) whose
+// aggregate exceeds the actual shared arena by 64 MiB. No GGUF or weight
+// payload is loaded. Empty/all-device plans
 // are failures, not a vacuous ordering PASS. See the arithmetic below: 1% of
 // the B50 is LESS than external headroom and aborts before this boundary.
 static bool host_inventory_initializes_zones(sycl::queue & q) {
@@ -796,37 +797,73 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     TEST_ASSERT(cache->pinned_pool_budget() >= 1536 * mib && cache->pinned_pool_budget() <= 4096 * mib,
                 "fixture requires a 1.5-4 GiB host pool budget; use the documented local host");
     const size_t shared_bytes = cache->zone_capacity(vram_zone_id::WEIGHT);
-    const size_t n_experts = (shared_bytes + mib - 1) / mib + 64;
-    TEST_ASSERT(n_experts <= 512, "synthetic inventory would exceed 512-MiB metadata bound");
+    constexpr size_t group_bytes = 3 * mib;
+    const size_t n_experts = (shared_bytes + 64 * mib + group_bytes - 1) / group_bytes;
+    TEST_ASSERT(3 * n_experts <= 512, "synthetic inventory would exceed 512-MiB metadata bound");
     fprintf(stderr, "fixture pct=%d arena=%zu shared=%zu experts=%zu external_headroom=%zu\n",
             budget_pct, cache->arena_total_size(), shared_bytes, n_experts, cache->external_headroom());
 
-    ggml_sycl_tensor_info tensor{};
-    tensor.name  = "blk.0.ffn_gate_exps.weight";
-    tensor.type  = GGML_TYPE_F32;
-    tensor.ne[0] = 512;
-    tensor.ne[1] = 512;
-    tensor.ne[2] = static_cast<int64_t>(n_experts);
-    tensor.ne[3] = 1;
-    tensor.size = n_experts * mib;
+    // CONTROL requires a complete logical role set, not the gate-only
+    // descriptor that produced metadata_mismatch=1 in the f6cae004 run.
+    const char * names[] = {
+        "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight",
+    };
+    ggml_sycl_tensor_info tensors[3]{};
+    for (size_t i = 0; i < 3; ++i) {
+        tensors[i].name  = names[i];
+        tensors[i].type  = GGML_TYPE_F32;
+        tensors[i].ne[0] = 512;
+        tensors[i].ne[1] = 512;
+        tensors[i].ne[2] = static_cast<int64_t>(n_experts);
+        tensors[i].ne[3] = 1;
+        tensors[i].size  = n_experts * mib;
+    }
     ggml_sycl_tensor_inventory inventory{};
-    inventory.tensors      = &tensor;
-    inventory.count        = 1;
-    inventory.total_size   = tensor.size;
+    inventory.tensors      = tensors;
+    inventory.count        = 3;
+    inventory.total_size   = group_bytes * n_experts;
     inventory.n_expert     = static_cast<int>(n_experts);
     inventory.n_expert_used = 1;
     inventory.n_layer      = 1;
     inventory.n_ctx        = 16;
     inventory.n_ubatch     = 1;
 
-    // Use the public early planning pass to validate the upcoming physical
-    // footprint BEFORE late inventory provisions it. This pass must not
-    // configure host zones itself, and does not install a test-made plan.
-    ggml_backend_sycl_compute_placement_plan_early(backend.get(), &inventory);
-    const auto snapshot = cache->get_placement_plan_snapshot();
-    TEST_ASSERT(snapshot && snapshot->plan, "public inventory did not publish a plan");
+    // The production loader binds a transaction and stages inventory through
+    // this public wrapper. Naked early/late setters compute a local snapshot
+    // but do not stage it without the wrapper's load-effect authority. Cache
+    // snapshots are publication diagnostics, NOT the early load candidate.
+    struct load_scope {
+        ggml_sycl_load_txn txn{};
+        bool active = false;
+
+        ggml_sycl_lifecycle_result abort() noexcept {
+            if (!active) {
+                return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
+            }
+            active = false;
+            return ggml_backend_sycl_model_load_end(txn, false, nullptr);
+        }
+
+        ~load_scope() {
+            if (active) {
+                const auto rc = abort();
+                if (rc != GGML_SYCL_LIFECYCLE_ABORTED) {
+                    fprintf(stderr, "host inventory fixture failure-path abort result=%d\n", static_cast<int>(rc));
+                }
+            }
+        }
+    } load;
+    const auto begin_rc = ggml_backend_sycl_model_load_begin(&load.txn);
+    load.active = begin_rc == GGML_SYCL_LIFECYCLE_OK;
+    TEST_ASSERT(load.active, "public model-load begin failed");
+    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
+                "public early inventory staging failed");
+    const auto snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(snapshot && snapshot->load_txn_id == load.txn.id && !snapshot->explicit_no_plan && snapshot->plan,
+                "public early inventory did not stage the exact transaction candidate");
     const auto & plan = *snapshot->plan;
-    TEST_ASSERT(!plan.entries.empty(), "synthetic inventory produced an empty plan");
+    TEST_ASSERT(plan.entries.size() == 3 * n_experts, "synthetic inventory did not plan every expert role");
+    TEST_ASSERT(plan.base_context_control_layout.valid, "complete descriptors produced invalid CONTROL layout");
     TEST_ASSERT(plan.weight_host_bytes > 0, "synthetic inventory produced no host placement");
     TEST_ASSERT(!cache->host_zones_configured(), "early inventory unexpectedly configured host zones");
     // Match the late configure helper, including its KV/scratch floors and
@@ -844,8 +881,9 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     constexpr size_t chunk = 16 * mib;
     const size_t host_committed_bound = (host_zones + chunk - 1) / chunk * chunk +
                                        (host_runtime + chunk - 1) / chunk * chunk + chunk;
-    TEST_ASSERT(cache->pinned_pool_committed() + host_committed_bound <= cache->pinned_pool_budget(),
-                "host budget cannot cover zones plus runtime chunks");
+    TEST_ASSERT(host_committed_bound <= 1680 * mib &&
+                    cache->pinned_pool_committed() + host_committed_bound <= cache->pinned_pool_budget(),
+                "host provisioning exceeds fixture cap or pool budget");
     size_t planned_runtime = 0;
     TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(0, &planned_runtime) &&
                     planned_runtime <= cache->zone_capacity(vram_zone_id::RUNTIME),
@@ -857,9 +895,16 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // Now cross the real late-inventory boundary. Its tiered_headroom
     // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
     // second budget subtraction: g_tiered_headroom_reserve has no readers.
-    ggml_backend_sycl_set_tensor_inventory(backend.get(), &inventory);
+    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+                "public late inventory staging failed");
+    const auto late_snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(late_snapshot && late_snapshot->load_txn_id == load.txn.id && !late_snapshot->explicit_no_plan &&
+                    late_snapshot->plan && late_snapshot->plan->entries.size() == 3 * n_experts &&
+                    late_snapshot->plan->weight_host_bytes > 0,
+                "public late inventory did not retain a nonempty exact host candidate");
     fprintf(stderr, "entries=%zu host_weights=%zu committed=%zu budget=%zu\n",
-            plan.entries.size(), plan.weight_host_bytes, cache->pinned_pool_committed(), cache->pinned_pool_budget());
+            late_snapshot->plan->entries.size(), late_snapshot->plan->weight_host_bytes,
+            cache->pinned_pool_committed(), cache->pinned_pool_budget());
     // Expected historical RED at 7b03ea03f: planning returns before the only
     // zone-configuration calls (S1-PRELOAD). Do not allocate first: that would
     // consume runtime chunks and obscure the ordering assertion's cause.
@@ -883,9 +928,14 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
                     "host buffer allocation was not charged to WEIGHT");
     }
     TEST_ASSERT(cache->host_zone_used(host_zone_id::WEIGHT) == before, "host buffer release leaked WEIGHT usage");
-    // This allocation/routing check is coverage, NOT a max-size regression
-    // witness (CHUNK_SIZE/chunk_cap can mask the old zone selection), and does
-    // not prove post-weight-load headroom or the 64-MiB reserve sufficient.
+    // This allocation happens DURING loading: load-side routing coverage,
+    // NOT a max-size regression witness (the chunk floor can mask it), and
+    // NOT proof of post-load context headroom or the 64-MiB reserve. Never
+    // finish successfully just to publish a cache snapshot: that runs S1.
+    // The inner buffer owner is gone before abort on all paths, including
+    // assertion returns and exceptions. Abort skips preload; check its result
+    // explicitly on success, and let the guard handle failing paths.
+    TEST_ASSERT(load.abort() == GGML_SYCL_LIFECYCLE_ABORTED, "public model-load abort cleanup failed");
     TEST_PASS();
     return true;
 }
