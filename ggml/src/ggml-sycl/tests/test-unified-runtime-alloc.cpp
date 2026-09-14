@@ -7,6 +7,7 @@
 //
 
 #include "../ggml-sycl-test.hpp"
+#include "../model-lifecycle.hpp"
 #include "../unified-cache.hpp"
 #include "../zone-sizing.hpp"
 #include "sycl-spin-kernel.hpp"
@@ -832,30 +833,61 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // this public wrapper. Naked early/late setters compute a local snapshot
     // but do not stage it without the wrapper's load-effect authority. Cache
     // snapshots are publication diagnostics, NOT the early load candidate.
+    const auto admission_before = lifecycle::global_registry().admission_diagnostics();
+    TEST_ASSERT(admission_before.active_txn == 0 && admission_before.models == 0 &&
+                    !admission_before.shutdown_reserved && !admission_before.shutdown_completed,
+                "fixture requires an idle, empty, non-shutdown lifecycle registry");
     struct load_scope {
+        lifecycle::admission_diagnostics_snapshot before;
         ggml_sycl_load_txn txn{};
         bool active = false;
 
-        ggml_sycl_lifecycle_result abort() noexcept {
+        bool abort() noexcept {
             if (!active) {
-                return GGML_SYCL_LIFECYCLE_OK_ALREADY_DEAD;
+                fprintf(stderr, "FAILED: host inventory cleanup called without active transaction\n");
+                return false;
             }
             active = false;
-            return ggml_backend_sycl_model_load_end(txn, false, nullptr);
+            const auto rc = ggml_backend_sycl_model_load_end(txn, false, nullptr);
+            const bool candidate_absent = !lifecycle_find_candidate_placement_plan(txn.id);
+            const auto after = lifecycle::global_registry().admission_diagnostics();
+            // end(false) rolls back with reason MISSING_SUCCESS; ABORTED is
+            // the terminal phase, not this API's result. EFFECT_FAILED and
+            // every other result remain failures, even if counts look empty.
+            const bool clean = rc == GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && candidate_absent &&
+                               after.active_txn == 0 && after.models == before.models &&
+                               after.shutdown_reserved == before.shutdown_reserved &&
+                               after.shutdown_completed == before.shutdown_completed;
+            fprintf(stderr, "%s host inventory cleanup: result=%d candidate_absent=%d active=%llu models=%llu "
+                            "baseline_models=%llu\n",
+                    clean ? "PASS:" : "FAILED:", static_cast<int>(rc), static_cast<int>(candidate_absent),
+                    static_cast<unsigned long long>(after.active_txn), static_cast<unsigned long long>(after.models),
+                    static_cast<unsigned long long>(before.models));
+            return clean;
         }
 
         ~load_scope() {
             if (active) {
-                const auto rc = abort();
-                if (rc != GGML_SYCL_LIFECYCLE_ABORTED) {
-                    fprintf(stderr, "host inventory fixture failure-path abort result=%d\n", static_cast<int>(rc));
-                }
+                // Assertion/exception paths already fail the case; abort()
+                // still prints the full semantic receipt and any failure.
+                (void) abort();
             }
         }
-    } load;
+    } load{ admission_before };
     const auto begin_rc = ggml_backend_sycl_model_load_begin(&load.txn);
     load.active = begin_rc == GGML_SYCL_LIFECYCLE_OK;
     TEST_ASSERT(load.active, "public model-load begin failed");
+    const auto admission_during = lifecycle::global_registry().admission_diagnostics();
+    // begin_outer reserves a slot and inserts txns_, NOT models_. models_
+    // gains its transient row in prepare_end and loses it on clean rollback.
+    // Prove this observer sees the public begin before trusting its later
+    // zero: an unrelated/empty registry cannot satisfy active_txn==txn.id.
+    TEST_ASSERT(load.txn.id != 0 && admission_during.active_txn == load.txn.id &&
+                    admission_during.models == admission_before.models,
+                "public begin not visible in exact registry, or unexpected model admission change");
+    const auto begin_candidate = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(begin_candidate && begin_candidate->load_txn_id == load.txn.id && begin_candidate->explicit_no_plan,
+                "public begin did not expose its exact initial candidate");
     TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
                 "public early inventory staging failed");
     const auto snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
@@ -935,7 +967,7 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     // The inner buffer owner is gone before abort on all paths, including
     // assertion returns and exceptions. Abort skips preload; check its result
     // explicitly on success, and let the guard handle failing paths.
-    TEST_ASSERT(load.abort() == GGML_SYCL_LIFECYCLE_ABORTED, "public model-load abort cleanup failed");
+    TEST_ASSERT(load.abort(), "public model-load abort semantic cleanup receipt failed");
     TEST_PASS();
     return true;
 }
