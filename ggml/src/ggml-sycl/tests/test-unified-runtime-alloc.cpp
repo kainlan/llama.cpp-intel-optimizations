@@ -746,9 +746,10 @@ static bool host_zone_config_ordering_matters(sycl::queue & q) {
 }
 
 // Run only via --case host_inventory_initializes_zones, in a fresh process.
-// Metadata describes 512 one-MiB experts; no GGUF or weight payload is loaded.
-// With the case's 1% VRAM budget on the lead-selected B50, some experts must
-// land on host. Empty/all-device plans are failures, not a vacuous ordering PASS.
+// Metadata describes enough one-MiB experts to exceed the actual shared
+// arena by 64 MiB; no GGUF or weight payload is loaded. Empty/all-device plans
+// are failures, not a vacuous ordering PASS. See the arithmetic below: 1% of
+// the B50 is LESS than external headroom and aborts before this boundary.
 static bool host_inventory_initializes_zones(sycl::queue & q) {
     TEST_BEGIN("host_inventory_initializes_zones");
     constexpr size_t mib = 1024ull * 1024ull;
@@ -757,6 +758,31 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     TEST_ASSERT(device.is_gpu() && !device.get_info<sycl::info::device::host_unified_memory>() &&
                     device_bytes >= 8192 * mib && device_bytes <= 20480 * mib,
                 "fixture requires an 8-20 GiB discrete GPU (lead-selected B50), not the iGPU");
+    // Keep the real ONEDNN policy, but bound unused compute/runtime zones
+    // to 16 MiB each (this fixture submits no inference). Conservative tail:
+    // 256 ONEDNN + 16 SCRATCH + 16 RUNTIME + 16 minimum shared = 304 MiB.
+    // Add 16 MiB margin and round the authority's result down to the arena's
+    // 2-MiB granularity. Choose the FIRST percentage meeting that bound via
+    // the production authority, which subtracts external headroom exactly
+    // once. At the observed B50 total of 16304 MiB this chooses 12%, yielding
+    // 326 MiB (not the former 1% -> zero). The ONEDNN quarter-budget clamp
+    // can only reduce the conservative tail, not invalidate its bound.
+    constexpr size_t min_arena = 320 * mib;
+    constexpr size_t max_arena = 512 * mib;
+    constexpr size_t arena_alignment = 2 * mib;
+    int budget_pct = 0;
+    for (int pct = 1; pct <= 100; ++pct) {
+        const auto authority = compute_vram_budget_authority(false, device_bytes, device_bytes, device_bytes, pct);
+        const size_t rounded = authority.budget_bytes / arena_alignment * arena_alignment;
+        if (rounded >= min_arena) {
+            TEST_ASSERT(rounded <= max_arena, "minimum usable arena exceeds fixture's 512-MiB device bound");
+            budget_pct = pct;
+            break;
+        }
+    }
+    TEST_ASSERT(budget_pct != 0, "no usable bounded arena budget");
+    const std::string pct_text = std::to_string(budget_pct);
+    set_env_var("GGML_SYCL_VRAM_BUDGET_PCT", pct_text.c_str());
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(
         ggml_backend_sycl_init(0), ggml_backend_free);
     TEST_ASSERT(backend != nullptr, "SYCL backend initialization failed");
@@ -764,35 +790,74 @@ static bool host_inventory_initializes_zones(sycl::queue & q) {
     TEST_ASSERT(cache != nullptr, "backend cache unavailable");
     TEST_ASSERT(cache->get_queue().get_device() == q.get_device(), "fixture queue/backend device mismatch");
     TEST_ASSERT(!cache->host_zones_configured(), "fixture requires a fresh cache without host zones");
+    TEST_ASSERT(cache->arena_active() && cache->arena_total_size() >= min_arena &&
+                    cache->arena_total_size() <= max_arena,
+                "actual free-VRAM authority did not yield the bounded usable arena; do not call inventory");
     TEST_ASSERT(cache->pinned_pool_budget() >= 1536 * mib && cache->pinned_pool_budget() <= 4096 * mib,
                 "fixture requires a 1.5-4 GiB host pool budget; use the documented local host");
+    const size_t shared_bytes = cache->zone_capacity(vram_zone_id::WEIGHT);
+    const size_t n_experts = (shared_bytes + mib - 1) / mib + 64;
+    TEST_ASSERT(n_experts <= 512, "synthetic inventory would exceed 512-MiB metadata bound");
+    fprintf(stderr, "fixture pct=%d arena=%zu shared=%zu experts=%zu external_headroom=%zu\n",
+            budget_pct, cache->arena_total_size(), shared_bytes, n_experts, cache->external_headroom());
 
     ggml_sycl_tensor_info tensor{};
     tensor.name  = "blk.0.ffn_gate_exps.weight";
     tensor.type  = GGML_TYPE_F32;
     tensor.ne[0] = 512;
     tensor.ne[1] = 512;
-    tensor.ne[2] = 512;
+    tensor.ne[2] = static_cast<int64_t>(n_experts);
     tensor.ne[3] = 1;
-    tensor.size = 512 * mib;
+    tensor.size = n_experts * mib;
     ggml_sycl_tensor_inventory inventory{};
     inventory.tensors      = &tensor;
     inventory.count        = 1;
     inventory.total_size   = tensor.size;
-    inventory.n_expert     = 512;
+    inventory.n_expert     = static_cast<int>(n_experts);
     inventory.n_expert_used = 1;
     inventory.n_layer      = 1;
     inventory.n_ctx        = 16;
     inventory.n_ubatch     = 1;
 
-    // This is the real public late-inventory boundary, not a direct call to
-    // configure_host_zones or a test-installed placement plan.
-    ggml_backend_sycl_set_tensor_inventory(backend.get(), &inventory);
+    // Use the public early planning pass to validate the upcoming physical
+    // footprint BEFORE late inventory provisions it. This pass must not
+    // configure host zones itself, and does not install a test-made plan.
+    ggml_backend_sycl_compute_placement_plan_early(backend.get(), &inventory);
     const auto snapshot = cache->get_placement_plan_snapshot();
     TEST_ASSERT(snapshot && snapshot->plan, "public inventory did not publish a plan");
     const auto & plan = *snapshot->plan;
     TEST_ASSERT(!plan.entries.empty(), "synthetic inventory produced an empty plan");
     TEST_ASSERT(plan.weight_host_bytes > 0, "synthetic inventory produced no host placement");
+    TEST_ASSERT(!cache->host_zones_configured(), "early inventory unexpectedly configured host zones");
+    // Match the late configure helper, including its KV/scratch floors and
+    // the separate runtime-chunk preallocation. Ceil each aggregate to a
+    // 16-MiB chunk; allow one further chunk for aligned zone boundaries.
+    const size_t host_scratch = std::max(plan.host_zone_scratch_bytes,
+        cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
+        plan.max_tensor_bytes + 32 * mib);
+    const size_t host_zones = plan.host_zone_weight_bytes + std::max(plan.host_zone_kv_bytes, 64 * mib) +
+                             plan.host_zone_staging_bytes + host_scratch;
+    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes +
+                                plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes;
+    TEST_ASSERT(host_zones <= 1536 * mib && host_runtime <= 128 * mib,
+                "planned host footprint exceeds fixture bound; do not call late inventory");
+    constexpr size_t chunk = 16 * mib;
+    const size_t host_committed_bound = (host_zones + chunk - 1) / chunk * chunk +
+                                       (host_runtime + chunk - 1) / chunk * chunk + chunk;
+    TEST_ASSERT(cache->pinned_pool_committed() + host_committed_bound <= cache->pinned_pool_budget(),
+                "host budget cannot cover zones plus runtime chunks");
+    size_t planned_runtime = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(0, &planned_runtime) &&
+                    planned_runtime <= cache->zone_capacity(vram_zone_id::RUNTIME),
+                "inventory would grow mandatory runtime tail beyond the bounded arena");
+    TEST_ASSERT(unified_cache_get_planned_onednn_scratchpad_bytes(0) <= 256 * mib,
+                "inventory would exceed the conservative ONEDNN tail bound");
+    fprintf(stderr, "host_zones=%zu host_runtime=%zu committed_bound=%zu\n",
+            host_zones, host_runtime, host_committed_bound);
+    // Now cross the real late-inventory boundary. Its tiered_headroom
+    // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
+    // second budget subtraction: g_tiered_headroom_reserve has no readers.
+    ggml_backend_sycl_set_tensor_inventory(backend.get(), &inventory);
     fprintf(stderr, "entries=%zu host_weights=%zu committed=%zu budget=%zu\n",
             plan.entries.size(), plan.weight_host_bytes, cache->pinned_pool_committed(), cache->pinned_pool_budget());
     // Expected historical RED at 7b03ea03f: planning returns before the only
@@ -1538,7 +1603,11 @@ int main(int argc, char ** argv) {
         // Before any SYCL/backend initialization or memoized env reads. Use
         // controls already implemented at the historical RED source SHA;
         // GGML_SYCL_HOST_RESERVE_MB was dead there, so do not depend on it.
-        set_env_var("GGML_SYCL_VRAM_BUDGET_PCT", "1");
+        set_env_var("GGML_SYCL_VRAM_BUDGET_PCT", nullptr);
+        set_env_var("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB", nullptr);
+        set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", "16");
+        set_env_var("GGML_SYCL_RUNTIME_ARENA_MB", "16");
+        set_env_var("GGML_SYCL_S1_MAX_IN_FLIGHT", "1");
         set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
         set_env_var("GGML_SYCL_HOST_STAGING_MB", "1");
         set_env_var("GGML_SYCL_HOST_RESERVE_MB", nullptr);
