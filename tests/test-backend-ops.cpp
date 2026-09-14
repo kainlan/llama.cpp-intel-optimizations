@@ -7409,6 +7409,7 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
                        const char * filter, printer * output_printer) override {
         mode = MODE_TEST;
         current_op_name = "FLASH_ATTN_EXT";
+        sentinels.clear(); // eval may be invoked again; prior contexts are gone.
         auto finish = [&](test_status_t status, const char * message) {
             test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
                                status != test_status_t::NOT_SUPPORTED, status == test_status_t::OK, message);
@@ -7442,12 +7443,16 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
             ggml_tensor * k;
             ggml_tensor * v;
             stage stages[2];
+            size_t sentinel_begin;
+            size_t sentinel_end;
         };
         replica replicas[2];
         const ggml_backend_t backends[] = {backend1, backend2};
         size_t owned_bytes = 2*context_bytes;
         // Maximum live host buffers: two per-stream F32 outputs, plus chunked
-        // F16 cache reads/expected values and input conversion/index staging.
+        // F16 cache reads/expected values, input conversion/index staging,
+        // and a 4 KiB sentinel readback. Actual buffer sizes include all guards
+        // (12 x 4 KiB per replica, 96 KiB total), in addition to tensor payload.
         const size_t host_bound = 2*size_t(hsk*8*26)*sizeof(float) + chunk*32;
         owned_bytes += host_bound;
         auto seed = [](size_t i) { return (float(i % 31) - 15.0f)/128.0f; };
@@ -7457,6 +7462,7 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
             rep.ctx.reset(ggml_init({context_bytes, nullptr, true}));
             if (!rep.ctx) { return finish(test_status_t::FAIL, "context allocation"); }
             auto * ctx = rep.ctx.get();
+            rep.sentinel_begin = sentinels.size();
             rep.k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*2, 1024*4);
             rep.v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*2, 1024*4);
             for (int step = 0; step < 2; ++step) {
@@ -7488,6 +7494,7 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
                     }
                 }
             }
+            rep.sentinel_end = sentinels.size();
             rep.buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backends[r]));
             if (!rep.buffer) { return finish(test_status_t::FAIL, "backend allocation"); }
             owned_bytes += ggml_backend_buffer_get_size(rep.buffer.get());
@@ -7508,6 +7515,9 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
                                             off*(fp32 ? 4 : 2), count*(fp32 ? 4 : 2));
                 }
             };
+            for (size_t guard = rep.sentinel_begin; guard < rep.sentinel_end; ++guard) {
+                fill(sentinels[guard], [](size_t i) { return (float(i % 17)-8.0f)/16.0f; });
+            }
             fill(rep.k, seed);
             fill(rep.v, seed);
             for (int step = 0; step < 2; ++step) {
@@ -7533,10 +7543,26 @@ struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_s
         for (int step = 0; step < 2; ++step) {
             const size_t queries = step == 0 ? 26 : 4;
             for (int r = 0; r < 2; ++r) {
-                if (ggml_backend_graph_compute(backends[r], replicas[r].stages[step].graph) != GGML_STATUS_SUCCESS) {
-                    return finish(test_status_t::FAIL, "graph compute");
-                }
+                const auto status = ggml_backend_graph_compute(backends[r], replicas[r].stages[step].graph);
+                // Even a failed submission may have enqueued earlier nodes.
+                // Attempt the existing backend drain before retiring buffers;
+                // backend synchronize retains its normal fatal-error contract.
                 ggml_backend_synchronize(backends[r]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return finish(test_status_t::FAIL, "graph compute (drain attempted)");
+                }
+                std::vector<float> guard_values(sentinel_size);
+                const auto & rep = replicas[r];
+                size_t guard_errors = 0;
+                for (size_t guard = rep.sentinel_begin; guard < rep.sentinel_end; ++guard) {
+                    ggml_backend_tensor_get(sentinels[guard], guard_values.data(), 0, sentinel_size*sizeof(float));
+                    for (size_t i = 0; i < guard_values.size(); ++i) {
+                        guard_errors += guard_values[i] != (float(i % 17)-8.0f)/16.0f;
+                    }
+                }
+                printf("gemma4_stateful_probe D=%lld stage=%d replica=%d guard_values=%zu mismatches=%zu\n",
+                       (long long) hsk, step, r, (rep.sentinel_end-rep.sentinel_begin)*sentinel_size, guard_errors);
+                if (guard_errors) { return finish(test_status_t::FAIL, "sentinel overwritten"); }
             }
             size_t mismatches = 0;
             size_t checked_bytes = 0;
@@ -11155,6 +11181,20 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
     filter_test_cases(test_cases, params_filter);
 
+    // This opt-in fixture has a custom sequential test driver only. Never
+    // label its inherited isolated graph as stateful grad/perf/support evidence.
+    bool stateful_mode_unavailable = false;
+    if (mode != MODE_TEST) {
+        test_cases.erase(std::remove_if(test_cases.begin(), test_cases.end(), [&](const std::unique_ptr<test_case> & tc) {
+            if (tc->vars().find("gemma4_stateful_probe=1,") != 0) { return false; }
+            stateful_mode_unavailable = true;
+            test_result result(ggml_backend_name(backend), "FLASH_ATTN_EXT", tc->vars(), "unavailable",
+                               false, false, "stateful fixture requires test mode");
+            print_test_result_locked(output_printer, result);
+            return true;
+        }), test_cases.end());
+    }
+
     if (mode == MODE_TEST) {
         ggml_backend_ptr backend_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
         if (backend_cpu == NULL) {
@@ -11275,14 +11315,14 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         }
         output_printer->print_summary(test_summary_info(n_ok, test_cases.size(), false));
 
-        return n_ok == test_cases.size();
+        return n_ok == test_cases.size() && !stateful_mode_unavailable;
     }
 
     if (mode == MODE_PERF) {
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
         }
-        return true;
+        return !stateful_mode_unavailable;
     }
 
     if (mode == MODE_SUPPORT) {
@@ -11297,7 +11337,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         for (auto & test : test_cases) {
             test->eval_support(backend, op_names_filter, output_printer);
         }
-        return true;
+        return !stateful_mode_unavailable;
     }
 
     GGML_ABORT("fatal error");
