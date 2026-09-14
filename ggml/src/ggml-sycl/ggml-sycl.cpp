@@ -16462,6 +16462,42 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     // are configured, so all-VRAM models do not allocate a full host copy here.
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 
+    // llama.cpp-glkg: configure host zones NOW, from the plan we just
+    // finalized, rather than waiting for the lazy S1-PRELOAD call
+    // (ggml_sycl_configure_host_zones_for_plan() at S1-PRELOAD bulk/MoE
+    // sites in ggml-sycl.cpp). This function is called by
+    // llama_model_sycl_set_late_inventory() BEFORE create_tensor() allocates
+    // any weight tensor's buffer -- the log line above ("enables unified
+    // placement before allocation") already documents that ordering
+    // guarantee for VRAM placement; it did not previously extend to host
+    // zones. Without this, every host-resident weight tensor created
+    // between here and S1-PRELOAD (which can be 80+ seconds later on a
+    // large MoE model) goes through
+    // ggml_backend_sycl_host_buffer_type_alloc_buffer's use_pinned_pool =
+    // host_zones_configured() = false branch, i.e. the UNZONED
+    // allocate_runtime() fallback (host_arena_->allocate_runtime() ->
+    // pinned_chunk_pool::allocate_from_chunks(runtime_chunks_, ...,
+    // runtime_pool=true)). Those bytes still count against the pool's
+    // total_allocated_ budget (pinned-pool.cpp), so by the time S1-PRELOAD's
+    // lazy call runs, the budget can already be almost fully consumed and
+    // pinned_chunk_pool::configure_zones()'s growth guard
+    // (total_allocated_ + chunk_size_ <= budget_) is false on entry --
+    // reported capacity 0.0 MB, host zones permanently disabled for the
+    // rest of the load, and the first runtime host-compute allocation after
+    // load (llama_context::output_reserve()) fails outright even though the
+    // pool's budget was never actually exceeded. Calling this here closes
+    // that window entirely for the standard load path: cache is non-null
+    // whenever the SYCL device backing ctx exists, and a null/empty plan
+    // (e.g. an all-VRAM model, ml.no_alloc, or a plan with no host-resident
+    // entries) makes ggml_sycl_configure_host_zones_for_plan() a no-op, same
+    // as its two existing S1-PRELOAD call sites.
+    {
+        auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
+        if (cache) {
+            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
+        }
+    }
+
     GGML_LOG_INFO(
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "
         "(VRAM: %.2f GB free, planner host placement: %s)\n",
@@ -41179,13 +41215,26 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
     // CPU-backend `mul_mat_id`'s output memcpy (bug llama.cpp-lj6p0).
     auto * cache = ggml_sycl::get_unified_cache_for_device(get_current_device_id());
     if (cache && cache->host_zones_configured()) {
-        // Mirror the zone-selection logic in `alloc_buffer`:
-        //   in_model_load || weights_evictable → WEIGHT
-        //   otherwise → STAGING
-        const bool                    in_model_load     = g_sycl_in_model_load.load(std::memory_order_acquire);
-        const bool                    weights_evictable = ggml_backend_sycl_weights_evictable();
-        const ggml_sycl::host_zone_id target_zone =
-            (in_model_load || weights_evictable) ? ggml_sycl::host_zone_id::WEIGHT : ggml_sycl::host_zone_id::STAGING;
+        // Mirror the zone-selection logic `alloc_buffer` actually reaches
+        // (unified-cache.cpp's `select_zone`, inside `unified_alloc`):
+        //   role == WEIGHT || cat == HOST_COMPUTE || cat == EXPERT_CACHE -> WEIGHT
+        //   otherwise                                                    -> STAGING
+        // `alloc_buffer` unconditionally sets
+        // `req.intent.category = ggml_sycl::runtime_category::HOST_COMPUTE` for
+        // every buffer this buft allocates, and select_zone's WEIGHT branch is
+        // checked BEFORE any role-only STAGING fallback, so a HOST_COMPUTE
+        // category request routes to WEIGHT unconditionally here -- regardless
+        // of role, in_model_load, or weights_evictable. This function used to
+        // re-derive alloc_buffer's ROLE computation instead of select_zone's
+        // actual ZONE decision -- a role-only ternary (WEIGHT when
+        // in_model_load was set or weights_evictable, STAGING otherwise) --
+        // so once in_model_load went false after model load, it picked
+        // STAGING while the real allocator kept using WEIGHT -- ggml-alloc
+        // then chunked a request against the wrong zone's
+        // largest-free-block (llama.cpp-glkg). See
+        // tests/test-sycl-host-zone-config-source-contract.py for the source
+        // gate pinning this agreement.
+        constexpr ggml_sycl::host_zone_id target_zone = ggml_sycl::host_zone_id::WEIGHT;
         size_t largest = cache->host_zone_largest_free_block(target_zone);
         // Floor: unified_alloc will grow the zone on fragmentation, so as long
         // as zone capacity still has room we can at least advertise one chunk
