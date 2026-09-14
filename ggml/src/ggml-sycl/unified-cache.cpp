@@ -4083,17 +4083,16 @@ unified_cache::unified_cache(sycl::queue & queue,
         // llama.cpp-glkg: GGML_SYCL_HOST_RESERVE_MB used to be parsed only by
         // resolve_host_reserve_bytes(), which has no callers -- a dead
         // variable documented as a live override. Wire it here as the actual
-        // override of the pinned-pool BUDGET (in MB), same effect as
-        // g_unified_cache_host_budget above, which today has no env var and
-        // is reachable only via ggml_backend_sycl_set_unified_cache_host_budget_pct()
-        // (a percentage, not a byte count, and not wired to any CLI flag) --
-        // this is the CLI-reachable form. Skipped when the C-API override is
-        // already set (nonzero), since that is an explicit programmatic
-        // choice that should not be silently replaced by an env var. This is
-        // also the reproduction lever cited on llama.cpp-glkg: a small value
-        // here (e.g. 6144) plus a model whose host-resident weights exceed
-        // budget - one 2 GiB chunk reproduces "pinned pool capacity 0.0 MB"
-        // on hardware that would not otherwise hit it.
+        // override of the pinned-pool BUDGET (in MB). The byte sentinel
+        // g_unified_cache_host_budget is initialized to zero and currently
+        // has no writer. The public host-budget-pct setter changes only the
+        // percentage used by the auto calculation below, not this sentinel.
+        // A positive parsed env value therefore precedes that calculation,
+        // even when the percentage was explicitly set through the API. Zero
+        // leaves auto calculation enabled. This describes current behavior,
+        // not a separate provenance mechanism or an API-priority guarantee.
+        // A small fixed budget can exercise pool shortfalls; its value alone
+        // does not guarantee a particular failure or allocation ordering.
         size_t host_reserve_mb = 0;
         if (host_mem_budget == 0 && parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)) {
             host_mem_budget = host_reserve_mb * 1024ULL * 1024ULL;
@@ -14967,8 +14966,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // Fix: use the single-segment-contiguous `zone_alloc`. If the
             // zone cannot satisfy the request contiguously, grow the zone by
             // one chunk (or more, capped by budget) and retry. If growth is
-            // blocked (phase gate or budget exhausted), fail cleanly so the
-            // caller can fall back through the sycl::malloc_host path below.
+            // blocked (phase gate or budget exhausted), return a miss. The
+            // host-buffer WEIGHT path fails cleanly without a raw malloc_host
+            // escape; the separate KV-only pool retry below is not its fallback.
             auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
                 if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
                     // Zones not yet configured (pre-configure model-load path):
@@ -26553,19 +26553,15 @@ static void populate_host_zone_sizing(placement_plan &                          
     // request lands (select_zone() in unified_alloc routes role==WEIGHT OR
     // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
     // that includes llama_context::output_reserve()'s logits/embd host
-    // buffer plus the server's prompt-checkpoint reads -- both allocated
-    // long AFTER model load, once every byte of `host_zone_weight_bytes`
-    // below is already the model's own host-resident weights plus its 20%
-    // headroom. Without this, a model sized close to the pinned-pool budget
-    // leaves the WEIGHT zone with zero free room, and the zone's dynamic
-    // growth (pinned_chunk_pool::host_zone_grow(), 2 GiB chunk granularity)
-    // is a second line of defense, not a substitute -- it only succeeds if
-    // the pool's OVERALL budget still has a free chunk beyond this zone's
-    // own footprint, which is exactly the invariant this reserve exists to
-    // protect. 64 MiB comfortably covers the observed failure sizes
-    // (3.8 MB / 0.95 MB on the reporting NAS box) with headroom for larger
-    // n_vocab * n_ubatch output buffers; it is not a hard cap -- a request
-    // that still exceeds it falls through to host_zone_grow() same as today.
+    // buffer plus the server's prompt-checkpoint reads after model load.
+    // Add 64 MiB of consumable sizing slack beyond the weight estimate and
+    // its 20% headroom. This is not an earmarked context reservation: other
+    // WEIGHT-zone owners can consume it before a context requests memory.
+    // It neither guarantees sufficient context capacity nor protects free
+    // pool budget for growth. Dynamic growth still depends on available
+    // pool budget, allocation phase, and contiguous/aligned chunk capacity.
+    // Retained-weight/post-load tests must establish sufficiency for each
+    // qualified workload; the observed request sizes alone do not prove it.
     constexpr size_t k_host_runtime_reserve_bytes = 64ull * 1024ull * 1024ull;
 
     plan.max_tensor_bytes       = 0;

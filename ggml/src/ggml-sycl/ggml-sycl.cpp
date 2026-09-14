@@ -16487,10 +16487,10 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     // load (llama_context::output_reserve()) fails outright even though the
     // pool's budget was never actually exceeded. Calling this here closes
     // that window entirely for the standard load path: cache is non-null
-    // whenever the SYCL device backing ctx exists, and a null/empty plan
-    // (e.g. an all-VRAM model, ml.no_alloc, or a plan with no host-resident
-    // entries) makes ggml_sycl_configure_host_zones_for_plan() a no-op, same
-    // as its two existing S1-PRELOAD call sites.
+    // whenever the SYCL device backing ctx exists. The helper skips a null
+    // cache, an empty entries list, or already-configured host zones. A
+    // nonempty all-device plan is NOT a no-op: its planned host zones and
+    // runtime chunks may still be provisioned, as at the existing S1 sites.
     {
         auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
         if (cache) {
@@ -41236,11 +41236,11 @@ static size_t ggml_backend_sycl_host_buffer_type_get_max_size(ggml_backend_buffe
         // gate pinning this agreement.
         constexpr ggml_sycl::host_zone_id target_zone = ggml_sycl::host_zone_id::WEIGHT;
         size_t largest = cache->host_zone_largest_free_block(target_zone);
-        // Floor: unified_alloc will grow the zone on fragmentation, so as long
-        // as zone capacity still has room we can at least advertise one chunk
-        // worth.  If even a chunk-sized growth is blocked by the pool budget
-        // the subsequent alloc will return false and the caller falls back to
-        // the non-pooled `sycl::malloc_host` path.
+        // Optimistic chunk capability, not a reservation or a guarantee of
+        // currently available contiguous bytes. unified_alloc may try zone
+        // growth, but budget, phase, or alignment constraints can still make
+        // allocation fail. This host buffer path then returns nullptr; it
+        // does not escape the pool through raw sycl::malloc_host.
         if (largest < chunk_cap) {
             largest =
                 std::min(chunk_cap, std::max(largest, static_cast<size_t>(ggml_sycl::pinned_chunk_pool::CHUNK_SIZE)));
@@ -41316,8 +41316,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
     req.intent.cohort_id                    = "backend_host_buffer";
     req.intent.constraints.must_host_pinned = true;
     // When host zones are configured, route through the zone system so allocations
-    // are tracked and budgeted. Model weights go to WEIGHT zone, compute buffers
-    // go to SCRATCH zone. When zones are not configured, use the pinned pool runtime.
+    // are tracked and budgeted. This buft's WEIGHT/STAGING roles both route
+    // to WEIGHT because its category is HOST_COMPUTE. When zones are not
+    // configured, use the pinned pool runtime.
     req.intent.constraints.use_pinned_pool  = (exact_cache && exact_cache->host_zones_configured());
     ggml_sycl::alloc_handle host_buffer_owner{};
     if (!ggml_sycl::unified_alloc(req, &host_buffer_owner)) {
