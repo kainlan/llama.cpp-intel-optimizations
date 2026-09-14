@@ -7280,6 +7280,115 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Opt-in llama.cpp-3aos consumer probe, not another generic FA sweep.
+// Frozen Gemma4 E4B: 8 Q heads / 2 KV heads, scale 1, D=256 SWA or
+// D=512 FULL. Separate KV at c4096/np4/ub512 has 1024 physical cells per
+// stream, while get_n_kv() exposes 256 at the observed <=60 positions.
+// Query 1 covers decode; query 8 covers the initial 0->8 prompt checkpoint.
+struct test_flash_attn_ext_gemma4_streams : public test_flash_attn_ext {
+    test_flash_attn_ext_gemma4_streams(int64_t d, int64_t streams, int64_t queries)
+        : test_flash_attn_ext(d, d, 2, {4, streams}, 256, queries) {}
+
+    std::string vars() override {
+        return "gemma4_stream_probe=1," + test_flash_attn_ext::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t streams = nr23[1];
+        // build_attn_mha casts permuted D256 Q to contiguous F16. D512
+        // bypasses that cast, retaining F32 and the head-interleaved strides.
+        ggml_tensor * q;
+        if (hsk == 256) {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, nb, 8, streams);
+            ggml_set_name(q, "gemma4_q_storage");
+        } else {
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, 8, nb, streams);
+            ggml_set_name(storage, "gemma4_q_storage");
+            q = ggml_permute(ctx, storage, 0, 2, 1, 3);
+        }
+        auto cache_view = [&](const char * name) {
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, 2, 1024, streams);
+            ggml_set_name(storage, name);
+            // get_k/get_v followed by build_attn_mha's permutation:
+            // visible [D,256,2,S], stride3=D*2*1024*sizeof(f16).
+            return ggml_view_4d(ctx, storage, hsk, kv, 2, streams,
+                                storage->nb[2], storage->nb[1], storage->nb[3], 0);
+        };
+        auto * k = cache_view("gemma4_k_storage");
+        auto * v = cache_view("gemma4_v_storage");
+        auto * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, streams);
+        ggml_set_name(m, "gemma4_mask");
+        auto * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            const bool q = strcmp(t->name, "gemma4_q_storage") == 0;
+            const bool k = strcmp(t->name, "gemma4_k_storage") == 0;
+            const bool v = strcmp(t->name, "gemma4_v_storage") == 0;
+            const bool m = strcmp(t->name, "gemma4_mask") == 0;
+            if (!q && !k && !v && !m) {
+                init_tensor_uniform(t); // output/sentinels, not probe inputs
+                continue;
+            }
+            const size_t n = ggml_nelements(t);
+            const size_t per_stream = n / nr23[1];
+            std::vector<float> values(n);
+            for (size_t i = 0; i < n; ++i) {
+                const size_t stream = i / per_stream;
+                if (m) {
+                    const size_t query = (i / kv) % nb;
+                    const size_t position = (nb == 1 ? 42 : 0) + query;
+                    values[i] = i % kv <= position ? 0.0f : -INFINITY;
+                } else {
+                    // Stable per-element and per-stream variation: a dropped
+                    // stream stride must not be hidden by broadcast-like data.
+                    uint32_t x = uint32_t(i) + (q ? 17u : k ? 131u : 977u);
+                    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15;
+                    values[i] = (float(x % 2001u) - 1000.0f) / 4000.0f;
+                    if (v) {
+                        values[i] += 0.5f * float(stream);
+                    }
+                }
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, n * sizeof(float));
+            } else {
+                GGML_ASSERT(t->type == GGML_TYPE_F16);
+                std::vector<ggml_fp16_t> half(n);
+                for (size_t i = 0; i < n; ++i) {
+                    half[i] = ggml_fp32_to_fp16(values[i]);
+                }
+                ggml_backend_tensor_set(t, half.data(), 0, n * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != size_t(hsv * 8 * nb * nr23[1])) {
+            return test_flash_attn_ext::err(a, b, n);
+        }
+        double worst = 0.0;
+        const size_t per_stream = n / nr23[1];
+        for (int64_t s = 0; s < nr23[1]; ++s) {
+            const double error = nmse(a + s * per_stream, b + s * per_stream, per_stream);
+            printf("gemma4_stream_probe D=%lld Q=%lld S=%lld stream=%lld NMSE=%.9g\n",
+                   (long long) hsk, (long long) nb, (long long) nr23[1], (long long) s, error);
+            if (!std::isfinite(error)) {
+                return INFINITY;
+            }
+            worst = std::max(worst, error);
+        }
+        return worst; // enforce the existing 5e-4 tolerance on EACH stream
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9988,6 +10097,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool circular : {false, true}) {
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {512, 512, 1, 1}, 0, 1, 0, 1, 0, 0, 0, 0, tfrm, circular));
             test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {11, 22, 33, 44}, 1, 2, 3, 4, 5, 6, 7, 8, tfrm, circular));
+        }
+    }
+
+    // Explicit opt-in plus -p gemma4_stream_probe=1 selects exactly eight
+    // numerical cases. Never remove the selector when running on this host.
+    const char * gemma4_probe = getenv("GGML_TEST_GEMMA4_STREAM_PROBE");
+    if (gemma4_probe && strcmp(gemma4_probe, "1") == 0) {
+        for (int64_t d : {256, 512}) {
+            for (int64_t streams : {1, 4}) {
+                for (int64_t queries : {1, 8}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_gemma4_streams(d, streams, queries));
+                }
+            }
         }
     }
 
