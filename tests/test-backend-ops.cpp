@@ -7285,6 +7285,9 @@ struct test_flash_attn_ext : public test_case {
 // D=512 FULL. Separate KV at c4096/np4/ub512 has 1024 physical cells per
 // stream, while get_n_kv() exposes 256 at the observed <=60 positions.
 // Query 1 covers decode; query 8 covers the initial 0->8 prompt checkpoint.
+// Archived traced RED's late cohort additionally used Q26 at positions 12..37
+// and Q4 at 38..41, streams 0..2. These are isolated consumer checks, NOT
+// reproductions of KV writes, checkpointing, or stateful graph transitions.
 struct test_flash_attn_ext_gemma4_streams : public test_flash_attn_ext {
     test_flash_attn_ext_gemma4_streams(int64_t d, int64_t streams, int64_t queries)
         : test_flash_attn_ext(d, d, 2, {4, streams}, 256, queries) {}
@@ -7307,7 +7310,9 @@ struct test_flash_attn_ext_gemma4_streams : public test_flash_attn_ext {
             q = ggml_permute(ctx, storage, 0, 2, 1, 3);
         }
         auto cache_view = [&](const char * name) {
-            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, 2, 1024, streams);
+            // The late cohort views streams 0..2 of the four-stream cache.
+            const int64_t physical_streams = streams == 3 ? 4 : streams;
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, 2, 1024, physical_streams);
             ggml_set_name(storage, name);
             // get_k/get_v followed by build_attn_mha's permutation:
             // visible [D,256,2,S], stride3=D*2*1024*sizeof(f16).
@@ -7338,13 +7343,14 @@ struct test_flash_attn_ext_gemma4_streams : public test_flash_attn_ext {
                 continue;
             }
             const size_t n = ggml_nelements(t);
-            const size_t per_stream = n / nr23[1];
+            const size_t per_stream = n / t->ne[3];
             std::vector<float> values(n);
             for (size_t i = 0; i < n; ++i) {
                 const size_t stream = i / per_stream;
                 if (m) {
                     const size_t query = (i / kv) % nb;
-                    const size_t position = (nb == 1 ? 42 : 0) + query;
+                    const size_t first_position = nb == 1 ? 42 : nb == 26 ? 12 : nb == 4 ? 38 : 0;
+                    const size_t position = first_position + query;
                     values[i] = i % kv <= position ? 0.0f : -INFINITY;
                 } else {
                     // Stable per-element and per-stream variation: a dropped
@@ -10100,7 +10106,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Explicit opt-in plus -p gemma4_stream_probe=1 selects exactly eight
+    // Explicit opt-in plus -p gemma4_stream_probe=1 selects exactly twelve
     // numerical cases. Never remove the selector when running on this host.
     const char * gemma4_probe = getenv("GGML_TEST_GEMMA4_STREAM_PROBE");
     if (gemma4_probe && strcmp(gemma4_probe, "1") == 0) {
@@ -10109,6 +10115,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (int64_t queries : {1, 8}) {
                     test_cases.emplace_back(new test_flash_attn_ext_gemma4_streams(d, streams, queries));
                 }
+            }
+            // Only the two missing late-cohort prefill shapes from traced RED.
+            for (int64_t queries : {4, 26}) {
+                test_cases.emplace_back(new test_flash_attn_ext_gemma4_streams(d, 3, queries));
             }
         }
     }
