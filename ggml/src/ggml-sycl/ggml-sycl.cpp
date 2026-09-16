@@ -5579,16 +5579,15 @@ void * moe_expert_ensure_soa_cached(int layer_idx, int expert_idx, int device_id
     return nullptr;
 }
 
-static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache) {
-    if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+static void ggml_sycl_configure_host_zones_for_plan(
+    ggml_sycl::unified_cache * cache, const std::shared_ptr<const ggml_sycl::placement_plan> & plan_owner) {
+    if (!cache || !plan_owner || plan_owner->entries.empty()) {
         return;
     }
 
     if (cache->host_zones_configured()) {
         return;
     }
-
-    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
 
     const auto &     plan               = *plan_owner;
     constexpr size_t min_kv_zone        = 64ull * 1024ull * 1024ull;
@@ -5658,6 +5657,14 @@ static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * c
     } else {
         GGML_LOG_WARN(
             "[HOST-ARENA] Host zones disabled for this plan; model load will use fallback pinned allocations\n");
+    }
+}
+
+// S1 preload retains its existing current-plan behavior. The guarded inventory
+// path instead passes the exact candidate captured while inventory was locked.
+static void ggml_sycl_configure_host_zones_for_plan(ggml_sycl::unified_cache * cache) {
+    if (cache) {
+        ggml_sycl_configure_host_zones_for_plan(cache, ggml_sycl_cache_plan_owner(cache));
     }
 }
 
@@ -16333,13 +16340,14 @@ void ggml_backend_sycl_compute_placement_plan_early(ggml_backend_t              
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 }
 
-void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
+static std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> ggml_sycl_set_tensor_inventory_impl(
+    ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
     if (!backend || !inventory || (inventory->count > 0 && !inventory->tensors)) {
-        return;
+        return {};
     }
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *) backend->context;
     if (!ctx) {
-        return;
+        return {};
     }
 
     std::lock_guard<std::mutex> lock(g_tensor_inventory_mutex);
@@ -16462,47 +16470,22 @@ void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_s
     // are configured, so all-VRAM models do not allocate a full host copy here.
     compute_and_store_plan_for_inventory(ctx, vram_budget, budget_pct);
 
-    // llama.cpp-glkg: configure host zones NOW, from the plan we just
-    // finalized, rather than waiting for the lazy S1-PRELOAD call
-    // (ggml_sycl_configure_host_zones_for_plan() at S1-PRELOAD bulk/MoE
-    // sites in ggml-sycl.cpp). This function is called by
-    // llama_model_sycl_set_late_inventory() BEFORE create_tensor() allocates
-    // any weight tensor's buffer -- the log line above ("enables unified
-    // placement before allocation") already documents that ordering
-    // guarantee for VRAM placement; it did not previously extend to host
-    // zones. Without this, every host-resident weight tensor created
-    // between here and S1-PRELOAD (which can be 80+ seconds later on a
-    // large MoE model) goes through
-    // ggml_backend_sycl_host_buffer_type_alloc_buffer's use_pinned_pool =
-    // host_zones_configured() = false branch, i.e. the UNZONED
-    // allocate_runtime() fallback (host_arena_->allocate_runtime() ->
-    // pinned_chunk_pool::allocate_from_chunks(runtime_chunks_, ...,
-    // runtime_pool=true)). Those bytes still count against the pool's
-    // total_allocated_ budget (pinned-pool.cpp), so by the time S1-PRELOAD's
-    // lazy call runs, the budget can already be almost fully consumed and
-    // pinned_chunk_pool::configure_zones()'s growth guard
-    // (total_allocated_ + chunk_size_ <= budget_) is false on entry --
-    // reported capacity 0.0 MB, host zones permanently disabled for the
-    // rest of the load, and the first runtime host-compute allocation after
-    // load (llama_context::output_reserve()) fails outright even though the
-    // pool's budget was never actually exceeded. Calling this here closes
-    // that window entirely for the standard load path: cache is non-null
-    // whenever the SYCL device backing ctx exists. The helper skips a null
-    // cache, an empty entries list, or already-configured host zones. A
-    // nonempty all-device plan is NOT a no-op: its planned host zones and
-    // runtime chunks may still be provisioned, as at the existing S1 sites.
-    {
-        auto * cache = ggml_sycl::get_unified_cache_for_device(ctx->device);
-        if (cache) {
-            ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache);
-        }
-    }
-
     GGML_LOG_INFO(
         "[SYCL] Tensor inventory set: %zu tensors, %.2f GB total "
         "(VRAM: %.2f GB free, planner host placement: %s)\n",
         g_tensor_inventory.size(), g_tensor_inventory_total_size / (1024.0 * 1024.0 * 1024.0),
         free_mem / (1024.0 * 1024.0 * 1024.0), ggml_sycl_current_model_planner_host_placement() ? "yes" : "no");
+
+    // Capture the staged revision before releasing the inventory writer lock.
+    // Without staging authority, a direct legacy setter needs no candidate.
+    return g_sycl_plan_load_effect_txn != 0 ?
+               ggml_sycl::lifecycle_find_candidate_placement_plan(g_sycl_plan_load_effect_txn) : nullptr;
+}
+
+void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t backend, const ggml_sycl_tensor_inventory * inventory) {
+    // Preserve the pre-091afc direct-setter contract. Eager host provisioning
+    // belongs to stage_inventory_plan(), which owns the necessary lifetime guards.
+    (void) ggml_sycl_set_tensor_inventory_impl(backend, inventory);
 }
 
 void ggml_backend_sycl_set_placement_envelope(ggml_backend_t backend, const ggml_sycl_placement_envelope * envelope) {
@@ -16580,7 +16563,37 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_inventory_plan(const ggml_syc
             if (early) {
                 ggml_backend_sycl_compute_placement_plan_early(backend, inventory);
             } else {
-                ggml_backend_sycl_set_tensor_inventory(backend, inventory);
+                const auto snapshot = ggml_sycl_set_tensor_inventory_impl(backend, inventory);
+                const auto owner    = effect.owner;
+                const auto candidate_is_current = [&]() {
+                    // Candidate versions/slot fields are not published identities.
+                    // The effect owns the full token; object identity identifies
+                    // the exact staged revision, including explicit no-plan rows.
+                    return snapshot && snapshot->load_txn_id == owner.load.value &&
+                           (snapshot->explicit_no_plan || snapshot->plan) &&
+                           ggml_sycl_same_owner(registry.current_active_token(), owner) &&
+                           ggml_sycl::lifecycle_find_candidate_placement_plan(owner.load.value).get() == snapshot.get();
+                };
+                if (!candidate_is_current()) {
+                    throw std::runtime_error("stale host provisioning candidate before allocation");
+                }
+
+                // The inventory lock has been released. Keep module_guard, effect
+                // and the backend alive across physical provisioning; do not
+                // reacquire an effect after a finisher has closed admission.
+                // This is synchronous before the loader allocates weight buffers,
+                // so those buffers cannot consume the unzoned runtime pool first.
+                // Optional zone/scratch failures retain the helper's fallback policy.
+                if (!snapshot->explicit_no_plan) {
+                    const int device = ((ggml_backend_sycl_context *) backend->context)->device;
+                    auto * cache = ggml_sycl::get_unified_cache_for_device(device);
+                    ggml_sycl::ggml_sycl_configure_host_zones_for_plan(cache, snapshot->plan);
+                }
+                if (!candidate_is_current()) {
+                    // Detection, not atomic competing-provisioning or backing
+                    // rollback: the existing owner rollback handles this refusal.
+                    throw std::runtime_error("stale host provisioning candidate after allocation");
+                }
             }
 #if defined(GGML_SYCL_PRIVATE_TESTING)
             if ((early && g_test_fail_next_stage_inventory_plan_early_after_first_device.exchange(false, std::memory_order_acq_rel)) ||
