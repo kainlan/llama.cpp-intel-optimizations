@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 4,
+  "scaffoldVersion": 3,
+  "enabled": true,
+  "routingMode": "team",
+  "roles": {
+    "explorer": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    },
+    "librarian": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    },
+    "oracle": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    },
+    "designer": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    },
+    "fixer": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "bash", "edit", "write"], "write": true },
+      "prompt": "default"
+    },
+    "reviewer": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    },
+    "observer": {
+      "model": "openai-codex/gpt-6-astra",
+      "thinkingLevel": "low",
+      "access": { "tools": ["read", "grep", "find", "ls", "bash"], "write": false },
+      "prompt": "default"
+    }
+  }
+}
