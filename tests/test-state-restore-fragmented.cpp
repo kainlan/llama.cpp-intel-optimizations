@@ -107,6 +107,10 @@ static int test_prepare_rollback_restores_stream_head(const common_params & para
     params.n_batch    = 512;
     params.n_ubatch   = 128;
 
+    // the SYCL backend auto-sizes n_ubatch unless -ub was given explicitly (it picked 512 for
+    // this context, which turns the 240-token batch into a single ubatch and defuses the scenario)
+    params.n_ubatch_auto = false;
+
     const int n_stream = params.n_parallel;
 
     // find_slot() only logs the per-stream head when the cache was constructed with
@@ -134,6 +138,14 @@ static int test_prepare_rollback_restores_stream_head(const common_params & para
         return 1;
     }
 
+    // the 128 + 112 split below needs exactly these; a planner that overrides them silently
+    // turns the failing batch into one ubatch that never places anything, so nothing is rolled back
+    if (llama_n_batch(ctx) != 512 || llama_n_ubatch(ctx) != 128) {
+        fprintf(stderr, "%s : unexpected n_batch = %u, n_ubatch = %u, the scenario assumes 512 and 128\n", __func__,
+                llama_n_batch(ctx), llama_n_ubatch(ctx));
+        return 1;
+    }
+
     // heads = [38, 38, 38, 42]
     const int n_prime[4] = { 38, 38, 38, 42 };
 
@@ -158,8 +170,7 @@ static int test_prepare_rollback_restores_stream_head(const common_params & para
             return 1;
         }
 
-        fprintf(stderr, "%s : 240-token batch on seq 3 failed as expected (ret = %d), prepare() rolled back\n",
-                __func__, ret);
+        fprintf(stderr, "%s : 240-token batch on seq 3 failed as expected (ret = %d)\n", __func__, ret);
     }
 
     // observe stream 3's head through the find_slot debug line of the next decode on seq 3
