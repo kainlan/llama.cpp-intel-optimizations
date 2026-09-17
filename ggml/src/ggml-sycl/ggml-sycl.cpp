@@ -51018,6 +51018,146 @@ static bool ggml_sycl_find_tensor_storage_handle(const ggml_tensor *            
     return false;
 }
 
+// Diagnostic for a ggml_sycl_find_tensor_storage_handle() miss.
+//
+// That lookup can fail for six unrelated reasons -- no view root, no extra, an
+// extra whose data_handle is unset or unresolvable, a non-SYCL buffer, a SYCL
+// buffer with no managed allocation, or a managed allocation that does not span
+// the tensor -- and its callers' refusal messages named none of them. Narrowing
+// one by hand cost a full model-load run (llama.cpp-srti), so report it.
+//
+// This prints OBSERVABLE STATE and deliberately does not re-evaluate the
+// predicate. A second copy of the decision logic can drift out of agreement
+// with the real one and then confidently misattribute a failure, which is worse
+// than printing nothing; facts about the tensor cannot disagree with it.
+//
+// Unconditional WARN rather than gated on ggml_sycl_moe_route_log_enabled():
+// every caller treats this miss as fatal to the entire graph compute, so it must
+// not be diagnosable only by someone who set an env var before the run. It fires
+// at most once per process for that reason.
+static void ggml_sycl_log_storage_handle_miss(const char *        context,
+                                              const char *        role,
+                                              const ggml_tensor * tensor,
+                                              int                 device) {
+    static std::atomic<bool> logged{ false };
+    if (logged.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    if (!tensor) {
+        GGML_LOG_WARN("[SYCL-STORAGE] %s %s: tensor is null (device=%d)\n", context ? context : "?", role ? role : "?",
+                      device);
+        return;
+    }
+
+    size_t              view_offset = 0;
+    const ggml_tensor * root        = ggml_sycl_view_root_and_offset(tensor, view_offset);
+
+    GGML_LOG_WARN(
+        "[SYCL-STORAGE] %s %s: tensor=%s device=%d buffer=%s is_host=%d sycl_ctx=%d data=%p span=%zu root=%s "
+        "view_offset=%zu\n",
+        context ? context : "?", role ? role : "?", tensor->name ? tensor->name : "?", device,
+        tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "<none>",
+        tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) ? 1 : 0,
+        tensor->buffer && ggml_backend_buffer_has_sycl_context(tensor->buffer) ? 1 : 0, tensor->data,
+        ggml_sycl_tensor_span_bytes(tensor),
+        root ? (root == tensor ? "<self>" : (root->name ? root->name : "?")) : "<null>", view_offset);
+
+    const int device_count = ggml_sycl_routable_device_count();
+    for (const ggml_tensor * cand : { tensor, root }) {
+        if (!cand || (cand == root && root == tensor)) {
+            continue;
+        }
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(cand->extra);
+        if (!extra) {
+            GGML_LOG_WARN("[SYCL-STORAGE]   %s: extra=null, so no data_handle can exist\n",
+                          cand->name ? cand->name : "?");
+        } else {
+            int n_valid = 0;
+            for (int d = 0; d < device_count && d < GGML_SYCL_MAX_DEVICES; ++d) {
+                const ggml_sycl::mem_handle & h = extra->data_handle[d];
+                if (!h.valid()) {
+                    continue;
+                }
+                ++n_valid;
+                auto resolved = h.resolve(d);
+                GGML_LOG_WARN("[SYCL-STORAGE]   %s: data_handle[%d] valid handle_device=%d resolve=%d on_device=%d\n",
+                              cand->name ? cand->name : "?", d, h.device(), resolved ? 1 : 0,
+                              resolved && resolved.on_device ? 1 : 0);
+            }
+            if (n_valid == 0) {
+                GGML_LOG_WARN("[SYCL-STORAGE]   %s: extra present but no data_handle[0..%d) is valid\n",
+                              cand->name ? cand->name : "?", device_count);
+            }
+        }
+        if (cand->buffer && cand->buffer->context && ggml_backend_buffer_has_sycl_context(cand->buffer)) {
+            const auto * buf_ctx = static_cast<const ggml_backend_sycl_buffer_context *>(cand->buffer->context);
+            GGML_LOG_WARN("[SYCL-STORAGE]   %s: managed_meta valid=%d ptr=%p size=%zu\n", cand->name ? cand->name : "?",
+                          buf_ctx->managed_meta.valid() ? 1 : 0, buf_ctx->managed_meta.ptr, buf_ctx->managed_meta.size);
+        }
+    }
+}
+
+// Resolve a tensor's storage into a mem_handle, bridging past a managed-lookup
+// miss instead of failing the graph.
+//
+// ggml_sycl_find_tensor_storage_handle() answers only for a tensor whose extra
+// carries a resolvable data_handle for this device, or that sits inside a
+// unified-cache-managed buffer allocation. A graph INTERMEDIATE is guaranteed
+// neither: an activation can live in a compute buffer that is not managed on
+// this device (e.g. GPT-OSS on a card where experts spill to host), and a
+// per-tensor handle slot can go stale across a buffer reset or a replan.
+//
+// The MoE host-expert dispatch sites need src1/dst bytes only as a COPY
+// ENDPOINT, and ggml_sycl::mem_copy_async takes mem_handles on both sides with
+// no raw-pointer overload -- so a miss used to fail the entire llama_decode
+// (llama.cpp-srti) even though the live tensor->data was right there. The PP
+// CPU island path already recovered through make_data_ptr_handle(); this is
+// that recovery extracted, so the sibling sites cannot diverge from it.
+//
+// The bridge stays inside the sanctioned ownership surfaces: from_chunk_ptr()
+// reacquires a unified-cache arena lease when the pointer belongs to one and
+// degrades to DIRECT only when it genuinely does not. It allocates nothing and
+// moves nothing, so placement is untouched -- this names the bytes the executor
+// chosen by placement was already going to read.
+//
+// Returns false only when even the live data pointer cannot be wrapped, and
+// then reports the observable state of the miss. Callers keep their own refusal
+// so each site's message stays specific to it.
+static bool ggml_sycl_ensure_tensor_storage_handle(const ggml_tensor *               tensor,
+                                                   int                               device,
+                                                   ggml_sycl_tensor_storage_handle * out,
+                                                   const char *                      context,
+                                                   const char *                      role) {
+    if (!out) {
+        return false;
+    }
+    if (ggml_sycl_find_tensor_storage_handle(tensor, device, out) && out->handle.valid()) {
+        return true;
+    }
+    if (tensor && tensor->data) {
+        out->handle = make_data_ptr_handle(tensor, device, tensor->data);
+        if (out->handle.valid()) {
+            auto resolved    = out->handle.resolve(device);
+            out->owner       = (resolved && resolved.on_device) ? device : ggml_sycl::mem_handle::HOST_DEVICE;
+            // tensor->data already points at a view's own first byte, so the
+            // view offset must NOT be carried forward here: adding it a second
+            // time would copy the wrong rows and report no error at all.
+            out->view_offset = 0;
+            static std::atomic<int> bridge_log{ 0 };
+            if (bridge_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+                GGML_LOG_WARN(
+                    "[SYCL-STORAGE] %s using raw-pointer bridge for %s tensor=%s device=%d "
+                    "(no managed storage handle)\n",
+                    context ? context : "?", role ? role : "?", tensor->name ? tensor->name : "?", device);
+            }
+            return true;
+        }
+    }
+    *out = {};
+    ggml_sycl_log_storage_handle_miss(context, role, tensor, device);
+    return false;
+}
+
 struct ggml_sycl_deferred_copy_endpoint {
     void *                debug_ptr = nullptr;
     ggml_sycl::mem_handle handle{};
@@ -63138,10 +63278,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx,
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
                 ggml_sycl_tensor_storage_handle dst_storage{};
-                if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
-                    !src1_storage.handle.valid() ||
-                    !ggml_sycl_find_tensor_storage_handle(dst, ctx.device, &dst_storage) ||
-                    !dst_storage.handle.valid()) {
+                if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage, "CPU-HOST-MAT", "src1") ||
+                    !ggml_sycl_ensure_tensor_storage_handle(dst, ctx.device, &dst_storage, "CPU-HOST-MAT", "dst")) {
                     GGML_ABORT("[CPU-HOST-MAT] missing smart handle for src1/dst tensor=%s src1=%s dst=%s",
                                src0->name ? src0->name : "?", src1->name ? src1->name : "?",
                                dst->name ? dst->name : "?");
@@ -74314,8 +74452,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                          ggml_sycl::runtime_category::HOST_COMPUTE, "moe_shared_activation_host")) {
                     shared_act_handle = s_act_staging.as_mem_handle();
                     ggml_sycl_tensor_storage_handle src1_storage{};
-                    if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
-                        !src1_storage.handle.valid()) {
+                    if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage,
+                                                                "MUL_MAT_ID shared activation", "src1")) {
                         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                             GGML_LOG_WARN(
                                 "[MOE-ROUTE] shared activation missing smart src1 handle tensor=%s device=%d; "
@@ -74419,8 +74557,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
-                if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
-                    !src1_storage.handle.valid()) {
+                if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage, "MUL_MAT_ID CPU dispatch",
+                                                            "src1")) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         GGML_LOG_WARN(
                             "[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d; refusing route\n",
@@ -74639,8 +74777,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 ggml_sycl_tensor_storage_handle dst_storage{};
-                if (!ggml_sycl_find_tensor_storage_handle(dst, ctx.device, &dst_storage) ||
-                    !dst_storage.handle.valid()) {
+                if (!ggml_sycl_ensure_tensor_storage_handle(dst, ctx.device, &dst_storage, "MUL_MAT_ID CPU dispatch",
+                                                            "dst")) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         GGML_LOG_WARN(
                             "[MOE-ROUTE] CPU dispatch missing smart dst handle tensor=%s device=%d; refusing route\n",
@@ -75855,8 +75993,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
 
                 ggml_sycl_tensor_storage_handle src1_storage{};
-                if (!ggml_sycl_find_tensor_storage_handle(src1, ctx.device, &src1_storage) ||
-                    !src1_storage.handle.valid()) {
+                if (!ggml_sycl_ensure_tensor_storage_handle(src1, ctx.device, &src1_storage,
+                                                            "MUL_MAT_ID planner CPU dispatch", "src1")) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         GGML_LOG_WARN(
                             "[MOE-ROUTE] CPU dispatch missing smart src1 handle tensor=%s device=%d; refusing route\n",
@@ -75922,8 +76060,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 sycl::event::wait(copy_events);
 
                 ggml_sycl_tensor_storage_handle dst_storage{};
-                if (!ggml_sycl_find_tensor_storage_handle(dst, ctx.device, &dst_storage) ||
-                    !dst_storage.handle.valid()) {
+                if (!ggml_sycl_ensure_tensor_storage_handle(dst, ctx.device, &dst_storage,
+                                                            "MUL_MAT_ID planner CPU dispatch", "dst")) {
                     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                         GGML_LOG_WARN(
                             "[MOE-ROUTE] planner CPU dispatch missing smart dst handle tensor=%s device=%d; "
@@ -76697,32 +76835,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const int64_t                   N = ne01;
             ggml_sycl_tensor_storage_handle src1_storage{};
             ggml_sycl_tensor_storage_handle dst_storage{};
-            // Intermediate activations can live in compute buffers that are not
-            // unified-cache-managed on this device (e.g. GPT-OSS on a card where
-            // experts spill to host).  Recover through the documented raw-pointer
-            // ABI bridge instead of aborting; abort only if even the live data
-            // pointer cannot be wrapped.
+            // This path's src1/dst are graph intermediates, so the managed
+            // lookup can legitimately miss; ggml_sycl_ensure_tensor_storage_handle
+            // bridges that. Refuse only when even the live data pointer cannot be
+            // wrapped.
             auto ensure_island_storage = [&](const ggml_tensor * t, ggml_sycl_tensor_storage_handle * storage,
                                              const char * role) {
-                if (ggml_sycl_find_tensor_storage_handle(t, ctx.device, storage) && storage->handle.valid()) {
+                if (ggml_sycl_ensure_tensor_storage_handle(t, ctx.device, storage, "MUL_MAT_ID PP CPU island", role)) {
                     return;
-                }
-                if (t && t->data) {
-                    storage->handle = make_data_ptr_handle(t, ctx.device, t->data);
-                    if (storage->handle.valid()) {
-                        auto resolved = storage->handle.resolve(ctx.device);
-                        storage->owner =
-                            (resolved && resolved.on_device) ? ctx.device : ggml_sycl::mem_handle::HOST_DEVICE;
-                        storage->view_offset = 0;
-                        static std::atomic<int> bridge_log{ 0 };
-                        if (bridge_log.fetch_add(1, std::memory_order_relaxed) < 8) {
-                            GGML_LOG_WARN(
-                                "[MOE-ROUTE] PP CPU island using raw-pointer bridge for %s tensor=%s device=%d "
-                                "(no managed storage handle)\n",
-                                role, t->name ? t->name : "?", ctx.device);
-                        }
-                        return;
-                    }
                 }
                 if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     GGML_LOG_WARN(

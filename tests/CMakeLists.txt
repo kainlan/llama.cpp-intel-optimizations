@@ -686,6 +686,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
     set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
+    # A MoE host-expert dispatch must bridge a storage-handle miss, not kill the
+    # graph (llama.cpp-srti). Also runs WITH --self-test: the per-site checks are
+    # anchored on refusal-message text, so a renamed site would silently stop
+    # being checked -- the mutants prove each anchor is still load-bearing.
+    add_test(NAME test-sycl-moe-cpu-dispatch-storage-bridge-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-cpu-dispatch-storage-bridge-source.py --self-test)
+    set_tests_properties(test-sycl-moe-cpu-dispatch-storage-bridge-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
     # gate checks capability against the launchers that EXIST; this checks it
     # against what each consumer's own switch ENUMERATES. Census 9b died in the
