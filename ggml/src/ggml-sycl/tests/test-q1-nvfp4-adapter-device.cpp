@@ -131,7 +131,7 @@ struct lifecycle_fixture {
         // llama.cpp-oyfl: flash_attn_enabled=true -- this test exercises the
         // allocation-free admitted adapter, not the non-FA attention scratch
         // guard; true skips that guard entirely.
-        require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1,
+        require(ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
                                                                 /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
                 "execution context/model bind failed");
         ggml_sycl_execution_snapshot state{};

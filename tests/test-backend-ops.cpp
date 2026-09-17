@@ -820,6 +820,9 @@ struct console_printer : public printer {
             print_perf_console(result);
         } else if (result.test_mode == "support") {
             print_support_console(result);
+        } else if (result.test_mode == "unavailable") {
+            fprintf(fout, "  %s(%s): unavailable: %s\n", result.op_name.c_str(),
+                    result.op_params.c_str(), result.error_message.c_str());
         }
     }
 
@@ -1313,7 +1316,7 @@ struct test_case {
         }
     }
 
-    test_status_t eval(ggml_backend_t backend1,
+    virtual test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
                        const char *   op_names_filter,
                        printer *      output_printer) {
@@ -7280,6 +7283,341 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// Opt-in llama.cpp-3aos consumer probe, not another generic FA sweep.
+// Frozen Gemma4 E4B: 8 Q heads / 2 KV heads, scale 1, D=256 SWA or
+// D=512 FULL. Separate KV at c4096/np4/ub512 has 1024 physical cells per
+// stream, while get_n_kv() exposes 256 at the observed <=60 positions.
+// Query 1 covers decode; query 8 covers the initial 0->8 prompt checkpoint.
+// Archived traced RED's late cohort additionally used Q26 at positions 12..37
+// and Q4 at 38..41, streams 0..2. These are isolated consumer checks, NOT
+// reproductions of KV writes, checkpointing, or stateful graph transitions.
+struct test_flash_attn_ext_gemma4_streams : public test_flash_attn_ext {
+    test_flash_attn_ext_gemma4_streams(int64_t d, int64_t streams, int64_t queries)
+        : test_flash_attn_ext(d, d, 2, {4, streams}, 256, queries) {}
+
+    std::string vars() override {
+        return "gemma4_stream_probe=1," + test_flash_attn_ext::vars();
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t streams = nr23[1];
+        // build_attn_mha casts permuted D256 Q to contiguous F16. D512
+        // bypasses that cast, retaining F32 and the head-interleaved strides.
+        ggml_tensor * q;
+        if (hsk == 256) {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, nb, 8, streams);
+            ggml_set_name(q, "gemma4_q_storage");
+        } else {
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, 8, nb, streams);
+            ggml_set_name(storage, "gemma4_q_storage");
+            q = ggml_permute(ctx, storage, 0, 2, 1, 3);
+        }
+        auto cache_view = [&](const char * name) {
+            // The late cohort views streams 0..2 of the four-stream cache.
+            const int64_t physical_streams = streams == 3 ? 4 : streams;
+            auto * storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hsk, 2, 1024, physical_streams);
+            ggml_set_name(storage, name);
+            // get_k/get_v followed by build_attn_mha's permutation:
+            // visible [D,256,2,S], stride3=D*2*1024*sizeof(f16).
+            return ggml_view_4d(ctx, storage, hsk, kv, 2, streams,
+                                storage->nb[2], storage->nb[1], storage->nb[3], 0);
+        };
+        auto * k = cache_view("gemma4_k_storage");
+        auto * v = cache_view("gemma4_v_storage");
+        auto * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, streams);
+        ggml_set_name(m, "gemma4_mask");
+        auto * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            const bool q = strcmp(t->name, "gemma4_q_storage") == 0;
+            const bool k = strcmp(t->name, "gemma4_k_storage") == 0;
+            const bool v = strcmp(t->name, "gemma4_v_storage") == 0;
+            const bool m = strcmp(t->name, "gemma4_mask") == 0;
+            if (!q && !k && !v && !m) {
+                init_tensor_uniform(t); // output/sentinels, not probe inputs
+                continue;
+            }
+            const size_t n = ggml_nelements(t);
+            const size_t per_stream = n / t->ne[3];
+            std::vector<float> values(n);
+            for (size_t i = 0; i < n; ++i) {
+                const size_t stream = i / per_stream;
+                if (m) {
+                    const size_t query = (i / kv) % nb;
+                    const size_t first_position = nb == 1 ? 42 : nb == 26 ? 12 : nb == 4 ? 38 : 0;
+                    const size_t position = first_position + query;
+                    values[i] = i % kv <= position ? 0.0f : -INFINITY;
+                } else {
+                    // Stable per-element and per-stream variation: a dropped
+                    // stream stride must not be hidden by broadcast-like data.
+                    uint32_t x = uint32_t(i) + (q ? 17u : k ? 131u : 977u);
+                    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15;
+                    values[i] = (float(x % 2001u) - 1000.0f) / 4000.0f;
+                    if (v) {
+                        values[i] += 0.5f * float(stream);
+                    }
+                }
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, n * sizeof(float));
+            } else {
+                GGML_ASSERT(t->type == GGML_TYPE_F16);
+                std::vector<ggml_fp16_t> half(n);
+                for (size_t i = 0; i < n; ++i) {
+                    half[i] = ggml_fp32_to_fp16(values[i]);
+                }
+                ggml_backend_tensor_set(t, half.data(), 0, n * sizeof(ggml_fp16_t));
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (n != size_t(hsv * 8 * nb * nr23[1])) {
+            return test_flash_attn_ext::err(a, b, n);
+        }
+        double worst = 0.0;
+        const size_t per_stream = n / nr23[1];
+        for (int64_t s = 0; s < nr23[1]; ++s) {
+            const double error = nmse(a + s * per_stream, b + s * per_stream, per_stream);
+            printf("gemma4_stream_probe D=%lld Q=%lld S=%lld stream=%lld NMSE=%.9g\n",
+                   (long long) hsk, (long long) nb, (long long) nr23[1], (long long) s, error);
+            if (!std::isfinite(error)) {
+                return INFINITY;
+            }
+            worst = std::max(worst, error);
+        }
+        return worst; // enforce the existing 5e-4 tolerance on EACH stream
+    }
+};
+
+// Two sequential computations with independent persistent CPU/device caches.
+// This tests SET_ROWS -> aliased FA, not checkpoint restore or scratch reuse.
+struct test_flash_attn_ext_gemma4_stateful : public test_flash_attn_ext_gemma4_streams {
+    explicit test_flash_attn_ext_gemma4_stateful(int64_t d)
+        : test_flash_attn_ext_gemma4_streams(d, 3, 26) {}
+
+    std::string vars() override {
+        return "gemma4_stateful_probe=1," + test_flash_attn_ext::vars();
+    }
+
+    test_status_t eval(ggml_backend_t backend1, ggml_backend_t backend2,
+                       const char * filter, printer * output_printer) override {
+        mode = MODE_TEST;
+        current_op_name = "FLASH_ATTN_EXT";
+        sentinels.clear(); // eval may be invoked again; prior contexts are gone.
+        auto finish = [&](test_status_t status, const char * message) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                               status != test_status_t::NOT_SUPPORTED, status == test_status_t::OK, message);
+            print_test_result_locked(output_printer, result);
+            return status;
+        };
+        // Apply exactly the ordinary operation/full-parameter matcher before
+        // checking reference support or allocating anything.
+        ggml_tensor filter_op = {};
+        filter_op.op = GGML_OP_FLASH_ATTN_EXT;
+        if (!matches_filter(&filter_op, filter)) { return test_status_t::SKIPPED; }
+        // Fail closed if this is not the independent CPU reference backend.
+        using set_ref_t = void (*)(ggml_backend_t, bool);
+        auto * cpu_dev = ggml_backend_get_device(backend2);
+        auto * set_ref = (set_ref_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_cpu_set_use_ref");
+        if (ggml_backend_dev_type(cpu_dev) != GGML_BACKEND_DEVICE_TYPE_CPU || !set_ref) {
+            return finish(test_status_t::NOT_SUPPORTED, "CPU reference mode unavailable");
+        }
+        set_ref(backend2, true);
+        const size_t budget = 64u * 1024u * 1024u;
+        const size_t chunk = 4096;
+        const size_t context_bytes = ggml_tensor_overhead()*128 + 2*ggml_graph_overhead();
+        struct stage {
+            ggml_tensor * q;
+            ggml_tensor * k;
+            ggml_tensor * v;
+            ggml_tensor * idx;
+            ggml_tensor * mask;
+            ggml_tensor * out;
+            ggml_cgraph * graph;
+        };
+        struct replica {
+            ggml_context_ptr ctx;
+            ggml_backend_buffer_ptr buffer;
+            ggml_tensor * k;
+            ggml_tensor * v;
+            stage stages[2];
+            size_t sentinel_begin;
+            size_t sentinel_end;
+        };
+        replica replicas[2];
+        const ggml_backend_t backends[] = {backend1, backend2};
+        size_t owned_bytes = 2*context_bytes;
+        // Maximum live host buffers: two per-stream F32 outputs, plus chunked
+        // F16 cache reads/expected values, input conversion/index staging,
+        // and a 4 KiB sentinel readback. Actual buffer sizes include all guards
+        // (12 x 4 KiB per replica, 96 KiB total), in addition to tensor payload.
+        const size_t host_bound = 2*size_t(hsk*8*26)*sizeof(float) + chunk*32;
+        owned_bytes += host_bound;
+        auto seed = [](size_t i) { return (float(i % 31) - 15.0f)/128.0f; };
+        auto update = [](size_t i, int step) { return float(32 + i % 29 + 32*step)/128.0f; };
+        for (int r = 0; r < 2; ++r) {
+            auto & rep = replicas[r];
+            rep.ctx.reset(ggml_init({context_bytes, nullptr, true}));
+            if (!rep.ctx) { return finish(test_status_t::FAIL, "context allocation"); }
+            auto * ctx = rep.ctx.get();
+            rep.sentinel_begin = sentinels.size();
+            rep.k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*2, 1024*4);
+            rep.v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk*2, 1024*4);
+            for (int step = 0; step < 2; ++step) {
+                const int64_t queries = step == 0 ? 26 : 4;
+                auto & s = rep.stages[step];
+                s.graph = ggml_new_graph(ctx);
+                s.q = ggml_new_tensor_4d(ctx, hsk == 256 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                                        hsk, hsk == 256 ? queries : 8, hsk == 256 ? 8 : queries, 3);
+                auto * q = hsk == 256 ? s.q : ggml_permute(ctx, s.q, 0, 2, 1, 3);
+                s.k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hsk*2, queries*3);
+                s.v = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hsk*2, queries*3);
+                s.idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, queries*3);
+                s.mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, queries, 1, 3);
+                // Exactly the producer ordering; FA views the original cache,
+                // not the SET_ROWS outputs. Do not fabricate a data dependency.
+                ggml_build_forward_expand(s.graph, ggml_set_rows(ctx, rep.k, s.k, s.idx));
+                ggml_build_forward_expand(s.graph, ggml_set_rows(ctx, rep.v, s.v, s.idx));
+                auto view = [&](ggml_tensor * cache) {
+                    return ggml_view_4d(ctx, cache, hsk, 256, 2, 3,
+                                        hsk*4, hsk*2, hsk*4096, 0);
+                };
+                s.out = ggml_flash_attn_ext(ctx, q, view(rep.k), view(rep.v), s.mask, 1.0f, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(s.out, GGML_PREC_F32);
+                if (!matches_filter(s.out, filter)) { return test_status_t::SKIPPED; }
+                ggml_build_forward_expand(s.graph, s.out);
+                for (int i = 0; i < ggml_graph_n_nodes(s.graph); ++i) {
+                    if (!ggml_backend_supports_op(backends[r], ggml_graph_node(s.graph, i))) {
+                        return finish(test_status_t::NOT_SUPPORTED, "stateful graph unsupported");
+                    }
+                }
+            }
+            rep.sentinel_end = sentinels.size();
+            rep.buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backends[r]));
+            if (!rep.buffer) { return finish(test_status_t::FAIL, "backend allocation"); }
+            owned_bytes += ggml_backend_buffer_get_size(rep.buffer.get());
+            if (owned_bytes > budget) { return finish(test_status_t::FAIL, "64 MiB fixture budget exceeded"); }
+            // Bounded chunks avoid duplicate host cache images.
+            std::vector<float> f(chunk);
+            std::vector<ggml_fp16_t> half(chunk);
+            auto fill = [&](ggml_tensor * t, auto value) {
+                const size_t n = ggml_nelements(t);
+                for (size_t off = 0; off < n; off += chunk) {
+                    const size_t count = std::min(chunk, n-off);
+                    for (size_t j = 0; j < count; ++j) {
+                        f[j] = value(off+j);
+                        half[j] = ggml_fp32_to_fp16(f[j]);
+                    }
+                    const bool fp32 = t->type == GGML_TYPE_F32;
+                    ggml_backend_tensor_set(t, fp32 ? (void *) f.data() : (void *) half.data(),
+                                            off*(fp32 ? 4 : 2), count*(fp32 ? 4 : 2));
+                }
+            };
+            for (size_t guard = rep.sentinel_begin; guard < rep.sentinel_end; ++guard) {
+                fill(sentinels[guard], [](size_t i) { return (float(i % 17)-8.0f)/16.0f; });
+            }
+            fill(rep.k, seed);
+            fill(rep.v, seed);
+            for (int step = 0; step < 2; ++step) {
+                auto & s = rep.stages[step];
+                const size_t queries = step == 0 ? 26 : 4;
+                const size_t first = step == 0 ? 12 : 38;
+                fill(s.q, [](size_t i) { return (float(i % 23)-11.0f)/32.0f; });
+                auto input = [&](size_t i) {
+                    const size_t row = i/size_t(hsk*2);
+                    const size_t global = ((row/queries)*1024 + first + row%queries)*size_t(hsk*2) + i%size_t(hsk*2);
+                    return update(global, step);
+                };
+                fill(s.k, input);
+                fill(s.v, input);
+                fill(s.mask, [&](size_t i) { return i%256 <= first+(i/256)%queries ? 0.0f : -INFINITY; });
+                std::vector<int64_t> indices(queries*3);
+                for (size_t i = 0; i < indices.size(); ++i) { indices[i] = (i/queries)*1024 + first+i%queries; }
+                ggml_backend_tensor_set(s.idx, indices.data(), 0, indices.size()*sizeof(int64_t));
+            }
+        }
+        printf("gemma4_stateful_probe D=%lld owned_bytes=%zu budget=%zu host_bound=%zu\n",
+               (long long) hsk, owned_bytes, budget, host_bound);
+        for (int step = 0; step < 2; ++step) {
+            const size_t queries = step == 0 ? 26 : 4;
+            for (int r = 0; r < 2; ++r) {
+                const auto status = ggml_backend_graph_compute(backends[r], replicas[r].stages[step].graph);
+                // Even a failed submission may have enqueued earlier nodes.
+                // Attempt the existing backend drain before retiring buffers;
+                // backend synchronize retains its normal fatal-error contract.
+                ggml_backend_synchronize(backends[r]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return finish(test_status_t::FAIL, "graph compute (drain attempted)");
+                }
+                std::vector<float> guard_values(sentinel_size);
+                const auto & rep = replicas[r];
+                size_t guard_errors = 0;
+                for (size_t guard = rep.sentinel_begin; guard < rep.sentinel_end; ++guard) {
+                    ggml_backend_tensor_get(sentinels[guard], guard_values.data(), 0, sentinel_size*sizeof(float));
+                    for (size_t i = 0; i < guard_values.size(); ++i) {
+                        guard_errors += guard_values[i] != (float(i % 17)-8.0f)/16.0f;
+                    }
+                }
+                printf("gemma4_stateful_probe D=%lld stage=%d replica=%d guard_values=%zu mismatches=%zu\n",
+                       (long long) hsk, step, r, (rep.sentinel_end-rep.sentinel_begin)*sentinel_size, guard_errors);
+                if (guard_errors) { return finish(test_status_t::FAIL, "sentinel overwritten"); }
+            }
+            size_t mismatches = 0;
+            size_t checked_bytes = 0;
+            std::vector<ggml_fp16_t> a(chunk), b(chunk);
+            for (int cache = 0; cache < 2; ++cache) {
+                auto * ta = cache == 0 ? replicas[0].k : replicas[0].v;
+                auto * tb = cache == 0 ? replicas[1].k : replicas[1].v;
+                const size_t n = ggml_nelements(ta);
+                for (size_t off = 0; off < n; off += chunk) {
+                    const size_t count = std::min(chunk, n-off);
+                    ggml_backend_tensor_get(ta, a.data(), off*2, count*2);
+                    ggml_backend_tensor_get(tb, b.data(), off*2, count*2);
+                    for (size_t j = 0; j < count; ++j) {
+                        const size_t i = off+j, row = i/size_t(hsk*2), cell = row%1024;
+                        float expected = seed(i);
+                        if (row/1024 < 3 && cell >= 12 && cell < 38) { expected = update(i, 0); }
+                        if (row/1024 < 3 && step == 1 && cell >= 38 && cell < 42) { expected = update(i, 1); }
+                        const auto half = ggml_fp32_to_fp16(expected);
+                        mismatches += a[j] != half || b[j] != half;
+                    }
+                    checked_bytes += count*2*2; // both independent replicas
+                }
+            }
+            printf("gemma4_stateful_probe D=%lld stage=%d cache_bytes=%zu mismatches=%zu changed_rows=%zu\n",
+                   (long long) hsk, step, checked_bytes, mismatches, queries*3);
+            if (mismatches) { return finish(test_status_t::FAIL, "cache placement/content"); }
+            const size_t per_stream = size_t(hsk*8)*queries;
+            std::vector<float> out_a(per_stream), out_b(per_stream);
+            for (size_t stream = 0; stream < 3; ++stream) {
+                ggml_backend_tensor_get(replicas[0].stages[step].out, out_a.data(), stream*per_stream*4, per_stream*4);
+                ggml_backend_tensor_get(replicas[1].stages[step].out, out_b.data(), stream*per_stream*4, per_stream*4);
+                for (size_t i = 0; i < per_stream; ++i) {
+                    if (!std::isfinite(out_a[i]) || !std::isfinite(out_b[i])) {
+                        return finish(test_status_t::FAIL, "nonfinite attention output");
+                    }
+                }
+                const double error = nmse(out_a.data(), out_b.data(), per_stream);
+                printf("gemma4_stateful_probe D=%lld stage=%d Q=%zu S=3 stream=%zu NMSE=%.9g\n",
+                       (long long) hsk, step, queries, stream, error);
+                if (!std::isfinite(error) || error > 5e-4) { return finish(test_status_t::FAIL, "attention NMSE"); }
+            }
+            // Stage B is never submitted unless all stage A checks passed.
+        }
+        return finish(test_status_t::OK, "");
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9991,6 +10329,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Explicit opt-in plus -p gemma4_stream_probe=1 selects exactly twelve
+    // numerical cases. Never remove the selector when running on this host.
+    const char * gemma4_probe = getenv("GGML_TEST_GEMMA4_STREAM_PROBE");
+    if (gemma4_probe && strcmp(gemma4_probe, "1") == 0) {
+        for (int64_t d : {256, 512}) {
+            for (int64_t streams : {1, 4}) {
+                for (int64_t queries : {1, 8}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_gemma4_streams(d, streams, queries));
+                }
+            }
+            // Only the two missing late-cohort prefill shapes from traced RED.
+            for (int64_t queries : {4, 26}) {
+                test_cases.emplace_back(new test_flash_attn_ext_gemma4_streams(d, 3, queries));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_gemma4_stateful(d));
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
@@ -10825,6 +11181,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();
+            // Materialize only the opt-in descriptors so the same parameter
+            // and operator filters can reject unsupported stateful PERF, too.
+            // Their inherited perf driver must never be invoked.
+            if (const char * probe = getenv("GGML_TEST_GEMMA4_STREAM_PROBE")) {
+                if (strcmp(probe, "1") == 0) {
+                    for (int64_t d : {256, 512}) {
+                        test_cases.emplace_back(new test_flash_attn_ext_gemma4_stateful(d));
+                    }
+                }
+            }
             break;
         }
     } else {
@@ -10832,6 +11198,26 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     }
 
     filter_test_cases(test_cases, params_filter);
+
+    // This opt-in fixture has a custom sequential test driver only. Never
+    // label its inherited isolated graph as stateful grad/perf/support evidence.
+    bool stateful_mode_unavailable = false;
+    if (mode != MODE_TEST) {
+        test_cases.erase(std::remove_if(test_cases.begin(), test_cases.end(), [&](const std::unique_ptr<test_case> & tc) {
+            if (tc->vars().find("gemma4_stateful_probe=1,") != 0) { return false; }
+            ggml_tensor filter_op = {};
+            filter_op.op = GGML_OP_FLASH_ATTN_EXT;
+            if (tc->matches_filter(&filter_op, op_names_filter)) {
+                stateful_mode_unavailable = true;
+                test_result result(ggml_backend_name(backend), "FLASH_ATTN_EXT", tc->vars(), "unavailable",
+                                   false, false, "stateful fixture requires test mode");
+                print_test_result_locked(output_printer, result);
+            }
+            // Unrelated operators silently skip this descriptor, just as TEST
+            // does. Either way, never dispatch its inherited isolated graph.
+            return true;
+        }), test_cases.end());
+    }
 
     if (mode == MODE_TEST) {
         ggml_backend_ptr backend_cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL));
@@ -10953,14 +11339,14 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         }
         output_printer->print_summary(test_summary_info(n_ok, test_cases.size(), false));
 
-        return n_ok == test_cases.size();
+        return n_ok == test_cases.size() && !stateful_mode_unavailable;
     }
 
     if (mode == MODE_PERF) {
         for (auto & test : test_cases) {
             test->eval_perf(backend, op_names_filter, output_printer);
         }
-        return true;
+        return !stateful_mode_unavailable;
     }
 
     if (mode == MODE_SUPPORT) {
@@ -10975,7 +11361,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         for (auto & test : test_cases) {
             test->eval_support(backend, op_names_filter, output_printer);
         }
-        return true;
+        return !stateful_mode_unavailable;
     }
 
     GGML_ABORT("fatal error");

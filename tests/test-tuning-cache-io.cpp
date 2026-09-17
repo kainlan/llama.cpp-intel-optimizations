@@ -566,10 +566,11 @@ TEST(atomic_write) {
 // ever running against the real cache directory unsandboxed.
 // =============================================================================
 
-// Test: CACHE_VERSION was bumped to 2 for this task (v1 stays reserved for
-// the pre-existing matmul dispatch-tuning format alone).
-TEST(cache_version_is_2) {
-    ASSERT(CACHE_VERSION == 2);
+// Test: CACHE_VERSION was bumped to 3 (llama.cpp-3aos, UbatchCacheKey::
+// kv_unified) -- v1 stays reserved for the pre-existing matmul
+// dispatch-tuning format alone, v2 for the pre-kv_unified ubatch key shape.
+TEST(cache_version_is_3) {
+    ASSERT(CACHE_VERSION == 3);
     return true;
 }
 
@@ -632,6 +633,41 @@ TEST(ubatch_key_equality) {
     b.device_set_hash = a.device_set_hash ^ 1u;
     ASSERT(a != b);
 
+    // llama.cpp-3aos: kv_unified must independently affect equality too --
+    // added in CACHE_VERSION 3 once KV sizing started depending on it.
+    a.kv_unified = false;
+    b            = a;
+    ASSERT(a == b);
+    b.kv_unified = !a.kv_unified;
+    ASSERT(a != b);
+
+    return true;
+}
+
+// Exercise the persisted key boundary without requiring a kv_unified struct
+// member, so this same regression can run against the pre-v3 header.
+TEST(ubatch_kv_mode_json_roundtrip) {
+    const std::string prefix =
+        "{\"device_key\":\"Dev@1.0\",\"model_name\":\"mode-regression\","
+        "\"model_size\":4096,\"model_hash\":17,\"n_ctx\":4096,\"n_batch\":2048,"
+        "\"flash_attn\":true,\"n_seq_max\":4,\"type_k\":1,\"type_v\":1,"
+        "\"device_set_hash\":23,\"kv_unified\":";
+    const UbatchCacheKey separate = ubatch_key_from_json(prefix + "false}");
+    const UbatchCacheKey unified  = ubatch_key_from_json(prefix + "true}");
+    // Positive parse controls must pass before the mode distinction is tested.
+    ASSERT(separate.device_key == "Dev@1.0");
+    ASSERT(separate.model_name == "mode-regression");
+    ASSERT(separate.n_ctx == 4096 && separate.n_seq_max == 4);
+    ASSERT(unified.device_key == separate.device_key);
+    ASSERT(unified.model_name == separate.model_name);
+    ASSERT(unified.n_ctx == separate.n_ctx && unified.n_seq_max == separate.n_seq_max);
+    ASSERT(separate != unified);
+
+    const UbatchCacheKey separate_restored = ubatch_key_from_json("{" + ubatch_key_to_json(separate) + "}");
+    const UbatchCacheKey unified_restored  = ubatch_key_from_json("{" + ubatch_key_to_json(unified) + "}");
+    ASSERT(separate_restored == separate);
+    ASSERT(unified_restored == unified);
+    ASSERT(separate_restored != unified_restored);
     return true;
 }
 
@@ -756,6 +792,39 @@ TEST(ubatch_cache_v1_file_rejected) {
     return true;
 }
 
+// Test: a v2 ubatch cache file (the pre-llama.cpp-3aos shape, entries with
+// no "kv_unified" key at all) is ALSO rejected now that CACHE_VERSION is 3
+// -- this is the RED case the version bump exists for: without it, a v2
+// entry would parse via ubatch_key_from_json() with kv_unified defaulting
+// to false (parse_bool() on a missing key), and could then falsely MATCH a
+// real kv_unified=false lookup that was never actually validated against a
+// kv_unified-aware KV-sizing formula.
+TEST(ubatch_cache_v2_file_rejected) {
+    std::string cache_dir   = "/tmp/llama_test_ubatch_cache_v2_" + std::to_string(getpid());
+    std::string device_name = "TestUbatchV2Device_" + std::to_string(getpid());
+
+    create_dir_recursive(cache_dir);
+    std::string   path = get_ubatch_cache_file(cache_dir, device_name);
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"version\": 2,\n";
+    f << "  \"device\": \"" << device_name << "\",\n";
+    f << "  \"entries\": [{\"key\":{\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,"
+      << "\"model_hash\":0,\"n_ctx\":4096,\"n_batch\":2048,\"flash_attn\":false,\"n_seq_max\":1,"
+      << "\"type_k\":0,\"type_v\":0,\"device_set_hash\":0},\"n_ubatch\":512,\"reason\":\"ladder\","
+      << "\"created\":\"2026-09-11T12:34:56Z\"}]\n";
+    f << "}\n";
+    f.close();
+
+    std::vector<UbatchCacheEntry> loaded;
+    bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
+    ASSERT(result == false);
+    ASSERT(loaded.empty());
+
+    std::remove(path.c_str());
+    return true;
+}
+
 // Test: an unwritable directory makes save_ubatch_cache() return false (no
 // throw), and a missing file makes load_ubatch_cache() return false (no
 // throw, entries left empty) -- the two halves of the "unwritable dir"
@@ -852,7 +921,7 @@ TEST(ubatch_cache_corrupt_json) {
 
     {
         std::ofstream f(get_ubatch_cache_file(cache_dir, device_name));
-        f << "{\"version\": 2, \"entries\": [{\"device_key\":\"a";
+        f << "{\"version\": " << CACHE_VERSION << ", \"entries\": [{\"device_key\":\"a";
     }
     std::vector<UbatchCacheEntry> loaded;
     bool                          result = load_ubatch_cache(cache_dir, device_name, loaded);
@@ -978,7 +1047,9 @@ TEST(ubatch_cache_oversized_digit_no_ub) {
     {
         std::ofstream f(get_ubatch_cache_file(cache_dir, device_name));
         f << "{\n"
-             "  \"version\": 2,\n"
+             "  \"version\": "
+          << CACHE_VERSION
+          << ",\n"
              "  \"entries\": [\n"
              "    {\"device_key\":\"Dev@1.0\",\"model_name\":\"m\",\"model_size\":0,\"model_hash\":0,"
              "\"n_ctx\":123456789012345678901234567890,\"n_batch\":2048,\"flash_attn\":false,"
@@ -1127,11 +1198,13 @@ int main() {
     RUN_TEST(parse_string_edge_cases);
     RUN_TEST(atomic_write);
 
-    RUN_TEST(cache_version_is_2);
+    RUN_TEST(cache_version_is_3);
     RUN_TEST(ubatch_key_equality);
+    RUN_TEST(ubatch_kv_mode_json_roundtrip);
     RUN_TEST(ubatch_entry_serialization);
     RUN_TEST(ubatch_cache_file_roundtrip);
     RUN_TEST(ubatch_cache_v1_file_rejected);
+    RUN_TEST(ubatch_cache_v2_file_rejected);
     RUN_TEST(ubatch_cache_unwritable_dir);
     RUN_TEST(ubatch_cache_load_missing_file);
     RUN_TEST(ubatch_cache_string_escaping_roundtrip);

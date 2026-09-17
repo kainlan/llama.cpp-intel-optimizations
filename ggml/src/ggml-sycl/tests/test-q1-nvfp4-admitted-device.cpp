@@ -115,7 +115,7 @@ struct lifecycle_fixture {
             // true skips that guard entirely, matching this call's pre-existing
             // behavior before the guard was threaded through this API.
             require(
-                ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1,
+                ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
                                                                 /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
                 "model root bind failed");
             require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),

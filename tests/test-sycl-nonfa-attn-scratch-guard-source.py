@@ -131,8 +131,12 @@ def test_llama_context_threads_real_flash_attn_state():
     runtime-context call -- otherwise the guard below is gated on nothing
     real for the one caller that matters."""
     ctx_norm = _normalize_ws(LLAMA_CONTEXT_CPP_CODE)
+    # llama.cpp-3aos: tolerate additional cparams.* arguments inserted
+    # between n_seq_max and flash_attn (e.g. cparams.kv_unified) -- this
+    # check's intent is "flash_attn is the real cparams field, passed all
+    # the way to the call", not "these two arguments are adjacent".
     matches = re.findall(
-        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,\s*cparams\.flash_attn\)", ctx_norm
+        r"runtime_context_fn\([^;]*?cparams\.n_seq_max,(?:\s*cparams\.\w+,)*\s*cparams\.flash_attn\)", ctx_norm
     )
     assert len(matches) >= 2, (
         "expected at least two runtime_context_fn(...) call sites in llama-context.cpp "
@@ -507,8 +511,12 @@ def test_for_model_forwards_flash_attn_enabled():
     func_start = GGML_SYCL_CPP_CODE.find("ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(")
     assert func_start != -1, "ggml_backend_sycl_set_runtime_context_for_model() definition not found"
     body_norm = _normalize_ws(GGML_SYCL_CPP_CODE[func_start : func_start + 8000])
+    # llama.cpp-3aos: tolerate additional arguments inserted between
+    # n_seq_max and flash_attn_enabled (e.g. kv_unified) -- the intent is
+    # "flash_attn_enabled reaches the inner call", not "these two
+    # parameters are adjacent".
     assert re.search(
-        r"ggml_backend_sycl_set_runtime_context\(backend, n_ctx, n_ubatch, n_seq_max,\s*flash_attn_enabled\)",
+        r"ggml_backend_sycl_set_runtime_context\(backend, n_ctx, n_ubatch, n_seq_max,(?:\s*\w+,)*\s*flash_attn_enabled\)",
         body_norm,
     ), "ggml_backend_sycl_set_runtime_context_for_model() must forward flash_attn_enabled to the inner call"
 

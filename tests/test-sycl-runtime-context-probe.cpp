@@ -224,16 +224,16 @@ int main(int argc, char ** argv) {
     const bool flash_attn_enabled = true;
 
     ggml_sycl_runtime_context_probe  out512{};
-    const ggml_sycl_lifecycle_result rc512 =
-        ggml_backend_sycl_probe_runtime_context_for_model(backend, token, 4096, 512, 1, flash_attn_enabled, &out512);
+    const ggml_sycl_lifecycle_result rc512 = ggml_backend_sycl_probe_runtime_context_for_model(
+        backend, token, 4096, 512, 1, /*kv_unified=*/false, flash_attn_enabled, &out512);
     printf("PROBE 512: rc=%d accepted=%d would_demote_kv=%d host_kv_bytes=%zu reason=%s\n", (int) rc512,
            out512.accepted ? 1 : 0, out512.would_demote_kv ? 1 : 0, out512.host_kv_bytes,
            out512.reason ? out512.reason : "-");
     fflush(stdout);
 
     ggml_sycl_runtime_context_probe  out8192{};
-    const ggml_sycl_lifecycle_result rc8192 =
-        ggml_backend_sycl_probe_runtime_context_for_model(backend, token, 8192, 8192, 1, flash_attn_enabled, &out8192);
+    const ggml_sycl_lifecycle_result rc8192 = ggml_backend_sycl_probe_runtime_context_for_model(
+        backend, token, 8192, 8192, 1, /*kv_unified=*/false, flash_attn_enabled, &out8192);
     printf("PROBE 8192: rc=%d accepted=%d would_demote_kv=%d host_kv_bytes=%zu reason=%s\n", (int) rc8192,
            out8192.accepted ? 1 : 0, out8192.would_demote_kv ? 1 : 0, out8192.host_kv_bytes,
            out8192.reason ? out8192.reason : "-");

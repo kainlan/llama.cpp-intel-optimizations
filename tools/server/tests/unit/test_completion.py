@@ -2,6 +2,9 @@ import pytest
 import requests
 import time
 import random
+import hashlib
+import threading
+from pathlib import Path
 
 from openai import OpenAI
 from utils import *
@@ -370,6 +373,153 @@ def test_completion_parallel_slots(n_slots: int, n_requests: int):
         assert len(res.body["content"]) > 10
         # FIXME: the result is not deterministic when using other slot than slot 0
         # assert match_regex(re_content, res.body["content"])
+
+
+def test_sycl_parallel_slot_acceptance(monkeypatch):
+    """Lead-only, one model/process per invocation; never a default GPU sweep.
+
+    Select SYCL_SLOT_MODEL=gemma4|gptoss and SYCL_SLOT_CASE=auto|four-unified|
+    four-separate|one-unified|one-separate. SYCL_SLOT_EVIDENCE must name a new
+    directory, LLAMA_SERVER_BIN_PATH the frozen binary. Run this exact test
+    node only, serially, after lead memory/device preflight. Missing overlap
+    is a failure of acceptance evidence, not permission to retry in a loop.
+    """
+    model = os.environ.get("SYCL_SLOT_MODEL")
+    if model is None:
+        pytest.skip("opt-in lead-only real-model SYCL slot acceptance")
+    models = {
+        "gemma4": ("/models/stock-gemma-4-E4B-it.Q8_0.gguf",
+                   "f8854aa4480df62585a279e7ca0a881554fc18a41c59c4f62642d16a2ae47012", "level_zero:0", 600),
+        "gptoss": ("/models/gpt-oss-20b-mxfp4.gguf",
+                   "be37a636aca0fc1aae0d32325f82f6b4d21495f06823b5fbc1898ae0303e9935", "level_zero:1", 60),
+    }
+    cases = {"auto": (None, None), "four-unified": (4, True),
+             "four-separate": (4, False), "one-unified": (1, True), "one-separate": (1, False)}
+    assert model in models
+    case = os.environ["SYCL_SLOT_CASE"]
+    assert case in cases
+    assert "PYTEST_XDIST_WORKER" not in os.environ, "GPU cases must run serially"
+    assert "DEBUG_EXTERNAL" not in os.environ, "must supervise our own frozen server"
+    binary = Path(os.environ["LLAMA_SERVER_BIN_PATH"]).resolve(strict=True)
+    evidence = Path(os.environ["SYCL_SLOT_EVIDENCE"])
+    evidence.mkdir(parents=True, exist_ok=False)
+    model_path, expected_hash, selector, lifetime = models[model]
+
+    def digest(path):
+        hasher = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    assert digest(model_path) == expected_hash, "model differs from frozen reproducer"
+    # Remove ambient tuning/argument overrides; oneAPI loader environment stays.
+    for key in list(os.environ):
+        if key.startswith(("LLAMA_ARG_", "GGML_SYCL_")):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("ONEAPI_DEVICE_SELECTOR", selector)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(evidence / "xdg"))
+    monkeypatch.setenv("GGML_SYCL_TUNING_CACHE_DIR", str(evidence / "tuning"))
+    n_slots, unified = cases[case]
+    if unified is not None:
+        monkeypatch.setenv("LLAMA_ARG_KV_UNIFIED", "1" if unified else "0")
+    if model == "gptoss":
+        monkeypatch.setenv("LLAMA_ARG_CHAT_TEMPLATE_KWARGS", '{"reasoning_effort":"medium"}')
+        monkeypatch.setenv("LLAMA_ARG_THINK_BUDGET", "0")
+
+    global server
+    server = ServerProcess()
+    server.server_path = str(binary)
+    server.server_port = 18083
+    server.model_hf_repo = server.model_hf_file = None
+    server.model_file = model_path
+    server.model_alias = "sycl-slot-model"
+    server.n_gpu_layer = None  # preserve reporter's no-ngl server launch
+    server.n_ctx, server.n_batch, server.n_ubatch = 4096, 2048, 512
+    server.n_slots = n_slots
+    server.kv_unified = False  # explicit modes supplied by the env option above
+    server.server_slots = server.jinja = server.debug = True
+    server.temperature, server.seed = 0.0, 42
+    server.reasoning_format = "none" if model == "gptoss" else None
+    server.log_path = str(evidence / "server.log")
+    count = n_slots or 4
+    root = Path(__file__).resolve().parents[4]
+    records = {"source_sha": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),
+               "model": model_path, "model_sha256": expected_hash,
+               "binary": str(binary), "binary_sha256": digest(binary),
+               "case": case, "expected_slots": count, "expected_kv_unified": unified if unified is not None else True,
+               "environment": {k: v for k, v in os.environ.items()
+                               if k.startswith(("LLAMA_ARG_", "GGML_SYCL_")) or k in ("ONEAPI_DEVICE_SELECTOR", "XDG_CACHE_HOME")},
+               "slot_samples": [], "responses": []}
+    expired = threading.Event()
+    started = time.monotonic()
+
+    def expire():
+        expired.set()
+        server.stop()  # existing bounded terminate/kill supervision
+
+    watchdog = threading.Timer(lifetime, expire)
+    watchdog.start()
+    try:
+        server.start(timeout_seconds=lifetime)
+        records["argv"] = server.process.args
+        barrier = threading.Barrier(count + 1, timeout=10)
+        finished = threading.Event()
+        body = {"model": "sycl-slot-model", "messages": [{"role": "user", "content":
+                "Count from 1 to 5. Answer with only: 1, 2, 3, 4, 5"}],
+                "temperature": 0, "seed": 42, "max_tokens": 48, "stream": False}
+        records["request"] = body
+
+        def request():
+            barrier.wait()
+            begin = time.monotonic() - started
+            response = server.make_request("POST", "/v1/chat/completions", body, timeout=30)
+            return {"start": begin, "end": time.monotonic() - started,
+                    "status": response.status_code, "body": response.body}
+
+        def observe():
+            barrier.wait()
+            while not finished.is_set() and not expired.is_set():
+                response = server.make_request("GET", "/slots", timeout=2)
+                assert response.status_code == 200
+                assert len(response.body) == count
+                records["slot_samples"].append({"time": time.monotonic() - started,
+                                               "slots": response.body})
+                time.sleep(0.01)
+
+        with ThreadPoolExecutor(max_workers=count + 1) as pool:
+            observer = pool.submit(observe)
+            futures = [pool.submit(request) for _ in range(count)]
+            try:
+                for future in futures:
+                    records["responses"].append(future.result())
+            finally:
+                finished.set()
+            observer.result()
+        assert not expired.is_set(), "server exceeded total lifetime"
+        assert server.process is not None and server.process.poll() is None
+        for response in records["responses"]:
+            assert response["status"] == 200
+            assert response["body"]["usage"]["completion_tokens"] > 0
+            assert response["body"]["choices"][0]["message"]["content"].strip() == "1, 2, 3, 4, 5"
+        occupied = [len({s["id"] for s in sample["slots"] if s["is_processing"]})
+                    for sample in records["slot_samples"]]
+        assert max(occupied, default=0) >= min(2, count), "no observed occupied-slot overlap"
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+        process = server.process
+        server.stop()
+        records["server_exit"] = process.returncode if process is not None else None
+        records["expired"] = expired.is_set()
+        (evidence / "result.json").write_text(json.dumps(records, indent=2))
+    assert records["server_exit"] in (0, -15), "server did not shut down normally"
+    log = (evidence / "server.log").read_text()
+    expected_mode = "true" if records["expected_kv_unified"] else "false"
+    assert re.search(r"kv_unified\s*=\s*" + expected_mode + r"\b", log), "resolved KV mode not evidenced"
+    assert not re.search(r"overflows|runtime KV update rejected|failed to activate exact SYCL model plan|"
+                         r"result=19|GGML_ASSERT|ggml-sycl\.cpp:[0-9]+:", log), "KV refusal/abort in server log"
+    # Registry mismatch diagnostics are preserved for ttws, not suppressed here.
 
 
 @pytest.mark.parametrize(

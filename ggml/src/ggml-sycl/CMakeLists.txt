@@ -1643,6 +1643,40 @@ set_tests_properties(sycl-kv-slice-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# llama.cpp-3aos: per-layer KV sizing (placement_kv_info::kv_bytes_for_layer(),
+# placement_plan::kv_size_for_layer()) -- Gemma 4 E4B's heterogeneous SWA/
+# full/shared-KV layers and n_seq_max scaling for --parallel > 1. Same shape
+# as test-kv-slice-sizing above: needs -fsycl only because unified-cache.hpp
+# pulls in SYCL headers, no device kernel and no queue, so
+# SYCL_LINK_ONLY_TEST_OPTIONS + ggml-base alone. Unlike test-kv-slice-sizing
+# it needs no second .cpp -- placement_kv_info/placement_plan's methods under
+# test are all inline in the header.
+add_executable(test-sycl-kv-layer-sizing
+    tests/test-sycl-kv-layer-sizing.cpp
+)
+target_include_directories(test-sycl-kv-layer-sizing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-kv-layer-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-kv-layer-sizing PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-kv-layer-sizing PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-kv-layer-sizing PRIVATE ggml-base)
+add_test(NAME sycl-kv-layer-sizing COMMAND test-sycl-kv-layer-sizing)
+set_tests_properties(sycl-kv-layer-sizing PROPERTIES
+    # No ONEAPI_DEVICE_SELECTOR: this test never creates a queue.  LD_LIBRARY_PATH
+    # is still needed -- the binary links the SYCL runtime because of the headers.
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    # llama.cpp-3aos: "hostonly" (no hyphen) matches the sibling
+    # sycl-kv-slice-sizing's own spelling.
+    LABELS "sycl;kv;sizing;hostonly"
+    TIMEOUT 60
+)
+
 # Runtime KV demotion decision (llama.cpp-uize/llama.cpp-3px1).  Deliberately a
 # pure host-linkable TU with no include of unified-cache.hpp (the c-8lff siting
 # lesson: an enum placed in unified-cache.hpp "would not have linked" for a

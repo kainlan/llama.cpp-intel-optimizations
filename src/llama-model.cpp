@@ -310,9 +310,52 @@ static bool llama_model_sycl_onednn_head_dim_eligible(uint32_t head_dim, float f
     return std::fabs(1.0f / kq_scale - sqrtf(static_cast<float>(head_dim))) < 1e-3f;
 }
 
+// llama.cpp-3aos: owning storage for the three per-layer arrays below --
+// grouped into one struct so the two llama_model_sycl_populate_inventory
+// callers hold one object instead of three separate unique_ptrs.
+struct llama_model_sycl_kv_layer_arrays {
+    std::unique_ptr<uint32_t[]> k_width;
+    std::unique_ptr<uint32_t[]> v_width;
+    std::unique_ptr<uint8_t[]>  kind;
+};
+
+// llama.cpp-3aos: per-layer (attention kind, K width, V width) for the SYCL
+// KV planner (ggml_sycl_tensor_inventory::kv_layer_kind/kv_k_width_per_layer/
+// kv_v_width_per_layer). Owned by the caller of
+// llama_model_sycl_populate_inventory (same lifetime requirement as
+// swa_layer_mask just below -- the inventory only stores raw pointers, and
+// must remain valid through the caller's llama_model_sycl_apply_inventory
+// call). Kind and width must agree with what the tensor loader actually
+// created: SHARED (llama_hparams::has_kv(il) == false, e.g. Gemma 4/3n's
+// trailing reused-KV layers) gets width 0; SWA/FULL both use
+// hparams.n_embd_{k,v}_gqa(il), which is already per-layer (switches on
+// is_swa(il) internally -- see llama-hparams.cpp).
+static llama_model_sycl_kv_layer_arrays llama_model_sycl_build_kv_layer_arrays(const llama_hparams & hparams,
+                                                                               uint32_t              n_layer) {
+    llama_model_sycl_kv_layer_arrays out;
+    out.k_width.reset(new uint32_t[n_layer]);
+    out.v_width.reset(new uint32_t[n_layer]);
+    out.kind.reset(new uint8_t[n_layer]);
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (!hparams.has_kv(il)) {
+            out.kind[il]    = GGML_SYCL_KV_LAYER_SHARED;
+            out.k_width[il] = 0;
+            out.v_width[il] = 0;
+        } else {
+            out.kind[il]    = hparams.is_swa(il) ? GGML_SYCL_KV_LAYER_SWA : GGML_SYCL_KV_LAYER_FULL;
+            out.k_width[il] = hparams.n_embd_k_gqa(il);
+            out.v_width[il] = hparams.n_embd_v_gqa(il);
+        }
+    }
+    return out;
+}
+
 static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &         inventory,
                                                 std::vector<ggml_sycl_tensor_info> & tensors,
                                                 const bool *                         swa_layer_mask,
+                                                const uint32_t *                     kv_k_width_per_layer,
+                                                const uint32_t *                     kv_v_width_per_layer,
+                                                const uint8_t *                      kv_layer_kind,
                                                 size_t                               total_size,
                                                 size_t                               max_pp_pipeline_weight_bytes,
                                                 const llama_hparams &                hparams) {
@@ -325,8 +368,24 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.n_expert                = hparams.n_expert;
     inventory.n_expert_used           = hparams.n_expert_used;
     inventory.n_layer                 = n_layer;
-    inventory.n_embd_k_gqa            = hparams.n_embd_k_gqa();
-    inventory.n_embd_v_gqa            = hparams.n_embd_v_gqa();
+    // llama.cpp-3aos: layer 0 may be a sliding layer whose width is
+    // narrower than the full-attention layers', so the fallback width
+    // here must be the per-layer MAXIMUM, not layer 0's own width. On
+    // Gemma 4 E4B layer 0 is a SWA layer (width 512), so the il=0
+    // accessor (no explicit layer argument) silently under-widens the
+    // FULL-attention-width fields this struct's own field comment
+    // (ggml-sycl.h) and unified-cache.hpp's kv_bytes_per_layer()/
+    // kv_bytes_per_swa_layer() comments describe -- kv_bytes_per_layer()
+    // would compute n_ctx * (512+512) * 2 = 8,388,608 for Gemma 4 E4B
+    // instead of the real full-attention n_ctx * (1024+1024) * 2 =
+    // 16,777,216, which is plan.kv_per_layer, consumed by
+    // ggml_sycl_largest_fitting_n_ctx() and the KV-buffer-kind heuristic
+    // in ggml-sycl.cpp. _max() is the correct accessor: the maximum
+    // per-layer width, which for a model whose full-attention layers are
+    // its widest (true of every SWA architecture in this codebase) is
+    // genuinely the FULL-attention width.
+    inventory.n_embd_k_gqa              = hparams.n_embd_k_gqa_max();
+    inventory.n_embd_v_gqa              = hparams.n_embd_v_gqa_max();
     // Model loading no longer has runtime context params. Do not reserve
     // train-context KV here; actual KV allocations are placed later by the
     // unified cache once llama_context provides the real n_ctx.
@@ -470,6 +529,14 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
     inventory.n_swa_layers         = 0;
     inventory.swa_layer_mask       = swa_layer_mask;
     inventory.swa_layer_mask_count = n_layer;
+    // llama.cpp-3aos: per-layer KV width/kind truth -- see the field
+    // comments in ggml-sycl.h and llama_model_sycl_build_kv_layer_arrays()
+    // above for why a single global width/mask pair cannot express Gemma
+    // 4's heterogeneous layers.
+    inventory.kv_k_width_per_layer = kv_k_width_per_layer;
+    inventory.kv_v_width_per_layer = kv_v_width_per_layer;
+    inventory.kv_layer_kind        = kv_layer_kind;
+    inventory.kv_layer_count       = n_layer;
 
     uint32_t    n_head_ctx_max        = 0;
     uint32_t    n_head_swa_max        = 0;
@@ -565,9 +632,11 @@ static void llama_model_sycl_compute_early_plan(llama_model_loader &  ml,
     for (uint32_t il = 0; il < n_layer; ++il) {
         swa_layer_mask[il] = hparams.is_swa(il);
     }
+    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(hparams, n_layer);
 
     ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), total_size,
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
+                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
                                         max_pp_pipeline_weight_bytes, hparams);
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, true);
@@ -615,9 +684,11 @@ static void llama_model_sycl_set_late_inventory(llama_model_loader &  ml,
     for (uint32_t il = 0; il < n_layer; ++il) {
         swa_layer_mask[il] = hparams.is_swa(il);
     }
+    llama_model_sycl_kv_layer_arrays kv_layer_arrays = llama_model_sycl_build_kv_layer_arrays(hparams, n_layer);
 
     ggml_sycl_tensor_inventory inventory = {};
-    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), total_size,
+    llama_model_sycl_populate_inventory(inventory, tensors, swa_layer_mask.get(), kv_layer_arrays.k_width.get(),
+                                        kv_layer_arrays.v_width.get(), kv_layer_arrays.kind.get(), total_size,
                                         max_pp_pipeline_weight_bytes, hparams);
     const ggml_sycl_placement_envelope envelope = llama_model_sycl_make_placement_envelope();
     llama_model_sycl_apply_inventory(inventory, envelope, false);
