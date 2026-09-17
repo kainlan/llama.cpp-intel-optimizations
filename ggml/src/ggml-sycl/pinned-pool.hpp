@@ -276,6 +276,23 @@ class pinned_chunk_pool {
     // Allocate a new chunk (>= min_size). Returns false if over budget or allocation fails.
     bool grow(size_t min_size);
 
+    // Byte footprint of ONE new chunk able to hold `min_size` usable bytes.
+    // `usable` is what the chunk's TLSF arena manages (max(chunk_size_,
+    // align_up(min_size))); `backing` is what grow_into() commits against
+    // budget_ (usable plus the DEFAULT_ALIGNMENT header it skips at the
+    // base). Every pre-growth budget check (grow_zone, allocate_from_chunks)
+    // and grow_into()'s own check must use this same arithmetic: llama.cpp-nsl3
+    // was a divergence between them (grow_zone budgeted N * chunk_size_ for
+    // chunks grow_into() sized differently), and a pre-check that admits a
+    // growth grow_into() then refuses surfaces as an allocation failure with
+    // a misleading budget line.
+    struct chunk_footprint {
+        size_t usable;
+        size_t backing;
+    };
+
+    chunk_footprint chunk_footprint_for(size_t min_size) const;
+
     void free_chunk_owner(chunk & c, const char * ctx);
 
     // Internal free without acquiring mutex_ (caller must hold it).

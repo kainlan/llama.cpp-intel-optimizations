@@ -657,28 +657,24 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     // path (allocate_from_chunks) has always used -- so the zone path follows
     // it, and the budget is checked against the bytes that chunk actually
     // commits (grow_into() adds one DEFAULT_ALIGNMENT header per chunk).
-    const size_t chunk_bytes   = std::max(chunk_size_, align_up(additional_bytes, DEFAULT_ALIGNMENT));
-    const size_t backing_bytes = chunk_bytes + DEFAULT_ALIGNMENT;
-    if (total_allocated_ + backing_bytes > budget_) {
+    const chunk_footprint footprint = chunk_footprint_for(additional_bytes);
+    if (total_allocated_ + footprint.backing > budget_) {
         GGML_LOG_WARN(
             "[SYCL] Pinned pool grow_zone: budget exhausted for zone %zu "
             "(need %.1f MB, budget=%.1f GB, used=%.1f GB)\n",
-            zi, backing_bytes / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
+            zi, footprint.backing / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0),
             total_allocated_ / (1024.0 * 1024.0 * 1024.0));
         return false;
     }
 
-    // Record the old end of the pool (where the new chunk will start)
+    // Record the old end of the pool (where the new chunk will start). grow()
+    // appends exactly one chunk on success and none on failure, so the loop
+    // below visits that one chunk.
     const size_t old_chunk_count = chunks_.size();
 
-    if (!grow(chunk_bytes)) {
+    if (!grow(footprint.usable)) {
         GGML_LOG_WARN("[SYCL] Pinned pool grow_zone: grow failed for zone %zu (%.1f MB chunk)\n", zi,
-                      chunk_bytes / (1024.0 * 1024.0));
-        return false;
-    }
-
-    const size_t new_chunks_added = chunks_.size() - old_chunk_count;
-    if (new_chunks_added == 0) {
+                      footprint.usable / (1024.0 * 1024.0));
         return false;
     }
 
@@ -711,7 +707,8 @@ bool pinned_chunk_pool::grow_zone(host_zone_id zone, size_t additional_bytes) {
     GGML_LOG_INFO(
         "[SYCL] Pinned pool grow_zone: zone %zu grown by %.1f MB "
         "(%zu new chunks, zone now %.1f MB)\n",
-        zi, additional_capacity / (1024.0 * 1024.0), new_chunks_added, zones_[zi].size / (1024.0 * 1024.0));
+        zi, additional_capacity / (1024.0 * 1024.0), chunks_.size() - old_chunk_count,
+        zones_[zi].size / (1024.0 * 1024.0));
     return true;
 }
 
@@ -798,6 +795,13 @@ bool pinned_chunk_pool::grow(size_t min_size) {
     return grow_into(chunks_, min_size, false);
 }
 
+pinned_chunk_pool::chunk_footprint pinned_chunk_pool::chunk_footprint_for(size_t min_size) const {
+    chunk_footprint footprint;
+    footprint.usable  = std::max(chunk_size_, align_up(min_size, DEFAULT_ALIGNMENT));
+    footprint.backing = footprint.usable + DEFAULT_ALIGNMENT;
+    return footprint;
+}
+
 void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
                                                size_t               size,
                                                size_t               alignment,
@@ -818,8 +822,9 @@ void * pinned_chunk_pool::allocate_from_chunks(std::vector<chunk> & chunks,
         }
     }
 
-    size_t new_chunk_size = std::max(chunk_size_, align_up(size, DEFAULT_ALIGNMENT));
-    if (total_allocated_ + new_chunk_size > budget_) {
+    const chunk_footprint footprint      = chunk_footprint_for(size);
+    const size_t          new_chunk_size = footprint.usable;
+    if (total_allocated_ + footprint.backing > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
                       total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
         return nullptr;
@@ -881,11 +886,9 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     // allocation exceeds chunk_size_ (e.g., 615 MB reorder buffers for
     // MoE models).  Level Zero's ~11 GB per-allocation limit is the
     // real cap, not chunk_size_.
-    size_t usable_size = align_up(min_size, DEFAULT_ALIGNMENT);
-    if (usable_size < chunk_size_) {
-        usable_size = chunk_size_;
-    }
-    const size_t backing_size = usable_size + DEFAULT_ALIGNMENT;
+    const chunk_footprint footprint    = chunk_footprint_for(min_size);
+    const size_t          usable_size  = footprint.usable;
+    const size_t          backing_size = footprint.backing;
     if (total_allocated_ + backing_size > budget_) {
         GGML_LOG_WARN("[SYCL] Pinned pool budget exceeded (%.1f GB used, %.1f GB budget)\n",
                       total_allocated_ / (1024.0 * 1024.0 * 1024.0), budget_ / (1024.0 * 1024.0 * 1024.0));
