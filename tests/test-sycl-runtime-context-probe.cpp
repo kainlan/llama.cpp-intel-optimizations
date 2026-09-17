@@ -134,10 +134,14 @@ int main(int argc, char ** argv) {
     cparams.n_ubatch             = 512;
     cparams.n_seq_max            = 1;
     // llama.cpp-uajm: llama_context_default_params() defaults swa_full=true
-    // (src/llama-context.cpp:4149) but every tool runs with common's
-    // default false (common/common.h:571); the SYCL KV plan sizes SWA
-    // layers by the window, so the raw default overflows the planned slab
-    // at context init on GPT-OSS. Match the tools.
+    // (src/llama-context.cpp) but every tool runs with common's default
+    // false (common/common.h). The SYCL KV plan now honours either mode
+    // (kv_layer_bytes_for_kind(), unified-cache.hpp), so this pin is no
+    // longer a workaround for a planner defect; it is kept so this harness
+    // keeps probing the exact KV shape the CLI tools publish, and so the
+    // two probe calls below can forward the same value the context was
+    // built with. The lead's acceptance for uajm exercises the raw default
+    // separately (a context built WITHOUT this line).
     cparams.swa_full             = false;
     llama_context * ctx          = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -225,7 +229,7 @@ int main(int argc, char ** argv) {
 
     ggml_sycl_runtime_context_probe  out512{};
     const ggml_sycl_lifecycle_result rc512 = ggml_backend_sycl_probe_runtime_context_for_model(
-        backend, token, 4096, 512, 1, /*kv_unified=*/false, flash_attn_enabled, &out512);
+        backend, token, 4096, 512, 1, /*kv_unified=*/false, cparams.swa_full, flash_attn_enabled, &out512);
     printf("PROBE 512: rc=%d accepted=%d would_demote_kv=%d host_kv_bytes=%zu reason=%s\n", (int) rc512,
            out512.accepted ? 1 : 0, out512.would_demote_kv ? 1 : 0, out512.host_kv_bytes,
            out512.reason ? out512.reason : "-");
@@ -233,7 +237,7 @@ int main(int argc, char ** argv) {
 
     ggml_sycl_runtime_context_probe  out8192{};
     const ggml_sycl_lifecycle_result rc8192 = ggml_backend_sycl_probe_runtime_context_for_model(
-        backend, token, 8192, 8192, 1, /*kv_unified=*/false, flash_attn_enabled, &out8192);
+        backend, token, 8192, 8192, 1, /*kv_unified=*/false, cparams.swa_full, flash_attn_enabled, &out8192);
     printf("PROBE 8192: rc=%d accepted=%d would_demote_kv=%d host_kv_bytes=%zu reason=%s\n", (int) rc8192,
            out8192.accepted ? 1 : 0, out8192.would_demote_kv ? 1 : 0, out8192.host_kv_bytes,
            out8192.reason ? out8192.reason : "-");

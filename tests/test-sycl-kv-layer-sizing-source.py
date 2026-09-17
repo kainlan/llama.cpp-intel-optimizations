@@ -23,8 +23,21 @@ Three bugs, one root, described in the ticket:
   shared stream whose window scales with n_seq_max) -- correct only when
   kv_unified==true.
 
+  Bug 4 (llama.cpp-uajm, found by a raw-API harness): llama_context_default_
+  params() sets swa_full=true while common/common.h defaults it false, so no
+  CLI tool ever ran the planner against the raw default. With swa_full,
+  llama_kv_cache_iswa sets size_swa = size_base (src/llama-kv-cache-iswa.cpp)
+  -- an SWA layer then holds n_ctx cells, byte-identical to a FULL layer --
+  but the planner sized SWA layers by the window regardless, and the
+  full-context K tensor overflowed the planned slab at context init
+  ("[KV-REMAP] ERROR: cache_k_l0 overflows layer alloc!"). The plan must
+  describe what llama allocates: swa_full is threaded from cparams through
+  the same plumbing as kv_unified, and kv_layer_bytes_for_kind() sizes an
+  SWA layer as FULL when it is set.
+
 The fix threads a shared per-layer formula (kv_layer_bytes_for_kind(), a
-three-way FULL/SWA/SHARED switch that consumes n_seq_max AND kv_unified)
+three-way FULL/SWA/SHARED switch that consumes n_seq_max, kv_unified AND
+swa_full)
 through both the planner (placement_kv_info::kv_bytes_for_layer()) and the
 persisted plan (placement_plan::kv_size_for_layer()), and the runtime
 transaction body (ggml_sycl_run_runtime_context_transaction) threads its
@@ -45,6 +58,7 @@ UNIFIED_CACHE_HPP = ROOT / "ggml/src/ggml-sycl/unified-cache.hpp"
 UNIFIED_CACHE_CPP = ROOT / "ggml/src/ggml-sycl/unified-cache.cpp"
 GGML_SYCL_CPP = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 LLAMA_MODEL_CPP = ROOT / "src/llama-model.cpp"
+LLAMA_CONTEXT_CPP = ROOT / "src/llama-context.cpp"
 
 KV_LAYER_BYTES_FOR_KIND = "kv_layer_bytes_for_kind"
 # The actual shared transaction body -- ggml_backend_sycl_set_runtime_context_
@@ -147,6 +161,16 @@ def kv_layer_bytes_for_kind_violations(source: str) -> list[str]:
     if not re.search(r"swa_cells\s*=\s*swa_cells_per_stream\s*\*\s*n_stream", body):
         found.append("does not multiply the per-stream cell count by n_stream")
 
+    # Bug 4 (llama.cpp-uajm): swa_full must be a real parameter AND must be
+    # consulted before the windowed SWA formula -- with swa_full llama
+    # allocates an SWA layer at size_base (n_ctx_seq per stream), so the
+    # windowed arithmetic above must not run for it.
+    if not re.search(r"bool\s+swa_full\b",
+                     function_signature_params(source, "inline size_t " + KV_LAYER_BYTES_FOR_KIND)):
+        found.append("has no bool swa_full parameter")
+    if not re.search(r"kind\s*==\s*GGML_SYCL_KV_LAYER_SWA\s*&&\s*!\s*swa_full", body):
+        found.append("does not branch on swa_full")
+
     return found
 
 
@@ -176,6 +200,10 @@ def kv_bytes_for_layer_violations(source: str) -> list[str]:
         found.append("does not call kv_layer_bytes_for_kind with the per-layer arrays")
     elif "kv_unified" not in call.group(0):
         found.append("calls kv_layer_bytes_for_kind without forwarding kv_unified")
+    elif not re.search(r"\bswa_full\s*\)", call.group(0)):
+        # llama.cpp-uajm: and swa_full, as the LAST argument (a literal
+        # false there is exactly the "size by the window regardless" defect).
+        found.append("calls kv_layer_bytes_for_kind without forwarding swa_full")
     if "has_per_layer_kv_truth" not in body:
         found.append("does not check has_per_layer_kv_truth before using per-layer arrays")
     return found
@@ -199,6 +227,9 @@ def kv_size_for_layer_violations(source: str) -> list[str]:
         found.append("does not call kv_layer_bytes_for_kind with the per-layer arrays")
     elif "planner_kv_unified" not in call.group(0):
         found.append("calls kv_layer_bytes_for_kind without forwarding planner_kv_unified")
+    elif not re.search(r"\bplanner_swa_full\s*\)", call.group(0)):
+        # llama.cpp-uajm: the plan's own copy of swa_full, last argument.
+        found.append("calls kv_layer_bytes_for_kind without forwarding planner_swa_full")
     if "layer_kind" not in body or "layer_k_width" not in body or "layer_v_width" not in body:
         found.append("does not consult the plan's per-layer kind/width arrays")
     return found
@@ -224,6 +255,9 @@ def transaction_body_violations(source: str) -> list[str]:
         "next_kv_info.kv_unified":   r"next_kv_info\.kv_unified\s*=\s*kv_unified;",
         "next_plan.planner_n_seq_max":   r"next_plan\.planner_n_seq_max\s*=\s*n_seq_max;",
         "next_plan.planner_kv_unified":  r"next_plan\.planner_kv_unified\s*=\s*kv_unified;",
+        # llama.cpp-uajm: swa_full, same treatment as kv_unified.
+        "next_kv_info.swa_full":         r"next_kv_info\.swa_full\s*=\s*swa_full;",
+        "next_plan.planner_swa_full":    r"next_plan\.planner_swa_full\s*=\s*swa_full;",
     }
     positions: dict[str, int] = {}
     found: list[str] = []
@@ -234,7 +268,7 @@ def transaction_body_violations(source: str) -> list[str]:
         else:
             positions[name] = m.start()
 
-    # Ordering: all four must be set before next_plan.update_runtime_kv_sizes()
+    # Ordering: all six must be set before next_plan.update_runtime_kv_sizes()
     # -- that call's refresh_kv_byte_totals() walks kv_size_for_layer() per
     # layer, which reads next_plan.planner_n_seq_max/n_ubatch/n_ctx/
     # kv_unified directly, and the call also computes
@@ -271,6 +305,37 @@ def n_embd_gqa_max_violations(source: str) -> list[str]:
     return found
 
 
+def llama_context_swa_full_violations(source: str) -> list[str]:
+    """llama.cpp-uajm: llama-context.cpp must (1) record params.swa_full on
+    cparams (llama_cparams::swa_full -- the memory module already consumes
+    params.swa_full directly, but the SYCL calls below read cparams), (2)
+    forward cparams.swa_full on EVERY runtime_context_fn(...) and
+    probe_fn(...) call -- the probe must be given the same swa_full the
+    candidate would publish with, or its accept/reject answers for the wrong
+    KV shape -- and (3) key the persisted auto-n_ubatch cache on it, since
+    swa_full changes the plan's KV bytes and so which candidates fit (a
+    cached plan from a CLI run, swa_full=false, must not be reused by a
+    raw-API context, swa_full=true).
+    """
+    found: list[str] = []
+    if not re.search(r"cparams\.swa_full\s*=\s*params\.swa_full\s*;", source):
+        found.append("cparams.swa_full is not assigned from params.swa_full")
+    # Every runtime_context_fn(...) / probe_fn(...) call must carry
+    # cparams.swa_full somewhere in its argument list; `[^;]*?` bounds the
+    # search to one statement so a later call cannot satisfy an earlier one.
+    for fn in ("runtime_context_fn", "probe_fn"):
+        calls = re.findall(fn + r"\([^;]*?\)\s*;", source)
+        if len(calls) < 2:
+            found.append(f"expected at least two {fn}(...) call sites, found {len(calls)}")
+        for call in calls:
+            if "cparams.swa_full" not in call:
+                found.append(f"cparams.swa_full is not forwarded to {fn}")
+                break
+    if not re.search(r"cache_key\.swa_full\s*=\s*cparams\.swa_full\s*;", source):
+        found.append("cache_key.swa_full is not assigned from cparams.swa_full")
+    return found
+
+
 def stale_comment_violations(hpp_source: str, cpp_source: str) -> list[str]:
     found: list[str] = []
     if "with n_seq_max=1" in hpp_source:
@@ -298,6 +363,10 @@ def test_transaction_body_threads_n_seq_max_and_kv_unified_before_use() -> None:
 
 def test_llama_model_uses_n_embd_gqa_max() -> None:
     assert n_embd_gqa_max_violations(LLAMA_MODEL_CPP.read_text()) == []
+
+
+def test_llama_context_threads_swa_full() -> None:
+    assert llama_context_swa_full_violations(LLAMA_CONTEXT_CPP.read_text()) == []
 
 
 def test_no_stale_n_seq_max_one_comment_remains() -> None:
@@ -341,11 +410,31 @@ def test_mutation_kv_unified_param_renamed_is_witnessed() -> None:
     # signature and pass. This mutation keeps a bool parameter present
     # under a different name, so only a check anchored on "bool kv_unified"
     # as a pair (not "bool" alone) can catch it.
-    mutated = hpp.replace(
-        "                                      bool     kv_unified) {",
-        "                                      bool     kv_unified_flag) {", 1)
+    # llama.cpp-uajm: kv_unified is no longer the last parameter (swa_full
+    # follows it), so the rename is anchored on `bool <ws> kv_unified,`.
+    mutated, n = re.subn(r"(bool\s+)kv_unified,", r"\1kv_unified_flag,", hpp, count=1)
+    assert n == 1, "kv_unified parameter pattern did not match the current source"
     _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool kv_unified parameter",
                       "kv_unified parameter renamed away")
+
+
+def test_mutation_swa_full_param_renamed_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated, n = re.subn(r"(bool\s+)swa_full\)", r"\1swa_full_flag)", hpp, count=1)
+    assert n == 1, "swa_full parameter pattern did not match the current source"
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "has no bool swa_full parameter",
+                      "swa_full parameter renamed away")
+
+
+def test_mutation_swa_full_branch_dropped_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    # Back to "size by the window regardless of swa_full" -- the exact
+    # llama.cpp-uajm defect.
+    mutated, n = re.subn(r"kind == GGML_SYCL_KV_LAYER_SWA && !swa_full", "kind == GGML_SYCL_KV_LAYER_SWA", hpp,
+                         count=1)
+    assert n == 1, "swa_full branch pattern did not match the current source"
+    _assert_witnessed(hpp, mutated, kv_layer_bytes_for_kind_violations, "does not branch on swa_full",
+                      "swa_full branch dropped")
 
 
 def test_mutation_kv_unified_branch_dropped_is_witnessed() -> None:
@@ -379,11 +468,22 @@ def test_mutation_kv_bytes_for_layer_stops_forwarding_kv_unified_is_witnessed() 
     hpp = UNIFIED_CACHE_HPP.read_text()
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-        "                                           n_seq_max, kv_unified);",
+        "                                           n_seq_max, kv_unified, swa_full);",
         "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
-        "                                           n_seq_max, false);", 1)
+        "                                           n_seq_max, false, swa_full);", 1)
     _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding kv_unified",
                       "kv_bytes_for_layer stops forwarding kv_unified")
+
+
+def test_mutation_kv_bytes_for_layer_stops_forwarding_swa_full_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace(
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "                                           n_seq_max, kv_unified, swa_full);",
+        "return kv_layer_bytes_for_kind(layer_kind[il], layer_k_width[il], layer_v_width[il], n_ctx, n_swa, n_ubatch,\n"
+        "                                           n_seq_max, kv_unified, false);", 1)
+    _assert_witnessed(hpp, mutated, kv_bytes_for_layer_violations, "without forwarding swa_full",
+                      "kv_bytes_for_layer stops forwarding swa_full")
 
 
 def test_mutation_kv_size_for_layer_stops_forwarding_kv_unified_is_witnessed() -> None:
@@ -391,12 +491,25 @@ def test_mutation_kv_size_for_layer_stops_forwarding_kv_unified_is_witnessed() -
     mutated = hpp.replace(
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
-        "                                           planner_kv_unified);",
+        "                                           planner_kv_unified, planner_swa_full);",
         "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
         "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
-        "                                           false);", 1)
+        "                                           false, planner_swa_full);", 1)
     _assert_witnessed(hpp, mutated, kv_size_for_layer_violations, "without forwarding planner_kv_unified",
                       "kv_size_for_layer stops forwarding planner_kv_unified")
+
+
+def test_mutation_kv_size_for_layer_stops_forwarding_planner_swa_full_is_witnessed() -> None:
+    hpp = UNIFIED_CACHE_HPP.read_text()
+    mutated = hpp.replace(
+        "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
+        "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
+        "                                           planner_kv_unified, planner_swa_full);",
+        "return kv_layer_bytes_for_kind(layer_kind[layer_id], layer_k_width[layer_id], layer_v_width[layer_id],\n"
+        "                                           planner_n_ctx, planner_n_swa, planner_n_ubatch, planner_n_seq_max,\n"
+        "                                           planner_kv_unified, false);", 1)
+    _assert_witnessed(hpp, mutated, kv_size_for_layer_violations, "without forwarding planner_swa_full",
+                      "kv_size_for_layer stops forwarding planner_swa_full")
 
 
 def test_mutation_stale_comment_reappears_is_witnessed() -> None:
@@ -443,6 +556,52 @@ def test_mutation_next_plan_kv_unified_dropped_is_witnessed() -> None:
                       "next_plan.planner_kv_unified dropped")
 
 
+def test_mutation_next_kv_info_swa_full_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"[ \t]*next_kv_info\.swa_full\s*=\s*swa_full;\n", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations, "never sets next_kv_info.swa_full",
+                      "next_kv_info.swa_full dropped")
+
+
+def test_mutation_next_plan_swa_full_dropped_is_witnessed() -> None:
+    cpp = GGML_SYCL_CPP.read_text()
+    mutated = re.sub(r"[ \t]*next_plan\.planner_swa_full\s*=\s*swa_full;\n", "", cpp, count=1)
+    _assert_witnessed(cpp, mutated, transaction_body_violations, "never sets next_plan.planner_swa_full",
+                      "next_plan.planner_swa_full dropped")
+
+
+def test_mutation_cparams_swa_full_not_recorded_is_witnessed() -> None:
+    src = LLAMA_CONTEXT_CPP.read_text()
+    mutated = re.sub(r"[ \t]*cparams\.swa_full\s*=\s*params\.swa_full;\n", "", src, count=1)
+    _assert_witnessed(src, mutated, llama_context_swa_full_violations,
+                      "cparams.swa_full is not assigned from params.swa_full", "cparams.swa_full assignment dropped")
+
+
+def test_mutation_runtime_context_fn_drops_swa_full_is_witnessed() -> None:
+    src = LLAMA_CONTEXT_CPP.read_text()
+    # Replace the forwarded field with a literal at ONE call site -- the
+    # check must fail if ANY site stops forwarding the real value.
+    mutated = re.sub(r"(runtime_context_fn\([^;]*?)cparams\.swa_full", r"\1false", src, count=1)
+    _assert_witnessed(src, mutated, llama_context_swa_full_violations,
+                      "cparams.swa_full is not forwarded to runtime_context_fn",
+                      "runtime_context_fn call site stops forwarding cparams.swa_full")
+
+
+def test_mutation_probe_fn_drops_swa_full_is_witnessed() -> None:
+    src = LLAMA_CONTEXT_CPP.read_text()
+    mutated = re.sub(r"(probe_fn\([^;]*?)cparams\.swa_full", r"\1false", src, count=1)
+    _assert_witnessed(src, mutated, llama_context_swa_full_violations,
+                      "cparams.swa_full is not forwarded to probe_fn",
+                      "probe_fn call site stops forwarding cparams.swa_full")
+
+
+def test_mutation_cache_key_swa_full_dropped_is_witnessed() -> None:
+    src = LLAMA_CONTEXT_CPP.read_text()
+    mutated = re.sub(r"[ \t]*cache_key\.swa_full\s*=\s*cparams\.swa_full;\n", "", src, count=1)
+    _assert_witnessed(src, mutated, llama_context_swa_full_violations,
+                      "cache_key.swa_full is not assigned from cparams.swa_full", "cache_key.swa_full dropped")
+
+
 def test_mutation_planner_assignments_reordered_after_update_is_witnessed() -> None:
     cpp = GGML_SYCL_CPP.read_text()
     before = (
@@ -450,6 +609,7 @@ def test_mutation_planner_assignments_reordered_after_update_is_witnessed() -> N
         "    next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;\n"
         "    next_plan.planner_n_seq_max  = n_seq_max;\n"
         "    next_plan.planner_kv_unified = kv_unified;\n"
+        "    next_plan.planner_swa_full   = swa_full;\n"
         "    next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());\n"
     )
     after = (
@@ -458,6 +618,7 @@ def test_mutation_planner_assignments_reordered_after_update_is_witnessed() -> N
         "    next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;\n"
         "    next_plan.planner_n_seq_max  = n_seq_max;\n"
         "    next_plan.planner_kv_unified = kv_unified;\n"
+        "    next_plan.planner_swa_full   = swa_full;\n"
     )
     mutated = cpp.replace(before, after, 1)
     _assert_witnessed(cpp, mutated, transaction_body_violations,

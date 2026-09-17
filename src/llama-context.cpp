@@ -678,6 +678,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.swa_full   = params.swa_full;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -718,6 +719,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: swa_full              = %s\n", __func__, cparams.swa_full ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -1139,9 +1141,11 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             // same way cparams.n_seq_max already is -- SYCL's KV planner
             // needs it to pick the right SWA sizing mode (see
             // ggml_backend_sycl_set_runtime_context_for_model()'s
-            // declaration comment, ggml-sycl.h).
+            // declaration comment, ggml-sycl.h). llama.cpp-uajm:
+            // cparams.swa_full likewise -- with it set llama_kv_cache_iswa
+            // allocates SWA layers at full n_ctx and the planner must too.
             auto rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                         cparams.kv_unified, cparams.flash_attn);
+                                         cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
             // Context construction may overlap enough live updates to
             // exhaust the model's finite ticket pool transiently. Wait
             // with bounded exponential backoff instead of spinning three
@@ -1149,7 +1153,7 @@ void llama_context::sycl_resync_runtime_context_flash_attn() {
             for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = runtime_context_fn(backend.get(), token, cparams.n_ctx, cparams.n_ubatch, cparams.n_seq_max,
-                                        cparams.kv_unified, cparams.flash_attn);
+                                        cparams.kv_unified, cparams.swa_full, cparams.flash_attn);
             }
             if (rc != GGML_SYCL_LIFECYCLE_OK) {
                 throw std::runtime_error(format("failed to activate exact SYCL model plan: result=%d", (int) rc));
@@ -1486,8 +1490,9 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             // must be given the SAME kv_unified the candidate would
             // actually publish with, or its accept/reject answer is for the
             // wrong KV shape (ggml-sycl.h, this probe's declaration).
+            // llama.cpp-uajm: and the same swa_full, for the same reason.
             auto rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                               cparams.flash_attn, &probe);
+                               cparams.swa_full, cparams.flash_attn, &probe);
 
             // Same bounded exponential backoff as
             // sycl_resync_runtime_context_flash_attn()'s own BUSY retry
@@ -1497,7 +1502,7 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
             for (int wait = 0; rc == GGML_SYCL_LIFECYCLE_BUSY && wait < llama_context_sycl_max_busy_waits; ++wait) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1u << wait));
                 rc = probe_fn(sb.backend, token, cparams.n_ctx, c, cparams.n_seq_max, cparams.kv_unified,
-                              cparams.flash_attn, &probe);
+                              cparams.swa_full, cparams.flash_attn, &probe);
             }
 
             if (rc == GGML_SYCL_LIFECYCLE_BUSY) {
@@ -1607,6 +1612,10 @@ void llama_context::sycl_select_auto_ubatch(ggml_type type_k, ggml_type type_v) 
     // (kv_layer_bytes_for_kind(), unified-cache.hpp) -- must not share a
     // cache entry (CACHE_VERSION 3, ggml-sycl.h's struct comment).
     cache_key.kv_unified      = cparams.kv_unified;
+    // llama.cpp-uajm: swa_full changes every SWA layer's KV bytes (sized as
+    // FULL when set), so a CLI run (false) and a raw-API context (true)
+    // must not share one cache entry either (CACHE_VERSION 4).
+    cache_key.swa_full        = cparams.swa_full;
     cache_key.n_seq_max       = cparams.n_seq_max;
     cache_key.type_k          = static_cast<int32_t>(type_k);
     cache_key.type_v          = static_cast<int32_t>(type_v);

@@ -110,6 +110,7 @@ UbatchCacheKey to_internal_key(const std::string & device_key, const ggml_sycl_u
     k.type_v          = c_key.type_v;
     k.device_set_hash = c_key.device_set_hash;
     k.kv_unified      = c_key.kv_unified;
+    k.swa_full        = c_key.swa_full;
     return k;
 }
 

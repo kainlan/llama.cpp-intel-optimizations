@@ -114,8 +114,11 @@ struct lifecycle_fixture {
             // NVFP4 lifecycle scoping, not the non-FA attention scratch guard;
             // true skips that guard entirely, matching this call's pre-existing
             // behavior before the guard was threaded through this API.
+            // llama.cpp-uajm: swa_full=false (common's default) -- KV sizing
+            // is not what this test exercises.
             require(
                 ggml_backend_sycl_set_runtime_context_for_model(backend, model, 2, 2, 1, /*kv_unified=*/false,
+                                                                /*swa_full=*/false,
                                                                 /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
                 "model root bind failed");
             require(ggml_sycl_q1_nvfp4_test_scope_mint(backend, context, model, &scope),

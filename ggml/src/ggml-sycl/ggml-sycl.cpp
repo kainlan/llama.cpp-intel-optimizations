@@ -17342,11 +17342,14 @@ enum class ggml_sycl_txn_result { ACCEPTED, REFUSED, BUSY };
 // / kv_layer_bytes_for_kind() (unified-cache.hpp) for the rationale.
 // Threaded the same way n_seq_max already is: onto next_kv_info and
 // next_plan below, before either is consulted.
+// llama.cpp-uajm: swa_full -- see placement_kv_info::swa_full; identical
+// treatment.
 static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backend_t backend,
                                                                       uint32_t       n_ctx,
                                                                       uint32_t       n_ubatch,
                                                                       uint32_t       n_seq_max,
                                                                       bool           kv_unified,
+                                                                      bool           swa_full,
                                                                       bool           flash_attn_enabled,
                                                                       bool           probe_mode,
                                                                       ggml_sycl_runtime_context_probe * out) {
@@ -17432,20 +17435,25 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
     // sizing modes applies (kv_layer_bytes_for_kind(), unified-cache.hpp) --
     // same unconditional treatment as n_seq_max just above.
     next_kv_info.kv_unified       = kv_unified;
+    // llama.cpp-uajm: swa_full sizes every SWA layer as FULL when set
+    // (kv_layer_bytes_for_kind(), unified-cache.hpp) -- same unconditional
+    // treatment again.
+    next_kv_info.swa_full         = swa_full;
 
     auto next_plan = ggml_sycl::placement_plan(*current->plan);
-    // llama.cpp-3aos: these four must be current on next_plan BEFORE
+    // llama.cpp-3aos: these five must be current on next_plan BEFORE
     // update_runtime_kv_sizes()/rebuild_runtime_per_device_vram() below --
     // kv_size_for_layer()'s per-layer-truth path (unified-cache.hpp) reads
-    // next_plan.planner_n_ctx/n_ubatch/n_seq_max/kv_unified directly, not
-    // this function's own parameters, so setting them only after those
-    // calls (as this used to for the first three) sizes every SWA/full
-    // layer's zone from the PREVIOUS runtime context instead of this one
-    // whenever a model carries per-layer KV truth.
+    // next_plan.planner_n_ctx/n_ubatch/n_seq_max/kv_unified/swa_full
+    // directly, not this function's own parameters, so setting them only
+    // after those calls (as this used to for the first three) sizes every
+    // SWA/full layer's zone from the PREVIOUS runtime context instead of
+    // this one whenever a model carries per-layer KV truth.
     next_plan.planner_n_ctx      = n_ctx;
     next_plan.planner_n_ubatch   = next_kv_info.n_ubatch;
     next_plan.planner_n_seq_max  = n_seq_max;
     next_plan.planner_kv_unified = kv_unified;
+    next_plan.planner_swa_full   = swa_full;
     next_plan.update_runtime_kv_sizes(n_ctx, next_kv_info.kv_bytes_per_layer(), next_kv_info.kv_bytes_per_swa_layer());
     if (!next_plan.rebuild_runtime_per_device_vram()) {
         GGML_SYCL_RUNTIME_TXN_REFUSAL(probe_mode,
@@ -17592,13 +17600,17 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
         // probe is tried and rejected repeatedly by design; see
         // GGML_SYCL_RUNTIME_TXN_REFUSAL's own comment.)
         const double mb = 1024.0 * 1024.0;
+        // llama.cpp-uajm: n_seq_max/kv_unified/swa_full name the KV shape
+        // the refused demand was sized for -- an SWA model's kv figure can
+        // differ several-fold between swa_full=0 and =1 at the same n_ctx,
+        // and nothing else in this line distinguishes the two.
         GGML_SYCL_RUNTIME_TXN_REFUSAL(
             probe_mode,
-            "[SYCL-PLAN] runtime KV update rejected: %s -- n_ctx=%u n_ubatch=%u vram=%.1f MB "
-            "(weights %.1f + kv %.1f) budget=%.1f MB over_by=%.1f MB\n",
-            ggml_sycl::moe_mmid_runtime_reason_name(replan_reason), n_ctx, next_kv_info.n_ubatch,
-            next_plan.vram_bytes / mb, next_plan.weight_vram_bytes / mb, next_plan.kv_vram_bytes / mb,
-            next_plan.vram_budget / mb,
+            "[SYCL-PLAN] runtime KV update rejected: %s -- n_ctx=%u n_ubatch=%u n_seq_max=%u kv_unified=%d "
+            "swa_full=%d vram=%.1f MB (weights %.1f + kv %.1f) budget=%.1f MB over_by=%.1f MB\n",
+            ggml_sycl::moe_mmid_runtime_reason_name(replan_reason), n_ctx, next_kv_info.n_ubatch, n_seq_max,
+            kv_unified ? 1 : 0, swa_full ? 1 : 0, next_plan.vram_bytes / mb, next_plan.weight_vram_bytes / mb,
+            next_plan.kv_vram_bytes / mb, next_plan.vram_budget / mb,
             next_plan.vram_bytes > next_plan.vram_budget ? (next_plan.vram_bytes - next_plan.vram_budget) / mb : 0.0);
         if (replan_reason == ggml_sycl::moe_mmid_runtime_reason::BUDGET_EXCEEDED ||
             replan_reason == ggml_sycl::moe_mmid_runtime_reason::GROWTH_BUDGET_EXCEEDED) {
@@ -17831,11 +17843,14 @@ static ggml_sycl_txn_result ggml_sycl_run_runtime_context_transaction(ggml_backe
 #endif
 
     if (g_placement_kv_info.valid()) {
+        // llama.cpp-uajm: kv_unified/swa_full are read back from the
+        // PUBLISHED kv_info, not this call's parameters, so the line
+        // reports the mode the plan was actually sized under.
         GGML_LOG_INFO(
-            "[SYCL-PLAN] Runtime context update: n_ctx=%u n_ubatch=%u n_seq_max=%u kv_per_layer=%.1f MB "
-            "kv_per_swa_layer=%.1f MB\n",
-            g_placement_kv_info.n_ctx, g_placement_kv_info.n_ubatch, n_seq_max,
-            g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
+            "[SYCL-PLAN] Runtime context update: n_ctx=%u n_ubatch=%u n_seq_max=%u kv_unified=%d swa_full=%d "
+            "kv_per_layer=%.1f MB kv_per_swa_layer=%.1f MB\n",
+            g_placement_kv_info.n_ctx, g_placement_kv_info.n_ubatch, n_seq_max, g_placement_kv_info.kv_unified ? 1 : 0,
+            g_placement_kv_info.swa_full ? 1 : 0, g_placement_kv_info.kv_bytes_per_layer() / (1024.0 * 1024.0),
             g_placement_kv_info.kv_bytes_per_swa_layer() / (1024.0 * 1024.0));
     }
     // llama.cpp-tsfl (round 1 F4): the compute-buffer host-pinned-fallback
@@ -17866,8 +17881,9 @@ void ggml_backend_sycl_set_runtime_context(ggml_backend_t backend,
                                            uint32_t       n_ubatch,
                                            uint32_t       n_seq_max,
                                            bool           kv_unified,
+                                           bool           swa_full,
                                            bool           flash_attn_enabled) {
-    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified,
+    (void) ggml_sycl_run_runtime_context_transaction(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
                                                      flash_attn_enabled,
                                                      /*probe_mode=*/false, /*out=*/nullptr);
 }
@@ -17893,6 +17909,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
                                                                              uint32_t              n_ubatch,
                                                                              uint32_t              n_seq_max,
                                                                              bool                  kv_unified,
+                                                                             bool                  swa_full,
                                                                              bool                  flash_attn_enabled,
                                                                              ggml_sycl_runtime_context_probe * out) {
     if (!out) {
@@ -17971,7 +17988,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_probe_runtime_context_for_model(ggm
     // ggml_sycl_txn_result's own comment for why BUSY must not collapse into
     // PLAN_REJECTED).
     const ggml_sycl_txn_result result = ggml_sycl_run_runtime_context_transaction(
-        backend, n_ctx, n_ubatch, n_seq_max, kv_unified, flash_attn_enabled, /*probe_mode=*/true, out);
+        backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full, flash_attn_enabled, /*probe_mode=*/true, out);
     switch (result) {
         case ggml_sycl_txn_result::ACCEPTED:
             return GGML_SYCL_LIFECYCLE_OK;
@@ -18004,6 +18021,7 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
                                                                            uint32_t              n_ubatch,
                                                                            uint32_t              n_seq_max,
                                                                            bool                  kv_unified,
+                                                                           bool                  swa_full,
                                                                            bool                  flash_attn_enabled) {
     sycl_module_mutation_guard module_guard;
     if (!module_guard) return GGML_SYCL_LIFECYCLE_BUSY;
@@ -18118,7 +18136,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_set_runtime_context_for_model(ggml_
     g_runtime_external_lease     = true;
     g_runtime_update_succeeded   = false;
     try {
-        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, flash_attn_enabled);
+        ggml_backend_sycl_set_runtime_context(backend, n_ctx, n_ubatch, n_seq_max, kv_unified, swa_full,
+                                              flash_attn_enabled);
     } catch (...) {
         return GGML_SYCL_LIFECYCLE_EFFECT_FAILED;
     }
@@ -18250,7 +18269,10 @@ void ggml_backend_sycl_set_runtime_n_ctx(ggml_backend_t backend, uint32_t n_ctx)
     // llama.cpp-3aos: same reasoning as n_seq_max=1 above --
     // this legacy entry point has no way to learn a real kv_unified either,
     // so it passes llama_cparams::kv_unified's own default (false).
-    ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1, /*kv_unified=*/false, /*flash_attn_enabled=*/false);
+    // llama.cpp-uajm: likewise swa_full=false -- common's default and the
+    // window-sized behaviour this entry point always had.
+    ggml_backend_sycl_set_runtime_context(backend, n_ctx, 0, 1, /*kv_unified=*/false, /*swa_full=*/false,
+                                          /*flash_attn_enabled=*/false);
 }
 
 void ggml_backend_sycl_notify_compute_buffer_sizes(ggml_backend_t backend, const size_t * sizes, int n_sizes) {
