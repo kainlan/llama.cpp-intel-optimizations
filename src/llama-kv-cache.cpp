@@ -932,7 +932,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & head  = v_heads[sinfo.strm[s]];
 
             cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+            head = it->v_heads_old[sinfo.strm[s]];
         }
     }
 
