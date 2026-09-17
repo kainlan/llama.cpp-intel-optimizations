@@ -746,6 +746,79 @@ static bool host_zone_config_ordering_matters(sycl::queue & q) {
     return true;
 }
 
+// llama.cpp-nsl3: the host WEIGHT zone must be able to hand out ONE
+// contiguous allocation larger than a pinned chunk. zone_alloc() serves a
+// contiguous pointer from a single chunk's TLSF, so growth sized to the
+// shortfall and split into fixed chunk_size_ chunks adds aggregate capacity
+// that no single-chunk allocation can consume: Gemma 4 E4B's 2856 MB
+// host-placed per-layer embedding against 2048 MB chunks grew the zone by two
+// more 2048 MB chunks and still failed model load. The runtime path
+// (allocate_from_chunks -> grow_into) has always sized an oversize chunk as
+// max(chunk_size_, align_up(size)); this pins that grow_zone() follows the
+// same rule and reports the zone's added capacity from the actual chunk bytes.
+static bool host_zone_grow_serves_oversize_contiguous_alloc(sycl::queue & q) {
+    TEST_BEGIN("host_zone_grow_serves_oversize_contiguous_alloc");
+
+    const char * old_chunk_mb = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
+    const bool   had_chunk_mb = old_chunk_mb != nullptr;
+    std::string  saved_chunk_mb;
+    if (had_chunk_mb) {
+        saved_chunk_mb = old_chunk_mb;
+    }
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+
+    constexpr size_t mib    = 1024ull * 1024ull;
+    constexpr size_t chunk  = 16ull * mib;
+    constexpr size_t budget = 128ull * mib;
+    const size_t     align  = pinned_chunk_pool::DEFAULT_ALIGNMENT;
+
+    pinned_chunk_pool pool(q, budget);
+    pool.configure_zones(4ull * mib, 1ull * mib, 2ull * mib, 1ull * mib);  // one 16 MiB chunk
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", had_chunk_mb ? saved_chunk_mb.c_str() : nullptr);
+    TEST_ASSERT(pool.zones_configured(), "host zones were not configured");
+
+    // Three chunks' worth in ONE contiguous request: the shape of the Gemma 4
+    // failure scaled down (2856 MB against 2048 MB chunks).
+    const size_t request = 3 * chunk;
+    TEST_ASSERT(pool.zone_alloc(host_zone_id::WEIGHT, request, align) == nullptr,
+                "a 48 MiB request must not fit the 4 MiB WEIGHT zone before growth");
+
+    const size_t cap_before    = pool.zone_capacity(host_zone_id::WEIGHT);
+    const size_t chunks_before = pool.chunk_count();
+    // Mirrors unified-cache.cpp's fragmentation path: the growth request must
+    // guarantee that a fresh chunk can hold the whole allocation.
+    const size_t need          = request + align;
+    TEST_ASSERT(pool.grow_zone(host_zone_id::WEIGHT, need), "grow_zone should succeed within a 128 MiB budget");
+    const size_t used_before = pool.zone_used(host_zone_id::WEIGHT);
+
+    void * ptr = pool.zone_alloc(host_zone_id::WEIGHT, request, align);
+    TEST_ASSERT(ptr != nullptr, "zone_alloc of 3 chunks after grow_zone should return a contiguous pointer");
+
+    const size_t cap_after    = pool.zone_capacity(host_zone_id::WEIGHT);
+    const size_t chunks_after = pool.chunk_count();
+    const size_t aligned_need = (need + align - 1) & ~(align - 1);
+    TEST_ASSERT(chunks_after == chunks_before + 1, "oversize growth should add exactly one chunk");
+    TEST_ASSERT(cap_after - cap_before == aligned_need,
+                "zone_capacity should grow by the actual bytes of the oversize chunk");
+    // TLSF does not split off a tail smaller than its minimum block, so the
+    // 64-byte slack rides along with the allocation: the accounted bytes are
+    // at least the request and at most the new chunk.
+    const size_t used_delta = pool.zone_used(host_zone_id::WEIGHT) - used_before;
+    TEST_ASSERT(used_delta >= request && used_delta <= aligned_need,
+                "the oversize allocation should be accounted within the new chunk's bytes");
+
+    // Budget is checked against the actual bytes: a growth that does not fit
+    // the remaining budget is refused without adding any chunk.
+    TEST_ASSERT(!pool.grow_zone(host_zone_id::WEIGHT, 100ull * mib),
+                "growth beyond the remaining budget should be refused");
+    TEST_ASSERT(pool.chunk_count() == chunks_after, "a refused growth must not add a chunk");
+    TEST_ASSERT(pool.zone_capacity(host_zone_id::WEIGHT) == cap_after, "a refused growth must not change capacity");
+
+    pool.zone_free(host_zone_id::WEIGHT, ptr);
+    TEST_PASS();
+    return true;
+}
+
 // Run only via --case host_inventory_initializes_zones, in a fresh process.
 // Metadata describes complete gate/up/down groups (one MiB per role) whose
 // aggregate exceeds the actual shared arena by 64 MiB. No GGUF or weight
@@ -1791,6 +1864,16 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "usage: %s --case <name>\n", argv[0]);
             return 1;
         }
+        // llama.cpp-nsl3: pool-level, no oneDNN dependency, so it dispatches
+        // before the GGML_SYCL_DNNL block and runs on any SYCL device
+        // (including the CPU device) -- the only GPU-bound input is the
+        // pinned_chunk_pool's queue.
+        if (std::strcmp(argv[2], "host_zone_grow_serves_oversize_contiguous_alloc") == 0) {
+            const bool case_ok = host_zone_grow_serves_oversize_contiguous_alloc(q);
+            fprintf(stderr, "-------------------------------------------\n");
+            fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+            return case_ok ? 0 : 1;
+        }
 #if GGML_SYCL_DNNL
         const char * case_name = argv[2];
         bool         case_ok;
@@ -1846,6 +1929,7 @@ int main(int argc, char ** argv) {
     ok &= direct_stage_host_fallback_counts_attempt(q);
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
     ok &= host_zone_config_ordering_matters(q);
+    ok &= host_zone_grow_serves_oversize_contiguous_alloc(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= independent_exact_token_defers_owned_release(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);

@@ -567,8 +567,17 @@ checks = {
         # plan) before deferring into the shared transaction body -- it
         # arms no lease of its own and takes no second, in-lock read the
         # way the narrow re-check above does, since it never mutates the
-        # published plan (11 + 1).
-        "ggml_sycl_cache_plan_owner": 120,
+        # published plan (11 + 1). llama.cpp-glkg (8c8a0afae) then took
+        # one reader away: the one-arg
+        # ggml_sycl_configure_host_zones_for_plan(cache) overload used to
+        # read the cache plan owner twice (once in its
+        # `->entries.empty()` early-return guard, once into its
+        # `plan_owner` local); it is now a forwarding shim whose single
+        # ggml_sycl_cache_plan_owner(cache) read is passed straight into
+        # the two-arg overload that the guarded inventory path calls with
+        # the exact candidate captured under g_tensor_inventory_mutex
+        # (12 - 1). Census reconciled by llama.cpp-nsl3.
+        "ggml_sycl_cache_plan_owner": 119,
         "ggml_sycl_global_plan_owner": 16,
         "ggml_sycl_global_plan_snapshot": 12,
         "ggml_sycl_has_global_plan": 26,
