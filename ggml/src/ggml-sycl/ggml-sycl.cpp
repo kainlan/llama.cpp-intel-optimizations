@@ -74362,12 +74362,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 ggml_sycl::mem_handle act_owner;
 
                 auto & pool = g_pinned_buffer_pools[ctx.device];
-                if (pool.is_initialized() && !immutable_host_recipe) {
+                // can_serve(), not is_initialized(): the pool's capacity is fixed at init from
+                // the first graph scanned (llama's 2-token warmup run), while one MUL_MAT_ID
+                // needs an entry per (token, slot) pair -- up to top-K * n_ubatch. An
+                // over-capacity request is unservable, so route it to the correctly-sized
+                // managed host-pinned path below instead of asserting in acquire().
+                if (pool.can_serve(n_cpu) && !immutable_host_recipe) {
                     auto bp    = pool.acquire(n_cpu);
                     act_pinned = bp.act;
                     out_pinned = bp.out;
                     from_pool  = true;
                 } else {
+                    if (pool.is_initialized() && !immutable_host_recipe) {
+                        // Visible once per process: the fast path is off for every dispatch of
+                        // this shape, which is a throughput cliff and not merely a detail.
+                        static std::atomic<bool> warned_pool_capacity{ false };
+                        if (!warned_pool_capacity.exchange(true, std::memory_order_relaxed)) {
+                            GGML_LOG_WARN(
+                                "[MoE-CPU] pinned expert pool too small for this dispatch "
+                                "(%zu entries requested); using managed host-pinned buffers for "
+                                "over-capacity dispatches on device %d\n",
+                                n_cpu, ctx.device);
+                        }
+                    }
                     const size_t act_bytes = n_cpu * static_cast<size_t>(K) * sizeof(float);
                     const size_t out_bytes = n_cpu * static_cast<size_t>(N) * sizeof(float);
                     if (allocate_managed_host_pinned(

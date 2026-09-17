@@ -48,6 +48,15 @@ class PinnedBufferPool {
 
     BufferPair acquire(size_t n_experts);
 
+    // Whether acquire(n_experts) would be served. The pool's capacity is fixed
+    // at init() and the buffers really are max_experts_ * dim floats, so an
+    // over-capacity request cannot be served at all -- acquire() asserts on it.
+    // Callers must ask FIRST and take their own correctly-sized path when this
+    // returns false (llama.cpp-sfal: a dispatch entry is one (token, slot)
+    // pair, so a MUL_MAT_ID needs up to top-K * n_ubatch of them, while the
+    // pool is sized from the 2-token warmup graph).
+    bool can_serve(size_t n_experts) const { return is_initialized() && n_experts <= max_experts_; }
+
     // Release buffers back to pool (no zeroing -- CPU kernels write all read elements).
     void release(BufferPair);
 

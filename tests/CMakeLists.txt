@@ -679,6 +679,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-weight-alias-source.py)
     set_tests_properties(test-sycl-host-weight-alias-source PROPERTIES
         LABELS "sycl;registry;source;source-contract;hostonly" TIMEOUT 30)
+    # An over-capacity CPU expert dispatch must fall back, not abort (llama.cpp-sfal).
+    # Run WITH --self-test: a text-only check whose anchors stop matching real code
+    # passes vacuously, and --self-test requires its 5 mutants to still be caught.
+    add_test(NAME test-sycl-cpu-expert-pool-capacity-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-cpu-expert-pool-capacity-source.py --self-test)
+    set_tests_properties(test-sycl-cpu-expert-pool-capacity-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly" TIMEOUT 30)
     # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
     # gate checks capability against the launchers that EXIST; this checks it
     # against what each consumer's own switch ENUMERATES. Census 9b died in the
