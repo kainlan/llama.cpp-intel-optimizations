@@ -715,17 +715,9 @@ static void test_plan_kv_size_for_layer_honours_swa_full() {
     for (bool swa_full : { false, true }) {
         placement_kv_info kv = make_gptoss_20b(4096, 512, 1, /*kv_unified=*/false);
         kv.swa_full          = swa_full;
-
-        placement_plan plan{};
-        plan.layer_kind         = kv.layer_kind;
-        plan.layer_k_width      = kv.layer_k_width;
-        plan.layer_v_width      = kv.layer_v_width;
-        plan.planner_n_ctx      = kv.n_ctx;
-        plan.planner_n_swa      = kv.n_swa;
-        plan.planner_n_ubatch   = kv.n_ubatch;
-        plan.planner_n_seq_max  = kv.n_seq_max;
-        plan.planner_kv_unified = kv.kv_unified;
-        plan.planner_swa_full   = kv.swa_full;
+        // make_plan_from_kv_info() mirrors every planner_* field, swa_full
+        // included, the way compute_placement_plan() does.
+        placement_plan plan  = make_plan_from_kv_info(kv, /*device=*/0);
 
         char label[96];
         snprintf(label, sizeof(label), "(m) plan l0 (SWA), planner_swa_full=%d", (int) swa_full);

@@ -615,7 +615,7 @@ struct placement_kv_info {
     // default (every CLI tool); llama_context_default_params() sets TRUE,
     // so raw-API consumers hit the other mode. Like kv_unified above this
     // is a RUNTIME property only the runtime transaction body sets.
-    bool                  swa_full         = false;
+    bool                  swa_full     = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers
     // (0 if unknown/unset), split by attention window class -- see
     // ggml_sycl_tensor_inventory::n_head_ctx_max/n_head_swa_max
@@ -776,7 +776,7 @@ struct placement_plan {
     bool                         planner_kv_unified       = false;
     // llama.cpp-uajm: mirrors placement_kv_info::swa_full -- see that
     // field's comment. Default false matches common's default.
-    bool                                       planner_swa_full         = false;
+    bool                         planner_swa_full         = false;
     bool                         planner_n_ctx_is_runtime = false;
     // llama.cpp-o3a0: max query-head count across all oneDNN-eligible layers,
     // split by attention window class and threaded from
