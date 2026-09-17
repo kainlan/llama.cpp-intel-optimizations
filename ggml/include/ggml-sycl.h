@@ -316,6 +316,9 @@ struct ggml_sycl_placement_envelope {
 // Set tensor inventory for tiered memory placement.
 // Must be called after model metadata parsing, before tensor allocation.
 // This enables automatic VRAM/host placement based on tensor priority.
+// Direct calls retain legacy planning/late side effects; they do not guarantee
+// eager host-zone provisioning. The loader uses stage_inventory_plan(..., false)
+// to attempt that provisioning before buffer allocation, under lifecycle guards.
 GGML_BACKEND_API void ggml_backend_sycl_set_tensor_inventory(ggml_backend_t                            backend,
                                                              const struct ggml_sycl_tensor_inventory * inventory);
 

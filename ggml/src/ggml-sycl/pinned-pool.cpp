@@ -328,10 +328,28 @@ void pinned_chunk_pool::configure_zones(size_t weight_bytes,
     }
 
     if (total_zone_bytes > total_capacity) {
+        // llama.cpp-glkg: name every term of the arithmetic that produced this
+        // refusal, not just the two the old message compared. `total_capacity`
+        // above sums `chunks_` ONLY, but the growth guard just above
+        // (`total_allocated_ + chunk_size_ <= budget_`) reads
+        // `total_allocated_`, which also counts `runtime_chunks_` -- bytes
+        // already committed by the PRE-ZONE fallback (see the
+        // "[HOST-ARENA] runtime pinned chunk" WARN in grow_into() above). A
+        // reader who only sees "capacity 0.0 MB" next to a multi-GB budget
+        // cannot tell those two accumulators apart; this line makes the
+        // budget, the zone-eligible chunk bytes, the runtime-chunk bytes
+        // already spent, and the requested footprint all explicit.
+        size_t runtime_capacity = 0;
+        for (const auto & c : runtime_chunks_) {
+            runtime_capacity += c.size;
+        }
         GGML_LOG_WARN(
-            "[HOST-ARENA] pinned pool capacity %.1f MB is below requested zone footprint %.1f MB; "
+            "[HOST-ARENA] pinned pool capacity %.1f MB is below requested zone footprint %.1f MB "
+            "(budget=%.1f MB, zone-chunk bytes=%.1f MB, runtime-chunk bytes=%.1f MB, total committed=%.1f MB); "
             "disabling host zones and falling back to runtime pinned allocations\n",
-            total_capacity / (1024.0 * 1024.0), total_zone_bytes / (1024.0 * 1024.0));
+            total_capacity / (1024.0 * 1024.0), total_zone_bytes / (1024.0 * 1024.0), budget_ / (1024.0 * 1024.0),
+            total_capacity / (1024.0 * 1024.0), runtime_capacity / (1024.0 * 1024.0),
+            total_allocated_ / (1024.0 * 1024.0));
         for (auto & zone : zones_) {
             zone.size  = 0;
             zone.start = 0;
@@ -940,6 +958,25 @@ bool pinned_chunk_pool::grow_into(std::vector<chunk> & chunks, size_t min_size, 
     GGML_LOG_INFO("[SYCL] Allocated pinned %s chunk %zu (size=%.1f MB, total=%.1f GB)\n",
                   runtime_pool ? "runtime" : "base", chunks.size(), usable_size / (1024.0 * 1024.0),
                   total_allocated_ / (1024.0 * 1024.0 * 1024.0));
+
+    // llama.cpp-glkg: this is the log the original NAS repro was missing.
+    // A runtime chunk grown BEFORE host zones exist (zones_configured_ ==
+    // false) is exactly the pre-zone fallback path
+    // (pinned_chunk_pool::allocate_runtime() -> allocate_from_chunks(
+    // runtime_chunks_, ..., runtime_pool=true) -> here) that can silently
+    // consume the whole pinned-pool budget while model weights load, so that
+    // by the time configure_zones() finally runs (today: eagerly, per the
+    // ordering fix above; historically: lazily at S1-PRELOAD) its growth
+    // guard is already false and it reports 0.0 MB of capacity with no
+    // warning naming why. GGML_LOG_INFO above is dropped at default
+    // verbosity in every tool (see CLAUDE.md's "llama-bench traps"), so this
+    // is a WARN, not a second INFO line, specifically for the pre-zone case.
+    if (runtime_pool && !zones_configured_) {
+        GGML_LOG_WARN(
+            "[HOST-ARENA] runtime pinned chunk %zu: +%.1f MB, %.1f of %.1f GB committed before host zones exist\n",
+            chunks.size(), usable_size / (1024.0 * 1024.0), total_allocated_ / (1024.0 * 1024.0 * 1024.0),
+            budget_ / (1024.0 * 1024.0 * 1024.0));
+    }
 
     return true;
 }

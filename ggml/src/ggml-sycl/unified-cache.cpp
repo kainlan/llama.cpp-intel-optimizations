@@ -3856,16 +3856,10 @@ static size_t resolve_host_staging_bytes() {
     return staging_mb * 1024ULL * 1024ULL;
 }
 
-static size_t resolve_host_reserve_bytes(size_t staging_bytes) {
-    size_t reserve_mb = 0;
-    size_t env_mb     = 0;
-    if (parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", env_mb)) {
-        reserve_mb = env_mb;
-    } else {
-        reserve_mb = staging_bytes / (1024ULL * 1024ULL);
-    }
-    return reserve_mb * 1024ULL * 1024ULL;
-}
+// llama.cpp-glkg: resolve_host_reserve_bytes() (parsed GGML_SYCL_HOST_RESERVE_MB
+// but had zero callers) removed. The env var is now wired directly at the
+// pinned-pool budget construction site below, as the actual override of the
+// pool's BUDGET -- see the comment there.
 
 static bool cache_assert_enabled() {
     int enabled = g_cache_assert_enabled.load(std::memory_order_acquire);
@@ -4086,6 +4080,27 @@ unified_cache::unified_cache(sycl::queue & queue,
     // The pool grows lazily; this budget is a cap, not committed memory.
     {
         size_t host_mem_budget = g_unified_cache_host_budget;
+        // llama.cpp-glkg: GGML_SYCL_HOST_RESERVE_MB used to be parsed only by
+        // resolve_host_reserve_bytes(), which has no callers -- a dead
+        // variable documented as a live override. Wire it here as the actual
+        // override of the pinned-pool BUDGET (in MB). The byte sentinel
+        // g_unified_cache_host_budget is initialized to zero and currently
+        // has no writer. The public host-budget-pct setter changes only the
+        // percentage used by the auto calculation below, not this sentinel.
+        // A positive parsed env value therefore precedes that calculation,
+        // even when the percentage was explicitly set through the API. Zero
+        // leaves auto calculation enabled. This describes current behavior,
+        // not a separate provenance mechanism or an API-priority guarantee.
+        // A small fixed budget can exercise pool shortfalls; its value alone
+        // does not guarantee a particular failure or allocation ordering.
+        size_t host_reserve_mb = 0;
+        if (host_mem_budget == 0 && parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)) {
+            host_mem_budget = host_reserve_mb * 1024ULL * 1024ULL;
+            GGML_LOG_INFO(
+                "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=%zu overrides the auto-computed pinned-pool budget "
+                "(%.1f GB)\n",
+                host_reserve_mb, host_mem_budget / (1024.0 * 1024.0 * 1024.0));
+        }
         size_t total_mem       = 0;
         size_t available_mem   = 0;
         size_t os_reserve      = 0;
@@ -14951,8 +14966,9 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
             // Fix: use the single-segment-contiguous `zone_alloc`. If the
             // zone cannot satisfy the request contiguously, grow the zone by
             // one chunk (or more, capped by budget) and retry. If growth is
-            // blocked (phase gate or budget exhausted), fail cleanly so the
-            // caller can fall back through the sycl::malloc_host path below.
+            // blocked (phase gate or budget exhausted), return a miss. The
+            // host-buffer WEIGHT path fails cleanly without a raw malloc_host
+            // escape; the separate KV-only pool retry below is not its fallback.
             auto try_zone_alloc_contiguous = [&](host_zone_id zone) -> void * {
                 if (!ucache->host_zones_configured() && req.intent.constraints.use_pinned_pool) {
                     // Zones not yet configured (pre-configure model-load path):
@@ -26533,6 +26549,20 @@ static void populate_host_zone_sizing(placement_plan &                          
     constexpr size_t k_tp_staging_headroom   = 16ull * 1024ull * 1024ull;
     constexpr size_t k_scratch_headroom      = 32ull * 1024ull * 1024ull;
     constexpr double k_weight_headroom_ratio = 1.2;
+    // llama.cpp-glkg: the WEIGHT zone is where every runtime HOST_COMPUTE
+    // request lands (select_zone() in unified_alloc routes role==WEIGHT OR
+    // cat==HOST_COMPUTE OR cat==EXPERT_CACHE to host_zone_id::WEIGHT), and
+    // that includes llama_context::output_reserve()'s logits/embd host
+    // buffer plus the server's prompt-checkpoint reads after model load.
+    // Add 64 MiB of consumable sizing slack beyond the weight estimate and
+    // its 20% headroom. This is not an earmarked context reservation: other
+    // WEIGHT-zone owners can consume it before a context requests memory.
+    // It neither guarantees sufficient context capacity nor protects free
+    // pool budget for growth. Dynamic growth still depends on available
+    // pool budget, allocation phase, and contiguous/aligned chunk capacity.
+    // Retained-weight/post-load tests must establish sufficiency for each
+    // qualified workload; the observed request sizes alone do not prove it.
+    constexpr size_t k_host_runtime_reserve_bytes = 64ull * 1024ull * 1024ull;
 
     plan.max_tensor_bytes       = 0;
     plan.max_staging_pair_bytes = 0;
@@ -27100,7 +27130,8 @@ static void populate_host_zone_sizing(placement_plan &                          
     // --- Host zone sizing (uses inference category fields computed above) ---
 
     plan.host_zone_weight_bytes =
-        static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * k_weight_headroom_ratio);
+        static_cast<size_t>(static_cast<double>(plan.weight_host_bytes) * k_weight_headroom_ratio) +
+        k_host_runtime_reserve_bytes;
     plan.host_zone_kv_bytes             = std::max<size_t>(k_min_zone_bytes, plan.kv_host_bytes);
     // Staging zone: S1 preload may keep multiple async H2D/reorder submissions
     // alive. CPU-side layout conversion can hold both the source staging copy

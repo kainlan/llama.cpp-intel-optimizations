@@ -7,6 +7,7 @@
 //
 
 #include "../ggml-sycl-test.hpp"
+#include "../model-lifecycle.hpp"
 #include "../unified-cache.hpp"
 #include "../zone-sizing.hpp"
 #include "sycl-spin-kernel.hpp"
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -661,6 +663,311 @@ static bool host_zone_contiguous_alloc_skips_chunk_tail(sycl::queue & q) {
     TEST_ASSERT(ptr != nullptr, "contiguous zone allocation should skip the partial chunk tail");
     pool.zone_free(host_zone_id::STAGING, ptr);
 
+    TEST_PASS();
+    return true;
+}
+
+// llama.cpp-glkg: pins the pinned_chunk_pool-level invariant the ordering
+// fix in ggml-sycl.cpp relies on, and the boundary that fix deliberately
+// does NOT cross. The root bug: configure_zones()'s capacity check
+// (chunks_-only total_capacity) and its growth guard
+// (total_allocated_ + chunk_size_ <= budget_, where total_allocated_ counts
+// BOTH chunks_ AND runtime_chunks_) can disagree when runtime_chunks_ has
+// already consumed the pool's budget through the pre-zone fallback path
+// (ggml_backend_sycl_host_buffer_type_alloc_buffer's use_pinned_pool =
+// host_zones_configured() = false branch) -- exactly what happened for 80+
+// seconds on the reporting NAS box before S1-PRELOAD's lazy
+// configure_host_zones_for_plan() call ever ran.
+static bool host_zone_config_ordering_matters(sycl::queue & q) {
+    TEST_BEGIN("host_zone_config_ordering_matters");
+
+    const char * old_chunk_mb = std::getenv("GGML_SYCL_PINNED_CHUNK_MB");
+    const bool   had_chunk_mb = old_chunk_mb != nullptr;
+    std::string  saved_chunk_mb;
+    if (had_chunk_mb) {
+        saved_chunk_mb = old_chunk_mb;
+    }
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+
+    constexpr size_t mib    = 1024ull * 1024ull;
+    // 20 MiB budget, 16 MiB chunks: any single runtime allocation needing a
+    // full fresh chunk leaves less than one more chunk's worth of budget
+    // headroom, which is the exact shape of the master-era bug (there,
+    // 13 x 2 GiB runtime chunks left 0.8 of 26.8 GB, less than one chunk).
+    constexpr size_t budget = 20ull * mib;
+
+    // Case 1: the invariant llama.cpp-glkg's ORDERING fix relies on --
+    // configure_zones() called on a fresh pool, BEFORE any runtime-chunk
+    // consumption, succeeds even for a footprint that will consume most of
+    // the budget. This is what calling
+    // ggml_sycl_configure_host_zones_for_plan() right after the placement
+    // plan is finalized (ggml-sycl.cpp's
+    // ggml_backend_sycl_set_tensor_inventory(), before create_tensor()
+    // allocates any weight buffer) guarantees in production.
+    {
+        pinned_chunk_pool pool(q, budget);
+        pool.configure_zones(4ull * mib, 1ull * mib, 2ull * mib, 1ull * mib);  // 8 MiB total footprint
+        TEST_ASSERT(pool.zones_configured(), "fresh-pool configure_zones should succeed under budget");
+    }
+
+    // Case 2: the boundary this fix does NOT cross, and why not. If
+    // runtime_chunks_ already committed most of the budget BEFORE
+    // configure_zones() runs (the pre-zone-fallback scenario the bug
+    // report's NAS trace shows), configure_zones() still reports the
+    // shortfall and leaves zones disabled -- pinned_chunk_pool's own
+    // capacity arithmetic was deliberately NOT changed to "adopt" bytes
+    // already sitting in runtime_chunks_ into the zone system. Adoption was
+    // considered and rejected: a runtime chunk's own tlsf_allocator already
+    // reflects whatever is live-allocated within it, but configure_zones()
+    // seeds a brand-new, EMPTY tlsf_allocator for each zone-chunk overlap
+    // (see the zone_allocators_ construction loop in configure_zones()) --
+    // reusing that chunk as zone-backing without also transplanting its
+    // already-used ranges into the new zone-scoped allocator would let a
+    // later zone_alloc() hand out bytes a live weight tensor already
+    // occupies. llama.cpp-glkg's fix instead moves the
+    // configure_host_zones_for_plan() CALL SITE earlier, so the standard
+    // model-load path never reaches this state; this case pins that the
+    // pool-level fallback the fix relies on not reaching has not quietly
+    // changed underneath that ordering guarantee.
+    {
+        pinned_chunk_pool pool(q, budget);
+        void *            pre_fill = pool.allocate_runtime(15ull * mib, pinned_chunk_pool::DEFAULT_ALIGNMENT);
+        TEST_ASSERT(pre_fill != nullptr, "runtime pre-fill allocation failed");
+        pool.configure_zones(4ull * mib, 1ull * mib, 2ull * mib, 1ull * mib);  // same 8 MiB footprint as case 1
+        TEST_ASSERT(!pool.zones_configured(),
+                    "documents current pinned_chunk_pool behavior: prior runtime consumption still blocks "
+                    "configure_zones -- llama.cpp-glkg fixes ORDERING at the ggml-sycl.cpp call site, not "
+                    "this pool-level arithmetic");
+        pool.deallocate(pre_fill, 15ull * mib);
+    }
+
+    set_env_var("GGML_SYCL_PINNED_CHUNK_MB", had_chunk_mb ? saved_chunk_mb.c_str() : nullptr);
+    TEST_PASS();
+    return true;
+}
+
+// Run only via --case host_inventory_initializes_zones, in a fresh process.
+// Metadata describes complete gate/up/down groups (one MiB per role) whose
+// aggregate exceeds the actual shared arena by 64 MiB. No GGUF or weight
+// payload is loaded. Empty/all-device plans
+// are failures, not a vacuous ordering PASS. See the arithmetic below: 1% of
+// the B50 is LESS than external headroom and aborts before this boundary.
+static bool host_inventory_initializes_zones(sycl::queue & q) {
+    TEST_BEGIN("host_inventory_initializes_zones");
+    constexpr size_t mib = 1024ull * 1024ull;
+    const auto device = q.get_device();
+    const size_t device_bytes = device.get_info<sycl::info::device::global_mem_size>();
+    TEST_ASSERT(device.is_gpu() && !device.get_info<sycl::info::device::host_unified_memory>() &&
+                    device_bytes >= 8192 * mib && device_bytes <= 20480 * mib,
+                "fixture requires an 8-20 GiB discrete GPU (lead-selected B50), not the iGPU");
+    // Keep the real ONEDNN policy, but bound unused compute/runtime zones
+    // to 16 MiB each (this fixture submits no inference). Conservative tail:
+    // 256 ONEDNN + 16 SCRATCH + 16 RUNTIME + 16 minimum shared = 304 MiB.
+    // Add 16 MiB margin and round the authority's result down to the arena's
+    // 2-MiB granularity. Choose the FIRST percentage meeting that bound via
+    // the production authority, which subtracts external headroom exactly
+    // once. At the observed B50 total of 16304 MiB this chooses 12%, yielding
+    // 326 MiB (not the former 1% -> zero). The ONEDNN quarter-budget clamp
+    // can only reduce the conservative tail, not invalidate its bound.
+    constexpr size_t min_arena = 320 * mib;
+    constexpr size_t max_arena = 512 * mib;
+    constexpr size_t arena_alignment = 2 * mib;
+    int budget_pct = 0;
+    for (int pct = 1; pct <= 100; ++pct) {
+        const auto authority = compute_vram_budget_authority(false, device_bytes, device_bytes, device_bytes, pct);
+        const size_t rounded = authority.budget_bytes / arena_alignment * arena_alignment;
+        if (rounded >= min_arena) {
+            TEST_ASSERT(rounded <= max_arena, "minimum usable arena exceeds fixture's 512-MiB device bound");
+            budget_pct = pct;
+            break;
+        }
+    }
+    TEST_ASSERT(budget_pct != 0, "no usable bounded arena budget");
+    const std::string pct_text = std::to_string(budget_pct);
+    set_env_var("GGML_SYCL_VRAM_BUDGET_PCT", pct_text.c_str());
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(
+        ggml_backend_sycl_init(0), ggml_backend_free);
+    TEST_ASSERT(backend != nullptr, "SYCL backend initialization failed");
+    auto * cache = get_unified_cache_for_device(0);
+    TEST_ASSERT(cache != nullptr, "backend cache unavailable");
+    TEST_ASSERT(cache->get_queue().get_device() == q.get_device(), "fixture queue/backend device mismatch");
+    TEST_ASSERT(!cache->host_zones_configured(), "fixture requires a fresh cache without host zones");
+    TEST_ASSERT(cache->arena_active() && cache->arena_total_size() >= min_arena &&
+                    cache->arena_total_size() <= max_arena,
+                "actual free-VRAM authority did not yield the bounded usable arena; do not call inventory");
+    TEST_ASSERT(cache->pinned_pool_budget() >= 1536 * mib && cache->pinned_pool_budget() <= 4096 * mib,
+                "fixture requires a 1.5-4 GiB host pool budget; use the documented local host");
+    const size_t shared_bytes = cache->zone_capacity(vram_zone_id::WEIGHT);
+    constexpr size_t group_bytes = 3 * mib;
+    const size_t n_experts = (shared_bytes + 64 * mib + group_bytes - 1) / group_bytes;
+    TEST_ASSERT(3 * n_experts <= 512, "synthetic inventory would exceed 512-MiB metadata bound");
+    fprintf(stderr, "fixture pct=%d arena=%zu shared=%zu experts=%zu external_headroom=%zu\n",
+            budget_pct, cache->arena_total_size(), shared_bytes, n_experts, cache->external_headroom());
+
+    // CONTROL requires a complete logical role set, not the gate-only
+    // descriptor that produced metadata_mismatch=1 in the f6cae004 run.
+    const char * names[] = {
+        "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight",
+    };
+    ggml_sycl_tensor_info tensors[3]{};
+    for (size_t i = 0; i < 3; ++i) {
+        tensors[i].name  = names[i];
+        tensors[i].type  = GGML_TYPE_F32;
+        tensors[i].ne[0] = 512;
+        tensors[i].ne[1] = 512;
+        tensors[i].ne[2] = static_cast<int64_t>(n_experts);
+        tensors[i].ne[3] = 1;
+        tensors[i].size  = n_experts * mib;
+    }
+    ggml_sycl_tensor_inventory inventory{};
+    inventory.tensors      = tensors;
+    inventory.count        = 3;
+    inventory.total_size   = group_bytes * n_experts;
+    inventory.n_expert     = static_cast<int>(n_experts);
+    inventory.n_expert_used = 1;
+    inventory.n_layer      = 1;
+    inventory.n_ctx        = 16;
+    inventory.n_ubatch     = 1;
+
+    // The production loader binds a transaction and stages inventory through
+    // this public wrapper. Naked early/late setters compute a local snapshot
+    // but do not stage it without the wrapper's load-effect authority. Cache
+    // snapshots are publication diagnostics, NOT the early load candidate.
+    const auto admission_before = lifecycle::global_registry().admission_diagnostics();
+    TEST_ASSERT(admission_before.active_txn == 0 && admission_before.models == 0 &&
+                    !admission_before.shutdown_reserved && !admission_before.shutdown_completed,
+                "fixture requires an idle, empty, non-shutdown lifecycle registry");
+    struct load_scope {
+        lifecycle::admission_diagnostics_snapshot before;
+        ggml_sycl_load_txn txn{};
+        bool active = false;
+
+        bool abort() noexcept {
+            if (!active) {
+                fprintf(stderr, "FAILED: host inventory cleanup called without active transaction\n");
+                return false;
+            }
+            active = false;
+            const auto rc = ggml_backend_sycl_model_load_end(txn, false, nullptr);
+            const bool candidate_absent = !lifecycle_find_candidate_placement_plan(txn.id);
+            const auto after = lifecycle::global_registry().admission_diagnostics();
+            // end(false) rolls back with reason MISSING_SUCCESS; ABORTED is
+            // the terminal phase, not this API's result. EFFECT_FAILED and
+            // every other result remain failures, even if counts look empty.
+            const bool clean = rc == GGML_SYCL_LIFECYCLE_MISSING_SUCCESS && candidate_absent &&
+                               after.active_txn == 0 && after.models == before.models &&
+                               after.shutdown_reserved == before.shutdown_reserved &&
+                               after.shutdown_completed == before.shutdown_completed;
+            fprintf(stderr, "%s host inventory cleanup: result=%d candidate_absent=%d active=%llu models=%llu "
+                            "baseline_models=%llu\n",
+                    clean ? "PASS:" : "FAILED:", static_cast<int>(rc), static_cast<int>(candidate_absent),
+                    static_cast<unsigned long long>(after.active_txn), static_cast<unsigned long long>(after.models),
+                    static_cast<unsigned long long>(before.models));
+            return clean;
+        }
+
+        ~load_scope() {
+            if (active) {
+                // Assertion/exception paths already fail the case; abort()
+                // still prints the full semantic receipt and any failure.
+                (void) abort();
+            }
+        }
+    } load{ admission_before };
+    const auto begin_rc = ggml_backend_sycl_model_load_begin(&load.txn);
+    load.active = begin_rc == GGML_SYCL_LIFECYCLE_OK;
+    TEST_ASSERT(load.active, "public model-load begin failed");
+    const auto admission_during = lifecycle::global_registry().admission_diagnostics();
+    // begin_outer reserves a slot and inserts txns_, NOT models_. models_
+    // gains its transient row in prepare_end and loses it on clean rollback.
+    // Prove this observer sees the public begin before trusting its later
+    // zero: an unrelated/empty registry cannot satisfy active_txn==txn.id.
+    TEST_ASSERT(load.txn.id != 0 && admission_during.active_txn == load.txn.id &&
+                    admission_during.models == admission_before.models,
+                "public begin not visible in exact registry, or unexpected model admission change");
+    const auto begin_candidate = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(begin_candidate && begin_candidate->load_txn_id == load.txn.id && begin_candidate->explicit_no_plan,
+                "public begin did not expose its exact initial candidate");
+    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, true) == GGML_SYCL_LIFECYCLE_OK,
+                "public early inventory staging failed");
+    const auto snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(snapshot && snapshot->load_txn_id == load.txn.id && !snapshot->explicit_no_plan && snapshot->plan,
+                "public early inventory did not stage the exact transaction candidate");
+    const auto & plan = *snapshot->plan;
+    TEST_ASSERT(plan.entries.size() == 3 * n_experts, "synthetic inventory did not plan every expert role");
+    TEST_ASSERT(plan.base_context_control_layout.valid, "complete descriptors produced invalid CONTROL layout");
+    TEST_ASSERT(plan.weight_host_bytes > 0, "synthetic inventory produced no host placement");
+    TEST_ASSERT(!cache->host_zones_configured(), "early inventory unexpectedly configured host zones");
+    // Match the late configure helper, including its KV/scratch floors and
+    // the separate runtime-chunk preallocation. Ceil each aggregate to a
+    // 16-MiB chunk; allow one further chunk for aligned zone boundaries.
+    const size_t host_scratch = std::max(plan.host_zone_scratch_bytes,
+        cache->onednn_weights_scratch_size() + cache->onednn_activations_scratch_size() +
+        plan.max_tensor_bytes + 32 * mib);
+    const size_t host_zones = plan.host_zone_weight_bytes + std::max(plan.host_zone_kv_bytes, 64 * mib) +
+                             plan.host_zone_staging_bytes + host_scratch;
+    const size_t host_runtime = plan.onednn_scratchpad_bytes + plan.dma_staging_pool_bytes +
+                                plan.pp_pipeline_scratch_bytes + plan.pp_moe_onednn_scratch_bytes;
+    TEST_ASSERT(host_zones <= 1536 * mib && host_runtime <= 128 * mib,
+                "planned host footprint exceeds fixture bound; do not call late inventory");
+    constexpr size_t chunk = 16 * mib;
+    const size_t host_committed_bound = (host_zones + chunk - 1) / chunk * chunk +
+                                       (host_runtime + chunk - 1) / chunk * chunk + chunk;
+    TEST_ASSERT(host_committed_bound <= 1680 * mib &&
+                    cache->pinned_pool_committed() + host_committed_bound <= cache->pinned_pool_budget(),
+                "host provisioning exceeds fixture cap or pool budget");
+    size_t planned_runtime = 0;
+    TEST_ASSERT(unified_cache_get_planned_runtime_zone_requirement(0, &planned_runtime) &&
+                    planned_runtime <= cache->zone_capacity(vram_zone_id::RUNTIME),
+                "inventory would grow mandatory runtime tail beyond the bounded arena");
+    TEST_ASSERT(unified_cache_get_planned_onednn_scratchpad_bytes(0) <= 256 * mib,
+                "inventory would exceed the conservative ONEDNN tail bound");
+    fprintf(stderr, "host_zones=%zu host_runtime=%zu committed_bound=%zu\n",
+            host_zones, host_runtime, host_committed_bound);
+    // Now cross the real late-inventory boundary. Its tiered_headroom
+    // diagnostic (base_mem/4 when weights exceed shared capacity) is not a
+    // second budget subtraction: g_tiered_headroom_reserve has no readers.
+    TEST_ASSERT(ggml_backend_sycl_stage_inventory_plan(&inventory, nullptr, false) == GGML_SYCL_LIFECYCLE_OK,
+                "public late inventory staging failed");
+    const auto late_snapshot = lifecycle_find_candidate_placement_plan(load.txn.id);
+    TEST_ASSERT(late_snapshot && late_snapshot->load_txn_id == load.txn.id && !late_snapshot->explicit_no_plan &&
+                    late_snapshot->plan && late_snapshot->plan->entries.size() == 3 * n_experts &&
+                    late_snapshot->plan->weight_host_bytes > 0,
+                "public late inventory did not retain a nonempty exact host candidate");
+    fprintf(stderr, "entries=%zu host_weights=%zu committed=%zu budget=%zu\n",
+            late_snapshot->plan->entries.size(), late_snapshot->plan->weight_host_bytes,
+            cache->pinned_pool_committed(), cache->pinned_pool_budget());
+    // Expected historical RED at 7b03ea03f: planning returns before the only
+    // zone-configuration calls (S1-PRELOAD). Do not allocate first: that would
+    // consume runtime chunks and obscure the ordering assertion's cause.
+    TEST_ASSERT(cache->host_zones_configured(), "HOST_ORDER_RED: nonempty host plan returned before host zone setup");
+
+    auto * buft = ggml_backend_sycl_host_buffer_type_for_device(ggml_backend_get_device(backend.get()));
+    TEST_ASSERT(buft != nullptr, "exact-device host buffer type unavailable");
+    constexpr size_t request_bytes = 993280;  // reporter's -c 4096 output request
+    TEST_ASSERT(ggml_backend_buft_get_max_size(buft) >= request_bytes, "host buft cannot advertise reporter request");
+    const size_t before = cache->host_zone_used(host_zone_id::WEIGHT);
+    {
+        std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
+            ggml_backend_buft_alloc_buffer(buft, request_bytes), ggml_backend_buffer_free);
+        TEST_ASSERT(buffer != nullptr, "public host buffer allocation failed after inventory");
+        alloc_metadata metadata{};
+        TEST_ASSERT(unified_lookup(ggml_backend_buffer_get_base(buffer.get()), &metadata),
+                    "host buffer lacks allocation metadata");
+        TEST_ASSERT(metadata.zone_managed && metadata.host_zone == host_zone_id::WEIGHT,
+                    "public host buffer did not route to accounted WEIGHT zone");
+        TEST_ASSERT(cache->host_zone_used(host_zone_id::WEIGHT) >= before + request_bytes,
+                    "host buffer allocation was not charged to WEIGHT");
+    }
+    TEST_ASSERT(cache->host_zone_used(host_zone_id::WEIGHT) == before, "host buffer release leaked WEIGHT usage");
+    // This allocation happens DURING loading: load-side routing coverage,
+    // NOT a max-size regression witness (the chunk floor can mask it), and
+    // NOT proof of post-load context headroom or the 64-MiB reserve. Never
+    // finish successfully just to publish a cache snapshot: that runs S1.
+    // The inner buffer owner is gone before abort on all paths, including
+    // assertion returns and exceptions. Abort skips preload; check its result
+    // explicitly on success, and let the guard handle failing paths.
+    TEST_ASSERT(load.abort(), "public model-load abort semantic cleanup receipt failed");
     TEST_PASS();
     return true;
 }
@@ -1372,6 +1679,25 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Unified Runtime Allocator Tests\n");
     fprintf(stderr, "===========================================\n");
 
+    const bool host_inventory_case = argc == 3 && std::strcmp(argv[1], "--case") == 0 &&
+                                     std::strcmp(argv[2], "host_inventory_initializes_zones") == 0;
+    if (host_inventory_case) {
+        // Before any SYCL/backend initialization or memoized env reads. Use
+        // controls already implemented at the historical RED source SHA;
+        // GGML_SYCL_HOST_RESERVE_MB was dead there, so do not depend on it.
+        set_env_var("GGML_SYCL_VRAM_BUDGET_PCT", nullptr);
+        set_env_var("GGML_SYCL_VRAM_ARENA_EXTERNAL_HEADROOM_MB", nullptr);
+        set_env_var("GGML_SYCL_COMPUTE_ARENA_MB", "16");
+        set_env_var("GGML_SYCL_RUNTIME_ARENA_MB", "16");
+        set_env_var("GGML_SYCL_S1_MAX_IN_FLIGHT", "1");
+        set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
+        set_env_var("GGML_SYCL_HOST_STAGING_MB", "1");
+        set_env_var("GGML_SYCL_HOST_RESERVE_MB", nullptr);
+        set_env_var("GGML_SYCL_MOE_MULTI_GPU", "0");
+        set_env_var("GGML_SYCL_FORCE_STREAMING", "0");
+        ggml_backend_sycl_set_unified_cache_host_budget_pct(1);
+    }
+
     if (std::getenv("GGML_SYCL_PINNED_CHUNK_MB") == nullptr) {
         set_env_var("GGML_SYCL_PINNED_CHUNK_MB", "16");
     }
@@ -1412,6 +1738,21 @@ int main(int argc, char ** argv) {
     }
     sycl::device & dev = *dev_opt;
     sycl::queue q(dev, sycl::property::queue::in_order{});
+
+    if (host_inventory_case) {
+        bool ok = false;
+        try {
+            ok = host_inventory_initializes_zones(q);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "host inventory fixture exception: %s\n", e.what());
+        }
+        if (!shutdown_unified_cache()) {
+            fprintf(stderr, "host inventory fixture shutdown failed\n");
+            ok = false;
+        }
+        fprintf(stderr, "Tests: %d run, %d passed\n", g_tests_run, g_tests_passed);
+        return ok ? 0 : 1;
+    }
 
     // This child intentionally omits explicit shutdown. Its ordinary return
     // exercises the production fallback where g_device_caches destroys its
@@ -1504,6 +1845,7 @@ int main(int argc, char ** argv) {
     ok &= offload_raw_alloc_and_fallback_stats_are_counted();
     ok &= direct_stage_host_fallback_counts_attempt(q);
     ok &= host_zone_contiguous_alloc_skips_chunk_tail(q);
+    ok &= host_zone_config_ordering_matters(q);
     ok &= host_zone_reset_trims_released_offload_pool_slots(q);
     ok &= independent_exact_token_defers_owned_release(q);
     ok &= arena_owned_shutdown_and_lifecycle_serialization(q);
