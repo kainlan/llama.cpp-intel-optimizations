@@ -5025,6 +5025,29 @@ set_tests_properties(sycl-host-reserve-env PROPERTIES
     TIMEOUT 60
 )
 
+# Test: host-weight registry name-collision classifier (llama.cpp-ttws).
+# Host-only, same arrangement as the two above: host-weight-alias.hpp is a
+# header-only pure function of ggml_tensor metadata (no SYCL header), so the
+# test compiles it directly with no -fsycl and no device. It links ggml-base
+# only because the classifier calls ggml_nbytes() and the fixture builds its
+# tensors with ggml_init()/ggml_new_tensor_*() in no_alloc contexts.
+add_executable(test-host-weight-alias
+    tests/test-host-weight-alias.cpp
+)
+target_include_directories(test-host-weight-alias PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_link_libraries(test-host-weight-alias PRIVATE ggml-base)
+set_target_properties(test-host-weight-alias PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-host-weight-alias COMMAND test-host-weight-alias)
+set_tests_properties(sycl-host-weight-alias PROPERTIES
+    # Not labelled "cache"/"mem-handle" for the same reason as above.
+    LABELS "sycl;registry;hostonly;tdd"
+    TIMEOUT 60
+)
+
 # Test: a Battlemage device is never gated onto the legacy mul_mat path.
 # Guards the gate dispatch.hpp reads (family -> supports_esimd_dpas), which is
 # what silently demoted the B70, and calls is_unified_kernel_enabled_for_device
