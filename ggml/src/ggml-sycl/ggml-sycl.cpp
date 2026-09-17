@@ -94,6 +94,7 @@
 #include "ggml-sycl/fattn.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/host-weight-alias.hpp"
 #include "ggml-sycl/kernel-selection.hpp"
 #include "ggml-sycl/l144i-probe.hpp"
 #include "ggml-sycl/mem-ops.hpp"
@@ -13692,9 +13693,46 @@ void ggml_backend_sycl_register_host_weight_tensor(ggml_backend_dev_t dev, ggml_
         if (!insert.second) {
             sycl_host_weight_extra_entry & existing = insert.first->second;
             if (existing.extra != extra || existing.tensor != tensor) {
-                ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (existing=%p new=%p)\n",
-                                         tensor->name ? tensor->name : "unknown", (void *) existing.extra,
-                                         (void *) extra);
+                // llama.cpp-ttws: a name collision here is EXPECTED for every
+                // model that ties its output head to token_embd, and it is not
+                // a mismatch of anything that matters. llama-model-loader's
+                // TENSOR_DUPLICATED path reuses the original ggml_tensor only
+                // when it already exists in the same buffer-type context;
+                // Gemma 3n / Gemma 4 (src/models/gemma4.cpp) create the
+                // DUPLICATED output alias BEFORE the real tok_embd, so the
+                // lookup can never hit and a SECOND ggml_tensor object named
+                // token_embd.weight is created, and llama-family archs route
+                // the MUL_MAT output role and the GET_ROWS input role to
+                // different contexts and miss the same way (per-layer
+                // rope_freqs duplicates too). Both objects describe the same
+                // GGUF bytes -- same name (the GGUF key, hence one weights_map
+                // entry), type, ne[], nbytes -- and the reconcile below merges
+                // them onto one extra, which is the intended ownership
+                // outcome. Printing that as a WARN put two "host weight
+                // registry mismatch for token_embd.weight" lines (the emitter
+                // mirrors to stderr) in every Gemma 4 load log and sent a
+                // ticket looking for a double registration that is by design.
+                // classify_host_weight_alias() (host-weight-alias.hpp) tells
+                // that case apart from the one the WARN exists for: one key,
+                // DIFFERENT metadata, i.e. two weights answering to one name.
+                // The alias is logged at DEBUG only; everything else still
+                // warns, now naming the kind. Gated by
+                // tests/test-sycl-host-weight-alias-source.py; the classifier
+                // by ggml/src/ggml-sycl/tests/test-host-weight-alias.cpp.
+                const auto alias_kind = ggml_sycl::detail::classify_host_weight_alias(existing.tensor, tensor);
+                if (alias_kind == ggml_sycl::detail::host_weight_alias_kind::ALIAS_SAME_BYTES) {
+                    GGML_LOG_DEBUG(
+                        "[SYCL] host weight registry: %s registered by a second ggml_tensor over the "
+                        "same bytes (tied-weight alias, %s %lldx%lld); sharing one extra "
+                        "(existing=%p new=%p)\n",
+                        tensor->name, ggml_type_name(tensor->type), (long long) tensor->ne[0],
+                        (long long) tensor->ne[1], (void *) existing.extra, (void *) extra);
+                } else {
+                    ggml_sycl_diag_emit_warn("[SYCL] host weight registry mismatch for %s (%s: existing=%p new=%p)\n",
+                                             tensor->name ? tensor->name : "unknown",
+                                             ggml_sycl::detail::host_weight_alias_kind_name(alias_kind),
+                                             (void *) existing.extra, (void *) extra);
+                }
                 // llama.cpp-dkw0: registry reconcile snapshot -- logs BOTH
                 // sides' data_handle[0] state at the exact moment of the
                 // mismatch, before `existing = new_entry` overwrites the row.

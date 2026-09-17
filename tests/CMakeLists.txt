@@ -671,6 +671,14 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-backend-count-get-null-census.py)
     set_tests_properties(test-backend-count-get-null-census PROPERTIES
         LABELS "backend;lifecycle;source;host" TIMEOUT 30)
+    # llama.cpp-ttws: the host-weight registry must classify a name collision
+    # (tied token_embd/output alias vs a genuine conflict) before it warns.
+    # Structural gate on the print site in ggml-sycl.cpp; the classifier's own
+    # behaviour is covered by sycl-host-weight-alias (ggml/src/ggml-sycl).
+    add_test(NAME test-sycl-host-weight-alias-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-host-weight-alias-source.py)
+    set_tests_properties(test-sycl-host-weight-alias-source PROPERTIES
+        LABELS "sycl;registry;source;source-contract;hostonly" TIMEOUT 30)
     # Consumer-side half of the MMVQ coverage invariant (llama.cpp-gx30). The C++
     # gate checks capability against the launchers that EXIST; this checks it
     # against what each consumer's own switch ENUMERATES. Census 9b died in the
