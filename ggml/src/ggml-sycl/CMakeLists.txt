@@ -5002,6 +5002,29 @@ set_tests_properties(zone-sizing PROPERTIES
     TIMEOUT 60
 )
 
+# Test: GGML_SYCL_HOST_RESERVE_MB parse robustness (llama.cpp-16el).
+# Host-only, same arrangement as test-zone-sizing above and for the same
+# reason: host-reserve-env.cpp includes no SYCL header, so the parser is
+# compiled directly into this target with no -fsycl, no ggml-base, no device,
+# and it builds in seconds. The same file is globbed into libggml-sycl
+# (file(GLOB) at :83) for the production call site, the host-arena
+# constructor in unified-cache.cpp. Staying SYCL-header-free is therefore a
+# live constraint on that TU, not incidental.
+add_executable(test-host-reserve-env
+    tests/test-host-reserve-env.cpp
+    host-reserve-env.cpp
+)
+target_include_directories(test-host-reserve-env PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(NAME sycl-host-reserve-env COMMAND test-host-reserve-env)
+set_tests_properties(sycl-host-reserve-env PROPERTIES
+    # Deliberately NOT labelled "cache"/"mem-handle": allocates nothing, opens
+    # no device -- must not be excluded from the throttled sweep's denylist.
+    LABELS "sycl;host-arena;hostonly;tdd"
+    TIMEOUT 60
+)
+
 # Test: a Battlemage device is never gated onto the legacy mul_mat path.
 # Guards the gate dispatch.hpp reads (family -> supports_esimd_dpas), which is
 # what silently demoted the B70, and calls is_unified_kernel_enabled_for_device

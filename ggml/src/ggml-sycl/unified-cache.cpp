@@ -15,6 +15,7 @@
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
+#include "host-reserve-env.hpp"
 #include "kv-tier-manager.hpp"
 #include "mem-handle.hpp"
 #include "mem-ops.hpp"
@@ -4101,17 +4102,43 @@ unified_cache::unified_cache(sycl::queue & queue,
         // not a separate provenance mechanism or an API-priority guarantee.
         // A small fixed budget can exercise pool shortfalls; its value alone
         // does not guarantee a particular failure or allocation ordering.
-        size_t host_reserve_mb = 0;
-        if (host_mem_budget == 0 && parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)) {
-            host_mem_budget = host_reserve_mb * 1024ULL * 1024ULL;
-            GGML_LOG_INFO(
-                "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=%zu overrides the auto-computed pinned-pool budget "
-                "(%.1f GB)\n",
-                host_reserve_mb, host_mem_budget / (1024.0 * 1024.0 * 1024.0));
+        //
+        // llama.cpp-16el: a budget gets the strict parser (host-reserve-env.cpp),
+        // not the lenient parse_env_mb_value() the tuning knobs share: junk,
+        // signs, ERANGE and a MiB count whose byte conversion would wrap are
+        // rejected with ONE warning and the auto calculation runs exactly as
+        // if the variable were unset.
+        if (host_mem_budget == 0) {
+            const char * reserve_raw = std::getenv("GGML_SYCL_HOST_RESERVE_MB");
+
+            const ggml_sycl::detail::host_reserve_parse_result reserve =
+                ggml_sycl::detail::parse_host_reserve_mb(reserve_raw);
+            switch (reserve.status) {
+                case ggml_sycl::detail::host_reserve_parse_status::OVERRIDE:
+                    host_mem_budget = reserve.bytes;
+                    GGML_LOG_INFO(
+                        "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=%zu overrides the auto-computed pinned-pool budget "
+                        "(%.1f GB)\n",
+                        reserve.mb, host_mem_budget / (1024.0 * 1024.0 * 1024.0));
+                    break;
+                case ggml_sycl::detail::host_reserve_parse_status::AUTO:
+                    GGML_LOG_INFO(
+                        "[HOST-ARENA] GGML_SYCL_HOST_RESERVE_MB=0 leaves the auto-computed pinned-pool "
+                        "budget enabled\n");
+                    break;
+                case ggml_sycl::detail::host_reserve_parse_status::REJECTED:
+                    GGML_LOG_WARN(
+                        "[HOST-ARENA] ignoring GGML_SYCL_HOST_RESERVE_MB='%s': %s; using the auto-computed "
+                        "pinned-pool budget as if the variable were unset\n",
+                        reserve_raw, reserve.reason);
+                    break;
+                case ggml_sycl::detail::host_reserve_parse_status::UNSET:
+                    break;
+            }
         }
-        size_t total_mem       = 0;
-        size_t available_mem   = 0;
-        size_t os_reserve      = 0;
+        size_t total_mem     = 0;
+        size_t available_mem = 0;
+        size_t os_reserve    = 0;
         if (host_mem_budget == 0) {
             total_mem     = ggml_sycl_get_total_system_memory_bytes();
             available_mem = ggml_sycl_get_available_system_memory_bytes();

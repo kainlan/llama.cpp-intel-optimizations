@@ -17,6 +17,10 @@
 # retained snapshot OUTSIDE the lock (canonical contract 12.5). A 528397d03
 # extract is the positive control for A3 (its setter body carries the call).
 #
+# llama.cpp-16el: check E's anchor moved with the reserve parse (lenient
+# parse_env_mb_value -> strict ggml_sycl::detail::parse_host_reserve_mb) and
+# E1/E2 pin the strict-parse and warn-and-fall-through behaviour.
+#
 # --self-test re-evaluates every check against a mutated copy of the text it
 # reads and requires the check to flip to RED, so a check whose anchor silently
 # stopped matching real code cannot pass vacuously.
@@ -117,8 +121,11 @@ texts = {
         cache_cpp,
         "static void populate_host_zone_sizing(placement_plan &                           plan,",
         window=45000),
+    # llama.cpp-16el: 3200 chars, not the 1400 default -- the strict-parse
+    # switch (four cases, two log lines) sits after the glkg comment block and
+    # the default window ended inside it.
     "host_arena_ctor_window": statement_window(
-        cache_cpp, "size_t host_mem_budget = g_unified_cache_host_budget;"),
+        cache_cpp, "size_t host_mem_budget = g_unified_cache_host_budget;", window=3200),
     "cache_cpp": cache_cpp,
     "pool_cpp": pool_cpp,
     "env_doc": env_doc,
@@ -318,16 +325,70 @@ def witness_a2_capacity_warn(t):
 
 # --- E: GGML_SYCL_HOST_RESERVE_MB wired as a real override of the pinned
 # pool's BUDGET at construction, not parsed only by a callerless function.
+# llama.cpp-16el moved the parse from the lenient parse_env_mb_value() helper
+# to the strict ggml_sycl::detail::parse_host_reserve_mb() (host-reserve-env.cpp);
+# the anchor is the getenv read plus that call, both inside the ctor window.
 DEAD_RESOLVER_SIG = "static size_t resolve_host_reserve_bytes("
-RESERVE_PARSE_CALL = 'parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)'
+RESERVE_ENV_READ = 'std::getenv("GGML_SYCL_HOST_RESERVE_MB")'
+RESERVE_PARSE_CALL = "ggml_sycl::detail::parse_host_reserve_mb(reserve_raw)"
 
 
 def check_e_reserve_wired(t):
-    return DEAD_RESOLVER_SIG not in t["cache_cpp"] and RESERVE_PARSE_CALL in t["host_arena_ctor_window"]
+    win = t["host_arena_ctor_window"]
+    return DEAD_RESOLVER_SIG not in t["cache_cpp"] and RESERVE_ENV_READ in win and RESERVE_PARSE_CALL in win
 
 
 def witness_e_reserve_wired(t):
     t["cache_cpp"] = t["cache_cpp"] + "\nstatic size_t resolve_host_reserve_bytes(size_t s) { return s; }\n"
+    return t
+
+
+# --- E1 (llama.cpp-16el): the reserve variable never goes back through the
+# lenient helper, which accepts `6144junk` as 6144, ignores ERANGE and lets the
+# MiB->byte multiply wrap. Absence check, so it fails closed: the strict call
+# must be present in the same window for the absence half to count.
+LENIENT_RESERVE_PARSE = 'parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB"'
+
+
+def check_e1_no_lenient_reserve_parse(t):
+    win = t["host_arena_ctor_window"]
+    return win != "" and RESERVE_PARSE_CALL in win and LENIENT_RESERVE_PARSE not in t["cache_cpp"]
+
+
+def witness_e1_no_lenient_reserve_parse(t):
+    # The pre-16el shape: the budget parsed by the shared lenient helper.
+    t["cache_cpp"] = t["cache_cpp"].replace(
+        RESERVE_PARSE_CALL,
+        'parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)')
+    t["host_arena_ctor_window"] = t["host_arena_ctor_window"].replace(
+        RESERVE_PARSE_CALL,
+        'parse_env_mb_value("GGML_SYCL_HOST_RESERVE_MB", host_reserve_mb)')
+    return t
+
+
+# --- E2 (llama.cpp-16el): a rejected value is WARNed once, naming the
+# variable, the raw string and the reason, and falls through to the auto
+# calculation (the REJECTED case assigns nothing to host_mem_budget). Anchors
+# on the WARN's format text and the case label, both real code.
+REJECTED_CASE = "case ggml_sycl::detail::host_reserve_parse_status::REJECTED:"
+REJECTED_WARN_FMT = "\"[HOST-ARENA] ignoring GGML_SYCL_HOST_RESERVE_MB='%s': %s; using the auto-computed \""
+
+
+def check_e2_rejection_warns_and_falls_through(t):
+    win = t["host_arena_ctor_window"]
+    case_idx = win.find(REJECTED_CASE)
+    warn_idx = win.find(REJECTED_WARN_FMT)
+    if case_idx < 0 or warn_idx < 0 or warn_idx < case_idx:
+        return False
+    # Between the case label and its break, nothing may assign the budget:
+    # rejection must leave host_mem_budget == 0 so the auto calculation runs.
+    end_idx = win.find("break;", warn_idx)
+    return end_idx > warn_idx and "host_mem_budget =" not in win[case_idx:end_idx]
+
+
+def witness_e2_rejection_warns_and_falls_through(t):
+    # Silent rejection: drop the WARN.
+    t["host_arena_ctor_window"] = t["host_arena_ctor_window"].replace(REJECTED_WARN_FMT, '"rejected"')
     return t
 
 
@@ -370,6 +431,10 @@ checks = [
      check_a2_capacity_warn, witness_a2_capacity_warn),
     ("E: GGML_SYCL_HOST_RESERVE_MB wired at budget construction, dead resolver removed",
      check_e_reserve_wired, witness_e_reserve_wired),
+    ("E1: the reserve variable is parsed by the strict parser, never the lenient helper",
+     check_e1_no_lenient_reserve_parse, witness_e1_no_lenient_reserve_parse),
+    ("E2: a rejected reserve value WARNs once and falls through to the auto calculation",
+     check_e2_rejection_warns_and_falls_through, witness_e2_rejection_warns_and_falls_through),
     ("E: env-var catalog documents the wiring and the staging-buffer distinction",
      check_e_docs, witness_e_docs),
 ]
